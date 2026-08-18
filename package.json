@@ -17,7 +17,8 @@
     "test:watch": "vitest",
     "migrate": "tsx src/db/migrate.ts",
     "migrate:test": "tsx src/db/migrate.ts --test-db",
-    "sdk:know-reader": "tsx src/sdk/run-know-reader.ts"
+    "sdk:know-reader": "tsx src/sdk/run-know-reader.ts",
+    "scheduler": "tsx src/orchestrator/run-scheduler.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.234",

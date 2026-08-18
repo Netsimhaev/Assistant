@@ -8,12 +8,13 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 113 מבחנים
+npm test          # vitest run — 121 מבחנים
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_URL
 npm run test:watch
 npm run sdk:know-reader  # הרצה חיה מול ה-Agent SDK — דורש ANTHROPIC_API_KEY
+npm run scheduler        # מעיר jobs רדומים ומפקיע אישורים — תהליך מתמשך
 ```
 
 **המבחנים דורשים Postgres אמיתי.** אין mock ואין DB בזיכרון. נדרשים שני בסיסי נתונים — `assistant_dev` ו-`assistant_test` — ו-`.env` עם `DATABASE_URL` ו-`TEST_DATABASE_URL` (ראה `.env.example`). נבדק על PostgreSQL 17.11.
@@ -56,6 +57,12 @@ npm run sdk:know-reader  # הרצה חיה מול ה-Agent SDK — דורש ANTH
 **שדה זיהוי אחד אינו מספיק.** `doNotContact`, `counterpartyAutonomy` ו-`knownCounterparties` ממופים לפי ארבעה סלים — `entityIds`, `emailDomains`, `phones`, `tags` — וכל עובדה נבדקת רק מול הסל שלה. ברשימה שטוחה אחת, `entityId` שהמטען ממציא התאים ל**תגית** וקנה ציון סיכון נמוך שלא הגיע לו. נמענים נקראים כרשימה: `to` כמערך או כמחרוזת עם פסיקים היה מניב **אפס** כתובות והחסימה פשוט לא רצה.
 
 **ערך שלא הצלחנו לקרוא אינו ערך מתיר.** סכום שלא נקרא → `amount_unreadable` (לא אפס); מחלקת מידע לא מוכרת → נספרת כחמורה ביותר; פעולת יומן לא מוכרת → `calendar.cancel`; אזור זמן שלא נפתר או דפוס רדקציה שלא מתקמפל → **התקנון נדחה בחתימה**, לא ממשיך בזמן ריצה. נפילה ל-UTC לא מרחיבה את חלון שעות השקט אלא **מזיזה** אותו.
+
+**בלי ה-scheduler שום דבר נדחה לא חוזר.** `executeStep` מרדים job ל-`followup` עם `wakeAt`, ו-`expireOverdue` מפקיע אישור שאיש לא ענה — לשניהם לא היה קורא. `npm run scheduler` הוא מה שסוגר את שתי הלולאות. `tick()` היא פונקציה שמחזירה מה עשתה, והלולאה בחוץ: tick שאפשר לקרוא לו פעם אחת הוא tick שאפשר לבדוק.
+
+**`pg_try_advisory_xact_lock` ולא נעילה חוסמת.** scheduler שני צריך לדלג על הסבב ולחזור, לא להצטבר בתור מאחורי הראשון ואז לחזור על עבודתו.
+
+**דחיית אישור סוגרת את ה-job ולא מכשילה אותו.** המערכת עשתה מה שהתבקשה ואדם אמר לא. זו תוצאה, לא תקלה. הפקעה מחזירה ל-`followup` מאותה סיבה.
 
 **`counterpartyTags` הוא שדה חובה.** כל הקוראים השמיטו אותו כשהיה אופציונלי, ולכן היה תמידית ריק — מה שהשבית בשקט כל כלל `forbidden` מצומצם-לפי-תגית ואת כל סל `doNotContact.tags`. מי שאין לו resolver חייב לכתוב `[]` במפורש; זו אמירה אחרת מ"לא הסתכלנו".
 
@@ -137,7 +144,7 @@ npm run sdk:know-reader  # הרצה חיה מול ה-Agent SDK — דורש ANTH
 
 ## מה עוד לא נבנה בשלב 0
 
-מתכנן (Plan מ-intents) · תור pg-boss ו-scheduler · פרוטוקול ה-envelope ומרשם ה-intents · מסירת אישורים בפועל (ה-broker מייצר ומכריע, אף אחד לא רואה) · CredentialBroker · רמפת האוטונומיה · pgvector ושכבות L1/L3/L4.
+מתכנן (Plan מ-intents) · פרוטוקול ה-envelope ומרשם ה-intents · מסירת אישורים בפועל (ה-broker מייצר ומכריע, אף אחד לא רואה) · CredentialBroker · רמפת האוטונומיה · pgvector ושכבות L1/L3/L4.
 
 **`know.reader` מחובר ל-SDK אבל לא הורץ חי** — אין מפתח API על המכונה הזו. הלוגיקה מכוסה במבחנים מול הטיפוסים האמיתיים; ההרצה מול המודל עצמה טרם בוצעה.
 

@@ -13,7 +13,7 @@
 npm install
 cp .env.example .env      # התאם את DATABASE_URL אם צריך
 npm run migrate           # יוצר את הסכמה
-npm test                  # 113 מבחנים
+npm test                  # 121 מבחנים
 ```
 
 דרישות: Node ≥ 22 · PostgreSQL (נבדק על 17.11) עם שני בסיסי נתונים — `assistant_dev` ו-`assistant_test`.
@@ -67,7 +67,6 @@ kill switch → תקנון עדכני → הרשאת כלי → קריאה-בל�
 | חסר | הערה |
 |---|---|
 | Orchestrator — מכונת מצבי Job, הרצת תוכניות, retries | הטבלאות קיימות; הלוגיקה לא |
-| תור pg-boss + scheduler ל-wakeups | נדרש לעבודה שנמשכת ימים |
 | פרוטוקול ה-envelope + מרשם intents + שומרי לולאה | הטיפוסים ב-`src/domain/policy.ts`; המימוש לא |
 | מסירת אישורים בפועל — דשבורד PWA, מייל HMAC | ה-broker מייצר ומכריע; אף אחד עדיין לא **רואה** |
 | CredentialBroker | |
