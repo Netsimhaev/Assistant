@@ -8,11 +8,12 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 65 מבחנים
+npm test          # vitest run — 76 מבחנים
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_URL
 npm run test:watch
+npm run sdk:know-reader  # הרצה חיה מול ה-Agent SDK — דורש ANTHROPIC_API_KEY
 ```
 
 **המבחנים דורשים Postgres אמיתי.** אין mock ואין DB בזיכרון. נדרשים שני בסיסי נתונים — `assistant_dev` ו-`assistant_test` — ו-`.env` עם `DATABASE_URL` ו-`TEST_DATABASE_URL` (ראה `.env.example`). נבדק על PostgreSQL 17.11.
@@ -120,11 +121,19 @@ npm run test:watch
 
 ## מה עוד לא נבנה בשלב 0
 
-Orchestrator (מכונת המצבים — הטבלאות קיימות, הלוגיקה לא) · תור pg-boss ו-scheduler · פרוטוקול ה-envelope ומרשם ה-intents · מסירת אישורים בפועל (ה-broker מייצר ומכריע, אף אחד לא רואה) · CredentialBroker · רמפת האוטונומיה · סוכן אחד end-to-end מול ה-Agent SDK · pgvector ושכבות L1/L3/L4.
+Orchestrator (מכונת המצבים — הטבלאות קיימות, הלוגיקה לא) · תור pg-boss ו-scheduler · פרוטוקול ה-envelope ומרשם ה-intents · מסירת אישורים בפועל (ה-broker מייצר ומכריע, אף אחד לא רואה) · CredentialBroker · רמפת האוטונומיה · pgvector ושכבות L1/L3/L4.
+
+**`know.reader` מחובר ל-SDK אבל לא הורץ חי** — אין מפתח API על המכונה הזו. הלוגיקה מכוסה במבחנים מול הטיפוסים האמיתיים; ההרצה מול המודל עצמה טרם בוצעה.
 
 `NormsLookup` ב-`policy/risk.ts` הוא ממשק עם מימוש ריק (`NO_HISTORY`, z=0 תמיד). זה הופך את המערכת **מתירנית יותר** בהתחלה, וזה בטוח רק כי הרמפה מחזיקה הכול ב-`draft_only` — שני המנגנונים נושאים משקל יחד.
 
-**ה-Agent SDK עדיין לא חובר.** ל-`evaluateToolCall` אין קורא מלבד המבחנים. חתימות ה-SDK מסומנות כשאלה פתוחה ב-[docs/09-roadmap.md](docs/09-roadmap.md).
+**ה-Agent SDK מחובר ב-`src/sdk/`.** `createGateHook` הוא `PreToolUse` שמריץ את `evaluateToolCall` לפני כל כלי. חתימות ה-SDK אומתו מול `@anthropic-ai/claude-agent-sdk@0.3.234` ואינן עוד שאלה פתוחה.
+
+**המיפוי `SDK_TO_INTERNAL` הוא גבול אבטחה, לא נוחות.** ל-SDK יש כלים שהמדיניות מעולם לא שמעה עליהם — `Bash` בראשם — והשער לא יכול לדחות מה שאין לו שם עבורו. לכן הכלל הפוך מהרגיל: **כלי שאינו במיפוי נדחה**. `sdkToolsFor` גוזר את רשימת הכלים מה-allowlist ולא כותב אותה ביד, כדי שהשתיים לא ייפרדו.
+
+**`queue_approval` חוזר ל-SDK כ-`deny`.** זו לא פשרה — הריצה חייבת להסתיים, כי אישור לוקח שעות. מזהה האישור נוסע בתוך `permissionDecisionReason` כי זה השדה היחיד שה-SDK מחזיר.
+
+**ההרצה החיה היא סקריפט ולא מבחן.** `npm run sdk:know-reader` עולה כסף ודורש מפתח. מבחן שמדלג בשקט כשאין מפתח הוא מבחן שמדווח ירוק על עבודה שלא נעשתה.
 
 ---
 
