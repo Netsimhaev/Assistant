@@ -81,7 +81,7 @@ export async function assessRisk(
       class: BASELINE_REVERSIBILITY[facts.actionClass],
       score: REVERSIBILITY_SCORE[BASELINE_REVERSIBILITY[facts.actionClass]],
     },
-    externalVisibility: scoreVisibility(facts),
+    externalVisibility: scoreVisibility(facts, bundle.knownCounterparties),
     dataSensitivity: scoreSensitivity(facts),
     novelty: {
       metric: novelty.metric,
@@ -119,7 +119,7 @@ export async function assessRisk(
     total,
     band,
     decidedBy: 'rules',
-    explanation: explain(band, dimensions, facts, ceilings),
+    explanation: explain(band, total, dimensions, facts, ceilings),
     suggestedApprovers: [],
   };
 }
@@ -137,10 +137,30 @@ function scoreMoney(
   };
 }
 
-function scoreVisibility(facts: ActionFacts): RiskDimensions['externalVisibility'] {
+/**
+ * `one_known` means the charter knows this counterparty — not that the payload
+ * claimed one.
+ *
+ * `buildFacts` falls back to the payload's `entityId` when `counterpartyId` is
+ * absent, which is right for resolving a counterparty but wrong as evidence of
+ * one: any outbound payload carrying an `entityId` field used to score as a
+ * known recipient, dropping 55 to 25 and, through `bandFor`, turning a
+ * `sensitive` first contact into a `routine` send. An agent reasoning from
+ * injected content could therefore quiet its own risk score by naming an id
+ * that exists nowhere. Membership is now checked against the compiled charter,
+ * which the model cannot write to.
+ */
+function scoreVisibility(
+  facts: ActionFacts,
+  known: readonly string[],
+): RiskDimensions['externalVisibility'] {
   if (!facts.leavesInstance) return { audience: 'internal', score: 0 };
-  if (facts.counterpartyId === null) return { audience: 'one_unknown', score: 55 };
-  return { audience: 'one_known', score: 25 };
+  const resolved =
+    (facts.counterpartyId !== null && known.includes(facts.counterpartyId)) ||
+    facts.counterpartyTags.some((tag) => known.includes(tag));
+  return resolved
+    ? { audience: 'one_known', score: 25 }
+    : { audience: 'one_unknown', score: 55 };
 }
 
 function scoreSensitivity(facts: ActionFacts): RiskDimensions['dataSensitivity'] {
@@ -192,6 +212,7 @@ function bandFor(
 
 function explain(
   band: RiskBand,
+  total: number,
   dimensions: RiskDimensions,
   facts: ActionFacts,
   ceilings: CompiledCeilings,
@@ -222,7 +243,11 @@ function explain(
 
   return reasons.length > 0
     ? `${facts.actionClass}: ${reasons.join(' · ')}.`
-    : `${facts.actionClass} דורש מבט שני (ציון ${dimensions.money.score}).`;
+    // The composite total, not the money dimension. The old form printed
+    // `dimensions.money.score`, so an escalation driven by provenance or
+    // reversibility was explained to the boss as "(score 0)" — a number that
+    // contradicted the escalation it was meant to justify.
+    : `${facts.actionClass} דורש מבט שני (ציון ${total}).`;
 }
 
 function clamp(value: number): number {

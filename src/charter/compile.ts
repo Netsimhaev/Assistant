@@ -37,9 +37,9 @@ export function compileCharter(charter: BusinessCharter): PolicyBundle {
     autonomyBase: charter.autonomy.base,
     provenanceCeiling: charter.autonomy.provenanceCeiling,
     counterpartyAutonomy: compileCounterpartyAutonomy(charter),
-    doNotContact: charter.counterparties
-      .filter((c) => c.doNotContact)
-      .map((c) => c.match.entityId ?? c.match.emailDomain ?? c.match.phone ?? c.match.tag)
+    doNotContact: compileDoNotContact(charter),
+    knownCounterparties: charter.counterparties
+      .flatMap((c) => [c.match.entityId, c.match.emailDomain, c.match.phone, c.match.tag])
       .filter((key): key is string => key !== undefined),
 
     allowlists: AGENT_ALLOWLISTS,
@@ -49,6 +49,36 @@ export function compileCharter(charter: BusinessCharter): PolicyBundle {
     promptFragments: renderPromptFragments(charter),
     plainLanguage: renderPlainLanguage(charter),
   };
+}
+
+/**
+ * Sort do-not-contact entries by the key that identifies them.
+ *
+ * The previous version collapsed all four match keys into one string list and
+ * compared it against `facts.counterpartyId` alone. An entry matched by
+ * `emailDomain` therefore compiled successfully, appeared in the signed
+ * document, and matched nothing — the quietest possible failure for a rule
+ * whose entire purpose is to be absolute.
+ *
+ * A counterparty carrying several match keys contributes to each list: any one
+ * of them identifying the other side is enough to stop the message.
+ */
+function compileDoNotContact(charter: BusinessCharter): PolicyBundle['doNotContact'] {
+  const out = { entityIds: [] as string[], emailDomains: [] as string[], phones: [] as string[], tags: [] as string[] };
+
+  for (const c of charter.counterparties) {
+    if (!c.doNotContact) continue;
+    if (c.match.entityId !== undefined) out.entityIds.push(c.match.entityId);
+    // Normalised at compile time to match how `buildFacts` normalises the
+    // payload — a domain that differs only in case must still match.
+    if (c.match.emailDomain !== undefined) {
+      out.emailDomains.push(c.match.emailDomain.trim().toLowerCase().replace(/^@/, ''));
+    }
+    if (c.match.phone !== undefined) out.phones.push(c.match.phone.replace(/\D/g, ''));
+    if (c.match.tag !== undefined) out.tags.push(c.match.tag);
+  }
+
+  return out;
 }
 
 function compileRules(charter: BusinessCharter): CompiledRule[] {

@@ -61,10 +61,28 @@ describe('charter compilation', () => {
     expect(forbidden.every((r) => r.description.length > 0)).toBe(true);
   });
 
-  it('flattens doNotContact into a lookup the gate reads per call', () => {
+  it('sorts doNotContact by match key instead of flattening it', () => {
     const bundle = compileCharter(buildCharter());
-    expect(bundle.doNotContact).toContain('c_blocked');
-    expect(bundle.doNotContact).not.toContain('c_812');
+    expect(bundle.doNotContact.entityIds).toContain('c_blocked');
+    expect(bundle.doNotContact.entityIds).not.toContain('c_812');
+  });
+
+  it('compiles a domain block into the bucket the gate can actually match', () => {
+    // The flattened form put every match key into one list compared against
+    // `counterpartyId`, so this entry compiled and then matched nothing at all.
+    const bundle = compileCharter(
+      buildCharter({ doNotContactEmailDomain: 'Rival-Legal.CO.il' }),
+    );
+
+    expect(bundle.doNotContact.emailDomains).toEqual(['rival-legal.co.il']);
+    // Normalised at compile time, because the gate normalises the payload the
+    // same way — a block defeated by capitalisation is not a block.
+    expect(bundle.doNotContact.entityIds).not.toContain('rival-legal.co.il');
+  });
+
+  it('lists known counterparties so the risk layer need not trust the payload', () => {
+    const bundle = compileCharter(buildCharter());
+    expect(bundle.knownCounterparties).toContain('c_812');
   });
 
   it('renders plain language stating the daily exposure in one sentence', () => {

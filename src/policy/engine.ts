@@ -125,15 +125,13 @@ export async function evaluateToolCall(
   }
 
   // 6. Do-not-contact ------------------------------------------------------
-  if (facts.counterpartyId !== null && ctx.bundle.doNotContact.includes(facts.counterpartyId)) {
+  const blocked = matchDoNotContact(facts, ctx.bundle.doNotContact);
+  if (blocked !== null) {
     await recordIntent(facts, ctx, currentVersion, businessId, {
       kind: 'policy_denial',
-      reason: `${DENY_CODES.doNotContact}: ${facts.counterpartyId}`,
+      reason: `${DENY_CODES.doNotContact}: ${blocked}`,
     });
-    return deny(
-      DENY_CODES.doNotContact,
-      `${facts.counterpartyId} מסומן כ-doNotContact`,
-    );
+    return deny(DENY_CODES.doNotContact, `${blocked} מסומן כ-doNotContact`);
   }
 
   // 7. Autonomy ------------------------------------------------------------
@@ -218,7 +216,7 @@ export async function evaluateToolCall(
         risk,
         reason: `queued_for_approval:${approvalId} (intent seq ${intent.seq})`,
       },
-      { businessId },
+      { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
     );
 
     return {
@@ -234,6 +232,32 @@ export async function evaluateToolCall(
     effectiveAutonomy: effective,
     redactedInput: toolInput,
   };
+}
+
+/**
+ * Match a do-not-contact entry against every key that can identify the other
+ * side, and return the one that matched so the denial can name it.
+ *
+ * Four keys, checked independently: an entry is a block if *any* of them
+ * matches. The email match is on the domain, which is the point of the key —
+ * "never contact anyone at this company" is a sentence an owner writes.
+ */
+function matchDoNotContact(
+  facts: ActionFacts,
+  list: PolicyBundle['doNotContact'],
+): string | null {
+  if (facts.counterpartyId !== null && list.entityIds.includes(facts.counterpartyId)) {
+    return facts.counterpartyId;
+  }
+  if (facts.counterpartyEmail !== null) {
+    const domain = facts.counterpartyEmail.split('@')[1];
+    if (domain !== undefined && list.emailDomains.includes(domain)) return domain;
+  }
+  if (facts.counterpartyPhone !== null && list.phones.includes(facts.counterpartyPhone)) {
+    return facts.counterpartyPhone;
+  }
+  const tag = facts.counterpartyTags.find((t) => list.tags.includes(t));
+  return tag ?? null;
 }
 
 /**
@@ -270,6 +294,16 @@ async function recordIntent(
     risk?: RiskAssessment;
   },
 ) {
+  // Join the caller's transaction when there is one. `checkBudget` and
+  // `enqueueApproval` already used `ctx.db`; the audit writes did not, so a
+  // caller-supplied transaction produced an approval row and an audit entry
+  // citing it on two different connections — the approval could commit while
+  // its own justification rolled back.
+  //
+  // Passed only when the caller actually supplied a handle. The audit chain
+  // serialises on `pg_advisory_xact_lock`, which is transaction-scoped: handing
+  // it the bare pool would take and drop the lock inside one statement and
+  // silently remove the serialisation that keeps the chain from forking.
   return appendAudit(
     {
       actor: ctx.agent,
@@ -283,7 +317,7 @@ async function recordIntent(
       risk: entry.risk ?? null,
       reason: entry.reason,
     },
-    { businessId },
+    { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
   );
 }
 

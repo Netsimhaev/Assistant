@@ -53,6 +53,8 @@ export interface CharterOverrides {
   dailyCeilingMinor?: number;
   perActionClassCeilingMinor?: Partial<Record<ActionClass, number>>;
   doNotContactEntityId?: string;
+  /** Adds a third counterparty blocked by email domain rather than by id. */
+  doNotContactEmailDomain?: string;
 }
 
 /** A realistic small-business charter: an Israeli firm working Sun–Thu. */
@@ -145,6 +147,20 @@ export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter 
         doNotContact: true,
         notes: 'ביקש להפסיק כל קשר.',
       },
+      // Only present when a test asks for it, so the default charter keeps the
+      // shape every other test was written against.
+      ...(overrides.doNotContactEmailDomain === undefined
+        ? []
+        : [
+            {
+              match: { emailDomain: overrides.doNotContactEmailDomain },
+              label: 'חברה חסומה',
+              trust: 'unknown_external' as const,
+              autonomyOverrides: {},
+              doNotContact: true,
+              notes: 'עורכי דין של הצד השני — כל פנייה עוברת דרך הבוס.',
+            },
+          ]),
     ],
 
     money: {

@@ -55,7 +55,27 @@ export async function checkBudget(
   ceilings: CompiledCeilings,
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<BudgetVerdict> {
-  if (facts.actionClass === null || facts.amountMinor === 0) {
+  if (facts.actionClass === null) {
+    return { permitted: true };
+  }
+
+  // The discount ceiling is checked before the zero-amount short-circuit and
+  // not after it. A discount is a percentage, and the tool call that grants one
+  // carries no `amountMinor` at all — so an early return on `amountMinor === 0`
+  // skipped this check entirely and let a 90% discount through a 10% cap.
+  if (
+    facts.actionClass === 'discount.grant' &&
+    facts.discountPercent > ceilings.maxDiscountPercent
+  ) {
+    return {
+      permitted: false,
+      code: 'budget_exceeded:discount',
+      reason:
+        `discounts are capped at ${ceilings.maxDiscountPercent}%; this one is ${facts.discountPercent}%`,
+    };
+  }
+
+  if (facts.amountMinor === 0) {
     return { permitted: true };
   }
 
@@ -83,16 +103,27 @@ export async function checkBudget(
     };
   }
 
-  if (
-    facts.actionClass === 'discount.grant' &&
-    facts.discountPercent > ceilings.maxDiscountPercent
-  ) {
-    return {
-      permitted: false,
-      code: 'budget_exceeded:discount',
-      reason:
-        `discounts are capped at ${ceilings.maxDiscountPercent}%; this one is ${facts.discountPercent}%`,
-    };
+  // Per-supplier auto-order ceiling. The charter compiles one of these for every
+  // approved supplier, and until now nothing compared it to anything: the owner
+  // could sign "auto-order up to ₪500 from this supplier" and the number was
+  // never read.
+  //
+  // Only *approved* suppliers are capped here. A supplier absent from the list
+  // is not denied at this step — that is not a budget question, and the risk
+  // layer already treats an unrecognised counterparty as sensitive. Denying
+  // here would be terminal and would silently forbid every first-time purchase.
+  if (facts.supplierId !== null) {
+    const supplierCeiling = ceilings.approvedSupplierCeilingMinor[facts.supplierId];
+    if (supplierCeiling !== undefined && facts.amountMinor > supplierCeiling) {
+      return {
+        permitted: false,
+        code: `budget_exceeded:supplier:${facts.supplierId}`,
+        reason:
+          `auto-ordering from ${facts.supplierId} is capped at ` +
+          `${formatMinor(supplierCeiling, ceilings.currency)}; ` +
+          `this one is ${formatMinor(facts.amountMinor, ceilings.currency)}`,
+      };
+    }
   }
 
   const spent = await spentInWindows(businessId, db);

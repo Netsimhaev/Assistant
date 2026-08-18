@@ -149,17 +149,30 @@ export function isOutbound(toolName: string): boolean {
  * thread to reply to — a materially different risk profile, since a first
  * contact with an unknown party is exactly what the sensitive band is for.
  */
+/**
+ * Does the payload actually reference an existing thread?
+ *
+ * Tested positively — a non-empty string — rather than by excluding `undefined`.
+ * The excluding form treated `inReplyTo: null` and `inReplyTo: ""` as a real
+ * thread and downgraded `email.initiate` (approve_required) to `email.reply`
+ * (auto_notify), which is precisely the wrong direction to be wrong in. Any
+ * shape we do not recognise now yields the *stricter* class.
+ */
+function hasThreadRef(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 export function refineActionClass(
   base: ActionClass,
   input: Record<string, unknown>,
 ): ActionClass {
   switch (base) {
     case 'email.reply':
-      return input['inReplyTo'] === undefined ? 'email.initiate' : 'email.reply';
+      return hasThreadRef(input['inReplyTo']) ? 'email.reply' : 'email.initiate';
     case 'whatsapp.reply':
-      return input['conversationId'] === undefined
-        ? 'whatsapp.initiate'
-        : 'whatsapp.reply';
+      return hasThreadRef(input['conversationId'])
+        ? 'whatsapp.reply'
+        : 'whatsapp.initiate';
     case 'calendar.create': {
       const op = input['operation'];
       if (op === 'move') return 'calendar.move';

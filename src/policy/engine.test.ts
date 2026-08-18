@@ -2,11 +2,12 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
-import { installCharter } from '../charter/store.js';
+import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { queryAudit, verifyChain } from '../audit/log.js';
 import { decide, getApproval, pendingApprovals } from '../governance/approvals.js';
 import { release, trip } from '../governance/killswitch.js';
 import { evaluateToolCall, type GateContext } from './engine.js';
+import { refineActionClass } from './classify.js';
 import type { PolicyBundle } from '../domain/policy.js';
 
 const BUSINESS = 'test-business';
@@ -409,5 +410,175 @@ describe('audit chain integrity', () => {
         BUSINESS,
       ]),
     ).rejects.toThrow(/append-only/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regressions. Every test below fails against the code as it stood before the
+// review: each one describes a gate step that compiled, ran, and decided
+// nothing.
+
+describe('regressions found in review', () => {
+  it('holds the discount ceiling on a call that carries no amount', async () => {
+    const bundle = await install();
+
+    // A discount is a percentage; the tool call granting one has no
+    // `amountMinor`, so `readAmountMinor` returns 0. The budget gate returned
+    // early on exactly that and never reached the discount comparison — a 90%
+    // discount passed a signed 10% cap with outcome `allow`.
+    const decision = await evaluateToolCall(
+      'discount.grant',
+      { counterpartyId: 'c_812', discountPercent: 90 },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('budget_exceeded:discount');
+  });
+
+  it('enforces the per-supplier auto-order ceiling the owner signed', async () => {
+    const bundle = await install();
+
+    // supplier_a is approved up to ₪2,500 in the fixture. Nothing compared
+    // that number to anything before this.
+    const decision = await evaluateToolCall(
+      'browser.submit_order',
+      { supplierId: 'supplier_a', amountMinor: 260_000 },
+      ctx(bundle, { agent: 'ops.web' }),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('budget_exceeded:supplier:supplier_a');
+  });
+
+  it('treats an explicit null thread id as a first contact, not a reply', () => {
+    // Asserted on the classifier directly. Going through the gate does not
+    // isolate this: an unresolvable recipient makes the risk layer escalate on
+    // its own, so the call queues for approval either way and the test passes
+    // against the bug — which is how this one nearly shipped as a test that
+    // guarded nothing.
+    expect(refineActionClass('email.reply', { inReplyTo: null })).toBe('email.initiate');
+    expect(refineActionClass('email.reply', { inReplyTo: '' })).toBe('email.initiate');
+    expect(refineActionClass('email.reply', { inReplyTo: 't-1' })).toBe('email.reply');
+    expect(refineActionClass('whatsapp.reply', { conversationId: null })).toBe(
+      'whatsapp.initiate',
+    );
+  });
+
+  it('does not let a null thread id buy auto_notify at the gate', async () => {
+    const bundle = await install();
+
+    // With a counterparty the charter knows, risk stays routine — so the only
+    // thing standing between this call and `allow` is the action class. Under
+    // the old classifier it was `email.reply` (auto_notify) and the message
+    // went out; it is `email.initiate` (approve_required) now.
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'vip@example.com', counterpartyId: 'c_812', inReplyTo: null, body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('queue_approval');
+  });
+
+  it('blocks a counterparty marked do-not-contact by email domain', async () => {
+    const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
+
+    // The compiled entry used to be compared against `counterpartyId` alone,
+    // so a domain block was a rule that existed in the signed document and
+    // stopped nothing.
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'Adv@Rival-Legal.co.il', inReplyTo: 'thread-1', body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('do_not_contact');
+
+    const denials = await queryAudit(
+      { businessId: BUSINESS, kind: 'policy_denial' },
+      getPool(),
+    );
+    expect(denials.some((e) => e.reason.includes('rival-legal.co.il'))).toBe(true);
+  });
+
+  it('does not score an unresolvable counterparty as one we know', async () => {
+    const bundle = await install();
+
+    // `buildFacts` falls back to the payload's `entityId`, so any outbound
+    // payload carrying that field scored as `one_known` (25) instead of
+    // `one_unknown` (55) and dropped out of the sensitive band.
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'x@example.com', entityId: 'not_in_the_charter', inReplyTo: 't-9' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('queue_approval');
+  });
+
+  it('refuses to decide an approval whose fuse already burned out', async () => {
+    const bundle = await install();
+
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'new@example.com', body: 'פנייה ראשונה' },
+      ctx(bundle),
+    );
+    expect(decision.outcome).toBe('queue_approval');
+    if (decision.outcome !== 'queue_approval') throw new Error('unreachable');
+
+    // Push the fuse into the past. `expireOverdue` has no caller yet, so the
+    // row stays `pending` — which is exactly the state the bug lived in.
+    await getPool().query(
+      `UPDATE approval_requests SET expires_at = now() - interval '3 days'
+        WHERE approval_id = $1`,
+      [decision.approvalId],
+    );
+
+    await expect(
+      decide(decision.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }, {
+        businessId: BUSINESS,
+      }),
+    ).rejects.toThrow(/expired/);
+
+    const after = await getApproval(decision.approvalId, { businessId: BUSINESS });
+    expect(after?.state).toBe('pending');
+  });
+
+  it('refuses to record a release of a kill switch that was never tripped', async () => {
+    await install();
+
+    // The UPDATE matched no row and the audit entry was written anyway, so the
+    // permanent trail gained a RELEASED event for something that never stopped.
+    await expect(
+      release('all', 'p_boss', 'לא היה מה לשחרר', { businessId: BUSINESS }),
+    ).rejects.toThrow(/not tripped/);
+
+    const entries = await queryAudit(
+      { businessId: BUSINESS, kind: 'kill_switch' },
+      getPool(),
+    );
+    expect(entries).toEqual([]);
+  });
+
+  it('keeps a charter scoped to its own business', async () => {
+    const bundle = await install();
+    // Same version string, different business — a global primary key on
+    // `charter_version` rejected this outright, and the active-charter join
+    // could hand one business the other's rules.
+    await installCharter(buildCharter({ dailyCeilingMinor: 50 }), {
+      businessId: 'other-business',
+    });
+
+    const mine = await loadActiveCharter(BUSINESS, getPool());
+    expect(mine?.bundle.ceilings.dailyMinor).toBe(bundle.ceilings.dailyMinor);
+
+    const theirs = await loadActiveCharter('other-business', getPool());
+    expect(theirs?.bundle.ceilings.dailyMinor).toBe(50);
   });
 });

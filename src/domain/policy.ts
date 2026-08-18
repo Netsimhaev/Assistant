@@ -18,6 +18,9 @@ export const ActionFacts = z.object({
   amountMinor: z.number().int().nonnegative(),
   /** Resolved entity id of the other side, when there is one. */
   counterpartyId: z.string().nullable(),
+  /** Address the payload would reach, normalised, for do-not-contact matching. */
+  counterpartyEmail: z.string().nullable(),
+  counterpartyPhone: z.string().nullable(),
   /** Tags carried by the counterparty, used by narrowed forbidden rules. */
   counterpartyTags: z.array(z.string()),
   /** Trust of the least-trusted link in this job's causal chain. */
@@ -90,7 +93,31 @@ export const PolicyBundle = z.object({
     z.string(),
     z.partialRecord(ActionClass, AutonomyLevel),
   ),
-  doNotContact: z.array(z.string()),
+  /**
+   * Structured rather than a flat string list.
+   *
+   * The flat list was compared only against `facts.counterpartyId`, so a
+   * counterparty matched by `emailDomain`, `phone` or `tag` compiled into an
+   * entry that could never equal anything — the owner marked a domain
+   * do-not-contact and the gate silently kept mailing it. Each key is now
+   * matched against the fact that can actually carry it.
+   */
+  doNotContact: z.object({
+    entityIds: z.array(z.string()),
+    emailDomains: z.array(z.string()),
+    phones: z.array(z.string()),
+    tags: z.array(z.string()),
+  }),
+
+  /**
+   * Every counterparty the charter names, by whichever key identifies it.
+   *
+   * The risk layer treats an outbound message to a resolvable counterparty as
+   * lower-risk than a first contact. That check has to consult the charter: if
+   * it trusts the payload's own claim to name a counterparty, an agent working
+   * from injected content can quiet its own risk score by inventing one.
+   */
+  knownCounterparties: z.array(z.string()),
 
   allowlists: z.record(AgentId, z.array(z.string())),
   denylists: z.record(AgentId, z.array(z.string())),

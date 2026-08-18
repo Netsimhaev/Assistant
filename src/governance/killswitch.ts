@@ -101,12 +101,20 @@ export async function release(
 ): Promise<void> {
   const businessId = options.businessId ?? config.businessId;
 
-  await getPool().query(
+  const { rowCount } = await getPool().query(
     `UPDATE kill_switch
         SET tripped = false, released_by = $3, released_at = now(), updated_at = now()
-      WHERE business_id = $1 AND scope = $2`,
+      WHERE business_id = $1 AND scope = $2 AND tripped = true`,
     [businessId, scope, by],
   );
+
+  // Nothing was tripped, so nothing was released. Writing the audit entry
+  // anyway put a permanent, hash-chained "RELEASED" record in the trail for an
+  // event that never happened — and the trail is the only thing anyone has to
+  // reconstruct who stopped the system and when.
+  if ((rowCount ?? 0) === 0) {
+    throw new Error(`kill switch scope "${scope}" is not tripped; nothing to release`);
+  }
 
   await appendAudit(
     {

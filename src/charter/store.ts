@@ -83,9 +83,14 @@ export async function loadActiveCharter(
   db: Queryable = getPool(),
 ): Promise<ActiveCharter | null> {
   const { rows } = await db.query<CharterRow>(
+    // The join carries business_id as well as the version. Without it, two
+    // businesses that both call their first charter "v1" resolve to whichever
+    // row Postgres happened to return — a cross-business policy leak.
     `SELECT v.charter, v.policy_bundle
        FROM charter_active a
-       JOIN charter_versions v ON v.charter_version = a.charter_version
+       JOIN charter_versions v
+         ON v.charter_version = a.charter_version
+        AND v.business_id     = a.business_id
       WHERE a.business_id = $1`,
     [businessId],
   );

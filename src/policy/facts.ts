@@ -33,6 +33,8 @@ export function buildFacts(
     actionClass,
     amountMinor: readAmountMinor(input),
     counterpartyId: readString(input, 'counterpartyId') ?? readString(input, 'entityId'),
+    counterpartyEmail: readEmail(input),
+    counterpartyPhone: readPhone(input),
     counterpartyTags: ctx.counterpartyTags ?? [],
     provenance: ctx.provenance,
     chainDepth: ctx.chainDepth,
@@ -68,6 +70,32 @@ function readAmountMinor(input: Record<string, unknown>): number {
 function readString(input: Record<string, unknown>, key: string): string | null {
   const value = input[key];
   return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/**
+ * The address an outbound message would actually reach.
+ *
+ * Lower-cased, because a do-not-contact entry must not be defeated by casing.
+ * Only the first recipient is read: Phase 0 serialises one outbound message per
+ * counterparty thread, so a multi-recipient payload is not a shape the gate is
+ * built to reason about — and quietly checking one of several addresses would
+ * be worse than not checking at all. See the note in docs/04-charter.md.
+ */
+function readEmail(input: Record<string, unknown>): string | null {
+  const raw = readString(input, 'to') ?? readString(input, 'recipient') ?? readString(input, 'email');
+  return raw === null ? null : raw.trim().toLowerCase();
+}
+
+/**
+ * Digits only, so `+972-50-123-4567` and `0501234567` compare equal. The leading
+ * country code is not normalised away — that needs a locale the charter owns.
+ */
+function readPhone(input: Record<string, unknown>): string | null {
+  const raw =
+    readString(input, 'phone') ?? readString(input, 'toNumber') ?? readString(input, 'msisdn');
+  if (raw === null) return null;
+  const digits = raw.replace(/\D/g, '');
+  return digits.length > 0 ? digits : null;
 }
 
 function readNumber(input: Record<string, unknown>, key: string): number | null {

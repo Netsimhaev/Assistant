@@ -13,6 +13,10 @@ import {
   directlyMappedActionClasses,
 } from '../policy/classify.js';
 import { ActionClass } from '../domain/action.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { compileCharter } from './compile.js';
+import { buildCharter } from '../test/fixtures.js';
 import type { AgentId } from '../domain/audit.js';
 
 const AGENTS = Object.keys(AGENT_ALLOWLISTS) as AgentId[];
@@ -104,5 +108,45 @@ describe('capability table invariants', () => {
     for (const agent of AGENTS) {
       expect(COLLABORATION_GRAPH[agent], agent).not.toContain(agent);
     }
+  });
+});
+
+/**
+ * Four of the defects found in review were the same defect: a charter field
+ * that compiled into the bundle and was then read by nobody. The owner signs a
+ * sentence, the compiler emits a number, and no gate step ever compares it.
+ *
+ * Type-checking cannot catch this — the field exists and is well-typed. So the
+ * invariant is asserted against the source of the modules that make decisions:
+ * every ceiling the compiler produces must be mentioned somewhere a decision is
+ * made. A crude check, deliberately: it is looking for total absence, which is
+ * what "compiled but unenforced" actually looks like.
+ */
+describe('compiled policy has a reader', () => {
+  const GATE_SOURCES = ['../policy/budget.ts', '../policy/engine.ts', '../policy/risk.ts'].map(
+    (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'),
+  );
+
+  it('every compiled ceiling is named somewhere in the gate', () => {
+    const ceilings = compileCharter(buildCharter()).ceilings;
+    const unread = Object.keys(ceilings).filter(
+      (field) => !GATE_SOURCES.some((src) => src.includes(field)),
+    );
+
+    // `approvedSupplierCeilingMinor` sat here unread: the owner could sign
+    // "auto-order up to X from this supplier" and nothing compared X to
+    // anything.
+    expect(unread).toEqual([]);
+  });
+
+  it('every do-not-contact match key is read by the gate', () => {
+    const buckets = Object.keys(compileCharter(buildCharter()).doNotContact);
+    const engine = GATE_SOURCES[1] ?? '';
+    const unread = buckets.filter((bucket) => !engine.includes(bucket));
+
+    // Three of these four used to compile into a flat list compared against
+    // `counterpartyId` alone, so a block by domain, phone or tag matched
+    // nothing at all while appearing in the signed document.
+    expect(unread).toEqual([]);
   });
 });

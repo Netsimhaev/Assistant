@@ -199,6 +199,15 @@ export async function decide(
       `approval ${approvalId} is already ${existing.state}; refusing to decide it twice`,
     );
   }
+  // A fuse that burned out is not a decision that can still be made. `state`
+  // stays 'pending' until the scheduler sweeps it, and `expireOverdue` has no
+  // caller yet — so without this check an approval three days past its expiry
+  // was still approvable, and the TTL was decoration.
+  if (Date.parse(existing.expiresAt) <= Date.now()) {
+    throw new Error(
+      `approval ${approvalId} expired at ${existing.expiresAt}; it must be re-queued, not decided`,
+    );
+  }
 
   const edited = decision.editedInput !== undefined;
   const state: ApprovalState =
@@ -215,7 +224,8 @@ export async function decide(
         SET state = $3, decided_by = $4, decided_at = now(),
             decided_channel = $5, decision_note = $6,
             edited_input = $7, input_hash_at_decision = $8
-      WHERE approval_id = $1 AND business_id = $2 AND state = 'pending'
+      WHERE approval_id = $1 AND business_id = $2
+        AND state = 'pending' AND expires_at > now()
       RETURNING *`,
     [
       approvalId,
@@ -231,7 +241,9 @@ export async function decide(
 
   const row = rows[0];
   if (!row) {
-    throw new Error(`approval ${approvalId} was decided concurrently`);
+    // The predicate above is the authority, not the read that preceded it: the
+    // scheduler may have expired this row between the two statements.
+    throw new Error(`approval ${approvalId} was decided or expired concurrently`);
   }
   return toRequest(row);
 }
