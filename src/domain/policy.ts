@@ -110,6 +110,25 @@ export const PolicyBundle = z.object({
   }),
 
   /**
+   * Hours during which nothing may be sent, in the business's own timezone.
+   *
+   * The owner signs a sentence promising this. Until the gate read it, the
+   * sentence was the only place it existed.
+   */
+  quietHours: z
+    .object({ from: z.string(), to: z.string(), timezone: z.string() })
+    .nullable(),
+
+  /**
+   * Patterns stripped from a payload before it leaves the instance.
+   *
+   * Compiled from `charter.data.redactBeforeSending`, which had no caller: the
+   * gate returned the raw input as `redactedInput`, so the field named a
+   * protection that was never applied.
+   */
+  redactPatterns: z.array(z.string()),
+
+  /**
    * Every counterparty the charter names, by whichever key identifies it.
    *
    * The risk layer treats an outbound message to a resolvable counterparty as
@@ -165,5 +184,6 @@ export const DENY_CODES = {
   budgetExceeded: 'budget_exceeded',
   riskBlocked: 'risk_blocked',
   doNotContact: 'do_not_contact',
+  quietHours: 'quiet_hours',
   notAllowlisted: 'tool_not_allowlisted',
 } as const;

@@ -16,6 +16,7 @@ import { checkBudget } from './budget.js';
 import { buildFacts, type FactsContext } from './facts.js';
 import { isOutbound, isKnownTool } from './classify.js';
 import { assessRisk, type NormsLookup } from './risk.js';
+import { inQuietHours, redactPayload } from './redact.js';
 
 export interface GateContext extends FactsContext {
   agent: AgentId;
@@ -29,6 +30,8 @@ export interface GateContext extends FactsContext {
   businessId?: string;
   db?: Queryable;
   norms?: NormsLookup;
+  /** Injectable clock. The quiet-hours check is the only time-dependent step. */
+  now?: Date;
 }
 
 /**
@@ -44,9 +47,10 @@ export interface GateContext extends FactsContext {
  *   4. read-only        — nothing side-effecting, short-circuit to allow
  *   5. hard prohibition — charter `forbidden`, not overridable by anyone
  *   6. do-not-contact   — an absolute per-counterparty block
- *   7. autonomy         — the combined ceiling from five independent sources
- *   8. budget           — money ceilings, denied rather than escalated
- *   9. risk             — score, then band, then allow or queue for approval
+ *   7. quiet hours      — outbound only; the action is early, not questionable
+ *   8. autonomy         — the combined ceiling from five independent sources
+ *   9. budget           — money ceilings, denied rather than escalated
+ *  10. risk             — score, then band, then allow or queue for approval
  *
  * Intent is written to the audit log *before* the call is permitted, so a crash
  * between decision and execution is visible rather than silent.
@@ -134,7 +138,26 @@ export async function evaluateToolCall(
     return deny(DENY_CODES.doNotContact, `${blocked} מסומן כ-doNotContact`);
   }
 
-  // 7. Autonomy ------------------------------------------------------------
+  // 7. Quiet hours ---------------------------------------------------------
+  // Only outbound actions. Reading, drafting and writing to our own systems at
+  // 03:00 is fine; it is the message arriving on someone's phone that the owner
+  // promised would not happen.
+  const quiet = ctx.bundle.quietHours;
+  if (outbound && quiet !== null && inQuietHours(quiet, ctx.now ?? new Date())) {
+    await recordIntent(facts, ctx, currentVersion, businessId, {
+      kind: 'policy_denial',
+      reason: `${DENY_CODES.quietHours}: ${quiet.from}-${quiet.to} ${quiet.timezone}`,
+    });
+    // A denial and not a queued approval: the action is not questionable, it is
+    // merely early. The orchestrator reschedules it past the window rather than
+    // asking anyone to approve it (docs/02-orchestrator.md, followup phase).
+    return deny(
+      DENY_CODES.quietHours,
+      `שעות שקט ${quiet.from}–${quiet.to} — ההודעה תישלח אחרי ${quiet.to}`,
+    );
+  }
+
+  // 8. Autonomy ------------------------------------------------------------
   const effective = effectiveAutonomy(facts, ctx);
 
   if (effective === 'forbidden') {
@@ -159,7 +182,7 @@ export async function evaluateToolCall(
     );
   }
 
-  // 8. Budget --------------------------------------------------------------
+  // 9. Budget --------------------------------------------------------------
   const budget = await checkBudget(facts, ctx.bundle.ceilings, { businessId, db });
   if (!budget.permitted) {
     await recordIntent(facts, ctx, currentVersion, businessId, {
@@ -169,7 +192,7 @@ export async function evaluateToolCall(
     return deny(budget.code, budget.reason);
   }
 
-  // 9. Risk ----------------------------------------------------------------
+  // 10. Risk ----------------------------------------------------------------
   const risk = await assessRisk(facts, ctx.bundle, ctx.norms ? { norms: ctx.norms } : {});
 
   // Intent to act is recorded here, before any decision to permit — so an
@@ -230,7 +253,9 @@ export async function evaluateToolCall(
   return {
     outcome: 'allow',
     effectiveAutonomy: effective,
-    redactedInput: toolInput,
+    // Redaction happens here and not in the agent, because the agent is the
+    // component we are least able to trust to have done it.
+    redactedInput: outbound ? redactPayload(toolInput, ctx.bundle) : toolInput,
   };
 }
 

@@ -37,6 +37,11 @@ export function compileCharter(charter: BusinessCharter): PolicyBundle {
     autonomyBase: charter.autonomy.base,
     provenanceCeiling: charter.autonomy.provenanceCeiling,
     counterpartyAutonomy: compileCounterpartyAutonomy(charter),
+    quietHours:
+      charter.operations.quietHours === undefined
+        ? null
+        : { ...charter.operations.quietHours, timezone: charter.identity.timezone },
+    redactPatterns: charter.data.redactBeforeSending,
     doNotContact: compileDoNotContact(charter),
     knownCounterparties: charter.counterparties
       .flatMap((c) => [c.match.entityId, c.match.emailDomain, c.match.phone, c.match.tag])
