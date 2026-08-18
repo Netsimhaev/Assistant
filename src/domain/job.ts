@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { AgentId } from './audit.js';
 
 /**
  * The loop as durable state.
@@ -56,11 +57,13 @@ export const LEGAL_TRANSITIONS: Record<JobPhase, readonly JobPhase[]> = {
   halted: [],
 };
 
+// `z.string()` as the last union member subsumed the three literals, so the
+// schema advertised a constraint it did not have. Closed over AgentId instead.
 export const JobActor = z.union([
   z.literal('orchestrator'),
   z.literal('human'),
   z.literal('system'),
-  z.string(),
+  AgentId,
 ]);
 export type JobActor = z.infer<typeof JobActor>;
 

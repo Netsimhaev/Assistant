@@ -29,6 +29,12 @@ const TOOL_ACTION_CLASS: Record<string, ActionClass> = {
   'contract.sign': 'contract.sign',
   'data.export': 'data.export',
   'media.publish': 'media.publish',
+  // Was read-only. A tool that writes to the filesystem is not a read, and
+  // "read-only" here means "skips the gate entirely and leaves no audit row" —
+  // so a write landing in `.git/hooks/pre-commit` or a shell rc file was
+  // unrecorded code execution. It is classified now, which costs an agent
+  // nothing it should have had.
+  'file.write': 'artifact.write',
   'doc.deliver': 'doc.deliver',
   'memory.write_entity': 'memory.write_longterm',
   'memory.write_chunk': 'memory.write_longterm',
@@ -69,7 +75,6 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'norms.query',
   'artifact.read',
   'assert.evaluate',
-  'file.write',
   'recipe.load',
   'recipe.save',
   'browser.navigate',
@@ -190,10 +195,15 @@ export function refineActionClass(
       return typeof amount === 'number' && amount > 0 ? 'purchase.place' : 'browser.interact';
     }
     case 'calendar.create': {
+      // An unrecognised operation yields the *strictest* class, matching the
+      // rule stated for thread references above. The previous order fell
+      // through to `calendar.create` — reversibility 20 instead of 60 — so
+      // `operation: 'Cancel'` or `['cancel']` bought a gentler class than the
+      // action deserved.
       const op = input['operation'];
+      if (op === undefined || op === null || op === 'create') return 'calendar.create';
       if (op === 'move') return 'calendar.move';
-      if (op === 'cancel') return 'calendar.cancel';
-      return 'calendar.create';
+      return 'calendar.cancel';
     }
     default:
       return base;

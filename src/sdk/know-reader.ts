@@ -76,6 +76,11 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
     bundle: request.bundle,
     provenance: request.provenance ?? 'unknown_external',
     documentRoot: request.documentRoot,
+    // No resolver yet — stated rather than defaulted, so the dead tag rules
+    // are visible here instead of hidden behind an optional field.
+    counterpartyTags: [],
+    // No ramp yet. draft_only is the value the risk engine's comment assumes.
+    rampLevel: 'draft_only',
     onDecision: (event) => {
       if (event.decision === 'deny') denials.push(event.code);
     },
@@ -102,6 +107,20 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
     // A second boundary under the hook's path check, so a filesystem read is
     // scoped by the SDK as well as by us.
     cwd: request.documentRoot,
+    // Load no settings from disk.
+    //
+    // Omitting this loads every source "matching CLI defaults" — this repo's
+    // .claude/settings.json (which registers a plugin and a Stop hook that
+    // shells out) and the operator's own ~/.claude/settings.json with their
+    // MCP connectors and permission rules. Handing all of that to the one
+    // agent defined by having no authority, fed by untrusted documents, is the
+    // opposite of a quarantine.
+    settingSources: [],
+    // Name what the subprocess gets rather than inheriting process.env, which
+    // config.ts has just populated from .env with the database credentials.
+    env: process.env['PATH'] === undefined ? {} : { PATH: process.env['PATH'] },
+    // An unbounded read loop is a cost incident waiting for a long document.
+    maxTurns: 12,
     // The hook is the authority; `permissionMode` only decides what happens to
     // calls the hook did not already settle.
     permissionMode: 'default',

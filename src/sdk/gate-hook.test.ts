@@ -13,6 +13,8 @@ import { knowReaderDefinition } from './know-reader.js';
 
 const BUSINESS = 'test-business';
 const DOCS = join(tmpdir(), 'assistant-docs');
+/** 12:00 Asia/Jerusalem — outside the fixture's quiet hours. */
+const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 /**
  * Exercises the adapter with the shapes the SDK actually delivers, typed
@@ -44,6 +46,9 @@ async function decisionFor(
     businessId: BUSINESS,
     jobId: 'J-SDK',
     documentRoot: DOCS,
+    counterpartyTags: [],
+    rampLevel: 'auto',
+    now: NOON,
   });
   const out = await hook(preToolUse(toolName, toolInput));
   // HookJSONOutput is a union: the async variant carries no hookSpecificOutput
@@ -192,6 +197,9 @@ describe('the gate hook', () => {
       provenance: 'boss',
       businessId: BUSINESS,
       documentRoot: DOCS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
     });
     const out = await hook(
       preToolUse('mcp__assistant__mail.send', {
@@ -262,6 +270,9 @@ describe('decision reporting', () => {
       provenance: 'boss',
       businessId: BUSINESS,
       documentRoot: DOCS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
       onDecision: (event) => seen.push(event),
     });
 

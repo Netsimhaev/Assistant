@@ -82,7 +82,10 @@ describe('charter compilation', () => {
 
   it('lists known counterparties so the risk layer need not trust the payload', () => {
     const bundle = compileCharter(buildCharter());
-    expect(bundle.knownCounterparties).toContain('c_812');
+    expect(bundle.knownCounterparties.entityIds).toContain('c_812');
+    // Split by key, so an id the payload supplies cannot match a *tag* and buy
+    // a resolved-counterparty score it has not earned.
+    expect(bundle.knownCounterparties.tags).not.toContain('c_812');
   });
 
   it('renders plain language stating the daily exposure in one sentence', () => {

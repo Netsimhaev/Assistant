@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
+import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
 import type { AgentId } from '../domain/audit.js';
 import type { ActionFacts, PolicyBundle, PolicyDecision } from '../domain/policy.js';
 import { DENY_CODES } from '../domain/policy.js';
@@ -105,7 +105,26 @@ export async function evaluateToolCall(
   // 4. Read-only short-circuit --------------------------------------------
   const facts = buildFacts(toolName, toolInput, ctx);
   if (facts.actionClass === null) {
-    return { outcome: 'allow', effectiveAutonomy: 'auto', redactedInput: toolInput };
+    // Three tools are in READ_ONLY_TOOLS *and* OUTBOUND_TOOLS —
+    // `browser.navigate`, `media.generate_image`, `media.generate_video`. They
+    // carry no action class, so the class-based steps below cannot judge them,
+    // but they do leave the instance: skipping quiet hours and redaction for
+    // them made a URL an unredacted egress channel.
+    if (!outbound) {
+      return { outcome: 'allow', effectiveAutonomy: 'auto', redactedInput: toolInput };
+    }
+    const window = ctx.bundle.quietHours;
+    if (window !== null && inQuietHours(window, ctx.now ?? new Date())) {
+      return deny(
+        DENY_CODES.quietHours,
+        `שעות שקט ${window.from}–${window.to} — הפעולה תתבצע אחרי ${window.to}`,
+      );
+    }
+    return {
+      outcome: 'allow',
+      effectiveAutonomy: 'auto',
+      redactedInput: redactPayload(toolInput, ctx.bundle),
+    };
   }
 
   // 5. Hard prohibitions ---------------------------------------------------
@@ -183,6 +202,20 @@ export async function evaluateToolCall(
   }
 
   // 9. Budget --------------------------------------------------------------
+  // An amount we could not read is not an amount of zero. Without this, a
+  // purchase whose total arrived as `total` or `order.amountMinor` skipped
+  // every ceiling and scored zero on the money dimension.
+  if (AMOUNT_REQUIRED_CLASSES.has(facts.actionClass) && !facts.amountDeclared) {
+    await recordIntent(facts, ctx, currentVersion, businessId, {
+      kind: 'policy_denial',
+      reason: `${DENY_CODES.amountUnreadable}: ${facts.actionClass}`,
+    });
+    return deny(
+      DENY_CODES.amountUnreadable,
+      `${facts.actionClass} חייב לשאת amountMinor — בלעדיו אי אפשר לאכוף תקרה`,
+    );
+  }
+
   const budget = await checkBudget(facts, ctx.bundle.ceilings, { businessId, db });
   if (!budget.permitted) {
     await recordIntent(facts, ctx, currentVersion, businessId, {
@@ -274,13 +307,12 @@ function matchDoNotContact(
   if (facts.counterpartyId !== null && list.entityIds.includes(facts.counterpartyId)) {
     return facts.counterpartyId;
   }
-  if (facts.counterpartyEmail !== null) {
-    const domain = facts.counterpartyEmail.split('@')[1];
+  for (const email of facts.counterpartyEmails) {
+    const domain = email.split('@')[1];
     if (domain !== undefined && list.emailDomains.includes(domain)) return domain;
   }
-  if (facts.counterpartyPhone !== null && list.phones.includes(facts.counterpartyPhone)) {
-    return facts.counterpartyPhone;
-  }
+  const phone = facts.counterpartyPhones.find((p) => list.phones.includes(p));
+  if (phone !== undefined) return phone;
   const tag = facts.counterpartyTags.find((t) => list.tags.includes(t));
   return tag ?? null;
 }
@@ -298,8 +330,23 @@ function effectiveAutonomy(facts: ActionFacts, ctx: GateContext): AutonomyLevel 
     ctx.bundle.provenanceCeiling[facts.provenance],
   ];
 
-  if (facts.counterpartyId !== null) {
-    const override = ctx.bundle.counterpartyAutonomy[facts.counterpartyId]?.[actionClass];
+  // Every key that identifies the other side, each against its own bucket.
+  // Keyed by entityId alone, an override written against a domain, a phone or
+  // a tag was compiled and never found — and since an override can only
+  // tighten, losing one is silently more permissive.
+  const overrides = ctx.bundle.counterpartyAutonomy;
+  const candidates: (AutonomyLevel | undefined)[] = [
+    facts.counterpartyId === null
+      ? undefined
+      : overrides.byEntityId[facts.counterpartyId]?.[actionClass],
+    ...facts.counterpartyEmails.map((email) => {
+      const domain = email.split('@')[1];
+      return domain === undefined ? undefined : overrides.byEmailDomain[domain]?.[actionClass];
+    }),
+    ...facts.counterpartyPhones.map((p) => overrides.byPhone[p]?.[actionClass]),
+    ...facts.counterpartyTags.map((tag) => overrides.byTag[tag]?.[actionClass]),
+  ];
+  for (const override of candidates) {
     if (override !== undefined) ceilings.push(override);
   }
   if (ctx.rampLevel !== undefined) ceilings.push(ctx.rampLevel);

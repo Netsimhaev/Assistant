@@ -15,6 +15,22 @@ export interface GateHookBinding {
   /** Lowest trust in this job's causal chain, stamped by the caller. */
   provenance: TrustLevel;
   chainDepth?: number;
+  /**
+   * Tags of the resolved counterparty. Required so a caller with no resolver
+   * has to write `[]` deliberately — every tag-narrowed charter rule and the
+   * whole doNotContact-by-tag bucket read this, and while it was optional it
+   * was permanently empty and they were all dead.
+   */
+  counterpartyTags: string[];
+  /**
+   * Earned autonomy for this action class, from the ramp.
+   *
+   * Required, and there is no ramp yet, so callers pass `draft_only`. The risk
+   * engine's null NormsLookup is documented as safe *because* the ramp holds
+   * everything at draft_only — the two are load-bearing together, and leaving
+   * this optional meant only one of the pair was actually present.
+   */
+  rampLevel: AutonomyLevel;
   businessId?: string;
   jobId?: string | null;
   envelopeId?: string | null;
@@ -39,6 +55,8 @@ export interface GateHookBinding {
    * an attacker's document and that document telling it to read `.env`.
    */
   documentRoot: string;
+  /** Injectable clock, for the quiet-hours step. Real time when omitted. */
+  now?: Date;
 }
 
 /**
@@ -125,6 +143,9 @@ async function decide(
         bundle: binding.bundle,
         provenance: binding.provenance,
         chainDepth: binding.chainDepth ?? 0,
+        counterpartyTags: binding.counterpartyTags,
+        rampLevel: binding.rampLevel,
+        ...(binding.now !== undefined ? { now: binding.now } : {}),
         ...(binding.businessId !== undefined ? { businessId: binding.businessId } : {}),
         ...(binding.jobId !== undefined ? { jobId: binding.jobId } : {}),
         ...(binding.envelopeId !== undefined ? { envelopeId: binding.envelopeId } : {}),

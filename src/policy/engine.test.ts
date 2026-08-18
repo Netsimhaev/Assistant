@@ -12,6 +12,16 @@ import type { PolicyBundle } from '../domain/policy.js';
 
 const BUSINESS = 'test-business';
 
+/**
+ * A fixed clock, 12:00 in Asia/Jerusalem.
+ *
+ * Without it these tests read the wall clock, and the fixture charter has quiet
+ * hours 22:00-07:00 — so every test that sends something would have failed
+ * between 10pm and 7am and passed the rest of the day. A suite whose result
+ * depends on when it runs is not a suite.
+ */
+const NOON = new Date('2026-08-18T09:00:00.000Z');
+
 async function install(overrides = {}): Promise<PolicyBundle> {
   const charter = buildCharter(overrides);
   return installCharter(charter, { businessId: BUSINESS });
@@ -25,8 +35,16 @@ function ctx(bundle: PolicyBundle, over: Partial<GateContext> = {}): GateContext
     chainDepth: 0,
     businessId: BUSINESS,
     jobId: 'J-TEST',
+    // Stated, not defaulted. Production callers pass `draft_only` because no
+    // autonomy ramp exists yet; these tests exercise the gate itself, so they
+    // pass the permissive value deliberately and say so here.
+    counterpartyTags: [],
+    rampLevel: 'auto',
+    now: NOON,
     ...over,
-  };
+    // The spread of a Partial can reintroduce `undefined` for a required field
+    // under exactOptionalPropertyTypes; the cast is confined to this helper.
+  } as GateContext;
 }
 
 beforeEach(async () => {

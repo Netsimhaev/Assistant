@@ -46,8 +46,15 @@ export const ALWAYS_DISALLOWED_SDK_TOOLS: readonly string[] = [
   'Agent',
 ];
 
-/** Filesystem-reading SDK tools, whose path argument must be scoped. */
-const PATH_SCOPED_SDK_TOOLS: ReadonlySet<string> = new Set(['Read']);
+/**
+ * Internal names whose payload carries a filesystem path that must be scoped.
+ *
+ * Keyed on the *internal* name, not the SDK one. Keyed on the SDK name, an MCP
+ * tool arriving as `mcp__assistant__doc.fetch` would resolve to the same
+ * read-only internal name with `pathScoped: false` and skip the check
+ * entirely — live the day the first MCP server is registered.
+ */
+const PATH_SCOPED_INTERNAL: ReadonlySet<string> = new Set(['doc.fetch']);
 
 /**
  * Prefix for tools this system exposes to the SDK over MCP.
@@ -78,13 +85,13 @@ export function translateToolName(sdkToolName: string): TranslatedTool | null {
   if (sdkToolName.startsWith(MCP_PREFIX)) {
     const internal = sdkToolName.slice(MCP_PREFIX.length);
     return internal.length > 0
-      ? { internal, via: 'mcp', pathScoped: false }
+      ? { internal, via: 'mcp', pathScoped: PATH_SCOPED_INTERNAL.has(internal) }
       : null;
   }
   const internal = SDK_TO_INTERNAL[sdkToolName];
   return internal === undefined
     ? null
-    : { internal, via: 'builtin', pathScoped: PATH_SCOPED_SDK_TOOLS.has(sdkToolName) };
+    : { internal, via: 'builtin', pathScoped: PATH_SCOPED_INTERNAL.has(internal) };
 }
 
 /**

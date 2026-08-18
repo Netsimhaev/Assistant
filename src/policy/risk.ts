@@ -153,7 +153,7 @@ function scoreMoney(
  */
 function scoreVisibility(
   facts: ActionFacts,
-  known: readonly string[],
+  known: PolicyBundle['knownCounterparties'],
 ): RiskDimensions['externalVisibility'] {
   if (!facts.leavesInstance) return { audience: 'internal', score: 0 };
 
@@ -164,9 +164,17 @@ function scoreVisibility(
     return { audience: 'many', score: 30 };
   }
 
+  // Each fact is compared only against the bucket that can legitimately hold
+  // it. Against one flat list, `entityId: "vip"` matched a *tag* and bought a
+  // resolved-counterparty score the sender had not earned.
   const resolved =
-    (facts.counterpartyId !== null && known.includes(facts.counterpartyId)) ||
-    facts.counterpartyTags.some((tag) => known.includes(tag));
+    (facts.counterpartyId !== null && known.entityIds.includes(facts.counterpartyId)) ||
+    facts.counterpartyEmails.some((email) => {
+      const domain = email.split('@')[1];
+      return domain !== undefined && known.emailDomains.includes(domain);
+    }) ||
+    facts.counterpartyPhones.some((phone) => known.phones.includes(phone)) ||
+    facts.counterpartyTags.some((tag) => known.tags.includes(tag));
   return resolved
     ? { audience: 'one_known', score: 25 }
     : { audience: 'one_unknown', score: 55 };

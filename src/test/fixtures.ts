@@ -33,6 +33,9 @@ const BASE_AUTONOMY: Record<ActionClass, AutonomyLevel> = {
   'browser.interact': 'auto',
   // Handing an agent a live authenticated session is not ordinary work.
   'browser.session': 'approve_required',
+  // Producing a document is ordinary work; the control is the path scope and
+  // the audit row, not an approval.
+  'artifact.write': 'auto',
   'contract.sign': 'forbidden',
   'data.export': 'approve_required',
   'memory.write_longterm': 'auto',

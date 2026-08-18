@@ -31,6 +31,34 @@ const TimeOfDay = z
 
 const IsoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD');
 
+/**
+ * Can the runtime actually resolve this zone?
+ *
+ * Checked at signing rather than at send time. `Intl` throws on an unknown
+ * zone, and the quiet-hours reader caught that and fell back to UTC — which
+ * does not widen the window, it *shifts* it, so a message the owner promised
+ * would not go out at 22:30 went out. A zone we cannot resolve should fail the
+ * charter, not the promise.
+ */
+function isResolvableTimeZone(zone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-GB', { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Rejects a redaction pattern the engine could not compile. */
+function isCompilableRegex(source: string): boolean {
+  try {
+    new RegExp(source, 'g');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Minor units (agorot / cents). Integer so no float rounding ever applies to money. */
 const MinorAmount = z.number().int().nonnegative();
 
@@ -42,7 +70,10 @@ export const CharterIdentity = z.object({
   vertical: z.string().min(1),
   /** Ordered by preference, e.g. ['he', 'en', 'ar']. */
   languages: z.array(z.string().min(2)).min(1),
-  timezone: z.string().min(1),
+  timezone: z
+    .string()
+    .min(1)
+    .refine(isResolvableTimeZone, 'unknown IANA time zone'),
   locations: z
     .array(
       z.object({
@@ -212,8 +243,14 @@ export const CharterAutonomy = z.object({
 
 export const CharterData = z.object({
   retentionDays: z.partialRecord(DataClass, z.number().int().positive()).default({}),
-  /** Regex patterns redacted at retrieval time, not just at send time. */
-  redactBeforeSending: z.array(z.string()).default([]),
+  /**
+   * Regex patterns redacted at retrieval time, not just at send time.
+   *
+   * Compiled here so an unusable pattern cannot be signed. Without this the
+   * runtime skipped it and carried on, which meant a typo silently disabled a
+   * redaction the owner had put their name to.
+   */
+  redactBeforeSending: z.array(z.string().refine(isCompilableRegex, 'not a valid regular expression')).default([]),
   mayShareExternally: z
     .partialRecord(DataClass, z.enum(['never', 'with_approval', 'yes']))
     .default({}),

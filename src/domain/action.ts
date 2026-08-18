@@ -34,6 +34,7 @@ export const ActionClass = z.enum([
   'crm.write',
   'accounting.write',
   // Deliverables
+  'artifact.write',
   'doc.deliver',
   'media.publish',
   // Live browser authority. Classified rather than read-only: a session holds
@@ -83,6 +84,9 @@ export const BASELINE_REVERSIBILITY: Record<ActionClass, Reversibility> = {
   'refund.issue': 'irreversible',
   'crm.write': 'reversible',
   'accounting.write': 'costly',
+  // Writing a file is undone by writing it again — unless it lands somewhere
+  // that executes it, which is what the path scoping is for.
+  'artifact.write': 'reversible',
   'doc.deliver': 'irreversible',
   'media.publish': 'costly',
   // Optimistic, and correct as a baseline: most clicks navigate. A click that
@@ -102,13 +106,45 @@ export const BASELINE_REVERSIBILITY: Record<ActionClass, Reversibility> = {
  * autonomy-ramp metrics look. Some things you do not automate.
  * (docs/08-risks.md — "irreversibility is never automated")
  */
-export const NEVER_FULLY_AUTONOMOUS: ReadonlySet<ActionClass> = new Set([
-  'contract.sign',
-  'payment.make',
-  'refund.issue',
-  'data.export',
-  'charter.amend',
-]);
+const NEVER_FULLY_AUTONOMOUS_TABLE: Record<ActionClass, boolean> = {
+  'email.reply': false,
+  'email.initiate': false,
+  'whatsapp.reply': false,
+  'whatsapp.initiate': false,
+  'calendar.create': false,
+  'calendar.move': false,
+  'calendar.cancel': false,
+  'quote.issue': false,
+  'discount.grant': false,
+  'commitment.make': false,
+  'purchase.place': false,
+  'payment.make': true,
+  'refund.issue': true,
+  'browser.interact': false,
+  'browser.session': false,
+  'contract.sign': true,
+  'data.export': true,
+  'crm.write': false,
+  'accounting.write': false,
+  'artifact.write': false,
+  'doc.deliver': false,
+  'media.publish': false,
+  'memory.write_longterm': false,
+  'charter.amend': true,
+};
+
+/**
+ * A total record rather than a `Set`.
+ *
+ * A `Set` is maintained by hand and says nothing when the enum grows: a newly
+ * added irreversible class would land silently *outside* the "always needs a
+ * human" check. A `Record<ActionClass, boolean>` makes that a compile error.
+ */
+export const NEVER_FULLY_AUTONOMOUS: ReadonlySet<ActionClass> = new Set(
+  (Object.entries(NEVER_FULLY_AUTONOMOUS_TABLE) as [ActionClass, boolean][])
+    .filter(([, never]) => never)
+    .map(([cls]) => cls),
+);
 
 /**
  * Classes that address a host rather than a person.
@@ -140,3 +176,37 @@ export const MONETARY_CLASSES: ReadonlySet<ActionClass> = new Set([
   'refund.issue',
   'accounting.write',
 ]);
+
+/**
+ * Does this action commit money that the ceilings must account for?
+ *
+ * One predicate for both sides of the accounting. They used to disagree:
+ * `checkBudget` charged *any* action carrying `amountMinor` against the daily
+ * ceiling, while the ledger only recorded the six classes in
+ * `MONETARY_CLASSES`. A class outside that set could therefore be charged
+ * against a ceiling and never added to it — so repeated `commitment.make`
+ * calls each passed the per-action cap and the daily total stayed at zero.
+ */
+/**
+ * Monetary classes whose payload must carry a readable amount.
+ *
+ * Listed by name rather than derived as "MONETARY_CLASSES minus the odd one",
+ * because the odd one is load-bearing: a discount is a percentage and its tool
+ * call carries no amount at all. Requiring one there would deny every discount
+ * and quietly undo the fix that made the discount ceiling reachable.
+ */
+export const AMOUNT_REQUIRED_CLASSES: ReadonlySet<ActionClass> = new Set([
+  'quote.issue',
+  'purchase.place',
+  'payment.make',
+  'refund.issue',
+  'accounting.write',
+]);
+
+export function isMoneyBearing(
+  actionClass: ActionClass | null,
+  amountMinor: number,
+): boolean {
+  if (actionClass === null) return false;
+  return amountMinor > 0 || MONETARY_CLASSES.has(actionClass);
+}

@@ -16,11 +16,27 @@ export const ActionFacts = z.object({
   actionClass: ActionClass.nullable(),
   /** Money at stake, in minor units. Zero for non-monetary actions. */
   amountMinor: z.number().int().nonnegative(),
+  /**
+   * Did the payload actually carry a readable amount?
+   *
+   * Distinct from `amountMinor === 0`, which is also what an absent, misnamed
+   * or nested amount produces. Without the distinction a purchase whose amount
+   * arrived as `total` rather than `amountMinor` skipped every ceiling and
+   * scored zero on the money dimension.
+   */
+  amountDeclared: z.boolean(),
   /** Resolved entity id of the other side, when there is one. */
   counterpartyId: z.string().nullable(),
-  /** Address the payload would reach, normalised, for do-not-contact matching. */
-  counterpartyEmail: z.string().nullable(),
-  counterpartyPhone: z.string().nullable(),
+  /**
+   * Every address the payload would reach, normalised.
+   *
+   * A list, not one value. Reading only the first recipient meant a payload
+   * with `to: ["ok@x.com", "blocked@y.com"]` — or a comma-joined string — had
+   * its do-not-contact check run against one address and skipped for the rest,
+   * and an array `to` produced no address at all.
+   */
+  counterpartyEmails: z.array(z.string()),
+  counterpartyPhones: z.array(z.string()),
   /** Tags carried by the counterparty, used by narrowed forbidden rules. */
   counterpartyTags: z.array(z.string()),
   /** Trust of the least-trusted link in this job's causal chain. */
@@ -88,11 +104,22 @@ export const PolicyBundle = z.object({
   autonomyBase: z.record(ActionClass, AutonomyLevel),
   /** Hard cap by the provenance of the causal chain. */
   provenanceCeiling: z.record(TrustLevel, AutonomyLevel),
-  /** Per-counterparty overrides, keyed by the resolved entity id. */
-  counterpartyAutonomy: z.record(
-    z.string(),
-    z.partialRecord(ActionClass, AutonomyLevel),
-  ),
+  /**
+   * Per-counterparty autonomy overrides, split by the key that identifies them.
+   *
+   * Flattening these into one map keyed by any match string meant only the
+   * `entityId` entries were ever looked up: the gate compares against
+   * `facts.counterpartyId`, so an override written against an email domain,
+   * a phone or a tag compiled, appeared in the signed charter, and could never
+   * be found. Since an override can only tighten, a lost one is silently
+   * *more* permissive. Same defect the do-not-contact list already had.
+   */
+  counterpartyAutonomy: z.object({
+    byEntityId: z.record(z.string(), z.partialRecord(ActionClass, AutonomyLevel)),
+    byEmailDomain: z.record(z.string(), z.partialRecord(ActionClass, AutonomyLevel)),
+    byPhone: z.record(z.string(), z.partialRecord(ActionClass, AutonomyLevel)),
+    byTag: z.record(z.string(), z.partialRecord(ActionClass, AutonomyLevel)),
+  }),
   /**
    * Structured rather than a flat string list.
    *
@@ -135,8 +162,18 @@ export const PolicyBundle = z.object({
    * lower-risk than a first contact. That check has to consult the charter: if
    * it trusts the payload's own claim to name a counterparty, an agent working
    * from injected content can quiet its own risk score by inventing one.
+   *
+   * Split by key for the same reason as `doNotContact`. Flattened, the id the
+   * payload supplies was compared against a list that also held tags and
+   * domains — so `entityId: "vip"` matched a *tag* and bought the sender a
+   * resolved-counterparty score it had not earned.
    */
-  knownCounterparties: z.array(z.string()),
+  knownCounterparties: z.object({
+    entityIds: z.array(z.string()),
+    emailDomains: z.array(z.string()),
+    phones: z.array(z.string()),
+    tags: z.array(z.string()),
+  }),
 
   allowlists: z.record(AgentId, z.array(z.string())),
   denylists: z.record(AgentId, z.array(z.string())),
@@ -185,5 +222,7 @@ export const DENY_CODES = {
   riskBlocked: 'risk_blocked',
   doNotContact: 'do_not_contact',
   quietHours: 'quiet_hours',
+  amountUnreadable: 'amount_unreadable',
+  recipientUnreadable: 'recipient_unreadable',
   notAllowlisted: 'tool_not_allowlisted',
 } as const;

@@ -43,9 +43,7 @@ export function compileCharter(charter: BusinessCharter): PolicyBundle {
         : { ...charter.operations.quietHours, timezone: charter.identity.timezone },
     redactPatterns: charter.data.redactBeforeSending,
     doNotContact: compileDoNotContact(charter),
-    knownCounterparties: charter.counterparties
-      .flatMap((c) => [c.match.entityId, c.match.emailDomain, c.match.phone, c.match.tag])
-      .filter((key): key is string => key !== undefined),
+    knownCounterparties: bucketMatches(charter.counterparties, () => true),
 
     allowlists: AGENT_ALLOWLISTS,
     denylists: AGENT_DENYLISTS,
@@ -69,21 +67,42 @@ export function compileCharter(charter: BusinessCharter): PolicyBundle {
  * of them identifying the other side is enough to stop the message.
  */
 function compileDoNotContact(charter: BusinessCharter): PolicyBundle['doNotContact'] {
-  const out = { entityIds: [] as string[], emailDomains: [] as string[], phones: [] as string[], tags: [] as string[] };
+  return bucketMatches(charter.counterparties, (c) => c.doNotContact);
+}
 
-  for (const c of charter.counterparties) {
-    if (!c.doNotContact) continue;
+/**
+ * Sort counterparty match keys into the bucket each one can actually be
+ * compared against.
+ *
+ * Normalised here to match how `buildFacts` normalises the payload — a domain
+ * that differs only in case, or a phone written with dashes, must still match.
+ */
+function bucketMatches(
+  counterparties: BusinessCharter['counterparties'],
+  include: (c: BusinessCharter['counterparties'][number]) => boolean,
+): PolicyBundle['doNotContact'] {
+  const out = {
+    entityIds: [] as string[],
+    emailDomains: [] as string[],
+    phones: [] as string[],
+    tags: [] as string[],
+  };
+
+  for (const c of counterparties) {
+    if (!include(c)) continue;
     if (c.match.entityId !== undefined) out.entityIds.push(c.match.entityId);
-    // Normalised at compile time to match how `buildFacts` normalises the
-    // payload — a domain that differs only in case must still match.
     if (c.match.emailDomain !== undefined) {
-      out.emailDomains.push(c.match.emailDomain.trim().toLowerCase().replace(/^@/, ''));
+      out.emailDomains.push(normaliseDomain(c.match.emailDomain));
     }
     if (c.match.phone !== undefined) out.phones.push(c.match.phone.replace(/\D/g, ''));
     if (c.match.tag !== undefined) out.tags.push(c.match.tag);
   }
 
   return out;
+}
+
+export function normaliseDomain(domain: string): string {
+  return domain.trim().toLowerCase().replace(/^@/, '');
 }
 
 function compileRules(charter: BusinessCharter): CompiledRule[] {
@@ -154,30 +173,39 @@ function compileCeilings(charter: BusinessCharter): CompiledCeilings {
  */
 function compileCounterpartyAutonomy(
   charter: BusinessCharter,
-): Record<string, Partial<Record<ActionClass, AutonomyLevel>>> {
-  const out: Record<string, Partial<Record<ActionClass, AutonomyLevel>>> = {};
+): PolicyBundle['counterpartyAutonomy'] {
+  const out: PolicyBundle['counterpartyAutonomy'] = {
+    byEntityId: {},
+    byEmailDomain: {},
+    byPhone: {},
+    byTag: {},
+  };
 
   for (const counterparty of charter.counterparties) {
     const overrides = counterparty.autonomyOverrides;
     if (Object.keys(overrides).length === 0) continue;
 
-    for (const key of [
-      counterparty.match.entityId,
-      counterparty.match.emailDomain,
-      counterparty.match.phone,
-      counterparty.match.tag,
-    ]) {
-      if (key === undefined) continue;
+    const targets: [Record<string, Partial<Record<ActionClass, AutonomyLevel>>>, string | undefined][] = [
+      [out.byEntityId, counterparty.match.entityId],
+      [out.byEmailDomain, counterparty.match.emailDomain === undefined
+        ? undefined
+        : normaliseDomain(counterparty.match.emailDomain)],
+      [out.byPhone, counterparty.match.phone?.replace(/\D/g, '')],
+      [out.byTag, counterparty.match.tag],
+    ];
+
+    for (const [bucket, key] of targets) {
+      if (key === undefined || key.length === 0) continue;
       // A later rule matching the same key tightens rather than replaces: two
       // rules that both apply should not let ordering decide the outcome.
-      const existing = out[key] ?? {};
+      const existing = bucket[key] ?? {};
       for (const [actionClass, level] of Object.entries(overrides)) {
         if (level === undefined) continue;
         const current = existing[actionClass as ActionClass];
         existing[actionClass as ActionClass] =
           current === undefined ? level : moreRestrictive(current, level);
       }
-      out[key] = existing;
+      bucket[key] = existing;
     }
   }
 

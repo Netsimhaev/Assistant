@@ -1,6 +1,7 @@
 import type { AgentId } from '../domain/audit.js';
 import type { PolicyBundle } from '../domain/policy.js';
-import { MONETARY_CLASSES } from '../domain/action.js';
+import { isMoneyBearing } from '../domain/action.js';
+import type { AutonomyLevel } from '../domain/trust.js';
 import { classifyAction, refineActionClass } from '../policy/classify.js';
 import { evaluateToolCall } from '../policy/engine.js';
 import { recordSpend } from '../policy/budget.js';
@@ -17,6 +18,10 @@ export interface StepRequest {
   toolInput: Record<string, unknown>;
   /** Performs the actual side effect once the gate has permitted it. */
   perform: (redactedInput: unknown) => Promise<unknown>;
+  /** Tags of the resolved counterparty; `[]` when nothing resolved them. */
+  counterpartyTags: string[];
+  /** Earned autonomy from the ramp; `draft_only` until a ramp exists. */
+  rampLevel: AutonomyLevel;
   now?: Date;
 }
 
@@ -37,6 +42,21 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   const { job, bundle, toolName, toolInput } = request;
   const now = request.now ?? new Date();
 
+  // The phase is checked BEFORE the side effect, not after it.
+  //
+  // `transition` validates the predecessor, but the only transition here used
+  // to be the one to `verify` — which runs after `perform`. Re-invoking a step
+  // on a halted, failed or dormant job therefore sent the mail and only then
+  // threw "illegal transition". The action had happened and no job_steps row
+  // recorded it.
+  if (job.phase !== 'execute') {
+    return {
+      status: 'refused',
+      code: 'job_not_executable',
+      reason: `job ${job.jobId} is in phase ${job.phase}, not execute`,
+    };
+  }
+
   const decision = await evaluateToolCall(toolName, toolInput, {
     agent: request.agent,
     bundle,
@@ -44,6 +64,8 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     chainDepth: 0,
     businessId: job.businessId,
     jobId: job.jobId,
+    counterpartyTags: request.counterpartyTags,
+    rampLevel: request.rampLevel,
     now,
   });
 
@@ -115,10 +137,16 @@ async function recordStepSpend(request: StepRequest): Promise<boolean> {
   if (base === null) return false;
 
   const actionClass = refineActionClass(base, request.toolInput);
-  if (!MONETARY_CLASSES.has(actionClass)) return false;
 
   const amountMinor = request.toolInput['amountMinor'];
   if (typeof amountMinor !== 'number' || amountMinor <= 0) return false;
+
+  // One predicate for both halves of the accounting. The ledger used to record
+  // only six classes while `checkBudget` charged *any* action carrying an
+  // amount against the daily ceiling — so a class outside that set could be
+  // charged against a ceiling it never contributed to, and repeated calls each
+  // passed the per-action cap while the daily total stayed at zero.
+  if (!isMoneyBearing(actionClass, amountMinor)) return false;
 
   return recordSpend(
     {

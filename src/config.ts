@@ -32,5 +32,8 @@ export const config = {
    * Pointing them at the dev database would silently destroy dev state.
    */
   databaseUrl: isTest ? required('TEST_DATABASE_URL') : required('DATABASE_URL'),
-  businessId: process.env['BUSINESS_ID'] ?? 'dev-business',
+  // Required, not defaulted. This key scopes the charter, the kill switch, the
+  // spend ledger and the audit chain; a deploy that forgets it would run under
+  // someone else's name and interleave two businesses' audit chains.
+  businessId: required('BUSINESS_ID'),
 } as const;

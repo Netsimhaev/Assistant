@@ -83,6 +83,7 @@ export async function checkBudget(
   const db = options.db ?? getPool();
 
   const perClass = ceilings.perActionClassMinor[facts.actionClass];
+
   if (perClass !== undefined && facts.amountMinor > perClass) {
     return {
       permitted: false,

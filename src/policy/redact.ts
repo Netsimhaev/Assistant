@@ -25,23 +25,19 @@ const REDACTED = '[הוסר]';
 const MAX_DEPTH = 12;
 
 function compile(sources: readonly string[]): RegExp[] {
-  const out: RegExp[] = [];
-  for (const source of sources) {
-    try {
-      out.push(new RegExp(source, 'g'));
-    } catch {
-      // A charter carrying an invalid pattern must not take the gate down: a
-      // send would then fail open on the *next* deploy, when someone removes
-      // the throw to unblock themselves. Skipping one pattern is the smaller
-      // failure, and the pattern is validated when the charter is signed.
-      continue;
-    }
-  }
-  return out;
+  // Throws rather than skipping. The skipping form was justified by "the
+  // pattern is validated when the charter is signed" — which was not true at
+  // the time, so a typo disabled a signed redaction silently and forever. It
+  // is true now (`CharterData.redactBeforeSending` compiles each pattern), so
+  // reaching this throw means the bundle was built by something that bypassed
+  // the schema, and failing loudly is right. Both callers fail closed.
+  return sources.map((source) => new RegExp(source, 'g'));
 }
 
 function walk(value: unknown, patterns: RegExp[], depth: number): unknown {
-  if (depth > MAX_DEPTH) return value;
+  // Redacted rather than returned as-is: a value we declined to inspect is not
+  // a value we have cleared for sending.
+  if (depth > MAX_DEPTH) return REDACTED;
 
   if (typeof value === 'string') {
     return patterns.reduce((text, pattern) => {
@@ -77,8 +73,14 @@ export function inQuietHours(
   const local = localHourMinute(now, quietHours.timezone);
   const from = toMinutes(quietHours.from);
   const to = toMinutes(quietHours.to);
-  if (from === null || to === null) return false;
-  if (from === to) return false;
+  // Unparseable means we cannot tell, and the owner signed a promise. The
+  // restrictive answer is the honest one; the schema rejects these shapes at
+  // signing, so reaching either branch means something bypassed it.
+  if (from === null || to === null) return true;
+  // A zero-width window is not "never quiet" — the charter says the window
+  // exists, and a window we cannot make sense of should not silently vanish
+  // from a document the owner still reads as a promise.
+  if (from === to) return true;
 
   return from < to
     ? local >= from && local < to
@@ -99,10 +101,12 @@ function localHourMinute(now: Date, timezone: string): number {
     const minute = Number(parts.find((p) => p.type === 'minute')?.value ?? '0');
     return hour * 60 + minute;
   } catch {
-    // An unknown timezone must not silently disable the quiet-hours promise,
-    // but it also must not crash a send. UTC is the honest fallback and the
-    // charter schema is where a bad zone should have been caught.
-    return now.getUTCHours() * 60 + now.getUTCMinutes();
+    // Falling back to UTC does not widen the window, it *shifts* it: 22:30 in
+    // Jerusalem is 19:30 UTC, outside a 22:00-07:00 window, so the message the
+    // owner promised would not be sent went out. The zone is validated when the
+    // charter is signed, so this is now unreachable — and if something does
+    // reach it, refusing to send is the side to fail on.
+    throw new Error(`unresolvable time zone "${timezone}"`);
   }
 }
 

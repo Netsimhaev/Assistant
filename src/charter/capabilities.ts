@@ -202,6 +202,12 @@ export function matchesPattern(toolName: string, pattern: string): boolean {
  * is denied, because the safer reading of a contradiction is the restrictive one.
  */
 export function isToolPermitted(agent: AgentId, toolName: string): boolean {
+  // Enforced positively rather than by absence from every allowlist. The
+  // comment said these were "unreachable by construction"; the only code that
+  // read the list was a test *exemption*, so one line added to an allowlist
+  // would have made contract.sign reachable with every invariant still green.
+  if (UNOWNED_TOOLS.some((pattern) => matchesPattern(toolName, pattern))) return false;
+
   const denied = AGENT_DENYLISTS[agent].some((p) => matchesPattern(toolName, p));
   if (denied) return false;
   return AGENT_ALLOWLISTS[agent].some((p) => matchesPattern(toolName, p));
