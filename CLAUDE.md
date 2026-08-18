@@ -8,7 +8,7 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 91 מבחנים
+npm test          # vitest run — 98 מבחנים
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_URL
@@ -51,7 +51,7 @@ npm run sdk:know-reader  # הרצה חיה מול ה-Agent SDK — דורש ANTH
 
 **`browser.click`/`browser.fill` מסווגים כ-`browser.interact`, לא קריאה-בלבד.** הבסיס הוא `auto` — הגידור לא בא מהמחלקה אלא מ**תקרת המקור** מעליה: שרשרת שקראה דף לא אמין היא `open_web` ולכן `draft_only`. קליק שנושא `amountMinor > 0` מתעדן ל-`purchase.place`. הטריגר הוא הסכום ולעולם לא תווית הכפתור — הדף נכתב על ידי מי ששולט באתר, והתאמה לטקסט שלו היא קריאת הקלט של התוקף כמדיניות.
 
-**מחלקה שיוצאת מהמכונה לא בהכרח פונה לאדם.** `COUNTERPARTY_ADDRESSED_CLASSES` מפריד בין "הודעה לנמען" לבין "בקשה לשרת". ההסלמה `one_unknown` שייכת רק לראשונה — בלי ההפרדה הזו כל קליק בדפדפן הפך ל"מגע ראשון עם גורם לא מזוהה" ונשלח לתור אישורים.
+**פטור מהסלמה נכתב כרשימה חיובית.** `HOST_ADDRESSED_CLASSES` מונה בשם את שתי מחלקות הדפדפן שפטורות מהסלמת `one_unknown`. הניסוח השולל — "כל מה שלא פונה לאדם" — גרף איתו את `crm.write` והוריד אותו מ-`sensitive` ל-`routine`. מחלקה חדשה ב-enum חייבת להישאר בתוך ההסלמה כברירת מחדל.
 
 **כסף הוא מספר שלם ביחידות מינור, תמיד.** `readAmountMinor` ב-[src/policy/facts.ts](src/policy/facts.ts) **זורק `TypeError`** על עשרוני במקום לעגל. שים לב: זו חריגה ולא `deny` — היא יוצאת מ-`evaluateToolCall` ולא משאירה רשומת ביקורת.
 

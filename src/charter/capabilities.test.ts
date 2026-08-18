@@ -12,7 +12,7 @@ import {
   classifiedToolNames,
   directlyMappedActionClasses,
 } from '../policy/classify.js';
-import { ActionClass } from '../domain/action.js';
+import { ActionClass, HOST_ADDRESSED_CLASSES } from '../domain/action.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { compileCharter } from './compile.js';
@@ -148,5 +148,33 @@ describe('compiled policy has a reader', () => {
     // `counterpartyId` alone, so a block by domain, phone or tag matched
     // nothing at all while appearing in the signed document.
     expect(unread).toEqual([]);
+  });
+});
+
+/**
+ * The first-contact escalation is what forces a human onto any outbound action
+ * whose counterparty the charter cannot resolve: `scoreVisibility` returns
+ * `one_unknown`, `bandFor` turns that into `sensitive`, and `sensitive` forces
+ * an approval regardless of the risk total.
+ *
+ * That escalation was briefly expressed as "every class except the ones that
+ * address a person", which quietly swept in `crm.write` — an outbound write to
+ * a system of record dropped from `sensitive` to `routine` and stopped needing
+ * a human. The exemption is now an explicit two-element allowlist, and this
+ * test is what keeps it that size.
+ */
+describe('the first-contact escalation covers everything it should', () => {
+  it('exempts only the two browser classes, by name', () => {
+    expect([...HOST_ADDRESSED_CLASSES].sort()).toEqual([
+      'browser.interact',
+      'browser.session',
+    ]);
+  });
+
+  it('leaves every other action class inside the escalation', () => {
+    const exempt = ActionClass.options.filter((cls) => HOST_ADDRESSED_CLASSES.has(cls));
+    // A class added to the enum later must not fall out of the sensitive band
+    // by omission — which is exactly how crm.write escaped it.
+    expect(exempt).toHaveLength(2);
   });
 });

@@ -7,7 +7,7 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import type { Queryable } from '../db/pool.js';
 import { evaluateToolCall } from '../policy/engine.js';
-import { translateToolName } from './tool-names.js';
+import { isPathWithin, readPathArgument, translateToolName } from './tool-names.js';
 
 export interface GateHookBinding {
   agent: AgentId;
@@ -30,6 +30,15 @@ export interface GateHookBinding {
    * run.
    */
   onDecision?: (event: { tool: string; decision: 'allow' | 'deny'; code: string }) => void;
+  /**
+   * Root a filesystem read may not escape.
+   *
+   * Required, because `doc.fetch` is read-only and therefore short-circuits the
+   * gate at step 4 without risk scoring, without an audit row, and without the
+   * outbound controls. This check is the only thing between an agent reading
+   * an attacker's document and that document telling it to read `.env`.
+   */
+  documentRoot: string;
 }
 
 /**
@@ -54,6 +63,26 @@ export interface GateHookBinding {
  */
 export function createGateHook(binding: GateHookBinding) {
   return async function gateHook(input: unknown): Promise<HookJSONOutput> {
+    try {
+      return await decide(input, binding);
+    } catch (error) {
+      // `readAmountMinor` throws on a decimal amount, and any database error in
+      // gate steps 1-2 throws too. What the SDK does with a hook that rejects is
+      // unspecified, and "unspecified" on the permission path is not a risk
+      // worth taking: fail closed and say so.
+      return denial(
+        'gate_error',
+        error instanceof Error ? error.message : 'שגיאה לא צפויה בשער',
+      );
+    }
+  };
+}
+
+async function decide(
+  input: unknown,
+  binding: GateHookBinding,
+): Promise<HookJSONOutput> {
+  {
     const hook = input as PreToolUseHookInput;
 
     const translated = translateToolName(hook.tool_name);
@@ -71,6 +100,21 @@ export function createGateHook(binding: GateHookBinding) {
         'sdk_tool_unmapped',
         `הכלי "${hook.tool_name}" אינו ממופה למרשם הכלים של המערכת`,
       );
+    }
+
+    if (translated.pathScoped) {
+      const path = readPathArgument(hook.tool_input);
+      if (path === null || !isPathWithin(path, binding.documentRoot)) {
+        binding.onDecision?.({
+          tool: translated.internal,
+          decision: 'deny',
+          code: 'path_outside_document_root',
+        });
+        return denial(
+          'path_outside_document_root',
+          `קריאה מחוץ לתיקיית המסמכים המורשית: ${path ?? '(ללא נתיב)'}`,
+        );
+      }
     }
 
     const decision = await evaluateToolCall(
@@ -93,11 +137,28 @@ export function createGateHook(binding: GateHookBinding) {
 
     if (decision.outcome === 'allow') {
       binding.onDecision?.({ tool: translated.internal, decision: 'allow', code: 'allow' });
+      // `updatedInput` is how the redaction actually reaches the wire. Without
+      // it the gate computed a redacted payload and the SDK went on to execute
+      // the original — the charter's redactBeforeSending promise silently did
+      // not hold on the only execution path that exists.
+      const redacted = decision.redactedInput;
+      const wasObject = typeof hook.tool_input === 'object' && hook.tool_input !== null;
+      const isObject = typeof redacted === 'object' && redacted !== null;
+      if (wasObject && !isObject) {
+        // Fail closed: an allow we cannot express with the redacted payload
+        // would send the unredacted one.
+        return denial(
+          'redaction_unrepresentable',
+          'הקלט המצונזר אינו אובייקט ולכן לא ניתן להעביר אותו ל-SDK',
+        );
+      }
+
       return {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           permissionDecision: 'allow',
           permissionDecisionReason: `policy:${binding.agent}:${translated.internal}`,
+          ...(isObject ? { updatedInput: redacted as Record<string, unknown> } : {}),
         },
       };
     }
@@ -108,7 +169,7 @@ export function createGateHook(binding: GateHookBinding) {
       code: decision.code,
     });
     return denial(decision.code, decision.reason);
-  };
+  }
 }
 
 function denial(code: string, reason: string): HookJSONOutput {

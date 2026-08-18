@@ -5,11 +5,14 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AgentId } from '../domain/audit.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createGateHook } from './gate-hook.js';
-import { sdkToolsFor, translateToolName } from './tool-names.js';
+import { isPathWithin, sdkToolsFor, translateToolName } from './tool-names.js';
 import { knowReaderDefinition } from './know-reader.js';
 
 const BUSINESS = 'test-business';
+const DOCS = join(tmpdir(), 'assistant-docs');
 
 /**
  * Exercises the adapter with the shapes the SDK actually delivers, typed
@@ -40,6 +43,7 @@ async function decisionFor(
     provenance: 'boss',
     businessId: BUSINESS,
     jobId: 'J-SDK',
+    documentRoot: DOCS,
   });
   const out = await hook(preToolUse(toolName, toolInput));
   // HookJSONOutput is a union: the async variant carries no hookSpecificOutput
@@ -66,6 +70,26 @@ afterAll(async () => {
 });
 
 describe('SDK tool-name translation', () => {
+  it('offers the quarantine reader no web egress and no filesystem search', () => {
+    // These all mapped to `doc.fetch` - a read-only internal name that skips
+    // the gate at step 4 and writes no audit row. That turned "fetch a business
+    // document" into "read any path and fetch any URL", which is precisely the
+    // arbitrary-read-plus-egress pair a quarantine agent must not hold.
+    expect(translateToolName('WebFetch')).toBeNull();
+    expect(translateToolName('Glob')).toBeNull();
+    expect(translateToolName('Grep')).toBeNull();
+    expect(sdkToolsFor('know.reader')).toEqual(['Read']);
+  });
+
+  it('scopes a filesystem read to the document root, traversal included', () => {
+    expect(isPathWithin(join(DOCS, 'a.pdf'), DOCS)).toBe(true);
+    // Normalised before the prefix test, not after.
+    expect(isPathWithin('../../.env', DOCS)).toBe(false);
+    expect(isPathWithin(join(DOCS, '..', '..', '.env'), DOCS)).toBe(false);
+    // A sibling directory sharing the prefix is still outside.
+    expect(isPathWithin(DOCS + '-other/x', DOCS)).toBe(false);
+  });
+
   it('refuses to translate a tool it does not know', () => {
     // The inverted default that makes the boundary safe: the SDK ships tools
     // the charter has never heard of, and an unknown name must not arrive at
@@ -79,6 +103,7 @@ describe('SDK tool-name translation', () => {
     expect(translateToolName('mcp__assistant__mail.send')).toEqual({
       internal: 'mail.send',
       via: 'mcp',
+      pathScoped: false,
     });
   });
 
@@ -108,23 +133,24 @@ describe('the gate hook', () => {
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
 
     const { decision } = await decisionFor(bundle, 'know.reader', 'Read', {
-      file_path: '/tmp/invoice.pdf',
+      file_path: join(DOCS, 'invoice.pdf'),
     });
 
     expect(decision).toBe('allow');
   });
 
-  it('denies a write the agent is not allowlisted for', async () => {
+  it('denies a write outright - it is not a tool the SDK map offers at all', async () => {
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
 
-    // file.write is a real tool in the registry, but not one know.reader owns.
-    // This is the capability layer denying before the charter is consulted.
+    // `Write` used to map to `file.write`, which is in READ_ONLY_TOOLS and so
+    // short-circuits the gate at step 4 with no audit row. It is now unmapped
+    // and explicitly disallowed.
     const { decision, reason } = await decisionFor(bundle, 'know.reader', 'Write', {
-      file_path: '/tmp/x',
+      file_path: join(DOCS, 'x'),
     });
 
     expect(decision).toBe('deny');
-    expect(reason).toContain('tool_not_allowlisted');
+    expect(reason).toContain('sdk_tool_unmapped');
   });
 
   it('turns a queued approval into a denial that names the approval', async () => {
@@ -143,6 +169,66 @@ describe('the gate hook', () => {
     expect(reason).toContain('queued_for_approval:AP-');
   });
 
+  it('denies a read that climbs out of the document root', async () => {
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+
+    // The injection this agent exists to contain: untrusted content telling the
+    // reader to go and read the credentials file. `doc.fetch` is read-only, so
+    // this check is the only thing standing in the way.
+    const { decision, reason } = await decisionFor(bundle, 'know.reader', 'Read', {
+      file_path: '../../.env',
+    });
+
+    expect(decision).toBe('deny');
+    expect(reason).toContain('path_outside_document_root');
+  });
+
+  it('hands the SDK the redacted payload rather than the one proposed', async () => {
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+
+    const hook = createGateHook({
+      agent: 'comms.email',
+      bundle,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      documentRoot: DOCS,
+    });
+    const out = await hook(
+      preToolUse('mcp__assistant__mail.send', {
+        to: 'a@b.com',
+        inReplyTo: 'm1',
+        counterpartyId: 'c_812',
+        body: 'id 123456789',
+      }),
+    );
+
+    if (!('hookSpecificOutput' in out)) throw new Error('async shape');
+    const specific = out.hookSpecificOutput;
+    if (specific?.hookEventName !== 'PreToolUse') throw new Error('wrong hook');
+    expect(specific.permissionDecision).toBe('allow');
+    // Without updatedInput the gate computed a redacted payload and the SDK
+    // went on to send the original - the charter promise silently not holding.
+    const updated = specific.updatedInput as { body: string } | undefined;
+    expect(updated?.body).toContain('[\u05d4\u05d5\u05e1\u05e8]');
+  });
+
+  it('fails closed when the gate throws instead of letting it escape', async () => {
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+
+    // readAmountMinor throws a TypeError on a decimal amount. What the SDK does
+    // with a rejected hook is unspecified, and unspecified on the permission
+    // path is not a risk worth taking.
+    const { decision, reason } = await decisionFor(
+      bundle,
+      'comms.email',
+      'mcp__assistant__quote.issue',
+      { counterpartyId: 'c_812', amountMinor: 100.5 },
+    );
+
+    expect(decision).toBe('deny');
+    expect(reason).toContain('gate_error');
+  });
+
   it('the kill switch reaches the SDK, not just direct callers', async () => {
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
     const { trip, release } = await import('../governance/killswitch.js');
@@ -152,7 +238,7 @@ describe('the gate hook', () => {
     });
 
     const { decision, reason } = await decisionFor(bundle, 'know.reader', 'Read', {
-      file_path: '/tmp/x',
+      file_path: join(DOCS, 'x.txt'),
     });
 
     expect(decision).toBe('deny');
@@ -175,10 +261,11 @@ describe('decision reporting', () => {
       bundle,
       provenance: 'boss',
       businessId: BUSINESS,
+      documentRoot: DOCS,
       onDecision: (event) => seen.push(event),
     });
 
-    await hook(preToolUse('Read', { file_path: '/tmp/a' }));
+    await hook(preToolUse('Read', { file_path: join(DOCS, 'a.txt') }));
     await hook(preToolUse('Bash', { command: 'id' }));
 
     // Without this the caller cannot tell "found nothing" from "was stopped".
@@ -205,6 +292,7 @@ describe('the know.reader definition', () => {
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
     const definition = knowReaderDefinition(bundle);
     expect(definition.disallowedTools).toContain('Bash');
-    expect(definition.tools).not.toContain('Bash');
+    expect(definition.disallowedTools).toContain('WebFetch');
+    expect(definition.tools).toEqual(['Read']);
   });
 });

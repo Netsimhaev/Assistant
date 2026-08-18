@@ -7,6 +7,8 @@
  *
  *   npm run sdk:know-reader -- "סכם את הקובץ README.md"
  */
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { config } from '../config.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
@@ -30,7 +32,16 @@ async function main(): Promise<void> {
   const active = await loadActiveCharter(config.businessId);
   const bundle = active?.bundle ?? (await installCharter(buildCharter()));
 
-  const result = await runKnowReader({ bundle, task, provenance: 'unknown_external' });
+  // Never the repository root: that is where .env lives.
+  const documentRoot = process.env['DOCUMENT_ROOT'] ?? join(process.cwd(), 'documents');
+  await mkdir(documentRoot, { recursive: true });
+
+  const result = await runKnowReader({
+    bundle,
+    task,
+    provenance: 'unknown_external',
+    documentRoot,
+  });
 
   console.log('--- תוצאה ---');
   console.log(result.text);

@@ -2,7 +2,7 @@ import { query, type AgentDefinition, type Options } from '@anthropic-ai/claude-
 import type { PolicyBundle } from '../domain/policy.js';
 import type { TrustLevel } from '../domain/trust.js';
 import { createGateHook, type GateHookBinding } from './gate-hook.js';
-import { sdkToolsFor } from './tool-names.js';
+import { ALWAYS_DISALLOWED_SDK_TOOLS, sdkToolsFor } from './tool-names.js';
 
 const AGENT = 'know.reader' as const;
 
@@ -26,9 +26,9 @@ export function knowReaderDefinition(bundle: PolicyBundle): AgentDefinition {
     prompt: bundle.promptFragments[AGENT],
     tools: sdkToolsFor(AGENT),
     // Belt and braces. The hook is the control that decides, but there is no
-    // reason to offer a shell to an agent whose entire job is reading, and
-    // whose input is untrusted by construction.
-    disallowedTools: ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebSearch'],
+    // reason to offer a shell — or web egress — to an agent whose entire job is
+    // reading, and whose input is untrusted by construction.
+    disallowedTools: [...ALWAYS_DISALLOWED_SDK_TOOLS],
     model: 'haiku',
   };
 }
@@ -47,6 +47,14 @@ export interface ReadRequest {
   provenance?: TrustLevel;
   businessId?: string;
   jobId?: string | null;
+  /**
+   * Directory the reader may read from, and nothing above it.
+   *
+   * Required rather than defaulted to the process cwd: defaulting would put the
+   * repository root — and its `.env` — inside the reader's reach, which is the
+   * exact shape of the injection this agent exists to contain.
+   */
+  documentRoot: string;
 }
 
 export interface ReadResult {
@@ -67,6 +75,7 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
     agent: AGENT,
     bundle: request.bundle,
     provenance: request.provenance ?? 'unknown_external',
+    documentRoot: request.documentRoot,
     onDecision: (event) => {
       if (event.decision === 'deny') denials.push(event.code);
     },
@@ -74,9 +83,25 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
     ...(request.jobId !== undefined ? { jobId: request.jobId } : {}),
   };
 
+  const definition = knowReaderDefinition(request.bundle);
+
   const options: Options = {
-    agents: { [AGENT]: knowReaderDefinition(request.bundle) },
-    allowedTools: sdkToolsFor(AGENT),
+    // The prompt goes in `systemPrompt`, not into an `agents` entry.
+    //
+    // An AgentDefinition only takes effect for a *subagent* invoked through the
+    // Agent tool — and that tool is unmapped, so the hook denies it. Registering
+    // the definition and then sending the task as a top-level prompt meant the
+    // model doing the reading never received the charter's quarantine
+    // instruction, never ran on Haiku, and never saw `disallowedTools`. The
+    // tests asserted on a definition that nothing used.
+    systemPrompt: definition.prompt,
+    // `tools` restricts; `allowedTools` only auto-approves what is already
+    // available. Using the latter alone left every built-in tool on the table.
+    tools: sdkToolsFor(AGENT),
+    disallowedTools: [...ALWAYS_DISALLOWED_SDK_TOOLS],
+    // A second boundary under the hook's path check, so a filesystem read is
+    // scoped by the SDK as well as by us.
+    cwd: request.documentRoot,
     // The hook is the authority; `permissionMode` only decides what happens to
     // calls the hook did not already settle.
     permissionMode: 'default',

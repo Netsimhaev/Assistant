@@ -1,4 +1,4 @@
-import { BASELINE_REVERSIBILITY, COUNTERPARTY_ADDRESSED_CLASSES } from '../domain/action.js';
+import { BASELINE_REVERSIBILITY, HOST_ADDRESSED_CLASSES } from '../domain/action.js';
 import type { ActionFacts, CompiledCeilings, PolicyBundle } from '../domain/policy.js';
 import type { RiskAssessment, RiskBand, RiskDimensions } from '../domain/risk.js';
 import {
@@ -139,7 +139,8 @@ function scoreMoney(
 
 /**
  * `one_known` means the charter knows this counterparty — not that the payload
- * claimed one.
+ * claimed one. Everything outbound that is not host-addressed goes through the
+ * first-contact escalation; only the two browser classes are exempt.
  *
  * `buildFacts` falls back to the payload's `entityId` when `counterpartyId` is
  * absent, which is right for resolving a counterparty but wrong as evidence of
@@ -159,7 +160,7 @@ function scoreVisibility(
   // Leaves the instance, but addresses a host rather than a person. Scored as
   // external exposure without the first-contact escalation, which is about
   // messaging someone we cannot identify.
-  if (facts.actionClass !== null && !COUNTERPARTY_ADDRESSED_CLASSES.has(facts.actionClass)) {
+  if (facts.actionClass !== null && HOST_ADDRESSED_CLASSES.has(facts.actionClass)) {
     return { audience: 'many', score: 30 };
   }
 

@@ -111,25 +111,24 @@ export const NEVER_FULLY_AUTONOMOUS: ReadonlySet<ActionClass> = new Set([
 ]);
 
 /**
- * Classes that address a counterparty — a person or company on the other end.
+ * Classes that address a host rather than a person.
  *
  * The `one_unknown` risk escalation ("first contact with a party we cannot
- * resolve") is about *messaging someone*, and only makes sense for these. A
- * browser click also leaves the instance, but it addresses a host, not a
- * person: scoring it as an unidentified first contact sent every ordinary
- * click to the approval queue and would have made the browser gate unusable.
+ * resolve") forces the sensitive band and therefore an approval. A browser
+ * click also leaves the instance, but it addresses a host, not a person, and
+ * scoring it as an unidentified first contact sent every ordinary click to the
+ * approval queue.
+ *
+ * Written as an explicit allowlist of the two classes the exemption is *for*,
+ * not as "everything except the classes that address people". The excluding
+ * form swept in `crm.write` — an outbound write to a system of record, with an
+ * unresolvable counterparty, dropped from `sensitive` to `routine` and stopped
+ * requiring a human. Any class added to the enum later must not be able to
+ * fall out of the sensitive band by omission.
  */
-export const COUNTERPARTY_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = new Set([
-  'email.reply',
-  'email.initiate',
-  'whatsapp.reply',
-  'whatsapp.initiate',
-  'quote.issue',
-  'discount.grant',
-  'commitment.make',
-  'doc.deliver',
-  'refund.issue',
-  'payment.make',
+export const HOST_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = new Set([
+  'browser.interact',
+  'browser.session',
 ]);
 
 /** Classes whose payload can carry a monetary amount the ceilings apply to. */
