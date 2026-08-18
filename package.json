@@ -1,0 +1,34 @@
+{
+  "name": "business-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI personal assistant for businesses — governance spine (Phase 0)",
+  "engines": {
+    "node": ">=22"
+  },
+  "allowScripts": [
+    "esbuild"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "migrate": "tsx src/db/migrate.ts",
+    "migrate:test": "tsx src/db/migrate.ts --test-db"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "pg": "^8.16.3",
+    "ulid": "^3.0.1",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.2",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "enabledPlugins": {
+    "context7@claude-plugins-official": true
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "node .claude/hooks/post-task-check.mjs",
+            "timeout": 180,
+            "statusMessage": "בודק קוד ואבטחה..."
+          }
+        ]
+      }
+    ]
+  }
+}

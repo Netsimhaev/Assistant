@@ -1,0 +1,108 @@
+import { describe, expect, it } from 'vitest';
+import {
+  AGENT_ALLOWLISTS,
+  AGENT_DENYLISTS,
+  COLLABORATION_GRAPH,
+  UNOWNED_TOOLS,
+  isToolPermitted,
+} from './capabilities.js';
+import {
+  READ_ONLY_TOOLS,
+  REFINEMENT_ONLY_CLASSES,
+  classifiedToolNames,
+  directlyMappedActionClasses,
+} from '../policy/classify.js';
+import { ActionClass } from '../domain/action.js';
+import type { AgentId } from '../domain/audit.js';
+
+const AGENTS = Object.keys(AGENT_ALLOWLISTS) as AgentId[];
+
+/**
+ * These are structural invariants, not behaviour tests. Each one encodes a way
+ * the capability table can drift out of step with the policy layer and produce
+ * either a dead rule or a silent hole.
+ */
+describe('capability table invariants', () => {
+  it('every allowlisted tool is either classified or explicitly read-only', () => {
+    const classified = new Set(classifiedToolNames());
+    const unknown: string[] = [];
+
+    for (const agent of AGENTS) {
+      for (const tool of AGENT_ALLOWLISTS[agent]) {
+        if (!classified.has(tool) && !READ_ONLY_TOOLS.has(tool)) {
+          unknown.push(`${agent} → ${tool}`);
+        }
+      }
+    }
+
+    // An unclassified tool in an allowlist would be treated as read-only and
+    // skip the gate entirely — a silent hole, not a loud failure.
+    expect(unknown).toEqual([]);
+  });
+
+  it('every side-effecting tool is reachable by some agent, or deliberately unowned', () => {
+    const owned = new Set(AGENTS.flatMap((agent) => AGENT_ALLOWLISTS[agent]));
+    const orphaned = classifiedToolNames().filter(
+      (tool) => !owned.has(tool) && !UNOWNED_TOOLS.includes(tool),
+    );
+
+    // An orphaned tool makes every charter rule about its action class dead
+    // code: the capability layer denies first, so the rule is never consulted.
+    expect(orphaned).toEqual([]);
+  });
+
+  it('every action class is reachable — no class the policy layer can never see', () => {
+    const reachable = new Set<string>([
+      ...directlyMappedActionClasses(),
+      ...REFINEMENT_ONLY_CLASSES,
+    ]);
+    const orphaned = ActionClass.options.filter((cls) => !reachable.has(cls));
+
+    // An orphaned class silently disables every rule written about it. The
+    // charter can declare a ceiling, budget.ts can enforce it, and the whole
+    // chain still never runs because no tool produces the class — which is
+    // exactly what happened to discount.grant before this test existed.
+    expect(orphaned).toEqual([]);
+  });
+
+  it('no tool appears in both an allowlist and its own denylist', () => {
+    const contradictions: string[] = [];
+    for (const agent of AGENTS) {
+      for (const tool of AGENT_ALLOWLISTS[agent]) {
+        if (!isToolPermitted(agent, tool)) {
+          contradictions.push(`${agent} → ${tool}`);
+        }
+      }
+    }
+    expect(contradictions).toEqual([]);
+  });
+
+  it('the quarantine agents hold no side-effecting capability at all', () => {
+    const classified = new Set(classifiedToolNames());
+    for (const agent of ['intake.triage', 'know.reader'] as const) {
+      const sideEffecting = AGENT_ALLOWLISTS[agent].filter((t) => classified.has(t));
+      expect(sideEffecting, `${agent} must stay a pure reader`).toEqual([]);
+    }
+  });
+
+  it('the browser operator cannot communicate, directly or by delegation', () => {
+    for (const tool of ['mail.send', 'wa.send_message', 'doc.deliver', 'quote.issue']) {
+      expect(isToolPermitted('ops.web', tool), tool).toBe(false);
+    }
+    // Nor indirectly: a hijacked session must not reach a comms agent by proxy.
+    expect(COLLABORATION_GRAPH['ops.web']).toEqual([]);
+  });
+
+  it('every agent appears in the denylist and collaboration tables', () => {
+    for (const agent of AGENTS) {
+      expect(AGENT_DENYLISTS[agent], agent).toBeDefined();
+      expect(COLLABORATION_GRAPH[agent], agent).toBeDefined();
+    }
+  });
+
+  it('collaboration is one level deep — no agent can delegate to itself', () => {
+    for (const agent of AGENTS) {
+      expect(COLLABORATION_GRAPH[agent], agent).not.toContain(agent);
+    }
+  });
+});
