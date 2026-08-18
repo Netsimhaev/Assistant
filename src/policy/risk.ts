@@ -1,4 +1,4 @@
-import { BASELINE_REVERSIBILITY } from '../domain/action.js';
+import { BASELINE_REVERSIBILITY, COUNTERPARTY_ADDRESSED_CLASSES } from '../domain/action.js';
 import type { ActionFacts, CompiledCeilings, PolicyBundle } from '../domain/policy.js';
 import type { RiskAssessment, RiskBand, RiskDimensions } from '../domain/risk.js';
 import {
@@ -155,6 +155,14 @@ function scoreVisibility(
   known: readonly string[],
 ): RiskDimensions['externalVisibility'] {
   if (!facts.leavesInstance) return { audience: 'internal', score: 0 };
+
+  // Leaves the instance, but addresses a host rather than a person. Scored as
+  // external exposure without the first-contact escalation, which is about
+  // messaging someone we cannot identify.
+  if (facts.actionClass !== null && !COUNTERPARTY_ADDRESSED_CLASSES.has(facts.actionClass)) {
+    return { audience: 'many', score: 30 };
+  }
+
   const resolved =
     (facts.counterpartyId !== null && known.includes(facts.counterpartyId)) ||
     facts.counterpartyTags.some((tag) => known.includes(tag));

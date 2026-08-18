@@ -16,6 +16,11 @@ const TOOL_ACTION_CLASS: Record<string, ActionClass> = {
   'crm.write': 'crm.write',
   'accounting.write': 'accounting.write',
   'browser.submit_order': 'purchase.place',
+  // Previously read-only. A hijacked session could therefore complete a
+  // checkout with ordinary clicks and never touch the gated submit_order.
+  'browser.click': 'browser.interact',
+  'browser.fill': 'browser.interact',
+  'credential.request_session': 'browser.session',
   'payment.charge': 'payment.make',
   'refund.issue': 'refund.issue',
   'quote.issue': 'quote.issue',
@@ -67,10 +72,7 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'file.write',
   'recipe.load',
   'recipe.save',
-  'credential.request_session',
   'browser.navigate',
-  'browser.click',
-  'browser.fill',
   'browser.snapshot',
   'browser.screenshot',
   'media.generate_image',
@@ -124,6 +126,8 @@ const OUTBOUND_TOOLS: ReadonlySet<string> = new Set([
   'crm.write',
   'accounting.write',
   'browser.navigate',
+  'browser.click',
+  'browser.fill',
   'browser.submit_order',
   'payment.charge',
   'refund.issue',
@@ -143,13 +147,6 @@ export function isOutbound(toolName: string): boolean {
 }
 
 /**
- * Refine a base class using the payload.
- *
- * `mail.send` is `email.reply` by default but `email.initiate` when there is no
- * thread to reply to — a materially different risk profile, since a first
- * contact with an unknown party is exactly what the sensitive band is for.
- */
-/**
  * Does the payload actually reference an existing thread?
  *
  * Tested positively — a non-empty string — rather than by excluding `undefined`.
@@ -162,6 +159,13 @@ function hasThreadRef(value: unknown): boolean {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+/**
+ * Refine a base class using the payload.
+ *
+ * `mail.send` is `email.reply` by default but `email.initiate` when there is no
+ * thread to reply to — a materially different risk profile, since a first
+ * contact with an unknown party is exactly what the sensitive band is for.
+ */
 export function refineActionClass(
   base: ActionClass,
   input: Record<string, unknown>,
@@ -173,6 +177,18 @@ export function refineActionClass(
       return hasThreadRef(input['conversationId'])
         ? 'whatsapp.reply'
         : 'whatsapp.initiate';
+    case 'browser.interact': {
+      // A click on a commit surface is a purchase, and is classified as one.
+      //
+      // The trigger is the amount the caller carries, never the button's label
+      // or any other text from the page: the page is written by whoever
+      // controls the site, so matching on "Buy now" would be reading the
+      // attacker's own input as policy. The orchestrator reads the live total
+      // from the DOM and puts it here, which is also what binds it to the
+      // approved plan (docs/08-risks.md, control 4).
+      const amount = input['amountMinor'];
+      return typeof amount === 'number' && amount > 0 ? 'purchase.place' : 'browser.interact';
+    }
     case 'calendar.create': {
       const op = input['operation'];
       if (op === 'move') return 'calendar.move';

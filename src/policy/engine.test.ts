@@ -582,3 +582,94 @@ describe('regressions found in review', () => {
     expect(theirs?.bundle.ceilings.dailyMinor).toBe(50);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The browser gate. Until now `browser.click` and `browser.fill` were
+// read-only, so they short-circuited the gate at step 4 and a hijacked session
+// could finish a checkout without ever touching the gated `browser.submit_order`.
+
+describe('browser gate', () => {
+  it('lets an approved session click and type without friction', async () => {
+    const bundle = await install();
+
+    // The point of classifying these was never to make ordinary browsing
+    // painful. A boss-initiated session still clicks freely.
+    const decision = await evaluateToolCall(
+      'browser.click',
+      { selector: '#next-page' },
+      ctx(bundle, { agent: 'ops.web', provenance: 'boss' }),
+    );
+
+    expect(decision.outcome).toBe('allow');
+  });
+
+  it('stops a session that has read an untrusted page from clicking at all', async () => {
+    const bundle = await install();
+
+    // This is the hijack. Once the chain's provenance is open_web, the
+    // provenance ceiling caps it at draft_only — a ceiling that existed all
+    // along and that click/fill were skipping past.
+    const decision = await evaluateToolCall(
+      'browser.click',
+      { selector: '#place-order' },
+      ctx(bundle, { agent: 'ops.web', provenance: 'open_web' }),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('draft_only:persist_as_draft');
+  });
+
+  it('treats a click that carries money as the purchase it is', async () => {
+    const bundle = await install();
+
+    // Classified on the amount the caller carries, never on the button's text:
+    // the page is written by whoever controls the site, so matching a label
+    // would be reading the attacker's own input as policy. supplier_a is
+    // approved to ₪2,500 and this is ₪2,600.
+    const decision = await evaluateToolCall(
+      'browser.click',
+      { selector: '#confirm', supplierId: 'supplier_a', amountMinor: 260_000 },
+      ctx(bundle, { agent: 'ops.web' }),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('budget_exceeded:supplier:supplier_a');
+  });
+
+  it('requires approval before an agent is handed a live session', async () => {
+    const bundle = await install();
+
+    const decision = await evaluateToolCall(
+      'credential.request_session',
+      { host: 'supplier-a.co.il' },
+      ctx(bundle, { agent: 'ops.web' }),
+    );
+
+    expect(decision.outcome).toBe('queue_approval');
+  });
+
+  it('an outbound stop reaches clicks, not just sends', async () => {
+    const bundle = await install();
+    await trip('outbound', 'p_boss', 'עצירת יוצא', {
+      businessId: BUSINESS,
+      charterVersion: bundle.charterVersion,
+    });
+
+    const decision = await evaluateToolCall(
+      'browser.click',
+      { selector: '#anything' },
+      ctx(bundle, { agent: 'ops.web' }),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('kill_switch_active');
+
+    await release('outbound', 'p_boss', 'סוף מבחן', {
+      businessId: BUSINESS,
+      charterVersion: bundle.charterVersion,
+    });
+  });
+});

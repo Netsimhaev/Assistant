@@ -27,6 +27,12 @@ const BASE_AUTONOMY: Record<ActionClass, AutonomyLevel> = {
   'accounting.write': 'approve_required',
   'doc.deliver': 'approve_required',
   'media.publish': 'approve_required',
+  // Clicking and typing in an already-approved session is ordinary work. The
+  // control that matters is the provenance ceiling above it: a chain that has
+  // read an untrusted page cannot reach `auto` no matter what this says.
+  'browser.interact': 'auto',
+  // Handing an agent a live authenticated session is not ordinary work.
+  'browser.session': 'approve_required',
   'contract.sign': 'forbidden',
   'data.export': 'approve_required',
   'memory.write_longterm': 'auto',

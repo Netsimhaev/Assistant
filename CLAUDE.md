@@ -8,7 +8,7 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 60 מבחנים
+npm test          # vitest run — 65 מבחנים
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_URL
@@ -46,7 +46,11 @@ npm run test:watch
 
 **כלי כתיבה חדש דורש שתי עריכות.** להוסיף ל-`TOOL_ACTION_CLASS` ב-[src/policy/classify.ts](src/policy/classify.ts) **וגם** ל-allowlist של סוכן ב-[src/charter/capabilities.ts](src/charter/capabilities.ts). כלי שחסר בשתיהן מטופל כקריאה-בלבד ו**עובר את השער בשקט**. זה הבאג שהפיל תשעה מבחנים בסשן שבנה את השלד.
 
-**`READ_ONLY_TOOLS` עוקף את שלבים 5–9 לגמרי** — וכולל כלים עם תופעות לוואי אמיתיות: `file.write`, `browser.click`, `browser.fill`, `credential.request_session`, `media.generate_image`. זו החלטה מודעת של שלב 0 שראויה לבחינה מחדש, לא תקלה. אם מוסיפים שם משהו, לוודא שהוא באמת לא צריך שער.
+**`READ_ONLY_TOOLS` עוקף את שלבים 5–9 לגמרי.** מי שנשאר שם עם תופעות לוואי אמיתיות: `file.write`, `media.generate_image`, `media.generate_video`. אם מוסיפים שם משהו, לוודא שהוא באמת לא צריך שער.
+
+**`browser.click`/`browser.fill` מסווגים כ-`browser.interact`, לא קריאה-בלבד.** הבסיס הוא `auto` — הגידור לא בא מהמחלקה אלא מ**תקרת המקור** מעליה: שרשרת שקראה דף לא אמין היא `open_web` ולכן `draft_only`. קליק שנושא `amountMinor > 0` מתעדן ל-`purchase.place`. הטריגר הוא הסכום ולעולם לא תווית הכפתור — הדף נכתב על ידי מי ששולט באתר, והתאמה לטקסט שלו היא קריאת הקלט של התוקף כמדיניות.
+
+**מחלקה שיוצאת מהמכונה לא בהכרח פונה לאדם.** `COUNTERPARTY_ADDRESSED_CLASSES` מפריד בין "הודעה לנמען" לבין "בקשה לשרת". ההסלמה `one_unknown` שייכת רק לראשונה — בלי ההפרדה הזו כל קליק בדפדפן הפך ל"מגע ראשון עם גורם לא מזוהה" ונשלח לתור אישורים.
 
 **כסף הוא מספר שלם ביחידות מינור, תמיד.** `readAmountMinor` ב-[src/policy/facts.ts](src/policy/facts.ts) **זורק `TypeError`** על עשרוני במקום לעגל. שים לב: זו חריגה ולא `deny` — היא יוצאת מ-`evaluateToolCall` ולא משאירה רשומת ביקורת.
 
@@ -106,7 +110,7 @@ npm run test:watch
 
 **החלטות מודעות שממתינות להכרעה — לא באגים, אבל גם לא סגורות:**
 
-`browser.click` ו-`browser.fill` הם `READ_ONLY_TOOLS`, כלומר סשן דפדפן שנחטף יכול להשלים רכישה בלי לגעת ב-`browser.submit_order` המגודר. זו ההשלכה החדה ביותר של הרשימה הזו וראוי להכריע בה לפני שמחברים דפדפן אמיתי.
+**נסגר ב-18/08:** שער הדפדפן הוכרע — ראה למעלה. מה שנותר פתוח הוא **קשירת התוכנית** (בקרה 4 ב-`docs/08-risks.md`): השוואת הסכום החי ב-DOM לסכום המאושר. דורשת תוכניות, כלומר Orchestrator.
 
 `redactedInput` מחזיר את הקלט הגולמי; `charter.data.redactBeforeSending` נקרא על ידי אף אחד. שעות השקט מופיעות במסמך החתום ואין להן נקודת אכיפה. שתיהן ממתינות ל-Orchestrator.
 

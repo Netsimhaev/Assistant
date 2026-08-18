@@ -36,6 +36,11 @@ export const ActionClass = z.enum([
   // Deliverables
   'doc.deliver',
   'media.publish',
+  // Live browser authority. Classified rather than read-only: a session holds
+  // the user's full authority on the site, and the page it reads is written by
+  // whoever controls that site (docs/08-risks.md, "the confused deputy").
+  'browser.interact',
+  'browser.session',
   // High blast radius
   'contract.sign',
   'data.export',
@@ -80,6 +85,12 @@ export const BASELINE_REVERSIBILITY: Record<ActionClass, Reversibility> = {
   'accounting.write': 'costly',
   'doc.deliver': 'irreversible',
   'media.publish': 'costly',
+  // Optimistic, and correct as a baseline: most clicks navigate. A click that
+  // commits money is refined to `purchase.place` before it is ever scored.
+  'browser.interact': 'reversible',
+  // Handing a live authenticated session to an agent is not undone by closing
+  // the tab — whatever it did with that authority is already done.
+  'browser.session': 'costly',
   'contract.sign': 'irreversible',
   'data.export': 'irreversible',
   'memory.write_longterm': 'reversible',
@@ -97,6 +108,28 @@ export const NEVER_FULLY_AUTONOMOUS: ReadonlySet<ActionClass> = new Set([
   'refund.issue',
   'data.export',
   'charter.amend',
+]);
+
+/**
+ * Classes that address a counterparty — a person or company on the other end.
+ *
+ * The `one_unknown` risk escalation ("first contact with a party we cannot
+ * resolve") is about *messaging someone*, and only makes sense for these. A
+ * browser click also leaves the instance, but it addresses a host, not a
+ * person: scoring it as an unidentified first contact sent every ordinary
+ * click to the approval queue and would have made the browser gate unusable.
+ */
+export const COUNTERPARTY_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = new Set([
+  'email.reply',
+  'email.initiate',
+  'whatsapp.reply',
+  'whatsapp.initiate',
+  'quote.issue',
+  'discount.grant',
+  'commitment.make',
+  'doc.deliver',
+  'refund.issue',
+  'payment.make',
 ]);
 
 /** Classes whose payload can carry a monetary amount the ceilings apply to. */
