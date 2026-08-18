@@ -1,0 +1,12 @@
+# Normalize to LF in the repository and on checkout, on every platform.
+#
+# Without this, Git for Windows (core.autocrlf=true) rewrites the working copy
+# to CRLF on checkout. That is self-consistent on one machine, but it makes the
+# line endings a property of *who checked out* rather than of the repository —
+# and the .mjs hook here is invoked through bash.
+* text=auto eol=lf
+
+# Binary — never touch.
+*.png binary
+*.jpg binary
+*.pdf binary
