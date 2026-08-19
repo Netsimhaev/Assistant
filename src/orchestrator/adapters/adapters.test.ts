@@ -871,6 +871,10 @@ describe('the mail adapter', () => {
       { label: 'a non-string to value', input: { to: 123 } },
       { label: 'a mixed-type to list', input: { to: [123, 'a@b.com'] } },
       { label: 'a display-name-wrapped to string', input: { to: 'Dana Cohen <dana@x.com>' } },
+      // The adversarial form: a bare address followed by a bracketed one.
+      // Both readers must extract the bracketed address and nothing else --
+      // 'a@b.com' is display-name-shaped text here, not a second recipient.
+      { label: 'a bare address followed by a bracket-wrapped one', input: { to: 'a@b.com <evil@x.com>' } },
     ];
 
     it.each(cases.map(({ label, input }) => [label, input] as const))(
@@ -878,20 +882,23 @@ describe('the mail adapter', () => {
       (_label, input) => {
         const delivered = readRecipients(input);
 
-        // The property the coordinator asked for, literally: every
-        // delivered address appears somewhere the gate looked. Written as
-        // substring containment rather than exact membership because
-        // extraction (display-name unwrapping) narrows a fragment to a
-        // substring of itself -- the gate's token still contains it
-        // untouched. This holds for *any* subset of {to, recipient, email}
-        // the adapter might read, since the gate reads the union of all
-        // three; it is necessary but, on its own, cannot detect the adapter
-        // reading more keys than it should (see below).
+        // Exact membership, not substring containment: `readEmails` and
+        // `readRecipients` now both extract addresses through the same
+        // `extractAddressCandidate` (`src/util/address.ts`), so for a
+        // fragment that came from `to`, the two must produce the identical
+        // token, not merely tokens where one contains the other. A
+        // substring check would still pass if the gate kept the raw,
+        // un-unwrapped token and the adapter delivered to something merely
+        // *found inside* it -- which is exactly the shape of the bypass this
+        // suite exists to catch (T7-13): the adapter unwrapping a
+        // display-name form for delivery while the gate screened the whole
+        // un-unwrapped string, or a domain parsed off a different substring
+        // of it entirely.
         const screenedEverywhere = readEmails(input);
         for (const address of delivered) {
           expect(
-            screenedEverywhere.some((token) => token.includes(address.toLowerCase())),
-            `delivered "${address}" was not screened anywhere: ${JSON.stringify(screenedEverywhere)}`,
+            screenedEverywhere.includes(address.toLowerCase()),
+            `delivered "${address}" does not exactly match anything screened: ${JSON.stringify(screenedEverywhere)}`,
           ).toBe(true);
         }
 
@@ -905,7 +912,7 @@ describe('the mail adapter', () => {
         const screenedFromToAlone = readEmails({ to: input['to'] });
         for (const address of delivered) {
           expect(
-            screenedFromToAlone.some((token) => token.includes(address.toLowerCase())),
+            screenedFromToAlone.includes(address.toLowerCase()),
             `delivered "${address}" did not come from \`to\`: ${JSON.stringify(screenedFromToAlone)}`,
           ).toBe(true);
         }
@@ -917,6 +924,16 @@ describe('the mail adapter', () => {
       // field must never become a delivery target.
       const input = { to: 'accounting@firm.com', recipient: 'other@firm.com', email: 'client@ext.com' };
       expect(readRecipients(input)).toEqual(['accounting@firm.com']);
+    });
+
+    it('extracts the bracketed address, not the bare one preceding it, and the gate screens the same address', () => {
+      // Directly pins the adversarial example from T7-13: before the shared
+      // normalisation, the gate's domain parse on the raw token
+      // 'a@b.com <evil@x.com>' was 'b.com <evil' -- neither real domain --
+      // while the adapter delivered to evil@x.com regardless.
+      const input = { to: 'a@b.com <evil@x.com>' };
+      expect(readRecipients(input)).toEqual(['evil@x.com']);
+      expect(readEmails(input)).toEqual(['evil@x.com']);
     });
   });
 

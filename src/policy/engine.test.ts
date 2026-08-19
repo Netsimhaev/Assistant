@@ -525,6 +525,27 @@ describe('regressions found in review', () => {
     expect(denials.some((e) => e.reason.includes('rival-legal.co.il'))).toBe(true);
   });
 
+  it('blocks a do-not-contact email domain even behind a display-name wrapper', async () => {
+    // `matchDoNotContact` reads the domain with `email.split('@')[1]`. Before
+    // `readEmails` unwrapped a display-name form itself, that split ran
+    // against the whole raw token -- 'dana cohen <dana@rival-legal.co.il>'
+    // -- and returned 'rival-legal.co.il>' with the closing bracket still
+    // attached, so this exact charter entry never matched while the mail
+    // adapter had already learned to unwrap the same string down to a
+    // deliverable address. This is the regression test for that gap.
+    const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
+
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'Dana Cohen <dana@rival-legal.co.il>', inReplyTo: 'thread-1', body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('do_not_contact');
+  });
+
   it('does not score an unresolvable counterparty as one we know', async () => {
     const bundle = await install();
 

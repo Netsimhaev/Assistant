@@ -1,4 +1,5 @@
 import { REDACTED } from '../../policy/redact.js';
+import { extractAddressCandidate } from '../../util/address.js';
 import type { AdapterCall, AdapterResult, CredentialHandle, ExternalAdapter } from './types.js';
 
 export interface MailMessage {
@@ -250,24 +251,30 @@ function readString(input: Record<string, unknown>, key: string): string | null 
  */
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** A trailing `<addr>` wrapper, as in `Dana Cohen <dana@x.com>`. */
-const DISPLAY_NAME_WRAPPER = /<([^<>]+)>\s*$/;
-
 /**
  * The address one `to` fragment names, or `null` if it names none.
  *
- * Unwraps a display-name form (`Name <addr@x.com>`) by taking whatever is
- * inside the trailing angle brackets, falling back to the fragment itself
- * when there is no wrapper. Refuses the result if it still carries the
- * redaction placeholder anywhere -- not only when it equals the placeholder
- * outright, because `redactPayload` does substring replacement, so
- * `'[הוסר]@x.com'` is a partially-redacted address, not a clean one, and
- * must be refused exactly as firmly as `'[הוסר]'` alone. Only then is the
- * result checked against `EMAIL_SHAPE`.
+ * Delegates the actual extraction -- unwrapping a `Name <addr@x.com>`
+ * display-name form -- to `extractAddressCandidate` in `src/util/address.ts`,
+ * the same function `readEmails` (the gate's screening reader, in
+ * `src/policy/facts.ts`) calls. Sharing it is not a style choice: the gate's
+ * do-not-contact check and this adapter's actual send must derive the exact
+ * same address from the exact same input, or screening one string while
+ * delivering to a different one silently defeats the block. See that
+ * function's docblock for the concrete bypass this closes.
+ *
+ * On top of the shared extraction, this function refuses the result if it
+ * still carries the redaction placeholder anywhere -- not only when it
+ * equals the placeholder outright, because `redactPayload` does substring
+ * replacement, so `'[הוסר]@x.com'` is a partially-redacted address, not a
+ * clean one, and must be refused exactly as firmly as `'[הוסר]'` alone. Only
+ * then is the result checked against `EMAIL_SHAPE`. Neither check runs in
+ * the shared function: they are delivery-only strictness, not something the
+ * gate's deliberately wide screening should also apply.
  */
 function extractEmail(fragment: string): string | null {
-  const wrapped = DISPLAY_NAME_WRAPPER.exec(fragment);
-  const candidate = (wrapped?.[1] ?? fragment).trim();
+  const candidate = extractAddressCandidate(fragment);
+  if (candidate === null) return null;
   if (candidate.includes(REDACTED)) return null;
   return EMAIL_SHAPE.test(candidate) ? candidate : null;
 }
@@ -293,6 +300,16 @@ function extractEmail(fragment: string): string | null {
  * must be something `readEmails` would have screened -- never equality:
  * equality is the property that let the two readers drift into reading the
  * same three keys in the first place.
+ *
+ * Same normalisation, different key breadth: this function and `readEmails`
+ * read different *keys* off the payload (by design, above), but they must
+ * turn a fragment into an address the exact same way -- both call
+ * `extractAddressCandidate` in `src/util/address.ts`. A `to`-only reader
+ * that unwrapped display names on its own, independently of how the gate
+ * did it, was a real bypass: the gate screened one string, this function
+ * delivered to a different one extracted from the same input, and a
+ * do-not-contact domain block on the extracted address never matched the
+ * gate's un-unwrapped one.
  *
  * Also dedupes, case-insensitively, preserving the order addresses first
  * appear in: `'a@b.com, a@b.com'` must not hand the transport the same

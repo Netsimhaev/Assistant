@@ -1,6 +1,7 @@
 import type { DataClass } from '../domain/charter.js';
 import type { ActionFacts } from '../domain/policy.js';
 import type { TrustLevel } from '../domain/trust.js';
+import { extractAddressCandidate } from '../util/address.js';
 import { canonicalHash } from '../util/canonical.js';
 import { classifyAction, isOutbound, refineActionClass } from './classify.js';
 
@@ -89,6 +90,20 @@ function readString(input: Record<string, unknown>, key: string): string | null 
  * All of them, not the first: checking one address of several reads as "we
  * checked" while being false.
  *
+ * Each split fragment is run through `extractAddressCandidate`
+ * (`src/util/address.ts`) before anything else, the same function
+ * `readRecipients` (delivery, `src/orchestrator/adapters/mail.ts`) uses --
+ * see that function's docblock for why sharing it is load-bearing rather
+ * than a style choice. Concretely: `matchDoNotContact` and the
+ * `byEmailDomain` autonomy override below both key off `email.split('@')[1]`
+ * -- the domain of *this function's output*. Before the shared extraction, a
+ * display-name form like `'Dana Cohen <dana@x.com>'` was kept whole, so that
+ * split read the domain as `'x.com>'` (the closing bracket still attached)
+ * and a charter entry blocking `x.com` silently never matched, while the
+ * mail adapter had already learned to unwrap the same string down to
+ * `dana@x.com` for delivery. Unwrapping here first makes the domain this
+ * function's callers screen the same domain the adapter actually sends to.
+ *
  * Exported so `src/orchestrator/adapters/mail.ts`'s own recipient reader can
  * be pinned against this one by a parity test: the mail adapter must never
  * mail an address the gate did not also see when it decided whether the
@@ -97,8 +112,9 @@ function readString(input: Record<string, unknown>, key: string): string | null 
 export function readEmails(input: Record<string, unknown>): string[] {
   return collectStrings(input, ['to', 'recipient', 'email'])
     .flatMap((value) => value.split(/[,;]/))
-    .map((value) => value.trim().toLowerCase())
-    .filter((value) => value.length > 0);
+    .map((value) => extractAddressCandidate(value))
+    .filter((value): value is string => value !== null)
+    .map((value) => value.toLowerCase());
 }
 
 /**
