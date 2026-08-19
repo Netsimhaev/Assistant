@@ -611,12 +611,16 @@ describe('the mail adapter', () => {
       expect(sent).toHaveLength(0);
     });
 
-    it('refuses a comma-shredded display name rather than mailing a fragment of it', async () => {
+    it('refuses a partially-redacted address, not only the exact placeholder', async () => {
+      // redactPayload does substring replacement, so '[הוסר]@x.com' is what
+      // a redacted local part actually looks like -- it passes both an
+      // exact-placeholder check and the shape check, and would otherwise be
+      // mailed to the real, unredacted domain.
       const { transport, sent } = recordingTransport();
       const adapter = createMailAdapter({ system: 'office-mail', transport });
 
       const result = await adapter.execute(
-        mailCall({ input: { to: '"Cohen, Dana" <dana@x.com>', subject: 's', body: 'b' } }),
+        mailCall({ input: { to: `${REDACTED}@x.com`, subject: 's', body: 'b' } }),
       );
 
       expect(result).toEqual({
@@ -626,6 +630,75 @@ describe('the mail adapter', () => {
         message: expect.any(String),
       });
       expect(sent).toHaveLength(0);
+    });
+
+    it('extracts the address from a display-name wrapper', async () => {
+      // 'Dana Cohen <dana@x.com>' has no comma, so it survives the split
+      // intact; EMAIL_SHAPE alone would refuse it for the internal
+      // whitespace, which is exactly the regression this guards.
+      const { transport, sent } = recordingTransport();
+      const adapter = createMailAdapter({ system: 'office-mail', transport });
+
+      const result = await adapter.execute(
+        mailCall({ input: { to: 'Dana Cohen <dana@x.com>', subject: 's', body: 'b' } }),
+      );
+
+      expect(result.ok).toBe(true);
+      expect(sent[0]?.to).toEqual(['dana@x.com']);
+    });
+
+    it('recovers the bracketed address from a comma-shredded display name', async () => {
+      // '"Cohen, Dana" <dana@x.com>' splits on the comma into '"Cohen' and
+      // 'Dana" <dana@x.com>'. The first fragment has no address and is
+      // dropped; the second still ends in a well-formed <addr> wrapper, so
+      // extractEmail recovers the real address from it. This is the
+      // intended effect of accepting display-name wrappers at all -- it is
+      // not a special case for shredded input, just what falls out of
+      // extracting from whichever fragment carries the brackets.
+      const { transport, sent } = recordingTransport();
+      const adapter = createMailAdapter({ system: 'office-mail', transport });
+
+      const result = await adapter.execute(
+        mailCall({ input: { to: '"Cohen, Dana" <dana@x.com>', subject: 's', body: 'b' } }),
+      );
+
+      expect(result.ok).toBe(true);
+      expect(sent[0]?.to).toEqual(['dana@x.com']);
+    });
+
+    it('refuses when no fragment contains a valid address to extract', async () => {
+      const { transport, sent } = recordingTransport();
+      const adapter = createMailAdapter({ system: 'office-mail', transport });
+
+      const result = await adapter.execute(
+        mailCall({ input: { to: '"Cohen, just a name, no address at all"', subject: 's', body: 'b' } }),
+      );
+
+      expect(result).toEqual({
+        ok: false,
+        retryable: false,
+        code: 'no_recipient',
+        message: expect.any(String),
+      });
+      expect(sent).toHaveLength(0);
+    });
+
+    it('dedupes a repeated address, preserving the order the rest arrived in', async () => {
+      const { transport, sent } = recordingTransport();
+      const adapter = createMailAdapter({ system: 'office-mail', transport });
+
+      await adapter.execute(mailCall({ input: { to: 'a@b.com, c@d.com, a@b.com', subject: 's', body: 'b' } }));
+
+      expect(sent[0]?.to).toEqual(['a@b.com', 'c@d.com']);
+    });
+
+    it('dedupes case-insensitively, keeping the first casing seen', async () => {
+      const { transport, sent } = recordingTransport();
+      const adapter = createMailAdapter({ system: 'office-mail', transport });
+
+      await adapter.execute(mailCall({ input: { to: 'A@b.com, a@b.com', subject: 's', body: 'b' } }));
+
+      expect(sent[0]?.to).toEqual(['A@b.com']);
     });
   });
 
@@ -769,22 +842,27 @@ describe('the mail adapter', () => {
     });
   });
 
-  describe('recipient reading matches the gate exactly', () => {
-    // Driven over one shared case table rather than compared against
-    // separately hand-written expectations: only running both functions on
-    // the same input can catch the two drifting apart, which is exactly
-    // what happened before this table existed (the adapter read only `to`;
-    // the gate also reads `recipient` and `email`).
+  describe('recipient delivery is a subset of what the gate screened, never equal', () => {
+    // Screening (readEmails, in the gate) deliberately over-approximates:
+    // it reads to/recipient/email so do-not-contact checks the widest
+    // plausible set, and a false positive there costs nothing. Delivery
+    // (readRecipients, here) must be exact -- every address it returns gets
+    // a real message -- so it reads `to` alone. The two were briefly made to
+    // read the same three keys so an equality-based version of this test
+    // would pass; that widening let a payload's `email` field become a
+    // delivery target instead of something the gate merely noticed, for
+    // `{ to: 'accounting@firm.com', email: 'client@ext.com' }`. Equality is
+    // the wrong relation between screening and delivery and must never come
+    // back; subset is.
     const cases: { label: string; input: Record<string, unknown> }[] = [
       { label: 'a single to string', input: { to: 'a@b.com' } },
       { label: 'a to list', input: { to: ['a@b.com', 'c@d.com'] } },
       { label: 'a comma-joined to string', input: { to: 'a@b.com, c@d.com' } },
       { label: 'a semicolon-joined to string', input: { to: 'a@b.com; c@d.com' } },
-      { label: 'the recipient key alone', input: { recipient: 'a@b.com' } },
-      { label: 'the recipient key as a list', input: { recipient: ['a@b.com', 'c@d.com'] } },
-      { label: 'the email key alone', input: { email: 'a@b.com' } },
+      { label: 'the recipient key alone (must deliver nothing)', input: { recipient: 'a@b.com' } },
+      { label: 'the email key alone (must deliver nothing)', input: { email: 'a@b.com' } },
       {
-        label: 'to, recipient and email all present',
+        label: 'to, recipient and email all present (must deliver only to)',
         input: { to: 'a@b.com', recipient: 'c@d.com', email: 'e@f.com' },
       },
       { label: 'no recipient key at all', input: {} },
@@ -792,27 +870,54 @@ describe('the mail adapter', () => {
       { label: 'an empty to list', input: { to: [] } },
       { label: 'a non-string to value', input: { to: 123 } },
       { label: 'a mixed-type to list', input: { to: [123, 'a@b.com'] } },
-      // Deliberately not included: `{ to: REDACTED }`. readEmails has no
-      // shape validation at all (it only matches do-not-contact entries, so
-      // an unparseable string is harmless there) and would collect it as an
-      // address; readRecipients must not, per the dedicated test above in
-      // 'recipient shape validation'. That is a real, intentional
-      // divergence -- this table exists to catch the *unintentional* kind,
-      // an address one function reads and the other silently drops.
+      { label: 'a display-name-wrapped to string', input: { to: 'Dana Cohen <dana@x.com>' } },
     ];
 
     it.each(cases.map(({ label, input }) => [label, input] as const))(
-      'agrees with the gate on the recipient set for: %s',
+      'is contained in what the gate screened, for: %s',
       (_label, input) => {
-        // readEmails lower-cases for do-not-contact matching; readRecipients
-        // keeps the original case for delivery. The two must still name the
-        // same *set* of addresses, so case is normalised only for this
-        // comparison.
-        const fromAdapter = readRecipients(input).map((value) => value.toLowerCase());
-        const fromGate = readEmails(input);
-        expect(fromAdapter).toEqual(fromGate);
+        const delivered = readRecipients(input);
+
+        // The property the coordinator asked for, literally: every
+        // delivered address appears somewhere the gate looked. Written as
+        // substring containment rather than exact membership because
+        // extraction (display-name unwrapping) narrows a fragment to a
+        // substring of itself -- the gate's token still contains it
+        // untouched. This holds for *any* subset of {to, recipient, email}
+        // the adapter might read, since the gate reads the union of all
+        // three; it is necessary but, on its own, cannot detect the adapter
+        // reading more keys than it should (see below).
+        const screenedEverywhere = readEmails(input);
+        for (const address of delivered) {
+          expect(
+            screenedEverywhere.some((token) => token.includes(address.toLowerCase())),
+            `delivered "${address}" was not screened anywhere: ${JSON.stringify(screenedEverywhere)}`,
+          ).toBe(true);
+        }
+
+        // The property that actually catches the regression: everything
+        // delivered must be traceable to `to` alone, not to `recipient` or
+        // `email`. `screenedEverywhere` above is a superset regardless of
+        // which keys the adapter reads (the gate always reads all three),
+        // so that check alone passes even if `readRecipients` is widened
+        // back to three keys -- only comparing against the gate's `to`-only
+        // view can fail in that case.
+        const screenedFromToAlone = readEmails({ to: input['to'] });
+        for (const address of delivered) {
+          expect(
+            screenedFromToAlone.some((token) => token.includes(address.toLowerCase())),
+            `delivered "${address}" did not come from \`to\`: ${JSON.stringify(screenedFromToAlone)}`,
+          ).toBe(true);
+        }
       },
     );
+
+    it('delivers only the `to` address, never one that arrived under `recipient` or `email`', () => {
+      // The coordinator's own example, pinned directly: a stray `email`
+      // field must never become a delivery target.
+      const input = { to: 'accounting@firm.com', recipient: 'other@firm.com', email: 'client@ext.com' };
+      expect(readRecipients(input)).toEqual(['accounting@firm.com']);
+    });
   });
 
   it('passes the shared adapter contract', async () => {

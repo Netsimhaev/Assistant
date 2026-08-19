@@ -244,48 +244,77 @@ function readString(input: Record<string, unknown>, key: string): string | null 
 /**
  * A deliberately loose but shape-checked address: no internal whitespace,
  * exactly the one `@`, and at least one `.` in the domain part. Not RFC
- * 5322 -- just enough to refuse the two concrete failures this guards
- * against: the redaction placeholder, and a fragment of a comma-shredded
- * display name like `"Cohen, Dana" <dana@x.com>` (which splits into
- * `"Cohen` and `Dana" <dana@x.com>`, neither of which is a bare address).
+ * 5322 -- just enough to refuse a fragment of a comma-shredded display name
+ * with no address in it, and to validate whatever `extractEmail` pulled out
+ * of an angle-bracket wrapper.
  */
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function isPlausibleEmail(value: string): boolean {
-  // Named explicitly rather than relying on EMAIL_SHAPE to reject it by
-  // accident: '[הוסר]' has no '@' and would already fail the pattern, but
-  // the redaction placeholder is exactly the one string this check must
-  // never let through, on purpose, forever -- not merely today, by
-  // coincidence of what the pattern happens to match.
-  if (value === REDACTED) return false;
-  return EMAIL_SHAPE.test(value);
+/** A trailing `<addr>` wrapper, as in `Dana Cohen <dana@x.com>`. */
+const DISPLAY_NAME_WRAPPER = /<([^<>]+)>\s*$/;
+
+/**
+ * The address one `to` fragment names, or `null` if it names none.
+ *
+ * Unwraps a display-name form (`Name <addr@x.com>`) by taking whatever is
+ * inside the trailing angle brackets, falling back to the fragment itself
+ * when there is no wrapper. Refuses the result if it still carries the
+ * redaction placeholder anywhere -- not only when it equals the placeholder
+ * outright, because `redactPayload` does substring replacement, so
+ * `'[הוסר]@x.com'` is a partially-redacted address, not a clean one, and
+ * must be refused exactly as firmly as `'[הוסר]'` alone. Only then is the
+ * result checked against `EMAIL_SHAPE`.
+ */
+function extractEmail(fragment: string): string | null {
+  const wrapped = DISPLAY_NAME_WRAPPER.exec(fragment);
+  const candidate = (wrapped?.[1] ?? fragment).trim();
+  if (candidate.includes(REDACTED)) return null;
+  return EMAIL_SHAPE.test(candidate) ? candidate : null;
 }
 
 /**
- * Every recipient, whether the payload carried a list or one joined string.
+ * Every recipient the message actually goes to, whether the payload carried
+ * a list or one joined string.
  *
- * Reads the same three keys as `readEmails` in `src/policy/facts.ts` — `to`,
- * `recipient`, `email` — with the same split-and-collect shape, so the
- * gate's do-not-contact check and this adapter's actual send never look at
- * different recipient sets. This function keeps the original case (SMTP
- * local parts are, by RFC, case-sensitive) where `readEmails` lower-cases
- * for matching; the parity test in `adapters.test.ts` drives both functions
- * over one case table and normalises case before comparing, rather than
- * checking each against a separately hand-written expectation that could
- * drift from the other file without anyone noticing.
+ * Reads `to` only -- deliberately narrower than `readEmails` in
+ * `src/policy/facts.ts`, which also reads `recipient` and `email`. Those two
+ * readers exist for different purposes and must never be collapsed into
+ * one: `readEmails` **screens**, so it deliberately over-approximates --
+ * anything that might be a recipient gets checked against do-not-contact,
+ * because a false positive there costs nothing and a false negative lets a
+ * blocked address through. This function **delivers** -- every address it
+ * returns receives a real message -- so it must be exact, not wide. A
+ * payload of `{ to: 'accounting@firm.com', email: 'client@ext.com' }` is
+ * meant to screen both, but deliver only to the first; reading `email` here
+ * too would silently mail the client, and would turn any field an upstream
+ * caller lets an attacker set into a delivery channel rather than something
+ * the gate merely noticed. The parity test in `adapters.test.ts` asserts
+ * the resulting **subset** relation -- everything this function delivers to
+ * must be something `readEmails` would have screened -- never equality:
+ * equality is the property that let the two readers drift into reading the
+ * same three keys in the first place.
+ *
+ * Also dedupes, case-insensitively, preserving the order addresses first
+ * appear in: `'a@b.com, a@b.com'` must not hand the transport the same
+ * address twice.
  */
 export function readRecipients(input: Record<string, unknown>): string[] {
+  const raw = input['to'];
   const values: string[] = [];
-  for (const key of ['to', 'recipient', 'email']) {
-    const raw = input[key];
-    if (typeof raw === 'string') values.push(raw);
-    else if (Array.isArray(raw)) {
-      for (const item of raw) if (typeof item === 'string') values.push(item);
-    }
+  if (typeof raw === 'string') values.push(raw);
+  else if (Array.isArray(raw)) {
+    for (const item of raw) if (typeof item === 'string') values.push(item);
   }
 
-  return values
-    .flatMap((value) => value.split(/[,;]/))
-    .map((value) => value.trim())
-    .filter((value) => isPlausibleEmail(value));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const fragment of values.flatMap((value) => value.split(/[,;]/))) {
+    const email = extractEmail(fragment.trim());
+    if (email === null) continue;
+    const dedupeKey = email.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(email);
+  }
+  return out;
 }
