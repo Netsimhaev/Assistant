@@ -6,6 +6,7 @@ import type { AdapterCall, AdapterResult, CredentialHandle, ExternalAdapter } fr
 import { createCredentialHandle } from './types.js';
 import { classifiedToolNames, READ_ONLY_TOOLS } from '../../policy/classify.js';
 import { canonicalJson } from '../../util/canonical.js';
+import { envCredentials } from '../credentials.js';
 
 function call(over: Partial<AdapterCall> = {}): AdapterCall {
   return {
@@ -292,5 +293,41 @@ describe('CredentialHandle is branded, not just conventionally built', () => {
   it('accepts the factory output as a real CredentialHandle', () => {
     const handle: CredentialHandle = createCredentialHandle('ref-1', 'secret');
     expect(handle.ref).toBe('ref-1');
+  });
+});
+
+describe('credentials', () => {
+  it('resolves a ref to a value from the environment', async () => {
+    const source = envCredentials({ OFFICE_MAIL: 'secret-value' });
+    const handle = await source.resolve('OFFICE_MAIL');
+    expect(handle?.value).toBe('secret-value');
+  });
+
+  it('returns null for a ref nothing defines, rather than an empty secret', async () => {
+    // An empty credential would be attempted and fail at the far end; null
+    // stops the step before it reaches an external system at all.
+    expect(await envCredentials({}).resolve('MISSING')).toBeNull();
+  });
+
+  it('returns null for a ref that resolves to an empty string', async () => {
+    // Distinct from "nothing defines it": an env var can be present but set
+    // to '', and that must be refused exactly like an absent one.
+    expect(await envCredentials({ EMPTY: '' }).resolve('EMPTY')).toBeNull();
+  });
+
+  it('does not serialise the value when the handle is stringified', async () => {
+    const handle = await envCredentials({ K: 'secret-value' }).resolve('K');
+    expect(JSON.stringify(handle)).not.toContain('secret-value');
+  });
+
+  it('keeps the secret out of canonicalJson for a handle this module produces', async () => {
+    // toJSON alone covers JSON.stringify; canonicalJson walks Object.keys
+    // directly and never calls it, so this is a separate guard against a
+    // separate path. envCredentials must go through createCredentialHandle
+    // rather than a plain object literal for this to hold.
+    const handle = await envCredentials({ K: 'super-secret-value' }).resolve('K');
+    const serialised = canonicalJson({ credential: handle });
+    expect(serialised).toContain('K');
+    expect(serialised).not.toContain('super-secret-value');
   });
 });
