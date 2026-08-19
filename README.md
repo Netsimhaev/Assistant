@@ -13,7 +13,7 @@
 npm install
 cp .env.example .env      # התאם את DATABASE_URL אם צריך
 npm run migrate           # יוצר את הסכמה
-npm test                  # 406 מבחנים
+npm test                  # 416 מבחנים
 ```
 
 דרישות: Node ≥ 22 · PostgreSQL (נבדק על 17.11) עם שני בסיסי נתונים — `assistant_dev` ו-`assistant_test`.

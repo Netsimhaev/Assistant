@@ -71,6 +71,17 @@ export interface MailSendContext {
  * among them) already throws.
  */
 export interface MailTransport {
+  /**
+   * **An implementation MUST reject or encode CR and LF in any value it
+   * places in a header field** -- `subject` above all, and every element of
+   * `to`. Nothing upstream strips them: a hand-rolled SMTP client that
+   * writes `Subject: ${subject}` straight into the wire format lets a
+   * newline inside the subject open a `Bcc:` header, delivering to an
+   * address the gate never screened against do-not-contact. There is no
+   * exploit in this repository today because there is no real transport in
+   * it; the requirement is stated here because the first one written is
+   * where it becomes real.
+   */
   send(message: MailMessage, context: MailSendContext): Promise<{ messageId: string }>;
 }
 

@@ -9,6 +9,7 @@ import {
   matchesToolPattern,
 } from '../domain/charter.js';
 import { classifiedToolNames, READ_ONLY_TOOLS } from '../policy/classify.js';
+import { domainMatches } from '../util/address.js';
 import { UNOWNED_TOOLS, matchesPattern } from './capabilities.js';
 
 describe('charter signing', () => {
@@ -402,5 +403,81 @@ describe('charter schema version', () => {
       );
       expect(versionIssue).toBeDefined();
     }
+  });
+});
+
+describe('an emailDomain rule that cannot match is refused at signing', () => {
+  /** The charter as the schema sees it, with one do-not-contact domain rule. */
+  function withDomain(domain: string): unknown {
+    const charter = buildCharter() as unknown as {
+      counterparties: { match: { emailDomain?: string }; label: string; trust: string;
+        autonomyOverrides: Record<string, string>; doNotContact: boolean; notes: string }[];
+    };
+    return {
+      ...charter,
+      counterparties: [
+        ...charter.counterparties,
+        {
+          match: { emailDomain: domain },
+          label: 'חברה חסומה',
+          trust: 'unknown_external',
+          autonomyOverrides: {},
+          doNotContact: true,
+          notes: '',
+        },
+      ],
+    };
+  }
+
+  // Every one of these signed cleanly, compiled into
+  // `doNotContact.emailDomains`, and blocked nothing -- because the old check
+  // was `normaliseDomainString(domain) !== null`, which is non-null for
+  // essentially any printable string.
+  const DEAD: [string, string][] = [
+    ['a wildcard', '*.rival.co.il'],
+    ['a full address', 'dana@rival.co.il'],
+    ['a leading dot', '.rival.co.il'],
+    ['a URL', 'https://rival.co.il'],
+    ['a trailing slash', 'rival.co.il/'],
+    ['a single label', 'rival'],
+    ['a label ending in a hyphen', 'rival-.co.il'],
+  ];
+
+  for (const [label, domain] of DEAD) {
+    it(`refuses ${label}: ${domain}`, () => {
+      const result = BusinessCharter.safeParse(withDomain(domain));
+      expect(result.success, `"${domain}" must not sign`).toBe(false);
+    });
+  }
+
+  it('tells the owner what to write instead of a wildcard', () => {
+    // Refused with a reason, not silently normalised to the bare domain: an
+    // owner who guesses at syntax guesses again next time.
+    const result = BusinessCharter.safeParse(withDomain('*.rival.co.il'));
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error('unreachable');
+    expect(JSON.stringify(result.error.issues)).toContain('rival.co.il');
+  });
+
+  it('still accepts a plain domain, and it still blocks every subdomain', () => {
+    // The guard against over-tightening. `*.rival.co.il` is refused precisely
+    // because the bare form ALREADY covers subdomains; if that stopped being
+    // true the refusal would be removing a capability rather than a dead rule.
+    // Through the fixture, so the charter is signed and `compileCharter`
+    // will verify it rather than refuse.
+    const bundle = compileCharter(buildCharter({ doNotContactEmailDomain: 'rival.co.il' }));
+    expect(bundle.doNotContact.emailDomains).toContain('rival.co.il');
+    expect(domainMatches('mail.rival.co.il', 'rival.co.il')).toBe(true);
+    expect(domainMatches('rival.co.il', 'rival.co.il')).toBe(true);
+    // And not a lookalike, which is what anchoring on the label boundary buys.
+    expect(domainMatches('evilrival.co.il', 'rival.co.il')).toBe(false);
+  });
+
+  it('still accepts the leading-@ shorthand, which normalises to a real domain', () => {
+    // `normaliseDomainString` strips a leading `@` on purpose, so this one is
+    // NOT a dead rule -- it compiles to `rival.co.il` and matches.
+    expect(BusinessCharter.safeParse(withDomain('@rival.co.il')).success).toBe(true);
+    const bundle = compileCharter(buildCharter({ doNotContactEmailDomain: '@rival.co.il' }));
+    expect(bundle.doNotContact.emailDomains).toContain('rival.co.il');
   });
 });

@@ -52,16 +52,67 @@ function isResolvableTimeZone(zone: string): boolean {
 }
 
 /**
- * Rejects a `emailDomain` match key that `normaliseDomainString`
- * (`src/util/address.ts`) -- the same function `matchDoNotContact` and the
- * `byEmailDomain` autonomy ceiling run every inbound address through --
- * cannot turn into a usable domain. A domain the gate cannot normalise is a
- * do-not-contact or autonomy rule that compiles, appears in the signed
- * document, and matches nothing at runtime: the quietest possible failure
- * for a rule whose entire purpose is to be absolute.
+ * A real hostname, in the shape `domainMatches` (`src/util/address.ts`) can
+ * actually match: at least two labels, each of lowercase alphanumerics and
+ * inner hyphens only, with no leading or trailing hyphen on any label.
+ *
+ * Tested against the string `normaliseDomainString` produces, never the raw
+ * input, because that normalised string is what `compileCharter` stores in
+ * `doNotContact.emailDomains` and what the gate compares against. Checking
+ * the raw input would validate one value and enforce another.
  */
-function isValidEmailDomain(domain: string): boolean {
-  return normaliseDomainString(domain) !== null;
+const DOMAIN_SHAPE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+
+/**
+ * Why this `emailDomain` match key cannot work, or `null` if it can.
+ *
+ * A domain the gate cannot match is a do-not-contact or autonomy rule that
+ * compiles, appears in the signed document, and matches nothing at runtime:
+ * the quietest possible failure for a rule whose entire purpose is to be
+ * absolute. Nothing contradicts the owner afterwards either -- `render.ts`
+ * does not print do-not-contact entries -- so the belief that the rule is in
+ * force survives indefinitely.
+ *
+ * This check used to be `normaliseDomainString(domain) !== null`, which reads
+ * like a validation and is not one: that function strips a leading `@`,
+ * trailing dots and case, and returns non-null for essentially any printable
+ * string. `*.rival.co.il`, `dana@rival.co.il`, `.rival.co.il`,
+ * `https://rival.co.il` and `rival.co.il/` all signed cleanly and all blocked
+ * nothing. No attacker is needed: an owner writing the wildcard form -- the
+ * most natural way to say "the whole company", and the one the field name
+ * invites -- got a signed rule that permitted the send.
+ *
+ * Returns a message rather than a boolean so the wildcard case can say what
+ * to write instead. Refusing it silently, or quietly rewriting it to
+ * `rival.co.il`, teaches the owner nothing and leaves them guessing at
+ * syntax the next time.
+ */
+function emailDomainProblem(domain: string): string | null {
+  const normalised = normaliseDomainString(domain);
+  if (normalised === null) {
+    return `emailDomain "${domain}" is empty once normalised, so it can never match an address`;
+  }
+  if (DOMAIN_SHAPE.test(normalised)) return null;
+
+  if (normalised.startsWith('*.')) {
+    // Not normalised away to the bare domain: an owner who writes a wildcard
+    // should learn that the plain form already does what they meant.
+    return (
+      `emailDomain "${domain}" is not a domain — write "${normalised.slice(2)}" instead. ` +
+      'A bare domain already covers every subdomain of it, because the match is anchored ' +
+      'on the label boundary'
+    );
+  }
+  if (normalised.includes('@')) {
+    return (
+      `emailDomain "${domain}" is an address, not a domain — write the part after the "@"`
+    );
+  }
+  return (
+    `emailDomain "${domain}" is not a domain: expected at least two labels of letters, ` +
+    'digits and inner hyphens (for example "rival.co.il"), with no scheme, path, "*" or ' +
+    'leading dot'
+  );
 }
 
 /** Rejects a redaction pattern the engine could not compile. */
@@ -278,7 +329,13 @@ export const CharterCounterparty = z.object({
       entityId: z.string().optional(),
       emailDomain: z
         .string()
-        .refine(isValidEmailDomain, 'not a domain the gate can normalise')
+        .superRefine((domain, ctx) => {
+          // superRefine rather than refine: the message depends on HOW the
+          // value is wrong, and a single static string cannot tell an owner
+          // that "*.rival.co.il" should have been "rival.co.il".
+          const problem = emailDomainProblem(domain);
+          if (problem !== null) ctx.addIssue({ code: 'custom', message: problem });
+        })
         .optional(),
       phone: z.string().optional(),
       tag: z.string().optional(),
