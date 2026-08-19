@@ -21,8 +21,13 @@ import type { AdapterCall, AdapterResult, ExternalAdapter } from './types.js';
  *
  * Extend this list — never `classifyAction` — when a future adapter's
  * contract test needs a different safe sample tool.
+ *
+ * Exported so `adapters.test.ts` can hold it against `classify.ts`: the names
+ * here are hand-written, and nothing in the type system stops a tool from
+ * being reclassified as committing while its name stays on this list. That
+ * invariant test is what ties the two files together.
  */
-const NON_COMMITTING_SAMPLE_TOOLS: ReadonlySet<string> = new Set([
+export const NON_COMMITTING_SAMPLE_TOOLS: ReadonlySet<string> = new Set([
   'browser.navigate',
   'browser.snapshot',
   'browser.screenshot',

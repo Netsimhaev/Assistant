@@ -64,10 +64,15 @@ export function createCredentialHandle(ref: string, value: string): CredentialHa
     configurable: false,
   });
   // The brand is asserted, never actually written: no runtime object holds
-  // this key. `as unknown as CredentialHandle` is deliberate here — it is
-  // the one place in the codebase allowed to claim the brand, and every
-  // other call site is left with a type that a plain literal cannot satisfy.
-  return handle as unknown as CredentialHandle;
+  // this key. This is the one place in the codebase allowed to claim the
+  // brand, and every other call site is left with a type that a plain
+  // literal cannot satisfy. The cast is the narrow `as CredentialHandle`
+  // rather than `as unknown as CredentialHandle`: the two compile the same
+  // here, but only the narrow form still checks `ref`, `value` and `toJSON`
+  // against the interface, so a typo or a dropped `defineProperty` in the
+  // lines above is a compile error instead of a silent lie in the one place
+  // handles are produced.
+  return handle as CredentialHandle;
 }
 
 export interface AdapterCall {

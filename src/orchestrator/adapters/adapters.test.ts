@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { AdapterRegistry } from './registry.js';
 import { browserAdapter } from './browser.js';
-import { assertAdapterContract } from './contract.js';
+import { assertAdapterContract, NON_COMMITTING_SAMPLE_TOOLS } from './contract.js';
 import type { AdapterCall, AdapterResult, CredentialHandle, ExternalAdapter } from './types.js';
 import { createCredentialHandle } from './types.js';
 import { classifiedToolNames, READ_ONLY_TOOLS } from '../../policy/classify.js';
@@ -107,15 +107,21 @@ describe('the adapter registry', () => {
       expect(registry.resolve('supplier-a-portal', 'browser', 'mail.send')).toBeNull();
     });
 
-    // The sibling of the channel-default serves check above: a
-    // system-specific adapter must clear the same bar. Replacing
-    // `specific.serves.includes(toolName) ? specific : null` with a bare
-    // `return specific` leaves every other test in this file green, since
-    // none of them call `resolve` with a system-specific adapter and a tool
-    // outside its `serves`.
+    // The sibling of the channel-default serves check above, and it needs the
+    // same construction as the two mismatch tests: a same-channel default
+    // that *does* serve the tool. Without one, a `resolve` that merely falls
+    // through when the system-specific adapter's `serves` excludes the tool
+    // (`if (specific.serves.includes(toolName)) return specific;`, no
+    // explicit refusal) would reach an empty channelDefaults map and return
+    // null anyway, so the test would pass whether or not the refusal exists.
+    // Falling through is the dangerous behaviour here, not a harmless
+    // simplification: it hands a connection that has its own adapter over to
+    // the channel default, which is a different channel-level decision than
+    // the one the owner signed.
     it('refuses a system-specific adapter for a tool it does not serve, even on the right channel', () => {
       const specific = apiAdapter('office-mail', ['mail.send']);
-      const registry = new AdapterRegistry([specific]);
+      const apiChannelDefault = apiAdapter('api-fallback', ['crm.write']);
+      const registry = new AdapterRegistry([specific], [apiChannelDefault]);
       expect(registry.resolve('office-mail', 'api', 'crm.write')).toBeNull();
     });
   });
@@ -201,6 +207,34 @@ describe('assertAdapterContract requires a non-committing sample by default', ()
     };
     const committing = call({ toolName: 'media.generate_video', input: {} });
     await expect(assertAdapterContract(double, committing)).rejects.toThrow();
+  });
+});
+
+describe('NON_COMMITTING_SAMPLE_TOOLS stays tied to classify.ts', () => {
+  it('names only tools the policy layer still holds as unclassified read-onlys', () => {
+    // The list is hand-written, and its whole promise is "running this for
+    // real commits nothing". Nothing enforces that promise over time: a tool
+    // named here can be reclassified in classify.ts — browser.click and
+    // file.write both already made that move — and it would stay on the
+    // "safe to execute" list, so the contract suite would go on executing it
+    // for real on every `npm test` against whatever driver backs it by then.
+    // Deriving the expectation from classify.ts is what makes the
+    // reclassification a test failure in the same change.
+    expect(NON_COMMITTING_SAMPLE_TOOLS.size, 'an empty list would pass vacuously')
+      .toBeGreaterThan(0);
+    const classified = classifiedToolNames();
+    for (const toolName of NON_COMMITTING_SAMPLE_TOOLS) {
+      expect(
+        classified,
+        `${toolName} is now a classified, committing action and must leave ` +
+          'NON_COMMITTING_SAMPLE_TOOLS',
+      ).not.toContain(toolName);
+      expect(
+        READ_ONLY_TOOLS.has(toolName),
+        `${toolName} is no longer a known read-only tool in classify.ts — either ` +
+          'the name is stale or the tool changed meaning',
+      ).toBe(true);
+    }
   });
 });
 
