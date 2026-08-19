@@ -12,7 +12,7 @@ import {
   classifiedToolNames,
   directlyMappedActionClasses,
 } from '../policy/classify.js';
-import { ActionClass, HOST_ADDRESSED_CLASSES } from '../domain/action.js';
+import { ACTION_ADDRESSEE, ActionClass, HOST_ADDRESSED_CLASSES } from '../domain/action.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { compileCharter } from './compile.js';
@@ -176,5 +176,25 @@ describe('the first-contact escalation covers everything it should', () => {
     // A class added to the enum later must not fall out of the sensitive band
     // by omission — which is exactly how crm.write escaped it.
     expect(exempt).toHaveLength(2);
+  });
+});
+
+describe('ACTION_ADDRESSEE stays total and the host bucket stays exactly the browser classes', () => {
+  it('has an entry for every action class', () => {
+    // `ACTION_ADDRESSEE` is a `Record<ActionClass, Addressee>`, so a missing
+    // class is already a compile error — this assertion is the runtime
+    // mirror of that, and it is what would catch the enum and the record
+    // going out of sync via an `as` cast or a stale build.
+    for (const cls of ActionClass.options) {
+      expect(ACTION_ADDRESSEE[cls]).toBeDefined();
+    }
+    expect(Object.keys(ACTION_ADDRESSEE)).toHaveLength(ActionClass.options.length);
+  });
+
+  it('marks only the two browser classes as host-addressed', () => {
+    const hostAddressed = ActionClass.options.filter(
+      (cls) => ACTION_ADDRESSEE[cls] === 'host',
+    );
+    expect(hostAddressed.sort()).toEqual(['browser.interact', 'browser.session']);
   });
 });

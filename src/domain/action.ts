@@ -146,46 +146,88 @@ export const NEVER_FULLY_AUTONOMOUS: ReadonlySet<ActionClass> = new Set(
     .map(([cls]) => cls),
 );
 
-/**
- * Classes that address a host rather than a person.
- *
- * The `one_unknown` risk escalation ("first contact with a party we cannot
- * resolve") forces the sensitive band and therefore an approval. A browser
- * click also leaves the instance, but it addresses a host, not a person, and
- * scoring it as an unidentified first contact sent every ordinary click to the
- * approval queue.
- *
- * Written as an explicit allowlist of the two classes the exemption is *for*,
- * not as "everything except the classes that address people". The excluding
- * form swept in `crm.write` — an outbound write to a system of record, with an
- * unresolvable counterparty, dropped from `sensitive` to `routine` and stopped
- * requiring a human. Any class added to the enum later must not be able to
- * fall out of the sensitive band by omission.
- */
-export const HOST_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = new Set([
-  'browser.interact',
-  'browser.session',
-]);
+/** Who or what an action class reaches, if anything — see `ACTION_ADDRESSEE`. */
+export const Addressee = z.enum(['person', 'host', 'internal']);
+export type Addressee = z.infer<typeof Addressee>;
 
 /**
- * Classes that reach a specific person rather than a system or a supplier.
+ * Who or what each action class reaches.
  *
- * Used to order target derivation: when a payload carries both a
- * `counterpartyId` and a `supplierId` (a stray field, or one an attacker
- * injected), which one is authoritative must be a property of the action
- * class, not of which field happens to be present. Written as an explicit
- * allowlist for the same reason as `HOST_ADDRESSED_CLASSES` above — the
- * excluding form ("everything that isn't clearly a supplier action") would
- * silently pull in a class added later and let its payload decide the
- * channel, which is the authority this list exists to keep out of the
- * payload's hands.
+ * A total `Record` rather than two hand-maintained `Set`s (the
+ * `HOST_ADDRESSED_CLASSES` and `COUNTERPARTY_ADDRESSED_CLASSES` this
+ * replaces, both still exported below, now derived). Two sets over one enum
+ * is exactly the shape that already hurt this codebase once: one of them was
+ * originally written as "everything except the classes that address a
+ * person", and inverting that by hand to build the other silently swept
+ * `crm.write` out of the `one_unknown` escalation — an outbound write to a
+ * system of record, with an unresolvable counterparty, dropped from
+ * `sensitive` to `routine` and stopped requiring a human. A class missing
+ * from a `Record<ActionClass, Addressee>` is a compile error, not a class
+ * quietly defaulting to whatever a consumer's `Set.has()` returns for it.
+ *
+ * - `person`: reaches a human on the other end — a customer, attendee, or
+ *   counterparty the action is addressed to.
+ * - `host`: reaches a server under someone else's control. Today that is
+ *   exactly the two browser classes: the session holds the owner's full
+ *   authority on a page an attacker may have written, which is why the
+ *   `one_unknown` first-contact escalation exempts them (a click is not a
+ *   message to an unidentified person) and why nothing else may join this
+ *   bucket by omission.
+ * - `internal`: neither — a system the business itself owns (CRM,
+ *   accounting, the filesystem, the charter, long-term memory) or a
+ *   counterparty addressed as a supplier rather than an individual
+ *   (`purchase.place`).
  */
-export const COUNTERPARTY_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = new Set([
-  'email.reply',
-  'email.initiate',
-  'whatsapp.reply',
-  'whatsapp.initiate',
-]);
+export const ACTION_ADDRESSEE: Record<ActionClass, Addressee> = {
+  'email.reply': 'person',
+  'email.initiate': 'person',
+  'whatsapp.reply': 'person',
+  'whatsapp.initiate': 'person',
+  'calendar.create': 'person',
+  'calendar.move': 'person',
+  'calendar.cancel': 'person',
+  'quote.issue': 'person',
+  'discount.grant': 'person',
+  'commitment.make': 'person',
+  // A supplier, not an individual — target derivation must order the
+  // supplier field first for this class (`orchestrator/channels.ts`).
+  'purchase.place': 'internal',
+  'payment.make': 'person',
+  'refund.issue': 'person',
+  'crm.write': 'internal',
+  'accounting.write': 'internal',
+  'artifact.write': 'internal',
+  'doc.deliver': 'person',
+  'media.publish': 'internal',
+  'browser.interact': 'host',
+  'browser.session': 'host',
+  'contract.sign': 'person',
+  'data.export': 'internal',
+  'memory.write_longterm': 'internal',
+  'charter.amend': 'internal',
+};
+
+function classesAddressed(addressee: Addressee): ReadonlySet<ActionClass> {
+  return new Set(
+    (Object.entries(ACTION_ADDRESSEE) as [ActionClass, Addressee][])
+      .filter(([, a]) => a === addressee)
+      .map(([cls]) => cls),
+  );
+}
+
+/**
+ * Classes that address a host rather than a person, derived from
+ * `ACTION_ADDRESSEE` so the `one_unknown` risk exemption (`policy/risk.ts`)
+ * cannot drift from the total mapping above.
+ */
+export const HOST_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = classesAddressed('host');
+
+/**
+ * Classes that reach a specific person rather than a system or a supplier,
+ * derived from `ACTION_ADDRESSEE` so target-derivation ordering
+ * (`orchestrator/channels.ts`) cannot drift from the same mapping.
+ */
+export const COUNTERPARTY_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = classesAddressed('person');
 
 /** Classes whose payload can carry a monetary amount the ceilings apply to. */
 export const MONETARY_CLASSES: ReadonlySet<ActionClass> = new Set([
