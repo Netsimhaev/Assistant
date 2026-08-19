@@ -7,6 +7,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { compileCharter } from '../charter/compile.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { deriveTargetId, resolveChannel } from './channels.js';
+import { buildFacts, type FactsContext } from '../policy/facts.js';
 
 const BUSINESS = 'test-business';
 const BY = 'net.simhaev@gmail.com';
@@ -317,15 +318,53 @@ describe('resolving a channel', () => {
     expect(result.status).toBe('unavailable');
   });
 
-  it('derives the target from the payload the same way facts do', () => {
-    expect(deriveTargetId({ supplierId: 'supplier-a' })).toBe('supplier-a');
-    expect(deriveTargetId({ counterpartyId: 'c_812' })).toBe('c_812');
-    // supplierId wins: a purchase names both, and the supplier is who we deal
-    // with.
-    expect(deriveTargetId({ supplierId: 'supplier-a', counterpartyId: 'c_812' })).toBe(
-      'supplier-a',
+  const FACTS_CTX: FactsContext = { provenance: 'boss', chainDepth: 0, counterpartyTags: [] };
+
+  describe('deriveTargetId agrees with buildFacts', () => {
+    // Driving both functions over one case table is the only form of this
+    // test that can detect drift between them — a hardcoded expectation on
+    // each side can be wrong in the same way on both sides at once and still
+    // pass. `mail.send` refines to an email class, which is in
+    // COUNTERPARTY_ADDRESSED_CLASSES, so the counterparty half is what both
+    // functions are compared on here.
+    const cases: [string, Record<string, unknown>][] = [
+      ['entityId only', { entityId: 'c_812' }],
+      ['counterpartyId only', { counterpartyId: 'c_900' }],
+      ['counterpartyId and entityId together', { counterpartyId: 'c_900', entityId: 'c_812' }],
+      ['neither', { body: 'hello' }],
+    ];
+
+    it.each(cases)('%s', (_label, input) => {
+      const facts = buildFacts('mail.send', input, FACTS_CTX);
+      const result = deriveTargetId(input, facts.actionClass);
+      expect(result).toBe(facts.counterpartyId);
+    });
+  });
+
+  it('resolves by counterparty for a class that addresses a person, even with a stray supplierId', () => {
+    const facts = buildFacts(
+      'mail.send',
+      { counterpartyId: 'c_812', supplierId: 'supplier-a' },
+      FACTS_CTX,
     );
-    expect(deriveTargetId({ body: 'hello' })).toBeNull();
-    expect(deriveTargetId({ supplierId: '' })).toBeNull();
+    expect(deriveTargetId({ counterpartyId: 'c_812', supplierId: 'supplier-a' }, facts.actionClass)).toBe(
+      'c_812',
+    );
+  });
+
+  it('resolves by supplier for a class that addresses a supplier, even with a counterpartyId present', () => {
+    const facts = buildFacts(
+      'browser.submit_order',
+      { supplierId: 'supplier-a', counterpartyId: 'c_812' },
+      FACTS_CTX,
+    );
+    expect(
+      deriveTargetId({ supplierId: 'supplier-a', counterpartyId: 'c_812' }, facts.actionClass),
+    ).toBe('supplier-a');
+  });
+
+  it('treats an empty-string field as absent', () => {
+    expect(deriveTargetId({ supplierId: '' }, null)).toBeNull();
+    expect(deriveTargetId({ body: 'hello' }, null)).toBeNull();
   });
 });

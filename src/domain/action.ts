@@ -167,6 +167,26 @@ export const HOST_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = new Set([
   'browser.session',
 ]);
 
+/**
+ * Classes that reach a specific person rather than a system or a supplier.
+ *
+ * Used to order target derivation: when a payload carries both a
+ * `counterpartyId` and a `supplierId` (a stray field, or one an attacker
+ * injected), which one is authoritative must be a property of the action
+ * class, not of which field happens to be present. Written as an explicit
+ * allowlist for the same reason as `HOST_ADDRESSED_CLASSES` above — the
+ * excluding form ("everything that isn't clearly a supplier action") would
+ * silently pull in a class added later and let its payload decide the
+ * channel, which is the authority this list exists to keep out of the
+ * payload's hands.
+ */
+export const COUNTERPARTY_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = new Set([
+  'email.reply',
+  'email.initiate',
+  'whatsapp.reply',
+  'whatsapp.initiate',
+]);
+
 /** Classes whose payload can carry a monetary amount the ceilings apply to. */
 export const MONETARY_CLASSES: ReadonlySet<ActionClass> = new Set([
   'quote.issue',

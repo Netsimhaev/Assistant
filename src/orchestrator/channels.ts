@@ -1,5 +1,7 @@
 import type { PolicyBundle } from '../domain/policy.js';
 import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
+import type { ActionClass } from '../domain/action.js';
+import { COUNTERPARTY_ADDRESSED_CLASSES } from '../domain/action.js';
 
 export type ChannelResolution =
   | { status: 'resolved'; system: string; channel: 'api' | 'browser' }
@@ -63,11 +65,36 @@ export function resolveChannel(
  * execution. Two derivations written separately are two derivations that will
  * diverge, and when they do a plan will be approved against one channel and
  * executed against another.
+ *
+ * The counterparty half must read `counterpartyId` with the same
+ * `entityId` fallback `buildFacts` (`src/policy/facts.ts`) uses, or this
+ * function and the facts the gate scores diverge on the exact payload shape
+ * — `{ entityId }` — that dominates the existing orchestrator and planner
+ * fixtures.
+ *
+ * When a payload carries both a `supplierId` and a `counterpartyId` (a stray
+ * field, or one an attacker rode in on), which one is authoritative must
+ * follow the action class, not field order: for a class in
+ * `COUNTERPARTY_ADDRESSED_CLASSES` the counterparty wins, otherwise the
+ * supplier does. Letting the payload's own shape settle the tie would hand a
+ * caller-supplied field the power to choose the channel.
  */
-export function deriveTargetId(input: Record<string, unknown>): string | null {
-  for (const key of ['supplierId', 'counterpartyId']) {
-    const value = input[key];
-    if (typeof value === 'string' && value.length > 0) return value;
-  }
-  return null;
+export function deriveTargetId(
+  input: Record<string, unknown>,
+  actionClass: ActionClass | null,
+): string | null {
+  const supplierId = readString(input, 'supplierId');
+  const counterpartyId = readString(input, 'counterpartyId') ?? readString(input, 'entityId');
+
+  const addressesCounterparty =
+    actionClass !== null && COUNTERPARTY_ADDRESSED_CLASSES.has(actionClass);
+
+  return addressesCounterparty
+    ? (counterpartyId ?? supplierId)
+    : (supplierId ?? counterpartyId);
+}
+
+function readString(input: Record<string, unknown>, key: string): string | null {
+  const value = input[key];
+  return typeof value === 'string' && value.length > 0 ? value : null;
 }

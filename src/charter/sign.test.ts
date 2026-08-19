@@ -265,6 +265,27 @@ describe('charter connections', () => {
     expect(BusinessCharter.safeParse(broken).success).toBe(false);
   });
 
+  it('refuses a connection with an empty-string target', () => {
+    const charter = buildCharter();
+    const broken = {
+      ...charter,
+      connections: [
+        {
+          system: 'crm-a',
+          label: 'CRM א',
+          channel: 'api' as const,
+          serves: ['crm.write'],
+          // An empty string is neither a real target nor the null catch-all —
+          // it signs, matches nothing at resolution time, and is dead policy
+          // of the same class the registry already rejects for unknown tools.
+          target: '',
+          subprocessor: null,
+        },
+      ],
+    };
+    expect(BusinessCharter.safeParse(broken).success).toBe(false);
+  });
+
   it('accepts a specific target sitting beside a null catch-all for the same tool', () => {
     // Not an authoring mistake: the resolver prefers the specific connection
     // and falls back to the catch-all for every other target.

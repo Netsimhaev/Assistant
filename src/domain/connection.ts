@@ -19,7 +19,7 @@ export const CharterConnection = z.object({
   /** Internal tool names this connection serves. */
   serves: z.array(z.string().min(1)).min(1),
   /** A specific counterparty or supplier, or null for every target. */
-  target: z.string().nullable(),
+  target: z.string().min(1).nullable(),
   /** Third party that processes the payload on the way out; null is direct. */
   subprocessor: z.string().nullable(),
 });
