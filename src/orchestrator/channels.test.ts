@@ -1,6 +1,5 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { closePool } from '../db/pool.js';
-import * as auditLog from '../audit/log.js';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { closePool, getPool } from '../db/pool.js';
 import { queryAudit } from '../audit/log.js';
 import { resetDatabase } from '../test/db.js';
 import { loadBindings, upsertBinding } from './bindings.js';
@@ -10,10 +9,6 @@ const BY = 'net.simhaev@gmail.com';
 
 beforeEach(async () => {
   await resetDatabase();
-});
-
-afterEach(() => {
-  vi.restoreAllMocks();
 });
 
 afterAll(async () => {
@@ -130,9 +125,7 @@ describe('connection bindings', () => {
     expect(entries[0]?.onBehalfOf).toBe(BY);
   });
 
-  it('rolls back the binding write when the audit append fails', async () => {
-    vi.spyOn(auditLog, 'appendAudit').mockRejectedValueOnce(new Error('audit append failed'));
-
+  it('rejects an empty "by" and writes nothing', async () => {
     await expect(
       upsertBinding(
         {
@@ -143,9 +136,42 @@ describe('connection bindings', () => {
           lastOkAt: null,
           lastError: null,
         },
-        { businessId: BUSINESS, by: BY },
+        { businessId: BUSINESS, by: '' },
       ),
-    ).rejects.toThrow('audit append failed');
+    ).rejects.toThrow();
+
+    expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
+  });
+
+  it('keeps the audit append inside the same transaction as the write', async () => {
+    const client = await getPool().connect();
+    try {
+      await client.query('BEGIN');
+
+      await upsertBinding(
+        {
+          system: 'office-mail',
+          status: 'live',
+          endpoint: null,
+          credentialRef: null,
+          lastOkAt: null,
+          lastError: null,
+        },
+        { businessId: BUSINESS, by: BY, db: client },
+      );
+
+      // Force this transaction to abort *after* the write and the audit
+      // append have both run, then roll it back. If the append shares this
+      // transaction — the property this test exists to protect — the
+      // rollback undoes the binding row and the audit row together. If the
+      // append instead ran on its own connection (the round-1/round-2
+      // regression), it already committed independently and survives this
+      // rollback, and only the audit assertion below fails.
+      await expect(client.query('SELECT 1/0')).rejects.toThrow();
+      await client.query('ROLLBACK');
+    } finally {
+      client.release();
+    }
 
     expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
     expect(await queryAudit({ businessId: BUSINESS, kind: 'connection_binding' })).toEqual([]);

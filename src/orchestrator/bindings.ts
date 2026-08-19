@@ -1,3 +1,4 @@
+import type pg from 'pg';
 import { config } from '../config.js';
 import { ConnectionBinding } from '../domain/connection.js';
 import { getPool, withTransaction, type Queryable } from '../db/pool.js';
@@ -62,12 +63,25 @@ export async function loadBindings(
  * `by` is required, not defaulted, for the same reason `trip()` and
  * `release()` in `governance/killswitch.ts` require it: an automated status
  * flip and a human-initiated redirect must not be recorded as the same
- * anonymous "human" actor.
+ * anonymous "human" actor. It must also be non-empty — an unvalidated
+ * required field is a required field in name only. (On the transaction point
+ * below, `trip()`/`release()` are not a precedent to imitate: they still
+ * write and audit on separate connections and carry the exact defect fixed
+ * here.)
+ *
+ * `options.db`, when supplied, must be a real `pg.PoolClient` already inside
+ * a transaction the caller owns — not just anything with a `.query` method.
+ * A bare `pg.Pool` satisfies a looser `Queryable` type structurally, which
+ * would silently defeat the atomicity this function exists to provide, so
+ * the type itself rules it out.
  */
 export async function upsertBinding(
   binding: ConnectionBinding,
-  options: { businessId?: string; db?: Queryable; charterVersion?: string; by: string },
+  options: { businessId?: string; db?: pg.PoolClient; charterVersion?: string; by: string },
 ): Promise<void> {
+  if (options.by.trim().length === 0) {
+    throw new Error('upsertBinding: "by" must not be empty');
+  }
   const parsed = ConnectionBinding.parse(binding);
   const businessId = options.businessId ?? config.businessId;
 
