@@ -12,7 +12,8 @@ import {
   classifiedToolNames,
   directlyMappedActionClasses,
 } from '../policy/classify.js';
-import { ACTION_ADDRESSEE, ActionClass, HOST_ADDRESSED_CLASSES } from '../domain/action.js';
+import { ActionClass, HOST_ADDRESSED_CLASSES, addresseeOf } from '../domain/action.js';
+import type { Addressee } from '../domain/action.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { compileCharter } from './compile.js';
@@ -179,22 +180,53 @@ describe('the first-contact escalation covers everything it should', () => {
   });
 });
 
-describe('ACTION_ADDRESSEE stays total and the host bucket stays exactly the browser classes', () => {
+/**
+ * Pins the whole `addresseeOf` mapping, class by class, not just the
+ * `browser` bucket — the round that introduced it expanded `person` from 4
+ * classes to 14 and every test still passed, because the only thing pinned
+ * was the bucket that did not change. Reclassifying any class now has to be
+ * a deliberate edit here as well as in `domain/action.ts`, which is the
+ * point: silent drift in either direction becomes a failing test instead of
+ * a passing one.
+ */
+describe('addresseeOf is pinned class by class', () => {
+  const EXPECTED: Record<ActionClass, Addressee> = {
+    'email.reply': 'person',
+    'email.initiate': 'person',
+    'whatsapp.reply': 'person',
+    'whatsapp.initiate': 'person',
+    'calendar.create': 'person',
+    'calendar.move': 'person',
+    'calendar.cancel': 'person',
+    'quote.issue': 'person',
+    'discount.grant': 'person',
+    'commitment.make': 'person',
+    'purchase.place': 'internal',
+    'payment.make': 'person',
+    'refund.issue': 'person',
+    'crm.write': 'internal',
+    'accounting.write': 'internal',
+    'artifact.write': 'internal',
+    'doc.deliver': 'person',
+    'media.publish': 'internal',
+    'browser.interact': 'browser',
+    'browser.session': 'browser',
+    'contract.sign': 'person',
+    'data.export': 'internal',
+    'memory.write_longterm': 'internal',
+    'charter.amend': 'internal',
+  };
+
   it('has an entry for every action class', () => {
-    // `ACTION_ADDRESSEE` is a `Record<ActionClass, Addressee>`, so a missing
-    // class is already a compile error — this assertion is the runtime
-    // mirror of that, and it is what would catch the enum and the record
-    // going out of sync via an `as` cast or a stale build.
-    for (const cls of ActionClass.options) {
-      expect(ACTION_ADDRESSEE[cls]).toBeDefined();
-    }
-    expect(Object.keys(ACTION_ADDRESSEE)).toHaveLength(ActionClass.options.length);
+    expect(Object.keys(EXPECTED)).toHaveLength(ActionClass.options.length);
   });
 
-  it('marks only the two browser classes as host-addressed', () => {
-    const hostAddressed = ActionClass.options.filter(
-      (cls) => ACTION_ADDRESSEE[cls] === 'host',
-    );
-    expect(hostAddressed.sort()).toEqual(['browser.interact', 'browser.session']);
+  it.each(ActionClass.options)('%s', (cls) => {
+    expect(addresseeOf(cls)).toBe(EXPECTED[cls]);
+  });
+
+  it('marks only the two browser classes as browser-addressed', () => {
+    const browserAddressed = ActionClass.options.filter((cls) => addresseeOf(cls) === 'browser');
+    expect(browserAddressed.sort()).toEqual(['browser.interact', 'browser.session']);
   });
 });

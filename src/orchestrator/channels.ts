@@ -1,7 +1,6 @@
 import type { PolicyBundle } from '../domain/policy.js';
 import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
 import type { ActionClass } from '../domain/action.js';
-import { COUNTERPARTY_ADDRESSED_CLASSES } from '../domain/action.js';
 
 export type ChannelResolution =
   | { status: 'resolved'; system: string; channel: 'api' | 'browser' }
@@ -73,11 +72,15 @@ export function resolveChannel(
  * fixtures.
  *
  * When a payload carries both a `supplierId` and a `counterpartyId` (a stray
- * field, or one an attacker rode in on), which one is authoritative must
- * follow the action class, not field order: for a class in
- * `COUNTERPARTY_ADDRESSED_CLASSES` the counterparty wins, otherwise the
- * supplier does. Letting the payload's own shape settle the tie would hand a
- * caller-supplied field the power to choose the channel.
+ * field, or one an attacker rode in on), which one is authoritative is a
+ * routing question, not the "does this reach a human" question
+ * `domain/action.ts`'s `addresseeOf` answers — a purchase is read by a
+ * person too, but it is still routed by supplier. `purchase.place` is the
+ * one class whose entire purpose is dealing with a supplier, so it is the
+ * one class where `supplierId` wins; every other class resolves by
+ * `counterpartyId` regardless of what else the payload carries. Letting the
+ * payload's own shape settle the tie would hand a caller-supplied field the
+ * power to choose the channel.
  */
 export function deriveTargetId(
   input: Record<string, unknown>,
@@ -86,12 +89,9 @@ export function deriveTargetId(
   const supplierId = readString(input, 'supplierId');
   const counterpartyId = readString(input, 'counterpartyId') ?? readString(input, 'entityId');
 
-  const addressesCounterparty =
-    actionClass !== null && COUNTERPARTY_ADDRESSED_CLASSES.has(actionClass);
-
-  return addressesCounterparty
-    ? (counterpartyId ?? supplierId)
-    : (supplierId ?? counterpartyId);
+  return actionClass === 'purchase.place'
+    ? (supplierId ?? counterpartyId)
+    : (counterpartyId ?? supplierId);
 }
 
 function readString(input: Record<string, unknown>, key: string): string | null {

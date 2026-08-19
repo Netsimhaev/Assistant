@@ -324,9 +324,9 @@ describe('resolving a channel', () => {
     // Driving both functions over one case table is the only form of this
     // test that can detect drift between them — a hardcoded expectation on
     // each side can be wrong in the same way on both sides at once and still
-    // pass. `mail.send` refines to an email class, which is in
-    // COUNTERPARTY_ADDRESSED_CLASSES, so the counterparty half is what both
-    // functions are compared on here.
+    // pass. `mail.send` refines to an email class, which resolves by
+    // counterparty (see the routing tests below), so the counterparty half
+    // is what both functions are compared on here.
     const cases: [string, Record<string, unknown>][] = [
       ['entityId only', { entityId: 'c_812' }],
       ['counterpartyId only', { counterpartyId: 'c_900' }],
@@ -341,26 +341,39 @@ describe('resolving a channel', () => {
     });
   });
 
-  it('resolves by counterparty for a class that addresses a person, even with a stray supplierId', () => {
-    const facts = buildFacts(
-      'mail.send',
-      { counterpartyId: 'c_812', supplierId: 'supplier-a' },
-      FACTS_CTX,
-    );
-    expect(deriveTargetId({ counterpartyId: 'c_812', supplierId: 'supplier-a' }, facts.actionClass)).toBe(
-      'c_812',
-    );
-  });
-
-  it('resolves by supplier for a class that addresses a supplier, even with a counterpartyId present', () => {
+  // Routing precedence is a narrower question than "does this reach a
+  // human" (that question lives in domain/action.ts's addresseeOf, unchanged
+  // by these three tests). purchase.place is the one class whose entire
+  // purpose is dealing with a supplier, so it is the one class where
+  // supplierId wins; every other class — even one that also pays a person,
+  // like payment.make — resolves by counterparty.
+  it('resolves purchase.place by supplier when the payload carries both', () => {
     const facts = buildFacts(
       'browser.submit_order',
       { supplierId: 'supplier-a', counterpartyId: 'c_812' },
       FACTS_CTX,
     );
+    expect(facts.actionClass).toBe('purchase.place');
     expect(
       deriveTargetId({ supplierId: 'supplier-a', counterpartyId: 'c_812' }, facts.actionClass),
     ).toBe('supplier-a');
+  });
+
+  it('resolves payment.make by counterparty when the payload carries both', () => {
+    expect(
+      deriveTargetId({ supplierId: 'supplier-a', counterpartyId: 'c_812' }, 'payment.make'),
+    ).toBe('c_812');
+  });
+
+  it('resolves mail.send by counterparty even with a stray supplierId', () => {
+    const facts = buildFacts(
+      'mail.send',
+      { counterpartyId: 'c_812', supplierId: 'supplier-a' },
+      FACTS_CTX,
+    );
+    expect(
+      deriveTargetId({ counterpartyId: 'c_812', supplierId: 'supplier-a' }, facts.actionClass),
+    ).toBe('c_812');
   });
 
   it('treats an empty-string field as absent', () => {
