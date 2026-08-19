@@ -66,12 +66,26 @@ export function createCredentialHandle(ref: string, value: string): CredentialHa
   // The brand is asserted, never actually written: no runtime object holds
   // this key. This is the one place in the codebase allowed to claim the
   // brand, and every other call site is left with a type that a plain
-  // literal cannot satisfy. The cast is the narrow `as CredentialHandle`
-  // rather than `as unknown as CredentialHandle`: the two compile the same
-  // here, but only the narrow form still checks `ref`, `value` and `toJSON`
-  // against the interface, so a typo or a dropped `defineProperty` in the
-  // lines above is a compile error instead of a silent lie in the one place
-  // handles are produced.
+  // literal cannot satisfy.
+  //
+  // The cast is the narrow `as CredentialHandle` rather than `as unknown as
+  // CredentialHandle`, which buys exactly one thing and no more: the field
+  // *types* stay checked against the interface, so if `CredentialHandle.ref`
+  // became a number while `handle`'s declared type still said string, this
+  // line would stop compiling.
+  //
+  // It does NOT check that the `defineProperty` calls above actually ran or
+  // ran correctly. `handle`'s type comes from its own assertion on the line
+  // that declares it, so TypeScript takes `value` and `toJSON` on faith and
+  // never looks at the statements in between — deleting a whole
+  // `defineProperty` block leaves `tsc --noEmit` silent. Nothing in the type
+  // system can see enumerability at all.
+  //
+  // The only thing that proves the secret is actually hidden is the runtime
+  // test in `adapters.test.ts` ('keeps the secret out of canonicalJson'). It
+  // is not belt-and-braces alongside the cast; it is the sole guard. Deleting
+  // it as redundant would leave the leak this factory exists to prevent with
+  // no check at all.
   return handle as CredentialHandle;
 }
 

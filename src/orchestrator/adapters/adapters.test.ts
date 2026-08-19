@@ -210,18 +210,36 @@ describe('assertAdapterContract requires a non-committing sample by default', ()
   });
 });
 
-describe('NON_COMMITTING_SAMPLE_TOOLS stays tied to classify.ts', () => {
-  it('names only tools the policy layer still holds as unclassified read-onlys', () => {
-    // The list is hand-written, and its whole promise is "running this for
-    // real commits nothing". Nothing enforces that promise over time: a tool
-    // named here can be reclassified in classify.ts — browser.click and
-    // file.write both already made that move — and it would stay on the
-    // "safe to execute" list, so the contract suite would go on executing it
-    // for real on every `npm test` against whatever driver backs it by then.
-    // Deriving the expectation from classify.ts is what makes the
-    // reclassification a test failure in the same change.
-    expect(NON_COMMITTING_SAMPLE_TOOLS.size, 'an empty list would pass vacuously')
-      .toBeGreaterThan(0);
+describe('NON_COMMITTING_SAMPLE_TOOLS is pinned, not merely read-only', () => {
+  it('holds exactly the three tools this suite has been reviewed to execute for real', () => {
+    // The safety of this list cannot be derived from anything in classify.ts,
+    // and pretending otherwise is the mistake `contract.ts`'s own docblock
+    // warns about: READ_ONLY_TOOLS means "skips the policy gate", not
+    // "harmless to run" — it knowingly holds media.generate_image and
+    // media.generate_video, which cost real money every time they run. So a
+    // check of the form "every member is read-only" would happily accept
+    // media.generate_image being ADDED here, and the contract suite would
+    // then generate a paid image on every `npm test`.
+    //
+    // Pinning the exact set is the only honest formulation: membership is a
+    // human judgement about a specific tool, so adding one must be a
+    // deliberate edit in two files rather than a one-line change nothing
+    // notices. Extend both together, and only after deciding that running
+    // the tool for real, repeatedly, against a live driver, is acceptable.
+    expect([...NON_COMMITTING_SAMPLE_TOOLS].sort()).toEqual([
+      'browser.navigate',
+      'browser.screenshot',
+      'browser.snapshot',
+    ]);
+  });
+
+  it('names no tool that classify.ts has since reclassified as committing', () => {
+    // A different mistake from the one above, and the pin does not catch it:
+    // a tool can stay spelled the same here while its meaning changes over
+    // there. browser.click and file.write both moved from READ_ONLY_TOOLS
+    // into TOOL_ACTION_CLASS after the fact; had either been a sample tool,
+    // it would have kept running for real. This fails in the same change
+    // that reclassifies it.
     const classified = classifiedToolNames();
     for (const toolName of NON_COMMITTING_SAMPLE_TOOLS) {
       expect(
@@ -229,10 +247,13 @@ describe('NON_COMMITTING_SAMPLE_TOOLS stays tied to classify.ts', () => {
         `${toolName} is now a classified, committing action and must leave ` +
           'NON_COMMITTING_SAMPLE_TOOLS',
       ).not.toContain(toolName);
+      // Read-only membership is a staleness check — it catches a typo or a
+      // tool deleted from classify.ts entirely. It is NOT the safety
+      // argument; the pin above is. Read-only does not imply safe to run.
       expect(
         READ_ONLY_TOOLS.has(toolName),
-        `${toolName} is no longer a known read-only tool in classify.ts — either ` +
-          'the name is stale or the tool changed meaning',
+        `${toolName} is not a known read-only tool in classify.ts — either the ` +
+          'name is stale or the tool changed meaning',
       ).toBe(true);
     }
   });
