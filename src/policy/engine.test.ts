@@ -677,7 +677,12 @@ describe('loadActiveCharter refuses a stale schema version legibly', () => {
       [BUSINESS, stale.charterVersion],
     );
 
-    await expect(loadActiveCharter(BUSINESS, getPool())).rejects.toThrow(/schemaVersion/);
+    // Asserts on the remedy text, not on "schemaVersion" — that word also
+    // appears in zod's own serialized issue path, so a bare /schemaVersion/
+    // match would pass equally against the raw ZodError this guard replaced.
+    await expect(loadActiveCharter(BUSINESS, getPool())).rejects.toThrow(
+      /must be re-signed/,
+    );
   });
 });
 

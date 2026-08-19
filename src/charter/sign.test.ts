@@ -9,7 +9,7 @@ import {
   matchesToolPattern,
 } from '../domain/charter.js';
 import { classifiedToolNames, READ_ONLY_TOOLS } from '../policy/classify.js';
-import { UNOWNED_TOOLS } from './capabilities.js';
+import { UNOWNED_TOOLS, matchesPattern } from './capabilities.js';
 
 describe('charter signing', () => {
   it('verifies a charter that has not been touched', () => {
@@ -283,19 +283,38 @@ describe('charter connections', () => {
     expect([...UNOWNED_TOOL_NAMES].sort()).toEqual([...UNOWNED_TOOLS].sort());
   });
 
-  it('matches unowned-tool patterns the same way the capability layer does', () => {
-    // UNOWNED_TOOLS entries are patterns read through `matchesPattern` in
-    // src/charter/capabilities.ts, where a trailing `*` is a prefix match.
-    // The three entries today are literal, so the string-equality invariant
-    // above would stay green even if this matching logic used plain
-    // `Set.has()` — this proves the wildcard semantics themselves are
-    // honoured, so a future wildcard entry (e.g. 'charter.*') cannot widen
-    // what `serves` accepts on this side without widening it on the other.
+  it('matches patterns exactly the way the capability layer does', () => {
+    // Driving both functions over one shared case table, not just asserting
+    // on the domain copy in isolation. A test that only exercised
+    // matchesToolPattern would stay green even if matchesPattern in
+    // src/charter/capabilities.ts changed underneath it — proven by breaking
+    // matchesPattern locally and watching only a test like this one fail.
+    const cases: Array<[tool: string, pattern: string]> = [
+      ['charter.apply_amendment', 'charter.*'],
+      ['charter.read', 'charter.*'],
+      ['crm.write', 'charter.*'],
+      ['contract.sign', 'contract.sign'],
+      ['contract.sign.v2', 'contract.sign'],
+      ['browser.click', 'browser.*'],
+      ['browser', 'browser.*'],
+      ['mail.send', 'mail.*'],
+      ['', '*'],
+      ['anything', '*'],
+    ];
+
+    for (const [tool, pattern] of cases) {
+      const domainResult = matchesToolPattern(tool, pattern);
+      const capabilityResult = matchesPattern(tool, pattern);
+      expect(
+        domainResult,
+        `matchesToolPattern("${tool}", "${pattern}") disagrees with matchesPattern`,
+      ).toBe(capabilityResult);
+    }
+
+    // And a concrete assertion, so the table above is checked against a known
+    // expectation and not just internal agreement between the two copies.
     expect(matchesToolPattern('charter.apply_amendment', 'charter.*')).toBe(true);
-    expect(matchesToolPattern('charter.read', 'charter.*')).toBe(true);
     expect(matchesToolPattern('crm.write', 'charter.*')).toBe(false);
-    expect(matchesToolPattern('contract.sign', 'contract.sign')).toBe(true);
-    expect(matchesToolPattern('contract.sign.v2', 'contract.sign')).toBe(false);
   });
 
   it('refuses a tool listed twice in the same connection with a message naming the mistake, not another connection', () => {

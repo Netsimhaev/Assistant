@@ -11,6 +11,22 @@ interface CharterRow {
 }
 
 /**
+ * Compares two `major.minor` schema version strings. Returns negative when
+ * `a` is older than `b`, positive when newer, `0` when equal, and `null` when
+ * either string does not fit the pattern — in which case the caller must not
+ * guess a direction, only report a mismatch.
+ */
+function compareSchemaVersions(a: string, b: string): number | null {
+  const pattern = /^(\d+)\.(\d+)$/;
+  const ma = pattern.exec(a);
+  const mb = pattern.exec(b);
+  if (!ma?.[1] || !ma[2] || !mb?.[1] || !mb[2]) return null;
+  const majorDiff = Number(ma[1]) - Number(mb[1]);
+  if (majorDiff !== 0) return majorDiff;
+  return Number(ma[2]) - Number(mb[2]);
+}
+
+/**
  * Persist a signed charter and its compiled bundle, then make it the active one.
  *
  * Both happen in a single transaction: a charter that is stored but not
@@ -105,20 +121,32 @@ export async function loadActiveCharter(
   if (!row) return null;
 
   // Checked before `.parse()` rather than left to it. A charter stored under
-  // an older schema would otherwise fail inside `BusinessCharter.parse` with
-  // a raw ZodError — illegible in the same way a raised signature failure
-  // is, except this one is not tampering, it is a schema the charter was
-  // never re-signed under. Named explicitly so the remedy (re-sign) is
-  // obvious from the error itself.
+  // a different schema would otherwise fail inside `BusinessCharter.parse`
+  // with a raw ZodError — illegible in the same way a raised signature
+  // failure is, except this one is not tampering, it is a version mismatch
+  // with a knowable remedy. Named explicitly, and the remedy depends on which
+  // direction the mismatch runs: a charter *older* than this code needs
+  // re-signing, but a charter *newer* than this code (a rollback) needs the
+  // code rolled forward instead — telling an operator to re-sign in that case
+  // sends them the wrong way.
   const storedVersion =
     typeof row.charter === 'object' && row.charter !== null && 'schemaVersion' in row.charter
       ? (row.charter as { schemaVersion?: unknown }).schemaVersion
       : undefined;
   if (storedVersion !== CURRENT_SCHEMA_VERSION) {
+    const cmp =
+      typeof storedVersion === 'string'
+        ? compareSchemaVersions(storedVersion, CURRENT_SCHEMA_VERSION)
+        : null;
+    const remedy =
+      cmp === null
+        ? 'its schema version cannot be compared against what this code expects'
+        : cmp < 0
+          ? 'it was signed under an older schema and must be re-signed'
+          : 'it was signed under a newer schema than this code understands — roll the code forward, do not re-sign';
     throw new Error(
       `charter stored for business "${businessId}" carries schemaVersion ` +
-        `${JSON.stringify(storedVersion)}, expected ${JSON.stringify(CURRENT_SCHEMA_VERSION)} — ` +
-        `it was signed under an older schema and must be re-signed`,
+        `${JSON.stringify(storedVersion)}, expected ${JSON.stringify(CURRENT_SCHEMA_VERSION)} — ${remedy}`,
     );
   }
 
