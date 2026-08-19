@@ -45,6 +45,8 @@ export function compileCharter(charter: BusinessCharter): PolicyBundle {
     doNotContact: compileDoNotContact(charter),
     knownCounterparties: bucketMatches(charter.counterparties, () => true),
 
+    connections: charter.connections,
+
     allowlists: AGENT_ALLOWLISTS,
     denylists: AGENT_DENYLISTS,
     collaborationGraph: COLLABORATION_GRAPH,

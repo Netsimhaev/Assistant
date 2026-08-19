@@ -113,6 +113,26 @@ describe('charter compilation', () => {
     expect(bundle.promptFragments['intake.triage']).toMatch(/אינו אמין/);
     expect(bundle.promptFragments['know.reader']).toMatch(/אינו אמין/);
   });
+
+  it('carries connections into the bundle the gate and planner read', () => {
+    const bundle = compileCharter(
+      buildCharter({
+        connections: [
+          {
+            system: 'office-mail',
+            label: 'תיבת המשרד',
+            channel: 'api',
+            serves: ['mail.send'],
+            target: null,
+            subprocessor: null,
+          },
+        ],
+      }),
+    );
+
+    expect(bundle.connections).toHaveLength(1);
+    expect(bundle.connections[0]?.channel).toBe('api');
+  });
 });
 
 describe('charter connections', () => {

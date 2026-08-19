@@ -3,6 +3,7 @@ import { ActionClass } from './action.js';
 import { AutonomyLevel, TrustLevel } from './trust.js';
 import { AgentId } from './audit.js';
 import { DataClass } from './charter.js';
+import { CharterConnection } from './connection.js';
 
 /**
  * The canonical fact object a tool call is reduced to before any policy runs.
@@ -174,6 +175,15 @@ export const PolicyBundle = z.object({
     phones: z.array(z.string()),
     tags: z.array(z.string()),
   }),
+
+  /**
+   * Systems this business is connected to, and on which channel.
+   *
+   * Carried into the bundle rather than read from the charter document so the
+   * resolver reads the same artefact the gate does — a run holding a stale
+   * bundle resolves channels from the same stale policy it is judged against.
+   */
+  connections: z.array(CharterConnection),
 
   allowlists: z.record(AgentId, z.array(z.string())),
   denylists: z.record(AgentId, z.array(z.string())),
