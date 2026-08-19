@@ -73,41 +73,74 @@ export function resolveChannel(
  * fixtures.
  *
  * When a payload carries both a `supplierId` and a `counterpartyId` (a stray
- * field, or one an attacker rode in on), the tie is broken by the action
- * class and never by the payload: letting the payload's own shape settle it
- * would hand a caller-supplied field the power to choose the channel.
+ * field, or one an attacker rode in on), the tie is broken by what the call
+ * *is* and never by what the payload contains: letting the payload's own
+ * shape settle it would hand a caller-supplied field the power to choose the
+ * channel.
  *
- * The tie-break *reads* `domain/action.ts`'s `addresseeOf`; it does not
- * redefine it. That mapping answers "does this action reach a human", which
- * is what the risk layer needs — and a class that reaches a human is exactly
- * the class whose `counterpartyId` names the party we are dealing with. Mail,
- * WhatsApp, calendar invitations and payments are addressed to a person and
- * so resolve by counterparty. Everything else — `purchase.place`, both
- * browser classes, the internal systems of record, and a call we could not
- * classify at all — deals with a supplier or a site, so `supplierId` wins.
+ * `prefersSupplier` below names the three ways a call earns supplier
+ * precedence. Everything else — every class that addresses a person, and
+ * every `internal` class — resolves by counterparty. Both halves of that
+ * boundary have been got wrong here already, in opposite directions:
  *
- * Keying on the literal class `purchase.place` was too narrow, and that
- * narrowness was reachable: `browser.click` and `browser.fill` classify as
- * `browser.interact` and only refine to `purchase.place` once the payload
- * carries `amountMinor > 0` (`policy/classify.ts`). An unpriced click on a
- * supplier's site would therefore have routed by whatever `counterpartyId`
- * happened to be in the payload — the precise steer the tie-break exists to
- * block. An unclassified call routes to the supplier for the same reason a
- * class we cannot read is scored at its worst: the value we could not
- * establish must not be the permissive one.
+ * - Keying on the literal class `purchase.place` was too narrow.
+ *   `browser.click` and `browser.fill` classify as `browser.interact` and
+ *   only refine to `purchase.place` once the payload carries
+ *   `amountMinor > 0` (`policy/classify.ts`), so an unpriced click on a
+ *   supplier's site routed by whatever `counterpartyId` was in the payload.
+ * - Widening it to "any class that does not address a person" was too broad
+ *   in the mirror image. `crm.write`, `accounting.write`, `data.export`,
+ *   `artifact.write`, `memory.write_longterm` and `charter.amend` are
+ *   `internal`, and none of them deals with a supplier: they write to the
+ *   CRM, the books, the filesystem, long-term memory and the charter, about a
+ *   counterparty that the payload names correctly. Handing them supplier
+ *   precedence let a stray `supplierId` steer a write to a system of record,
+ *   and broke this function's agreement with `facts.counterpartyId`.
+ *
+ * Written as an allowlist rather than as a negation, because both defects
+ * above were negations that swept in a neighbour nobody looked at.
  */
 export function deriveTargetId(
+  toolName: string,
   input: Record<string, unknown>,
   actionClass: ActionClass | null,
 ): string | null {
   const supplierId = readString(input, 'supplierId');
   const counterpartyId = readString(input, 'counterpartyId') ?? readString(input, 'entityId');
 
-  const addressesPerson = actionClass !== null && addresseeOf(actionClass) === 'person';
+  return prefersSupplier(toolName, actionClass)
+    ? (supplierId ?? counterpartyId)
+    : (counterpartyId ?? supplierId);
+}
 
-  return addressesPerson
-    ? (counterpartyId ?? supplierId)
-    : (supplierId ?? counterpartyId);
+/**
+ * The closed list of calls whose `supplierId` outranks their `counterpartyId`.
+ *
+ * Three entries, each true for a stated reason:
+ *
+ * 1. Addressee `browser`. Read from `domain/action.ts`'s `addresseeOf` rather
+ *    than restated here. That mapping answers "does this action reach a
+ *    human", which is what the risk layer needs; this is a *reader* of that
+ *    answer, not a second definition of it. The two browser classes are a
+ *    closed allowlist there, and a session on a supplier's site is served by
+ *    that supplier's connection.
+ * 2. `purchase.place`. `internal` by addressee — the ceilings do not treat a
+ *    supplier as a person — and routed by supplier for exactly that reason.
+ *    It is the one `internal` class that names a supplier as its target.
+ * 3. A `null` class on a `browser.` tool. `browser.navigate` is read-only and
+ *    so classifies as nothing at all, yet it is unmistakably a supplier-side
+ *    call. Scoped to the tool prefix and not generalised to every `null`
+ *    class: "unclassified therefore supplier" is what put the internal
+ *    classes on the wrong side, and most unclassified calls are not browsing.
+ *
+ * The tool name is a parameter rather than an optional one that defaults to
+ * "not a browser tool", so a caller that forgets it is a compile error rather
+ * than a call that silently routes the other way.
+ */
+function prefersSupplier(toolName: string, actionClass: ActionClass | null): boolean {
+  if (actionClass === null) return toolName.startsWith('browser.');
+  if (actionClass === 'purchase.place') return true;
+  return addresseeOf(actionClass) === 'browser';
 }
 
 function readString(input: Record<string, unknown>, key: string): string | null {

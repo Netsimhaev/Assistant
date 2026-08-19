@@ -139,8 +139,12 @@ function scoreMoney(
 
 /**
  * `one_known` means the charter knows this counterparty — not that the payload
- * claimed one. Everything outbound that is not host-addressed goes through the
- * first-contact escalation; only the two browser classes are exempt.
+ * claimed one. Everything outbound goes through the first-contact escalation
+ * except `BROWSER_ADDRESSED_CLASSES`, which is a closed two-element allowlist
+ * — `browser.interact` and `browser.session` and nothing else. Stated as those
+ * two names rather than as "host-addressed": "host" is the over-broad reading
+ * the allowlist exists to block, since a supplier API also terminates on a
+ * third party's server and must stay inside the escalation.
  *
  * `buildFacts` falls back to the payload's `entityId` when `counterpartyId` is
  * absent, which is right for resolving a counterparty but wrong as evidence of
@@ -157,9 +161,9 @@ function scoreVisibility(
 ): RiskDimensions['externalVisibility'] {
   if (!facts.leavesInstance) return { audience: 'internal', score: 0 };
 
-  // Leaves the instance, but addresses a host rather than a person. Scored as
-  // external exposure without the first-contact escalation, which is about
-  // messaging someone we cannot identify.
+  // Leaves the instance, but addresses a browser session rather than a person.
+  // Scored as external exposure without the first-contact escalation, which is
+  // about messaging someone we cannot identify.
   if (facts.actionClass !== null && BROWSER_ADDRESSED_CLASSES.has(facts.actionClass)) {
     return { audience: 'many', score: 30 };
   }

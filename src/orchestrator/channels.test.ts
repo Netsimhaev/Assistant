@@ -323,52 +323,74 @@ describe('resolving a channel', () => {
 
   describe('deriveTargetId agrees with buildFacts', () => {
     // Driving both functions over one case table is the only form of this
-    // test that can detect drift between them — a hardcoded expectation on
+    // test that can detect drift between them - a hardcoded expectation on
     // each side can be wrong in the same way on both sides at once and still
-    // pass. `mail.send` refines to an email class, which resolves by
-    // counterparty (see the routing tests below), so the counterparty half
-    // is what both functions are compared on here.
-    const cases: [string, Record<string, unknown>][] = [
-      ['entityId only', { entityId: 'c_812' }],
-      ['counterpartyId only', { counterpartyId: 'c_900' }],
-      ['counterpartyId and entityId together', { counterpartyId: 'c_900', entityId: 'c_812' }],
-      ['neither', { body: 'hello' }],
+    // pass.
+    //
+    // Both tools here resolve by counterparty, which is the half that has to
+    // agree: `mail.send` refines to an email class (addressee `person`) and
+    // `crm.write` is `internal`. The internal classes are in this table on
+    // purpose - when the rule read "not a person therefore supplier", they
+    // routed by a stray `supplierId` and this agreement broke.
+    const cases: [string, string, Record<string, unknown>][] = [
+      ['mail.send', 'entityId only', { entityId: 'c_812' }],
+      ['mail.send', 'counterpartyId only', { counterpartyId: 'c_900' }],
+      [
+        'mail.send',
+        'counterpartyId and entityId together',
+        { counterpartyId: 'c_900', entityId: 'c_812' },
+      ],
+      ['mail.send', 'neither', { body: 'hello' }],
+      ['mail.send', 'a stray supplierId alongside', { counterpartyId: 'c_900', supplierId: 's_1' }],
+      ['crm.write', 'entityId only', { entityId: 'c_812' }],
+      ['crm.write', 'a stray supplierId alongside', { counterpartyId: 'c_900', supplierId: 's_1' }],
+      ['accounting.write', 'a stray supplierId alongside', { entityId: 'c_812', supplierId: 's_1' }],
+      ['data.export', 'a stray supplierId alongside', { entityId: 'c_812', supplierId: 's_1' }],
+      ['file.write', 'a stray supplierId alongside', { entityId: 'c_812', supplierId: 's_1' }],
     ];
 
-    it.each(cases)('%s', (_label, input) => {
-      const facts = buildFacts('mail.send', input, FACTS_CTX);
-      const result = deriveTargetId(input, facts.actionClass);
+    it.each(cases)('%s, %s', (toolName, _label, input) => {
+      const facts = buildFacts(toolName, input, FACTS_CTX);
+      const result = deriveTargetId(toolName, input, facts.actionClass);
       expect(result).toBe(facts.counterpartyId);
     });
   });
 
-  describe('the routing tie-break follows addresseeOf, not one literal class', () => {
-    // The tie-break reads domain/action.ts's addresseeOf; it does not restate
-    // it. A class that reaches a person is the class whose counterpartyId
-    // names the party being dealt with — so person wins the counterparty, and
-    // everything else (supplier, site, internal system, or a call we could not
-    // classify) resolves by supplier.
+  describe('the routing tie-break', () => {
+    // Supplier precedence is a closed list of three: addressee `browser`,
+    // `purchase.place`, and a null class on a `browser.` tool. Everything
+    // else - every `person` class and every `internal` class - resolves by
+    // counterparty.
     //
-    // These cases are the boundary the previous rounds got wrong. Keying on
-    // the literal `purchase.place` left browser.interact, browser.session and
-    // a null class routing by counterparty, which let a stray or injected
-    // counterpartyId steer a supplier-side browser step.
+    // Both directions of this boundary have been wrong here before. Keying on
+    // the literal `purchase.place` left an unpriced browser click routing by
+    // counterparty; widening it to "anything not addressed to a person"
+    // handed the internal systems of record to a stray supplierId.
     const BOTH = { supplierId: 'supplier-a', counterpartyId: 'c_812' };
 
-    const cases: [ActionClass | null, string][] = [
-      ['browser.interact', 'supplier-a'],
-      ['browser.session', 'supplier-a'],
-      [null, 'supplier-a'],
-      ['purchase.place', 'supplier-a'],
-      ['email.initiate', 'c_812'],
-      ['payment.make', 'c_812'],
+    const cases: { label: string; tool: string; cls: ActionClass | null; expected: string }[] = [
+      { label: 'a browser click', tool: 'browser.click', cls: 'browser.interact', expected: 'supplier-a' },
+      { label: 'a session request', tool: 'credential.request_session', cls: 'browser.session', expected: 'supplier-a' },
+      { label: 'an unclassified browser call', tool: 'browser.navigate', cls: null, expected: 'supplier-a' },
+      { label: 'a purchase', tool: 'browser.submit_order', cls: 'purchase.place', expected: 'supplier-a' },
+      { label: 'a first-contact email', tool: 'mail.send', cls: 'email.initiate', expected: 'c_812' },
+      { label: 'a payment', tool: 'payment.charge', cls: 'payment.make', expected: 'c_812' },
     ];
 
-    it.each(cases)('%s with both ids resolves to %s', (actionClass, expected) => {
-      expect(deriveTargetId(BOTH, actionClass)).toBe(expected);
+    // Named-property cases, so a failure names the case and the id that should
+    // have won rather than printing two positional %s that do not line up.
+    it.each(cases)('$label with both ids resolves to $expected', ({ tool, cls, expected }) => {
+      expect(deriveTargetId(tool, BOTH, cls)).toBe(expected);
     });
 
-    // The same six decisions again, but reached through the real classifier
+    // The mirror of the null case above. `null` alone must not buy supplier
+    // precedence - only `null` on a browser tool does.
+    it('routes an unclassified non-browser call to the counterparty', () => {
+      expect(deriveTargetId('mail.draft', BOTH, null)).toBe('c_812');
+      expect(deriveTargetId('memory.recall', BOTH, null)).toBe('c_812');
+    });
+
+    // The same decisions again, but reached through the real classifier
     // rather than a literal class, because the defect lived in the gap
     // between a tool name and the class it lands on: browser.click carrying
     // no amount stays browser.interact and only refines to purchase.place
@@ -376,50 +398,99 @@ describe('resolving a channel', () => {
     it('routes an unpriced browser.click to the supplier', () => {
       const facts = buildFacts('browser.click', BOTH, FACTS_CTX);
       expect(facts.actionClass).toBe('browser.interact');
-      expect(deriveTargetId(BOTH, facts.actionClass)).toBe('supplier-a');
+      expect(deriveTargetId('browser.click', BOTH, facts.actionClass)).toBe('supplier-a');
     });
 
     it('routes a priced browser.click to the supplier as well', () => {
       const priced = { ...BOTH, amountMinor: 5000 };
       const facts = buildFacts('browser.click', priced, FACTS_CTX);
       expect(facts.actionClass).toBe('purchase.place');
-      expect(deriveTargetId(priced, facts.actionClass)).toBe('supplier-a');
+      expect(deriveTargetId('browser.click', priced, facts.actionClass)).toBe('supplier-a');
     });
 
     it('routes a browser session request to the supplier', () => {
       const facts = buildFacts('credential.request_session', BOTH, FACTS_CTX);
       expect(facts.actionClass).toBe('browser.session');
-      expect(deriveTargetId(BOTH, facts.actionClass)).toBe('supplier-a');
+      expect(deriveTargetId('credential.request_session', BOTH, facts.actionClass)).toBe(
+        'supplier-a',
+      );
     });
 
     it('routes browser.submit_order to the supplier', () => {
       const facts = buildFacts('browser.submit_order', BOTH, FACTS_CTX);
       expect(facts.actionClass).toBe('purchase.place');
-      expect(deriveTargetId(BOTH, facts.actionClass)).toBe('supplier-a');
+      expect(deriveTargetId('browser.submit_order', BOTH, facts.actionClass)).toBe('supplier-a');
     });
 
     it('routes mail.send to the counterparty despite a stray supplierId', () => {
       const facts = buildFacts('mail.send', BOTH, FACTS_CTX);
       expect(addresseeOf(facts.actionClass!)).toBe('person');
-      expect(deriveTargetId(BOTH, facts.actionClass)).toBe('c_812');
+      expect(deriveTargetId('mail.send', BOTH, facts.actionClass)).toBe('c_812');
     });
 
     it('routes whatsapp to the counterparty despite a stray supplierId', () => {
       const facts = buildFacts('wa.send_message', BOTH, FACTS_CTX);
       expect(addresseeOf(facts.actionClass!)).toBe('person');
-      expect(deriveTargetId(BOTH, facts.actionClass)).toBe('c_812');
+      expect(deriveTargetId('wa.send_message', BOTH, facts.actionClass)).toBe('c_812');
     });
 
-    // Every class in the enum agrees with addresseeOf, so a class added later
-    // cannot land on a routing rule nobody chose for it.
-    it.each(ActionClass.options)('%s routes by its addressee', (cls) => {
-      const expected = addresseeOf(cls) === 'person' ? 'c_812' : 'supplier-a';
-      expect(deriveTargetId(BOTH, cls)).toBe(expected);
+    it('routes a CRM write to the counterparty despite a stray supplierId', () => {
+      const facts = buildFacts('crm.write', BOTH, FACTS_CTX);
+      expect(addresseeOf(facts.actionClass!)).toBe('internal');
+      expect(deriveTargetId('crm.write', BOTH, facts.actionClass)).toBe('c_812');
+    });
+
+    /**
+     * Every class in the enum, written out.
+     *
+     * The expectation is a literal table and not `addresseeOf(cls) === ... ?`,
+     * because a computed expectation calls the same function the
+     * implementation calls: reclassifying a class would move both sides
+     * together and this test would stay green while claiming to be the thing
+     * that stops exactly that. Only literals pin anything.
+     *
+     * A `Record<ActionClass, string>` rather than a list, so a class added to
+     * the enum is a compile error here instead of a class with no pinned
+     * routing.
+     *
+     * The tool name is held constant and deliberately not a `browser.` one,
+     * so this table measures the class rule alone; the prefix rule for a null
+     * class is covered by its own cases above.
+     */
+    const ROUTES_TO: Record<ActionClass, string> = {
+      'email.reply': 'c_812',
+      'email.initiate': 'c_812',
+      'whatsapp.reply': 'c_812',
+      'whatsapp.initiate': 'c_812',
+      'calendar.create': 'c_812',
+      'calendar.move': 'c_812',
+      'calendar.cancel': 'c_812',
+      'quote.issue': 'c_812',
+      'discount.grant': 'c_812',
+      'commitment.make': 'c_812',
+      'purchase.place': 'supplier-a',
+      'payment.make': 'c_812',
+      'refund.issue': 'c_812',
+      'crm.write': 'c_812',
+      'accounting.write': 'c_812',
+      'artifact.write': 'c_812',
+      'doc.deliver': 'c_812',
+      'media.publish': 'c_812',
+      'browser.interact': 'supplier-a',
+      'browser.session': 'supplier-a',
+      'contract.sign': 'c_812',
+      'data.export': 'c_812',
+      'memory.write_longterm': 'c_812',
+      'charter.amend': 'c_812',
+    };
+
+    it.each(ActionClass.options)('%s routes to its pinned target', (cls) => {
+      expect(deriveTargetId('some.tool', BOTH, cls)).toBe(ROUTES_TO[cls]);
     });
   });
 
   it('treats an empty-string field as absent', () => {
-    expect(deriveTargetId({ supplierId: '' }, null)).toBeNull();
-    expect(deriveTargetId({ body: 'hello' }, null)).toBeNull();
+    expect(deriveTargetId('browser.navigate', { supplierId: '' }, null)).toBeNull();
+    expect(deriveTargetId('mail.send', { body: 'hello' }, null)).toBeNull();
   });
 });
