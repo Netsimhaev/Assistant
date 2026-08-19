@@ -546,6 +546,59 @@ describe('regressions found in review', () => {
     expect(decision.code).toBe('do_not_contact');
   });
 
+  it('blocks a do-not-contact email domain behind a trailing root dot', async () => {
+    // 'dana@rival-legal.co.il.' -- a trailing root dot, legal DNS notation
+    // that EMAIL_SHAPE (mail.ts) accepts -- used to split to
+    // 'rival-legal.co.il.' with the dot still attached, which matched
+    // nothing in a charter naming 'rival-legal.co.il'. extractDomain
+    // (src/util/address.ts) strips exactly one trailing dot before either
+    // reader compares it.
+    const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
+
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'dana@rival-legal.co.il.', inReplyTo: 'thread-1', body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('do_not_contact');
+  });
+
+  it('blocks a do-not-contact email domain for a subdomain of it, not only the exact host', async () => {
+    // A charter entry of 'rival-legal.co.il' means the company, every
+    // subdomain included -- `emailDomains.includes(domain)` (exact string
+    // equality) never blocked 'dana@mail.rival-legal.co.il'.
+    const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
+
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'dana@mail.rival-legal.co.il', inReplyTo: 'thread-1', body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('do_not_contact');
+  });
+
+  it('does not block a lookalike domain that merely ends with the same letters', async () => {
+    // 'rival-legal.co.il' is a plain substring of
+    // 'evilrival-legal.co.il', but never follows a '.' there. Anchoring on
+    // the subdomain boundary must not turn into a suffix match that blocks
+    // unrelated domains.
+    const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
+
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'dana@evilrival-legal.co.il', inReplyTo: 'thread-1', body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).not.toBe('deny');
+  });
+
   it('does not score an unresolvable counterparty as one we know', async () => {
     const bundle = await install();
 

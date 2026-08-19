@@ -8,6 +8,7 @@ import {
   SENSITIVE_MAX_TOTAL,
 } from '../domain/risk.js';
 import type { TrustLevel } from '../domain/trust.js';
+import { domainMatches, extractDomain } from '../util/address.js';
 import { formatMinor } from '../util/money.js';
 
 /**
@@ -174,8 +175,12 @@ function scoreVisibility(
   const resolved =
     (facts.counterpartyId !== null && known.entityIds.includes(facts.counterpartyId)) ||
     facts.counterpartyEmails.some((email) => {
-      const domain = email.split('@')[1];
-      return domain !== undefined && known.emailDomains.includes(domain);
+      const domain = extractDomain(email);
+      // A subdomain of a known counterparty's domain is the same company,
+      // per domainMatches (src/util/address.ts) -- the same anchoring this
+      // module's do-not-contact and autonomy-override checks now share, so
+      // 'mail.partner.co.il' resolves exactly as 'partner.co.il' does.
+      return domain !== null && known.emailDomains.some((pattern) => domainMatches(domain, pattern));
     }) ||
     facts.counterpartyPhones.some((phone) => known.phones.includes(phone)) ||
     facts.counterpartyTags.some((tag) => known.tags.includes(tag));

@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { domainMatches, extractDomain } from '../util/address.js';
 import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
 import type { AgentId } from '../domain/audit.js';
 import type { ActionFacts, PolicyBundle, PolicyDecision } from '../domain/policy.js';
@@ -298,7 +299,12 @@ export async function evaluateToolCall(
  *
  * Four keys, checked independently: an entry is a block if *any* of them
  * matches. The email match is on the domain, which is the point of the key —
- * "never contact anyone at this company" is a sentence an owner writes.
+ * "never contact anyone at this company" is a sentence an owner writes, and
+ * it means the whole company, not one hostname: `extractDomain` and
+ * `domainMatches` (`src/util/address.ts`) normalise the address's domain and
+ * match it against the charter entry or any subdomain of it, so
+ * `dana@mail.rival.co.il` is blocked by a `rival.co.il` entry exactly as
+ * `dana@rival.co.il` is.
  */
 function matchDoNotContact(
   facts: ActionFacts,
@@ -308,8 +314,10 @@ function matchDoNotContact(
     return facts.counterpartyId;
   }
   for (const email of facts.counterpartyEmails) {
-    const domain = email.split('@')[1];
-    if (domain !== undefined && list.emailDomains.includes(domain)) return domain;
+    const domain = extractDomain(email);
+    if (domain !== null && list.emailDomains.some((blocked) => domainMatches(domain, blocked))) {
+      return domain;
+    }
   }
   const phone = facts.counterpartyPhones.find((p) => list.phones.includes(p));
   if (phone !== undefined) return phone;
@@ -339,9 +347,19 @@ function effectiveAutonomy(facts: ActionFacts, ctx: GateContext): AutonomyLevel 
     facts.counterpartyId === null
       ? undefined
       : overrides.byEntityId[facts.counterpartyId]?.[actionClass],
-    ...facts.counterpartyEmails.map((email) => {
-      const domain = email.split('@')[1];
-      return domain === undefined ? undefined : overrides.byEmailDomain[domain]?.[actionClass];
+    // A direct property lookup (`byEmailDomain[domain]`) only ever matched
+    // the exact domain an owner wrote, so an override tightening every
+    // `rival.co.il` counterparty silently missed `mail.rival.co.il`. Every
+    // registered pattern the domain matches or is a subdomain of applies —
+    // never just the first one found — because this only ever tightens the
+    // ceiling, and dropping a stricter override that also matched would be
+    // the same silent-loosening bug this whole function exists to avoid.
+    ...facts.counterpartyEmails.flatMap((email) => {
+      const domain = extractDomain(email);
+      if (domain === null) return [];
+      return Object.keys(overrides.byEmailDomain)
+        .filter((pattern) => domainMatches(domain, pattern))
+        .map((pattern) => overrides.byEmailDomain[pattern]?.[actionClass]);
     }),
     ...facts.counterpartyPhones.map((p) => overrides.byPhone[p]?.[actionClass]),
     ...facts.counterpartyTags.map((tag) => overrides.byTag[tag]?.[actionClass]),
