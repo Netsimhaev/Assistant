@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import type { AgentId } from '../domain/audit.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withTransaction, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -56,6 +56,13 @@ interface KillRow {
  *
  * The state lives in Postgres rather than in memory precisely so it survives a
  * process restart — a stop that a crash-and-respawn would clear is not a stop.
+ *
+ * The write and its audit entry run in one transaction, on one connection: the
+ * kill switch is the control meant to work when everything else already has,
+ * and a stop that commits with no audit row means the one moment someone
+ * needs to reconstruct who stopped the system and when is exactly the moment
+ * the trail is silent. An append that fails must roll the trip back rather
+ * than leave the switch flipped with nothing recording it.
  */
 export async function trip(
   scope: KillScope,
@@ -65,33 +72,41 @@ export async function trip(
 ): Promise<void> {
   const businessId = options.businessId ?? config.businessId;
 
-  await getPool().query(
-    `INSERT INTO kill_switch (business_id, scope, tripped, tripped_by, tripped_at, reason, updated_at)
-     VALUES ($1, $2, true, $3, now(), $4, now())
-     ON CONFLICT (business_id, scope)
-     DO UPDATE SET tripped = true, tripped_by = EXCLUDED.tripped_by,
-                   tripped_at = now(), reason = EXCLUDED.reason,
-                   released_by = NULL, released_at = NULL, updated_at = now()`,
-    [businessId, scope, by, reason],
-  );
+  await withTransaction(async (tx) => {
+    await tx.query(
+      `INSERT INTO kill_switch (business_id, scope, tripped, tripped_by, tripped_at, reason, updated_at)
+       VALUES ($1, $2, true, $3, now(), $4, now())
+       ON CONFLICT (business_id, scope)
+       DO UPDATE SET tripped = true, tripped_by = EXCLUDED.tripped_by,
+                     tripped_at = now(), reason = EXCLUDED.reason,
+                     released_by = NULL, released_at = NULL, updated_at = now()`,
+      [businessId, scope, by, reason],
+    );
 
-  await appendAudit(
-    {
-      actor: 'human',
-      onBehalfOf: by,
-      kind: 'kill_switch',
-      charterVersion: options.charterVersion ?? 'unknown',
-      provenance: 'boss',
-      inputHash: canonicalHash({ scope, action: 'trip' }),
-      reason: `kill switch TRIPPED on scope "${scope}" by ${by}: ${reason}`,
-    },
-    { businessId },
-  );
+    await appendAudit(
+      {
+        actor: 'human',
+        onBehalfOf: by,
+        kind: 'kill_switch',
+        charterVersion: options.charterVersion ?? 'unknown',
+        provenance: 'boss',
+        inputHash: canonicalHash({ scope, action: 'trip' }),
+        reason: `kill switch TRIPPED on scope "${scope}" by ${by}: ${reason}`,
+      },
+      { businessId, tx },
+    );
+  });
 }
 
 /**
  * Release a kill switch. Requires an explicit human action and produces its own
  * audit entry with a reason — resuming is as accountable as stopping.
+ *
+ * The update and its audit entry share one transaction for the same reason as
+ * `trip()`. The "nothing was tripped" check runs first and throws inside the
+ * transaction, before any audit row is written, so the throw rolls back
+ * cleanly and the trail never gains a RELEASED entry for an event that never
+ * happened.
  */
 export async function release(
   scope: KillScope,
@@ -101,33 +116,35 @@ export async function release(
 ): Promise<void> {
   const businessId = options.businessId ?? config.businessId;
 
-  const { rowCount } = await getPool().query(
-    `UPDATE kill_switch
-        SET tripped = false, released_by = $3, released_at = now(), updated_at = now()
-      WHERE business_id = $1 AND scope = $2 AND tripped = true`,
-    [businessId, scope, by],
-  );
+  await withTransaction(async (tx) => {
+    const { rowCount } = await tx.query(
+      `UPDATE kill_switch
+          SET tripped = false, released_by = $3, released_at = now(), updated_at = now()
+        WHERE business_id = $1 AND scope = $2 AND tripped = true`,
+      [businessId, scope, by],
+    );
 
-  // Nothing was tripped, so nothing was released. Writing the audit entry
-  // anyway put a permanent, hash-chained "RELEASED" record in the trail for an
-  // event that never happened — and the trail is the only thing anyone has to
-  // reconstruct who stopped the system and when.
-  if ((rowCount ?? 0) === 0) {
-    throw new Error(`kill switch scope "${scope}" is not tripped; nothing to release`);
-  }
+    // Nothing was tripped, so nothing was released. Writing the audit entry
+    // anyway put a permanent, hash-chained "RELEASED" record in the trail for
+    // an event that never happened — and the trail is the only thing anyone
+    // has to reconstruct who stopped the system and when.
+    if ((rowCount ?? 0) === 0) {
+      throw new Error(`kill switch scope "${scope}" is not tripped; nothing to release`);
+    }
 
-  await appendAudit(
-    {
-      actor: 'human',
-      onBehalfOf: by,
-      kind: 'kill_switch',
-      charterVersion: options.charterVersion ?? 'unknown',
-      provenance: 'boss',
-      inputHash: canonicalHash({ scope, action: 'release' }),
-      reason: `kill switch RELEASED on scope "${scope}" by ${by}: ${reason}`,
-    },
-    { businessId },
-  );
+    await appendAudit(
+      {
+        actor: 'human',
+        onBehalfOf: by,
+        kind: 'kill_switch',
+        charterVersion: options.charterVersion ?? 'unknown',
+        provenance: 'boss',
+        inputHash: canonicalHash({ scope, action: 'release' }),
+        reason: `kill switch RELEASED on scope "${scope}" by ${by}: ${reason}`,
+      },
+      { businessId, tx },
+    );
+  });
 }
 
 export async function activeScopes(
