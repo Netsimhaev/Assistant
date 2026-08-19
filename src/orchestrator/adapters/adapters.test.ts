@@ -360,6 +360,13 @@ describe('credentials', () => {
   });
 
   describe('the lookup does not walk the prototype chain', () => {
+    // These names are also illegal refs (lowercase / underscored-lowercase),
+    // so with the ref-shape guard in place they are refused before the
+    // environment is ever touched. They stay as a defense-in-depth check —
+    // refusal must hold however it happens — but they no longer exercise
+    // the Object.hasOwn guard specifically. The tests below this block are
+    // the ones that do: they use a ref that legitimately passes REF_PATTERN
+    // and isolate the hasOwn / typeof checks each on their own.
     it.each(['constructor', 'hasOwnProperty', 'isPrototypeOf', '__proto__', 'toString'])(
       'returns null for ref %s against an injected {}',
       async (ref) => {
@@ -373,14 +380,55 @@ describe('credentials', () => {
         expect(await envCredentials(undefined, P).resolve(ref)).toBeNull();
       },
     );
+
+    it('rejects a prefixed key inherited via the prototype chain rather than owned', async () => {
+      // A ref of 'SECRET' is a legal, all-uppercase ref, so it reaches the
+      // environment lookup. env[key] would find this value because plain
+      // indexing walks the prototype chain; Object.hasOwn must not.
+      const env = Object.create({ [`${P}SECRET`]: 'leaked' }) as Record<
+        string,
+        string | undefined
+      >;
+      expect(await envCredentials(env, P).resolve('SECRET')).toBeNull();
+    });
+
+    it('rejects a prefixed own key whose value is not a string', async () => {
+      // Also a legal ref, so this isolates the typeof guard from the
+      // hasOwn guard: the key genuinely is an own property here.
+      const env = { [`${P}WEIRD`]: 12345 } as unknown as Record<string, string | undefined>;
+      expect(await envCredentials(env, P).resolve('WEIRD')).toBeNull();
+    });
   });
 
-  it('is case-sensitive: a wrong-case ref yields null rather than matching loosely', async () => {
-    // process.env lookup is case-insensitive on Windows and case-sensitive on
-    // Linux; Object.hasOwn is case-sensitive on both, so this behaves the
-    // same in dev and in production rather than only failing in one of them.
-    const source = envCredentials({ [`${P}OFFICE_MAIL`]: 'secret-value' }, P);
-    expect(await source.resolve('office_mail')).toBeNull();
-    expect(await source.resolve('OFFICE_MAIL')).not.toBeNull();
+  describe('a ref must be uppercase letters, digits and underscores only', () => {
+    it('rejects a lower-case ref even when the prefixed key exists in that case', async () => {
+      // Object.hasOwn is not reliably case-sensitive across platforms --
+      // Node's process.env accessor is case-insensitive on Windows -- so the
+      // guarantee comes from refusing the illegal ref outright, before any
+      // environment lookup happens, not from case-sensitive matching.
+      const source = envCredentials({ [`${P}OFFICE_MAIL`]: 'secret-value' }, P);
+      expect(await source.resolve('office_mail')).toBeNull();
+      expect(await source.resolve('OFFICE_MAIL')).not.toBeNull();
+    });
+
+    it('rejects a ref containing characters outside [A-Z0-9_]', async () => {
+      const source = envCredentials({ [`${P}OFFICE-MAIL`]: 'secret-value' }, P);
+      expect(await source.resolve('OFFICE-MAIL')).toBeNull();
+      expect(await source.resolve('OFFICE.MAIL')).toBeNull();
+      expect(await source.resolve('')).toBeNull();
+    });
+  });
+
+  describe('the prefix itself cannot be switched off', () => {
+    it('refuses an empty prefix at construction', () => {
+      // Not a resolve-time null: a caller that can pass '' and get a working
+      // CredentialSource back has a way to disable the entire namespace
+      // separation control, silently, with every other test still green.
+      expect(() => envCredentials({}, '')).toThrow(/prefix/i);
+    });
+
+    it('refuses a whitespace-only prefix at construction', () => {
+      expect(() => envCredentials({}, '   ')).toThrow(/prefix/i);
+    });
   });
 });
