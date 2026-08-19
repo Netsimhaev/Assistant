@@ -36,6 +36,13 @@ async function installAuditFailureTrigger(): Promise<void> {
     END;
     $$ LANGUAGE plpgsql;
 
+    -- The function is CREATE OR REPLACE (idempotent) but a bare CREATE
+    -- TRIGGER is not: a run interrupted after this point (before afterEach's
+    -- cleanup runs) leaves the trigger in place, and resetDatabase() only
+    -- truncates tables — it does not drop triggers. Without this DROP,
+    -- every later run would fail at "trigger already exists" instead of the
+    -- test it was meant to run.
+    DROP TRIGGER IF EXISTS force_audit_failure ON audit_log;
     CREATE TRIGGER force_audit_failure
       BEFORE INSERT ON audit_log
       FOR EACH ROW EXECUTE FUNCTION test_force_audit_failure();
@@ -49,31 +56,68 @@ async function removeAuditFailureTrigger(): Promise<void> {
   `);
 }
 
-describe('trip() and release() are transactional with their audit entry', () => {
+describe('trip() fails loud but does NOT roll back — the stop must hold', () => {
   afterEach(async () => {
     await removeAuditFailureTrigger();
   });
 
-  it('leaves the kill switch unchanged when the audit append fails inside trip()', async () => {
+  it('leaves the kill switch TRIPPED when the audit append fails on first trip', async () => {
     await installAuditFailureTrigger();
 
     await expect(
       trip('all', BY, FORCE_FAILURE, { businessId: BUSINESS }),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/IS TRIPPED/);
 
-    // The row must not exist at all — not "exists but still false" — because
-    // trip() upserts, and a partial commit would leave a row with garbage
-    // tripped_by/tripped_at from this attempt.
-    expect(await activeScopes(BUSINESS)).toEqual([]);
-    const { rows } = await getPool().query(
-      'SELECT * FROM kill_switch WHERE business_id = $1',
-      [BUSINESS],
-    );
-    expect(rows).toEqual([]);
+    // The write must have committed even though the audit append failed and
+    // the call threw: rolling back an emergency stop because its audit
+    // couldn't also be written would defeat the one control meant to work
+    // when everything else already has.
+    const scopes = await activeScopes(BUSINESS);
+    expect(scopes).toHaveLength(1);
+    expect(scopes[0]?.scope).toBe('all');
+    expect(scopes[0]?.trippedBy).toBe(BY);
+    // No audit row: the append genuinely failed and did not silently retry.
     expect(await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' })).toEqual([]);
   });
 
-  it('rolls back a trip that was already active if the release audit append fails', async () => {
+  it('holds the new trip when re-tripping an already-tripped scope and the audit append fails', async () => {
+    // First trip succeeds normally and is audited.
+    await trip('all', BY, 'עצירה ראשונה', { businessId: BUSINESS });
+    const firstAudit = await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' });
+    expect(firstAudit).toHaveLength(1);
+
+    // Re-trip the same scope through the ON CONFLICT DO UPDATE path, with a
+    // different actor and reason, while the audit append is forced to fail.
+    await installAuditFailureTrigger();
+    const secondBy = 'other.human@example.com';
+
+    await expect(
+      trip('all', secondBy, FORCE_FAILURE, { businessId: BUSINESS }),
+    ).rejects.toThrow(/IS TRIPPED/);
+
+    // The re-trip's write must hold — trippedBy and reason reflect the
+    // second call, not the first. A rollback here would silently keep the
+    // switch attributed to the wrong actor with the wrong reason while
+    // reporting (via the throw) that something went wrong, which is exactly
+    // the kind of "looks stopped but isn't quite" state trip() must not
+    // produce.
+    const scopes = await activeScopes(BUSINESS);
+    expect(scopes).toHaveLength(1);
+    expect(scopes[0]?.trippedBy).toBe(secondBy);
+    expect(scopes[0]?.reason).toBe(FORCE_FAILURE);
+
+    // Still only the one audit entry from the first, successful trip — the
+    // second trip's audit entry never made it in.
+    expect(await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' })).toEqual(firstAudit);
+  });
+});
+
+describe('release() is transactional with its audit entry — refusing to release is the safe failure', () => {
+  afterEach(async () => {
+    await removeAuditFailureTrigger();
+  });
+
+  it('rolls back a release if the audit append fails, leaving the scope still tripped', async () => {
     await trip('all', BY, 'תקלה בבדיקה', { businessId: BUSINESS });
     const before = await activeScopes(BUSINESS);
 

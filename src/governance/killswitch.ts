@@ -57,12 +57,35 @@ interface KillRow {
  * The state lives in Postgres rather than in memory precisely so it survives a
  * process restart — a stop that a crash-and-respawn would clear is not a stop.
  *
- * The write and its audit entry run in one transaction, on one connection: the
- * kill switch is the control meant to work when everything else already has,
- * and a stop that commits with no audit row means the one moment someone
- * needs to reconstruct who stopped the system and when is exactly the moment
- * the trail is silent. An append that fails must roll the trip back rather
- * than leave the switch flipped with nothing recording it.
+ * DELIBERATELY NOT ATOMIC WITH ITS AUDIT ENTRY, unlike every other write in
+ * this codebase (`upsertBinding`, `release()` below). The kill-switch write
+ * commits on its own first; the audit append happens after, on its own
+ * connection. If the append fails, this throws — loudly, saying the stop
+ * *is* in force but was not recorded — and does **not** undo the write.
+ *
+ * This looks like the same defect `release()` and `upsertBinding` had before
+ * they were made transactional. It is not, and "fixing" it back to
+ * atomic-with-rollback would reintroduce a real bug: the kill switch is the
+ * control whose entire job is to work when everything else already has. The
+ * audit advisory lock is exactly the thing likely to be contended when
+ * someone reaches for the stop, because contention means the system is busy,
+ * which is when a stop is needed. Of the two failure directions —
+ * "stopped, audit missing, throw raises the alarm" versus "still running, no
+ * record, no alarm" — only the first is defensible. A trip that rolled back
+ * because it could not also write an audit row would silently keep an
+ * emergency stop from taking effect at the worst possible moment.
+ *
+ * `release()` is intentionally the opposite: releasing without a record is
+ * the dangerous direction there, so `release()` rolls back and refuses to
+ * release when its audit append fails. The asymmetry between the two
+ * functions is the point, not an inconsistency to smooth over.
+ *
+ * Do not pass a caller-owned transaction into this function (there is
+ * currently no such option, and none should be added casually): the audit
+ * advisory lock is transaction-scoped, so calling `trip()` from inside a
+ * transaction that has already appended an audit entry this business would
+ * block on that lock with no deadlock detection across separate connections.
+ * No caller does this today.
  */
 export async function trip(
   scope: KillScope,
@@ -72,17 +95,17 @@ export async function trip(
 ): Promise<void> {
   const businessId = options.businessId ?? config.businessId;
 
-  await withTransaction(async (tx) => {
-    await tx.query(
-      `INSERT INTO kill_switch (business_id, scope, tripped, tripped_by, tripped_at, reason, updated_at)
-       VALUES ($1, $2, true, $3, now(), $4, now())
-       ON CONFLICT (business_id, scope)
-       DO UPDATE SET tripped = true, tripped_by = EXCLUDED.tripped_by,
-                     tripped_at = now(), reason = EXCLUDED.reason,
-                     released_by = NULL, released_at = NULL, updated_at = now()`,
-      [businessId, scope, by, reason],
-    );
+  await getPool().query(
+    `INSERT INTO kill_switch (business_id, scope, tripped, tripped_by, tripped_at, reason, updated_at)
+     VALUES ($1, $2, true, $3, now(), $4, now())
+     ON CONFLICT (business_id, scope)
+     DO UPDATE SET tripped = true, tripped_by = EXCLUDED.tripped_by,
+                   tripped_at = now(), reason = EXCLUDED.reason,
+                   released_by = NULL, released_at = NULL, updated_at = now()`,
+    [businessId, scope, by, reason],
+  );
 
+  try {
     await appendAudit(
       {
         actor: 'human',
@@ -93,9 +116,16 @@ export async function trip(
         inputHash: canonicalHash({ scope, action: 'trip' }),
         reason: `kill switch TRIPPED on scope "${scope}" by ${by}: ${reason}`,
       },
-      { businessId, tx },
+      { businessId },
     );
-  });
+  } catch (error) {
+    const cause = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `kill switch scope "${scope}" IS TRIPPED (the stop is in force) but the audit ` +
+        `entry recording it failed to write: ${cause}. The system is stopped; the ` +
+        `record of who stopped it and why is missing and must be reconstructed manually.`,
+    );
+  }
 }
 
 /**

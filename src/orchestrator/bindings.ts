@@ -65,9 +65,11 @@ export async function loadBindings(
  * flip and a human-initiated redirect must not be recorded as the same
  * anonymous "human" actor. It must also be non-empty — an unvalidated
  * required field is a required field in name only. (On the transaction point
- * below, `trip()`/`release()` are not a precedent to imitate: they still
- * write and audit on separate connections and carry the exact defect fixed
- * here.)
+ * below, `release()` follows this same atomic-with-rollback shape. `trip()`
+ * deliberately does not: its write commits even if the audit append fails,
+ * because rolling back an emergency stop over an audit failure would be
+ * worse than a stop with a late or manually reconstructed record. See the
+ * docblock on `trip()` for why that asymmetry is intentional.)
  *
  * `options.db`, when supplied, must be a real `pg.PoolClient` already inside
  * a transaction the caller owns — not just anything with a `.query` method.
