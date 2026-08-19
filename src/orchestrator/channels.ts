@@ -99,6 +99,19 @@ export function resolveChannel(
  *
  * Written as an allowlist rather than as a negation, because both defects
  * above were negations that swept in a neighbour nobody looked at.
+ *
+ * The losing side yields `null`; it never falls through to the other field.
+ * That cross-fallback made the whole precedence rule optional: a payload did
+ * not have to win the argument, it just had to omit the field it would have
+ * lost with. `mail.send` carrying only a `supplierId` returned that supplier
+ * even though `buildFacts` reports no counterparty at all, and a
+ * `browser.interact` carrying only a `counterpartyId` returned that
+ * counterparty. Whichever id the payload supplied became the target, which is
+ * precisely the caller-chosen routing this function exists to prevent.
+ *
+ * Returning no target is the safe outcome, not a degraded one: `resolveChannel`
+ * then matches the `target: null` catch-all, which is a connection the owner
+ * signed, or refuses outright. Either way the channel comes from the registry.
  */
 export function deriveTargetId(
   toolName: string,
@@ -108,9 +121,7 @@ export function deriveTargetId(
   const supplierId = readString(input, 'supplierId');
   const counterpartyId = readString(input, 'counterpartyId') ?? readString(input, 'entityId');
 
-  return prefersSupplier(toolName, actionClass)
-    ? (supplierId ?? counterpartyId)
-    : (counterpartyId ?? supplierId);
+  return prefersSupplier(toolName, actionClass) ? supplierId : counterpartyId;
 }
 
 /**

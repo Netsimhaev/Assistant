@@ -347,6 +347,15 @@ describe('resolving a channel', () => {
       ['accounting.write', 'a stray supplierId alongside', { entityId: 'c_812', supplierId: 's_1' }],
       ['data.export', 'a stray supplierId alongside', { entityId: 'c_812', supplierId: 's_1' }],
       ['file.write', 'a stray supplierId alongside', { entityId: 'c_812', supplierId: 's_1' }],
+      // The rows that matter most, and the ones whose absence let the
+      // cross-fallback survive five rounds: a single id, on the side that
+      // loses. The precedence rule never had to be beaten - a payload could
+      // just omit the field it would have lost with, and the surviving id
+      // became the target by default. Both of these must now agree with
+      // buildFacts reporting no counterparty at all.
+      ['mail.send', 'a supplierId and no counterparty', { to: 'victim@example.com', supplierId: 'evil-co' }],
+      ['crm.write', 'a supplierId and no counterparty', { supplierId: 'evil-co', note: 'hi' }],
+      ['accounting.write', 'a supplierId and no counterparty', { supplierId: 'evil-co' }],
     ];
 
     it.each(cases)('%s, %s', (toolName, _label, input) => {
@@ -381,6 +390,25 @@ describe('resolving a channel', () => {
     // have won rather than printing two positional %s that do not line up.
     it.each(cases)('$label with both ids resolves to $expected', ({ tool, cls, expected }) => {
       expect(deriveTargetId(tool, BOTH, cls)).toBe(expected);
+    });
+
+    // The losing side yields null rather than falling through to the other
+    // id. Without this, a payload skipped the precedence argument entirely by
+    // supplying only the field it wanted honoured.
+    it('yields no target when only the losing id is present', () => {
+      // Supplier-preferring call carrying only a counterparty.
+      expect(deriveTargetId('browser.click', { counterpartyId: 'c_812' }, 'browser.interact')).toBe(
+        null,
+      );
+      expect(deriveTargetId('browser.navigate', { counterpartyId: 'c_812' }, null)).toBe(null);
+      expect(
+        deriveTargetId('browser.submit_order', { entityId: 'c_812' }, 'purchase.place'),
+      ).toBe(null);
+      // Counterparty-preferring call carrying only a supplier.
+      expect(
+        deriveTargetId('mail.send', { to: 'victim@example.com', supplierId: 'evil-co' }, 'email.initiate'),
+      ).toBe(null);
+      expect(deriveTargetId('crm.write', { supplierId: 'evil-co' }, 'crm.write')).toBe(null);
     });
 
     // The mirror of the null case above. `null` alone must not buy supplier
