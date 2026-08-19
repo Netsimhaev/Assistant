@@ -7,7 +7,18 @@ import { evaluateToolCall } from '../policy/engine.js';
 import { recordSpend } from '../policy/budget.js';
 import { canonicalHash } from '../util/canonical.js';
 import { transition } from './jobs.js';
+import { StepChannelError } from './step-error.js';
 import type { Job } from './jobs.js';
+
+/**
+ * How long a step sleeps before a retryable channel failure is tried again.
+ *
+ * Flat, and no attempt counter: a permanently unreachable server therefore
+ * retries forever. Exponential backoff and attempt counting belong with the
+ * retry policy as a whole, and are tracked as follow-up work rather than
+ * half-built here.
+ */
+const RETRY_DELAY_MS = 5 * 60 * 1000;
 
 export interface StepRequest {
   job: Job;
@@ -107,7 +118,44 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   // Permitted. The redacted input is what actually goes out — the caller is
   // handed it rather than the original so a step cannot accidentally send the
   // unredacted payload it proposed.
-  const result = await request.perform(decision.redactedInput);
+  //
+  // A failure here must not fall through to the accounting and the `verify`
+  // transition below. It used to: `perform`'s result was ignored entirely, so
+  // an adapter reporting `browser_not_implemented` was recorded as an order
+  // placed and followed by a confirmation email. `perform` now throws on any
+  // non-ok adapter result, and this is where that becomes an outcome.
+  let result: unknown;
+  try {
+    result = await request.perform(decision.redactedInput);
+  } catch (error) {
+    // An adapter that throws must not escape past the outcome record: the
+    // intent is already in the audit log and would otherwise have no ending.
+    const code = error instanceof StepChannelError ? error.code : 'adapter_threw';
+    const retryable = error instanceof StepChannelError && error.retryable;
+    const message = error instanceof Error ? error.message : String(error);
+
+    if (retryable) {
+      // The far end being down is a reason to come back later, and the
+      // scheduler already runs that loop.
+      const wakeAt = new Date(now.getTime() + RETRY_DELAY_MS);
+      await transition(job.jobId, {
+        to: 'followup',
+        actor: 'orchestrator',
+        reason: `${code} — retry:${request.stepId} at ${wakeAt.toISOString()}`,
+        wakeAt,
+        businessId: job.businessId,
+      });
+      return { status: 'deferred', code, wakeAt: wakeAt.toISOString() };
+    }
+
+    await transition(job.jobId, {
+      to: 'failed',
+      actor: 'orchestrator',
+      reason: `${code} — ${message}`,
+      businessId: job.businessId,
+    });
+    return { status: 'refused', code, reason: message };
+  }
 
   const spendRecorded = await recordStepSpend(request);
 

@@ -61,10 +61,11 @@ export function resolveChannel(
 /**
  * The target a payload is addressed to.
  *
- * One function, imported by both call sites — plan validation and step
- * execution. Two derivations written separately are two derivations that will
- * diverge, and when they do a plan will be approved against one channel and
- * executed against another.
+ * One function, reached by both call sites — plan validation and step
+ * execution, in `run-plan.ts`, through the single `targetIdOf` helper there.
+ * Two derivations written separately are two derivations that will diverge,
+ * and when they do a plan will be approved against one channel and executed
+ * against another.
  *
  * The counterparty half must read `counterpartyId` with the same
  * `entityId` fallback `buildFacts` (`src/policy/facts.ts`) uses, or this

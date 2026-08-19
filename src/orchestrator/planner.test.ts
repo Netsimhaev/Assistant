@@ -1,19 +1,69 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { buildCharter } from '../test/fixtures.js';
+import { buildCharter, type CharterOverrides } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan, planProblems, topologicalOrder } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
 import { createJob, jobHistory, loadJob, transition } from './jobs.js';
 import { capabilityCatalogue, renderCatalogue } from './catalogue.js';
+import { AdapterRegistry } from './adapters/registry.js';
+import type { AdapterCall, AdapterResult, ExternalAdapter } from './adapters/types.js';
+import { envCredentials } from './credentials.js';
 import { runPlan } from './run-plan.js';
 
 const BUSINESS = 'test-business';
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
-async function install(overrides = {}): Promise<PolicyBundle> {
-  return installCharter(buildCharter(overrides), { businessId: BUSINESS });
+/**
+ * These tests are about plan validation and DAG ordering, not about channels.
+ * One catch-all connection serving every tool they use keeps channel
+ * resolution out of their way: without it every plan here would be rejected
+ * for having no channel, and the assertions below would pass for a reason
+ * that has nothing to do with what they are testing.
+ */
+const SERVED_TOOLS = ['mail.send', 'crm.write', 'crm.read'] as const;
+
+const OFFICE: CharterConnection = {
+  system: 'office-suite',
+  label: 'מערכות המשרד',
+  channel: 'api',
+  serves: [...SERVED_TOOLS],
+  target: null,
+  subprocessor: null,
+};
+
+const OFFICE_LIVE: ConnectionBinding = {
+  system: 'office-suite',
+  status: 'live',
+  endpoint: null,
+  credentialRef: null,
+  lastOkAt: null,
+  lastError: null,
+};
+
+const CREDENTIALS = envCredentials({}, 'TEST_CRED_');
+
+/** Records the tools it was asked to run, and reaches nothing external. */
+function stubRegistry(): { calls: string[]; registry: AdapterRegistry } {
+  const calls: string[] = [];
+  const adapter: ExternalAdapter = {
+    system: 'office-suite',
+    channel: 'api',
+    serves: [...SERVED_TOOLS],
+    async execute(call: AdapterCall): Promise<AdapterResult> {
+      calls.push(call.toolName);
+      return { ok: true, output: null, externalId: null };
+    },
+  };
+  return { calls, registry: new AdapterRegistry([adapter]) };
+}
+
+async function install(overrides: CharterOverrides = {}): Promise<PolicyBundle> {
+  return installCharter(buildCharter({ connections: [OFFICE], ...overrides }), {
+    businessId: BUSINESS,
+  });
 }
 
 async function jobInExecute(bundle: PolicyBundle) {
@@ -167,23 +217,27 @@ describe('running a plan', () => {
   it('runs the steps in dependency order and records each one', async () => {
     const bundle = await install({ autonomyBase: { 'crm.write': 'auto' } });
     const job = await jobInExecute(bundle);
-    const performed: string[] = [];
+    const { calls, registry } = stubRegistry();
 
     const result = await runPlan({
       job,
       bundle,
       plan: plan(),
-      perform: async (step) => {
-        performed.push(step.id);
-        return null;
-      },
+      registry,
+      bindings: [OFFICE_LIVE],
+      credentials: CREDENTIALS,
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
     });
 
     expect(result.status).toBe('done');
-    expect(performed).toEqual(['s1', 's2']);
+    if (result.status !== 'done') throw new Error('unreachable');
+    // s2 is written first and depends on s1; the runner reports the order it
+    // actually ran them in.
+    expect(result.steps.map((record) => record.stepId)).toEqual(['s1', 's2']);
+    // And both actually reached an adapter, in that same order.
+    expect(calls).toEqual(['mail.send', 'crm.write']);
 
     // Every step transition is in the history; nothing advanced silently.
     const history = await jobHistory(job.jobId);
@@ -194,7 +248,7 @@ describe('running a plan', () => {
   it('rejects a whole plan rather than half-executing it', async () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
-    let performed = 0;
+    const { calls, registry } = stubRegistry();
 
     // ops.web may never send mail. The step is the *second* one, so a plan
     // validated lazily would have run the first before discovering it.
@@ -207,17 +261,21 @@ describe('running a plan', () => {
           { id: 's2', agent: 'ops.web', intent: 'send', toolName: 'mail.send', input: {}, dependsOn: ['s1'], expectedActionClass: null },
         ],
       }),
-      perform: async () => {
-        performed += 1;
-        return null;
-      },
+      registry,
+      bindings: [OFFICE_LIVE],
+      credentials: CREDENTIALS,
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
     });
 
     expect(result.status).toBe('rejected');
-    expect(performed).toBe(0);
+    if (result.status !== 'rejected') throw new Error('unreachable');
+    // Rejected for the capability reason, not for a missing channel: both
+    // tools are served by the charter connection above. Asserted so this test
+    // cannot start passing for the wrong reason.
+    expect(result.reason).toContain('ops.web may not use mail.send');
+    expect(calls).toEqual([]);
   });
 
   it('refuses a plan that reasoned about a step as something it is not', async () => {
@@ -242,7 +300,9 @@ describe('running a plan', () => {
           },
         ],
       }),
-      perform: async () => null,
+      registry: stubRegistry().registry,
+      bindings: [OFFICE_LIVE],
+      credentials: CREDENTIALS,
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
@@ -256,7 +316,7 @@ describe('running a plan', () => {
   it('stops at the step that needs a human and leaves the rest for later', async () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);
-    const performed: string[] = [];
+    const { calls, registry } = stubRegistry();
 
     const result = await runPlan({
       job,
@@ -283,10 +343,9 @@ describe('running a plan', () => {
           },
         ],
       }),
-      perform: async (step) => {
-        performed.push(step.id);
-        return null;
-      },
+      registry,
+      bindings: [OFFICE_LIVE],
+      credentials: CREDENTIALS,
       counterpartyTags: [],
       rampLevel: 'auto',
       now: NOON,
@@ -295,8 +354,8 @@ describe('running a plan', () => {
     expect(result.status).toBe('halted');
     if (result.status !== 'halted') throw new Error('unreachable');
     expect(result.at).toBe('s1');
-    // The second step never ran, and the job says what happens next.
-    expect(performed).toEqual([]);
+    // Neither step reached an adapter, and the job says what happens next.
+    expect(calls).toEqual([]);
     expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
   });
 });
