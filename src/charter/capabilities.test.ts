@@ -12,7 +12,7 @@ import {
   classifiedToolNames,
   directlyMappedActionClasses,
 } from '../policy/classify.js';
-import { ActionClass, HOST_ADDRESSED_CLASSES, addresseeOf } from '../domain/action.js';
+import { ActionClass, BROWSER_ADDRESSED_CLASSES, addresseeOf } from '../domain/action.js';
 import type { Addressee } from '../domain/action.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -166,14 +166,14 @@ describe('compiled policy has a reader', () => {
  */
 describe('the first-contact escalation covers everything it should', () => {
   it('exempts only the two browser classes, by name', () => {
-    expect([...HOST_ADDRESSED_CLASSES].sort()).toEqual([
+    expect([...BROWSER_ADDRESSED_CLASSES].sort()).toEqual([
       'browser.interact',
       'browser.session',
     ]);
   });
 
   it('leaves every other action class inside the escalation', () => {
-    const exempt = ActionClass.options.filter((cls) => HOST_ADDRESSED_CLASSES.has(cls));
+    const exempt = ActionClass.options.filter((cls) => BROWSER_ADDRESSED_CLASSES.has(cls));
     // A class added to the enum later must not fall out of the sensitive band
     // by omission — which is exactly how crm.write escaped it.
     expect(exempt).toHaveLength(2);

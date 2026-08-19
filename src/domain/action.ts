@@ -147,7 +147,7 @@ export const NEVER_FULLY_AUTONOMOUS: ReadonlySet<ActionClass> = new Set(
 );
 
 /**
- * Who or what an action class reaches, if anything — see `ACTION_ADDRESSEE`.
+ * Who or what an action class reaches, if anything — read via `addresseeOf`.
  *
  * `browser` is deliberately not a description of physical reach — a supplier
  * API also terminates on a third party's server, and `purchase.place` is
@@ -164,9 +164,9 @@ export type Addressee = z.infer<typeof Addressee>;
 /**
  * Who or what each action class reaches.
  *
- * A total `Record` rather than two hand-maintained `Set`s (the
- * `HOST_ADDRESSED_CLASSES` and `COUNTERPARTY_ADDRESSED_CLASSES` this once
- * was). Two sets over one enum is exactly the shape that already hurt this
+ * A total `Record` rather than the two hand-maintained `Set`s this once was
+ * (a host-addressed set beside a counterparty-addressed one, each written out
+ * by hand). Two sets over one enum is exactly the shape that already hurt this
  * codebase: one of them was originally written as "everything except the
  * classes that address a person", and inverting that by hand to build the
  * other silently swept `crm.write` out of the `one_unknown` escalation — an
@@ -178,15 +178,16 @@ export type Addressee = z.infer<typeof Addressee>;
  *
  * Not exported. `NEVER_FULLY_AUTONOMOUS_TABLE` above stays private for the
  * same reason: a caller holding the raw record could mutate it and leave the
- * derived sets below disagreeing with it. Consumers get `HOST_ADDRESSED_CLASSES`
- * or `addresseeOf`.
+ * derived sets below disagreeing with it. Consumers get
+ * `BROWSER_ADDRESSED_CLASSES` or `addresseeOf`.
  *
- * This answers only "does this action reach a human" — it is not routing
- * precedence. `purchase.place` is `internal` here because the ceilings and
- * the risk engine do not treat a supplier as a person, but the *resolver*
- * (`orchestrator/channels.ts`) still needs `purchase.place` specifically to
- * prefer a `supplierId`; that is a narrower, separate rule, kept local to the
- * one class it is true for rather than folded into this mapping.
+ * This answers only "does this action reach a human". Two consumers read that
+ * one answer, and neither redefines it: `policy/risk.ts` reads the `browser`
+ * slice for the `one_unknown` exemption, and `orchestrator/channels.ts` reads
+ * `person` vs. not-`person` to decide whether a payload carrying both ids
+ * routes by counterparty or by supplier. `purchase.place` is `internal` here
+ * because the ceilings and the risk engine do not treat a supplier as a
+ * person — and that is also exactly why the resolver routes it by supplier.
  *
  * - `person`: reaches a human on the other end — a customer, attendee, or
  *   counterparty the action is addressed to.
@@ -230,10 +231,14 @@ export function addresseeOf(actionClass: ActionClass): Addressee {
 
 /**
  * Classes that address a browser session rather than a person, derived from
- * `ACTION_ADDRESSEE` so the `one_unknown` risk exemption (`policy/risk.ts`)
- * cannot drift from the total mapping above.
+ * the total mapping above so the `one_unknown` risk exemption
+ * (`policy/risk.ts`) cannot drift from it.
+ *
+ * Named for the value it selects (`browser`), not for the older `host`
+ * wording the value itself was renamed away from — a set whose name and whose
+ * predicate disagree is the first step towards someone widening one of them.
  */
-export const HOST_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = new Set(
+export const BROWSER_ADDRESSED_CLASSES: ReadonlySet<ActionClass> = new Set(
   (Object.entries(ACTION_ADDRESSEE) as [ActionClass, Addressee][])
     .filter(([, a]) => a === 'browser')
     .map(([cls]) => cls),

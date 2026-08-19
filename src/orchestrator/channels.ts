@@ -1,5 +1,6 @@
 import type { PolicyBundle } from '../domain/policy.js';
 import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
+import { addresseeOf } from '../domain/action.js';
 import type { ActionClass } from '../domain/action.js';
 
 export type ChannelResolution =
@@ -72,15 +73,28 @@ export function resolveChannel(
  * fixtures.
  *
  * When a payload carries both a `supplierId` and a `counterpartyId` (a stray
- * field, or one an attacker rode in on), which one is authoritative is a
- * routing question, not the "does this reach a human" question
- * `domain/action.ts`'s `addresseeOf` answers — a purchase is read by a
- * person too, but it is still routed by supplier. `purchase.place` is the
- * one class whose entire purpose is dealing with a supplier, so it is the
- * one class where `supplierId` wins; every other class resolves by
- * `counterpartyId` regardless of what else the payload carries. Letting the
- * payload's own shape settle the tie would hand a caller-supplied field the
- * power to choose the channel.
+ * field, or one an attacker rode in on), the tie is broken by the action
+ * class and never by the payload: letting the payload's own shape settle it
+ * would hand a caller-supplied field the power to choose the channel.
+ *
+ * The tie-break *reads* `domain/action.ts`'s `addresseeOf`; it does not
+ * redefine it. That mapping answers "does this action reach a human", which
+ * is what the risk layer needs — and a class that reaches a human is exactly
+ * the class whose `counterpartyId` names the party we are dealing with. Mail,
+ * WhatsApp, calendar invitations and payments are addressed to a person and
+ * so resolve by counterparty. Everything else — `purchase.place`, both
+ * browser classes, the internal systems of record, and a call we could not
+ * classify at all — deals with a supplier or a site, so `supplierId` wins.
+ *
+ * Keying on the literal class `purchase.place` was too narrow, and that
+ * narrowness was reachable: `browser.click` and `browser.fill` classify as
+ * `browser.interact` and only refine to `purchase.place` once the payload
+ * carries `amountMinor > 0` (`policy/classify.ts`). An unpriced click on a
+ * supplier's site would therefore have routed by whatever `counterpartyId`
+ * happened to be in the payload — the precise steer the tie-break exists to
+ * block. An unclassified call routes to the supplier for the same reason a
+ * class we cannot read is scored at its worst: the value we could not
+ * establish must not be the permissive one.
  */
 export function deriveTargetId(
   input: Record<string, unknown>,
@@ -89,9 +103,11 @@ export function deriveTargetId(
   const supplierId = readString(input, 'supplierId');
   const counterpartyId = readString(input, 'counterpartyId') ?? readString(input, 'entityId');
 
-  return actionClass === 'purchase.place'
-    ? (supplierId ?? counterpartyId)
-    : (counterpartyId ?? supplierId);
+  const addressesPerson = actionClass !== null && addresseeOf(actionClass) === 'person';
+
+  return addressesPerson
+    ? (counterpartyId ?? supplierId)
+    : (supplierId ?? counterpartyId);
 }
 
 function readString(input: Record<string, unknown>, key: string): string | null {

@@ -1,4 +1,4 @@
-import { BASELINE_REVERSIBILITY, HOST_ADDRESSED_CLASSES } from '../domain/action.js';
+import { BASELINE_REVERSIBILITY, BROWSER_ADDRESSED_CLASSES } from '../domain/action.js';
 import type { ActionFacts, CompiledCeilings, PolicyBundle } from '../domain/policy.js';
 import type { RiskAssessment, RiskBand, RiskDimensions } from '../domain/risk.js';
 import {
@@ -160,7 +160,7 @@ function scoreVisibility(
   // Leaves the instance, but addresses a host rather than a person. Scored as
   // external exposure without the first-contact escalation, which is about
   // messaging someone we cannot identify.
-  if (facts.actionClass !== null && HOST_ADDRESSED_CLASSES.has(facts.actionClass)) {
+  if (facts.actionClass !== null && BROWSER_ADDRESSED_CLASSES.has(facts.actionClass)) {
     return { audience: 'many', score: 30 };
   }
 
