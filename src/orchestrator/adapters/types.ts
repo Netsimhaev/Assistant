@@ -6,11 +6,48 @@
  * contract rather than a workaround a caller might forget to add. Optional
  * would let `{ ref, value }` typecheck and serialise the secret in full,
  * which is exactly the redaction this interface exists to guarantee.
+ *
+ * `toJSON` alone is not enough: this project's own serialiser,
+ * `canonicalJson` (`src/util/canonical.ts`), walks `Object.keys` directly and
+ * never calls `toJSON` — three hashes (the charter signature, the audit
+ * chain, the approval TOCTOU guard) depend on that serialiser's determinism,
+ * so it is not changed to accommodate this. A credential handle built with a
+ * plain object literal therefore still leaks `value` into any payload that
+ * goes through `canonicalJson`, permanently, since `audit_log` is
+ * append-only. `createCredentialHandle` below is the mitigation: it defines
+ * `value` as a non-enumerable property, so `Object.keys` — and therefore
+ * `canonicalJson` and `JSON.stringify` alike — does not see it, while an
+ * adapter that needs the secret can still read `handle.value` directly.
  */
 export interface CredentialHandle {
   readonly ref: string;
   readonly value: string;
   readonly toJSON: () => unknown;
+}
+
+/**
+ * Build a `CredentialHandle` whose `value` cannot be enumerated.
+ *
+ * Use this instead of an object literal wherever a real secret is involved.
+ * `ref` stays a normal, enumerable property — it identifies the credential
+ * without being the credential — so `canonicalJson({ credential: handle })`
+ * serialises to `{"ref":"..."}` and never touches `value`.
+ */
+export function createCredentialHandle(ref: string, value: string): CredentialHandle {
+  const handle = { ref } as { ref: string } & { value: string; toJSON: () => unknown };
+  Object.defineProperty(handle, 'value', {
+    value,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
+  Object.defineProperty(handle, 'toJSON', {
+    value: () => ({ ref }),
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
+  return handle;
 }
 
 export interface AdapterCall {
