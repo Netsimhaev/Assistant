@@ -9,6 +9,7 @@ import { release, trip } from '../governance/killswitch.js';
 import { evaluateToolCall, type GateContext } from './engine.js';
 import { refineActionClass } from './classify.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import type { BusinessCharter } from '../domain/charter.js';
 
 const BUSINESS = 'test-business';
 
@@ -598,6 +599,39 @@ describe('regressions found in review', () => {
 
     const theirs = await loadActiveCharter('other-business', getPool());
     expect(theirs?.bundle.ceilings.dailyMinor).toBe(50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `installCharter` receives an argument already typed as `BusinessCharter`,
+// but the type checker cannot see whether the caller actually ran it through
+// `.parse()`. Without a runtime check inside `installCharter` itself, an
+// invalid charter installs, activates, and only fails the next time anything
+// reads it — by which point the gate has no policy to load at all.
+
+describe('installCharter validates at write time', () => {
+  it('throws on a charter with a bad connection, before writing anything', async () => {
+    const charter = buildCharter();
+    const broken: BusinessCharter = {
+      ...charter,
+      connections: [
+        {
+          system: 'ghost',
+          label: 'לא קיים',
+          channel: 'api',
+          serves: ['mail.teleport'],
+          target: null,
+          subprocessor: null,
+        },
+      ],
+    };
+
+    await expect(installCharter(broken, { businessId: BUSINESS })).rejects.toThrow();
+
+    // Nothing was written: the next read finds no active charter rather than
+    // throwing when it tries to parse a row that was never valid.
+    const loaded = await loadActiveCharter(BUSINESS, getPool());
+    expect(loaded).toBeNull();
   });
 });
 

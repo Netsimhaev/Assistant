@@ -21,15 +21,21 @@ export async function installCharter(
   charter: BusinessCharter,
   options: { businessId?: string; activate?: boolean } = {},
 ): Promise<PolicyBundle> {
+  // The argument is typed as `BusinessCharter`, but a caller can construct one
+  // without going through `.parse()` — an object literal, a value round-tripped
+  // through JSON, a cast. Without a runtime check here, an invalid charter
+  // installs and activates, and the failure surfaces on the *next read*
+  // instead of at install time. Parsing throws before anything is written.
+  const parsed = BusinessCharter.parse(charter);
   const businessId = options.businessId ?? config.businessId;
   const activate = options.activate ?? true;
 
-  const signature = verifyCharterSignature(charter);
+  const signature = verifyCharterSignature(parsed);
   if (!signature.valid) {
     throw new Error(`refusing to install an unverified charter: ${signature.reason}`);
   }
 
-  const bundle = compileCharter(charter);
+  const bundle = compileCharter(parsed);
 
   await withTransaction(async (tx) => {
     await tx.query(
@@ -39,16 +45,16 @@ export async function installCharter(
          signed_by, signed_at, signature_method
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
-        charter.charterVersion,
+        parsed.charterVersion,
         businessId,
-        charter.effectiveFrom,
-        charter.supersedes ?? null,
-        JSON.stringify(charter),
+        parsed.effectiveFrom,
+        parsed.supersedes ?? null,
+        JSON.stringify(parsed),
         JSON.stringify(bundle),
-        charter.signature.contentHash,
-        charter.signature.signedByPersonId,
-        charter.signature.signedAt,
-        charter.signature.method,
+        parsed.signature.contentHash,
+        parsed.signature.signedByPersonId,
+        parsed.signature.signedAt,
+        parsed.signature.method,
       ],
     );
 
@@ -59,7 +65,7 @@ export async function installCharter(
          ON CONFLICT (business_id)
          DO UPDATE SET charter_version = EXCLUDED.charter_version,
                        activated_at    = now()`,
-        [businessId, charter.charterVersion],
+        [businessId, parsed.charterVersion],
       );
     }
   });

@@ -72,7 +72,7 @@ export interface CharterOverrides {
 /** A realistic small-business charter: an Israeli firm working Sun–Thu. */
 export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter {
   const unsigned: UnsignedCharter = {
-    schemaVersion: '1.0',
+    schemaVersion: '1.1',
     charterVersion: overrides.version ?? '2026-08-15.1',
     effectiveFrom: '2026-08-15T00:00:00.000Z',
 

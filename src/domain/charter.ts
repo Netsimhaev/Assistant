@@ -102,6 +102,20 @@ function isKnownToolName(tool: string): boolean {
   return KNOWN_TOOL_NAMES.has(tool);
 }
 
+/**
+ * Tools no agent holds — `UNOWNED_TOOLS` in `src/charter/capabilities.ts`.
+ *
+ * Duplicated for the same layering reason as `KNOWN_TOOL_NAMES`: `src/domain`
+ * must not import from `src/charter`. A connection that names one of these in
+ * `serves` is dead policy in exactly the way an unknown tool name is — no
+ * agent can ever be the one that calls it.
+ */
+export const UNOWNED_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'contract.sign',
+  'payment.charge',
+  'charter.apply_amendment',
+]);
+
 // ---------------------------------------------------------------------------
 
 export const CharterIdentity = z.object({
@@ -320,7 +334,13 @@ export const CharterSignature = z.object({
 });
 
 const BusinessCharterShape = z.object({
-  schemaVersion: z.literal('1.0'),
+  // Bumped from '1.0' when `connections` was added. A charter signed under
+  // 1.0 must be re-signed, not silently reinterpreted: `BusinessCharter.parse`
+  // fills in `connections: []` for a charter that never hashed it, which
+  // changes the content hash and must fail loudly as a schema mismatch, not
+  // quietly as "does not match its signature" — the alarm reserved for a
+  // malicious edit.
+  schemaVersion: z.literal('1.1'),
   charterVersion: z.string().min(1),
   effectiveFrom: z.string().datetime(),
   supersedes: z.string().optional(),
@@ -338,7 +358,18 @@ const BusinessCharterShape = z.object({
   forbidden: z.array(ForbiddenRule).default([]),
 });
 
+/** Sentinel for the null (catch-all) target, distinguishable from any real target string. */
+const CATCH_ALL_TARGET = '\0catch-all';
+
 export const BusinessCharter = BusinessCharterShape.superRefine((charter, ctx) => {
+  const seenSystems = new Set<string>();
+  // Keyed by `${tool}\0${target ?? CATCH_ALL_TARGET}` — two connections that
+  // serve the same tool for the same target (including two catch-alls) are an
+  // authoring mistake. A specific target beside a `null` catch-all for the
+  // same tool is not: the resolver prefers the specific one, so both keys
+  // differ and neither collides.
+  const seenToolTargets = new Set<string>();
+
   for (const [index, connection] of charter.connections.entries()) {
     // A connection serving a tool that does not exist is dead policy: it
     // compiles, appears in the signed document, and can never be selected.
@@ -349,8 +380,41 @@ export const BusinessCharter = BusinessCharterShape.superRefine((charter, ctx) =
           path: ['connections', index, 'serves'],
           message: `unknown tool "${tool}"`,
         });
+      } else if (UNOWNED_TOOL_NAMES.has(tool)) {
+        // Known to the policy layer but reachable by no agent — a connection
+        // serving it is exactly the dead-policy case above, by a different
+        // route.
+        ctx.addIssue({
+          code: 'custom',
+          path: ['connections', index, 'serves'],
+          message: `tool "${tool}" is owned by no agent and can never be called`,
+        });
+      }
+
+      const targetKey = `${tool}\0${connection.target ?? CATCH_ALL_TARGET}`;
+      if (seenToolTargets.has(targetKey)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['connections', index, 'serves'],
+          message: `another connection already serves "${tool}" for target ${connection.target === null ? '(catch-all)' : `"${connection.target}"`}`,
+        });
+      } else {
+        seenToolTargets.add(targetKey);
       }
     }
+
+    // Two connections cannot share a `system` name — it is the identifier the
+    // owner reads and the one a binding is looked up by.
+    if (seenSystems.has(connection.system)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['connections', index, 'system'],
+        message: `duplicate connection system "${connection.system}"`,
+      });
+    } else {
+      seenSystems.add(connection.system);
+    }
+
     // Every intermediary sees the payload, which is customer correspondence.
     if (
       connection.subprocessor !== null &&

@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { buildCharter } from '../test/fixtures.js';
 import { compileCharter } from './compile.js';
 import { verifyCharterSignature } from './sign.js';
-import { BusinessCharter } from '../domain/charter.js';
+import { BusinessCharter, KNOWN_TOOL_NAMES, UNOWNED_TOOL_NAMES } from '../domain/charter.js';
+import { classifiedToolNames, READ_ONLY_TOOLS } from '../policy/classify.js';
+import { UNOWNED_TOOLS } from './capabilities.js';
 
 describe('charter signing', () => {
   it('verifies a charter that has not been touched', () => {
@@ -164,5 +166,136 @@ describe('charter connections', () => {
     // Every intermediary sees the payloads. Rejected at signing, not at run
     // time, for the same reason an unresolvable timezone is.
     expect(BusinessCharter.safeParse(broken).success).toBe(false);
+  });
+
+  it('refuses a connection serving a tool no agent can ever hold', () => {
+    const charter = buildCharter();
+    const broken = {
+      ...charter,
+      connections: [
+        {
+          system: 'sign-portal',
+          label: 'פורטל חתימות',
+          channel: 'api' as const,
+          // Known to the policy layer but owned by no agent — reachable in
+          // name only, which is the same dead-policy shape as an unknown tool.
+          serves: ['contract.sign'],
+          target: null,
+          subprocessor: null,
+        },
+      ],
+    };
+    expect(BusinessCharter.safeParse(broken).success).toBe(false);
+  });
+
+  it('refuses two connections that share a system name', () => {
+    const charter = buildCharter();
+    const broken = {
+      ...charter,
+      connections: [
+        {
+          system: 'office-mail',
+          label: 'תיבת המשרד',
+          channel: 'api' as const,
+          serves: ['mail.send'],
+          target: null,
+          subprocessor: null,
+        },
+        {
+          system: 'office-mail',
+          label: 'תיבת המשרד (שוב)',
+          channel: 'browser' as const,
+          serves: ['mail.draft'],
+          target: null,
+          subprocessor: null,
+        },
+      ],
+    };
+    expect(BusinessCharter.safeParse(broken).success).toBe(false);
+  });
+
+  it('refuses two connections serving the same tool for the same target', () => {
+    const charter = buildCharter();
+    const broken = {
+      ...charter,
+      connections: [
+        {
+          system: 'crm-a',
+          label: 'CRM א',
+          channel: 'api' as const,
+          serves: ['crm.write'],
+          target: 'supplier_a',
+          subprocessor: null,
+        },
+        {
+          system: 'crm-b',
+          label: 'CRM ב',
+          channel: 'api' as const,
+          serves: ['crm.write'],
+          target: 'supplier_a',
+          subprocessor: null,
+        },
+      ],
+    };
+    expect(BusinessCharter.safeParse(broken).success).toBe(false);
+  });
+
+  it('accepts a specific target sitting beside a null catch-all for the same tool', () => {
+    // Not an authoring mistake: the resolver prefers the specific connection
+    // and falls back to the catch-all for every other target.
+    const charter = buildCharter({
+      connections: [
+        {
+          system: 'crm-a',
+          label: 'CRM א',
+          channel: 'api',
+          serves: ['crm.write'],
+          target: 'supplier_a',
+          subprocessor: null,
+        },
+        {
+          system: 'crm-default',
+          label: 'CRM ברירת מחדל',
+          channel: 'api',
+          serves: ['crm.write'],
+          target: null,
+          subprocessor: null,
+        },
+      ],
+    });
+    expect(BusinessCharter.safeParse(charter).success).toBe(true);
+  });
+
+  it('the charter tool list agrees with the policy layer', () => {
+    // charter.ts cannot import from policy/ without a layering cycle, so the
+    // list is duplicated. This is what stops it drifting.
+    const policy = new Set([...classifiedToolNames(), ...READ_ONLY_TOOLS]);
+    expect([...policy].filter((t) => !KNOWN_TOOL_NAMES.has(t))).toEqual([]);
+    expect([...KNOWN_TOOL_NAMES].filter((t) => !policy.has(t))).toEqual([]);
+  });
+
+  it('the unowned-tool list agrees with the capability layer', () => {
+    expect([...UNOWNED_TOOL_NAMES].sort()).toEqual([...UNOWNED_TOOLS].sort());
+  });
+});
+
+describe('charter schema version', () => {
+  it('refuses a charter still carrying the pre-connections schema version', () => {
+    const charter = buildCharter();
+    const stale = { ...charter, schemaVersion: '1.0' as const };
+
+    // `BusinessCharter.parse` would otherwise fill in `connections: []` for a
+    // charter that never signed over that field, changing the content hash
+    // and failing as "does not match its signature" — the alarm meant for a
+    // malicious edit, not a schema migration. The literal bump makes this
+    // failure legible as a version mismatch instead.
+    const result = BusinessCharter.safeParse(stale);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const versionIssue = result.error.issues.find(
+        (issue) => issue.path[0] === 'schemaVersion',
+      );
+      expect(versionIssue).toBeDefined();
+    }
   });
 });
