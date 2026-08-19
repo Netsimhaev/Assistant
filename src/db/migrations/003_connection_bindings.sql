@@ -1,9 +1,17 @@
 -- Whether a connection the charter permits currently works.
 --
 -- Deliberately has NO channel column. The charter is the only source of truth
--- for what is permitted and on which channel; this table can narrow a
--- permitted connection to unusable, and can do nothing else. Adding a channel
--- here would create a second, unsigned place where authority is decided.
+-- for what is permitted and on which channel; this table cannot change either
+-- one. Adding a channel here would create a second, unsigned place where
+-- authority is decided.
+--
+-- It CAN change where a permitted connection points and which secret it uses
+-- (endpoint, credential_ref) — that is not "narrow only", it is a real
+-- expansion of what a signed connection does in practice. Those fields are
+-- deliberately outside the charter (rotating a credential must not require
+-- the owner's signature), so the mitigation lives elsewhere: every write to
+-- this table is audited, in src/orchestrator/bindings.ts, so a redirect is at
+-- least as visible as a kill switch trip.
 --
 -- No foreign key to charter_versions: a connection survives a charter
 -- replacement, and whether it matches a declared system is checked when the

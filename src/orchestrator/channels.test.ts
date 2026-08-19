@@ -1,5 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool } from '../db/pool.js';
+import { queryAudit } from '../audit/log.js';
 import { resetDatabase } from '../test/db.js';
 import { loadBindings, upsertBinding } from './bindings.js';
 
@@ -65,5 +66,62 @@ describe('connection bindings', () => {
       { businessId: 'other-business' },
     );
     expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
+  });
+
+  it('rejects an invalid binding at write time and writes nothing', async () => {
+    await expect(
+      upsertBinding(
+        {
+          system: '',
+          status: 'live',
+          endpoint: null,
+          credentialRef: null,
+          lastOkAt: null,
+          lastError: null,
+        },
+        { businessId: BUSINESS },
+      ),
+    ).rejects.toThrow();
+
+    expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
+  });
+
+  it('audits a mutation with exactly one entry naming the system', async () => {
+    await upsertBinding(
+      {
+        system: 'office-mail',
+        status: 'live',
+        endpoint: null,
+        credentialRef: null,
+        lastOkAt: null,
+        lastError: null,
+      },
+      { businessId: BUSINESS },
+    );
+
+    const entries = await queryAudit({ businessId: BUSINESS, kind: 'connection_binding' });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.reason).toContain('office-mail');
+  });
+
+  it('survives endpoint and credentialRef across a status-only change', async () => {
+    const withValues = {
+      system: 'office-mail',
+      status: 'live' as const,
+      endpoint: 'smtp.example.com:587',
+      credentialRef: 'OFFICE_MAIL',
+      lastOkAt: null,
+      lastError: null,
+    };
+    await upsertBinding(withValues, { businessId: BUSINESS });
+    await upsertBinding({ ...withValues, status: 'error', lastError: 'auth failed' }, {
+      businessId: BUSINESS,
+    });
+
+    const bindings = await loadBindings({ businessId: BUSINESS });
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]?.status).toBe('error');
+    expect(bindings[0]?.endpoint).toBe('smtp.example.com:587');
+    expect(bindings[0]?.credentialRef).toBe('OFFICE_MAIL');
   });
 });

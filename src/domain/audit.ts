@@ -43,6 +43,7 @@ export const AuditKind = z.enum([
   'incident',
   'charter_change',
   'kill_switch',
+  'connection_binding',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 
