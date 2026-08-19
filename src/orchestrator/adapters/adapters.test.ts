@@ -7,7 +7,9 @@ import { createCredentialHandle } from './types.js';
 import { classifiedToolNames, READ_ONLY_TOOLS } from '../../policy/classify.js';
 import { canonicalJson } from '../../util/canonical.js';
 import { envCredentials } from '../credentials.js';
-import { createMailAdapter, type MailTransport } from './mail.js';
+import { createMailAdapter, readRecipients, type MailTransport } from './mail.js';
+import { readEmails } from '../../policy/facts.js';
+import { REDACTED } from '../../policy/redact.js';
 
 function call(over: Partial<AdapterCall> = {}): AdapterCall {
   return {
@@ -473,18 +475,29 @@ function recordingTransport() {
   return { transport, sent };
 }
 
+/** A ready-to-use call, overridable per test the same way `call()` is above. */
+function mailCall(over: Partial<AdapterCall> = {}): AdapterCall {
+  return {
+    toolName: 'mail.send',
+    input: { to: 'a@b.com', subject: 's', body: 'b' },
+    credential: createCredentialHandle('K', 'pw'),
+    idempotencyKey: 'test-idempotency-key',
+    signal: new AbortController().signal,
+    ...over,
+  };
+}
+
 describe('the mail adapter', () => {
   it('sends the payload it was given and returns the provider id', async () => {
     const { transport, sent } = recordingTransport();
     const adapter = createMailAdapter({ system: 'office-mail', transport });
 
-    const result = await adapter.execute({
-      toolName: 'mail.send',
-      input: { to: 'a@b.com', subject: 'שלום', body: 'הגוף' },
-      credential: createCredentialHandle('OFFICE_MAIL', 'pw'),
-      idempotencyKey: 'test-idempotency-key',
-      signal: new AbortController().signal,
-    });
+    const result = await adapter.execute(
+      mailCall({
+        input: { to: 'a@b.com', subject: 'שלום', body: 'הגוף' },
+        credential: createCredentialHandle('OFFICE_MAIL', 'pw'),
+      }),
+    );
 
     expect(result).toEqual({ ok: true, output: { messageId: 'MSG-1' }, externalId: 'MSG-1' });
     expect(sent).toHaveLength(1);
@@ -495,20 +508,8 @@ describe('the mail adapter', () => {
     const { transport, sent } = recordingTransport();
     const adapter = createMailAdapter({ system: 'office-mail', transport });
 
-    await adapter.execute({
-      toolName: 'mail.send',
-      input: { to: ['a@b.com', 'c@d.com'], subject: 's', body: 'b' },
-      credential: createCredentialHandle('K', 'pw'),
-      idempotencyKey: 'test-idempotency-key-1',
-      signal: new AbortController().signal,
-    });
-    await adapter.execute({
-      toolName: 'mail.send',
-      input: { to: 'e@f.com, g@h.com', subject: 's', body: 'b' },
-      credential: createCredentialHandle('K', 'pw'),
-      idempotencyKey: 'test-idempotency-key-2',
-      signal: new AbortController().signal,
-    });
+    await adapter.execute(mailCall({ input: { to: ['a@b.com', 'c@d.com'], subject: 's', body: 'b' } }));
+    await adapter.execute(mailCall({ input: { to: 'e@f.com, g@h.com', subject: 's', body: 'b' } }));
 
     expect(sent[0]?.to).toEqual(['a@b.com', 'c@d.com']);
     expect(sent[1]?.to).toEqual(['e@f.com', 'g@h.com']);
@@ -518,13 +519,7 @@ describe('the mail adapter', () => {
     const { transport } = recordingTransport();
     const adapter = createMailAdapter({ system: 'office-mail', transport });
 
-    const result = await adapter.execute({
-      toolName: 'mail.send',
-      input: { subject: 's', body: 'b' },
-      credential: createCredentialHandle('K', 'pw'),
-      idempotencyKey: 'test-idempotency-key',
-      signal: new AbortController().signal,
-    });
+    const result = await adapter.execute(mailCall({ input: { subject: 's', body: 'b' } }));
 
     expect(result).toEqual({
       ok: false,
@@ -538,78 +533,292 @@ describe('the mail adapter', () => {
     const { transport } = recordingTransport();
     const adapter = createMailAdapter({ system: 'office-mail', transport });
 
-    const result = await adapter.execute({
-      toolName: 'mail.send',
-      input: { to: 'a@b.com', subject: 's', body: 'b' },
-      credential: null,
-      idempotencyKey: 'test-idempotency-key',
-      signal: new AbortController().signal,
-    });
+    const result = await adapter.execute(mailCall({ credential: null }));
 
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error('unreachable');
     expect(result.code).toBe('credential_missing');
   });
 
-  it('classifies a transport failure as retryable', async () => {
-    const transport: MailTransport = {
-      async send() {
-        throw new Error('ECONNREFUSED');
-      },
-    };
+  it('refuses a call for a tool it does not serve, rather than sending mail for it', async () => {
+    // AdapterRegistry.get looks an adapter up by system name and does not
+    // check `serves` -- a mis-wired binding could otherwise route an
+    // unrelated tool through this adapter and have it send mail anyway.
+    const { transport, sent } = recordingTransport();
     const adapter = createMailAdapter({ system: 'office-mail', transport });
 
-    const result = await adapter.execute({
-      toolName: 'mail.send',
-      input: { to: 'a@b.com', subject: 's', body: 'b' },
-      credential: createCredentialHandle('K', 'pw'),
-      idempotencyKey: 'test-idempotency-key',
-      signal: new AbortController().signal,
-    });
+    const result = await adapter.execute(mailCall({ toolName: 'crm.write' }));
 
-    // The server being down is a reason to come back later. A malformed
-    // address is not.
+    expect(result).toEqual({
+      ok: false,
+      retryable: false,
+      code: 'unsupported_tool',
+      message: expect.any(String),
+    });
+    expect(sent).toHaveLength(0);
+  });
+
+  it('refuses before sending when the call is already aborted', async () => {
+    const { transport, sent } = recordingTransport();
+    const adapter = createMailAdapter({ system: 'office-mail', transport });
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await adapter.execute(mailCall({ signal: controller.signal }));
+
     expect(result).toEqual({
       ok: false,
       retryable: true,
-      code: 'transport_error',
+      code: 'aborted',
       message: expect.any(String),
+    });
+    expect(sent).toHaveLength(0);
+  });
+
+  it.each([
+    ['missing subject', { body: 'b' }],
+    ['missing body', { subject: 's' }],
+    ['non-string subject', { subject: 5, body: 'b' }],
+    ['empty body', { subject: 's', body: '' }],
+  ])('refuses to send an incomplete message (%s) rather than mailing it empty', async (_label, extra) => {
+    const { transport, sent } = recordingTransport();
+    const adapter = createMailAdapter({ system: 'office-mail', transport });
+
+    const result = await adapter.execute(mailCall({ input: { to: 'a@b.com', ...extra } }));
+
+    expect(result).toEqual({
+      ok: false,
+      retryable: false,
+      code: 'message_incomplete',
+      message: expect.any(String),
+    });
+    expect(sent).toHaveLength(0);
+  });
+
+  describe('recipient shape validation', () => {
+    it('refuses the redaction placeholder as a recipient', async () => {
+      const { transport, sent } = recordingTransport();
+      const adapter = createMailAdapter({ system: 'office-mail', transport });
+
+      const result = await adapter.execute(mailCall({ input: { to: REDACTED, subject: 's', body: 'b' } }));
+
+      expect(result).toEqual({
+        ok: false,
+        retryable: false,
+        code: 'no_recipient',
+        message: expect.any(String),
+      });
+      expect(sent).toHaveLength(0);
+    });
+
+    it('refuses a comma-shredded display name rather than mailing a fragment of it', async () => {
+      const { transport, sent } = recordingTransport();
+      const adapter = createMailAdapter({ system: 'office-mail', transport });
+
+      const result = await adapter.execute(
+        mailCall({ input: { to: '"Cohen, Dana" <dana@x.com>', subject: 's', body: 'b' } }),
+      );
+
+      expect(result).toEqual({
+        ok: false,
+        retryable: false,
+        code: 'no_recipient',
+        message: expect.any(String),
+      });
+      expect(sent).toHaveLength(0);
+    });
+  });
+
+  describe('the credential reaches the transport', () => {
+    it('passes the resolved secret to transport.send, not just the ref', async () => {
+      const seenCredentialValues: string[] = [];
+      const transport: MailTransport = {
+        async send(_message, context) {
+          seenCredentialValues.push(context.credential.value);
+          return { messageId: 'MSG-1' };
+        },
+      };
+      const adapter = createMailAdapter({ system: 'office-mail', transport });
+
+      await adapter.execute(mailCall({ credential: createCredentialHandle('K', 'super-secret-value') }));
+
+      expect(seenCredentialValues).toEqual(['super-secret-value']);
     });
   });
 
   it('forwards the idempotency key to the transport', async () => {
     const seen: string[] = [];
     const transport: MailTransport = {
-      async send(_message, idempotencyKey) {
-        seen.push(idempotencyKey);
+      async send(_message, context) {
+        seen.push(context.idempotencyKey);
         return { messageId: 'MSG-1' };
       },
     };
     const adapter = createMailAdapter({ system: 'office-mail', transport });
 
-    await adapter.execute({
-      toolName: 'mail.send',
-      input: { to: 'a@b.com', subject: 's', body: 'b' },
-      credential: createCredentialHandle('K', 'pw'),
-      idempotencyKey: 'attempt-42',
-      signal: new AbortController().signal,
-    });
+    await adapter.execute(mailCall({ idempotencyKey: 'attempt-42' }));
 
     expect(seen).toEqual(['attempt-42']);
   });
 
+  it('forwards the abort signal to the transport', async () => {
+    const seen: AbortSignal[] = [];
+    const transport: MailTransport = {
+      async send(_message, context) {
+        seen.push(context.signal);
+        return { messageId: 'MSG-1' };
+      },
+    };
+    const adapter = createMailAdapter({ system: 'office-mail', transport });
+    const controller = new AbortController();
+
+    await adapter.execute(mailCall({ signal: controller.signal }));
+
+    expect(seen).toEqual([controller.signal]);
+  });
+
+  describe('classifying a transport failure into permanent, transient and ambiguous', () => {
+    async function sendWithFailure(error: unknown): Promise<AdapterResult> {
+      const transport: MailTransport = {
+        async send() {
+          throw error;
+        },
+      };
+      const adapter = createMailAdapter({ system: 'office-mail', transport });
+      return adapter.execute(mailCall());
+    }
+
+    it('treats a 5xx SMTP rejection as permanent -- not retryable', async () => {
+      const result = await sendWithFailure(
+        Object.assign(new Error('550 no such mailbox'), { responseCode: 550 }),
+      );
+      expect(result).toEqual({
+        ok: false,
+        retryable: false,
+        code: 'send_rejected',
+        message: expect.any(String),
+      });
+    });
+
+    it('treats a 535 auth rejection as permanent -- not retryable', async () => {
+      const result = await sendWithFailure(
+        Object.assign(new Error('535 bad credentials'), { responseCode: 535 }),
+      );
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error('unreachable');
+      expect(result.retryable).toBe(false);
+      expect(result.code).toBe('send_rejected');
+    });
+
+    it('treats a 4xx SMTP rejection as transient -- retryable', async () => {
+      const result = await sendWithFailure(
+        Object.assign(new Error('421 too busy'), { responseCode: 421 }),
+      );
+      expect(result).toEqual({
+        ok: false,
+        retryable: true,
+        code: 'transport_error',
+        message: expect.any(String),
+      });
+    });
+
+    it('treats connection refused as transient -- retryable', async () => {
+      // The server being down is a reason to come back later. A malformed
+      // address is not, which the two permanent-failure tests above cover.
+      const result = await sendWithFailure(
+        Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }),
+      );
+      expect(result).toEqual({
+        ok: false,
+        retryable: true,
+        code: 'transport_error',
+        message: expect.any(String),
+      });
+    });
+
+    it('treats a DNS failure as transient -- retryable', async () => {
+      const result = await sendWithFailure(Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }));
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error('unreachable');
+      expect(result.retryable).toBe(true);
+    });
+
+    it('treats a failure mid-DATA as ambiguous -- not retryable, and not the same code as a rejection', async () => {
+      // The connection dropped while (or after) the body was in transit,
+      // with no final reply. The server may already have the message; a
+      // duplicate on retry is the risk this must not take.
+      const result = await sendWithFailure(
+        Object.assign(new Error('socket hang up'), { code: 'ECONNRESET', command: 'DATA' }),
+      );
+      expect(result).toEqual({
+        ok: false,
+        retryable: false,
+        code: 'delivery_unknown',
+        message: expect.any(String),
+      });
+    });
+
+    it('treats an unclassifiable failure as ambiguous rather than guessing it is safe to retry', async () => {
+      const result = await sendWithFailure(new Error('mystery failure'));
+      expect(result).toEqual({
+        ok: false,
+        retryable: false,
+        code: 'delivery_unknown',
+        message: expect.any(String),
+      });
+    });
+  });
+
+  describe('recipient reading matches the gate exactly', () => {
+    // Driven over one shared case table rather than compared against
+    // separately hand-written expectations: only running both functions on
+    // the same input can catch the two drifting apart, which is exactly
+    // what happened before this table existed (the adapter read only `to`;
+    // the gate also reads `recipient` and `email`).
+    const cases: { label: string; input: Record<string, unknown> }[] = [
+      { label: 'a single to string', input: { to: 'a@b.com' } },
+      { label: 'a to list', input: { to: ['a@b.com', 'c@d.com'] } },
+      { label: 'a comma-joined to string', input: { to: 'a@b.com, c@d.com' } },
+      { label: 'a semicolon-joined to string', input: { to: 'a@b.com; c@d.com' } },
+      { label: 'the recipient key alone', input: { recipient: 'a@b.com' } },
+      { label: 'the recipient key as a list', input: { recipient: ['a@b.com', 'c@d.com'] } },
+      { label: 'the email key alone', input: { email: 'a@b.com' } },
+      {
+        label: 'to, recipient and email all present',
+        input: { to: 'a@b.com', recipient: 'c@d.com', email: 'e@f.com' },
+      },
+      { label: 'no recipient key at all', input: {} },
+      { label: 'an empty to string', input: { to: '' } },
+      { label: 'an empty to list', input: { to: [] } },
+      { label: 'a non-string to value', input: { to: 123 } },
+      { label: 'a mixed-type to list', input: { to: [123, 'a@b.com'] } },
+      // Deliberately not included: `{ to: REDACTED }`. readEmails has no
+      // shape validation at all (it only matches do-not-contact entries, so
+      // an unparseable string is harmless there) and would collect it as an
+      // address; readRecipients must not, per the dedicated test above in
+      // 'recipient shape validation'. That is a real, intentional
+      // divergence -- this table exists to catch the *unintentional* kind,
+      // an address one function reads and the other silently drops.
+    ];
+
+    it.each(cases.map(({ label, input }) => [label, input] as const))(
+      'agrees with the gate on the recipient set for: %s',
+      (_label, input) => {
+        // readEmails lower-cases for do-not-contact matching; readRecipients
+        // keeps the original case for delivery. The two must still name the
+        // same *set* of addresses, so case is normalised only for this
+        // comparison.
+        const fromAdapter = readRecipients(input).map((value) => value.toLowerCase());
+        const fromGate = readEmails(input);
+        expect(fromAdapter).toEqual(fromGate);
+      },
+    );
+  });
+
   it('passes the shared adapter contract', async () => {
     const { transport } = recordingTransport();
-    await assertAdapterContract(
-      createMailAdapter({ system: 'office-mail', transport }),
-      {
-        toolName: 'mail.send',
-        input: { to: 'a@b.com', subject: 's', body: 'b' },
-        credential: createCredentialHandle('K', 'pw'),
-        idempotencyKey: 'test-idempotency-key',
-        signal: new AbortController().signal,
-      },
-      { allowCommittingSample: true },
-    );
+    await assertAdapterContract(createMailAdapter({ system: 'office-mail', transport }), mailCall(), {
+      allowCommittingSample: true,
+    });
   });
 });

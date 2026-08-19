@@ -20,7 +20,12 @@ export function redactPayload(input: unknown, bundle: PolicyBundle): unknown {
   return walk(input, patterns, 0);
 }
 
-const REDACTED = '[הוסר]';
+/**
+ * Exported so `src/orchestrator/adapters/mail.ts` can refuse this exact
+ * placeholder as a recipient: a redacted payload that still carries `to:
+ * '[הוסר]'` must never resolve to an address rather than being sent nowhere.
+ */
+export const REDACTED = '[הוסר]';
 /** Deep enough for any real payload; a guard against a cyclic structure. */
 const MAX_DEPTH = 12;
 

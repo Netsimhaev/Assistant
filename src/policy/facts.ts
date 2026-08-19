@@ -88,8 +88,13 @@ function readString(input: Record<string, unknown>, key: string): string | null 
  * and split on `,`/`;` because a payload may join recipients into one string.
  * All of them, not the first: checking one address of several reads as "we
  * checked" while being false.
+ *
+ * Exported so `src/orchestrator/adapters/mail.ts`'s own recipient reader can
+ * be pinned against this one by a parity test: the mail adapter must never
+ * mail an address the gate did not also see when it decided whether the
+ * message was allowed to go out.
  */
-function readEmails(input: Record<string, unknown>): string[] {
+export function readEmails(input: Record<string, unknown>): string[] {
   return collectStrings(input, ['to', 'recipient', 'email'])
     .flatMap((value) => value.split(/[,;]/))
     .map((value) => value.trim().toLowerCase())
