@@ -27,10 +27,16 @@ export const DEFAULT_CREDENTIAL_ENV_PREFIX = 'ASSISTANT_CREDENTIAL_';
 
 /**
  * A legal `credential_ref`: uppercase letters, digits and underscores only,
- * non-empty. This is what actually closes the case-sensitivity gap, not the
- * lookup mechanism — see `resolve` below.
+ * non-empty. Exported so `ConnectionBinding` (`src/domain/connection.ts`) can
+ * reject a malformed ref at configuration time — when a binding is written —
+ * rather than let it read as credentialled and fail only at execution, with
+ * nothing distinguishing "the ref is misspelled" from "the environment
+ * variable is missing". This project rejects that class of thing at
+ * configuration time everywhere else (an unresolvable timezone, an
+ * uncompilable redaction pattern, a connection serving an unknown tool), and
+ * a credential ref is no different.
  */
-const REF_PATTERN = /^[A-Z0-9_]+$/;
+export const CREDENTIAL_REF_PATTERN = /^[A-Z0-9_]+$/;
 
 /**
  * Reads secrets from the process environment.
@@ -44,28 +50,31 @@ const REF_PATTERN = /^[A-Z0-9_]+$/;
  * namespace test while doing nothing.
  *
  * A ref resolves to `null`, never a handle, when:
- * - it does not match `REF_PATTERN` (uppercase letters, digits, underscores
- *   only). This is what makes case ambiguity impossible, not the lookup
- *   mechanism below: a ref that differs from the canonical spelling only by
- *   case is not a legal ref at all, so it never reaches the environment
- *   lookup in the first place. This matters because `Object.hasOwn` is
- *   *not* reliably case-sensitive here — Node's `process.env` accessor is
- *   case-insensitive on Windows, so `Object.hasOwn(process.env,
- *   'ASSISTANT_CREDENTIAL_office_mail')` can return `true` there even
- *   though the same lookup is case-sensitive on Linux. Relying on
- *   `Object.hasOwn`'s case sensitivity would make a ref resolve in dev on
- *   Windows and return `null` in production on Linux;
- * - the prefixed key is absent or holds an empty string (an empty secret
- *   would still be attempted against a real external system and fail there,
- *   while `null` stops the step before it reaches anything);
- * - the prefixed key is not the environment object's *own* property. Plain
- *   indexing (`env[key]`) also returns inherited properties — anything
- *   sitting on the object's prototype rather than on the object itself —
- *   so a prefixed key that only exists there would otherwise resolve to
- *   whatever that inherited value is instead of `null`. `Object.hasOwn`
- *   rejects those, and rejects a resolved value that is not a string for
- *   the same reason (an own property can hold any type; only a string is a
- *   usable secret).
+ * - it does not match `CREDENTIAL_REF_PATTERN` (uppercase letters, digits, underscores
+ *   only). A ref that differs from the canonical spelling only by case is
+ *   not a legal ref at all, so it never reaches the environment lookup in
+ *   the first place;
+ * - the prefixed key is not present among the environment object's *own*
+ *   enumerable keys, checked by an exact-string membership test
+ *   (`Object.keys(env).includes(key)`), deliberately not `Object.hasOwn`.
+ *   `Object.hasOwn(env, key)` is *not* reliably case-sensitive here —
+ *   Node's `process.env` accessor is case-insensitive on Windows, so
+ *   `Object.hasOwn(process.env, 'ASSISTANT_CREDENTIAL_OFFICE_MAIL')`
+ *   returns `true` there even when the variable was actually set as
+ *   `assistant_credential_office_mail`. `Object.keys(env)` always returns
+ *   `process.env`'s keys in the exact casing they were set with, on every
+ *   platform, so comparing against that list is what actually makes the
+ *   ref-shape guard above mean something: without it, a differently-cased
+ *   real variable would still resolve in Windows dev and return `null` in
+ *   Linux production — the exact split CREDENTIAL_REF_PATTERN exists to rule out.
+ *   Checking the *own* key list also rejects anything sitting on the
+ *   environment object's prototype rather than on the object itself, which
+ *   plain indexing (`env[key]`) would otherwise return;
+ * - the prefixed key is present but resolves to an empty string (an empty
+ *   secret would still be attempted against a real external system and
+ *   fail there, while `null` stops the step before it reaches anything) or
+ *   to a non-string value (an own property can hold any type; only a
+ *   string is a usable secret).
  *
  * Handles are built with `createCredentialHandle`, which is the only way to
  * produce a value typed `CredentialHandle` — it hides `value` from
@@ -91,9 +100,11 @@ export function envCredentials(
 
   return {
     async resolve(ref: string): Promise<CredentialHandle | null> {
-      if (!REF_PATTERN.test(ref)) return null;
+      if (!CREDENTIAL_REF_PATTERN.test(ref)) return null;
       const key = prefix + ref;
-      if (!Object.hasOwn(env, key)) return null;
+      // Exact-string membership, not Object.hasOwn: see the docblock above
+      // for why hasOwn is not safe to use for this on Windows.
+      if (!Object.keys(env).includes(key)) return null;
       const value = env[key];
       if (typeof value !== 'string' || value.length === 0) return null;
       return createCredentialHandle(ref, value);

@@ -402,10 +402,12 @@ describe('credentials', () => {
 
   describe('a ref must be uppercase letters, digits and underscores only', () => {
     it('rejects a lower-case ref even when the prefixed key exists in that case', async () => {
-      // Object.hasOwn is not reliably case-sensitive across platforms --
-      // Node's process.env accessor is case-insensitive on Windows -- so the
-      // guarantee comes from refusing the illegal ref outright, before any
-      // environment lookup happens, not from case-sensitive matching.
+      // The ref-shape guard refuses the illegal ref outright, before any
+      // environment lookup happens. Against an injected plain object this is
+      // the only guard in play anyway, since plain-object property access is
+      // already case-sensitive; the platform-dependent gap this rules out
+      // only shows up against the real process.env (see the describe block
+      // below).
       const source = envCredentials({ [`${P}OFFICE_MAIL`]: 'secret-value' }, P);
       expect(await source.resolve('office_mail')).toBeNull();
       expect(await source.resolve('OFFICE_MAIL')).not.toBeNull();
@@ -416,6 +418,32 @@ describe('credentials', () => {
       expect(await source.resolve('OFFICE-MAIL')).toBeNull();
       expect(await source.resolve('OFFICE.MAIL')).toBeNull();
       expect(await source.resolve('')).toBeNull();
+    });
+  });
+
+  describe('the environment key check is exact-case, not Object.hasOwn', () => {
+    it('rejects a same key set under a different case in the real process.env', async () => {
+      // This can only be demonstrated against the real process.env, not an
+      // injected {} literal: Object.hasOwn(process.env, key) is
+      // case-insensitive on Windows -- confirmed here:
+      // Object.hasOwn(process.env, 'X') is true even when the variable was
+      // actually set as 'x' -- while Object.keys(process.env) always lists
+      // it under the exact case it was set with. A plain object literal's
+      // property access is already case-sensitive on every platform, so the
+      // same test against an injected {} would pass whether or not this
+      // guard used hasOwn or exact-key matching, and would prove nothing.
+      // resolve() must use the exact-key check, or a ref legally spelled in
+      // upper case could still be answered by a same-named lower-case real
+      // env var on Windows and return null for the identical setup on Linux.
+      const suffix = `PROBE_${Date.now()}`;
+      const key = `${P}${suffix}`;
+      const differentCaseKey = key.toLowerCase();
+      process.env[differentCaseKey] = 'leaked-cross-case-value';
+      try {
+        expect(await envCredentials(undefined, P).resolve(suffix)).toBeNull();
+      } finally {
+        delete process.env[differentCaseKey];
+      }
     });
   });
 

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CREDENTIAL_REF_PATTERN } from '../orchestrator/credentials.js';
 
 /** The two ways an action can reach the outside world. */
 export const CONNECTION_CHANNELS = ['api', 'browser'] as const;
@@ -30,8 +31,15 @@ export const ConnectionBinding = z.object({
   system: z.string().min(1),
   status: z.enum(['live', 'disconnected', 'error']),
   endpoint: z.string().nullable(),
-  /** A POINTER to a secret. Never the secret. */
-  credentialRef: z.string().nullable(),
+  /**
+   * A POINTER to a secret. Never the secret. Must match
+   * CREDENTIAL_REF_PATTERN (uppercase letters, digits, underscores) so a
+   * misspelled ref is refused when the binding is written, rather than
+   * reading as credentialled and failing only at execution with nothing
+   * distinguishing "the ref is misspelled" from "the environment variable
+   * is missing".
+   */
+  credentialRef: z.string().regex(CREDENTIAL_REF_PATTERN).nullable(),
   lastOkAt: z.string().nullable(),
   lastError: z.string().nullable(),
 });

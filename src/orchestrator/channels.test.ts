@@ -112,6 +112,30 @@ describe('connection bindings', () => {
     expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
   });
 
+  it('rejects a malformed credentialRef at write time and writes nothing', async () => {
+    // A credentialRef must match CREDENTIAL_REF_PATTERN (uppercase letters,
+    // digits, underscores) so a misspelled ref -- lower-case, hyphenated,
+    // whatever envCredentials.resolve would silently refuse at execution --
+    // is caught here, at configuration time, instead of reading as
+    // credentialled and failing later with nothing distinguishing "the ref
+    // is misspelled" from "the environment variable is missing".
+    await expect(
+      upsertBinding(
+        {
+          system: 'office-mail',
+          status: 'live',
+          endpoint: null,
+          credentialRef: 'sendgrid-api',
+          lastOkAt: null,
+          lastError: null,
+        },
+        { businessId: BUSINESS, by: BY },
+      ),
+    ).rejects.toThrow();
+
+    expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
+  });
+
   it('audits a mutation with exactly one entry naming the system and the actor', async () => {
     await upsertBinding(
       {
