@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildCharter } from '../test/fixtures.js';
 import { compileCharter } from './compile.js';
 import { verifyCharterSignature } from './sign.js';
+import { BusinessCharter } from '../domain/charter.js';
 
 describe('charter signing', () => {
   it('verifies a charter that has not been touched', () => {
@@ -104,5 +105,64 @@ describe('charter compilation', () => {
     // The quarantine agents must be told their input is data, not instructions.
     expect(bundle.promptFragments['intake.triage']).toMatch(/אינו אמין/);
     expect(bundle.promptFragments['know.reader']).toMatch(/אינו אמין/);
+  });
+});
+
+describe('charter connections', () => {
+  it('accepts a connection that names a known tool and no subprocessor', () => {
+    const charter = buildCharter({
+      connections: [
+        {
+          system: 'office-mail',
+          label: 'תיבת המשרד',
+          channel: 'api',
+          serves: ['mail.send'],
+          target: null,
+          subprocessor: null,
+        },
+      ],
+    });
+    expect(BusinessCharter.safeParse(charter).success).toBe(true);
+  });
+
+  it('refuses a connection that serves a tool the registry does not know', () => {
+    const charter = buildCharter();
+    const broken = {
+      ...charter,
+      connections: [
+        {
+          system: 'ghost',
+          label: 'לא קיים',
+          channel: 'api' as const,
+          serves: ['mail.teleport'],
+          target: null,
+          subprocessor: null,
+        },
+      ],
+    };
+    // Otherwise a connection can declare a tool that does not exist, and the
+    // whole entry is dead policy.
+    expect(BusinessCharter.safeParse(broken).success).toBe(false);
+  });
+
+  it('refuses a subprocessor the owner did not sign for', () => {
+    const charter = buildCharter();
+    const broken = {
+      ...charter,
+      connections: [
+        {
+          system: 'crm-via-zapier',
+          label: 'CRM דרך Zapier',
+          channel: 'api' as const,
+          serves: ['crm.write'],
+          target: null,
+          subprocessor: 'zapier',
+        },
+      ],
+      data: { ...charter.data, subprocessorsAllowed: ['anthropic'] },
+    };
+    // Every intermediary sees the payloads. Rejected at signing, not at run
+    // time, for the same reason an unresolvable timezone is.
+    expect(BusinessCharter.safeParse(broken).success).toBe(false);
   });
 });

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { ActionClass } from './action.js';
 import { AutonomyLevel, TrustLevel } from './trust.js';
+import { CharterConnection } from './connection.js';
 
 export const Channel = z.enum([
   'email',
@@ -61,6 +62,45 @@ function isCompilableRegex(source: string): boolean {
 
 /** Minor units (agorot / cents). Integer so no float rounding ever applies to money. */
 const MinorAmount = z.number().int().nonnegative();
+
+/**
+ * Every tool name the policy layer classifies, plus every tool it treats as
+ * read-only. Generated from `classifiedToolNames()` and `READ_ONLY_TOOLS` in
+ * `src/policy/classify.ts` — not imported from there, because that would make
+ * `src/domain` depend on `src/policy`, which is a layering cycle. The
+ * structural test in Task 8 asserts the two lists agree, so this duplication
+ * cannot drift silently.
+ */
+export const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'accounting.read', 'accounting.write', 'agent.request_help', 'artifact.read',
+  'assert.evaluate', 'brand.check', 'browser.click', 'browser.fill',
+  'browser.navigate', 'browser.screenshot', 'browser.snapshot',
+  'browser.submit_order', 'calendar.propose_slots', 'calendar.read',
+  'calendar.write', 'chart.render', 'charter.apply_amendment',
+  'charter.evaluate', 'charter.propose_amendment', 'charter.read',
+  'charter.voice', 'code_execution', 'commitment.make', 'contract.sign',
+  'credential.request_session', 'crm.read', 'crm.write', 'data.export',
+  'discount.grant', 'doc.deliver', 'doc.fetch', 'escalate_to_human',
+  'file.write', 'followup.schedule', 'mail.draft', 'mail.send',
+  'media.generate_image', 'media.generate_video', 'media.inspect',
+  'media.publish', 'memory.recall', 'memory.recall_shallow', 'memory.retire',
+  'memory.upsert_preference', 'memory.write_chunk', 'memory.write_entity',
+  'norms.query', 'payment.charge', 'quote.issue', 'recipe.load',
+  'recipe.save', 'refund.issue', 'render.markdown', 'schema.map',
+  'tasks.read', 'tasks.update_state', 'template.load', 'template.render',
+  'wa.can_send_freeform', 'wa.conversation_state', 'wa.send_message',
+]);
+
+/**
+ * Is this a tool the policy layer knows?
+ *
+ * Duplicated deliberately rather than imported from `src/policy/classify.ts`:
+ * domain must not depend on policy. The structural test in Task 8 asserts the
+ * two lists agree, so the duplication cannot drift silently.
+ */
+function isKnownToolName(tool: string): boolean {
+  return KNOWN_TOOL_NAMES.has(tool);
+}
 
 // ---------------------------------------------------------------------------
 
@@ -279,7 +319,7 @@ export const CharterSignature = z.object({
   contentHash: z.string().regex(/^[0-9a-f]{64}$/, 'expected a lowercase sha256 hex digest'),
 });
 
-export const BusinessCharter = z.object({
+const BusinessCharterShape = z.object({
   schemaVersion: z.literal('1.0'),
   charterVersion: z.string().min(1),
   effectiveFrom: z.string().datetime(),
@@ -291,10 +331,38 @@ export const BusinessCharter = z.object({
   operations: CharterOperations,
   people: z.array(CharterPerson).min(1),
   counterparties: z.array(CharterCounterparty).default([]),
+  connections: z.array(CharterConnection).default([]),
   money: CharterMoney,
   autonomy: CharterAutonomy,
   data: CharterData,
   forbidden: z.array(ForbiddenRule).default([]),
+});
+
+export const BusinessCharter = BusinessCharterShape.superRefine((charter, ctx) => {
+  for (const [index, connection] of charter.connections.entries()) {
+    // A connection serving a tool that does not exist is dead policy: it
+    // compiles, appears in the signed document, and can never be selected.
+    for (const tool of connection.serves) {
+      if (!isKnownToolName(tool)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['connections', index, 'serves'],
+          message: `unknown tool "${tool}"`,
+        });
+      }
+    }
+    // Every intermediary sees the payload, which is customer correspondence.
+    if (
+      connection.subprocessor !== null &&
+      !charter.data.subprocessorsAllowed.includes(connection.subprocessor)
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['connections', index, 'subprocessor'],
+        message: `subprocessor "${connection.subprocessor}" is not in data.subprocessorsAllowed`,
+      });
+    }
+  }
 });
 
 export type BusinessCharter = z.infer<typeof BusinessCharter>;
@@ -305,8 +373,13 @@ export type ForbiddenRule = z.infer<typeof ForbiddenRule>;
 /**
  * An unsigned charter — what the onboarding flow assembles before the owner
  * signs. Signing computes the hash over exactly this shape.
+ *
+ * Built from `BusinessCharterShape` rather than `BusinessCharter` because zod
+ * does not support `.omit()` on a refined schema. Nothing is lost: connections
+ * validation is a signing-time concern, so it runs when the *signed* charter
+ * is parsed, not when the unsigned draft is assembled.
  */
-export const UnsignedCharter = BusinessCharter.omit({ signature: true });
+export const UnsignedCharter = BusinessCharterShape.omit({ signature: true });
 export type UnsignedCharter = z.infer<typeof UnsignedCharter>;
 
 /** Exactly one principal, or the escalation chain has no root. */

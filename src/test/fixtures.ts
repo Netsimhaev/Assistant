@@ -2,6 +2,7 @@ import type { ActionClass } from '../domain/action.js';
 import type { BusinessCharter, UnsignedCharter } from '../domain/charter.js';
 import { BusinessCharter as CharterSchema } from '../domain/charter.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
+import type { CharterConnection } from '../domain/connection.js';
 import { signCharter } from '../charter/sign.js';
 
 /**
@@ -64,6 +65,8 @@ export interface CharterOverrides {
   doNotContactEntityId?: string;
   /** Adds a third counterparty blocked by email domain rather than by id. */
   doNotContactEmailDomain?: string;
+  /** Connections the charter declares. Empty by default. */
+  connections?: CharterConnection[];
 }
 
 /** A realistic small-business charter: an Israeli firm working Sun–Thu. */
@@ -171,6 +174,8 @@ export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter 
             },
           ]),
     ],
+
+    connections: overrides.connections ?? [],
 
     money: {
       currency: 'ILS',
