@@ -3,6 +3,10 @@ import { closePool, getPool } from '../db/pool.js';
 import { queryAudit } from '../audit/log.js';
 import { resetDatabase } from '../test/db.js';
 import { loadBindings, upsertBinding } from './bindings.js';
+import { buildCharter } from '../test/fixtures.js';
+import { compileCharter } from '../charter/compile.js';
+import type { CharterConnection } from '../domain/connection.js';
+import { deriveTargetId, resolveChannel } from './channels.js';
 
 const BUSINESS = 'test-business';
 const BY = 'net.simhaev@gmail.com';
@@ -208,5 +212,120 @@ describe('connection bindings', () => {
     expect(after[0]?.status).toBe('error');
     expect(after[0]?.endpoint).toBe('smtp.example.com:587');
     expect(after[0]?.credentialRef).toBe('OFFICE_MAIL');
+  });
+});
+
+function conn(over: Partial<CharterConnection> = {}): CharterConnection {
+  return {
+    system: 'office-mail',
+    label: 'תיבת המשרד',
+    channel: 'api',
+    serves: ['mail.send'],
+    target: null,
+    subprocessor: null,
+    ...over,
+  };
+}
+
+function bundleWith(connections: CharterConnection[]) {
+  return compileCharter(buildCharter({ connections }));
+}
+
+const LIVE = {
+  system: 'office-mail',
+  status: 'live' as const,
+  endpoint: null,
+  credentialRef: null,
+  lastOkAt: null,
+  lastError: null,
+};
+
+describe('resolving a channel', () => {
+  it('resolves a tool to the system that serves it', () => {
+    const result = resolveChannel(bundleWith([conn()]), [LIVE], 'mail.send', null);
+    expect(result).toEqual({ status: 'resolved', system: 'office-mail', channel: 'api' });
+  });
+
+  it('prefers an exact target over the catch-all', () => {
+    const bundle = bundleWith([
+      conn({ system: 'generic', serves: ['browser.submit_order'], target: null }),
+      conn({
+        system: 'supplier-a-api',
+        serves: ['browser.submit_order'],
+        target: 'supplier-a',
+      }),
+    ]);
+    const bindings = [
+      { ...LIVE, system: 'generic' },
+      { ...LIVE, system: 'supplier-a-api' },
+    ];
+
+    const result = resolveChannel(bundle, bindings, 'browser.submit_order', 'supplier-a');
+    expect(result).toEqual({
+      status: 'resolved',
+      system: 'supplier-a-api',
+      channel: 'api',
+    });
+  });
+
+  it('refuses when two connections match at the same specificity', () => {
+    // Charter signing now rejects two connections serving the same tool for
+    // the same target (including two catch-alls) as an authoring mistake —
+    // src/domain/charter.ts's superRefine. That guards signing time. This
+    // resolver defends the same shape at a different moment: a bundle that
+    // reached it without going through that gate (an older signed charter,
+    // a hand-built bundle in a test, a future bypass). Build the bundle
+    // through the normal path, then graft on the ambiguous pair directly so
+    // the signing check never sees it.
+    const bundle = bundleWith([conn({ system: 'mail-a' })]);
+    const ambiguous = {
+      ...bundle,
+      connections: [conn({ system: 'mail-a' }), conn({ system: 'mail-b' })],
+    };
+    const bindings = [
+      { ...LIVE, system: 'mail-a' },
+      { ...LIVE, system: 'mail-b' },
+    ];
+
+    // Array order deciding between two policies looks like a decision and
+    // behaves like an accident.
+    const result = resolveChannel(ambiguous, bindings, 'mail.send', null);
+    expect(result.status).toBe('ambiguous');
+  });
+
+  it('refuses a tool no connection serves', () => {
+    const result = resolveChannel(bundleWith([conn()]), [LIVE], 'crm.write', null);
+    expect(result.status).toBe('no_channel');
+  });
+
+  it('reports a permitted connection with no live binding as unavailable', () => {
+    const result = resolveChannel(bundleWith([conn()]), [], 'mail.send', null);
+    expect(result).toEqual({
+      status: 'unavailable',
+      system: 'office-mail',
+      reason: 'no binding',
+    });
+  });
+
+  it('reports a disconnected binding as unavailable, not resolved', () => {
+    const result = resolveChannel(
+      bundleWith([conn()]),
+      [{ ...LIVE, status: 'disconnected' }],
+      'mail.send',
+      null,
+    );
+    expect(result.status).toBe('unavailable');
+  });
+
+  it('derives the target from the payload the same way facts do', () => {
+    expect(deriveTargetId({ supplierId: 'supplier-a' })).toBe('supplier-a');
+    expect(deriveTargetId({ counterpartyId: 'c_812' })).toBe('c_812');
+    // supplierId wins: a purchase names both, and the supplier is who we deal
+    // with.
+    expect(deriveTargetId({ supplierId: 'supplier-a', counterpartyId: 'c_812' })).toBe(
+      'supplier-a',
+    );
+    expect(deriveTargetId({ body: 'hello' })).toBeNull();
+    expect(deriveTargetId({ supplierId: '' })).toBeNull();
   });
 });
