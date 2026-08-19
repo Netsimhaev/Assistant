@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { queryAudit } from '../audit/log.js';
 import { resetDatabase } from '../test/db.js';
-import { activeScopes, release, trip } from './killswitch.js';
+import { activeScopes, KillSwitchAuditUnrecordedError, release, trip } from './killswitch.js';
 
 const BUSINESS = 'test-business';
 const BY = 'net.simhaev@gmail.com';
@@ -64,9 +64,22 @@ describe('trip() fails loud but does NOT roll back — the stop must hold', () =
   it('leaves the kill switch TRIPPED when the audit append fails on first trip', async () => {
     await installAuditFailureTrigger();
 
-    await expect(
-      trip('all', BY, FORCE_FAILURE, { businessId: BUSINESS }),
-    ).rejects.toThrow(/IS TRIPPED/);
+    // Assert on the typed discriminator, not the message text — a caller
+    // must be able to tell "stopped but unrecorded" from "the stop itself
+    // failed" without regex-matching a human-readable string.
+    let caught: unknown;
+    try {
+      await trip('all', BY, FORCE_FAILURE, { businessId: BUSINESS });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(KillSwitchAuditUnrecordedError);
+    const typedError = caught as KillSwitchAuditUnrecordedError;
+    expect(typedError.switchInForce).toBe(true);
+    // The original pg error survives as `cause` rather than being flattened
+    // into the message string.
+    expect(typedError.cause).toBeInstanceOf(Error);
+    expect((typedError.cause as Error).message).toContain('forced audit failure');
 
     // The write must have committed even though the audit append failed and
     // the call threw: rolling back an emergency stop because its audit
@@ -80,6 +93,23 @@ describe('trip() fails loud but does NOT roll back — the stop must hold', () =
     expect(await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' })).toEqual([]);
   });
 
+  it('stamps the audit reason with the instant of the state write, not the append', async () => {
+    const before = new Date();
+    await trip('all', BY, 'עצירה עם חותמת זמן', { businessId: BUSINESS });
+    const after = new Date();
+
+    const entries = await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' });
+    expect(entries).toHaveLength(1);
+    const match = entries[0]?.reason.match(/\[movedAt=([^\]]+)\]/);
+    expect(match).not.toBeNull();
+    const movedAt = new Date(match![1]!);
+    // Sanity bounds rather than an exact match: movedAt was captured before
+    // the state write, so it must fall between the moment the test called
+    // trip() and the moment the audit query returned.
+    expect(movedAt.getTime()).toBeGreaterThanOrEqual(before.getTime());
+    expect(movedAt.getTime()).toBeLessThanOrEqual(after.getTime());
+  });
+
   it('holds the new trip when re-tripping an already-tripped scope and the audit append fails', async () => {
     // First trip succeeds normally and is audited.
     await trip('all', BY, 'עצירה ראשונה', { businessId: BUSINESS });
@@ -91,9 +121,9 @@ describe('trip() fails loud but does NOT roll back — the stop must hold', () =
     await installAuditFailureTrigger();
     const secondBy = 'other.human@example.com';
 
-    await expect(
-      trip('all', secondBy, FORCE_FAILURE, { businessId: BUSINESS }),
-    ).rejects.toThrow(/IS TRIPPED/);
+    await expect(trip('all', secondBy, FORCE_FAILURE, { businessId: BUSINESS })).rejects.toThrow(
+      KillSwitchAuditUnrecordedError,
+    );
 
     // The re-trip's write must hold — trippedBy and reason reflect the
     // second call, not the first. A rollback here would silently keep the
@@ -134,6 +164,23 @@ describe('release() is transactional with its audit entry — refusing to releas
     const entries = await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' });
     expect(entries).toHaveLength(1);
     expect(entries[0]?.reason).toContain('TRIPPED');
+  });
+
+  it('stamps the audit reason with the instant of the state write, not the append', async () => {
+    await trip('all', BY, 'עצירה', { businessId: BUSINESS });
+
+    const before = new Date();
+    await release('all', BY, 'שחרור עם חותמת זמן', { businessId: BUSINESS });
+    const after = new Date();
+
+    const entries = await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' });
+    const released = entries.find((entry) => entry.reason.includes('RELEASED'));
+    expect(released).toBeDefined();
+    const match = released?.reason.match(/\[movedAt=([^\]]+)\]/);
+    expect(match).not.toBeNull();
+    const movedAt = new Date(match![1]!);
+    expect(movedAt.getTime()).toBeGreaterThanOrEqual(before.getTime());
+    expect(movedAt.getTime()).toBeLessThanOrEqual(after.getTime());
   });
 
   it('release() on a scope that was never tripped throws and writes no audit row', async () => {
