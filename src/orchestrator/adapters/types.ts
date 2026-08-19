@@ -1,4 +1,13 @@
 /**
+ * Not exported. The only way to produce a value typed `[CREDENTIAL_HANDLE]:
+ * true` is `createCredentialHandle` below, which asserts its way past the
+ * missing property — nothing else in or outside this module can spell the
+ * property name to build one by hand. This is a type-only brand: no runtime
+ * object ever actually carries this symbol as a key.
+ */
+declare const CREDENTIAL_HANDLE: unique symbol;
+
+/**
  * An opaque secret. Adapters use it; nothing logs or serialises it.
  *
  * `toJSON` is declared here, and required rather than optional, so a handle
@@ -18,11 +27,18 @@
  * `value` as a non-enumerable property, so `Object.keys` — and therefore
  * `canonicalJson` and `JSON.stringify` alike — does not see it, while an
  * adapter that needs the secret can still read `handle.value` directly.
+ *
+ * The `[CREDENTIAL_HANDLE]` field brands the type. Without it, `{ ref, value,
+ * toJSON }` typechecks as a `CredentialHandle` with an ordinary, enumerable
+ * `value` — a hand-built literal that compiles and leaks. With it, only
+ * `createCredentialHandle`'s own cast can produce one, so the non-enumerable
+ * construction above is enforced rather than merely conventional.
  */
 export interface CredentialHandle {
   readonly ref: string;
   readonly value: string;
   readonly toJSON: () => unknown;
+  readonly [CREDENTIAL_HANDLE]: true;
 }
 
 /**
@@ -47,7 +63,11 @@ export function createCredentialHandle(ref: string, value: string): CredentialHa
     writable: false,
     configurable: false,
   });
-  return handle;
+  // The brand is asserted, never actually written: no runtime object holds
+  // this key. `as unknown as CredentialHandle` is deliberate here — it is
+  // the one place in the codebase allowed to claim the brand, and every
+  // other call site is left with a type that a plain literal cannot satisfy.
+  return handle as unknown as CredentialHandle;
 }
 
 export interface AdapterCall {

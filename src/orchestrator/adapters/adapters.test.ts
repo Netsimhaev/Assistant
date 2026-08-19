@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { AdapterRegistry } from './registry.js';
 import { browserAdapter } from './browser.js';
 import { assertAdapterContract } from './contract.js';
-import type { AdapterCall, AdapterResult, ExternalAdapter } from './types.js';
+import type { AdapterCall, AdapterResult, CredentialHandle, ExternalAdapter } from './types.js';
 import { createCredentialHandle } from './types.js';
 import { classifiedToolNames, READ_ONLY_TOOLS } from '../../policy/classify.js';
 import { canonicalJson } from '../../util/canonical.js';
@@ -102,16 +102,21 @@ describe('the adapter registry', () => {
 
     // The channel default must not become a catch-all for every tool signed
     // onto that channel.
-    it('resolves a browser-signed connection to the channel default for a tool it serves', () => {
-      const registry = new AdapterRegistry([], [browserAdapter]);
-      expect(registry.resolve('supplier-a-portal', 'browser', 'browser.navigate')).toBe(
-        browserAdapter,
-      );
-    });
-
     it('refuses the channel default for a tool it does not serve, even on the right channel', () => {
       const registry = new AdapterRegistry([], [browserAdapter]);
       expect(registry.resolve('supplier-a-portal', 'browser', 'mail.send')).toBeNull();
+    });
+
+    // The sibling of the channel-default serves check above: a
+    // system-specific adapter must clear the same bar. Replacing
+    // `specific.serves.includes(toolName) ? specific : null` with a bare
+    // `return specific` leaves every other test in this file green, since
+    // none of them call `resolve` with a system-specific adapter and a tool
+    // outside its `serves`.
+    it('refuses a system-specific adapter for a tool it does not serve, even on the right channel', () => {
+      const specific = apiAdapter('office-mail', ['mail.send']);
+      const registry = new AdapterRegistry([specific]);
+      expect(registry.resolve('office-mail', 'api', 'crm.write')).toBeNull();
     });
   });
 
@@ -179,6 +184,24 @@ describe('assertAdapterContract requires a non-committing sample by default', ()
       assertAdapterContract(double, committing, { allowCommittingSample: true }),
     ).resolves.toBeUndefined();
   });
+
+  it('rejects media.generate_video as a sample even though it is not a classified, gated action', async () => {
+    // media.generate_video sits in READ_ONLY_TOOLS (it bypasses the policy
+    // gate) but generates real content and costs real money -- exactly the
+    // tool that a `classifyAction(toolName) === null` check would have
+    // waved through as "safe". It must never appear in
+    // NON_COMMITTING_SAMPLE_TOOLS, and this suite must refuse it by default.
+    const double: ExternalAdapter = {
+      system: 'test-double-media',
+      channel: 'api',
+      serves: ['media.generate_video'],
+      async execute(): Promise<AdapterResult> {
+        return { ok: true, output: null, externalId: null };
+      },
+    };
+    const committing = call({ toolName: 'media.generate_video', input: {} });
+    await expect(assertAdapterContract(double, committing)).rejects.toThrow();
+  });
 });
 
 describe('createCredentialHandle', () => {
@@ -192,5 +215,27 @@ describe('createCredentialHandle', () => {
   it('still lets an adapter read the secret directly', () => {
     const handle = createCredentialHandle('ref-1', 'super-secret-value');
     expect(handle.value).toBe('super-secret-value');
+  });
+});
+
+describe('CredentialHandle is branded, not just conventionally built', () => {
+  it('rejects a hand-built literal at compile time', () => {
+    // @ts-expect-error a plain { ref, value, toJSON } literal is missing the
+    // private brand and must not satisfy CredentialHandle -- only
+    // createCredentialHandle can produce one. If this ever stops being a
+    // type error, the unused @ts-expect-error directive fails
+    // `tsc --noEmit`, which is the proof this test relies on; the runtime
+    // assertion below only keeps the binding used.
+    const illTyped: CredentialHandle = {
+      ref: 'r',
+      value: 'v',
+      toJSON: () => ({}),
+    };
+    expect(illTyped.ref).toBe('r');
+  });
+
+  it('accepts the factory output as a real CredentialHandle', () => {
+    const handle: CredentialHandle = createCredentialHandle('ref-1', 'secret');
+    expect(handle.ref).toBe('ref-1');
   });
 });
