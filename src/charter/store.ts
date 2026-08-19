@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { BusinessCharter } from '../domain/charter.js';
+import { BusinessCharter, CURRENT_SCHEMA_VERSION } from '../domain/charter.js';
 import { PolicyBundle } from '../domain/policy.js';
 import { getPool, withTransaction, type Queryable } from '../db/pool.js';
 import { compileCharter } from './compile.js';
@@ -103,6 +103,24 @@ export async function loadActiveCharter(
 
   const row = rows[0];
   if (!row) return null;
+
+  // Checked before `.parse()` rather than left to it. A charter stored under
+  // an older schema would otherwise fail inside `BusinessCharter.parse` with
+  // a raw ZodError — illegible in the same way a raised signature failure
+  // is, except this one is not tampering, it is a schema the charter was
+  // never re-signed under. Named explicitly so the remedy (re-sign) is
+  // obvious from the error itself.
+  const storedVersion =
+    typeof row.charter === 'object' && row.charter !== null && 'schemaVersion' in row.charter
+      ? (row.charter as { schemaVersion?: unknown }).schemaVersion
+      : undefined;
+  if (storedVersion !== CURRENT_SCHEMA_VERSION) {
+    throw new Error(
+      `charter stored for business "${businessId}" carries schemaVersion ` +
+        `${JSON.stringify(storedVersion)}, expected ${JSON.stringify(CURRENT_SCHEMA_VERSION)} — ` +
+        `it was signed under an older schema and must be re-signed`,
+    );
+  }
 
   return {
     charter: BusinessCharter.parse(row.charter),

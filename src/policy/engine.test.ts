@@ -636,6 +636,52 @@ describe('installCharter validates at write time', () => {
 });
 
 // ---------------------------------------------------------------------------
+// A charter stored under a pre-connections schema version must fail loudly
+// and legibly on the read path too — not just on a fresh parse. Reaching
+// `BusinessCharter.parse` directly on a stale row produces a raw ZodError,
+// which reads exactly like the alarm for a tampered charter. The row is
+// inserted directly rather than through `installCharter`, since install now
+// refuses schemaVersion '1.0' itself — this simulates a charter that was
+// written before the bump and never re-signed.
+
+describe('loadActiveCharter refuses a stale schema version legibly', () => {
+  it('names the schema version and the remedy, not a zod issue path', async () => {
+    const charter = buildCharter();
+    const stale = { ...charter, schemaVersion: '1.0' };
+
+    await getPool().query(
+      `INSERT INTO charter_versions (
+         charter_version, business_id, effective_from, supersedes,
+         charter, policy_bundle, content_hash,
+         signed_by, signed_at, signature_method
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
+        stale.charterVersion,
+        BUSINESS,
+        stale.effectiveFrom,
+        stale.supersedes ?? null,
+        JSON.stringify(stale),
+        JSON.stringify({}),
+        stale.signature.contentHash,
+        stale.signature.signedByPersonId,
+        stale.signature.signedAt,
+        stale.signature.method,
+      ],
+    );
+    await getPool().query(
+      `INSERT INTO charter_active (business_id, charter_version, activated_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (business_id)
+       DO UPDATE SET charter_version = EXCLUDED.charter_version,
+                     activated_at    = now()`,
+      [BUSINESS, stale.charterVersion],
+    );
+
+    await expect(loadActiveCharter(BUSINESS, getPool())).rejects.toThrow(/schemaVersion/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The browser gate. Until now `browser.click` and `browser.fill` were
 // read-only, so they short-circuited the gate at step 4 and a hijacked session
 // could finish a checkout without ever touching the gated `browser.submit_order`.

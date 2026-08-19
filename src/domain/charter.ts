@@ -109,12 +109,38 @@ function isKnownToolName(tool: string): boolean {
  * must not import from `src/charter`. A connection that names one of these in
  * `serves` is dead policy in exactly the way an unknown tool name is — no
  * agent can ever be the one that calls it.
+ *
+ * These are *patterns*, not exact names — `UNOWNED_TOOLS` is read through
+ * `matchesPattern` there, where a trailing `*` is a prefix match. Matching
+ * this set with plain `Set.has()` would stay green on the string-equality
+ * invariant test while quietly diverging in behaviour the moment either list
+ * gains a wildcard entry the other does not honour the same way.
  */
 export const UNOWNED_TOOL_NAMES: ReadonlySet<string> = new Set([
   'contract.sign',
   'payment.charge',
   'charter.apply_amendment',
 ]);
+
+/**
+ * Wildcard-aware match, mirroring `matchesPattern` in
+ * `src/charter/capabilities.ts` exactly — duplicated for the same layering
+ * reason as the lists above. A trailing `*` is a prefix match, otherwise the
+ * pattern must equal the tool name exactly.
+ */
+export function matchesToolPattern(tool: string, pattern: string): boolean {
+  if (pattern.endsWith('*')) {
+    return tool.startsWith(pattern.slice(0, -1));
+  }
+  return tool === pattern;
+}
+
+function isUnownedToolName(tool: string): boolean {
+  for (const pattern of UNOWNED_TOOL_NAMES) {
+    if (matchesToolPattern(tool, pattern)) return true;
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -333,14 +359,23 @@ export const CharterSignature = z.object({
   contentHash: z.string().regex(/^[0-9a-f]{64}$/, 'expected a lowercase sha256 hex digest'),
 });
 
+/**
+ * Bumped from '1.0' when `connections` was added. A charter signed under 1.0
+ * must be re-signed, not silently reinterpreted: `BusinessCharter.parse`
+ * fills in `connections: []` for a charter that never hashed it, which
+ * changes the content hash and must fail loudly as a schema mismatch, not
+ * quietly as "does not match its signature" — the alarm reserved for a
+ * malicious edit.
+ *
+ * Exported so `loadActiveCharter` in `src/charter/store.ts` can check a
+ * stored charter's version *before* parsing and raise a legible error naming
+ * the problem, instead of parsing straight into a raw `ZodError` — the same
+ * illegibility this bump was meant to fix, one layer down on the read path.
+ */
+export const CURRENT_SCHEMA_VERSION = '1.1';
+
 const BusinessCharterShape = z.object({
-  // Bumped from '1.0' when `connections` was added. A charter signed under
-  // 1.0 must be re-signed, not silently reinterpreted: `BusinessCharter.parse`
-  // fills in `connections: []` for a charter that never hashed it, which
-  // changes the content hash and must fail loudly as a schema mismatch, not
-  // quietly as "does not match its signature" — the alarm reserved for a
-  // malicious edit.
-  schemaVersion: z.literal('1.1'),
+  schemaVersion: z.literal(CURRENT_SCHEMA_VERSION),
   charterVersion: z.string().min(1),
   effectiveFrom: z.string().datetime(),
   supersedes: z.string().optional(),
@@ -363,12 +398,15 @@ const CATCH_ALL_TARGET = '\0catch-all';
 
 export const BusinessCharter = BusinessCharterShape.superRefine((charter, ctx) => {
   const seenSystems = new Set<string>();
-  // Keyed by `${tool}\0${target ?? CATCH_ALL_TARGET}` — two connections that
-  // serve the same tool for the same target (including two catch-alls) are an
-  // authoring mistake. A specific target beside a `null` catch-all for the
-  // same tool is not: the resolver prefers the specific one, so both keys
-  // differ and neither collides.
-  const seenToolTargets = new Set<string>();
+  // Keyed by `${tool}\0${target ?? CATCH_ALL_TARGET}`, mapped to the index of
+  // the connection that first claimed it. Two connections that serve the same
+  // tool for the same target (including two catch-alls) are an authoring
+  // mistake. A specific target beside a `null` catch-all for the same tool is
+  // not: the resolver prefers the specific one, so both keys differ and
+  // neither collides. Storing the owning index (not just membership) lets the
+  // message distinguish two connections colliding from one connection listing
+  // the same tool twice in its own `serves`.
+  const seenToolTargets = new Map<string, number>();
 
   for (const [index, connection] of charter.connections.entries()) {
     // A connection serving a tool that does not exist is dead policy: it
@@ -380,7 +418,7 @@ export const BusinessCharter = BusinessCharterShape.superRefine((charter, ctx) =
           path: ['connections', index, 'serves'],
           message: `unknown tool "${tool}"`,
         });
-      } else if (UNOWNED_TOOL_NAMES.has(tool)) {
+      } else if (isUnownedToolName(tool)) {
         // Known to the policy layer but reachable by no agent — a connection
         // serving it is exactly the dead-policy case above, by a different
         // route.
@@ -392,14 +430,16 @@ export const BusinessCharter = BusinessCharterShape.superRefine((charter, ctx) =
       }
 
       const targetKey = `${tool}\0${connection.target ?? CATCH_ALL_TARGET}`;
-      if (seenToolTargets.has(targetKey)) {
-        ctx.addIssue({
-          code: 'custom',
-          path: ['connections', index, 'serves'],
-          message: `another connection already serves "${tool}" for target ${connection.target === null ? '(catch-all)' : `"${connection.target}"`}`,
-        });
+      const targetDesc = connection.target === null ? '(catch-all)' : `"${connection.target}"`;
+      const owner = seenToolTargets.get(targetKey);
+      if (owner !== undefined) {
+        const message =
+          owner === index
+            ? `tool "${tool}" is listed twice in this connection's serves for target ${targetDesc}`
+            : `another connection already serves "${tool}" for target ${targetDesc}`;
+        ctx.addIssue({ code: 'custom', path: ['connections', index, 'serves'], message });
       } else {
-        seenToolTargets.add(targetKey);
+        seenToolTargets.set(targetKey, index);
       }
     }
 

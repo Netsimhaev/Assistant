@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { buildCharter } from '../test/fixtures.js';
 import { compileCharter } from './compile.js';
 import { verifyCharterSignature } from './sign.js';
-import { BusinessCharter, KNOWN_TOOL_NAMES, UNOWNED_TOOL_NAMES } from '../domain/charter.js';
+import {
+  BusinessCharter,
+  KNOWN_TOOL_NAMES,
+  UNOWNED_TOOL_NAMES,
+  matchesToolPattern,
+} from '../domain/charter.js';
 import { classifiedToolNames, READ_ONLY_TOOLS } from '../policy/classify.js';
 import { UNOWNED_TOOLS } from './capabilities.js';
 
@@ -276,6 +281,46 @@ describe('charter connections', () => {
 
   it('the unowned-tool list agrees with the capability layer', () => {
     expect([...UNOWNED_TOOL_NAMES].sort()).toEqual([...UNOWNED_TOOLS].sort());
+  });
+
+  it('matches unowned-tool patterns the same way the capability layer does', () => {
+    // UNOWNED_TOOLS entries are patterns read through `matchesPattern` in
+    // src/charter/capabilities.ts, where a trailing `*` is a prefix match.
+    // The three entries today are literal, so the string-equality invariant
+    // above would stay green even if this matching logic used plain
+    // `Set.has()` — this proves the wildcard semantics themselves are
+    // honoured, so a future wildcard entry (e.g. 'charter.*') cannot widen
+    // what `serves` accepts on this side without widening it on the other.
+    expect(matchesToolPattern('charter.apply_amendment', 'charter.*')).toBe(true);
+    expect(matchesToolPattern('charter.read', 'charter.*')).toBe(true);
+    expect(matchesToolPattern('crm.write', 'charter.*')).toBe(false);
+    expect(matchesToolPattern('contract.sign', 'contract.sign')).toBe(true);
+    expect(matchesToolPattern('contract.sign.v2', 'contract.sign')).toBe(false);
+  });
+
+  it('refuses a tool listed twice in the same connection with a message naming the mistake, not another connection', () => {
+    const charter = buildCharter();
+    const broken = {
+      ...charter,
+      connections: [
+        {
+          system: 'crm-a',
+          label: 'CRM א',
+          channel: 'api' as const,
+          serves: ['crm.write', 'crm.write'],
+          target: 'supplier_a',
+          subprocessor: null,
+        },
+      ],
+    };
+
+    const result = BusinessCharter.safeParse(broken);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find((i) => i.path.includes('serves'));
+      expect(issue?.message).toMatch(/listed twice in this connection/);
+      expect(issue?.message).not.toMatch(/another connection/);
+    }
   });
 });
 

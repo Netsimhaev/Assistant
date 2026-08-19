@@ -23,7 +23,7 @@ export type ActionClass =
   | 'contract.sign' | 'data.export' | 'memory.write_longterm' | 'charter.amend';
 
 export interface BusinessCharter {
-  schemaVersion: '1.0';
+  schemaVersion: '1.1';
   charterVersion: string;              // '2026-08-14.3'
   effectiveFrom: string;
   supersedes?: string;
@@ -91,6 +91,16 @@ export interface BusinessCharter {
     notes: string;                                          // נחשף לסוכני הניסוח
   }[];
 
+  // המערכות החיצוניות שהעסק מחובר אליהן, וכיצד. ברירת מחדל: מערך ריק.
+  connections: {
+    system: string;                                         // מזהה, למשל 'office-mail'
+    label: string;                                          // מה שבעל העסק קורא בתקנון בשפה פשוטה
+    channel: 'api' | 'browser';                              // ראה למטה — זה השדה הנושא משקל
+    serves: string[];                                        // שמות כלים פנימיים, למשל ['mail.send']
+    target: string | null;                                   // צד ספציפי, או null לכל היעדים
+    subprocessor: string | null;                             // מתווך שרואה את המטען; null = ישיר
+  }[];
+
   money: {
     currency: string;                                       // 'ILS'
     singleActionCeilingMinor: number;
@@ -121,6 +131,17 @@ export interface BusinessCharter {
   forbidden: string[];                                      // פרדיקטים קשיחים, לא ניתנים לעקיפה
 }
 ```
+
+### `connections` — מה שהעסק מחובר אליו כלפי חוץ
+
+`channel` הוא השדה הנושא משקל: "להשתמש בדפדפן כשאין API" היא החלטה על כמות הסמכות שניתנת, ולכן היא נחתמת כאן **לפי מערכת**, לא נקבעת בזמן ריצה — דף שכתב תוקף לא יכול לשכנע את המערכת לעבור לערוץ החזק יותר.
+
+שני דברים נבדקים **בזמן חתימה**, לא בזמן ריצה — מאותה סיבה שאזור זמן שלא נפתר נדחה בחתימה:
+
+- **כל שם כלי ב-`serves` חייב להיות מוכר ובעל בעלים.** שם שלא קיים ברשימת הכלים המסווגת הוא פרדיקט מת. שם שקיים אך לא בבעלות אף סוכן (`contract.sign`, `payment.charge`, `charter.apply_amendment`) הוא אותו מקרה בדיוק — נגיש בשם בלבד.
+- **`subprocessor`, אם אינו `null`, חייב להופיע ב-`data.subprocessorsAllowed`.** כל מתווך רואה את המטען, שהוא לרוב תכתובת לקוחות — תיווך שלא נחתם אסור.
+
+בנוסף: אין שני `system` זהים, ואין שתי חיבורים שמשרתים אותו כלי עבור אותו `target`. יעד ספציפי לצד יעד `null` (קליטה כללית) עבור אותו כלי כן מותר — הפותר מעדיף את הספציפי; הכלל הזה ייאכף כקוד בפועל רק כשהפותר (`resolveChannel`) ייבנה.
 
 ---
 
