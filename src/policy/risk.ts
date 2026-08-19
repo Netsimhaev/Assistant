@@ -8,7 +8,7 @@ import {
   SENSITIVE_MAX_TOTAL,
 } from '../domain/risk.js';
 import type { TrustLevel } from '../domain/trust.js';
-import { domainMatches, extractDomain } from '../util/address.js';
+import { extractDomain } from '../util/address.js';
 import { formatMinor } from '../util/money.js';
 
 /**
@@ -176,11 +176,17 @@ function scoreVisibility(
     (facts.counterpartyId !== null && known.entityIds.includes(facts.counterpartyId)) ||
     facts.counterpartyEmails.some((email) => {
       const domain = extractDomain(email);
-      // A subdomain of a known counterparty's domain is the same company,
-      // per domainMatches (src/util/address.ts) -- the same anchoring this
-      // module's do-not-contact and autonomy-override checks now share, so
-      // 'mail.partner.co.il' resolves exactly as 'partner.co.il' does.
-      return domain !== null && known.emailDomains.some((pattern) => domainMatches(domain, pattern));
+      // Exact match, deliberately not domainMatches (src/util/address.ts):
+      // "known" here LOOSENS the score -- it skips the first-contact
+      // escalation -- and a subdomain is not a company boundary a charter
+      // entry for the parent vouched for. 'promo.mail.acme.co.il' is not
+      // known just because 'acme.co.il' is; anyone can get a subdomain of
+      // a domain someone else owns, and a hosting platform's own domain
+      // makes that true for every one of its customers at once. See
+      // domainMatches's own docblock for why the two consumers of it that
+      // *tighten* a restriction are allowed the broader match and this one
+      // is not.
+      return domain !== null && known.emailDomains.includes(domain);
     }) ||
     facts.counterpartyPhones.some((phone) => known.phones.includes(phone)) ||
     facts.counterpartyTags.some((tag) => known.tags.includes(tag));

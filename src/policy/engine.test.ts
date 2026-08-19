@@ -599,6 +599,45 @@ describe('regressions found in review', () => {
     expect(decision.outcome).not.toBe('deny');
   });
 
+  it('blocks a do-not-contact domain even when the charter entry itself carries a trailing dot', async () => {
+    // Only the candidate side used to strip a trailing dot; the charter
+    // side did not. A charter entry written 'rival-legal.co.il.' and an
+    // inbound address of 'dana@rival-legal.co.il.' -- both carrying the
+    // identical trailing dot -- used to match by raw string equality, and
+    // stopped matching the moment only the inbound side started
+    // normalising it away: a deny that silently became an allow. Both
+    // sides now go through the same normaliseDomainString.
+    const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il.' });
+
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'dana@rival-legal.co.il.', inReplyTo: 'thread-1', body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('do_not_contact');
+  });
+
+  it('blocks a do-not-contact domain behind a doubled trailing dot', async () => {
+    // Stripping only one trailing dot would normalise
+    // 'rival-legal.co.il..' to 'rival-legal.co.il.', which still would not
+    // match a charter entry for 'rival-legal.co.il' -- the same bypass
+    // shape the single-dot fix closed, one character further out.
+    const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
+
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'dana@rival-legal.co.il..', inReplyTo: 'thread-1', body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('do_not_contact');
+  });
+
   it('does not score an unresolvable counterparty as one we know', async () => {
     const bundle = await install();
 

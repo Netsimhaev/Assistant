@@ -10,6 +10,7 @@ import type { AutonomyLevel } from '../domain/trust.js';
 import { assertExactlyOnePrincipal } from '../domain/charter.js';
 import { verifyCharterSignature } from './sign.js';
 import { AGENT_ALLOWLISTS, AGENT_DENYLISTS, COLLABORATION_GRAPH } from './capabilities.js';
+import { normaliseDomainString } from '../util/address.js';
 import { formatMinor } from '../util/money.js';
 import { renderPlainLanguage, renderPromptFragments } from './render.js';
 
@@ -103,8 +104,33 @@ function bucketMatches(
   return out;
 }
 
+/**
+ * Delegates to `normaliseDomainString` (`src/util/address.ts`) -- the exact
+ * function that normalises a candidate email's domain at runtime -- so a
+ * charter entry and an inbound address are always compared on the same
+ * string. Normalising only one side let a charter entry written
+ * `'rival.co.il.'` and an inbound `'dana@rival.co.il.'` stop matching each
+ * other the moment only the runtime side started stripping the trailing
+ * dot: a deny that silently became an allow.
+ *
+ * Throws rather than returning the raw input on a domain that does not
+ * normalise to anything: `CharterCounterparty.match.emailDomain`
+ * (`src/domain/charter.ts`) already refuses this shape with the same
+ * function at sign time, so reaching this branch means something built a
+ * `BusinessCharter` without going through that schema. Compiling it as if
+ * it named a domain would sign a rule that can never match, exactly the
+ * silent-forbidden-that-does-nothing failure this project refuses a bad
+ * timezone or an uncompilable redaction pattern to avoid.
+ */
 export function normaliseDomain(domain: string): string {
-  return domain.trim().toLowerCase().replace(/^@/, '');
+  const normalised = normaliseDomainString(domain);
+  if (normalised === null) {
+    throw new Error(
+      `emailDomain "${domain}" does not normalise to a usable domain -- this should have been ` +
+        'refused when the charter was signed',
+    );
+  }
+  return normalised;
 }
 
 function compileRules(charter: BusinessCharter): CompiledRule[] {

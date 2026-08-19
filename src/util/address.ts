@@ -68,20 +68,41 @@ export function extractAddressCandidate(fragment: string): string | null {
 }
 
 /**
- * The domain an address candidate names, normalised, or `null` when the
- * candidate does not have exactly one `@` or has no domain part.
+ * Normalise a bare domain string: drop a leading `@` someone typed by habit,
+ * strip *every* trailing `.`, lower-case. Returns `null` when nothing is
+ * left, which every caller must treat as "this is not a domain."
+ *
+ * The one normalisation both `extractDomain` (below, given a whole address
+ * candidate) and `normaliseDomain` (`src/charter/compile.ts`, given a
+ * charter's raw `emailDomain` field) go through. Normalising only the
+ * candidate side and leaving the charter side raw is the same class of bug
+ * as not sharing extraction at all: a charter entry written `'rival.co.il.'`
+ * stopped matching `'dana@rival.co.il.'` the moment only the inbound side
+ * started stripping the dot -- a deny that silently became an allow.
+ *
+ * Strips every trailing dot, not just one: `'rival.co.il..'` must not
+ * normalise to `'rival.co.il.'` and slip past a charter entry for
+ * `'rival.co.il'` by being one dot short of matching -- the same bypass
+ * shape the single-dot fix closed, one character further out.
+ */
+export function normaliseDomainString(domain: string): string | null {
+  const stripped = domain.trim().replace(/^@/, '').replace(/\.+$/, '');
+  return stripped.length > 0 ? stripped.toLowerCase() : null;
+}
+
+/**
+ * The domain an address candidate names, normalised via
+ * `normaliseDomainString` above, or `null` when the candidate does not have
+ * exactly one `@` or has no domain part.
  *
  * Shared by every consumer that keys a decision off a counterparty's email
  * domain — `matchDoNotContact` and the `byEmailDomain` autonomy override in
  * `src/policy/engine.ts`, and `knownCounterparties` in `src/policy/risk.ts`
  * — for the same reason `extractAddressCandidate` above is shared: a bare
  * `email.split('@')[1]` on a candidate this module deliberately never
- * shape-validates missed input that is legal but odd.
- * `'dana@rival.co.il.'` — a trailing root dot, which is legal DNS notation
- * and passes `EMAIL_SHAPE` in `mail.ts` — split to `'rival.co.il.'`, which
- * matched nothing in a charter naming `'rival.co.il'`, and the message was
- * delivered anyway. Stripping exactly one trailing `.` and lower-casing
- * here means every caller sees the same, comparable domain.
+ * shape-validates missed input that is legal but odd. See
+ * `normaliseDomainString`'s own docblock for the trailing-dot bypass this
+ * closed on both the candidate and the charter side together.
  *
  * Refuses (returns `null`) a candidate with zero or more than one `@`:
  * more than one is ambiguous about which part is actually the domain, and
@@ -95,8 +116,7 @@ export function extractDomain(candidate: string): string | null {
   const raw = parts[1];
   if (raw === undefined || raw.length === 0) return null;
 
-  const stripped = raw.endsWith('.') ? raw.slice(0, -1) : raw;
-  return stripped.length > 0 ? stripped.toLowerCase() : null;
+  return normaliseDomainString(raw);
 }
 
 /**
@@ -104,15 +124,28 @@ export function extractDomain(candidate: string): string | null {
  *
  * A charter entry of `'rival.co.il'` is a sentence an owner writes about a
  * company, not one hostname — `emailDomains.includes(domain)` (exact string
- * equality) never blocked `dana@mail.rival.co.il`, and the identical naive
- * comparison in the `byEmailDomain` autonomy override and
- * `knownCounterparties` let a subdomain skip a tightening ceiling too.
+ * equality) never blocked `dana@mail.rival.co.il`.
  *
  * Anchored on the label boundary with a leading dot, so the match is on a
  * whole domain label, not a text suffix: `'mail.rival.co.il'` matches
  * `'rival.co.il'`, but the lookalike `'evilrival.co.il'` does not, because
  * `'rival.co.il'` never follows a `.` inside it. A plain `.endsWith(pattern)`
  * without the dot would have matched the lookalike.
+ *
+ * **Use this only where a broader match makes the outcome MORE
+ * restrictive, never less.** `matchDoNotContact` and the `byEmailDomain`
+ * autonomy ceiling in `src/policy/engine.ts` both use it correctly: a
+ * subdomain matching means *more* gets blocked or its ceiling tightened,
+ * which is always safe to widen. `knownCounterparties` in
+ * `src/policy/risk.ts` must NOT use it: there, a match means *less*
+ * restriction -- it scores the sender as a known counterparty and skips the
+ * first-contact risk escalation -- and a DNS label boundary is not a
+ * company boundary an owner vouched for. A charter entry for
+ * `'acme.co.il'` says nothing about `'promo.mail.acme.co.il'`, and less
+ * than nothing when the parent domain is a hosting platform anyone can get
+ * a subdomain of. `knownCounterparties` compares with exact equality
+ * instead, on purpose. The next call site that reaches for this function
+ * should ask which direction its own match loosens before using it.
  */
 export function domainMatches(domain: string, pattern: string): boolean {
   return domain === pattern || domain.endsWith(`.${pattern}`);

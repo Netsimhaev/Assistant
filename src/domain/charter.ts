@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ActionClass } from './action.js';
 import { AutonomyLevel, TrustLevel } from './trust.js';
 import { CharterConnection } from './connection.js';
+import { normaliseDomainString } from '../util/address.js';
 
 export const Channel = z.enum([
   'email',
@@ -48,6 +49,19 @@ function isResolvableTimeZone(zone: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Rejects a `emailDomain` match key that `normaliseDomainString`
+ * (`src/util/address.ts`) -- the same function `matchDoNotContact` and the
+ * `byEmailDomain` autonomy ceiling run every inbound address through --
+ * cannot turn into a usable domain. A domain the gate cannot normalise is a
+ * do-not-contact or autonomy rule that compiles, appears in the signed
+ * document, and matches nothing at runtime: the quietest possible failure
+ * for a rule whose entire purpose is to be absolute.
+ */
+function isValidEmailDomain(domain: string): boolean {
+  return normaliseDomainString(domain) !== null;
 }
 
 /** Rejects a redaction pattern the engine could not compile. */
@@ -262,7 +276,10 @@ export const CharterCounterparty = z.object({
   match: z
     .object({
       entityId: z.string().optional(),
-      emailDomain: z.string().optional(),
+      emailDomain: z
+        .string()
+        .refine(isValidEmailDomain, 'not a domain the gate can normalise')
+        .optional(),
       phone: z.string().optional(),
       tag: z.string().optional(),
     })

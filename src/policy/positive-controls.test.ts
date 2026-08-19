@@ -266,4 +266,74 @@ describe('constants that must fail closed as the system grows', () => {
     // silently and permanently.
     expect(BusinessCharter.safeParse(broken).success).toBe(false);
   });
+
+  it('refuses to sign a counterparty emailDomain the gate cannot normalise', () => {
+    const charter = buildCharter({ doNotContactEmailDomain: 'rival-legal.co.il' });
+    const broken = {
+      ...charter,
+      counterparties: charter.counterparties.map((c) =>
+        c.match.emailDomain === 'rival-legal.co.il'
+          ? { ...c, match: { ...c.match, emailDomain: '.' } }
+          : c,
+      ),
+    };
+    // A domain that normalises to nothing would compile into doNotContact,
+    // appear in the signed document, and match no inbound address ever --
+    // exactly as silent a failure as an unresolvable timezone or an
+    // uncompilable redaction pattern above.
+    expect(BusinessCharter.safeParse(broken).success).toBe(false);
+  });
+});
+
+/**
+ * `domainMatches` (src/util/address.ts) is used in two directions from one
+ * function, and the safe direction depends on which one: broader matching
+ * that *tightens* a restriction (do-not-contact, the autonomy ceiling) is
+ * always safe to widen to a subdomain. Broader matching that *loosens* one
+ * (knownCounterparties, which skips the first-contact risk escalation) is
+ * not -- a DNS label boundary is not a company boundary an owner vouched
+ * for. Both assertions below exercise the identical subdomain shape against
+ * the two different consumers, so the whole lesson sits in one place: the
+ * same input must be treated oppositely depending on which way the match
+ * loosens or tightens.
+ */
+describe('broad domain matching widens what gets blocked, never what gets trusted', () => {
+  it('does not let a subdomain of a known counterparty skip the first-contact escalation', async () => {
+    const bundle = await installCharter(
+      buildCharter({ knownCounterpartyEmailDomain: 'acme.co.il' }),
+      { businessId: BUSINESS },
+    );
+
+    // A valid reply (auto_notify baseline) so risk alone -- not the action
+    // class -- decides allow vs. queue_approval. 'promo.mail.acme.co.il' is
+    // a subdomain of the known 'acme.co.il', but knownCounterparties matches
+    // exactly, so this must still be scored as an unresolved first contact.
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'dana@promo.mail.acme.co.il', inReplyTo: 't-1', body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('queue_approval');
+  });
+
+  it('still denies a subdomain of a do-not-contact domain', async () => {
+    const bundle = await installCharter(
+      buildCharter({ doNotContactEmailDomain: 'rival-legal.co.il' }),
+      { businessId: BUSINESS },
+    );
+
+    // The mirror image of the case above: matchDoNotContact widens to a
+    // subdomain on purpose, because blocking more is always the safe
+    // direction.
+    const decision = await evaluateToolCall(
+      'mail.send',
+      { to: 'dana@mail.rival-legal.co.il', inReplyTo: 't-1', body: 'שלום' },
+      ctx(bundle),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('do_not_contact');
+  });
 });

@@ -65,6 +65,8 @@ export interface CharterOverrides {
   doNotContactEntityId?: string;
   /** Adds a third counterparty blocked by email domain rather than by id. */
   doNotContactEmailDomain?: string;
+  /** Adds a counterparty known (not blocked) by email domain, for risk scoring. */
+  knownCounterpartyEmailDomain?: string;
   /** Connections the charter declares. Empty by default. */
   connections?: CharterConnection[];
 }
@@ -171,6 +173,18 @@ export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter 
               autonomyOverrides: {},
               doNotContact: true,
               notes: 'עורכי דין של הצד השני — כל פנייה עוברת דרך הבוס.',
+            },
+          ]),
+      ...(overrides.knownCounterpartyEmailDomain === undefined
+        ? []
+        : [
+            {
+              match: { emailDomain: overrides.knownCounterpartyEmailDomain },
+              label: 'שותף מוכר',
+              trust: 'known_counterparty' as const,
+              autonomyOverrides: {},
+              doNotContact: false,
+              notes: 'שותף עסקי קבוע.',
             },
           ]),
     ],
