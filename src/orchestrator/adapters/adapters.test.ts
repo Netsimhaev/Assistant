@@ -297,8 +297,13 @@ describe('CredentialHandle is branded, not just conventionally built', () => {
 });
 
 describe('credentials', () => {
-  it('resolves a ref to a value from the environment', async () => {
-    const source = envCredentials({ OFFICE_MAIL: 'secret-value' });
+  // A short, readable prefix for these tests, distinct from the real
+  // ASSISTANT_CREDENTIAL_ default — envCredentials takes prefix as an
+  // explicit override precisely so tests are not tied to the production one.
+  const P = 'TEST_CRED_';
+
+  it('resolves a ref to a value from the environment, under the prefix', async () => {
+    const source = envCredentials({ [`${P}OFFICE_MAIL`]: 'secret-value' }, P);
     const handle = await source.resolve('OFFICE_MAIL');
     expect(handle?.value).toBe('secret-value');
   });
@@ -306,17 +311,17 @@ describe('credentials', () => {
   it('returns null for a ref nothing defines, rather than an empty secret', async () => {
     // An empty credential would be attempted and fail at the far end; null
     // stops the step before it reaches an external system at all.
-    expect(await envCredentials({}).resolve('MISSING')).toBeNull();
+    expect(await envCredentials({}, P).resolve('MISSING')).toBeNull();
   });
 
   it('returns null for a ref that resolves to an empty string', async () => {
     // Distinct from "nothing defines it": an env var can be present but set
     // to '', and that must be refused exactly like an absent one.
-    expect(await envCredentials({ EMPTY: '' }).resolve('EMPTY')).toBeNull();
+    expect(await envCredentials({ [`${P}EMPTY`]: '' }, P).resolve('EMPTY')).toBeNull();
   });
 
   it('does not serialise the value when the handle is stringified', async () => {
-    const handle = await envCredentials({ K: 'secret-value' }).resolve('K');
+    const handle = await envCredentials({ [`${P}K`]: 'secret-value' }, P).resolve('K');
     expect(JSON.stringify(handle)).not.toContain('secret-value');
   });
 
@@ -325,9 +330,57 @@ describe('credentials', () => {
     // directly and never calls it, so this is a separate guard against a
     // separate path. envCredentials must go through createCredentialHandle
     // rather than a plain object literal for this to hold.
-    const handle = await envCredentials({ K: 'super-secret-value' }).resolve('K');
+    const handle = await envCredentials({ [`${P}K`]: 'super-secret-value' }, P).resolve('K');
     const serialised = canonicalJson({ credential: handle });
     expect(serialised).toContain('K');
     expect(serialised).not.toContain('super-secret-value');
+  });
+
+  describe('the ref namespace is separated from infrastructure env vars, not policed', () => {
+    it('cannot reach DATABASE_URL by name, even when the process actually defines it', async () => {
+      // A binding's credential_ref is attacker- or misconfiguration-reachable
+      // text. If the lookup were a bare env[ref], a ref of 'DATABASE_URL'
+      // would hand an infrastructure secret to an external adapter. Under
+      // the default prefix there is no ref that spells
+      // ASSISTANT_CREDENTIAL_DATABASE_URL by accident.
+      const env = {
+        DATABASE_URL: 'postgres://real-infra-secret',
+        ANTHROPIC_API_KEY: 'sk-real-infra-secret',
+      };
+      const source = envCredentials(env); // default prefix, not the test prefix
+      expect(await source.resolve('DATABASE_URL')).toBeNull();
+      expect(await source.resolve('ANTHROPIC_API_KEY')).toBeNull();
+    });
+
+    it('reaches only the prefixed form of the same name', async () => {
+      const env = { ASSISTANT_CREDENTIAL_DATABASE_URL: 'not-actually-infra' };
+      const handle = await envCredentials(env).resolve('DATABASE_URL');
+      expect(handle?.value).toBe('not-actually-infra');
+    });
+  });
+
+  describe('the lookup does not walk the prototype chain', () => {
+    it.each(['constructor', 'hasOwnProperty', 'isPrototypeOf', '__proto__', 'toString'])(
+      'returns null for ref %s against an injected {}',
+      async (ref) => {
+        expect(await envCredentials({}, P).resolve(ref)).toBeNull();
+      },
+    );
+
+    it.each(['constructor', 'hasOwnProperty', 'isPrototypeOf', '__proto__', 'toString'])(
+      'returns null for ref %s against the real process.env',
+      async (ref) => {
+        expect(await envCredentials(undefined, P).resolve(ref)).toBeNull();
+      },
+    );
+  });
+
+  it('is case-sensitive: a wrong-case ref yields null rather than matching loosely', async () => {
+    // process.env lookup is case-insensitive on Windows and case-sensitive on
+    // Linux; Object.hasOwn is case-sensitive on both, so this behaves the
+    // same in dev and in production rather than only failing in one of them.
+    const source = envCredentials({ [`${P}OFFICE_MAIL`]: 'secret-value' }, P);
+    expect(await source.resolve('office_mail')).toBeNull();
+    expect(await source.resolve('OFFICE_MAIL')).not.toBeNull();
   });
 });
