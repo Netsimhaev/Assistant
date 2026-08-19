@@ -48,6 +48,17 @@ export type StepOutcome =
  * The order is the whole point. Nothing performs a side effect that has not
  * passed `evaluateToolCall` first, and nothing that spent money returns without
  * the spend being written to the ledger.
+ *
+ * **A `deferred` outcome is not a bookmark.** Quiet hours and a retryable
+ * channel failure both move the job to `followup` with a `wakeAt`, and the
+ * scheduler later returns it to `execute` — but nothing here records which
+ * step was in flight, and no plan state is persisted anywhere. Whatever calls
+ * back in is starting over. `AdapterCall.idempotencyKey` is the only thing
+ * standing between a re-run and a duplicate at the far end, and it protects
+ * only against systems that honour such a key.
+ *
+ * Persisting step progress so a woken job resumes where it stopped is future
+ * work, stated here so a `deferred` return is not mistaken for one.
  */
 export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   const { job, bundle, toolName, toolInput } = request;

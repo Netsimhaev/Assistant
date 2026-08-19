@@ -17,6 +17,17 @@ export interface MailMessage {
  */
 export interface MailSendContext {
   /**
+   * `AdapterCall.endpoint`, forwarded unchanged: the SMTP host the binding
+   * points this connection at, or `null` for the transport's own default.
+   *
+   * Forwarded rather than consumed here because this adapter opens no
+   * connection — the transport does. It is on the context, not baked into
+   * `createMailAdapter`'s options, because the endpoint belongs to the
+   * *binding* and can be changed (and audited) without rebuilding the
+   * adapter, which is the whole point of `connection_bindings` holding it.
+   */
+  endpoint: string | null;
+  /**
    * The resolved per-connection secret (an SMTP password, an app token).
    * Every layer beneath this adapter — the binding's `credential_ref`, the
    * prefix namespace, the branded handle, the non-enumerable `value` — exists
@@ -156,7 +167,12 @@ export function createMailAdapter(options: MailAdapterOptions): ExternalAdapter 
       try {
         const sent = await options.transport.send(
           { to, subject, body },
-          { credential: call.credential, idempotencyKey: call.idempotencyKey, signal: call.signal },
+          {
+            endpoint: call.endpoint,
+            credential: call.credential,
+            idempotencyKey: call.idempotencyKey,
+            signal: call.signal,
+          },
         );
         return { ok: true, output: sent, externalId: sent.messageId };
       } catch (error) {

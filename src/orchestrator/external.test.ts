@@ -44,18 +44,24 @@ const CREDENTIALS = envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX);
  * browser driver as the browser channel's default. Nothing in this suite ever
  * opens a socket.
  */
-function recording(): { sent: MailMessage[]; registry: AdapterRegistry } {
+function recording(): {
+  sent: MailMessage[];
+  endpoints: (string | null)[];
+  registry: AdapterRegistry;
+} {
   const sent: MailMessage[] = [];
+  const endpoints: (string | null)[] = [];
   const adapter = createMailAdapter({
     system: 'office-mail',
     transport: {
-      async send(message) {
+      async send(message, context) {
         sent.push(message);
+        endpoints.push(context.endpoint);
         return { messageId: 'MSG-1' };
       },
     },
   });
-  return { sent, registry: new AdapterRegistry([adapter], [browserAdapter]) };
+  return { sent, endpoints, registry: new AdapterRegistry([adapter], [browserAdapter]) };
 }
 
 function mailPlan(): Plan {
@@ -122,8 +128,37 @@ describe('a plan reaches a real external system', () => {
     });
 
     expect(result.status).toBe('done');
+    if (result.status !== 'done') throw new Error('unreachable');
     expect(sent).toHaveLength(1);
     expect(sent[0]?.to).toEqual(['a@b.com']);
+    // The provider's handle on what was created. Without it `verify` has no
+    // way to ask the far end what actually happened.
+    expect(result.steps[0]?.externalId).toBe('MSG-1');
+  });
+
+  it('carries the binding endpoint through to the transport', async () => {
+    // `endpoint` is validated on write and audited as a trust-relocating
+    // change. Until it reached the transport, that audit entry described a
+    // field nothing read.
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+      businessId: BUSINESS,
+    });
+    const job = await jobInExecute(bundle);
+    const { endpoints, registry } = recording();
+
+    await runPlan({
+      job,
+      bundle,
+      plan: mailPlan(),
+      registry,
+      bindings: [{ ...LIVE, endpoint: 'smtp://mail.example.co.il:587' }],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(endpoints).toEqual(['smtp://mail.example.co.il:587']);
   });
 
   it('hands the adapter the redacted payload, not the one the plan proposed', async () => {
@@ -309,7 +344,7 @@ describe('a plan reaches a real external system', () => {
     expect(after?.wakeAt).not.toBeNull();
   });
 
-  it('refuses the step when the binding is not live, after the gate has run', async () => {
+  it('sleeps the step when the binding is not live, after the gate has run', async () => {
     const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
       businessId: BUSINESS,
     });
@@ -335,7 +370,13 @@ describe('a plan reaches a real external system', () => {
     // is on the record rather than having vanished with the plan.
     const history = await jobHistory(job.jobId);
     expect(history.some((h) => h.reason.includes('channel_unavailable'))).toBe(true);
-    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+
+    // A binding that is down is transient — it may be live again in five
+    // minutes — so the job sleeps to followup rather than failing terminally
+    // and throwing away work that nothing was wrong with.
+    const after = await loadJob(job.jobId, { businessId: BUSINESS });
+    expect(after?.phase).toBe('followup');
+    expect(after?.wakeAt).not.toBeNull();
   });
 
   it('refuses when the binding names a credential the source cannot resolve', async () => {
@@ -361,6 +402,128 @@ describe('a plan reaches a real external system', () => {
     if (result.status !== 'halted') throw new Error('unreachable');
     expect(result.reason).toBe('credential_unavailable');
     expect(sent).toEqual([]);
+  });
+});
+
+describe('only a step that goes somewhere needs a channel', () => {
+  it('runs a plan of purely local steps with no connections and an empty registry', async () => {
+    // `crm.read`, `memory.recall` and `escalate_to_human` reach nothing
+    // outside the instance. Demanding a signed connection for them rejected
+    // plans the planner's own catalogue says are valid.
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const job = await jobInExecute(bundle);
+
+    const result = await runPlan({
+      job,
+      bundle,
+      plan: Plan.parse({
+        goal: 'להבין את המצב לפני שעונים',
+        steps: [
+          { id: 's1', agent: 'ops.systems', intent: 'read', toolName: 'crm.read', input: { entityId: 'c_812' } },
+          {
+            id: 's2',
+            agent: 'ops.systems',
+            intent: 'recall',
+            toolName: 'memory.recall',
+            input: { query: 'c_812' },
+            dependsOn: ['s1'],
+          },
+        ],
+      }),
+      registry: new AdapterRegistry([]),
+      bindings: [],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(result.status).toBe('done');
+    if (result.status !== 'done') throw new Error('unreachable');
+    expect(result.steps.map((record) => record.stepId)).toEqual(['s1', 's2']);
+    // Nothing was created anywhere, so there is no external handle to record.
+    expect(result.steps.map((record) => record.externalId)).toEqual([null, null]);
+  });
+
+  it('still demands a channel for the outbound step in a mostly-local plan', async () => {
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const job = await jobInExecute(bundle);
+
+    const result = await runPlan({
+      job,
+      bundle,
+      plan: Plan.parse({
+        goal: 'לקרוא ואז לענות',
+        steps: [
+          { id: 's1', agent: 'ops.systems', intent: 'read', toolName: 'crm.read', input: {} },
+          {
+            id: 's2',
+            agent: 'comms.email',
+            intent: 'reply',
+            toolName: 'mail.send',
+            input: { to: 'a@b.com', inReplyTo: 'm1', subject: 'ש', body: 'ג' },
+            dependsOn: ['s1'],
+          },
+        ],
+      }),
+      registry: new AdapterRegistry([]),
+      bindings: [],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(result.status).toBe('rejected');
+    if (result.status !== 'rejected') throw new Error('unreachable');
+    expect(result.reason).toContain('s2');
+    expect(result.reason).toContain('no_channel_for_tool');
+  });
+});
+
+describe('the adapter deadline is enforced, not merely announced', () => {
+  it('sleeps the job when an adapter never answers', async () => {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+      businessId: BUSINESS,
+    });
+    const job = await jobInExecute(bundle);
+
+    // An adapter that ignores the AbortSignal entirely, which is the case the
+    // signal alone cannot handle: nothing cancels a promise from outside.
+    const hanging: ExternalAdapter = {
+      system: 'office-mail',
+      channel: 'api',
+      serves: ['mail.send'],
+      execute() {
+        return new Promise<AdapterResult>(() => {
+          /* never settles */
+        });
+      },
+    };
+
+    const result = await runPlan({
+      job,
+      bundle,
+      plan: mailPlan(),
+      registry: new AdapterRegistry([hanging]),
+      bindings: [LIVE],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+      adapterTimeoutMs: 25,
+    });
+
+    expect(result.status).toBe('halted');
+    if (result.status !== 'halted') throw new Error('unreachable');
+    expect(result.reason).toBe('deferred');
+
+    const after = await loadJob(job.jobId, { businessId: BUSINESS });
+    // Retryable: a call that timed out may or may not have landed, which is
+    // exactly what the idempotency key is for.
+    expect(after?.phase).toBe('followup');
+    const history = await jobHistory(job.jobId);
+    expect(history.some((h) => h.reason.includes('adapter_timeout'))).toBe(true);
   });
 });
 

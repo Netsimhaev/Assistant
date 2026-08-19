@@ -100,6 +100,18 @@ export interface AdapterCall {
   input: unknown;
   credential: CredentialHandle | null;
   /**
+   * `ConnectionBinding.endpoint` for the resolved system, or `null` when the
+   * binding names none and the adapter should use its own default.
+   *
+   * Required rather than optional. The field was validated on write and
+   * audited as a trust-relocating change — an endpoint points a permitted
+   * connection at a different host — and then read by nobody at execution,
+   * which made that audit entry a claim the code did not honour. Optional
+   * would let an adapter be written without ever noticing the field exists;
+   * required makes ignoring it a decision someone had to type.
+   */
+  endpoint: string | null;
+  /**
    * A key the caller generates once per attempt at the underlying business
    * action, stable across retries of that same attempt.
    *

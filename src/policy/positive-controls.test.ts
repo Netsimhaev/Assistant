@@ -5,9 +5,15 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { compileCharter } from '../charter/compile.js';
 import { BusinessCharter } from '../domain/charter.js';
-import { NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
+import { addresseeOf, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
 import { AGENT_ALLOWLISTS, isToolPermitted } from '../charter/capabilities.js';
-import { refineActionClass, READ_ONLY_TOOLS } from './classify.js';
+import {
+  classifyAction,
+  classifiedToolNames,
+  isOutbound,
+  refineActionClass,
+  READ_ONLY_TOOLS,
+} from './classify.js';
 import { evaluateToolCall, type GateContext } from './engine.js';
 import type { PolicyBundle } from '../domain/policy.js';
 
@@ -335,5 +341,49 @@ describe('broad domain matching widens what gets blocked, never what gets truste
     expect(decision.outcome).toBe('deny');
     if (decision.outcome !== 'deny') throw new Error('unreachable');
     expect(decision.code).toBe('do_not_contact');
+  });
+});
+
+describe('outbound is a positive list, and it is complete', () => {
+  it('every classified tool that reaches a person or a browser is outbound', () => {
+    // `OUTBOUND_TOOLS` drives redaction, quiet hours and the outbound kill
+    // switch. A tool missing from it is handed to an adapter with its payload
+    // untouched, at any hour, under an outbound stop. Two were missing —
+    // `calendar.write` and `credential.request_session` — and nothing said so,
+    // because the list was hand-maintained beside a separate hand-maintained
+    // mapping of who each class reaches.
+    //
+    // Derived from `addresseeOf` rather than restated, so a new tool whose
+    // class addresses a person cannot be added without landing here too.
+    // `internal` classes are deliberately NOT required to be outbound: they
+    // are the ones that write to the filesystem, to memory and to the charter.
+    // Several internal tools (crm.write, data.export) ARE outbound anyway,
+    // which this direction permits — it is a lower bound, not an equality.
+    const missing = classifiedToolNames().filter((tool) => {
+      const actionClass = classifyAction(tool);
+      if (actionClass === null) return false;
+      return addresseeOf(actionClass) !== 'internal' && !isOutbound(tool);
+    });
+
+    expect(missing, 'tools that reach a person or a browser but are not outbound').toEqual([]);
+  });
+
+  it('redacts the payload of a calendar invitation', async () => {
+    const bundle = await installCharter(buildCharter({ autonomyBase: { 'calendar.create': 'auto' } }), {
+      businessId: BUSINESS,
+    });
+
+    // The fixture charter redacts a bare nine-digit number. An invitation is
+    // delivered to attendees, so the description must not carry one out.
+    const decision = await evaluateToolCall(
+      'calendar.write',
+      { entityId: 'c_812', title: 'פגישה', description: 'ת.ז. 123456789' },
+      ctx(bundle, { agent: 'sched.meetings' }),
+    );
+
+    expect(decision.outcome).toBe('allow');
+    if (decision.outcome !== 'allow') throw new Error('unreachable');
+    const redacted = decision.redactedInput as { description: string };
+    expect(redacted.description).not.toContain('123456789');
   });
 });

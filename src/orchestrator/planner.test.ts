@@ -18,12 +18,16 @@ const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 /**
  * These tests are about plan validation and DAG ordering, not about channels.
- * One catch-all connection serving every tool they use keeps channel
+ * One catch-all connection serving the OUTBOUND tools they use keeps channel
  * resolution out of their way: without it every plan here would be rejected
  * for having no channel, and the assertions below would pass for a reason
  * that has nothing to do with what they are testing.
+ *
+ * `crm.read` is deliberately absent. It reaches nothing outside the instance,
+ * so it needs no connection — and having had to list it here to keep these
+ * tests green was the signal that the channel requirement was too wide.
  */
-const SERVED_TOOLS = ['mail.send', 'crm.write', 'crm.read'] as const;
+const SERVED_TOOLS = ['mail.send', 'crm.write'] as const;
 
 const OFFICE: CharterConnection = {
   system: 'office-suite',

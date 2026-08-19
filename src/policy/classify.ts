@@ -121,13 +121,30 @@ export function isKnownTool(toolName: string): boolean {
 /**
  * Whether a tool call causes something to leave the instance.
  *
- * Drives the `outbound` kill-switch scope and the data-sensitivity dimension.
+ * Drives four things, which is why a tool missing from here is expensive:
+ * the `outbound` kill-switch scope, the data-sensitivity dimension, whether
+ * `evaluateToolCall` applies quiet hours, and whether it redacts the payload
+ * at all — `redactedInput` is the untouched `toolInput` for a tool that is
+ * not on this list. Since `runPlan` now hands `redactedInput` to a real
+ * adapter, an omission here is a raw payload leaving the instance.
+ *
  * Browser navigation counts: it reaches a third-party host, and under an
  * outbound stop we do not want a session touching a supplier portal either.
+ *
+ * `positive-controls.test.ts` locks the invariant that every classified tool
+ * whose action class addresses a `person` or a `browser` is on this list. That
+ * is what caught `calendar.write` and `credential.request_session`, both of
+ * which sat in `TOOL_ACTION_CLASS` and not here — so a calendar invitation
+ * reached an attendee, and a session request reached a host, with neither
+ * redacted nor held out of quiet hours.
  */
 const OUTBOUND_TOOLS: ReadonlySet<string> = new Set([
   'mail.send',
   'wa.send_message',
+  // An invitation is delivered to attendees who are not the business.
+  'calendar.write',
+  // Opening an authenticated session reaches the host it is opened against.
+  'credential.request_session',
   'crm.write',
   'accounting.write',
   'browser.navigate',
