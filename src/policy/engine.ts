@@ -11,6 +11,7 @@ import { appendAudit } from '../audit/log.js';
 import { isToolPermitted } from '../charter/capabilities.js';
 import { activeCharterVersion } from '../charter/store.js';
 import { enqueueApproval } from '../governance/approvals.js';
+import { consumeApproval } from '../governance/consume.js';
 import { checkKillSwitch } from '../governance/killswitch.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import { checkBudget } from './budget.js';
@@ -33,6 +34,20 @@ export interface GateContext extends FactsContext {
   norms?: NormsLookup;
   /** Injectable clock. The quiet-hours check is the only time-dependent step. */
   now?: Date;
+  /**
+   * An approval a human already granted for THIS step.
+   *
+   * Supplied by the executor when it resumes a job that was parked on an
+   * approval. Without it the gate recomputes `needsApproval` and queues a
+   * second request, and the step never runs however many times it is approved.
+   */
+  approvalId?: string;
+  /**
+   * The step spending `approvalId`. The two travel together and neither is
+   * useful alone: the gate sees one tool call and has no step of its own, and
+   * `consumed_by_step` exists so the chain can be read back afterwards.
+   */
+  stepId?: string;
 }
 
 /**
@@ -239,6 +254,51 @@ export async function evaluateToolCall(
 
   if (risk.band === 'blocked') {
     return deny(`${DENY_CODES.riskBlocked}:${risk.actionId}`, risk.explanation);
+  }
+
+  // An approval a person already granted is spent here, before the gate asks
+  // for another one. Placed after the `blocked` check on purpose: an approval
+  // is permission to do something questionable, never permission to do
+  // something the charter forbids outright.
+  if (ctx.approvalId !== undefined) {
+    const spent = await consumeApproval({
+      approvalId: ctx.approvalId,
+      // An approval always belongs to a job. A context carrying an approval
+      // id and no job id cannot match any row, so it falls through and queues
+      // a fresh request — which is the safe direction for a malformed call.
+      jobId: ctx.jobId ?? '',
+      stepId: ctx.stepId ?? '',
+      liveInputHash: facts.inputHash,
+      businessId,
+      ...(ctx.db ? { db: ctx.db } : {}),
+    });
+
+    if (spent.ok) {
+      await appendAudit(
+        {
+          actor: ctx.agent,
+          kind: 'approval',
+          jobId: ctx.jobId ?? null,
+          envelopeId: ctx.envelopeId ?? null,
+          actionClass: facts.actionClass,
+          charterVersion: currentVersion,
+          provenance: facts.provenance,
+          inputHash: facts.inputHash,
+          risk,
+          reason: `approval_consumed:${ctx.approvalId} (intent seq ${intent.seq})`,
+        },
+        { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
+      );
+
+      return {
+        outcome: 'allow',
+        effectiveAutonomy: effective,
+        redactedInput: redactPayload(toolInput, ctx.bundle),
+      };
+    }
+    // Every failure code falls through to the normal path, which queues a
+    // fresh request. That is the correct answer to all of them: the human
+    // approved something, and it was not this.
   }
 
   const needsApproval =
