@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<meta charset="utf-8">
+<title>דוח מצב פרויקט</title>
+<style>
+  @page { size: A4; margin: 14mm 12mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", Arial, sans-serif; color: #1f2937; font-size: 11pt; line-height: 1.5; margin: 0; }
+  /* בהדפסה השוליים באים מ-@page; על המסך הם חייבים להיכתב במפורש, אחרת הטקסט נצמד לקצה */
+  @media screen { body { padding: 14mm 12mm; max-width: 210mm; } }
+  h1 { font-size: 20pt; margin: 0 0 2px; }
+  h2 { font-size: 13pt; margin: 22px 0 8px; padding-bottom: 4px; border-bottom: 2px solid #e5e7eb; }
+  .sub { color: #6b7280; font-size: 10pt; margin-bottom: 14px; }
+  .headline { background: #f9fafb; border-right: 4px solid #4b5563; padding: 10px 12px; margin: 12px 0 18px; }
+
+  /* סרגל השלבים */
+  .phases { display: flex; gap: 6px; margin: 10px 0 4px; }
+  .ph { flex: 1; padding: 8px 6px; border-radius: 5px; text-align: center; font-size: 9.5pt; border: 1px solid; }
+
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 4px; }
+  th { background: #f3f4f6; font-size: 9.5pt; text-align: right; padding: 7px 9px; border: 1px solid #e5e7eb; }
+  td { padding: 7px 9px; border: 1px solid #e5e7eb; vertical-align: top; font-size: 10pt; }
+  td.st { width: 92px; white-space: nowrap; font-weight: 600; }
+  .note { color: #6b7280; font-size: 9pt; }
+
+  /* שלושת המצבים — הצבע הוא המידע, ולכן גם הטקסט אומר אותו */
+  .green  { background: #d1fae5; border-color: #6ee7b7; color: #065f46; }
+  .yellow { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
+  .red    { background: #fee2e2; border-color: #fca5a5; color: #991b1b; }
+  .gray   { background: #f3f4f6; border-color: #d1d5db; color: #4b5563; }
+
+  .legend { display: flex; gap: 14px; font-size: 9pt; margin: 6px 0 0; }
+  .legend span { padding: 3px 8px; border-radius: 4px; border: 1px solid; }
+  ol, ul { margin: 6px 0; padding-inline-start: 20px; }
+  li { margin-bottom: 5px; }
+  tr, li { break-inside: avoid; }
+  h2 { break-after: avoid; }
+</style>
+
+<h1>דוח מצב פרויקט — <!--שם הפרויקט--></h1>
+<div class="sub"><!--תאריך--> · <!--שם השלב הנוכחי--></div>
+
+<div class="headline"><!--שורה אחת: איפה אנחנו, ומה חוסם את הסיום--></div>
+
+<div class="legend">
+  <span class="green">ירוק — הושלם ונבדק</span>
+  <span class="yellow">צהוב — בעבודה, הבדיקות טרם הושלמו</span>
+  <span class="red">אדום — טרם החל</span>
+</div>
+
+<h2>מפת השלבים</h2>
+<div class="phases">
+  <!-- תא לכל שלב, עם המחלקה המתאימה -->
+  <div class="ph yellow">שלב 0<br>עמוד שדרה</div>
+  <div class="ph red">שלב 1<br>עוזרת שמישה</div>
+</div>
+
+<h2>השלב הנוכחי — <!--שם--></h2>
+<p><!--שתי שורות: מה השלב הזה אמור להשיג, ומה תנאי היציאה ממנו--></p>
+<table>
+  <tr><th>משימה</th><th>מצב</th><th>הראיה</th></tr>
+  <tr><td>שם המשימה</td><td class="st green">הושלם</td><td class="note">מה מוכיח זאת</td></tr>
+</table>
+<p class="note"><!--כמה משימות נותרו לסיום השלב--></p>
+
+<h2>שאר השלבים</h2>
+<table>
+  <tr><th>שלב</th><th>מצב</th><th>מה חסר כדי להתחיל</th></tr>
+</table>
+
+<h2>משימות פתוחות — לפי סדר עדיפות</h2>
+<ol>
+  <li><b>כותרת המשימה</b> — למה עכשיו, ומה נחסם בלעדיה.</li>
+</ol>
+
+<h2>המלצות</h2>
+<ul>
+  <li>המלצה קונקרטית אחת בשורה.</li>
+</ul>

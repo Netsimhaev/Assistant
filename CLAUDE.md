@@ -229,6 +229,7 @@ npm run scheduler        # מעיר jobs רדומים ומפקיע אישורי�
 | [goodbad](.claude/skills/goodbad/SKILL.md) | הסבר בעברית פשוטה למי שאינו קורא קוד — מה נעשה, מה משתנה, ואז **יתרונות** ו**חסרונות** |
 | [agentsdkpro](.claude/skills/agentsdkpro/SKILL.md) | מצב חיבור ה-Agent SDK בפועל — מה מחובר, מול מה שרק מופיע ברשימות ההרשאה |
 | [simple](.claude/skills/simple/SKILL.md) | פירוק בעברית פשוטה של משהו שנאמר — מה נאמר, דוגמא להמחשה, וההשלכות. קורא בלבד, לא מבצע |
+| [projectpro](.claude/skills/projectpro/SKILL.md) | דוח מצב פרויקט ב-PDF — שלבים, מה הושלם (ירוק), מה בעבודה (צהוב), מה טרם החל (אדום), ומשימות פתוחות |
 
 ---
 
