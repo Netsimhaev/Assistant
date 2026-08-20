@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -119,6 +119,43 @@ describe('a step resumed from an approval', () => {
 
     expect(seen).toHaveLength(1);
     expect((seen[0] as { body: string }).body).toBe('נוסח ערוך');
+  });
+
+  // "The approval expired" must be a fresh question, never a failure: the
+  // work is still wanted and nothing about it went wrong. `expireOverdue`
+  // never touches a decided row, so this state — approved, unspent, past its
+  // expiry — is what a job that halted for a few hours leaves behind.
+  it('queues a fresh request instead of spending an expired approval', async () => {
+    const bundle = await install();
+    const job = await jobInExecute(bundle);
+    const approvalId = await parkOnApproval(bundle, job);
+    await applyDecision(approvalId, 'approved',
+      { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS });
+
+    await getPool().query(
+      `UPDATE approval_requests SET expires_at = now() - interval '1 hour'
+        WHERE approval_id = $1`,
+      [approvalId],
+    );
+
+    const resumed = await loadJob(job.jobId, { businessId: BUSINESS });
+    if (resumed === null) throw new Error('job vanished');
+
+    const outcome = await executeStep({
+      ...STRANGER, job: resumed, bundle, approvalId,
+      perform: async () => { throw new Error('perform must not run'); }, now: NOON,
+    });
+
+    expect(outcome.status).toBe('awaiting_approval');
+    if (outcome.status !== 'awaiting_approval') return;
+    expect(outcome.approvalId).not.toBe(approvalId);
+
+    // The expired one stays unspent — a claim that failed must not mark it.
+    const { rows } = await getPool().query<{ consumed_at: Date | null }>(
+      `SELECT consumed_at FROM approval_requests WHERE approval_id = $1`,
+      [approvalId],
+    );
+    expect(rows[0]?.consumed_at).toBeNull();
   });
 
   // `executeStep` is exported and takes `approvalId` from its caller, while

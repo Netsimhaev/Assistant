@@ -288,6 +288,10 @@ export async function evaluateToolCall(
       // a fresh request — which is the safe direction for a malformed call.
       jobId: ctx.jobId ?? '',
       stepId: ctx.approval.stepId,
+      // The tool the gate is judging, not one the caller named separately:
+      // an approval is permission for a specific action, and the tool is
+      // half of what makes it specific.
+      toolName: facts.toolName,
       liveInputHash: facts.inputHash,
       businessId,
       ...(ctx.db ? { db: ctx.db } : {}),

@@ -175,6 +175,16 @@ export async function getApproval(
  * Ordered oldest-first with `LIMIT 1` so that two rows which happened to match
  * — the same job re-proposing the identical input twice — cannot answer
  * differently across two runs of the same resume.
+ *
+ * Expired rows are excluded. `expireOverdue` only sweeps rows still in
+ * `pending`, so an approval that was granted and then stranded — the job
+ * halted, the run never came back — keeps `state = 'approved'` indefinitely.
+ * Without the `expires_at` predicate here, a re-plan long afterwards that
+ * happened to produce the same input hash would be handed a decision nobody
+ * remembers making. A step offered nothing simply queues a fresh request,
+ * which is the right outcome: the fuse ran out on the question, not on the
+ * work. `consumeApproval` re-checks the same predicate in its claim, because
+ * this answer can go stale between the two statements.
  */
 export async function unspentApprovalFor(
   query: { jobId: string; inputHash: string; businessId?: string; db?: Queryable },
@@ -185,6 +195,7 @@ export async function unspentApprovalFor(
       WHERE business_id = $1 AND job_id = $2 AND input_hash = $3
         AND state IN ('approved', 'approved_with_edit')
         AND consumed_at IS NULL
+        AND expires_at > now()
       ORDER BY created_at ASC
       LIMIT 1`,
     [query.businessId ?? config.businessId, query.jobId, query.inputHash],

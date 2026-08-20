@@ -5,7 +5,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { assessRisk } from '../policy/risk.js';
 import { canonicalHash } from '../util/canonical.js';
-import { decide, enqueueApproval } from './approvals.js';
+import { decide, enqueueApproval, unspentApprovalFor } from './approvals.js';
 import { consumeApproval } from './consume.js';
 
 import type { PolicyBundle, ActionFacts } from '../domain/policy.js';
@@ -149,7 +149,7 @@ describe('an approval is spent exactly once', () => {
   it('lets the step through when all four conditions hold', async () => {
     const approvalId = await approvedApproval('J-1', bundle);
     const out = await consumeApproval({
-      approvalId, jobId: 'J-1', stepId: 's1',
+      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
     });
     expect(out).toEqual({ ok: true });
@@ -158,7 +158,7 @@ describe('an approval is spent exactly once', () => {
   it('refuses the same approval a second time', async () => {
     const approvalId = await approvedApproval('J-1', bundle);
     const args = {
-      approvalId, jobId: 'J-1', stepId: 's1',
+      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
     };
     expect(await consumeApproval(args)).toEqual({ ok: true });
@@ -170,7 +170,7 @@ describe('an approval is spent exactly once', () => {
   it('refuses when the input changed after the approval', async () => {
     const approvalId = await approvedApproval('J-1', bundle);
     const out = await consumeApproval({
-      approvalId, jobId: 'J-1', stepId: 's1',
+      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
       liveInputHash: canonicalHash({ ...INPUT, body: 'משהו אחר' }),
       businessId: BUSINESS,
     });
@@ -180,7 +180,7 @@ describe('an approval is spent exactly once', () => {
   it('refuses an approval that belongs to another job', async () => {
     const approvalId = await approvedApproval('J-1', bundle);
     const out = await consumeApproval({
-      approvalId, jobId: 'J-2', stepId: 's1',
+      approvalId, jobId: 'J-2', stepId: 's1', toolName: 'mail.send',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
     });
     expect(out).toEqual({ ok: false, code: 'wrong_job' });
@@ -189,7 +189,7 @@ describe('an approval is spent exactly once', () => {
   it('refuses an approval nobody decided yet', async () => {
     const approvalId = await pendingApproval('J-1', bundle);
     const out = await consumeApproval({
-      approvalId, jobId: 'J-1', stepId: 's1',
+      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
     });
     expect(out).toEqual({ ok: false, code: 'not_approved' });
@@ -197,16 +197,73 @@ describe('an approval is spent exactly once', () => {
 
   it('refuses an approval id that does not exist', async () => {
     const out = await consumeApproval({
-      approvalId: 'A-nope', jobId: 'J-1', stepId: 's1',
+      approvalId: 'A-nope', jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
     });
     expect(out).toEqual({ ok: false, code: 'unknown_approval' });
   });
 
+  it('refuses an approval granted for a different tool', async () => {
+    const approvalId = await approvedApproval('J-1', bundle);
+    // Same job, same input, same everything the old claim compared — and a
+    // different tool. `proposed_tool` was stored on every approval from the
+    // start and matched against nothing.
+    const out = await consumeApproval({
+      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'whatsapp.send',
+      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
+    });
+    expect(out).toEqual({ ok: false, code: 'wrong_tool' });
+  });
+
+  it('refuses a decided approval whose fuse has since run out', async () => {
+    const approvalId = await approvedApproval('J-1', bundle);
+    // `expireOverdue` only sweeps rows still in `pending`, so nothing moves a
+    // DECIDED row out of `approved` when its expiry passes. Backdating the
+    // column is exactly the state a job that halted for four hours leaves
+    // behind.
+    await getPool().query(
+      `UPDATE approval_requests SET expires_at = now() - interval '1 hour'
+        WHERE approval_id = $1`,
+      [approvalId],
+    );
+
+    const out = await consumeApproval({
+      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
+      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
+    });
+    expect(out).toEqual({ ok: false, code: 'expired' });
+
+    // Still unspent: a refused claim must not mark the row as consumed.
+    const { rows } = await getPool().query<{ consumed_at: Date | null }>(
+      `SELECT consumed_at FROM approval_requests WHERE approval_id = $1`,
+      [approvalId],
+    );
+    expect(rows[0]?.consumed_at).toBeNull();
+  });
+
+  it('does not offer an expired approval to a step at all', async () => {
+    const approvalId = await approvedApproval('J-1', bundle);
+    expect(
+      await unspentApprovalFor({ jobId: 'J-1', inputHash: canonicalHash(INPUT), businessId: BUSINESS }),
+    ).toBe(approvalId);
+
+    await getPool().query(
+      `UPDATE approval_requests SET expires_at = now() - interval '1 hour'
+        WHERE approval_id = $1`,
+      [approvalId],
+    );
+
+    // Nothing to resume under, so the step queues a fresh request instead of
+    // spending a decision nobody remembers making.
+    expect(
+      await unspentApprovalFor({ jobId: 'J-1', inputHash: canonicalHash(INPUT), businessId: BUSINESS }),
+    ).toBeNull();
+  });
+
   it('lets exactly one of two concurrent attempts through', async () => {
     const approvalId = await approvedApproval('J-1', bundle);
     const args = {
-      approvalId, jobId: 'J-1', stepId: 's1',
+      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
     };
     const [a, b] = await Promise.all([
