@@ -20,6 +20,20 @@ import type { Job } from './jobs.js';
  */
 const RETRY_DELAY_MS = 5 * 60 * 1000;
 
+/**
+ * What one step produced: whatever the adapter returned, and the provider's
+ * handle on what it created.
+ *
+ * `externalId` is part of the contract rather than something the caller keeps
+ * on the side, because this function is what records the step as complete and
+ * the handle has to be written down with it — `verify` has no other way to ask
+ * the far end what actually happened after a resume.
+ */
+export interface StepEffect {
+  output: unknown;
+  externalId: string | null;
+}
+
 export interface StepRequest {
   job: Job;
   stepId: string;
@@ -28,16 +42,24 @@ export interface StepRequest {
   toolName: string;
   toolInput: Record<string, unknown>;
   /** Performs the actual side effect once the gate has permitted it. */
-  perform: (redactedInput: unknown) => Promise<unknown>;
+  perform: (redactedInput: unknown) => Promise<StepEffect>;
   /** Tags of the resolved counterparty; `[]` when nothing resolved them. */
   counterpartyTags: string[];
   /** Earned autonomy from the ramp; `draft_only` until a ramp exists. */
   rampLevel: AutonomyLevel;
+  /**
+   * The plan this step belongs to, when it belongs to one.
+   *
+   * Present, the step's completion is written down and a later run of the same
+   * plan skips it. Absent — a caller running a single step outside any stored
+   * plan — nothing is recorded, because there is no plan for a resume to walk.
+   */
+  planHash?: string;
   now?: Date;
 }
 
 export type StepOutcome =
-  | { status: 'done'; result: unknown; spendRecorded: boolean }
+  | { status: 'done'; result: unknown; spendRecorded: boolean; externalId: string | null }
   | { status: 'awaiting_approval'; approvalId: string }
   | { status: 'deferred'; code: string; wakeAt: string }
   | { status: 'refused'; code: string; reason: string };
@@ -49,16 +71,20 @@ export type StepOutcome =
  * passed `evaluateToolCall` first, and nothing that spent money returns without
  * the spend being written to the ledger.
  *
- * **A `deferred` outcome is not a bookmark.** Quiet hours and a retryable
- * channel failure both move the job to `followup` with a `wakeAt`, and the
- * scheduler later returns it to `execute` — but nothing here records which
- * step was in flight, and no plan state is persisted anywhere. Whatever calls
- * back in is starting over. `AdapterCall.idempotencyKey` is the only thing
- * standing between a re-run and a duplicate at the far end, and it protects
- * only against systems that honour such a key.
+ * **A `deferred` outcome is now a bookmark, for the steps before it.** Quiet
+ * hours and a retryable channel failure both move the job to `followup` with a
+ * `wakeAt`, and the scheduler later returns it to `execute`. A step that
+ * finished under a `planHash` has its completion written down — in the same
+ * transaction as the move to `verify` — so the run that comes back skips it
+ * instead of doing it again. The deferred step itself recorded nothing,
+ * correctly: it did not happen.
  *
- * Persisting step progress so a woken job resumes where it stopped is future
- * work, stated here so a `deferred` return is not mistaken for one.
+ * What that does not buy is exactly-once. A crash between the external call
+ * returning and the completion committing leaves the step done and unrecorded,
+ * and the resumed run repeats it; `recordStepCompletion` states the limit in
+ * full. `AdapterCall.idempotencyKey` is the only thing standing between that
+ * repeat and a duplicate at the far end, and it protects only against systems
+ * that honour such a key.
  */
 export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   const { job, bundle, toolName, toolInput } = request;
@@ -135,9 +161,9 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   // an adapter reporting `browser_not_implemented` was recorded as an order
   // placed and followed by a confirmation email. `perform` now throws on any
   // non-ok adapter result, and this is where that becomes an outcome.
-  let result: unknown;
+  let effect: StepEffect;
   try {
-    result = await request.perform(decision.redactedInput);
+    effect = await request.perform(decision.redactedInput);
   } catch (error) {
     // An adapter that throws must not escape past the outcome record: the
     // intent is already in the audit log and would otherwise have no ending.
@@ -170,14 +196,31 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
 
   const spendRecorded = await recordStepSpend(request);
 
+  // The completion rides inside this transition's transaction. Recording it
+  // afterwards would leave a window where the job has moved on and the step it
+  // moved past is unrecorded — which a resume reads as work still to do.
   await transition(job.jobId, {
     to: 'verify',
     actor: request.agent,
     reason: `${request.stepId} · ${toolName}`,
     businessId: job.businessId,
+    ...(request.planHash === undefined
+      ? {}
+      : {
+          completedStep: {
+            stepId: request.stepId,
+            planHash: request.planHash,
+            externalId: effect.externalId,
+          },
+        }),
   });
 
-  return { status: 'done', result, spendRecorded };
+  return {
+    status: 'done',
+    result: effect.output,
+    spendRecorded,
+    externalId: effect.externalId,
+  };
 }
 
 /**

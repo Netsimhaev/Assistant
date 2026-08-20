@@ -3,6 +3,7 @@ import { config } from '../config.js';
 import { JobPhase, canTransition, type JobActor } from '../domain/job.js';
 import type { TrustLevel } from '../domain/trust.js';
 import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { recordStepCompletion, type StepCompletion } from './plan-store.js';
 
 export interface Job {
   jobId: string;
@@ -89,6 +90,13 @@ export interface TransitionInput {
   envelopeId?: string | null;
   costMinor?: number | null;
   businessId?: string;
+  /**
+   * A plan step that finished and whose completion belongs with this move.
+   *
+   * Written inside this transaction rather than beside it — see the docblock
+   * below and `recordStepCompletion`.
+   */
+  completedStep?: StepCompletion;
 }
 
 /**
@@ -97,6 +105,13 @@ export interface TransitionInput {
  * The phase update and its `job_steps` row are one transaction. A phase that
  * advanced without a step row would be a job whose history has a hole in it,
  * and the history is the only thing that makes the run auditable afterwards.
+ *
+ * `completedStep` joins that same transaction for the same reason, one level
+ * up: a step's completion and the phase change that follows it must land
+ * together or not at all. Written separately, a crash between them leaves the
+ * job advanced past a step no row records, and the resumed run does that step
+ * again. What the transaction cannot cover is the external call itself, which
+ * already happened — `recordStepCompletion` says so in full.
  *
  * The read is `FOR UPDATE`, so two workers racing on the same job serialise
  * here rather than both reading `execute` and both deciding to advance.
@@ -148,6 +163,14 @@ export async function transition(
         input.reason,
       ],
     );
+
+    if (input.completedStep !== undefined) {
+      await recordStepCompletion(tx, {
+        ...input.completedStep,
+        jobId,
+        businessId,
+      });
+    }
 
     const row = updated.rows[0];
     if (!row) throw new Error(`job ${jobId} vanished mid-transition`);

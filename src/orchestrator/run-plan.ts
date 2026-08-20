@@ -10,8 +10,9 @@ import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
 import { loadBindings } from './bindings.js';
 import { deriveTargetId, resolveChannel } from './channels.js';
 import type { CredentialSource } from './credentials.js';
-import { executeStep, type StepOutcome } from './execute.js';
+import { executeStep, type StepEffect, type StepOutcome } from './execute.js';
 import { loadJob, transition } from './jobs.js';
+import { bindPlanToJob, completedSteps } from './plan-store.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { StepChannelError } from './step-error.js';
 import type { Job } from './jobs.js';
@@ -68,13 +69,23 @@ export interface StepRecord {
    *
    * Kept because `verify` has no other way to ask the far end what actually
    * happened: without it the adapter's own answer to "what did you create"
-   * was read and dropped on the floor.
+   * was read and dropped on the floor. It survives a deferral: a step skipped
+   * on resume reports the handle the run that actually did the work returned.
    */
   externalId: string | null;
+  /**
+   * True when an earlier run of this same plan already completed this step and
+   * this run did not re-run it.
+   *
+   * Reported rather than hidden: "the mail went out just now" and "the mail
+   * went out yesterday and we did not send it again" are different facts, and
+   * a caller deciding what to tell the owner needs to tell them apart.
+   */
+  skipped: boolean;
 }
 
 export type RunPlanResult =
-  | { status: 'rejected'; reason: string }
+  | { status: 'rejected'; code: string; reason: string }
   | { status: 'done'; steps: StepRecord[] }
   | { status: 'halted'; steps: StepRecord[]; at: string; reason: string };
 
@@ -91,32 +102,40 @@ export type RunPlanResult =
  * agent does not own would fail at that step, leaving the ones before it
  * already done; rejecting the plan is the cheaper failure by far.
  *
- * **A halted plan does not resume where it stopped, and nothing here pretends
- * otherwise.** Whatever ends the run — an approval to wait for, quiet hours, a
- * retryable channel failure — the job's phase is moved and this function
- * returns. Neither the plan nor the set of steps already completed is
- * persisted anywhere, so a job the scheduler wakes and hands back to `execute`
- * has no record of its own progress: calling `runPlan` again re-runs the plan
- * from the first step. For a step that already sent a message that is a
- * duplicate, and only `AdapterCall.idempotencyKey` — which the far end may or
- * may not honour — stands between it and a second one.
+ * **A halted plan resumes where it stopped.** Whatever ends the run — an
+ * approval to wait for, quiet hours, a retryable channel failure — the job's
+ * phase is moved and this function returns; the steps that had already
+ * finished are on record, each written in the same transaction as the phase
+ * change that followed it. A job the scheduler wakes and hands back here runs
+ * the same plan again, skips those steps, and picks up at the one that
+ * stopped. A skipped step is still reported, marked `skipped`.
  *
- * Persisting plan state and resuming mid-flight is real work that this plan
- * does not do. It is future work, named here so nobody reads the deferral
- * paths as though the loop were closed.
+ * The plan is bound to the job on the first run and cannot change afterwards.
+ * A second run offering a different plan is rejected with
+ * `plan_changed_mid_flight` and nothing executes: completed steps belong to
+ * the plan that produced them, and there is no correct automatic way to carry
+ * them onto a re-plan — least of all by matching step ids, which two unrelated
+ * plans may well share.
+ *
+ * Resumption is at-least-once. A crash between an adapter returning and the
+ * completion committing leaves the step done and unrecorded, and the resumed
+ * run does it again; `recordStepCompletion` (`plan-store.ts`) states that
+ * limit and why no transaction can remove it. `AdapterCall.idempotencyKey` is
+ * the only defence past that point, and only for a far end that honours it.
  */
 export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
   const { job, bundle, plan } = request;
 
   const problems = planProblems(plan);
   if (problems.length > 0) {
-    return { status: 'rejected', reason: describe(problems[0]!) };
+    return { status: 'rejected', code: 'malformed_plan', reason: describe(problems[0]!) };
   }
 
   for (const step of plan.steps) {
     if (!planStepIsFeasible(step.agent, step.toolName)) {
       return {
         status: 'rejected',
+        code: 'tool_not_allowlisted',
         reason: `step ${step.id}: ${step.agent} may not use ${step.toolName}`,
       };
     }
@@ -125,7 +144,11 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       // The planner's expectation is advisory, but a disagreement about what
       // an action *is* means the plan was reasoned about as something other
       // than what will happen. That is worth stopping for.
-      return { status: 'rejected', reason: `step ${step.id}: ${mismatch}` };
+      return {
+        status: 'rejected',
+        code: 'action_class_mismatch',
+        reason: `step ${step.id}: ${mismatch}`,
+      };
     }
 
     // A local step reaches nothing outside the instance and so has no channel
@@ -147,12 +170,14 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
     if (channel.status === 'no_channel') {
       return {
         status: 'rejected',
+        code: 'no_channel_for_tool',
         reason: `step ${step.id}: no_channel_for_tool — ${channel.reason}`,
       };
     }
     if (channel.status === 'ambiguous') {
       return {
         status: 'rejected',
+        code: 'ambiguous_channel',
         reason: `step ${step.id}: ambiguous_channel — ${channel.systems.join(', ')}`,
       };
     }
@@ -164,21 +189,47 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
     ) {
       return {
         status: 'rejected',
+        code: 'no_adapter_for_system',
         reason: `step ${step.id}: no_adapter_for_system — ${channel.system}`,
       };
     }
   }
 
+  // The plan is bound to the job before a single step runs, so that a re-plan
+  // is refused rather than half-applied on top of work already done.
+  const binding = await bindPlanToJob(job.jobId, plan, { businessId: job.businessId });
+  if (binding.status === 'conflict') {
+    return {
+      status: 'rejected',
+      code: 'plan_changed_mid_flight',
+      reason:
+        `job ${job.jobId} is already executing plan ${binding.storedHash.slice(0, 12)}; ` +
+        `${binding.offeredHash.slice(0, 12)} is a different plan and its steps cannot be ` +
+        'merged onto work that has already happened',
+    };
+  }
+  const planHash = binding.planHash;
+  const alreadyDone = await completedSteps(job.jobId, planHash, {
+    businessId: job.businessId,
+  });
+
   const records: StepRecord[] = [];
   let current = job;
 
   for (const step of topologicalOrder(plan)) {
-    // Captured out of the callback rather than threaded through
-    // `executeStep`, whose `perform` contract is deliberately just "a value or
-    // a throw". Safe only because this loop is strictly sequential — one
-    // `perform` is in flight at a time — which is an invariant this function
-    // already documents and depends on elsewhere.
-    let externalId: string | null = null;
+    if (alreadyDone.has(step.id)) {
+      // An earlier run of THIS plan finished this step. Re-running it would
+      // send the message a second time; the phase is left alone because
+      // nothing happened in this run to move it.
+      const externalId = alreadyDone.get(step.id) ?? null;
+      records.push({
+        stepId: step.id,
+        outcome: { status: 'done', result: null, spendRecorded: false, externalId },
+        externalId,
+        skipped: true,
+      });
+      continue;
+    }
 
     const outcome = await executeStep({
       job: current,
@@ -187,16 +238,18 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       bundle,
       toolName: step.toolName,
       toolInput: step.input,
-      perform: async (redacted) => {
-        const effect = await performStep(request, step, redacted);
-        externalId = effect.externalId;
-        return effect.output;
-      },
+      perform: async (redacted) => performStep(request, step, redacted),
       counterpartyTags: request.counterpartyTags,
       rampLevel: request.rampLevel,
+      planHash,
       ...(request.now !== undefined ? { now: request.now } : {}),
     });
-    records.push({ stepId: step.id, outcome, externalId });
+    records.push({
+      stepId: step.id,
+      outcome,
+      externalId: outcome.status === 'done' ? outcome.externalId : null,
+      skipped: false,
+    });
 
     if (outcome.status !== 'done') {
       // Anything other than `done` ends the run here: an approval to wait for,
@@ -243,12 +296,6 @@ export type RunPlanForJobRequest = Omit<RunPlanRequest, 'bindings'>;
 export async function runPlanForJob(request: RunPlanForJobRequest): Promise<RunPlanResult> {
   const bindings = await loadBindings({ businessId: request.job.businessId });
   return runPlan({ ...request, bindings });
-}
-
-/** What one step produced: the adapter's output, and its handle on it. */
-interface StepEffect {
-  output: unknown;
-  externalId: string | null;
 }
 
 /**

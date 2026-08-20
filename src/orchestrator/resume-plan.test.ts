@@ -1,0 +1,531 @@
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { closePool, getPool } from '../db/pool.js';
+import { resetDatabase } from '../test/db.js';
+import { buildCharter } from '../test/fixtures.js';
+import { installCharter } from '../charter/store.js';
+import { Plan } from '../domain/plan.js';
+import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
+import type { PolicyBundle } from '../domain/policy.js';
+import { createJob, loadJob, transition } from './jobs.js';
+import type { Job } from './jobs.js';
+import { AdapterRegistry } from './adapters/registry.js';
+import { createMailAdapter, type MailMessage } from './adapters/mail.js';
+import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
+import { envCredentials } from './credentials.js';
+import { applyDecision } from './resume.js';
+import { runPlan, type RunPlanResult } from './run-plan.js';
+
+const BUSINESS = 'test-business';
+/** 12:00 Asia/Jerusalem — outside the fixture's 20:00–07:00 quiet window. */
+const NOON = new Date('2026-08-18T09:00:00.000Z');
+/** 03:00 Asia/Jerusalem — inside it. */
+const NIGHT = new Date('2026-08-19T00:00:00.000Z');
+const PREFIX = 'TEST_CRED_';
+
+const MAIL_CONNECTION: CharterConnection = {
+  system: 'office-mail',
+  label: 'תיבת המשרד',
+  channel: 'api',
+  serves: ['mail.send'],
+  target: null,
+  subprocessor: null,
+};
+
+const WA_CONNECTION: CharterConnection = {
+  system: 'office-wa',
+  label: 'וואטסאפ המשרד',
+  channel: 'api',
+  serves: ['wa.send_message'],
+  target: null,
+  subprocessor: null,
+};
+
+const MAIL_LIVE: ConnectionBinding = {
+  system: 'office-mail',
+  status: 'live',
+  endpoint: null,
+  credentialRef: 'OFFICE_MAIL',
+  lastOkAt: null,
+  lastError: null,
+};
+
+const WA_LIVE: ConnectionBinding = {
+  system: 'office-wa',
+  status: 'live',
+  endpoint: null,
+  credentialRef: null,
+  lastOkAt: null,
+  lastError: null,
+};
+
+const CREDENTIALS = envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX);
+
+/**
+ * A recording mail transport plus a WhatsApp adapter whose availability the
+ * test controls. Nothing here opens a socket; the mail count is the side
+ * effect every assertion in this file is really about.
+ */
+function world(): {
+  sent: MailMessage[];
+  wa: { reachable: boolean; sent: unknown[] };
+  registry: AdapterRegistry;
+} {
+  const sent: MailMessage[] = [];
+  const wa = { reachable: false, sent: [] as unknown[] };
+
+  const mail = createMailAdapter({
+    system: 'office-mail',
+    transport: {
+      async send(message) {
+        sent.push(message);
+        return { messageId: `MSG-${sent.length}` };
+      },
+    },
+  });
+
+  const whatsapp: ExternalAdapter = {
+    system: 'office-wa',
+    channel: 'api',
+    serves: ['wa.send_message'],
+    async execute(call): Promise<AdapterResult> {
+      if (!wa.reachable) {
+        return {
+          ok: false,
+          retryable: true,
+          code: 'wa_unreachable',
+          message: 'הגשר אינו זמין כרגע',
+        };
+      }
+      wa.sent.push(call.input);
+      return { ok: true, output: null, externalId: 'WA-1' };
+    },
+  };
+
+  return { sent, wa, registry: new AdapterRegistry([mail, whatsapp]) };
+}
+
+/** A mail step followed by a WhatsApp step. `body` varies the plan's hash. */
+function twoStepPlan(body = 'שלום'): Plan {
+  return Plan.parse({
+    goal: 'לענות במייל ואז לעדכן בוואטסאפ',
+    steps: [
+      {
+        id: 's1',
+        agent: 'comms.email',
+        intent: 'reply',
+        toolName: 'mail.send',
+        input: { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812', subject: 'שלום', body },
+      },
+      {
+        id: 's2',
+        agent: 'comms.whatsapp',
+        intent: 'reply',
+        toolName: 'wa.send_message',
+        input: {
+          to: '+972500000000',
+          conversationId: 'w1',
+          counterpartyId: 'c_812',
+          body: 'עדכון קצר',
+        },
+        dependsOn: ['s1'],
+      },
+    ],
+  });
+}
+
+async function install(connections: CharterConnection[]): Promise<PolicyBundle> {
+  return installCharter(buildCharter({ connections }), { businessId: BUSINESS });
+}
+
+async function jobInExecute(bundle: PolicyBundle): Promise<Job> {
+  const job = await createJob({
+    charterVersion: bundle.charterVersion,
+    provenance: 'boss',
+    businessId: BUSINESS,
+  });
+  for (const to of ['understand', 'plan', 'execute'] as const) {
+    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+  }
+  return reload(job.jobId);
+}
+
+async function reload(jobId: string): Promise<Job> {
+  const loaded = await loadJob(jobId, { businessId: BUSINESS });
+  if (loaded === null) throw new Error('job vanished');
+  return loaded;
+}
+
+/** What the scheduler does to a job whose wake time has come. */
+async function wake(jobId: string): Promise<Job> {
+  await transition(jobId, {
+    to: 'execute',
+    actor: 'system',
+    reason: 'wake_at reached',
+    businessId: BUSINESS,
+  });
+  return reload(jobId);
+}
+
+function mailsTo(sent: MailMessage[], address: string): number {
+  return sent.filter((message) => message.to.includes(address)).length;
+}
+
+beforeEach(async () => {
+  await resetDatabase();
+});
+
+afterAll(async () => {
+  await closePool();
+});
+
+describe('a resumed plan does not re-run what already ran', () => {
+  it('sends the first step once across a quiet-hours deferral of the second', async () => {
+    const bundle = await install([MAIL_CONNECTION, WA_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { sent, wa, registry } = world();
+    const bindings = [MAIL_LIVE, WA_LIVE];
+    const run = (j: Job, now: Date): Promise<RunPlanResult> =>
+      runPlan({
+        job: j,
+        bundle,
+        plan: twoStepPlan(),
+        registry,
+        bindings,
+        credentials: CREDENTIALS,
+        counterpartyTags: [],
+        rampLevel: 'auto',
+        now,
+      });
+
+    // Run 1, in daylight: the mail goes out, the WhatsApp bridge is down and
+    // the failure is retryable, so the job sleeps.
+    const first = await run(job, NOON);
+    expect(first.status).toBe('halted');
+    expect(sent).toHaveLength(1);
+    expect((await reload(job.jobId)).phase).toBe('followup');
+
+    // Run 2, after the scheduler woke it, in daylight and with the bridge
+    // still down. Nothing stops the mail going out a second time except the
+    // record that says it already did.
+    const second = await run(await wake(job.jobId), NOON);
+    expect(sent).toHaveLength(1);
+    expect(second.status).toBe('halted');
+    if (second.status !== 'halted') throw new Error('unreachable');
+    expect(second.at).toBe('s2');
+    // The skipped step is still reported, and is distinguishable from one that ran.
+    expect(second.steps[0]?.stepId).toBe('s1');
+    expect(second.steps[0]?.skipped).toBe(true);
+
+    // Run 3, at 03:00: the second step is now held by quiet hours instead —
+    // a different deferral, and still no second mail.
+    const third = await run(await wake(job.jobId), NIGHT);
+    expect(sent).toHaveLength(1);
+    expect(third.status).toBe('halted');
+    if (third.status !== 'halted') throw new Error('unreachable');
+    expect(third.at).toBe('s2');
+    expect(third.reason).toBe('deferred');
+    expect(third.steps[0]?.skipped).toBe(true);
+    expect((await reload(job.jobId)).wakeAt).not.toBeNull();
+
+    // Run 4, in the morning, with the bridge back.
+    wa.reachable = true;
+    const fourth = await run(await wake(job.jobId), NOON);
+    expect(fourth.status).toBe('done');
+    if (fourth.status !== 'done') throw new Error('unreachable');
+    expect(fourth.steps.map((record) => record.skipped)).toEqual([true, false]);
+
+    // The whole point: one mail, four runs.
+    expect(sent).toHaveLength(1);
+    expect(wa.sent).toHaveLength(1);
+  });
+
+  it('sends the first step once across an approval on the second', async () => {
+    const bundle = await install([MAIL_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { sent, registry } = world();
+
+    // The second step is a first approach to a new address — `email.initiate`,
+    // which the charter puts at `approve_required`.
+    const plan = Plan.parse({
+      goal: 'לענות ואז לפנות ליועץ חדש',
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'reply',
+          toolName: 'mail.send',
+          input: { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812', subject: 'ש', body: 'ג' },
+        },
+        {
+          id: 's2',
+          agent: 'comms.email',
+          intent: 'initiate',
+          toolName: 'mail.send',
+          input: { to: 'new@example.com', subject: 'היכרות', body: 'שלום' },
+          dependsOn: ['s1'],
+        },
+      ],
+    });
+
+    const run = (j: Job): Promise<RunPlanResult> =>
+      runPlan({
+        job: j,
+        bundle,
+        plan,
+        registry,
+        bindings: [MAIL_LIVE],
+        credentials: CREDENTIALS,
+        counterpartyTags: [],
+        rampLevel: 'auto',
+        now: NOON,
+      });
+
+    const first = await run(job);
+    expect(first.status).toBe('halted');
+    if (first.status !== 'halted') throw new Error('unreachable');
+    expect(first.at).toBe('s2');
+    expect(mailsTo(sent, 'a@b.com')).toBe(1);
+
+    const approvalId = first.steps[1]?.outcome.status === 'awaiting_approval'
+      ? first.steps[1]!.outcome.approvalId
+      : null;
+    if (approvalId === null) throw new Error('expected s2 to queue an approval');
+
+    const decided = await applyDecision(
+      approvalId,
+      'approved',
+      { by: 'p_boss', channel: 'dashboard' },
+      { businessId: BUSINESS },
+    );
+    expect(decided.jobPhase).toBe('execute');
+
+    const second = await run(await reload(job.jobId));
+    if (second.status === 'rejected') throw new Error(`unexpected rejection: ${second.reason}`);
+    expect(second.steps[0]?.skipped).toBe(true);
+    // The reply the customer already had must not arrive a second time.
+    expect(mailsTo(sent, 'a@b.com')).toBe(1);
+  });
+
+  it('refuses a different plan for a job already mid-flight, and runs nothing', async () => {
+    const bundle = await install([MAIL_CONNECTION, WA_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { sent, wa, registry } = world();
+    const bindings = [MAIL_LIVE, WA_LIVE];
+
+    const first = await runPlan({
+      job,
+      bundle,
+      plan: twoStepPlan('שלום'),
+      registry,
+      bindings,
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+    expect(first.status).toBe('halted');
+    expect(sent).toHaveLength(1);
+
+    wa.reachable = true;
+    const replanned = await runPlan({
+      job: await wake(job.jobId),
+      bundle,
+      // Same step ids, different content: a re-plan, not a resume.
+      plan: twoStepPlan('נוסח אחר לגמרי'),
+      registry,
+      bindings,
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(replanned.status).toBe('rejected');
+    if (replanned.status !== 'rejected') throw new Error('unreachable');
+    expect(replanned.code).toBe('plan_changed_mid_flight');
+    // Nothing ran: not the step that was already done, and not the one that was not.
+    expect(sent).toHaveLength(1);
+    expect(wa.sent).toEqual([]);
+    expect((await reload(job.jobId)).phase).toBe('execute');
+  });
+
+  it('keeps the external id of a completed step across the resume', async () => {
+    const bundle = await install([MAIL_CONNECTION, WA_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { wa, registry } = world();
+    const bindings = [MAIL_LIVE, WA_LIVE];
+
+    const first = await runPlan({
+      job,
+      bundle,
+      plan: twoStepPlan(),
+      registry,
+      bindings,
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+    expect(first.status).toBe('halted');
+    if (first.status !== 'halted') throw new Error('unreachable');
+    expect(first.steps[0]?.externalId).toBe('MSG-1');
+
+    // Written down, not merely returned: `verify` reads it after the resume.
+    const { rows } = await getPool().query<{ step_id: string; external_id: string | null }>(
+      'SELECT step_id, external_id FROM job_step_results WHERE job_id = $1',
+      [job.jobId],
+    );
+    expect(rows).toEqual([{ step_id: 's1', external_id: 'MSG-1' }]);
+
+    wa.reachable = true;
+    const second = await runPlan({
+      job: await wake(job.jobId),
+      bundle,
+      plan: twoStepPlan(),
+      registry,
+      bindings,
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(second.status).toBe('done');
+    if (second.status !== 'done') throw new Error('unreachable');
+    expect(second.steps[0]?.skipped).toBe(true);
+    expect(second.steps[0]?.externalId).toBe('MSG-1');
+  });
+});
+
+describe('a completion belongs to one job and one plan', () => {
+  it('does not let one job skip another job’s step of the same id', async () => {
+    // The two jobs run the IDENTICAL plan — two requests that came out the
+    // same, which is ordinary. Identical means identical hashes, so the job is
+    // the only thing separating their completions; a lookup that forgot it
+    // would have the second job report the first one's work as its own and
+    // send nothing.
+    const bundle = await install([MAIL_CONNECTION, WA_CONNECTION]);
+    const { sent, registry } = world();
+    const bindings = [MAIL_LIVE, WA_LIVE];
+    const run = (job: Job): Promise<RunPlanResult> =>
+      runPlan({
+        job,
+        bundle,
+        plan: twoStepPlan(),
+        registry,
+        bindings,
+        credentials: CREDENTIALS,
+        counterpartyTags: [],
+        rampLevel: 'auto',
+        now: NOON,
+      });
+
+    await run(await jobInExecute(bundle));
+    expect(sent).toHaveLength(1);
+
+    await run(await jobInExecute(bundle));
+
+    // `s1` is done for the first job. That says nothing about the second one.
+    expect(sent).toHaveLength(2);
+  });
+
+  it('does not let a completion recorded under another plan hash cause a skip', async () => {
+    // The refusal in `bindPlanToJob` is the first barrier; the plan hash on the
+    // result row is the second, independent one. Written directly because that
+    // is the state the column exists to be safe against — a completion from a
+    // plan that is not the one now running.
+    const bundle = await install([MAIL_CONNECTION, WA_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { sent, registry } = world();
+
+    await getPool().query(
+      `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id)
+       VALUES ($1, $2, 'a-hash-from-some-other-plan', 's1', 'MSG-STALE')`,
+      [BUSINESS, job.jobId],
+    );
+
+    await runPlan({
+      job,
+      bundle,
+      plan: twoStepPlan(),
+      registry,
+      bindings: [MAIL_LIVE, WA_LIVE],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    // The stale row belongs to a different plan, so `s1` is still this plan's
+    // work to do.
+    expect(sent).toHaveLength(1);
+  });
+});
+
+describe('the completion and the transition it belongs to are one write', () => {
+  it('does not advance the phase when the completion cannot be recorded', async () => {
+    const bundle = await install([MAIL_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { sent, registry } = world();
+
+    // Force the failure the window would otherwise hide: the step's result
+    // cannot be written. If the completion were a second write after the
+    // transition, the job would already be in `verify` — recorded as having
+    // made progress it has no record of, and certain to re-run the step.
+    await getPool().query(`
+      CREATE FUNCTION refuse_step_result() RETURNS trigger AS $$
+      BEGIN RAISE EXCEPTION 'injected failure'; END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER refuse_step_result BEFORE INSERT ON job_step_results
+        FOR EACH ROW EXECUTE FUNCTION refuse_step_result();
+    `);
+
+    try {
+      await expect(
+        runPlan({
+          job,
+          bundle,
+          plan: Plan.parse({
+            goal: 'לענות ללקוח',
+            steps: [
+              {
+                id: 's1',
+                agent: 'comms.email',
+                intent: 'reply',
+                toolName: 'mail.send',
+                input: {
+                  to: 'a@b.com',
+                  inReplyTo: 'm1',
+                  counterpartyId: 'c_812',
+                  subject: 'ש',
+                  body: 'ג',
+                },
+              },
+            ],
+          }),
+          registry,
+          bindings: [MAIL_LIVE],
+          credentials: CREDENTIALS,
+          counterpartyTags: [],
+          rampLevel: 'auto',
+          now: NOON,
+        }),
+      ).rejects.toThrow(/injected failure/);
+
+      // The mail did go out — nothing can undo that, and the docblock on
+      // `recordStepCompletion` says so. What must not happen is the job
+      // claiming progress the results table does not carry.
+      expect(sent).toHaveLength(1);
+      expect((await reload(job.jobId)).phase).toBe('execute');
+      const { rows } = await getPool().query('SELECT 1 FROM job_step_results WHERE job_id = $1', [
+        job.jobId,
+      ]);
+      expect(rows).toHaveLength(0);
+    } finally {
+      await getPool().query(`
+        DROP TRIGGER refuse_step_result ON job_step_results;
+        DROP FUNCTION refuse_step_result();
+      `);
+    }
+  });
+});

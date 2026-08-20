@@ -10,6 +10,16 @@ import type { PolicyBundle } from '../domain/policy.js';
 import { createJob, dueJobs, jobHistory, loadJob, transition } from './jobs.js';
 import { executeStep } from './execute.js';
 
+/**
+ * What `perform` returns when a step produced nothing an adapter would hand
+ * back. The shape is `StepEffect`: the output, and the provider's handle on
+ * whatever was created — `executeStep` writes that handle down with the step's
+ * completion, which is what lets a resumed run skip the step instead of
+ * repeating it.
+ */
+const NOTHING = { output: null, externalId: null };
+
+
 const BUSINESS = 'test-business';
 
 /** 03:00 Asia/Jerusalem — inside the fixture's 22:00–07:00 quiet window. */
@@ -198,7 +208,7 @@ describe('quiet hours', () => {
       toolInput: { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812' },
       perform: async () => {
         performed = true;
-        return null;
+        return NOTHING;
       },
       now: NIGHT,
     });
@@ -275,7 +285,7 @@ describe('spend accounting', () => {
       rampLevel: 'auto' as const,
       toolName: 'quote.issue',
       toolInput: { counterpartyId: 'c_812', amountMinor: 120_000, inReplyTo: 'm1' },
-      perform: async () => ({ ok: true }),
+      perform: async () => ({ output: { ok: true }, externalId: null }),
       now: NOON,
     });
 
@@ -301,7 +311,7 @@ describe('spend accounting', () => {
       rampLevel: 'auto' as const,
       toolName: 'accounting.write',
       toolInput: { entityId: 'c_812', amountMinor: 50_000 },
-      perform: async () => ({ ok: true }),
+      perform: async () => ({ output: { ok: true }, externalId: null }),
       now: NOON,
     };
 
@@ -353,7 +363,7 @@ describe('spend accounting', () => {
       rampLevel: 'auto' as const,
       toolName: 'accounting.write',
       toolInput: { entityId: 'c_812', amountMinor: 45_000 },
-      perform: async () => null,
+      perform: async () => NOTHING,
       now: NOON,
     });
     expect(first.status).toBe('done');
@@ -374,7 +384,7 @@ describe('spend accounting', () => {
       rampLevel: 'auto' as const,
       toolName: 'accounting.write',
       toolInput: { entityId: 'c_812', amountMinor: 60_000 },
-      perform: async () => null,
+      perform: async () => NOTHING,
       now: NOON,
     });
 
@@ -399,7 +409,7 @@ describe('spend accounting', () => {
       toolInput: { counterpartyId: 'c_812', dataClasses: ['customer_pii'] },
       perform: async () => {
         performed = true;
-        return null;
+        return NOTHING;
       },
       now: NOON,
     });
@@ -425,7 +435,7 @@ describe('spend accounting', () => {
       toolInput: { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812', body: 'מספר 123456789' },
       perform: async (redacted) => {
         sent = redacted;
-        return null;
+        return NOTHING;
       },
       now: NOON,
     });

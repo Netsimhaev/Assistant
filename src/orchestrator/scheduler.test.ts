@@ -10,6 +10,16 @@ import { executeStep } from './execute.js';
 import { startScheduler, tick } from './scheduler.js';
 import { applyDecision } from './resume.js';
 
+/**
+ * What `perform` returns when a step produced nothing an adapter would hand
+ * back. The shape is `StepEffect`: the output, and the provider's handle on
+ * whatever was created — `executeStep` writes that handle down with the step's
+ * completion, which is what lets a resumed run skip the step instead of
+ * repeating it.
+ */
+const NOTHING = { output: null, externalId: null };
+
+
 const BUSINESS = 'test-business';
 /** 03:00 Asia/Jerusalem — inside the fixture's 22:00–07:00 quiet window. */
 const NIGHT = new Date('2026-08-18T00:00:00.000Z');
@@ -70,7 +80,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
       bundle,
       perform: async () => {
         sent += 1;
-        return null;
+        return NOTHING;
       },
       now: NIGHT,
     });
@@ -99,7 +109,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     const job = await jobInExecute(bundle);
     let sent = 0;
 
-    await executeStep({ ...STEP, job, bundle, perform: async () => { sent += 1; return null; }, now: NIGHT });
+    await executeStep({ ...STEP, job, bundle, perform: async () => { sent += 1; return NOTHING; }, now: NIGHT });
     await tick({ businessId: BUSINESS, now: NOON });
 
     const awake = await loadJob(job.jobId, { businessId: BUSINESS });
@@ -110,7 +120,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
       bundle,
       perform: async () => {
         sent += 1;
-        return null;
+        return NOTHING;
       },
       now: NOON,
     });
@@ -128,7 +138,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
       job,
       bundle,
       toolInput: { to: 'new@example.com', body: 'פנייה ראשונה' },
-      perform: async () => null,
+      perform: async () => NOTHING,
       now: NOON,
     });
     expect(queued.status).toBe('awaiting_approval');
@@ -159,7 +169,7 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
       job,
       bundle,
       toolInput: { to: 'new@example.com', body: 'פנייה' },
-      perform: async () => null,
+      perform: async () => NOTHING,
       now: NOON,
     });
     if (queued.status !== 'awaiting_approval') throw new Error('unreachable');
@@ -208,7 +218,7 @@ describe('a human decision restarts the job it was blocking', () => {
       job,
       bundle,
       toolInput: { to: 'new@example.com', body: 'פנייה ראשונה' },
-      perform: async () => null,
+      perform: async () => NOTHING,
       now: NOON,
     });
     if (queued.status !== 'awaiting_approval') throw new Error('unreachable');
@@ -235,7 +245,7 @@ describe('a human decision restarts the job it was blocking', () => {
       job,
       bundle,
       toolInput: { to: 'new@example.com', body: 'פנייה ראשונה' },
-      perform: async () => null,
+      perform: async () => NOTHING,
       now: NOON,
     });
     if (queued.status !== 'awaiting_approval') throw new Error('unreachable');
