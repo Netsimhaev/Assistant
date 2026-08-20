@@ -39,6 +39,7 @@ function readSecret(promptText: string): Promise<string> {
       };
       const onError = (err: Error): void => {
         stdin.removeListener('data', onData);
+        stdin.removeListener('error', onError);
         stdin.pause();
         reject(err);
       };
