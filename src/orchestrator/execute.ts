@@ -4,6 +4,7 @@ import { isMoneyBearing } from '../domain/action.js';
 import type { AutonomyLevel } from '../domain/trust.js';
 import { classifyAction, refineActionClass } from '../policy/classify.js';
 import { evaluateToolCall } from '../policy/engine.js';
+import { getApproval } from '../governance/approvals.js';
 import { recordSpend } from '../policy/budget.js';
 import { canonicalHash } from '../util/canonical.js';
 import { transition } from './jobs.js';
@@ -56,6 +57,14 @@ export interface StepRequest {
    */
   planHash?: string;
   now?: Date;
+  /**
+   * The approval this step is resuming under, when it is resuming under one.
+   *
+   * The executor, not the gate, is what knows a run came back from a human
+   * decision — the gate sees one tool call and has no memory of the job's
+   * history.
+   */
+  approvalId?: string;
 }
 
 export type StepOutcome =
@@ -79,12 +88,21 @@ export type StepOutcome =
  * instead of doing it again. The deferred step itself recorded nothing,
  * correctly: it did not happen.
  *
- * **`awaiting_approval` is not a bookmark in that sense.** The steps before it
- * resume as above, but this step will not: `evaluateToolCall` never consults
- * an approval already granted, so a re-run recomputes `needsApproval` and
- * enqueues a second request. A human can approve as many times as they like
- * and the step still will not run. Spending an existing approval — TOCTOU hash
- * check included — is work the gate has not been taught yet.
+ * **`awaiting_approval` IS a bookmark now, the same as `deferred`.** A caller
+ * resuming a step passes back `request.approvalId`, and it travels into the
+ * gate as `GateContext.approval` — `stepId` riding alongside it so
+ * `consumed_by_step` names who spent it. `evaluateToolCall` then spends the
+ * approval itself (TOCTOU hash check included) instead of recomputing
+ * `needsApproval` and enqueueing a second request. A spent approval stays
+ * spent even if the step goes on to fail: the claim is a single conditional
+ * UPDATE with nothing to undo it, so a retry after a failed `perform` queues a
+ * *fresh* approval request rather than trying to reuse the one already spent.
+ *
+ * On an approval-with-edit, the boss changed the action on the card and
+ * `decide` re-bound the approval's hash to that edited input — so this
+ * function substitutes `approval.editedInput` for `request.toolInput`
+ * *before* the gate ever sees it, both for the hash check to match and so the
+ * thing that runs is the thing that was actually approved.
  *
  * What that does not buy is exactly-once. A crash between the external call
  * returning and the completion committing leaves the step done and unrecorded,
@@ -94,7 +112,7 @@ export type StepOutcome =
  * that honour such a key.
  */
 export async function executeStep(request: StepRequest): Promise<StepOutcome> {
-  const { job, bundle, toolName, toolInput } = request;
+  const { job, bundle, toolName } = request;
   const now = request.now ?? new Date();
 
   // The phase is checked BEFORE the side effect, not after it.
@@ -112,7 +130,19 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     };
   }
 
-  const decision = await evaluateToolCall(toolName, toolInput, {
+  // What runs is what was approved. On an approval-with-edit the boss changed
+  // the action on the card, `decide` re-bound the approval's hash to that
+  // edited input, and running the original would both do the wrong thing and
+  // fail the gate's hash check — which is exactly how this was found.
+  let effectiveInput = request.toolInput;
+  if (request.approvalId !== undefined) {
+    const approval = await getApproval(request.approvalId, { businessId: job.businessId });
+    if (approval?.state === 'approved_with_edit' && approval.editedInput !== null) {
+      effectiveInput = approval.editedInput as Record<string, unknown>;
+    }
+  }
+
+  const decision = await evaluateToolCall(toolName, effectiveInput, {
     agent: request.agent,
     bundle,
     provenance: job.provenance,
@@ -122,6 +152,9 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     counterpartyTags: request.counterpartyTags,
     rampLevel: request.rampLevel,
     now,
+    ...(request.approvalId !== undefined
+      ? { approval: { approvalId: request.approvalId, stepId: request.stepId } }
+      : {}),
   });
 
   if (decision.outcome === 'queue_approval') {
@@ -228,7 +261,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     return { status: 'refused', code, reason: message };
   }
 
-  const spendRecorded = await recordStepSpend(request);
+  const spendRecorded = await recordStepSpend(request, effectiveInput);
 
   // The completion rides inside this transition's transaction. Recording it
   // afterwards would leave a window where the job has moved on and the step it
@@ -269,13 +302,16 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
  * The idempotency key is (jobId, stepId, canonical input hash), so a retry
  * after an uncertain timeout cannot count the same purchase twice.
  */
-async function recordStepSpend(request: StepRequest): Promise<boolean> {
+async function recordStepSpend(
+  request: StepRequest,
+  effectiveInput: Record<string, unknown>,
+): Promise<boolean> {
   const base = classifyAction(request.toolName);
   if (base === null) return false;
 
-  const actionClass = refineActionClass(base, request.toolInput);
+  const actionClass = refineActionClass(base, effectiveInput);
 
-  const amountMinor = request.toolInput['amountMinor'];
+  const amountMinor = effectiveInput['amountMinor'];
   if (typeof amountMinor !== 'number' || amountMinor <= 0) return false;
 
   // One predicate for both halves of the accounting. The ledger used to record
@@ -294,7 +330,7 @@ async function recordStepSpend(request: StepRequest): Promise<boolean> {
       idempotencyKey: canonicalHash({
         jobId: request.job.jobId,
         stepId: request.stepId,
-        input: request.toolInput,
+        input: effectiveInput,
       }),
     },
     { businessId: request.job.businessId },
