@@ -19,6 +19,19 @@ export interface FactsContext {
    * different statement from never having looked.
    */
   counterpartyTags: string[];
+  /**
+   * Set this only when `provenance` above was reduced over the causal chain
+   * of the action about to run — see `ActionFacts.provenanceChainDerived`
+   * (`src/domain/policy.ts`) for the three things a caller must be able to
+   * guarantee before writing `true`.
+   *
+   * Optional, and absence means `false`. Unlike `counterpartyTags` — where an
+   * omission produced a silently *empty* value that disabled controls — an
+   * omission here produces the strict answer: the first-contact escalation
+   * stays on. There is nothing to be gained by forcing seventy call sites to
+   * write down the same `false` that not writing it already means.
+   */
+  provenanceChainDerived?: boolean;
 }
 
 /**
@@ -48,6 +61,9 @@ export function buildFacts(
     counterpartyTags: ctx.counterpartyTags,
     provenance: ctx.provenance,
     chainDepth: ctx.chainDepth,
+    // `?? false` and not `?? true`: an absent signal is a caller that never
+    // computed one, and the exemption it feeds must read that as "no".
+    provenanceChainDerived: ctx.provenanceChainDerived ?? false,
     dataClasses: readDataClasses(input),
     leavesInstance: isOutbound(toolName),
     supplierId: readString(input, 'supplierId'),

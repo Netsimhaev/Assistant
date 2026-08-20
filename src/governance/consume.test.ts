@@ -92,6 +92,7 @@ function factsFor(input: unknown): ActionFacts {
     actionClass: 'email.initiate',
     provenance: 'boss',
     chainDepth: 0,
+    provenanceChainDerived: false,
     inputHash: canonicalHash(input),
     amountMinor: 0,
     amountDeclared: false,

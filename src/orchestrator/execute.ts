@@ -145,6 +145,16 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   const decision = await evaluateToolCall(toolName, effectiveInput, {
     agent: request.agent,
     bundle,
+    // The job's stamp, inherited by every step — which is precisely why
+    // `provenanceChainDerived` is NOT set here. A `PlanStep` carries no
+    // provenance of its own, so nothing reduces the trust of the content an
+    // earlier step read into the level this step is judged by: a job the boss
+    // started reaches the gate as `boss` even when injected content chose the
+    // recipient. Setting the signal here would be a claim this executor cannot
+    // honour, and the first-contact exemption it feeds stays off until a
+    // caller can (see `ActionFacts.provenanceChainDerived`). `chainDepth` is
+    // hardcoded for the same reason and is deliberately not used as a
+    // discriminator anywhere.
     provenance: job.provenance,
     chainDepth: 0,
     businessId: job.businessId,

@@ -43,6 +43,33 @@ export const ActionFacts = z.object({
   /** Trust of the least-trusted link in this job's causal chain. */
   provenance: TrustLevel,
   chainDepth: z.number().int().nonnegative(),
+  /**
+   * Whether `provenance` was computed for THIS action's own causal chain.
+   *
+   * Required, never defaulted, and read by exactly one control: the
+   * first-contact exemption in `src/policy/risk.ts`. That exemption says an
+   * instruction from the boss IS the approval, which is only true when the
+   * `boss` on this fact object describes the chain that chose *this*
+   * recipient — not merely the chain that started the job.
+   *
+   * A caller may set this to `true` only if it can guarantee all of:
+   *
+   *   1. `provenance` is `lowestTrust` (`src/domain/trust.ts`) over every
+   *      link in the causal chain of this specific action, and
+   *   2. that chain includes any content read by earlier steps whose output
+   *      fed this step's input — an inbound email whose body supplied the
+   *      address contributes `unknown_external` to the reduction, and
+   *   3. the reduction was recomputed for this action rather than inherited
+   *      from a value stamped once on the job.
+   *
+   * `false` means "nobody computed this", which is the only safe reading of
+   * an unset signal: the exemption stays off and the first contact escalates
+   * to a human. Nothing in the system sets it to `true` today — no gateway
+   * stamps provenance onto inbound content yet, so no caller can honestly
+   * make the guarantee. The exemption is therefore currently unreachable by
+   * construction, which is the intended state until that wiring exists.
+   */
+  provenanceChainDerived: z.boolean(),
   dataClasses: z.array(DataClass),
   /** True when the payload would leave the instance (an outbound send). */
   leavesInstance: z.boolean(),

@@ -406,12 +406,13 @@ describe('outbound is a positive list, and it is complete', () => {
  * (which exercises the boss/staff/unknown_external distinction in isolation);
  * this one exists to pin the exempt set's *width* against the whole enum.
  */
-function firstContactFacts(provenance: TrustLevel): ActionFacts {
+function firstContactFacts(provenance: TrustLevel, chainDerived: boolean): ActionFacts {
   return {
     toolName: 'mail.send',
     actionClass: 'email.initiate',
     provenance,
     chainDepth: 0,
+    provenanceChainDerived: chainDerived,
     inputHash: 'h',
     amountMinor: 0,
     amountDeclared: false,
@@ -426,7 +427,7 @@ function firstContactFacts(provenance: TrustLevel): ActionFacts {
   };
 }
 
-describe('the first-contact exemption stays exactly {boss}', () => {
+describe('the first-contact exemption stays exactly {boss}, and only when derived', () => {
   it('scores boss as routine and every other TrustLevel as sensitive', async () => {
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
 
@@ -444,9 +445,26 @@ describe('the first-contact exemption stays exactly {boss}', () => {
     // it deliberately in risk.ts. Listing today's non-exempt levels by hand
     // would silently stop covering a level that does not exist yet.
     for (const level of TrustLevel.options) {
-      const risk = await assessRisk(firstContactFacts(level), bundle);
+      const risk = await assessRisk(firstContactFacts(level, true), bundle);
       const expected = level === 'boss' ? 'routine' : 'sensitive';
       expect(risk.band, `provenance=${level}`).toBe(expected);
+    }
+  });
+
+  it('scores EVERY TrustLevel as sensitive when nobody derived the provenance', async () => {
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+
+    // The other half of the same invariant, and the half that holds the
+    // safety argument up. Membership of FIRST_CONTACT_EXEMPT is a necessary
+    // condition, never a sufficient one: without `provenanceChainDerived`,
+    // the level on the fact object is whatever was stamped on the job, and
+    // a job the boss started can reach a recipient that injected content
+    // chose. Every level must escalate here, boss included -- so widening
+    // the set cannot on its own reopen the path, and dropping the
+    // precondition cannot pass unnoticed.
+    for (const level of TrustLevel.options) {
+      const risk = await assessRisk(firstContactFacts(level, false), bundle);
+      expect(risk.band, `provenance=${level}, not chain-derived`).toBe('sensitive');
     }
   });
 });

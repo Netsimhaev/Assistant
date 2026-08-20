@@ -56,6 +56,7 @@ function factsFixture(proposedInput: unknown, overrides: Partial<ActionFacts> = 
     counterpartyTags: [],
     provenance: 'boss',
     chainDepth: 0,
+    provenanceChainDerived: false,
     dataClasses: [],
     leavesInstance: true,
     supplierId: null,

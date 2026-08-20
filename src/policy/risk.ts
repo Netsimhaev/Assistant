@@ -218,11 +218,28 @@ function scoreSensitivity(facts: ActionFacts): RiskDimensions['dataSensitivity']
  * the enum later stays inside the escalation until someone decides otherwise
  * in this file, which is the safe direction to be wrong in.
  *
- * `provenance` is the LEAST trusted link in the causal chain, not whoever
- * spoke first — which is what makes this narrow. "Send a quote to
+ * The set alone is not the control. `provenance` is supposed to be the LEAST
+ * trusted link in the causal chain, not whoever spoke first — that is what
+ * makes the exemption narrow enough to be safe. "Send a quote to
  * dana@newcompany.co.il" carries `boss` and goes. "Read this email and reply
- * to the sender" carries the inbound email's level and still escalates: the
- * boss gave a generic instruction and someone else chose the address.
+ * to the sender" is supposed to carry the inbound email's level and still
+ * escalate: the boss gave a generic instruction and someone else chose the
+ * address.
+ *
+ * Nothing about a `TrustLevel` value proves which of those two it came from.
+ * Provenance is stamped once per job today and inherited by every step, so a
+ * `boss` on a step whose recipient was chosen by content read three steps
+ * earlier is indistinguishable from a `boss` the owner typed — and lifting
+ * the escalation for the first case removes the human checkpoint from exactly
+ * the prompt-injection path this system exists to stop.
+ *
+ * So the exemption is gated on `facts.provenanceChainDerived`, an explicit
+ * claim by the caller that the value in `provenance` was reduced over THIS
+ * action's chain (see that field's docblock in `src/domain/policy.ts` for
+ * what a caller must guarantee before setting it). Absent, the escalation
+ * runs. Nothing sets it today, so the exemption does not currently fire at
+ * all — that is the intended state, not an oversight: the safety argument is
+ * held by a predicate rather than by the absence of a caller.
  */
 const FIRST_CONTACT_EXEMPT: ReadonlySet<TrustLevel> = new Set<TrustLevel>(['boss']);
 
@@ -231,12 +248,15 @@ const FIRST_CONTACT_EXEMPT: ReadonlySet<TrustLevel> = new Set<TrustLevel>(['boss
  * for the address. Shared by `bandFor` and `explain` so the escalation and its
  * stated reason can never drift apart — a past defect in this plan was exactly
  * two copies of one rule disagreeing.
+ *
+ * Two conditions, in this order: the origin must be on the positive list AND
+ * the caller must have said the origin was computed for this action's own
+ * chain. Either one alone lets an inherited trust level speak for a recipient
+ * it never saw.
  */
 function isUnvettedFirstContact(dimensions: RiskDimensions, facts: ActionFacts): boolean {
-  return (
-    dimensions.externalVisibility.audience === 'one_unknown' &&
-    !FIRST_CONTACT_EXEMPT.has(facts.provenance)
-  );
+  const exempt = facts.provenanceChainDerived && FIRST_CONTACT_EXEMPT.has(facts.provenance);
+  return dimensions.externalVisibility.audience === 'one_unknown' && !exempt;
 }
 
 /**
