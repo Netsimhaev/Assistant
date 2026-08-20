@@ -173,42 +173,74 @@ import { canonicalHash } from '../util/canonical.js';
 import { decide, enqueueApproval } from './approvals.js';
 import { consumeApproval } from './consume.js';
 
+import type { ActionFacts } from '../domain/policy.js';
+import type { RiskAssessment } from '../domain/risk.js';
+
 const BUSINESS = 'test-business';
 const INPUT = { to: 'dana@example.com', body: 'שלום' };
 
-async function approvedApproval(jobId: string, input: unknown = INPUT) {
+/**
+ * Real `ActionFacts` and `RiskAssessment` values, never `as never`.
+ *
+ * A cast to `never` switches off exactly the checking that catches a drifted
+ * fact shape — and a silently-empty fact field is a failure this codebase has
+ * hit more than once. Build the objects; let the compiler read them.
+ *
+ * Fill every field the two schemas declare. Run `npm run typecheck` after
+ * writing these helpers and before writing the tests: the compiler will name
+ * anything missing.
+ */
+function factsFor(input: unknown): ActionFacts {
+  return {
+    toolName: 'mail.send',
+    actionClass: 'email.initiate',
+    provenance: 'boss',
+    inputHash: canonicalHash(input),
+    amountMinor: 0,
+    amountDeclared: false,
+    counterpartyId: null,
+    counterpartyEmails: ['dana@example.com'],
+    counterpartyPhones: [],
+    counterpartyTags: [],
+    infoClasses: [],
+  };
+}
+
+/**
+ * A real assessment from the real scorer.
+ *
+ * `RiskDimensions` is a closed shape of seven sub-objects; hand-writing one
+ * would be forty lines of invented numbers that drift the moment the scorer
+ * changes. Calling `assessRisk` costs one line and cannot drift.
+ */
+async function riskFor(input: unknown, bundle: PolicyBundle): Promise<RiskAssessment> {
+  return assessRisk(factsFor(input), bundle);
+}
+
+async function pendingApproval(jobId: string, bundle: PolicyBundle, input: unknown = INPUT) {
   const approvalId = await enqueueApproval(
     {
       jobId,
-      facts: {
-        toolName: 'mail.send',
-        actionClass: 'email.initiate',
-        provenance: 'boss',
-        inputHash: canonicalHash(input),
-        amountMinor: 0,
-        amountDeclared: false,
-        counterpartyId: null,
-        counterpartyEmails: ['dana@example.com'],
-        counterpartyPhones: [],
-        counterpartyTags: [],
-        infoClasses: [],
-      },
-      risk: {
-        actionId: 'a1', total: 40, band: 'sensitive',
-        dimensions: {}, explanation: 'פנייה ראשונה',
-      },
+      facts: factsFor(input),
+      risk: await riskFor(input, bundle),
       proposedInput: input,
       summary: 'שליחת מייל',
-    } as never,
+    },
     { businessId: BUSINESS },
   );
-  await decide(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS });
+  return approvalId;
+}
+
+async function approvedApproval(jobId: string, bundle: PolicyBundle, input: unknown = INPUT) {
+  const approvalId = await pendingApproval(jobId, bundle, input);
+  await decide(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' },
+    { businessId: BUSINESS });
   return approvalId;
 }
 
 describe('an approval is spent exactly once', () => {
   it('lets the step through when all four conditions hold', async () => {
-    const approvalId = await approvedApproval('J-1');
+    const approvalId = await approvedApproval('J-1', bundle);
     const out = await consumeApproval({
       approvalId, jobId: 'J-1', stepId: 's1',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
@@ -217,7 +249,7 @@ describe('an approval is spent exactly once', () => {
   });
 
   it('refuses the same approval a second time', async () => {
-    const approvalId = await approvedApproval('J-1');
+    const approvalId = await approvedApproval('J-1', bundle);
     const args = {
       approvalId, jobId: 'J-1', stepId: 's1',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
@@ -229,7 +261,7 @@ describe('an approval is spent exactly once', () => {
   });
 
   it('refuses when the input changed after the approval', async () => {
-    const approvalId = await approvedApproval('J-1');
+    const approvalId = await approvedApproval('J-1', bundle);
     const out = await consumeApproval({
       approvalId, jobId: 'J-1', stepId: 's1',
       liveInputHash: canonicalHash({ ...INPUT, body: 'משהו אחר' }),
@@ -239,7 +271,7 @@ describe('an approval is spent exactly once', () => {
   });
 
   it('refuses an approval that belongs to another job', async () => {
-    const approvalId = await approvedApproval('J-1');
+    const approvalId = await approvedApproval('J-1', bundle);
     const out = await consumeApproval({
       approvalId, jobId: 'J-2', stepId: 's1',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
@@ -248,16 +280,7 @@ describe('an approval is spent exactly once', () => {
   });
 
   it('refuses an approval nobody decided yet', async () => {
-    const approvalId = await enqueueApproval(
-      { jobId: 'J-1', facts: { toolName: 'mail.send', actionClass: 'email.initiate',
-        provenance: 'boss', inputHash: canonicalHash(INPUT), amountMinor: 0,
-        amountDeclared: false, counterpartyId: null, counterpartyEmails: [],
-        counterpartyPhones: [], counterpartyTags: [], infoClasses: [] },
-        risk: { actionId: 'a1', total: 40, band: 'sensitive', dimensions: {},
-          explanation: 'פנייה ראשונה' },
-        proposedInput: INPUT, summary: 'שליחת מייל' } as never,
-      { businessId: BUSINESS },
-    );
+    const approvalId = await pendingApproval('J-1', bundle);
     const out = await consumeApproval({
       approvalId, jobId: 'J-1', stepId: 's1',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
@@ -274,7 +297,7 @@ describe('an approval is spent exactly once', () => {
   });
 
   it('lets exactly one of two concurrent attempts through', async () => {
-    const approvalId = await approvedApproval('J-1');
+    const approvalId = await approvedApproval('J-1', bundle);
     const args = {
       approvalId, jobId: 'J-1', stepId: 's1',
       liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
@@ -442,7 +465,10 @@ const CALL = {
   ctx: {
     agent: 'comms.email' as const,
     jobId: 'J-1',
+    stepId: 's1',
     provenance: 'unknown_external' as const,
+    // `FactsContext` requires it: zero is a call with no delegation chain.
+    chainDepth: 0,
     counterpartyTags: [] as string[],
     rampLevel: 'auto' as const,
     businessId: BUSINESS,
@@ -497,11 +523,12 @@ describe('an approval already granted is honoured, not recomputed', () => {
     expect(changed.outcome).toBe('queue_approval');
   });
 
-  it('does not let an approval carry an action past a hard prohibition', async () => {
+  it('does not let an approval carry an action past a denial', async () => {
+    // The fixture cannot express a charter `forbidden` rule, so the denial
+    // under test is the autonomy one at gate step 8. Either way the point is
+    // the same: consumption is step 10, and every denial before it stands.
     const bundle = await installCharter(
-      buildCharter({
-        forbidden: [{ id: 'no-mail', description: 'אין מיילים', appliesTo: ['email.initiate'] }],
-      }),
+      buildCharter({ autonomyBase: { 'email.initiate': 'forbidden' } }),
       { businessId: BUSINESS },
     );
     const denied = await evaluateToolCall(CALL.toolName, CALL.input, {
@@ -598,9 +625,16 @@ Expected: PASS, 4 tests.
 
 - [ ] **Step 6: Bite-check the placement**
 
-Move the consumption branch ABOVE the `risk.band === 'blocked'` check.
-Expected: the hard-prohibition test still passes (prohibitions are step 5, earlier) — so instead move it above **step 5** to prove the ordering matters.
-Restore it to its specified position, re-run, confirm green.
+Make the autonomy denial defer to the approval — the mistake a reader is most likely to make here, reasoning "they approved it, so let it through":
+
+```ts
+  if (effective === 'forbidden' && ctx.approvalId === undefined) {
+```
+
+Expected: FAIL — "does not let an approval carry an action past a denial".
+Restore the condition to `effective === 'forbidden'`, re-run, confirm green.
+
+(The branch cannot simply be moved earlier to test this: it reads `effective` and `risk`, which steps 8 and 10 compute, so an earlier position does not compile. The position is enforced by that data dependency; this mutation covers the failure the dependency does not.)
 
 - [ ] **Step 7: Run the whole suite**
 
@@ -812,7 +846,7 @@ import { TrustLevel } from '../domain/trust.js';
 import { assessRisk } from './risk.js';
 
 /** Facts for a first contact: an address nothing in the charter resolves. */
-function firstContact(provenance: TrustLevel) {
+function firstContact(provenance: TrustLevel): ActionFacts {
   return {
     toolName: 'mail.send',
     actionClass: 'email.initiate' as const,
@@ -830,23 +864,23 @@ function firstContact(provenance: TrustLevel) {
 
 describe('first contact escalates unless the boss named the counterparty', () => {
   it('does not escalate when the boss is the origin of the chain', async () => {
-    const risk = await assessRisk(firstContact('boss') as never, BUNDLE);
+    const risk = await assessRisk(firstContact('boss'), BUNDLE);
     expect(risk.band).toBe('routine');
   });
 
   it('escalates when the chain passed through an inbound email', async () => {
-    const risk = await assessRisk(firstContact('unknown_external') as never, BUNDLE);
+    const risk = await assessRisk(firstContact('unknown_external'), BUNDLE);
     expect(risk.band).toBe('sensitive');
   });
 
   it('escalates for staff, which is not on the exempt list', async () => {
-    const risk = await assessRisk(firstContact('staff') as never, BUNDLE);
+    const risk = await assessRisk(firstContact('staff'), BUNDLE);
     expect(risk.band).toBe('sensitive');
   });
 
   it('still escalates a boss-origin first contact that carries money', async () => {
     const facts = { ...firstContact('boss'), amountMinor: 500_00, amountDeclared: true };
-    const risk = await assessRisk(facts as never, BUNDLE);
+    const risk = await assessRisk(facts, BUNDLE);
     expect(risk.band).not.toBe('routine');
   });
 });
@@ -1243,9 +1277,24 @@ Expected: FAIL — module not found.
   // approval that vanished because an SMTP server was down would be far worse
   // than one nobody was emailed about.
   try {
-    await notifier.notify(request, approvalLink(approvalId));
+    const delivered = await notifier.notify(request, approvalLink(approvalId));
+    if (!delivered.ok) throw new Error(delivered.error ?? 'notify returned not-ok');
   } catch (error) {
-    await appendAudit({ /* kind: 'incident', reason: `approval_notify_failed:${approvalId}` */ });
+    await appendAudit(
+      {
+        actor: 'system',
+        kind: 'incident',
+        jobId: request.jobId,
+        actionClass: request.actionClass,
+        charterVersion: currentVersion,
+        provenance: facts.provenance,
+        inputHash: request.inputHash,
+        reason:
+          `approval_notify_failed:${approvalId} via ${notifier.channel} — ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      },
+      { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
+    );
   }
 ```
 
