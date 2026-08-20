@@ -195,10 +195,11 @@ describe('redeemRecoveryCode', () => {
     expect(rows[0]!.count).toBe('0');
   });
 
-  it('shares the login lockout: enough wrong codes lock out a correct one too', async () => {
-    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
-
-    for (let i = 0; i < 5; i += 1) {
+  it('exhausting the recovery budget leaves password login working', async () => {
+    // Recovery's own threshold (RECOVERY_MAX_FAILED = 10 in recovery.ts) is
+    // deliberately not password login's (MAX_FAILED = 5 in auth.ts) — walk
+    // past the recovery threshold and confirm login is untouched by it.
+    for (let i = 0; i < 10; i += 1) {
       const result = await redeemRecoveryCode({
         username: USERNAME,
         code: '0'.repeat(32),
@@ -207,22 +208,46 @@ describe('redeemRecoveryCode', () => {
       expect(result).toEqual({ ok: false, code: 'no_match' });
     }
 
+    const loginResult = await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+    expect(loginResult.ok).toBe(true);
+  });
+
+  it('exhausting the password budget leaves recovery redemption working', async () => {
+    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+
+    for (let i = 0; i < 5; i += 1) {
+      const result = await login({ username: USERNAME, password: 'wrong password', businessId: BUSINESS });
+      expect(result).toEqual({ ok: false, code: 'bad_credentials' });
+    }
+    const locked = await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+    expect(locked).toEqual({ ok: false, code: 'locked' });
+
+    const result = await redeemRecoveryCode({
+      username: USERNAME,
+      code: codes[0]!,
+      businessId: BUSINESS,
+    });
+    expect(result).toEqual({ ok: true });
+  });
+
+  it('recovery still locks after its own threshold', async () => {
+    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+
+    for (let i = 0; i < 10; i += 1) {
+      const result = await redeemRecoveryCode({
+        username: USERNAME,
+        code: '0'.repeat(32),
+        businessId: BUSINESS,
+      });
+      expect(result).toEqual({ ok: false, code: 'no_match' });
+    }
+
+    // The recovery budget is now spent — even a genuinely valid code refuses.
     const result = await redeemRecoveryCode({
       username: USERNAME,
       code: codes[0]!,
       businessId: BUSINESS,
     });
     expect(result).toEqual({ ok: false, code: 'no_match' });
-  });
-
-  it('a locked account also refuses a normal login', async () => {
-    await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
-
-    for (let i = 0; i < 5; i += 1) {
-      await redeemRecoveryCode({ username: USERNAME, code: '0'.repeat(32), businessId: BUSINESS });
-    }
-
-    const loginResult = await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
-    expect(loginResult).toEqual({ ok: false, code: 'locked' });
   });
 });

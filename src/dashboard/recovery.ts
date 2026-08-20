@@ -3,11 +3,26 @@ import { config } from '../config.js';
 import { getPool, withTransaction, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
-import { hashPassword, verifyPassword, revokeAllSessions, MAX_FAILED, LOCK_MINUTES } from './auth.js';
+import { hashPassword, verifyPassword, revokeAllSessions, DECOY_HASH, DECOY_SALT } from './auth.js';
 
 /** 128 bits of code, encoded as hex — the same size as a session token. */
 const CODE_BYTES = 16;
 const DEFAULT_CODE_COUNT = 8;
+
+/**
+ * Recovery redemption's own throttle, deliberately separate from password
+ * login's `failed_attempts`/`locked_until` (see the docblock on
+ * `redeemRecoveryCode`). A lockout exists to protect a *low-entropy* secret
+ * from repeated guessing; a 128-bit recovery code cannot be guessed at any
+ * rate, so this threshold is not defending a secret — it caps how much CPU
+ * an attacker can force this endpoint to spend running its (deliberately
+ * expensive) up-to-eight `scrypt` comparisons over and over. Ten attempts
+ * before a one-minute pause is real friction against a script hammering the
+ * endpoint, and effectively invisible to an owner typing one of eight
+ * printed codes by hand — nobody fat-fingers a recovery code ten times.
+ */
+const RECOVERY_MAX_FAILED = 10;
+const RECOVERY_LOCK_MINUTES = 1;
 
 interface RecoveryCodeRow {
   code_id: string;
@@ -75,18 +90,13 @@ export async function issueRecoveryCodes(input: {
 }
 
 /**
- * The same read-SQL-only increment login uses: a read-modify-write in
- * JavaScript would let concurrent wrong guesses all read the same stale
- * count and each write back count + 1, so the counter would advance by one
- * instead of by N and the lockout would stop existing under concurrency.
- * `failed_attempts = failed_attempts + 1` computed inside a single UPDATE is
- * safe because Postgres holds the row lock for the statement's duration.
- *
- * Sharing this with login's own increment (same columns, same MAX_FAILED,
- * same LOCK_MINUTES, imported from auth.ts rather than redefined here) is
- * the point: guessing recovery codes must spend down the identical budget
- * as guessing passwords, or it is a second, unlimited door next to the
- * first one's lock.
+ * The same read-SQL-only increment login uses, but against recovery's own
+ * columns: a read-modify-write in JavaScript would let concurrent wrong
+ * guesses all read the same stale count and each write back count + 1, so
+ * the counter would advance by one instead of by N and the throttle would
+ * stop existing under concurrency. `recovery_failed_attempts =
+ * recovery_failed_attempts + 1` computed inside a single UPDATE is safe
+ * because Postgres holds the row lock for the statement's duration.
  */
 async function recordFailedAttempt(
   db: Queryable,
@@ -94,16 +104,16 @@ async function recordFailedAttempt(
   username: string,
   now: Date,
 ): Promise<void> {
-  const lockUntilIfThresholdReached = new Date(now.getTime() + LOCK_MINUTES * 60_000);
+  const lockUntilIfThresholdReached = new Date(now.getTime() + RECOVERY_LOCK_MINUTES * 60_000);
   await db.query(
     `UPDATE dashboard_users
-        SET failed_attempts = failed_attempts + 1,
-            locked_until = CASE
-              WHEN failed_attempts + 1 >= $3 THEN $4
-              ELSE locked_until
+        SET recovery_failed_attempts = recovery_failed_attempts + 1,
+            recovery_locked_until = CASE
+              WHEN recovery_failed_attempts + 1 >= $3 THEN $4
+              ELSE recovery_locked_until
             END
       WHERE business_id = $1 AND username = $2`,
-    [businessId, username, MAX_FAILED, lockUntilIfThresholdReached],
+    [businessId, username, RECOVERY_MAX_FAILED, lockUntilIfThresholdReached],
   );
 }
 
@@ -114,7 +124,12 @@ async function recordFailedAttempt(
  * stops at the first match: breaking out early would let response time leak
  * which code — or which position — matched. Eight `scrypt` calls (the
  * default issue count) is the deliberate cost, not something to optimise
- * away; the slowness is what makes guessing codes expensive.
+ * away; the slowness is what makes guessing codes expensive. When the
+ * account has no codes issued at all, the same number of decoy `scrypt`
+ * calls run against `DECOY_HASH`/`DECOY_SALT` instead — otherwise that case
+ * returns after zero real work while an account with codes always runs
+ * several, and the gap tells an observer whether recovery was ever set up
+ * for a given username.
  *
  * The claim itself is `UPDATE ... WHERE code_id = $1 AND used_at IS NULL
  * RETURNING code_id` — one conditional statement, so two concurrent
@@ -122,12 +137,19 @@ async function recordFailedAttempt(
  * sees the row already spent and is told `already_used`, exactly as if it
  * had arrived a moment later.
  *
- * A locked account (same lock login enforces) refuses before touching any
- * code hash. It is reported as `no_match` rather than a distinct `locked`
- * code: the interface has no third case, and giving lock state away to
- * whoever is submitting codes would hand an attacker a free signal the
- * password path already declines to leak past 'locked' vs 'bad_credentials'
- * only being visible to someone who already knows the account exists.
+ * Throttled by its own lock (`recovery_failed_attempts`/
+ * `recovery_locked_until`, see the constants above), not by password
+ * login's. The two must not share a budget: a recovery code is 128 random
+ * bits and cannot be guessed at any rate, so spending login's budget on it
+ * buys no security — and doing so would let anyone who knows the username
+ * (effectively public on a single-tenant install) re-lock password login
+ * indefinitely with trivial wrong-code traffic, and, worse, would leave an
+ * owner who mistyped their password five times unable to use the recovery
+ * codes that exist for exactly that moment. A locked recovery budget refuses
+ * before touching any code hash, reported as `no_match` rather than a
+ * distinct `locked` code — the interface has no third case, and leaking
+ * lock state to whoever is submitting codes would hand an attacker a free
+ * signal.
  *
  * `sourceAddress` is supplied by the caller because this function has no
  * HTTP context of its own — it is never invented here, only carried through
@@ -144,21 +166,21 @@ export async function redeemRecoveryCode(input: {
   const now = input.now ?? new Date();
   const db = getPool();
 
-  const { rows: userRows } = await db.query<{ locked_until: Date | null }>(
-    `SELECT locked_until FROM dashboard_users WHERE business_id = $1 AND username = $2`,
+  const { rows: userRows } = await db.query<{ recovery_locked_until: Date | null }>(
+    `SELECT recovery_locked_until FROM dashboard_users WHERE business_id = $1 AND username = $2`,
     [businessId, input.username],
   );
-  let lockedUntil = userRows[0]?.locked_until ?? null;
+  let lockedUntil = userRows[0]?.recovery_locked_until ?? null;
 
-  // Lazily clear an expired lock, same as login: the WHERE clause re-checks
-  // `locked_until <= $3` in Postgres rather than trusting the JS-side read,
-  // so a concurrent failed attempt that re-locked the account between the
-  // SELECT and this UPDATE leaves the fresh lock intact instead of being
-  // clobbered a moment after it was set.
+  // Lazily clear an expired lock, same pattern as login: the WHERE clause
+  // re-checks `recovery_locked_until <= $3` in Postgres rather than trusting
+  // the JS-side read, so a concurrent failed attempt that re-locked the
+  // account between the SELECT and this UPDATE leaves the fresh lock intact
+  // instead of being clobbered a moment after it was set.
   if (lockedUntil !== null && lockedUntil.getTime() <= now.getTime()) {
     const cleared = await db.query(
-      `UPDATE dashboard_users SET failed_attempts = 0, locked_until = NULL
-        WHERE business_id = $1 AND username = $2 AND locked_until <= $3`,
+      `UPDATE dashboard_users SET recovery_failed_attempts = 0, recovery_locked_until = NULL
+        WHERE business_id = $1 AND username = $2 AND recovery_locked_until <= $3`,
       [businessId, input.username, now],
     );
     if ((cleared.rowCount ?? 0) > 0) {
@@ -178,12 +200,21 @@ export async function redeemRecoveryCode(input: {
   );
 
   let matched: RecoveryCodeRecord | null = null;
-  for (const row of codeRows) {
-    const record = toRecoveryCodeRecord(row);
-    // Sequential and deliberate: see the function docblock above.
-    const isMatch = await verifyPassword(input.code, record.codeHash, record.codeSalt);
-    if (isMatch) {
-      matched = record;
+  if (codeRows.length === 0) {
+    // No codes ever issued for this username: pay the same decoy cost login
+    // pays for "no such user", so the timing here matches an account that
+    // does have codes to try.
+    for (let i = 0; i < DEFAULT_CODE_COUNT; i += 1) {
+      await verifyPassword(input.code, DECOY_HASH, DECOY_SALT);
+    }
+  } else {
+    for (const row of codeRows) {
+      const record = toRecoveryCodeRecord(row);
+      // Sequential and deliberate: see the function docblock above.
+      const isMatch = await verifyPassword(input.code, record.codeHash, record.codeSalt);
+      if (isMatch) {
+        matched = record;
+      }
     }
   }
 
@@ -211,11 +242,10 @@ export async function redeemRecoveryCode(input: {
       return { ok: false, code: 'already_used' };
     }
 
-    // A successful redemption is exactly as trust-restoring as a correct
-    // password: it clears the same failed-attempt streak and lock a correct
-    // login would.
+    // Clears recovery's own throttle — not password login's, which this
+    // function never touches in either direction.
     await tx.query(
-      `UPDATE dashboard_users SET failed_attempts = 0, locked_until = NULL
+      `UPDATE dashboard_users SET recovery_failed_attempts = 0, recovery_locked_until = NULL
         WHERE business_id = $1 AND username = $2`,
       [businessId, input.username],
     );

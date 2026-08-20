@@ -10,15 +10,8 @@ const scrypt = promisify(scryptCb) as (
 ) => Promise<Buffer>;
 
 const KEY_LENGTH = 64;
-/**
- * Exported so recovery-code redemption can share the exact same lockout
- * counter and threshold as password login — a code guesser must not get a
- * separate, unlimited budget just because it went through a different
- * function. Two copies of these numbers would let the two paths drift apart
- * silently; one export keeps them identical by construction.
- */
-export const MAX_FAILED = 5;
-export const LOCK_MINUTES = 15;
+const MAX_FAILED = 5;
+const LOCK_MINUTES = 15;
 const SESSION_HOURS = 12;
 /** Raw session token size. 256 bits — comfortably more than a browser cookie needs to resist guessing. */
 const TOKEN_BYTES = 32;
@@ -46,15 +39,20 @@ export async function verifyPassword(
 }
 
 /**
- * A fixed salt/hash pair that never matches any real password. `login` runs
- * a verification against this when the username does not exist, so a
- * "no such user" response costs the same scrypt work as a "wrong password"
- * response. Without this, the two cases are distinguishable by response
- * time alone, which lets an attacker enumerate usernames on a system that
- * is meant to have exactly one.
+ * A fixed salt/hash pair that never matches any real password or recovery
+ * code. `login` runs a verification against this when the username does not
+ * exist, so a "no such user" response costs the same scrypt work as a
+ * "wrong password" response. Without this, the two cases are distinguishable
+ * by response time alone, which lets an attacker enumerate usernames on a
+ * system that is meant to have exactly one.
+ *
+ * Exported so `redeemRecoveryCode` can pay the same decoy cost when a
+ * username has no recovery codes issued — reusing this pair rather than
+ * minting a second one keeps there being exactly one "costs real work but
+ * matches nothing" constant in the system.
  */
-const DECOY_SALT = '0'.repeat(32);
-const DECOY_HASH = '0'.repeat(KEY_LENGTH * 2);
+export const DECOY_SALT = '0'.repeat(32);
+export const DECOY_HASH = '0'.repeat(KEY_LENGTH * 2);
 
 /**
  * Session tokens are hashed with a fast digest, deliberately NOT scrypt.
