@@ -2,6 +2,7 @@ import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'no
 import { promisify } from 'node:util';
 import { config } from '../config.js';
 import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { recordUnknownUserFailure, unknownUserLocked } from './unknown-user-throttle.js';
 
 const scrypt = promisify(scryptCb) as (
   password: string,
@@ -136,9 +137,32 @@ export async function login(input: {
   const row = rows[0];
 
   if (!row) {
+    // A username with no row has no counter of its own, so its failures go
+    // to the shared unknown-username bucket
+    // (./unknown-user-throttle.js). Without it, the UPDATE further down
+    // matched nothing and this branch was an unthrottled scrypt call for
+    // anyone who could reach the port — one call rather than recovery's
+    // eight, but still unbounded, and still the owner's only way in.
+    //
+    // A locked bucket returns before the decoy runs. That is the same trade
+    // the per-user lock already makes ('locked' is answered without touching
+    // a hash), and it is what a throttle is: still paying the cost would
+    // defeat the point. Reported as `bad_credentials`, never a distinct
+    // code — an unknown username must not become distinguishable by its
+    // reply.
+    const throttle = {
+      kind: 'login' as const,
+      maxFailed: MAX_FAILED,
+      lockMinutes: LOCK_MINUTES,
+      businessId,
+      now,
+    };
+    if (await unknownUserLocked(throttle)) return { ok: false, code: 'bad_credentials' };
+
     // Pay the same scrypt cost a real user would, so "no such user" and
     // "wrong password" are not distinguishable by timing.
     await verifyPassword(input.password, DECOY_HASH, DECOY_SALT);
+    await recordUnknownUserFailure(throttle);
     return { ok: false, code: 'bad_credentials' };
   }
 

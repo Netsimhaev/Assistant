@@ -251,6 +251,74 @@ describe('redeemRecoveryCode', () => {
     expect(result).toEqual({ ok: false, code: 'no_match' });
   });
 
+  // Before the shared bucket existed, `recordFailedAttempt` was an UPDATE
+  // against `dashboard_users` — which matches nothing for a username that has
+  // no row. The counter never moved, the lock never engaged, and every
+  // request bought up to eight scrypt calls from the server for free. The
+  // decoy calls are deliberate and stay; what must not stay is their being
+  // unbounded.
+  it('throttles a username that has no row at all', async () => {
+    const unknownBucket = async () => {
+      const { rows } = await getPool().query<{
+        recovery_failed_attempts: number;
+        recovery_locked_until: Date | null;
+      }>(
+        `SELECT recovery_failed_attempts, recovery_locked_until
+           FROM dashboard_unknown_user_throttle WHERE business_id = $1`,
+        [BUSINESS],
+      );
+      return rows[0] ?? null;
+    };
+
+    expect(await unknownBucket()).toBeNull();
+
+    for (let i = 0; i < 10; i += 1) {
+      const result = await redeemRecoveryCode({
+        username: 'nobody-by-that-name',
+        code: '0'.repeat(32),
+        businessId: BUSINESS,
+      });
+      expect(result).toEqual({ ok: false, code: 'no_match' });
+    }
+
+    const bucket = await unknownBucket();
+    expect(bucket?.recovery_failed_attempts).toBe(10);
+    expect(bucket?.recovery_locked_until).not.toBeNull();
+
+    // Locked: the next attempt refuses before any hash is computed, which is
+    // the whole point — the cost stops being available.
+    const after = await redeemRecoveryCode({
+      username: 'nobody-by-that-name',
+      code: '0'.repeat(32),
+      businessId: BUSINESS,
+    });
+    expect(after).toEqual({ ok: false, code: 'no_match' });
+    expect((await unknownBucket())?.recovery_failed_attempts).toBe(10);
+  });
+
+  it('cannot be used to lock the real owner out of recovery', async () => {
+    // The shared bucket must not become a denial-of-service on the account
+    // it protects: the real username has a row of its own and spends its own
+    // budget, so no amount of traffic aimed at names that do not exist can
+    // touch it.
+    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+
+    for (let i = 0; i < 15; i += 1) {
+      await redeemRecoveryCode({
+        username: `nobody-${i}`,
+        code: '0'.repeat(32),
+        businessId: BUSINESS,
+      });
+    }
+
+    const result = await redeemRecoveryCode({
+      username: USERNAME,
+      code: codes[0]!,
+      businessId: BUSINESS,
+    });
+    expect(result).toEqual({ ok: true });
+  });
+
   it('a successful redemption clears the password lockout too, immediately', async () => {
     // The whole point of recovery codes is to get back in when the password
     // is the thing that's gone wrong. If redeeming one didn't also clear

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   createOwner,
@@ -72,6 +72,36 @@ describe('login', () => {
       businessId: BUSINESS,
     });
     expect(result).toEqual({ ok: false, code: 'bad_credentials' });
+  });
+
+  it('counts failures for a username that has no row, against the shared bucket', async () => {
+    // The per-user UPDATE matches nothing when there is no row, so this
+    // branch used to be an unthrottled scrypt call for anyone who could
+    // reach the port. Its failures now land in
+    // dashboard_unknown_user_throttle instead.
+    for (let i = 0; i < 5; i += 1) {
+      const result = await login({ username: 'nobody', password: PASSWORD, businessId: BUSINESS });
+      expect(result).toEqual({ ok: false, code: 'bad_credentials' });
+    }
+
+    const { rows } = await getPool().query<{ failed_attempts: number; locked_until: Date | null }>(
+      `SELECT failed_attempts, locked_until FROM dashboard_unknown_user_throttle
+        WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    expect(rows[0]?.failed_attempts).toBe(5);
+    expect(rows[0]?.locked_until).not.toBeNull();
+
+    // Still `bad_credentials`, never a distinct code: whether a username
+    // exists must not become readable from the reply.
+    expect(await login({ username: 'nobody', password: PASSWORD, businessId: BUSINESS })).toEqual({
+      ok: false,
+      code: 'bad_credentials',
+    });
+
+    // And the real account is untouched by all of it.
+    const real = await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+    expect(real.ok).toBe(true);
   });
 
   it('locks the account after five wrong attempts', async () => {

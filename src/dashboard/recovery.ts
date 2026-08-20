@@ -4,6 +4,7 @@ import { getPool, withTransaction, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import { hashPassword, verifyPassword, revokeAllSessions, DECOY_HASH, DECOY_SALT } from './auth.js';
+import { recordUnknownUserFailure, unknownUserLocked } from './unknown-user-throttle.js';
 
 /** 128 bits of code, encoded as hex — the same size as a session token. */
 const CODE_BYTES = 16;
@@ -102,8 +103,25 @@ async function recordFailedAttempt(
   db: Queryable,
   businessId: string,
   username: string,
+  userExists: boolean,
   now: Date,
 ): Promise<void> {
+  // No row to hold the counter: this attempt goes to the shared
+  // unknown-username bucket instead. Without it the UPDATE below matched
+  // nothing, the counter never moved, and up to eight scrypt calls per
+  // request were available to anyone who could reach the port.
+  if (!userExists) {
+    await recordUnknownUserFailure({
+      kind: 'recovery',
+      maxFailed: RECOVERY_MAX_FAILED,
+      lockMinutes: RECOVERY_LOCK_MINUTES,
+      businessId,
+      now,
+      db,
+    });
+    return;
+  }
+
   const lockUntilIfThresholdReached = new Date(now.getTime() + RECOVERY_LOCK_MINUTES * 60_000);
   await db.query(
     `UPDATE dashboard_users
@@ -156,6 +174,15 @@ async function recordFailedAttempt(
  * other's failure count, exactly as login already does for itself on a
  * correct password. See the comment at the clearing UPDATE below.
  *
+ * A username with no `dashboard_users` row is throttled too, against the
+ * shared bucket in `./unknown-user-throttle.js`. It has to be: the decoy
+ * scrypt calls above exist so that an unknown username costs the ATTACKER
+ * what a real one does, and that is worth keeping — but the counter used to
+ * be an UPDATE against a row that did not exist, so it cost the SERVER the
+ * same forever, unthrottled, to anyone who could reach the port. Eight
+ * scrypt calls per request is the amplifier; starving the box starves the
+ * owner's only way to answer an approval.
+ *
  * `sourceAddress` is supplied by the caller because this function has no
  * HTTP context of its own — it is never invented here, only carried through
  * to the audit entry that names where the redemption came from.
@@ -175,6 +202,25 @@ export async function redeemRecoveryCode(input: {
     `SELECT recovery_locked_until FROM dashboard_users WHERE business_id = $1 AND username = $2`,
     [businessId, input.username],
   );
+  const userExists = userRows.length > 0;
+
+  // A username with no row of its own is throttled against the shared bucket
+  // — checked here, before any hash is computed, exactly as a locked account
+  // is. Refused as `no_match` like every other failure: the interface has no
+  // third case, and telling whoever is submitting codes that they have hit a
+  // limit is a free signal.
+  if (!userExists) {
+    const locked = await unknownUserLocked({
+      kind: 'recovery',
+      maxFailed: RECOVERY_MAX_FAILED,
+      lockMinutes: RECOVERY_LOCK_MINUTES,
+      businessId,
+      now,
+      db,
+    });
+    if (locked) return { ok: false, code: 'no_match' };
+  }
+
   let lockedUntil = userRows[0]?.recovery_locked_until ?? null;
 
   // Lazily clear an expired lock, same pattern as login: the WHERE clause
@@ -224,7 +270,7 @@ export async function redeemRecoveryCode(input: {
   }
 
   if (!matched) {
-    await recordFailedAttempt(db, businessId, input.username, now);
+    await recordFailedAttempt(db, businessId, input.username, userExists, now);
     return { ok: false, code: 'no_match' };
   }
 

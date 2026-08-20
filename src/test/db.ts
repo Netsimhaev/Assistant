@@ -35,6 +35,7 @@ export async function resetDatabase(): Promise<void> {
       charter_versions,
       dashboard_sessions,
       dashboard_recovery_codes,
+      dashboard_unknown_user_throttle,
       dashboard_users
     RESTART IDENTITY CASCADE
   `);
