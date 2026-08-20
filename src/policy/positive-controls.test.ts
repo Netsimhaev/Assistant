@@ -15,7 +15,9 @@ import {
   READ_ONLY_TOOLS,
 } from './classify.js';
 import { evaluateToolCall, type GateContext } from './engine.js';
-import type { PolicyBundle } from '../domain/policy.js';
+import { assessRisk } from './risk.js';
+import type { ActionFacts, PolicyBundle } from '../domain/policy.js';
+import { TrustLevel } from '../domain/trust.js';
 
 const BUSINESS = 'test-business';
 /** 12:00 Asia/Jerusalem — outside the fixture's 22:00–07:00 quiet window. */
@@ -395,5 +397,56 @@ describe('outbound is a positive list, and it is complete', () => {
     if (decision.outcome !== 'allow') throw new Error('unreachable');
     const redacted = decision.redactedInput as { description: string };
     expect(redacted.description).not.toContain('123456789');
+  });
+});
+
+/**
+ * Facts for a first contact: an address nothing in the charter resolves,
+ * with only `provenance` varying. Mirrors the helper in first-contact.test.ts
+ * (which exercises the boss/staff/unknown_external distinction in isolation);
+ * this one exists to pin the exempt set's *width* against the whole enum.
+ */
+function firstContactFacts(provenance: TrustLevel): ActionFacts {
+  return {
+    toolName: 'mail.send',
+    actionClass: 'email.initiate',
+    provenance,
+    chainDepth: 0,
+    inputHash: 'h',
+    amountMinor: 0,
+    amountDeclared: false,
+    counterpartyId: null,
+    counterpartyEmails: ['stranger@example.com'],
+    counterpartyPhones: [],
+    counterpartyTags: [],
+    dataClasses: [],
+    leavesInstance: true,
+    supplierId: null,
+    discountPercent: 0,
+  };
+}
+
+describe('the first-contact exemption stays exactly {boss}', () => {
+  it('scores boss as routine and every other TrustLevel as sensitive', async () => {
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+
+    // A widening of FIRST_CONTACT_EXEMPT in risk.ts is precisely how a
+    // security control loosens into a prompt-injection hole: add
+    // 'unknown_external' there and content-derived work stops escalating on
+    // first contact, silently, with every behaviour-agnostic test still
+    // green. This asserts the rule as it actually operates -- band by
+    // band, for every TrustLevel -- rather than the constant behind it, so
+    // there is no separate export to keep in sync with the implementation.
+    //
+    // Iterated from TrustLevel.options rather than listed by hand: a level
+    // added to the enum later is exercised by this loop automatically and
+    // must fail closed (assert sensitive) until someone decides to exempt
+    // it deliberately in risk.ts. Listing today's non-exempt levels by hand
+    // would silently stop covering a level that does not exist yet.
+    for (const level of TrustLevel.options) {
+      const risk = await assessRisk(firstContactFacts(level), bundle);
+      const expected = level === 'boss' ? 'routine' : 'sensitive';
+      expect(risk.band, `provenance=${level}`).toBe(expected);
+    }
   });
 });
