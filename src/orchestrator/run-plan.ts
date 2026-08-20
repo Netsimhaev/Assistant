@@ -59,9 +59,24 @@ export interface RunPlanRequest {
   adapterTimeoutMs?: number;
 }
 
+/**
+ * A step this run did not perform, because an earlier run of the same plan
+ * already did.
+ *
+ * Its own status rather than a synthesised `done`. A `done` outcome carries
+ * `spendRecorded`, and this run recorded no spend — the earlier one may well
+ * have. Reporting `false` there was quietly untrue, and the ledger, not this
+ * record, is the answer to what was charged.
+ */
+export interface SkippedOutcome {
+  status: 'skipped';
+  /** The handle returned by the run that actually did the work. */
+  externalId: string | null;
+}
+
 export interface StepRecord {
   stepId: string;
-  outcome: StepOutcome;
+  outcome: StepOutcome | SkippedOutcome;
   /**
    * The provider's handle on whatever this step created — a message id, an
    * order number — or `null` when the step created nothing, ran locally, or
@@ -80,6 +95,9 @@ export interface StepRecord {
    * Reported rather than hidden: "the mail went out just now" and "the mail
    * went out yesterday and we did not send it again" are different facts, and
    * a caller deciding what to tell the owner needs to tell them apart.
+   *
+   * Mirrors `outcome.status === 'skipped'` exactly. Kept as a flag so a caller
+   * can filter records without narrowing the outcome union.
    */
   skipped: boolean;
 }
@@ -102,20 +120,32 @@ export type RunPlanResult =
  * agent does not own would fail at that step, leaving the ones before it
  * already done; rejecting the plan is the cheaper failure by far.
  *
- * **A halted plan resumes where it stopped.** Whatever ends the run — an
- * approval to wait for, quiet hours, a retryable channel failure — the job's
- * phase is moved and this function returns; the steps that had already
- * finished are on record, each written in the same transaction as the phase
- * change that followed it. A job the scheduler wakes and hands back here runs
- * the same plan again, skips those steps, and picks up at the one that
- * stopped. A skipped step is still reported, marked `skipped`.
+ * **A halted plan resumes where it stopped.** Quiet hours and a retryable
+ * channel failure move the job's phase and this function returns; the steps
+ * that had already finished are on record, each written in the same
+ * transaction as the phase change that followed it. A job the scheduler wakes
+ * and hands back here runs the same plan again, skips those steps, and picks
+ * up at the one that stopped. A skipped step is still reported, marked
+ * `skipped`.
  *
- * The plan is bound to the job on the first run and cannot change afterwards.
- * A second run offering a different plan is rejected with
- * `plan_changed_mid_flight` and nothing executes: completed steps belong to
- * the plan that produced them, and there is no correct automatic way to carry
- * them onto a re-plan — least of all by matching step ids, which two unrelated
- * plans may well share.
+ * **An approval is the one deferral that does not yet complete, and this is
+ * not the place that can fix it.** The steps before it resume correctly, but
+ * `evaluateToolCall` has no path that consults an approval a human has already
+ * granted: it recomputes `needsApproval` and enqueues a second request. So the
+ * resumed run skips the finished steps and then queues *another* approval for
+ * the step that was waiting, and that step never runs however many times it is
+ * approved. Closing that means teaching the gate to spend an existing approval
+ * — including its TOCTOU input-hash check — which is separate work. Until then
+ * do not read the approval path here as a loop that closes.
+ *
+ * The plan is bound to the job on the first run. A second run offering a
+ * different plan is rejected with `plan_changed_mid_flight` *if any step has
+ * actually executed*: completed steps belong to the plan that produced them,
+ * and there is no correct automatic way to carry them onto a re-plan — least
+ * of all by matching step ids, which two unrelated plans may well share. If
+ * nothing has executed there is nothing to merge onto, the binding is simply
+ * replaced, and re-planning after a step-one failure works. See
+ * `bindPlanToJob`.
  *
  * Resumption is at-least-once. A crash between an adapter returning and the
  * completion committing leaves the step done and unrecorded, and the resumed
@@ -125,6 +155,27 @@ export type RunPlanResult =
  */
 export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
   const { job, bundle, plan } = request;
+
+  // The phase, before anything is written down.
+  //
+  // `executeStep` checks this too, but it checks it per step — far too late.
+  // `bindPlanToJob` runs first and stores the job's one and only plan row, so
+  // a call on a job that is not executable used to look like a benign refusal
+  // while having permanently bound the job to a plan that never ran. When the
+  // job later reached `execute` with its real plan it was rejected
+  // `plan_changed_mid_flight`, and nothing deletes a `job_plans` row. No
+  // adversary needed: `runPlanForJob` racing a scheduler that moved the job to
+  // `followup` a millisecond earlier was enough to lose the work.
+  //
+  // It belongs here for the same reason the tool allowlist does — the whole
+  // plan is judged before any part of it takes effect.
+  if (job.phase !== 'execute') {
+    return {
+      status: 'rejected',
+      code: 'job_not_executable',
+      reason: `job ${job.jobId} is in phase ${job.phase}, not execute`,
+    };
+  }
 
   const problems = planProblems(plan);
   if (problems.length > 0) {
@@ -196,16 +247,18 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
   }
 
   // The plan is bound to the job before a single step runs, so that a re-plan
-  // is refused rather than half-applied on top of work already done.
+  // is refused rather than half-applied on top of work already done. A re-plan
+  // over a job that has executed *nothing* is not that, and is allowed —
+  // `bindPlanToJob` draws the line.
   const binding = await bindPlanToJob(job.jobId, plan, { businessId: job.businessId });
   if (binding.status === 'conflict') {
     return {
       status: 'rejected',
       code: 'plan_changed_mid_flight',
       reason:
-        `job ${job.jobId} is already executing plan ${binding.storedHash.slice(0, 12)}; ` +
-        `${binding.offeredHash.slice(0, 12)} is a different plan and its steps cannot be ` +
-        'merged onto work that has already happened',
+        `job ${job.jobId} has already executed steps of plan ` +
+        `${binding.storedHash.slice(0, 12)}; ${binding.offeredHash.slice(0, 12)} is a ` +
+        'different plan and its steps cannot be merged onto work that has already happened',
     };
   }
   const planHash = binding.planHash;
@@ -224,7 +277,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       const externalId = alreadyDone.get(step.id) ?? null;
       records.push({
         stepId: step.id,
-        outcome: { status: 'done', result: null, spendRecorded: false, externalId },
+        outcome: { status: 'skipped', externalId },
         externalId,
         skipped: true,
       });
@@ -278,6 +331,20 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
         businessId: current.businessId,
       });
     }
+  }
+
+  // The plan is finished. If the job is still in `execute`, no step ran in
+  // this pass — every one was already recorded, or the last one was — and the
+  // phase never moved. `LEGAL_TRANSITIONS` has no `execute → closed`, so a
+  // caller acting on this `done` would throw on the next move. Advance it here
+  // instead, exactly as a step that actually ran would have.
+  if (current.phase === 'execute') {
+    current = await transition(current.jobId, {
+      to: 'verify',
+      actor: 'orchestrator',
+      reason: 'plan complete — every step already recorded',
+      businessId: current.businessId,
+    });
   }
 
   return { status: 'done', steps: records };

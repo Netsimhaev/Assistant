@@ -12,7 +12,9 @@ import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
 import { envCredentials } from './credentials.js';
+import { pendingApprovals } from '../governance/approvals.js';
 import { applyDecision } from './resume.js';
+import { planHashOf } from './plan-store.js';
 import { runPlan, type RunPlanResult } from './run-plan.js';
 
 const BUSINESS = 'test-business';
@@ -304,6 +306,18 @@ describe('a resumed plan does not re-run what already ran', () => {
     expect(second.steps[0]?.skipped).toBe(true);
     // The reply the customer already had must not arrive a second time.
     expect(mailsTo(sent, 'a@b.com')).toBe(1);
+
+    // And what the second step actually does, which is not "run". The gate has
+    // no path that spends an approval a human already granted, so it queues a
+    // NEW one and the step waits again. Asserted rather than left unsaid: the
+    // docblocks now say an approval is the one deferral that does not
+    // complete, and a test that checked only step one would have let this
+    // branch claim a story it does not deliver.
+    expect(second.steps[1]?.outcome.status).toBe('awaiting_approval');
+    expect(mailsTo(sent, 'new@example.com')).toBe(0);
+    const queuedTwice = await pendingApprovals({ businessId: BUSINESS });
+    expect(queuedTwice).toHaveLength(1);
+    expect(queuedTwice[0]?.approvalId).not.toBe(approvalId);
   });
 
   it('refuses a different plan for a job already mid-flight, and runs nothing', async () => {
@@ -394,6 +408,201 @@ describe('a resumed plan does not re-run what already ran', () => {
     if (second.status !== 'done') throw new Error('unreachable');
     expect(second.steps[0]?.skipped).toBe(true);
     expect(second.steps[0]?.externalId).toBe('MSG-1');
+  });
+});
+
+describe('nothing is bound until the job can actually run', () => {
+  it('refuses a job that is not in execute without binding its plan', async () => {
+    // The race that loses a customer's work: `runPlanForJob` arrives a
+    // millisecond after the scheduler parked the job in `followup`. Binding
+    // first and checking the phase per-step later left the job tied forever to
+    // a plan that never ran, and nothing deletes a `job_plans` row.
+    const bundle = await install([MAIL_CONNECTION, WA_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { sent, wa, registry } = world();
+    const bindings = [MAIL_LIVE, WA_LIVE];
+
+    await transition(job.jobId, {
+      to: 'followup',
+      actor: 'system',
+      reason: 'parked a moment before the run arrived',
+      wakeAt: NOON,
+      businessId: BUSINESS,
+    });
+
+    const parked = await runPlan({
+      job: await reload(job.jobId),
+      bundle,
+      plan: twoStepPlan('תוכנית שלא רצה מעולם'),
+      registry,
+      bindings,
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(parked.status).toBe('rejected');
+    if (parked.status !== 'rejected') throw new Error('unreachable');
+    expect(parked.code).toBe('job_not_executable');
+    expect(sent).toEqual([]);
+
+    // Nothing was written down, so the job is not tied to anything.
+    const { rows } = await getPool().query('SELECT 1 FROM job_plans WHERE job_id = $1', [
+      job.jobId,
+    ]);
+    expect(rows).toHaveLength(0);
+
+    // The job then wakes legitimately and runs its real plan.
+    wa.reachable = true;
+    const real = await runPlan({
+      job: await wake(job.jobId),
+      bundle,
+      plan: twoStepPlan(),
+      registry,
+      bindings,
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+    expect(real.status).toBe('done');
+    expect(sent).toHaveLength(1);
+  });
+});
+
+describe('re-planning is refused only over work that happened', () => {
+  it('replaces the binding when the first plan executed nothing', async () => {
+    // A step-one failure is when re-planning is most useful and completely
+    // safe. Refusing it forced a caller to reproduce the original plan byte
+    // for byte to recover.
+    const bundle = await install([MAIL_CONNECTION, WA_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { sent, registry } = world();
+    const bindings = [MAIL_LIVE, WA_LIVE];
+
+    const waOnly = Plan.parse({
+      goal: 'לעדכן בוואטסאפ',
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.whatsapp',
+          intent: 'reply',
+          toolName: 'wa.send_message',
+          input: {
+            to: '+972500000000',
+            conversationId: 'w1',
+            counterpartyId: 'c_812',
+            body: 'עדכון',
+          },
+        },
+      ],
+    });
+
+    // The bridge is down, so the only step defers and records nothing.
+    const first = await runPlan({
+      job,
+      bundle,
+      plan: waOnly,
+      registry,
+      bindings,
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+    expect(first.status).toBe('halted');
+    const { rows: none } = await getPool().query(
+      'SELECT 1 FROM job_step_results WHERE job_id = $1',
+      [job.jobId],
+    );
+    expect(none).toHaveLength(0);
+
+    // A different plan entirely — reach the customer by mail instead.
+    const mailOnly = Plan.parse({
+      goal: 'לענות במייל במקום',
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'reply',
+          toolName: 'mail.send',
+          input: { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812', subject: 'ש', body: 'ג' },
+        },
+      ],
+    });
+
+    const second = await runPlan({
+      job: await wake(job.jobId),
+      bundle,
+      plan: mailOnly,
+      registry,
+      bindings,
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(second.status).toBe('done');
+    expect(sent).toHaveLength(1);
+
+    // The job is bound to the new plan now, not the abandoned one.
+    const { rows } = await getPool().query<{ plan_hash: string }>(
+      'SELECT plan_hash FROM job_plans WHERE job_id = $1',
+      [job.jobId],
+    );
+    expect(rows[0]?.plan_hash).toBe(planHashOf(mailOnly));
+  });
+});
+
+describe('a run that performs nothing still leaves a phase a caller can act on', () => {
+  it('moves to verify when every step was already recorded', async () => {
+    const bundle = await install([MAIL_CONNECTION, WA_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { wa, registry } = world();
+    wa.reachable = true;
+    const bindings = [MAIL_LIVE, WA_LIVE];
+    const run = (j: Job): Promise<RunPlanResult> =>
+      runPlan({
+        job: j,
+        bundle,
+        plan: twoStepPlan(),
+        registry,
+        bindings,
+        credentials: CREDENTIALS,
+        counterpartyTags: [],
+        rampLevel: 'auto',
+        now: NOON,
+      });
+
+    expect((await run(job)).status).toBe('done');
+    expect((await reload(job.jobId)).phase).toBe('verify');
+
+    // The same plan handed back once more — every step is on record.
+    await transition(job.jobId, {
+      to: 'execute',
+      actor: 'orchestrator',
+      reason: 'handed the same plan again',
+      businessId: BUSINESS,
+    });
+    const again = await run(await reload(job.jobId));
+    expect(again.status).toBe('done');
+    if (again.status !== 'done') throw new Error('unreachable');
+    expect(again.steps.every((record) => record.skipped)).toBe(true);
+
+    // `execute` is not a phase a finished plan may sit in: LEGAL_TRANSITIONS
+    // has no edge from it to `closed`, so a caller acting on this `done` would
+    // throw on its next move.
+    expect((await reload(job.jobId)).phase).toBe('verify');
+    await expect(
+      transition(job.jobId, {
+        to: 'remember',
+        actor: 'orchestrator',
+        reason: 'the caller carries on',
+        businessId: BUSINESS,
+      }),
+    ).resolves.toBeTruthy();
   });
 });
 

@@ -79,6 +79,13 @@ export type StepOutcome =
  * instead of doing it again. The deferred step itself recorded nothing,
  * correctly: it did not happen.
  *
+ * **`awaiting_approval` is not a bookmark in that sense.** The steps before it
+ * resume as above, but this step will not: `evaluateToolCall` never consults
+ * an approval already granted, so a re-run recomputes `needsApproval` and
+ * enqueues a second request. A human can approve as many times as they like
+ * and the step still will not run. Spending an existing approval — TOCTOU hash
+ * check included — is work the gate has not been taught yet.
+ *
  * What that does not buy is exactly-once. A crash between the external call
  * returning and the completion committing leaves the step done and unrecorded,
  * and the resumed run repeats it; `recordStepCompletion` states the limit in
