@@ -46,6 +46,11 @@ const MAX_BODY_BYTES = 64 * 1024;
 
 export interface DashboardOptions {
   businessId?: string;
+  /**
+   * Permission to bind an interface other than loopback. Off by default, and
+   * `assertBindableHost` refuses loudly without it.
+   */
+  allowNonLoopbackBind?: boolean;
   /** Loopback by default — see docs/dashboard-deployment.md for why this must never change in a real deployment. */
   host?: string;
   /** 0 lets the OS assign a free port; tests always pass 0 so runs never collide. */
@@ -430,6 +435,47 @@ async function route(
   sendHtml(res, 404, renderNotFound());
 }
 
+/**
+ * Hosts that are only reachable from this machine. A positive list, never
+ * "anything that is not 0.0.0.0": an address this file has not heard of is
+ * one nobody has reasoned about, and the safe reading of that is "not
+ * loopback".
+ */
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['localhost', '::1', '[::1]', '::ffff:127.0.0.1']);
+
+function isLoopbackHost(host: string): boolean {
+  if (LOOPBACK_HOSTS.has(host)) return true;
+  // The whole 127.0.0.0/8 block, which is what a loopback IPv4 address is.
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+/**
+ * Refuse to bind anything but loopback, unless a caller explicitly says
+ * otherwise — and refuse loudly.
+ *
+ * This server does not terminate TLS (docs/dashboard-deployment.md), and it
+ * sets `Secure` on the session cookie. Bind `0.0.0.0` and the result is
+ * plaintext HTTP serving cookies a browser will refuse to send back: the
+ * deployment does not break in any way that says what is wrong, it just
+ * silently stops authenticating anyone, forever, while also exposing the
+ * login form and every approval card to the network in the clear.
+ *
+ * A misconfiguration whose only symptom is "nobody can log in" is worth
+ * throwing over. `DASHBOARD_HOST` used to be honoured verbatim.
+ *
+ * Exported so the refusal can be tested without actually opening a socket on
+ * a public interface.
+ */
+export function assertBindableHost(host: string, allowNonLoopback: boolean): void {
+  if (isLoopbackHost(host) || allowNonLoopback) return;
+  throw new Error(
+    `dashboard refuses to bind "${host}": it does not terminate TLS and sets Secure cookies, ` +
+      'so a non-loopback bind serves the login form in the clear and silently stops ' +
+      'authenticating anyone. Put a tunnel or reverse proxy in front and keep the bind on ' +
+      '127.0.0.1, or set DASHBOARD_ALLOW_PUBLIC_BIND=1 if you really mean it.',
+  );
+}
+
 export function createServer(options: DashboardOptions = {}): Server {
   const businessId = options.businessId ?? config.businessId;
   // Loopback only, always — see docs/dashboard-deployment.md. This server
@@ -437,6 +483,7 @@ export function createServer(options: DashboardOptions = {}): Server {
   // through a tunnel or reverse proxy that does, never by binding a public
   // interface here.
   const host = options.host ?? '127.0.0.1';
+  assertBindableHost(host, options.allowNonLoopbackBind ?? false);
 
   const server = createHttpServer((req, res) => {
     route(req, res, businessId, options.trustProxy ?? false).catch((err: unknown) => {

@@ -13,7 +13,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
-import { createServer } from './server.js';
+import { assertBindableHost, createServer } from './server.js';
 
 const BUSINESS = 'test-business';
 const OTHER_BUSINESS = 'test-business-other';
@@ -359,6 +359,25 @@ describe('recovery-code login', () => {
     const res = await fetch(`${baseUrl}/`, { headers: { cookie } });
     const body = await res.text();
     expect(body).toContain(String(expected));
+  });
+});
+
+describe('which interface it will bind', () => {
+  // Tested through the predicate rather than by opening a socket: the point
+  // is the refusal, and actually binding a public interface in a test suite
+  // is the thing the refusal exists to stop.
+  it('refuses a non-loopback host, loudly, and names the way out', () => {
+    for (const host of ['0.0.0.0', '::', '192.168.1.10', 'dashboard.example.com', '']) {
+      expect(() => assertBindableHost(host, false), host).toThrow(/refuses to bind/);
+    }
+    expect(() => assertBindableHost('0.0.0.0', false)).toThrow(/DASHBOARD_ALLOW_PUBLIC_BIND/);
+  });
+
+  it('allows every loopback form, and a public bind that was explicitly asked for', () => {
+    for (const host of ['127.0.0.1', '127.1.2.3', 'localhost', '::1', '[::1]']) {
+      expect(() => assertBindableHost(host, false), host).not.toThrow();
+    }
+    expect(() => assertBindableHost('0.0.0.0', true)).not.toThrow();
   });
 });
 

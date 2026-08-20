@@ -24,8 +24,21 @@ const host = process.env['DASHBOARD_HOST'] ?? '127.0.0.1';
  * a recovery code chooses what the audit log says about where they were.
  */
 const trustProxy = process.env['DASHBOARD_TRUST_PROXY'] === '1';
+/**
+ * `DASHBOARD_HOST` used to be honoured verbatim, so `0.0.0.0` produced
+ * plaintext HTTP with `Secure` cookies — a deployment that fails as "nobody
+ * can log in" and says nothing about why. `createServer` now refuses a
+ * non-loopback bind unless this is set.
+ */
+const allowNonLoopbackBind = process.env['DASHBOARD_ALLOW_PUBLIC_BIND'] === '1';
 
-const server = createServer({ businessId: config.businessId, host, port, trustProxy });
+const server = createServer({
+  businessId: config.businessId,
+  host,
+  port,
+  trustProxy,
+  allowNonLoopbackBind,
+});
 
 server.on('listening', () => {
   const address = server.address() as AddressInfo;
