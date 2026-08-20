@@ -35,19 +35,16 @@ export interface GateContext extends FactsContext {
   /** Injectable clock. The quiet-hours check is the only time-dependent step. */
   now?: Date;
   /**
-   * An approval a human already granted for THIS step.
+   * An approval a human already granted for this step, and the step spending
+   * it. One field, both required: the gate has no step of its own, and a
+   * consumption recorded against no step defeats the audit trail the column
+   * exists for. Supplying one without the other is not expressible.
    *
    * Supplied by the executor when it resumes a job that was parked on an
    * approval. Without it the gate recomputes `needsApproval` and queues a
    * second request, and the step never runs however many times it is approved.
    */
-  approvalId?: string;
-  /**
-   * The step spending `approvalId`. The two travel together and neither is
-   * useful alone: the gate sees one tool call and has no step of its own, and
-   * `consumed_by_step` exists so the chain can be read back afterwards.
-   */
-  stepId?: string;
+  approval?: { approvalId: string; stepId: string };
 }
 
 /**
@@ -256,18 +253,28 @@ export async function evaluateToolCall(
     return deny(`${DENY_CODES.riskBlocked}:${risk.actionId}`, risk.explanation);
   }
 
+  // Computed once and shared by both `allow` returns below (spending an
+  // approval, and the normal unattended path). The two must return the same
+  // payload for the same call — a spent approval that redacted a payload the
+  // human approved unredacted would run a *different* action than the one
+  // shown to them, and a normal allow that skipped redaction on an outbound
+  // call would leak. One expression is what keeps those two returns from
+  // drifting the way `approvalId`'s redaction and the plain allow's already
+  // had.
+  const permittedInput = outbound ? redactPayload(toolInput, ctx.bundle) : toolInput;
+
   // An approval a person already granted is spent here, before the gate asks
   // for another one. Placed after the `blocked` check on purpose: an approval
   // is permission to do something questionable, never permission to do
   // something the charter forbids outright.
-  if (ctx.approvalId !== undefined) {
+  if (ctx.approval !== undefined) {
     const spent = await consumeApproval({
-      approvalId: ctx.approvalId,
+      approvalId: ctx.approval.approvalId,
       // An approval always belongs to a job. A context carrying an approval
       // id and no job id cannot match any row, so it falls through and queues
       // a fresh request — which is the safe direction for a malformed call.
       jobId: ctx.jobId ?? '',
-      stepId: ctx.stepId ?? '',
+      stepId: ctx.approval.stepId,
       liveInputHash: facts.inputHash,
       businessId,
       ...(ctx.db ? { db: ctx.db } : {}),
@@ -285,7 +292,7 @@ export async function evaluateToolCall(
           provenance: facts.provenance,
           inputHash: facts.inputHash,
           risk,
-          reason: `approval_consumed:${ctx.approvalId} (intent seq ${intent.seq})`,
+          reason: `approval_consumed:${ctx.approval.approvalId} (intent seq ${intent.seq})`,
         },
         { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
       );
@@ -293,7 +300,7 @@ export async function evaluateToolCall(
       return {
         outcome: 'allow',
         effectiveAutonomy: effective,
-        redactedInput: redactPayload(toolInput, ctx.bundle),
+        redactedInput: permittedInput,
       };
     }
     // Every failure code falls through to the normal path, which queues a
@@ -348,8 +355,10 @@ export async function evaluateToolCall(
     outcome: 'allow',
     effectiveAutonomy: effective,
     // Redaction happens here and not in the agent, because the agent is the
-    // component we are least able to trust to have done it.
-    redactedInput: outbound ? redactPayload(toolInput, ctx.bundle) : toolInput,
+    // component we are least able to trust to have done it. Shared with the
+    // approval-consumption return above via `permittedInput` — see its
+    // comment for why that sharing is the point.
+    redactedInput: permittedInput,
   };
 }
 
