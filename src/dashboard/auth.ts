@@ -12,7 +12,13 @@ const scrypt = promisify(scryptCb) as (
 const KEY_LENGTH = 64;
 const MAX_FAILED = 5;
 const LOCK_MINUTES = 15;
-const SESSION_HOURS = 12;
+/**
+ * Exported because the dashboard server needs the same number twice: once to
+ * compute a session's `expires_at` (here) and once to set the cookie's
+ * `Max-Age` (server.ts) — hardcoding it a second time invites the two to
+ * drift.
+ */
+export const SESSION_HOURS = 12;
 /** Raw session token size. 256 bits — comfortably more than a browser cookie needs to resist guessing. */
 const TOKEN_BYTES = 32;
 
@@ -94,6 +100,7 @@ interface SessionRow {
   username: string;
   expires_at: Date;
   revoked_at: Date | null;
+  must_change_password: boolean;
 }
 
 export async function createOwner(input: {
@@ -228,15 +235,15 @@ export async function login(input: {
   return { ok: true, sessionId: token };
 }
 
-export async function verifySession(
+async function loadSession(
   sessionId: string,
-  options: { businessId?: string; now?: Date } = {},
-): Promise<{ username: string } | null> {
+  options: { businessId?: string; now?: Date },
+): Promise<{ username: string; mustChangePassword: boolean } | null> {
   const businessId = options.businessId ?? config.businessId;
   const now = options.now ?? new Date();
 
   const { rows } = await getPool().query<SessionRow>(
-    `SELECT username, expires_at, revoked_at
+    `SELECT username, expires_at, revoked_at, must_change_password
        FROM dashboard_sessions
       WHERE session_id = $1 AND business_id = $2`,
     [hashToken(sessionId), businessId],
@@ -246,7 +253,61 @@ export async function verifySession(
   if (row.revoked_at !== null) return null;
   if (row.expires_at.getTime() <= now.getTime()) return null;
 
-  return { username: row.username };
+  return { username: row.username, mustChangePassword: row.must_change_password };
+}
+
+export async function verifySession(
+  sessionId: string,
+  options: { businessId?: string; now?: Date } = {},
+): Promise<{ username: string } | null> {
+  const result = await loadSession(sessionId, options);
+  return result ? { username: result.username } : null;
+}
+
+/**
+ * Same lookup as `verifySession`, plus whether this particular session was
+ * minted mid recovery-code login and has not yet been through a password
+ * change. `verifySession` keeps its narrower `{ username }` shape because
+ * every existing caller already asserts an exact match against it
+ * (`toEqual({ username })`); adding a field there would break all of them.
+ * The dashboard is the one caller that needs the extra bit, to redirect
+ * everywhere except `/password` until it clears.
+ */
+export async function verifySessionDetails(
+  sessionId: string,
+  options: { businessId?: string; now?: Date } = {},
+): Promise<{ username: string; mustChangePassword: boolean } | null> {
+  return loadSession(sessionId, options);
+}
+
+/**
+ * Mint a session without a password check.
+ *
+ * Two callers need this, and neither has a password to verify: the dashboard
+ * after a recovery code was just redeemed (proof of ownership already came
+ * from `redeemRecoveryCode`, which also revoked every prior session — this
+ * only writes the new one `login`'s success path would have written), and
+ * the dashboard again right after `setPassword` completes, so the owner who
+ * just finished the forced password change lands back in the app instead of
+ * at a login form.
+ */
+export async function startSession(
+  username: string,
+  options: { businessId?: string; now?: Date; mustChangePassword?: boolean } = {},
+): Promise<string> {
+  const businessId = options.businessId ?? config.businessId;
+  const now = options.now ?? new Date();
+  const token = randomBytes(TOKEN_BYTES).toString('hex');
+  const expiresAt = new Date(now.getTime() + SESSION_HOURS * 3600_000);
+
+  await getPool().query(
+    `INSERT INTO dashboard_sessions
+       (session_id, business_id, username, created_at, expires_at, must_change_password)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [hashToken(token), businessId, username, now, expiresAt, options.mustChangePassword ?? false],
+  );
+
+  return token;
 }
 
 export async function revokeAllSessions(
