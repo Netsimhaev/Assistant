@@ -106,10 +106,15 @@ describe('controls that identify by one key must check every key', () => {
 
     // Against one flat list, `entityId: <a tag>` scored as a resolved
     // recipient and skipped the first-contact escalation.
+    //
+    // Provenance is 'staff', not the default 'boss': a boss-origin first
+    // contact is exempt from this escalation on purpose (naming the
+    // counterparty WAS the approval), so it would not tell resolved from
+    // unresolved apart here. Staff stays inside the escalation.
     const decision = await evaluateToolCall(
       'mail.send',
       { to: 'x@example.com', entityId: 'לקוח ותיק', inReplyTo: 'm1' },
-      ctx(bundle),
+      ctx(bundle, { provenance: 'staff' }),
     );
 
     expect(decision.outcome).toBe('queue_approval');
@@ -314,10 +319,15 @@ describe('broad domain matching widens what gets blocked, never what gets truste
     // class -- decides allow vs. queue_approval. 'promo.mail.acme.co.il' is
     // a subdomain of the known 'acme.co.il', but knownCounterparties matches
     // exactly, so this must still be scored as an unresolved first contact.
+    //
+    // Provenance is 'staff', not the default 'boss': a boss-origin first
+    // contact is exempt from this escalation on purpose, so it would not
+    // distinguish the subdomain bypass this test guards against. Staff
+    // stays inside the escalation.
     const decision = await evaluateToolCall(
       'mail.send',
       { to: 'dana@promo.mail.acme.co.il', inReplyTo: 't-1', body: 'שלום' },
-      ctx(bundle),
+      ctx(bundle, { provenance: 'staff' }),
     );
 
     expect(decision.outcome).toBe('queue_approval');

@@ -211,6 +211,35 @@ function scoreSensitivity(facts: ActionFacts): RiskDimensions['dataSensitivity']
 }
 
 /**
+ * Origins whose instruction IS the approval, so a first contact from them does
+ * not escalate.
+ *
+ * A positive list, not "anything that is not untrusted": a TrustLevel added to
+ * the enum later stays inside the escalation until someone decides otherwise
+ * in this file, which is the safe direction to be wrong in.
+ *
+ * `provenance` is the LEAST trusted link in the causal chain, not whoever
+ * spoke first — which is what makes this narrow. "Send a quote to
+ * dana@newcompany.co.il" carries `boss` and goes. "Read this email and reply
+ * to the sender" carries the inbound email's level and still escalates: the
+ * boss gave a generic instruction and someone else chose the address.
+ */
+const FIRST_CONTACT_EXEMPT: ReadonlySet<TrustLevel> = new Set<TrustLevel>(['boss']);
+
+/**
+ * Whether this first contact needs a human because nobody trustworthy vouched
+ * for the address. Shared by `bandFor` and `explain` so the escalation and its
+ * stated reason can never drift apart — a past defect in this plan was exactly
+ * two copies of one rule disagreeing.
+ */
+function isUnvettedFirstContact(dimensions: RiskDimensions, facts: ActionFacts): boolean {
+  return (
+    dimensions.externalVisibility.audience === 'one_unknown' &&
+    !FIRST_CONTACT_EXEMPT.has(facts.provenance)
+  );
+}
+
+/**
  * Band assignment. The total is only one input — several dimensions escalate on
  * their own, because an action can be cheap and average and still be the one
  * you want a human to look at.
@@ -233,8 +262,10 @@ function bandFor(
   if (Math.abs(dimensions.novelty.z) > ANOMALY_Z_THRESHOLD) return 'anomalous';
   if (dimensions.charterFit.verdict === 'ambiguous') return 'anomalous';
 
-  // First contact with a party we cannot resolve is the classic sensitive case.
-  if (dimensions.externalVisibility.audience === 'one_unknown') return 'sensitive';
+  // First contact with a party we cannot resolve is the classic sensitive
+  // case — unless the instruction came from the boss, in which case naming
+  // the counterparty WAS the approval.
+  if (isUnvettedFirstContact(dimensions, facts)) return 'sensitive';
 
   if (total > SENSITIVE_MAX_TOTAL) return 'anomalous';
   if (total > ROUTINE_MAX_TOTAL) return 'sensitive';
@@ -260,7 +291,7 @@ function explain(
   if (Math.abs(dimensions.novelty.z) > ANOMALY_Z_THRESHOLD) {
     reasons.push(`חריגה מהרגיל (z=${dimensions.novelty.z.toFixed(1)})`);
   }
-  if (dimensions.externalVisibility.audience === 'one_unknown') {
+  if (isUnvettedFirstContact(dimensions, facts)) {
     reasons.push('מגע ראשון עם גורם לא מזוהה');
   }
   if (dimensions.provenance.level === 'unknown_external' || dimensions.provenance.level === 'open_web') {

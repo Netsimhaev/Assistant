@@ -644,10 +644,17 @@ describe('regressions found in review', () => {
     // `buildFacts` falls back to the payload's `entityId`, so any outbound
     // payload carrying that field scored as `one_known` (25) instead of
     // `one_unknown` (55) and dropped out of the sensitive band.
+    //
+    // Provenance is 'staff', not the default 'boss': a boss-origin first
+    // contact is now exempt from the escalation this test checks for (the
+    // boss named the counterparty, so asking again would be redundant), so
+    // it would no longer distinguish resolved from unresolved here. Staff
+    // is not on that exempt list, so the escalation this test targets still
+    // fires.
     const decision = await evaluateToolCall(
       'mail.send',
       { to: 'x@example.com', entityId: 'not_in_the_charter', inReplyTo: 't-9' },
-      ctx(bundle),
+      ctx(bundle, { provenance: 'staff' }),
     );
 
     expect(decision.outcome).toBe('queue_approval');
