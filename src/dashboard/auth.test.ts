@@ -120,6 +120,22 @@ describe('login', () => {
     });
     expect(afterCooldown.ok).toBe(true);
   });
+
+  it('locks the account when five wrong attempts arrive concurrently', async () => {
+    // A read-modify-write increment (SELECT failed_attempts, add one in
+    // JavaScript, write it back) lets every one of these read the same
+    // stale count and each write back the same incremented value — the
+    // counter would advance by one instead of by five and the account
+    // would never lock. The increment must happen inside a single SQL
+    // UPDATE so Postgres's row lock serialises the five attempts.
+    await Promise.all(
+      Array.from({ length: 5 }, () =>
+        login({ username: USERNAME, password: 'wrong password', businessId: BUSINESS }),
+      ),
+    );
+    const result = await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+    expect(result).toEqual({ ok: false, code: 'locked' });
+  });
 });
 
 describe('sessions', () => {
@@ -169,6 +185,33 @@ describe('sessions', () => {
   it('does not verify a session token that was never issued', async () => {
     const verified = await verifySession('0'.repeat(64), { businessId: BUSINESS });
     expect(verified).toBeNull();
+  });
+});
+
+describe('tenant isolation', () => {
+  const OTHER_BUSINESS = 'test-business-other';
+
+  it('a user in one business is invisible to a login under another', async () => {
+    await createOwner({ username: USERNAME, password: PASSWORD, businessId: OTHER_BUSINESS });
+
+    const result = await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+    expect(result).toEqual({ ok: false, code: 'bad_credentials' });
+  });
+
+  it('a session created under one business is invisible to a lookup under another', async () => {
+    await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+    await createOwner({ username: USERNAME, password: PASSWORD, businessId: OTHER_BUSINESS });
+
+    const result = await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    // Same raw token, wrong tenant scope: must not resolve.
+    expect(await verifySession(result.sessionId, { businessId: OTHER_BUSINESS })).toBeNull();
+    // Right tenant: still resolves.
+    expect(await verifySession(result.sessionId, { businessId: BUSINESS })).toEqual({
+      username: USERNAME,
+    });
   });
 });
 

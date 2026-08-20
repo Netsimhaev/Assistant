@@ -68,14 +68,12 @@ function hashToken(token: string): string {
 interface UserRow {
   password_hash: string;
   password_salt: string;
-  failed_attempts: number;
   locked_until: Date | null;
 }
 
 interface UserRecord {
   passwordHash: string;
   passwordSalt: string;
-  failedAttempts: number;
   lockedUntil: Date | null;
 }
 
@@ -83,7 +81,6 @@ function toUserRecord(row: UserRow): UserRecord {
   return {
     passwordHash: row.password_hash,
     passwordSalt: row.password_salt,
-    failedAttempts: row.failed_attempts,
     lockedUntil: row.locked_until,
   };
 }
@@ -119,7 +116,7 @@ export async function login(input: {
   const db = getPool();
 
   const { rows } = await db.query<UserRow>(
-    `SELECT password_hash, password_salt, failed_attempts, locked_until
+    `SELECT password_hash, password_salt, locked_until
        FROM dashboard_users
       WHERE business_id = $1 AND username = $2`,
     [businessId, input.username],
@@ -140,18 +137,36 @@ export async function login(input: {
   // the only moment that matters. Resetting failed_attempts alongside
   // locked_until means the cooldown grants a fresh five attempts, not "one
   // more try before an instant re-lock".
+  //
+  // The `locked_until <= $3` predicate is re-checked by Postgres in the
+  // WHERE clause, not trusted from the JS-side read above: if a concurrent
+  // failed attempt re-locked the account between our SELECT and this
+  // UPDATE, the predicate no longer holds and the statement becomes a
+  // no-op instead of clobbering the fresh lock a moment after it was set.
   if (user.lockedUntil !== null && user.lockedUntil.getTime() <= now.getTime()) {
-    await db.query(
+    const cleared = await db.query(
       `UPDATE dashboard_users SET failed_attempts = 0, locked_until = NULL
-        WHERE business_id = $1 AND username = $2`,
-      [businessId, input.username],
+        WHERE business_id = $1 AND username = $2 AND locked_until <= $3`,
+      [businessId, input.username, now],
     );
-    user.failedAttempts = 0;
-    user.lockedUntil = null;
+    if ((cleared.rowCount ?? 0) > 0) {
+      user.lockedUntil = null;
+    }
+    // If the UPDATE was a no-op, `user.lockedUntil` is left at the stale
+    // (expired, by our own read) timestamp — still non-null, so the check
+    // below still reports "locked", which happens to be correct: a no-op
+    // here means someone else's fresh lock won the race.
   }
 
   // A locked account refuses even the correct password — checked before
-  // spending scrypt on the password at all.
+  // spending scrypt on the password at all. This means a known-but-locked
+  // account returns 'locked' cheaply, while an unknown username still pays
+  // the decoy scrypt cost above. That is not a reintroduction of the
+  // username-enumeration timing gap the decoy exists to close: the two
+  // cases already return different codes ('locked' vs 'bad_credentials'),
+  // so there is nothing hidden left for response time to leak. Do not
+  // "fix" this by paying scrypt here too — it would just be a cost with no
+  // corresponding secret to protect.
   if (user.lockedUntil !== null) {
     return { ok: false, code: 'locked' };
   }
@@ -159,13 +174,27 @@ export async function login(input: {
   const valid = await verifyPassword(input.password, user.passwordHash, user.passwordSalt);
 
   if (!valid) {
-    const failedAttempts = user.failedAttempts + 1;
-    const lockedUntil =
-      failedAttempts >= MAX_FAILED ? new Date(now.getTime() + LOCK_MINUTES * 60_000) : null;
+    // The increment happens in SQL, not JavaScript. Reading failed_attempts,
+    // adding one in application code, and writing the sum back is a classic
+    // read-modify-write race: fire N wrong-password attempts concurrently
+    // and every one of them reads the same stale count and writes back the
+    // same count + 1, so the counter advances by one instead of by N — the
+    // lockout threshold is never reached and the rate limit stops existing
+    // under any concurrency at all. `failed_attempts = failed_attempts + 1`
+    // computed by Postgres inside a single UPDATE is safe: Postgres holds a
+    // row lock for the duration of the UPDATE, so concurrent attempts
+    // against the same row serialise and each one sees the previous one's
+    // committed increment rather than a stale snapshot.
+    const lockUntilIfThresholdReached = new Date(now.getTime() + LOCK_MINUTES * 60_000);
     await db.query(
-      `UPDATE dashboard_users SET failed_attempts = $3, locked_until = $4
+      `UPDATE dashboard_users
+          SET failed_attempts = failed_attempts + 1,
+              locked_until = CASE
+                WHEN failed_attempts + 1 >= $3 THEN $4
+                ELSE locked_until
+              END
         WHERE business_id = $1 AND username = $2`,
-      [businessId, input.username, failedAttempts, lockedUntil],
+      [businessId, input.username, MAX_FAILED, lockUntilIfThresholdReached],
     );
     return { ok: false, code: 'bad_credentials' };
   }
