@@ -738,3 +738,152 @@ describe('the completion and the transition it belongs to are one write', () => 
     }
   });
 });
+
+describe('a dispatched call whose outcome nobody knows is not "nothing ran"', () => {
+  /**
+   * A mail adapter that accepts the call and then stalls past the deadline,
+   * until the test lets it answer. It records the idempotency key of every
+   * dispatch, which is the thing the far end would deduplicate on.
+   */
+  function stalling(): {
+    dispatched: string[];
+    state: { hang: boolean };
+    registry: AdapterRegistry;
+  } {
+    const dispatched: string[] = [];
+    const state = { hang: true };
+    const adapter: ExternalAdapter = {
+      system: 'office-mail',
+      channel: 'api',
+      serves: ['mail.send'],
+      async execute(call): Promise<AdapterResult> {
+        dispatched.push(call.idempotencyKey);
+        if (state.hang) {
+          // The supplier took the order and went quiet. Nothing here can say
+          // whether it landed.
+          return new Promise<AdapterResult>(() => {
+            /* never settles */
+          });
+        }
+        return { ok: true, output: null, externalId: 'MSG-LATE' };
+      },
+    };
+    return { dispatched, state, registry: new AdapterRegistry([adapter]) };
+  }
+
+  function orderPlan(body: string): Plan {
+    return Plan.parse({
+      goal: 'להזמין מהספק',
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'reply',
+          toolName: 'mail.send',
+          input: { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812', subject: 'הזמנה', body },
+        },
+      ],
+    });
+  }
+
+  async function timedOut(): Promise<{
+    job: Job;
+    bundle: PolicyBundle;
+    dispatched: string[];
+    state: { hang: boolean };
+    registry: AdapterRegistry;
+  }> {
+    const bundle = await install([MAIL_CONNECTION]);
+    const job = await jobInExecute(bundle);
+    const { dispatched, state, registry } = stalling();
+
+    const first = await runPlan({
+      job,
+      bundle,
+      plan: orderPlan('הזמנה ראשונה'),
+      registry,
+      bindings: [MAIL_LIVE],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+      adapterTimeoutMs: 25,
+    });
+
+    expect(first.status).toBe('halted');
+    if (first.status !== 'halted') throw new Error('unreachable');
+    expect(first.reason).toBe('deferred');
+    expect(dispatched).toHaveLength(1);
+
+    // The row that says "we do not know", written with the move to followup.
+    const { rows } = await getPool().query<{ status: string; external_id: string | null }>(
+      'SELECT status, external_id FROM job_step_results WHERE job_id = $1',
+      [job.jobId],
+    );
+    expect(rows).toEqual([{ status: 'unknown', external_id: null }]);
+
+    return { job, bundle, dispatched, state, registry };
+  }
+
+  it('re-runs the step on a same-plan resume, under the identical idempotency key', async () => {
+    const { job, bundle, dispatched, state, registry } = await timedOut();
+
+    // The far end can answer now.
+    state.hang = false;
+    const second = await runPlan({
+      job: await wake(job.jobId),
+      bundle,
+      plan: orderPlan('הזמנה ראשונה'),
+      registry,
+      bindings: [MAIL_LIVE],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+      adapterTimeoutMs: 25,
+    });
+
+    expect(second.status).toBe('done');
+    if (second.status !== 'done') throw new Error('unreachable');
+    // Re-run, NOT skipped: the step may never have happened.
+    expect(second.steps[0]?.skipped).toBe(false);
+    expect(dispatched).toHaveLength(2);
+    // The one defence that works here — same job, same step id, same input,
+    // so the far end sees the same key and can deduplicate.
+    expect(dispatched[1]).toBe(dispatched[0]);
+
+    // The unknown row was promoted rather than left to re-run forever.
+    const { rows } = await getPool().query<{ status: string; external_id: string | null }>(
+      'SELECT status, external_id FROM job_step_results WHERE job_id = $1',
+      [job.jobId],
+    );
+    expect(rows).toEqual([{ status: 'completed', external_id: 'MSG-LATE' }]);
+  });
+
+  it('refuses a different plan over it, because the key that protects it would change', async () => {
+    const { job, bundle, dispatched, state, registry } = await timedOut();
+    state.hang = false;
+
+    const replanned = await runPlan({
+      job: await wake(job.jobId),
+      bundle,
+      // The planner reworded the order. Different input, therefore a different
+      // idempotency key, therefore no deduplication at the supplier — and the
+      // first order may well have landed.
+      plan: orderPlan('הזמנה מנוסחת מחדש'),
+      registry,
+      bindings: [MAIL_LIVE],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+      adapterTimeoutMs: 25,
+    });
+
+    expect(replanned.status).toBe('rejected');
+    if (replanned.status !== 'rejected') throw new Error('unreachable');
+    expect(replanned.code).toBe('plan_changed_mid_flight');
+    // Nothing was dispatched a second time.
+    expect(dispatched).toHaveLength(1);
+  });
+});

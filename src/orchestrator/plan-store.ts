@@ -12,13 +12,27 @@ import { canonicalHash } from '../util/canonical.js';
  * step one — re-sending a mail that had already gone out.
  */
 
-/** One finished step, as it is written down. */
+/**
+ * What is known about a step after the run that attempted it.
+ *
+ * `completed` — it finished, and `externalId` is the provider's handle on what
+ * it created.
+ *
+ * `unknown` — the call was dispatched and nothing authoritative came back.
+ * Only `adapter_timeout` produces this: an adapter's own `retryable: true` is
+ * a claim that nothing was created, and adapters honour it, but a deadline the
+ * orchestrator enforced from outside carries no such claim.
+ */
+export type StepResultStatus = 'completed' | 'unknown';
+
+/** One attempted step, as it is written down. */
 export interface StepCompletion {
   stepId: string;
   /** The plan this completion belongs to. Never omitted — see the table comment. */
   planHash: string;
   /** The provider's handle on what the step created, or null when it created nothing. */
   externalId: string | null;
+  status: StepResultStatus;
 }
 
 interface PlanRow {
@@ -75,10 +89,12 @@ export type PlanBinding =
  * belong to the plan that produced them and cannot be carried onto a re-plan,
  * least of all by matching step ids, which two unrelated plans may well share.
  *
- * The existence test is "any completion for this job", not "any completion
+ * The existence test is "any result row for this job", not "any completion
  * under the stored hash". A row under some third hash means the job's history
  * is not what the `job_plans` row claims, and replacing on top of that is the
- * merge this function exists to refuse.
+ * merge this function exists to refuse. It also counts `unknown` rows: a
+ * missing row is what licenses a replacement, so a dispatched call whose
+ * outcome nobody knows has to leave one behind or "nothing ran" is a guess.
  *
  * All of it inside one transaction with the stored row locked `FOR UPDATE`:
  * read-then-replace across two statements lets two runners both find zero
@@ -117,6 +133,12 @@ export async function bindPlanToJob(
     }
     if (stored.plan_hash === offeredHash) return { status: 'matched', planHash: offeredHash };
 
+    // Deliberately unfiltered by status, unlike `completedSteps`. A row that
+    // says `unknown` means a call was dispatched and nobody knows whether it
+    // landed — the outcome a different plan must never be layered on top of,
+    // because a re-plan changes the step id or the input and therefore the
+    // idempotency key, so the far end's own deduplication cannot fire and the
+    // order is placed a second time for real.
     const executed = await tx.query<{ step_id: string }>(
       'SELECT step_id FROM job_step_results WHERE business_id = $1 AND job_id = $2 LIMIT 1',
       [businessId, jobId],
@@ -155,6 +177,17 @@ export async function loadStoredPlan(
  * keeps two jobs that happen to name their steps `s1` from skipping each
  * other's work; the plan hash keeps a completion produced under one plan from
  * satisfying a step of another that shares an id.
+ *
+ * **Takes `completed` only, while `bindPlanToJob` counts both statuses. The
+ * asymmetry is the point, and unifying them reintroduces a real defect in one
+ * direction or the other.** An `unknown` step must be re-run by a resume of
+ * the SAME plan: the step id and input are unchanged, so `performStep` derives
+ * the identical idempotency key and the far end can deduplicate — that is the
+ * entire design of the timeout path. Skipping it instead would abandon a step
+ * that may never have happened. The other reader asks a different question —
+ * may a DIFFERENT plan be layered on top of this job — and there an `unknown`
+ * row is disqualifying, because a re-plan changes the key's inputs by
+ * definition and no deduplication can fire.
  */
 export async function completedSteps(
   jobId: string,
@@ -164,7 +197,8 @@ export async function completedSteps(
   const db = options.db ?? getPool();
   const { rows } = await db.query<StepResultRow>(
     `SELECT step_id, external_id FROM job_step_results
-      WHERE business_id = $1 AND job_id = $2 AND plan_hash = $3`,
+      WHERE business_id = $1 AND job_id = $2 AND plan_hash = $3
+        AND status = 'completed'`,
     [options.businessId ?? config.businessId, jobId, planHash],
   );
   return new Map(rows.map((row) => [row.step_id, row.external_id]));
@@ -205,17 +239,32 @@ export async function completedSteps(
  * daily and monthly ceilings therefore under-count real exposure in exactly
  * that window, and those ceilings are the only thing bounding it.
  *
- * `ON CONFLICT DO NOTHING` so that a step recorded twice is not an error. The
- * first record is the one that counts.
+ * The upsert **promotes and never demotes**. A step that timed out leaves an
+ * `unknown` row; the same-plan resume re-runs it and, on success, must turn
+ * that row into a `completed` one — `DO NOTHING` would leave it `unknown`
+ * forever and the step would re-run on every resume after that. The reverse
+ * is refused by the `WHERE`: a `completed` row is never overwritten, so a
+ * later timeout on an already-finished step cannot un-know it.
  */
 export async function recordStepCompletion(
   tx: pg.PoolClient,
   input: StepCompletion & { jobId: string; businessId: string },
 ): Promise<void> {
   await tx.query(
-    `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (business_id, job_id, plan_hash, step_id) DO NOTHING`,
-    [input.businessId, input.jobId, input.planHash, input.stepId, input.externalId],
+    `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (business_id, job_id, plan_hash, step_id) DO UPDATE
+        SET status = 'completed',
+            external_id = EXCLUDED.external_id,
+            completed_at = now()
+      WHERE job_step_results.status = 'unknown' AND EXCLUDED.status = 'completed'`,
+    [
+      input.businessId,
+      input.jobId,
+      input.planHash,
+      input.stepId,
+      input.externalId,
+      input.status,
+    ],
   );
 }

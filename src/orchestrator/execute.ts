@@ -182,12 +182,39 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
       // The far end being down is a reason to come back later, and the
       // scheduler already runs that loop.
       const wakeAt = new Date(now.getTime() + RETRY_DELAY_MS);
+
+      // A dispatched call that never answered leaves a row saying so, in this
+      // same transaction.
+      //
+      // Every other retryable failure carries the adapter's own claim that
+      // nothing was created, so a missing row honestly means "nothing
+      // happened". `adapter_timeout` carries no such claim — the call may or
+      // may not have landed — and a missing row there reads as "nothing ran",
+      // which is what licenses `bindPlanToJob` to replace the plan. A re-plan
+      // changes the step id or the input and therefore the idempotency key, so
+      // the far end cannot deduplicate and the order is placed a second time,
+      // for real. The row is `unknown`, not `completed`: a resume of the SAME
+      // plan still re-runs this step, under the identical key, which is the
+      // behaviour the timeout path is designed for.
+      const unknownOutcome =
+        error instanceof StepChannelError && error.outcomeUnknown;
+
       await transition(job.jobId, {
         to: 'followup',
         actor: 'orchestrator',
         reason: `${code} — retry:${request.stepId} at ${wakeAt.toISOString()}`,
         wakeAt,
         businessId: job.businessId,
+        ...(unknownOutcome && request.planHash !== undefined
+          ? {
+              completedStep: {
+                stepId: request.stepId,
+                planHash: request.planHash,
+                externalId: null,
+                status: 'unknown' as const,
+              },
+            }
+          : {}),
       });
       return { status: 'deferred', code, wakeAt: wakeAt.toISOString() };
     }
@@ -218,6 +245,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
             stepId: request.stepId,
             planHash: request.planHash,
             externalId: effect.externalId,
+            status: 'completed' as const,
           },
         }),
   });

@@ -477,6 +477,11 @@ async function callWithDeadline(
             'adapter_timeout',
             `${adapter.system} did not answer within ${timeoutMs}ms`,
             true,
+            // The outcome is unknown, not merely unsuccessful. Every other
+            // retryable failure carries an adapter's own claim that nothing
+            // was created; this one is imposed from outside the adapter and
+            // carries no claim at all.
+            true,
           ),
         ),
       timeoutMs,
