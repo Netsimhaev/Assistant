@@ -91,9 +91,11 @@ describe('owner:create', () => {
 });
 
 describe('owner:password', () => {
+  let creationIo: ReturnType<typeof fakeIo>;
+
   beforeEach(async () => {
-    const io = fakeIo([PASSWORD, PASSWORD]);
-    await createOwnerRun([USERNAME], io);
+    creationIo = fakeIo([PASSWORD, PASSWORD]);
+    await createOwnerRun([USERNAME], creationIo);
   });
 
   it('refuses a password passed as an argument, citing shell history', async () => {
@@ -122,14 +124,24 @@ describe('owner:password', () => {
     expect(withNew.ok).toBe(true);
   });
 
-  it('re-issues recovery codes on reset', async () => {
+  it('re-issues recovery codes on reset, replacing the old set entirely', async () => {
+    const codePattern = /^\s*\d+\.\s/;
+    const oldCodes = creationIo.prints.filter((line) => codePattern.test(line));
+    expect(oldCodes).toHaveLength(8);
+
     const newPassword = 'a brand new password';
     const io = fakeIo([newPassword, newPassword]);
     const code = await ownerPasswordRun([USERNAME], io);
     expect(code).toBe(0);
 
-    const codeLines = io.prints.filter((line) => /^\s*\d+\.\s/.test(line));
-    expect(codeLines).toHaveLength(8);
+    const newCodes = io.prints.filter((line) => codePattern.test(line));
+    expect(newCodes).toHaveLength(8);
+    // Not just "eight lines printed" — the strengthened assertion: this
+    // would still pass a command that reprinted the same eight codes it
+    // handed out at creation, which the weaker length-only check above did
+    // not rule out.
+    const overlap = newCodes.filter((line) => oldCodes.includes(line));
+    expect(overlap).toHaveLength(0);
   });
 
   it('refuses to reset a password for an account that does not exist', async () => {
