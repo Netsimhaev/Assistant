@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { createOwner, login } from './auth.js';
+import { createOwner, login, setPassword } from './auth.js';
 import { issueRecoveryCodes, redeemRecoveryCode, remainingCodes } from './recovery.js';
 
 const BUSINESS = 'test-business';
@@ -249,5 +249,35 @@ describe('redeemRecoveryCode', () => {
       businessId: BUSINESS,
     });
     expect(result).toEqual({ ok: false, code: 'no_match' });
+  });
+
+  it('a successful redemption clears the password lockout too, immediately', async () => {
+    // The whole point of recovery codes is to get back in when the password
+    // is the thing that's gone wrong. If redeeming one didn't also clear
+    // login's own lock, an owner who fat-fingered their password five times
+    // would redeem a code, set a new password, and still sit locked out for
+    // whatever's left of the fifteen-minute window — the escape hatch would
+    // complete and leave them exactly where they started.
+    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+
+    for (let i = 0; i < 5; i += 1) {
+      await login({ username: USERNAME, password: 'wrong password', businessId: BUSINESS });
+    }
+    const locked = await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+    expect(locked).toEqual({ ok: false, code: 'locked' });
+
+    const redeemed = await redeemRecoveryCode({
+      username: USERNAME,
+      code: codes[0]!,
+      businessId: BUSINESS,
+    });
+    expect(redeemed).toEqual({ ok: true });
+
+    const newPassword = 'a brand new recovered password';
+    await setPassword({ username: USERNAME, password: newPassword, businessId: BUSINESS });
+
+    // No waiting out the lock: immediate success, same tick.
+    const loginResult = await login({ username: USERNAME, password: newPassword, businessId: BUSINESS });
+    expect(loginResult.ok).toBe(true);
   });
 });

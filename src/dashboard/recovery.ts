@@ -149,7 +149,12 @@ async function recordFailedAttempt(
  * before touching any code hash, reported as `no_match` rather than a
  * distinct `locked` code — the interface has no third case, and leaking
  * lock state to whoever is submitting codes would hand an attacker a free
- * signal.
+ * signal. On a *successful* redemption, though, login's counter is cleared
+ * alongside recovery's own — that is not a reintroduction of the shared
+ * budget: sharing means one path's failures spend the other's allowance,
+ * while clearing on success means one path's proof of ownership resets the
+ * other's failure count, exactly as login already does for itself on a
+ * correct password. See the comment at the clearing UPDATE below.
  *
  * `sourceAddress` is supplied by the caller because this function has no
  * HTTP context of its own — it is never invented here, only carried through
@@ -242,10 +247,26 @@ export async function redeemRecoveryCode(input: {
       return { ok: false, code: 'already_used' };
     }
 
-    // Clears recovery's own throttle — not password login's, which this
-    // function never touches in either direction.
+    // Clears BOTH recovery's own throttle and password login's lockout —
+    // and that is not the budget-sharing this module was fixed to remove.
+    // The two rules are different in kind, not just in direction:
+    //   - Sharing a budget means one path's FAILURES consume the other's
+    //     allowance. That is what was wrong: a wrong recovery-code guess
+    //     must never spend down login's counter, and vice versa.
+    //   - Clearing on success means one path's PROOF OF OWNERSHIP resets
+    //     the other's failure count. That is the same rule `login` already
+    //     applies to itself — a correct password clears its own counter
+    //     rather than leaving it at four. A redeemed recovery code is proof
+    //     of ownership at least as strong as a password, so it earns the
+    //     same reset on login's side too. Without this, an owner who locked
+    //     themselves out with five bad passwords, then did exactly what the
+    //     recovery path exists for, would still sit locked for the
+    //     remaining minutes of `locked_until` — the feature would complete
+    //     and leave them locked out anyway.
     await tx.query(
-      `UPDATE dashboard_users SET recovery_failed_attempts = 0, recovery_locked_until = NULL
+      `UPDATE dashboard_users
+          SET recovery_failed_attempts = 0, recovery_locked_until = NULL,
+              failed_attempts = 0, locked_until = NULL
         WHERE business_id = $1 AND username = $2`,
       [businessId, input.username],
     );
