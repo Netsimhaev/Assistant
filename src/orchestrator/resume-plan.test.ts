@@ -11,11 +11,12 @@ import type { Job } from './jobs.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
+import { upsertBinding } from './bindings.js';
 import { envCredentials } from './credentials.js';
 import { pendingApprovals } from '../governance/approvals.js';
 import { applyDecision } from './resume.js';
 import { planHashOf } from './plan-store.js';
-import { runPlan, type RunPlanResult } from './run-plan.js';
+import { runPlan, runPlanForJob, type RunPlanResult } from './run-plan.js';
 
 const BUSINESS = 'test-business';
 /** 12:00 Asia/Jerusalem — outside the fixture's 20:00–07:00 quiet window. */
@@ -307,17 +308,17 @@ describe('a resumed plan does not re-run what already ran', () => {
     // The reply the customer already had must not arrive a second time.
     expect(mailsTo(sent, 'a@b.com')).toBe(1);
 
-    // And what the second step actually does, which is not "run". The gate has
-    // no path that spends an approval a human already granted, so it queues a
-    // NEW one and the step waits again. Asserted rather than left unsaid: the
-    // docblocks now say an approval is the one deferral that does not
-    // complete, and a test that checked only step one would have let this
-    // branch claim a story it does not deliver.
-    expect(second.steps[1]?.outcome.status).toBe('awaiting_approval');
-    expect(mailsTo(sent, 'new@example.com')).toBe(0);
+    // And what the second step actually does now: it runs. `runPlan` hashes
+    // s2's original input, finds the approval `unspentApprovalFor` matched it
+    // to, and hands the id to `executeStep`, which spends it instead of
+    // recomputing `needsApproval`. Asserted rather than left unsaid: a test
+    // that checked only step one would let this branch claim a story it does
+    // not deliver.
+    expect(second.status).toBe('done');
+    expect(second.steps[1]?.outcome.status).toBe('done');
+    expect(mailsTo(sent, 'new@example.com')).toBe(1);
     const queuedTwice = await pendingApprovals({ businessId: BUSINESS });
-    expect(queuedTwice).toHaveLength(1);
-    expect(queuedTwice[0]?.approvalId).not.toBe(approvalId);
+    expect(queuedTwice).toHaveLength(0);
   });
 
   it('refuses a different plan for a job already mid-flight, and runs nothing', async () => {
@@ -408,6 +409,80 @@ describe('a resumed plan does not re-run what already ran', () => {
     if (second.status !== 'done') throw new Error('unreachable');
     expect(second.steps[0]?.skipped).toBe(true);
     expect(second.steps[0]?.externalId).toBe('MSG-1');
+  });
+});
+
+describe('the real entry point closes the approval loop, not only runPlan called directly', () => {
+  it('performs the approved step exactly once through runPlanForJob, and queues nothing twice', async () => {
+    // Every other test in this file (and in approved-step.test.ts) either
+    // calls `executeStep` directly or injects `bindings` by hand. Neither
+    // exercises `runPlanForJob` — the actual production entry point that
+    // loads bindings from the store and is what a resumed job is really
+    // handed back to. This is the gap a review found: `runPlan` never passed
+    // `approvalId` through, so this exact path queued a second approval
+    // forever no matter how many times a human said yes.
+    const bundle = await install([MAIL_CONNECTION]);
+    await upsertBinding(MAIL_LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    const job = await jobInExecute(bundle);
+    const { sent, registry } = world();
+
+    // A first approach to a new address — `email.initiate`, `approve_required`
+    // in the fixture charter.
+    const plan = Plan.parse({
+      goal: 'לפנות ליועץ חדש',
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'initiate',
+          toolName: 'mail.send',
+          input: { to: 'new@example.com', subject: 'היכרות', body: 'שלום' },
+        },
+      ],
+    });
+
+    const run = (j: Job): Promise<RunPlanResult> =>
+      runPlanForJob({
+        job: j,
+        bundle,
+        plan,
+        registry,
+        credentials: CREDENTIALS,
+        counterpartyTags: [],
+        rampLevel: 'auto',
+        now: NOON,
+      });
+
+    const first = await run(job);
+    expect(first.status).toBe('halted');
+    if (first.status !== 'halted') throw new Error('unreachable');
+    expect(first.steps[0]?.outcome.status).toBe('awaiting_approval');
+    expect(sent).toHaveLength(0);
+
+    const approvalId =
+      first.steps[0]?.outcome.status === 'awaiting_approval'
+        ? first.steps[0].outcome.approvalId
+        : null;
+    if (approvalId === null) throw new Error('expected s1 to queue an approval');
+
+    const decided = await applyDecision(
+      approvalId,
+      'approved',
+      { by: 'p_boss', channel: 'dashboard' },
+      { businessId: BUSINESS },
+    );
+    expect(decided.jobPhase).toBe('execute');
+
+    const second = await run(await reload(job.jobId));
+
+    expect(second.status).toBe('done');
+    if (second.status !== 'done') throw new Error('unreachable');
+    expect(second.steps[0]?.outcome.status).toBe('done');
+    // The whole point: it actually ran, exactly once.
+    expect(sent).toHaveLength(1);
+    expect(mailsTo(sent, 'new@example.com')).toBe(1);
+    // And nothing asked the boss again.
+    expect(await pendingApprovals({ businessId: BUSINESS })).toHaveLength(0);
   });
 });
 

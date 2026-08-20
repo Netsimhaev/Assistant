@@ -153,6 +153,45 @@ export async function getApproval(
   return row ? toRequest(row) : null;
 }
 
+/**
+ * The approval, if any, that already covers this exact step.
+ *
+ * Approvals do not record a step id when they are enqueued — the gate that
+ * creates one only ever sees a tool call, not the plan step it came from — so
+ * there is nothing to join a resumed step back to its approval by *except*
+ * what both sides already agree on: the input. `buildFacts` sets
+ * `inputHash: canonicalHash(toolInput)` (`src/policy/facts.ts`) and
+ * `enqueueApproval` stores that same value in `input_hash`, so a step whose
+ * ORIGINAL input hashes the same as an approved, unconsumed row for this job
+ * is the step that row was answering.
+ *
+ * "Original" matters: an approval-with-edit's edited input is a different
+ * value living under a different column (`input_hash_at_decision`, written by
+ * `decide`). This lookup only ever matches on the proposed input's hash —
+ * finding the right approval is a job-and-input match, not a content match —
+ * and the edited input is substituted later, inside `executeStep`, once the
+ * approval itself has been found.
+ *
+ * Ordered oldest-first with `LIMIT 1` so that two rows which happened to match
+ * — the same job re-proposing the identical input twice — cannot answer
+ * differently across two runs of the same resume.
+ */
+export async function unspentApprovalFor(
+  query: { jobId: string; inputHash: string; businessId?: string; db?: Queryable },
+): Promise<string | null> {
+  const db = query.db ?? getPool();
+  const { rows } = await db.query<{ approval_id: string }>(
+    `SELECT approval_id FROM approval_requests
+      WHERE business_id = $1 AND job_id = $2 AND input_hash = $3
+        AND state IN ('approved', 'approved_with_edit')
+        AND consumed_at IS NULL
+      ORDER BY created_at ASC
+      LIMIT 1`,
+    [query.businessId ?? config.businessId, query.jobId, query.inputHash],
+  );
+  return rows[0]?.approval_id ?? null;
+}
+
 export async function pendingApprovals(
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ApprovalRequest[]> {

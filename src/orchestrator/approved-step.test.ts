@@ -94,23 +94,6 @@ describe('a step resumed from an approval', () => {
     expect(performed).toBe(1);
   });
 
-  it('does not queue a second request for the same step', async () => {
-    const bundle = await install();
-    const job = await jobInExecute(bundle);
-    const approvalId = await parkOnApproval(bundle, job);
-    await applyDecision(approvalId, 'approved',
-      { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS });
-
-    const resumed = await loadJob(job.jobId, { businessId: BUSINESS });
-    if (resumed === null) throw new Error('job vanished');
-    const outcome = await executeStep({
-      ...STRANGER, job: resumed, bundle, approvalId,
-      perform: async () => NOTHING, now: NOON,
-    });
-
-    expect(outcome.status).not.toBe('awaiting_approval');
-  });
-
   it('runs the EDITED input when the boss changed it', async () => {
     const bundle = await install();
     const job = await jobInExecute(bundle);

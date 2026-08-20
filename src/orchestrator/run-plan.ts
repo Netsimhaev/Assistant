@@ -5,6 +5,7 @@ import type { AutonomyLevel } from '../domain/trust.js';
 import { planProblems, topologicalOrder, type Plan, type PlanStep } from '../domain/plan.js';
 import { classifyAction, isOutbound, refineActionClass } from '../policy/classify.js';
 import { canonicalHash } from '../util/canonical.js';
+import { unspentApprovalFor } from '../governance/approvals.js';
 import type { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
 import { loadBindings } from './bindings.js';
@@ -128,15 +129,19 @@ export type RunPlanResult =
  * up at the one that stopped. A skipped step is still reported, marked
  * `skipped`.
  *
- * **An approval is the one deferral that does not yet complete, and this is
- * not the place that can fix it.** The steps before it resume correctly, but
- * `evaluateToolCall` has no path that consults an approval a human has already
- * granted: it recomputes `needsApproval` and enqueues a second request. So the
- * resumed run skips the finished steps and then queues *another* approval for
- * the step that was waiting, and that step never runs however many times it is
- * approved. Closing that means teaching the gate to spend an existing approval
- * — including its TOCTOU input-hash check — which is separate work. Until then
- * do not read the approval path here as a loop that closes.
+ * **An approval a human already granted is now honoured on resume.** Before
+ * each step that has not already completed, `runPlan` hashes the step's
+ * ORIGINAL input the same way `buildFacts` does (`canonicalHash(step.input)`)
+ * and asks `unspentApprovalFor` for an approved, unconsumed row under that
+ * hash for this job. Approvals carry no step id — the gate that creates one
+ * only ever sees a tool call — so the input hash is the join key both sides
+ * already share. A match travels into `executeStep` as `approvalId`, and the
+ * gate spends it (TOCTOU hash check included) instead of recomputing
+ * `needsApproval` and enqueuing a second request. An approval-with-edit's
+ * edited input is substituted inside `executeStep` itself, after this lookup
+ * has already found the row by its ORIGINAL hash — the two hashes live in two
+ * different columns on purpose (`input_hash` vs `input_hash_at_decision`), and
+ * this function only ever reads the first.
  *
  * The plan is bound to the job on the first run. A second run offering a
  * different plan is rejected with `plan_changed_mid_flight` *if any step has
@@ -284,6 +289,18 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       continue;
     }
 
+    // An approval a human already granted for this exact step, found by the
+    // one thing both sides agree on before the step has an identity of its
+    // own to a fresh gate call: the ORIGINAL input's hash. See
+    // `unspentApprovalFor` for why a step id cannot be the join key, and why
+    // this deliberately does not look at any edit — that substitution is
+    // `executeStep`'s job, after the approval has been found.
+    const approvalId = await unspentApprovalFor({
+      jobId: current.jobId,
+      inputHash: canonicalHash(step.input),
+      businessId: current.businessId,
+    });
+
     const outcome = await executeStep({
       job: current,
       stepId: step.id,
@@ -296,6 +313,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       rampLevel: request.rampLevel,
       planHash,
       ...(request.now !== undefined ? { now: request.now } : {}),
+      ...(approvalId !== null ? { approvalId } : {}),
     });
     records.push({
       stepId: step.id,
