@@ -22,6 +22,7 @@ const transport = createSmtpTransport({
   port: 587,
   secure: false,
   from: 'assistant@example.com',
+  auth: { user: 'assistant', pass: 'test-pass' },
 });
 
 describe('createSmtpTransport', () => {
@@ -71,5 +72,49 @@ describe('createSmtpTransport', () => {
         context({ signal: controller.signal }),
       ),
     ).rejects.toThrow();
+  });
+});
+
+describe('createSmtpTransport construction', () => {
+  // Round 1 finding: an omitted `auth` used to fall back to a per-call
+  // credential the notifier never actually supplies, so a misconfigured
+  // deployment authenticated with an empty string only once a real SMTP
+  // server rejected it — deep inside a send the gate was already waiting
+  // on. `auth` is required now and validated here, before any transport is
+  // usable at all.
+  it('refuses to build a transport with an empty username', () => {
+    expect(() =>
+      createSmtpTransport({
+        host: 'smtp.invalid.example',
+        port: 587,
+        secure: false,
+        from: 'assistant@example.com',
+        auth: { user: '', pass: 'test-pass' },
+      }),
+    ).toThrow(/auth/);
+  });
+
+  it('refuses to build a transport with an empty password', () => {
+    expect(() =>
+      createSmtpTransport({
+        host: 'smtp.invalid.example',
+        port: 587,
+        secure: false,
+        from: 'assistant@example.com',
+        auth: { user: 'assistant', pass: '' },
+      }),
+    ).toThrow(/auth/);
+  });
+
+  it('builds successfully with a non-empty account', () => {
+    expect(() =>
+      createSmtpTransport({
+        host: 'smtp.invalid.example',
+        port: 587,
+        secure: false,
+        from: 'assistant@example.com',
+        auth: { user: 'assistant', pass: 'test-pass' },
+      }),
+    ).not.toThrow();
   });
 });

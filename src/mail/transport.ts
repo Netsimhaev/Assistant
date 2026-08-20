@@ -22,23 +22,41 @@ export interface SmtpConfig {
   /** The envelope `From:` header. */
   from: string;
   /**
-   * A fixed account this transport instance always authenticates as.
+   * The account this transport instance always authenticates as.
    *
-   * Omit it for the governed path: `createMailAdapter` (`mail.ts`) resolves a
-   * real per-connection secret from `connection_bindings` and forwards it as
-   * `context.credential` on every call — that field's own docblock is
-   * explicit ("Read `credential.value`; never log or serialise the handle
-   * itself"), so when no fixed account is configured here, every send reads
-   * it from there instead.
-   *
-   * Supply it for a single-account relay that never receives a per-call
-   * credential at all — the approval notifier's own system mailbox
-   * (`createEmailNotifier`, `src/governance/notify.ts`) has no connection
-   * binding and nothing resolves one for it, so the transport must already
-   * hold what it needs.
+   * Required, not optional — round 1 of review found the earlier optional
+   * design silently authenticating with an empty password: when `auth` was
+   * omitted, `send()` fell back to `context.credential`, and the only real
+   * caller (`createEmailNotifier`, `src/governance/notify.ts`) has no per-call
+   * credential of its own to offer, so that fallback resolved to a
+   * placeholder handle with `value: ''`. Nothing failed until an actual SMTP
+   * server rejected an empty `AUTH`, at send time, deep in a call the gate was
+   * already waiting on. Requiring `auth` up front, and validating it below,
+   * turns that into a synchronous throw the moment a misconfigured transport
+   * is built — long before anything tries to use it.
    */
-  auth?: { user: string; pass: string };
+  auth: { user: string; pass: string };
+  /**
+   * Milliseconds nodemailer waits for the TCP/TLS handshake before giving up.
+   * Defaults to `DEFAULT_TIMEOUT_MS` — left unset before round 1, which meant
+   * the real bound on a hung connection was whatever nodemailer's own
+   * default happened to be: unconfigured, untested, and not reasoned about
+   * anywhere in this file.
+   */
+  connectionTimeoutMs?: number;
+  /** Milliseconds nodemailer waits for the far end mid-conversation (after `HELO`/`AUTH`/`DATA`) before giving up. Same default and same reasoning as `connectionTimeoutMs`. */
+  socketTimeoutMs?: number;
 }
+
+/**
+ * Applies to both `connectionTimeoutMs` and `socketTimeoutMs` when a config
+ * omits either. This transport has exactly one caller today — the approval
+ * notifier, itself bounded by `NOTIFY_TIMEOUT_MS` in `src/governance/notify.ts`
+ * — so five seconds gives nodemailer room to actually attempt a handshake
+ * against a healthy relay while still resolving comfortably inside that
+ * caller's own deadline instead of racing against it.
+ */
+const DEFAULT_TIMEOUT_MS = 5_000;
 
 /**
  * A bare CR or LF anywhere in a header field lets it terminate the field
@@ -68,6 +86,19 @@ function assertNoCrlf(value: string, field: string): void {
  * this function connects to is not knowable until the call arrives.
  */
 export function createSmtpTransport(config: SmtpConfig): MailTransport {
+  // Fails synchronously, at construction — before this function ever returns
+  // a usable `MailTransport` — rather than at the first `send()`, which
+  // would already be inside whatever deadline a caller is racing against.
+  // `SmtpConfig.auth`'s own docblock explains why this exists.
+  if (config.auth.user.length === 0 || config.auth.pass.length === 0) {
+    throw new Error(
+      'createSmtpTransport: auth.user/auth.pass ריקים — לא ניתן להקים מתאם SMTP בלי חשבון אמיתי',
+    );
+  }
+
+  const connectionTimeout = config.connectionTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const socketTimeout = config.socketTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+
   return {
     async send(
       message: MailMessage,
@@ -82,14 +113,19 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
         throw new Error('הבקשה בוטלה לפני שהחיבור נפתח');
       }
 
-      const auth =
-        config.auth ?? { user: context.credential.ref, pass: context.credential.value };
-
+      // `context.credential` is still required by `MailSendContext` — every
+      // implementation of the interface must accept one — but this
+      // implementation never reads it for authentication: `config.auth`
+      // above is now unconditional, precisely so a caller with no per-call
+      // credential of its own (the notifier) cannot end up authenticating
+      // with one anyway.
       const transporter = nodemailer.createTransport({
         host: context.endpoint ?? config.host,
         port: config.port,
         secure: config.secure,
-        auth,
+        auth: config.auth,
+        connectionTimeout,
+        socketTimeout,
       });
 
       // Folded into the outgoing Message-ID, per `MailSendContext.idempotencyKey`'s

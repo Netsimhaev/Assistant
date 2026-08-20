@@ -15,6 +15,16 @@
  * (`src/orchestrator/adapters/types.ts`). The call site's own try/catch is
  * the actual safety net — this is what keeps it from needing two different
  * failure shapes to handle.
+ *
+ * `notify` also never *hangs*. `evaluateToolCall` (`src/policy/engine.ts`)
+ * awaits this call inline before it can return `queue_approval` — round 1 of
+ * review found that a transport which simply never settles (an unreachable
+ * SMTP host, with nothing else in the diff bounding the wait) turned the
+ * try/catch's protection against throwing into no protection at all against
+ * silence, and silence is the more common outage. `withDeadline` below races
+ * the transport call against `NOTIFY_TIMEOUT_MS` regardless of whether the
+ * transport itself cooperates — see that function's docblock for why the
+ * `AbortSignal` handed to `transport.send` is not, on its own, enough.
  */
 import type { MailTransport } from '../orchestrator/adapters/mail.js';
 import { createCredentialHandle } from '../orchestrator/adapters/types.js';
@@ -68,13 +78,53 @@ function buildMessage(request: ApprovalRequest, link: string): { subject: string
  *
  * No connection binding backs this send — it is a system notification, not
  * a governed business action — so there is no per-call secret to resolve.
- * An empty placeholder is enough: `createSmtpTransport` (`src/mail/transport.ts`)
- * falls back to its own configured `auth` whenever a transport is built for
- * exactly this single-account case (see that function's docblock), so this
- * handle's `value` is never actually read on the path this module is meant
- * to run on.
+ * A placeholder is enough *and no more than that*: since round 1,
+ * `createSmtpTransport` (`src/mail/transport.ts`) requires its own `auth` at
+ * construction and never reads `context.credential` for authentication, so
+ * this handle's `value` is structurally never used to authenticate anything
+ * — not "shouldn't be," but can't be, because the one implementation this
+ * module is meant to run against no longer looks at it.
  */
 const SYSTEM_CREDENTIAL = createCredentialHandle('notify:system', '');
+
+/**
+ * How long `notify` waits for a send before giving up.
+ *
+ * This is a courtesy notification, not the work the approval represents —
+ * the row already exists and the dashboard already shows it (see this
+ * module's top docblock). Five seconds is enough for a real SMTP exchange
+ * to complete against a healthy relay (matches `DEFAULT_TIMEOUT_MS` in
+ * `src/mail/transport.ts`, so the transport's own socket timeouts are not
+ * the thing racing this deadline to the finish), and short enough that a
+ * dead relay costs the gate almost nothing.
+ */
+const NOTIFY_TIMEOUT_MS = 5_000;
+
+/**
+ * Bound a promise that the transport might never settle.
+ *
+ * Mirrors `callWithDeadline` in `src/orchestrator/run-plan.ts` — same bug,
+ * same fix, two call sites. An `AbortSignal` handed to a component is
+ * advisory only: nothing forces the component to check it, so a transport
+ * that ignores `context.signal` entirely (or a test double that hangs
+ * forever on purpose) leaves whoever only passed the signal waiting anyway.
+ * Racing the call itself against an independent timer is what actually
+ * binds the wait; `AbortSignal.timeout` at the call site below is still
+ * worth sending, because it lets a *cooperating* transport give up on its
+ * own socket early, but this function does not depend on that cooperation.
+ */
+function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`השליחה לא הסתיימה תוך ${timeoutMs} מ״ש`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
 
 export function createEmailNotifier(transport: MailTransport, to: string): ApprovalNotifier {
   return {
@@ -83,14 +133,17 @@ export function createEmailNotifier(transport: MailTransport, to: string): Appro
     async notify(request, link) {
       const { subject, body } = buildMessage(request, link);
       try {
-        await transport.send(
-          { to: [to], subject, body },
-          {
-            endpoint: null,
-            credential: SYSTEM_CREDENTIAL,
-            idempotencyKey: `approval-notify:${request.approvalId}`,
-            signal: new AbortController().signal,
-          },
+        await withDeadline(
+          transport.send(
+            { to: [to], subject, body },
+            {
+              endpoint: null,
+              credential: SYSTEM_CREDENTIAL,
+              idempotencyKey: `approval-notify:${request.approvalId}`,
+              signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
+            },
+          ),
+          NOTIFY_TIMEOUT_MS,
         );
         return { ok: true };
       } catch (error) {

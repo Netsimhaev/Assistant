@@ -181,6 +181,7 @@ describe('createEmailNotifier', () => {
       port: 587,
       secure: false,
       from: 'assistant@example.com',
+      auth: { user: 'assistant', pass: 'test-pass' },
     });
     const notifier: ApprovalNotifier = createEmailNotifier(transport, 'owner@example.com');
     const request = await makeApproval({
@@ -191,5 +192,44 @@ describe('createEmailNotifier', () => {
 
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/CR\/LF|שורה חדשה/);
+  });
+
+  // Round 1 finding: nothing bounded the wait when a transport simply never
+  // settled. `evaluateToolCall` (tested directly in `src/policy/engine.test.ts`)
+  // awaits this call inline, so a hang here was a hang there. This is the
+  // same property, exercised at the unit that actually owns the deadline.
+  it('gives up on a transport that never resolves, within the deadline, instead of hanging forever', async () => {
+    const hangingTransport: MailTransport = {
+      send() {
+        return new Promise(() => {
+          // Deliberately never settles — the point of this test.
+        });
+      },
+    };
+    const notifier = createEmailNotifier(hangingTransport, 'owner@example.com');
+    const request = await makeApproval();
+
+    const started = Date.now();
+    const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
+    const elapsedMs = Date.now() - started;
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/לא הסתיימה/);
+    // Generous margin over the 5s deadline (NOTIFY_TIMEOUT_MS) — this only
+    // needs to prove the wait is bounded, not pin the exact number.
+    expect(elapsedMs).toBeLessThan(9_000);
+  }, 15_000);
+
+  it('turns a transport that resolves quickly with no throw at all into { ok: true }', async () => {
+    // The mirror image of the hang above: a transport that behaves exactly
+    // as MailTransport's contract promises (resolve fast, or throw) must
+    // not be slowed down or altered by the deadline machinery wrapping it.
+    const { transport } = recordingTransport();
+    const notifier = createEmailNotifier(transport, 'owner@example.com');
+    const request = await makeApproval();
+
+    const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
+
+    expect(result).toEqual({ ok: true });
   });
 });

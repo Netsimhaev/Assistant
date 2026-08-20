@@ -10,7 +10,8 @@ import { evaluateToolCall, type GateContext } from './engine.js';
 import { refineActionClass } from './classify.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { BusinessCharter } from '../domain/charter.js';
-import type { ApprovalNotifier } from '../governance/notify.js';
+import { createEmailNotifier, type ApprovalNotifier } from '../governance/notify.js';
+import type { MailTransport } from '../orchestrator/adapters/mail.js';
 
 const BUSINESS = 'test-business';
 
@@ -400,6 +401,80 @@ describe('approval notification', () => {
 
     const entries = await queryAudit({ businessId: BUSINESS, kind: 'incident' }, getPool());
     expect(entries).toHaveLength(0);
+  });
+
+  // Round 1 finding, and the one the whole finding is about: a notifier
+  // whose underlying transport never settles must not turn into a gate that
+  // never returns. Built with a promise that is never resolved — not a real
+  // socket — so this proves the deadline, not network flakiness.
+  it('returns queue_approval within the deadline even when the transport never resolves', async () => {
+    const bundle = await install();
+    const hangingTransport: MailTransport = {
+      send() {
+        return new Promise(() => {
+          // Deliberately never settles.
+        });
+      },
+    };
+    const notifier = createEmailNotifier(hangingTransport, 'owner@example.com');
+
+    const started = Date.now();
+    const decision = await evaluateToolCall(
+      'browser.submit_order',
+      SUBMIT_ORDER_INPUT,
+      ctx(bundle, {
+        agent: 'ops.web',
+        notify: { notifier, dashboardBaseUrl: 'https://dash.example.com' },
+      }),
+    );
+    const elapsedMs = Date.now() - started;
+
+    expect(decision.outcome).toBe('queue_approval');
+    if (decision.outcome !== 'queue_approval') throw new Error('unreachable');
+    // Generous margin over the notifier's own 5s deadline — this only needs
+    // to prove the gate is bounded, not pin the exact number.
+    expect(elapsedMs).toBeLessThan(9_000);
+
+    const stored = await getApproval(decision.approvalId, { businessId: BUSINESS });
+    expect(stored?.state).toBe('pending');
+
+    const entries = await queryAudit({ businessId: BUSINESS, kind: 'incident' }, getPool());
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.reason).toContain(`approval_notify_failed:${decision.approvalId}`);
+  }, 15_000);
+
+  // The other path round 1 flagged as unverified: a notifier that resolves
+  // — quickly, no throw at all — but reports failure through the `{ ok:
+  // false }` shape `ApprovalNotifier.notify` is typed to return. The engine
+  // only ever exercised the throwing branch before this.
+  it('does not fail enqueueApproval when the notifier resolves ok: false without throwing', async () => {
+    const bundle = await install();
+    const notifier: ApprovalNotifier = {
+      channel: 'email',
+      async notify() {
+        return { ok: false, error: 'mailbox full' };
+      },
+    };
+
+    const decision = await evaluateToolCall(
+      'browser.submit_order',
+      SUBMIT_ORDER_INPUT,
+      ctx(bundle, {
+        agent: 'ops.web',
+        notify: { notifier, dashboardBaseUrl: 'https://dash.example.com' },
+      }),
+    );
+
+    expect(decision.outcome).toBe('queue_approval');
+    if (decision.outcome !== 'queue_approval') throw new Error('unreachable');
+
+    const stored = await getApproval(decision.approvalId, { businessId: BUSINESS });
+    expect(stored?.state).toBe('pending');
+
+    const entries = await queryAudit({ businessId: BUSINESS, kind: 'incident' }, getPool());
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.reason).toContain(`approval_notify_failed:${decision.approvalId}`);
+    expect(entries[0]?.reason).toContain('mailbox full');
   });
 });
 
