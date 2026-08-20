@@ -67,7 +67,17 @@ function parseCookies(header: string | undefined): Record<string, string> {
     if (idx === -1) continue;
     const key = part.slice(0, idx).trim();
     const value = part.slice(idx + 1).trim();
-    if (key.length > 0) out[key] = decodeURIComponent(value);
+    if (key.length === 0) continue;
+    // A malformed `%` escape makes decodeURIComponent throw. A cookie this
+    // server issued is never malformed, so the only way to land here is a
+    // hand-crafted or corrupted header — which must mean "no session", not
+    // a 500. Skipping the pair leaves `out[SESSION_COOKIE]` unset, and
+    // `loadSession` already treats that as no session.
+    try {
+      out[key] = decodeURIComponent(value);
+    } catch {
+      continue;
+    }
   }
   return out;
 }
@@ -83,13 +93,33 @@ async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
   return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
 }
 
+/**
+ * Sent on every response, redirects included — the one place all of them
+ * pass through, so a route added later cannot forget either header.
+ *
+ * `Cache-Control: no-store` matters specifically because this server is
+ * *required* to sit behind a tunnel or reverse proxy (docs/dashboard-deployment.md):
+ * some of those cache dynamic responses by default (a stray "cache everything"
+ * rule, a corporate proxy), and a cached approval card is an email body, a
+ * counterparty and an amount served to whoever asks next.
+ *
+ * `X-Frame-Options: DENY` is defence in depth, not a hole being closed —
+ * `SameSite=Strict` already keeps the session cookie out of a cross-site
+ * iframe, so the approve/deny buttons cannot be clickjacked today. This is
+ * cheap insurance against that assumption ever changing.
+ */
+const SECURITY_HEADERS = {
+  'Cache-Control': 'no-store',
+  'X-Frame-Options': 'DENY',
+} as const;
+
 function sendHtml(res: ServerResponse, status: number, body: string, headers: Record<string, string> = {}): void {
-  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', ...headers });
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', ...SECURITY_HEADERS, ...headers });
   res.end(body);
 }
 
 function redirect(res: ServerResponse, location: string, headers: Record<string, string> = {}): void {
-  res.writeHead(302, { Location: location, ...headers });
+  res.writeHead(302, { Location: location, ...SECURITY_HEADERS, ...headers });
   res.end();
 }
 
@@ -250,6 +280,16 @@ async function route(req: IncomingMessage, res: ServerResponse, businessId: stri
   const pathname = new URL(req.url ?? '/', 'http://dashboard.local').pathname;
 
   if (method === 'GET' && pathname === '/login') return handleLoginGet(res);
+  // Deliberately no CSRF check here — not an oversight. A CSRF token is
+  // bound to a session id, and there is no session yet at this point in the
+  // request. Classic "login CSRF" (a cross-site form submitting attacker-
+  // known credentials so the victim's browser ends up authenticated as the
+  // attacker) has no target here either: this is a single account, created
+  // out-of-band by a local CLI command, with no self-registration — making
+  // either branch of this form succeed already requires possessing that one
+  // account's password or an unredeemed recovery code, at which point the
+  // attacker already has direct access and gains nothing by routing it
+  // through the victim's browser.
   if (method === 'POST' && pathname === '/login') return handleLoginPost(req, res, businessId);
 
   // Everything past this point requires a session.

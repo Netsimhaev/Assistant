@@ -315,6 +315,40 @@ describe('recovery-code login', () => {
     expect(res.headers.get('location')).toBe('/password');
   });
 
+  it('refuses to decide an approval while a password change is pending, even with a valid CSRF token', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+    const code = codes[0];
+    expect(code).toBeDefined();
+
+    const loginRes = await fetch(`${baseUrl}/login`, {
+      method: 'POST',
+      body: new URLSearchParams({ username: USERNAME, code: code! }),
+      redirect: 'manual',
+    });
+    const cookie = cookiePair(loginRes.headers.get('set-cookie'));
+
+    // /password is reachable precisely because the gate lets it through —
+    // its CSRF token is the same session-wide token every other page for
+    // this session would carry.
+    const passwordPage = await fetch(`${baseUrl}/password`, { headers: { cookie } });
+    const csrf = extractCsrf(await passwordPage.text());
+
+    const approvalId = await makeApproval({ businessId: BUSINESS });
+
+    const res = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/password');
+
+    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    expect(approval?.state).toBe('pending');
+  });
+
   it('shows how many recovery codes remain', async () => {
     const baseUrl = await startServer(BUSINESS);
     await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
