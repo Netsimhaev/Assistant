@@ -146,12 +146,15 @@ function parseCookies(header: string | undefined): Record<string, string> {
   return out;
 }
 
+/** Distinct from a generic read failure so a caller can give a readable answer instead of a 500. */
+class FormBodyTooLargeError extends Error {}
+
 async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req as AsyncIterable<Buffer>) {
     total += chunk.length;
-    if (total > MAX_BODY_BYTES) throw new Error('form body too large');
+    if (total > MAX_BODY_BYTES) throw new FormBodyTooLargeError('form body too large');
     chunks.push(chunk);
   }
   return new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
@@ -338,6 +341,11 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
   sendHtml(res, 200, renderApprovalCard({ approval, csrf: issueCsrfToken(session.sessionId) }));
 }
 
+/** JSON.parse can hand back an object, an array, a string, a number, a boolean, or null — only the first is a tool payload. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /**
  * The edited payload, if the owner changed anything, from the approve form's
  * `input` field.
@@ -351,13 +359,26 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
  *     does not get treated as an edit. Without that, `decide` would stamp
  *     `approved_with_edit` on every approval that merely passed through this
  *     form, and "edited" would stop meaning anything.
- *   - `{ ok: true, editedInput: <value> }` — parsed JSON that hashes
- *     differently from the stored proposal. This is what makes it into
- *     `Decision.editedInput`.
- *   - `{ ok: false, raw }` — the text is not valid JSON. `raw` is handed back
- *     to the caller so the card can be re-rendered with exactly what the
- *     owner typed, not a silently-reverted original; the approval is left
+ *   - `{ ok: true, editedInput: <value> }` — parsed JSON, and a plain object,
+ *     that hashes differently from the stored proposal. This is what makes
+ *     it into `Decision.editedInput`.
+ *   - `{ ok: false, raw }` — the text failed to parse as JSON, or parsed to
+ *     something other than a plain object. `raw` is handed back to the
+ *     caller so the card can be re-rendered with exactly what the owner
+ *     typed, not a silently-reverted original; the approval is left
  *     untouched (`decide` is never called).
+ *
+ * The object check is not decoration. `PlanStep.input` is
+ * `z.record(z.string(), z.unknown())` — a tool payload is an object
+ * everywhere else in this system — and `null` in particular is a trap: it
+ * passes `JSON.parse`, `decide` binds `canonicalHash(null)` and stamps
+ * `approved_with_edit`, and then `execute.ts`'s `editedInput !== null` guard
+ * refuses to run it — so the ORIGINAL input runs instead, its hash no longer
+ * matches the one the approval was just re-bound to, and the step re-queues
+ * forever behind an audit row that claims an edit was applied. A scalar or
+ * array would get past that guard and into a `Record<string, unknown>` cast
+ * that is a lie about the shape. Rejecting anything but a plain object here,
+ * at the one place a person can type into this value, is what stops both.
  */
 function parseEditedInput(
   raw: string | null,
@@ -368,6 +389,9 @@ function parseEditedInput(
   try {
     parsed = JSON.parse(raw);
   } catch {
+    return { ok: false, raw };
+  }
+  if (!isPlainObject(parsed)) {
     return { ok: false, raw };
   }
   if (canonicalHash(parsed) === originalInputHash) return { ok: true };
@@ -382,7 +406,28 @@ async function handleDecision(
   approvalId: string,
   outcome: 'approved' | 'denied',
 ): Promise<void> {
-  const form = await readFormBody(req);
+  let form: URLSearchParams;
+  try {
+    form = await readFormBody(req);
+  } catch (err) {
+    if (!(err instanceof FormBodyTooLargeError)) throw err;
+    // The body was too large to buffer at all, so there is no raw text to
+    // hand back — unlike the malformed-JSON case, the edit itself is what
+    // has to be given up here. The card still needs a live CSRF token and
+    // a session, exactly as the plain approve/deny path does; nothing about
+    // this error path skips either check.
+    const approval = await getApproval(approvalId, { businessId });
+    if (!approval) return sendHtml(res, 404, renderNotFound());
+    return sendHtml(
+      res,
+      400,
+      renderApprovalCard({
+        approval,
+        csrf: issueCsrfToken(session.sessionId),
+        error: 'התוכן שנשלח גדול מדי לשמירה. יש לקצר את העריכה ולנסות שוב.',
+      }),
+    );
+  }
 
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
     return sendHtml(res, 403, renderForbidden());
@@ -409,7 +454,8 @@ async function handleDecision(
         approval,
         csrf: issueCsrfToken(session.sessionId),
         editValue: edit.raw,
-        error: 'התוכן שהוזן אינו JSON תקין. אפשר לתקן ולנסות שוב.',
+        ...(note !== undefined ? { noteValue: note } : {}),
+        error: 'התוכן שהוזן אינו אובייקט JSON תקין. יש להזין מבנה בסגנון { "שדה": ערך } ולנסות שוב.',
       }),
     );
   }

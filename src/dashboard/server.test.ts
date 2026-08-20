@@ -140,6 +140,29 @@ function extractCsrf(html: string): string {
   return match[1];
 }
 
+/** The proposed-input `<textarea>`'s raw (still-escaped) content, as the browser would see it. */
+function extractInputTextarea(html: string): string {
+  const match = /<textarea name="input"[^>]*>([\s\S]*?)<\/textarea>/.exec(html);
+  if (!match?.[1]) throw new Error(`no input textarea found in body: ${html.slice(0, 200)}`);
+  return match[1];
+}
+
+/**
+ * Reverses `escapeHtml` (src/dashboard/views.ts), the way a browser decoding
+ * a `<textarea>`'s content would. `&amp;` must decode last: decoding it
+ * first would turn `&amp;lt;` into `&lt;` and then, on the next pass, into
+ * `<` — a double-decode escapeHtml never produced and this helper must not
+ * invent.
+ */
+function unescapeHtml(s: string): string {
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
 beforeEach(async () => {
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
 });
@@ -539,9 +562,12 @@ describe('HTML escaping', () => {
     expect(body).not.toContain(payload);
   });
 
-  it('escapes a script payload inside the editable textarea too, not just the old read-only view', async () => {
+  it('escapes a closing </textarea> so a payload cannot break out of the field early', async () => {
+    // `<script>` alone proves nothing about the textarea specifically — a
+    // textarea's content is RCDATA, and the one sequence that actually ends
+    // it early is its own closing tag. This is the payload that matters.
     const baseUrl = await startServer(BUSINESS);
-    const payload = '<script>alert(1)</script>';
+    const payload = '</textarea><script>alert(1)</script>';
     const approvalId = await makeApproval({
       businessId: BUSINESS,
       proposedInput: { note: payload },
@@ -551,8 +577,37 @@ describe('HTML escaping', () => {
     const res = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
     const body = await res.text();
     expect(body).toContain('name="input"');
-    expect(body).toContain('&lt;script&gt;');
     expect(body).not.toContain(payload);
+    expect(body).toContain('&lt;/textarea&gt;');
+    expect(body).toContain('&lt;script&gt;');
+  });
+
+  it('lets the escaped textarea content be submitted back verbatim as a plain approval, not an edit', async () => {
+    // Proves the un-escaping half: a browser decodes entities before putting
+    // the text in the form submission, so this reproduces exactly what an
+    // owner who opens the card and clicks approve without touching anything
+    // actually sends.
+    const baseUrl = await startServer(BUSINESS);
+    const original = { note: 'שלום <b>עולם</b> & "מרכאות" \'גרש\'' };
+    const approvalId = await makeApproval({ businessId: BUSINESS, proposedInput: original });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const html = await cardRes.text();
+    const csrf = extractCsrf(html);
+    const submitted = unescapeHtml(extractInputTextarea(html));
+
+    const decideRes = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, input: submitted }),
+      redirect: 'manual',
+    });
+    expect(decideRes.status).toBe(302);
+
+    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    expect(approval?.state).toBe('approved');
+    expect(approval?.editedInput).toBeNull();
   });
 });
 
@@ -624,10 +679,90 @@ describe('editing before approval', () => {
     });
     expect(decideRes.status).toBe(400);
     const body = await decideRes.text();
-    expect(body).toContain('אינו JSON תקין');
+    expect(body).toContain('אינו אובייקט JSON תקין');
     // What the owner typed comes back, not the original — losing an
     // in-progress edit on a typo would be its own kind of data loss.
     expect(body).toContain('{not valid json');
+
+    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    expect(approval?.state).toBe('pending');
+  });
+
+  it('preserves the typed note on a refusal too, not just the payload', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const csrf = extractCsrf(await cardRes.text());
+
+    const decideRes = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, input: '{not valid json', note: 'הערה חשובה שאסור לאבד' }),
+      redirect: 'manual',
+    });
+    expect(decideRes.status).toBe(400);
+    const body = await decideRes.text();
+    expect(body).toContain('הערה חשובה שאסור לאבד');
+  });
+
+  it.each([
+    ['null', 'null'],
+    ['an array', '["a","b"]'],
+    ['a bare string', '"just a string"'],
+    ['a number', '42'],
+  ])(
+    'refuses a valid-JSON-but-non-object edit (%s), the same as malformed JSON, and never executes it',
+    async (_label, raw) => {
+      const baseUrl = await startServer(BUSINESS);
+      const job = await jobAwaitingApproval(BUSINESS);
+      const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+      const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+      const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+      const csrf = extractCsrf(await cardRes.text());
+
+      const decideRes = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+        method: 'POST',
+        headers: { cookie },
+        body: new URLSearchParams({ csrf, input: raw }),
+        redirect: 'manual',
+      });
+      expect(decideRes.status).toBe(400);
+      const body = await decideRes.text();
+      expect(body).toContain('אינו אובייקט JSON תקין');
+
+      // Not just refused at the door — nothing was bound, decided, or
+      // handed to the job. `null` in particular used to sail through into
+      // `approved_with_edit` and then get silently ignored by the executor,
+      // which is the failure mode this test exists to close off.
+      const approval = await getApproval(approvalId, { businessId: BUSINESS });
+      expect(approval?.state).toBe('pending');
+      expect(approval?.editedInput).toBeNull();
+      const jobAfter = await loadJob(job.jobId, { businessId: BUSINESS });
+      expect(jobAfter?.phase).toBe('await_approval');
+    },
+  );
+
+  it('refuses an oversized edit with a readable message instead of a 500', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const csrf = extractCsrf(await cardRes.text());
+
+    const huge = 'x'.repeat(70 * 1024);
+    const decideRes = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, input: huge }),
+      redirect: 'manual',
+    });
+    expect(decideRes.status).toBe(400);
+    const body = await decideRes.text();
+    expect(body).toContain('גדול מדי');
 
     const approval = await getApproval(approvalId, { businessId: BUSINESS });
     expect(approval?.state).toBe('pending');

@@ -179,15 +179,21 @@ ${list}`,
  * before it reaches a `<textarea>`: element content has different escaping
  * needs than an attribute value, but the one escaper here handles both —
  * what matters is that nothing skips it.
+ *
+ * `noteValue` mirrors the same reasoning: a 400 that resets the note the
+ * owner already typed, right next to the payload it took such care to
+ * preserve, is losing their work by half.
  */
 export function renderApprovalCard(options: {
   approval: ApprovalRequest;
   csrf: string;
   editValue?: string;
+  noteValue?: string;
   error?: string;
 }): string {
   const { approval } = options;
   const editValue = options.editValue ?? JSON.stringify(approval.proposedInput, null, 2);
+  const noteValue = options.noteValue ?? '';
   const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
   const risk = approval.risk;
 
@@ -216,9 +222,9 @@ export function renderApprovalCard(options: {
     <label>תוכן מוצע (ניתן לעריכה לפני אישור)
       <textarea name="input" rows="12" spellcheck="false">${esc(editValue)}</textarea>
     </label>
-    <p class="muted">עריכת התוכן לפני האישור מריצה את הגרסה הערוכה. השארה כפי שהיא מאשרת את מה שתוכנן.</p>
+    <p class="muted">עריכת התוכן לפני האישור מריצה את הגרסה הערוכה. השארה כפי שהיא מאשרת את מה שתוכנן. שים לב: חלק מהערכים (כגון פרטי התחברות) מוסתרים לפני שהפעולה יוצאת החוצה, גם אם הם מוצגים כאן במלואם — עריכה שלהם לא תשפיע על מה שבפועל יישלח.</p>
     ${errorBlock}
-    <label>הערה (רשות)<textarea name="note" rows="2"></textarea></label>
+    <label>הערה (רשות)<textarea name="note" rows="2">${esc(noteValue)}</textarea></label>
     <button type="submit">אישור</button>
   </form>
   <form method="post" action="/a/${esc(approval.approvalId)}/deny">
