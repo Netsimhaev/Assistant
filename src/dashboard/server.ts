@@ -22,6 +22,7 @@ import {
   revokeAllSessions,
   setPassword,
   startSession,
+  verifyCurrentPassword,
   verifySessionDetails,
   SESSION_HOURS,
 } from './auth.js';
@@ -241,8 +242,30 @@ async function handleLoginPost(
   redirect(res, '/', { 'Set-Cookie': sessionCookie(result.sessionId) });
 }
 
+/**
+ * A password change needs the current password — except on the one path
+ * where there cannot be one.
+ *
+ * `mustChangePassword` is set only by the session minted immediately after a
+ * recovery code was redeemed, and redemption is itself proof of ownership
+ * (it revoked every other session on the way through). Everywhere else, a
+ * session alone must not be enough: this route sits before the
+ * must-change gate and after nothing at all, so without the current password
+ * a stolen cookie is a permanent takeover rather than a twelve-hour one.
+ */
+function requiresCurrentPassword(session: Session): boolean {
+  return !session.mustChangePassword;
+}
+
 async function handlePasswordGet(res: ServerResponse, session: Session): Promise<void> {
-  sendHtml(res, 200, renderPasswordChange({ csrf: issueCsrfToken(session.sessionId) }));
+  sendHtml(
+    res,
+    200,
+    renderPasswordChange({
+      csrf: issueCsrfToken(session.sessionId),
+      requireCurrent: requiresCurrentPassword(session),
+    }),
+  );
 }
 
 async function handlePasswordPost(
@@ -253,18 +276,31 @@ async function handlePasswordPost(
 ): Promise<void> {
   const form = await readFormBody(req);
   const csrf = issueCsrfToken(session.sessionId);
+  const requireCurrent = requiresCurrentPassword(session);
+  const view = (status: number, error: string): void =>
+    sendHtml(res, status, renderPasswordChange({ csrf, requireCurrent, error }));
 
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
-    return sendHtml(res, 403, renderPasswordChange({ csrf, error: 'הטופס פג תוקף. רענן ונסה שוב.' }));
+    return view(403, 'הטופס פג תוקף. רענן ונסה שוב.');
+  }
+
+  // Checked before the new password is even looked at: a caller who cannot
+  // prove what the password is now has no business proposing what it becomes.
+  if (requireCurrent) {
+    const current = form.get('current') ?? '';
+    const ok =
+      current.length > 0 &&
+      (await verifyCurrentPassword({ username: session.username, password: current, businessId }));
+    if (!ok) return view(403, 'הסיסמה הנוכחית שגויה.');
   }
 
   const password = form.get('password') ?? '';
   const confirm = form.get('confirm') ?? '';
   if (password.length < MIN_PASSWORD_LENGTH) {
-    return sendHtml(res, 400, renderPasswordChange({ csrf, error: `הסיסמה קצרה מדי — נדרשים לפחות ${MIN_PASSWORD_LENGTH} תווים.` }));
+    return view(400, `הסיסמה קצרה מדי — נדרשים לפחות ${MIN_PASSWORD_LENGTH} תווים.`);
   }
   if (password !== confirm) {
-    return sendHtml(res, 400, renderPasswordChange({ csrf, error: 'הסיסמאות אינן תואמות.' }));
+    return view(400, 'הסיסמאות אינן תואמות.');
   }
 
   // Revokes every open session, including this one — a fresh, ordinary

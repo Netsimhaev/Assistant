@@ -94,15 +94,32 @@ ${errorBlock}
   );
 }
 
-export function renderPasswordChange(options: { csrf: string; error?: string }): string {
+/**
+ * `requireCurrent` is false on exactly one path: the forced change right
+ * after a recovery-code login, where by definition the owner does not have a
+ * current password to type. Everywhere else the field is mandatory — see
+ * `verifyCurrentPassword` for why.
+ */
+export function renderPasswordChange(options: {
+  csrf: string;
+  requireCurrent: boolean;
+  error?: string;
+}): string {
   const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
+  const intro = options.requireCurrent
+    ? '<p class="muted">להחלפת הסיסמה יש להזין את הסיסמה הנוכחית.</p>'
+    : '<p class="muted">הכניסה בוצעה עם קוד שחזור. יש לקבוע סיסמה חדשה לפני שאפשר להמשיך.</p>';
+  const currentField = options.requireCurrent
+    ? '<label>סיסמה נוכחית<input type="password" name="current" autocomplete="current-password" required></label>'
+    : '';
   return page(
     'קביעת סיסמה חדשה',
-    `<h1>נדרשת סיסמה חדשה</h1>
-<p class="muted">הכניסה בוצעה עם קוד שחזור. יש לקבוע סיסמה חדשה לפני שאפשר להמשיך.</p>
+    `<h1>${options.requireCurrent ? 'החלפת סיסמה' : 'נדרשת סיסמה חדשה'}</h1>
+${intro}
 ${errorBlock}
 <form method="post" action="/password">
   <input type="hidden" name="csrf" value="${esc(options.csrf)}">
+  ${currentField}
   <label>סיסמה חדשה<input type="password" name="password" autocomplete="new-password" required></label>
   <label>אימות סיסמה<input type="password" name="confirm" autocomplete="new-password" required></label>
   <button type="submit">קביעת סיסמה</button>

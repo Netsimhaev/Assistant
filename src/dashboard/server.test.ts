@@ -362,6 +362,98 @@ describe('recovery-code login', () => {
   });
 });
 
+describe('changing the password', () => {
+  const NEW_PASSWORD = 'a whole new password entirely';
+
+  async function csrfFor(baseUrl: string, cookie: string): Promise<string> {
+    const page = await fetch(`${baseUrl}/password`, { headers: { cookie } });
+    return extractCsrf(await page.text());
+  }
+
+  // The must-change gate sits AFTER this route, and this route sat behind
+  // nothing but a session. Session theft was therefore permanent takeover:
+  // rotate the password and the owner never gets back in.
+  it('refuses without the current password', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const csrf = await csrfFor(baseUrl, cookie);
+
+    const res = await fetch(`${baseUrl}/password`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, password: NEW_PASSWORD, confirm: NEW_PASSWORD }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(403);
+
+    // Unchanged: the old password still works, the new one does not.
+    expect((await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS })).ok).toBe(true);
+    expect((await login({ username: USERNAME, password: NEW_PASSWORD, businessId: BUSINESS })).ok).toBe(false);
+  });
+
+  it('refuses with the wrong current password', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const csrf = await csrfFor(baseUrl, cookie);
+
+    const res = await fetch(`${baseUrl}/password`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf, current: 'not the password', password: NEW_PASSWORD, confirm: NEW_PASSWORD,
+      }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(403);
+    expect((await login({ username: USERNAME, password: PASSWORD, businessId: BUSINESS })).ok).toBe(true);
+  });
+
+  it('accepts with the current password', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const csrf = await csrfFor(baseUrl, cookie);
+
+    const res = await fetch(`${baseUrl}/password`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf, current: PASSWORD, password: NEW_PASSWORD, confirm: NEW_PASSWORD,
+      }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect((await login({ username: USERNAME, password: NEW_PASSWORD, businessId: BUSINESS })).ok).toBe(true);
+  });
+
+  // The one path where there is no current password to ask for: the owner
+  // just proved ownership with a recovery code, which is why they are here.
+  it('does not ask for a current password on the forced change after a recovery code', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+    const loginRes = await fetch(`${baseUrl}/login`, {
+      method: 'POST',
+      body: new URLSearchParams({ username: USERNAME, code: codes[0]! }),
+      redirect: 'manual',
+    });
+    const cookie = cookiePair(loginRes.headers.get('set-cookie'));
+
+    const page = await fetch(`${baseUrl}/password`, { headers: { cookie } });
+    const html = await page.text();
+    expect(html).not.toContain('name="current"');
+
+    const res = await fetch(`${baseUrl}/password`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf: extractCsrf(html), password: NEW_PASSWORD, confirm: NEW_PASSWORD,
+      }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect((await login({ username: USERNAME, password: NEW_PASSWORD, businessId: BUSINESS })).ok).toBe(true);
+  });
+});
+
 describe('the address a recovery redemption is audited from', () => {
   /** The reason line of the incident entry `redeemRecoveryCode` writes. */
   async function redemptionAudit(businessId: string): Promise<string> {

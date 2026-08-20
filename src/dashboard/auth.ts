@@ -352,6 +352,43 @@ export async function revokeAllSessions(
   return result.rowCount ?? 0;
 }
 
+/**
+ * Does this plaintext match the account's current password?
+ *
+ * Used by the dashboard's password-change route, which must not let a stolen
+ * session become a permanent takeover: without proof of the current
+ * password, whoever holds a session cookie can rotate the password and lock
+ * the owner out for good. Knowing the current one is the thing a session
+ * thief does not have.
+ *
+ * Pays the decoy scrypt cost for a username with no row, exactly as `login`
+ * does — the caller here always has a session, so there is no username to
+ * enumerate, but a branch that returns instantly for a missing row is the
+ * kind of asymmetry that becomes a leak the moment a caller changes.
+ * Deliberately does NOT touch `failed_attempts`: this path is already behind
+ * a valid session, and letting it spend login's budget would let a stolen
+ * session lock the real owner out — the opposite of the point.
+ */
+export async function verifyCurrentPassword(input: {
+  username: string;
+  password: string;
+  businessId?: string;
+}): Promise<boolean> {
+  const businessId = input.businessId ?? config.businessId;
+  const { rows } = await getPool().query<UserRow>(
+    `SELECT password_hash, password_salt, locked_until
+       FROM dashboard_users
+      WHERE business_id = $1 AND username = $2`,
+    [businessId, input.username],
+  );
+  const row = rows[0];
+  if (!row) {
+    await verifyPassword(input.password, DECOY_HASH, DECOY_SALT);
+    return false;
+  }
+  return verifyPassword(input.password, row.password_hash, row.password_salt);
+}
+
 export async function setPassword(input: {
   username: string;
   password: string;
