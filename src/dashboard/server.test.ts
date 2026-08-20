@@ -538,4 +538,131 @@ describe('HTML escaping', () => {
     expect(body).toContain('&lt;script&gt;');
     expect(body).not.toContain(payload);
   });
+
+  it('escapes a script payload inside the editable textarea too, not just the old read-only view', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const payload = '<script>alert(1)</script>';
+    const approvalId = await makeApproval({
+      businessId: BUSINESS,
+      proposedInput: { note: payload },
+    });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const body = await res.text();
+    expect(body).toContain('name="input"');
+    expect(body).toContain('&lt;script&gt;');
+    expect(body).not.toContain(payload);
+  });
+});
+
+describe('editing before approval', () => {
+  it('stores the edited payload and yields approved_with_edit when something actually changed', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const job = await jobAwaitingApproval(BUSINESS);
+    const original = { to: 'client@example.com', body: 'טקסט מקורי' };
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId, proposedInput: original });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const csrf = extractCsrf(await cardRes.text());
+
+    const edited = { to: 'client@example.com', body: 'טקסט ערוך' };
+    const decideRes = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, input: JSON.stringify(edited) }),
+      redirect: 'manual',
+    });
+    expect(decideRes.status).toBe(302);
+
+    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    expect(approval?.state).toBe('approved_with_edit');
+    expect(approval?.editedInput).toEqual(edited);
+    const updatedJob = await loadJob(job.jobId, { businessId: BUSINESS });
+    expect(updatedJob?.phase).toBe('execute');
+  });
+
+  it('approves plainly when the resubmitted payload is unchanged, even reformatted', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const original = { to: 'client@example.com', body: 'שלום' };
+    const approvalId = await makeApproval({ businessId: BUSINESS, proposedInput: original });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const csrf = extractCsrf(await cardRes.text());
+
+    // Same content, different key order and whitespace — a re-serialisation,
+    // not an edit, and must not be treated as one.
+    const reformatted = '{\n  "body": "שלום",\n  "to":    "client@example.com"\n}';
+    const decideRes = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, input: reformatted }),
+      redirect: 'manual',
+    });
+    expect(decideRes.status).toBe(302);
+
+    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    expect(approval?.state).toBe('approved');
+    expect(approval?.editedInput).toBeNull();
+  });
+
+  it('refuses malformed JSON with a readable Hebrew message and leaves the approval pending', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const csrf = extractCsrf(await cardRes.text());
+
+    const decideRes = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, input: '{not valid json' }),
+      redirect: 'manual',
+    });
+    expect(decideRes.status).toBe(400);
+    const body = await decideRes.text();
+    expect(body).toContain('אינו JSON תקין');
+    // What the owner typed comes back, not the original — losing an
+    // in-progress edit on a typo would be its own kind of data loss.
+    expect(body).toContain('{not valid json');
+
+    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    expect(approval?.state).toBe('pending');
+  });
+
+  it('refuses an edited approve without a CSRF token', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ input: JSON.stringify({ to: 'x@example.com' }) }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(403);
+
+    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    expect(approval?.state).toBe('pending');
+  });
+
+  it('refuses an edited approve without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS });
+
+    const res = await fetch(`${baseUrl}/a/${approvalId}/approve`, {
+      method: 'POST',
+      body: new URLSearchParams({ input: JSON.stringify({ to: 'x@example.com' }) }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+
+    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    expect(approval?.state).toBe('pending');
+  });
 });

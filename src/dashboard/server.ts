@@ -17,6 +17,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { config } from '../config.js';
 import { getApproval, pendingApprovals } from '../governance/approvals.js';
 import { applyDecision } from '../orchestrator/resume.js';
+import { canonicalHash } from '../util/canonical.js';
 import {
   login,
   revokeAllSessions,
@@ -337,6 +338,42 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
   sendHtml(res, 200, renderApprovalCard({ approval, csrf: issueCsrfToken(session.sessionId) }));
 }
 
+/**
+ * The edited payload, if the owner changed anything, from the approve form's
+ * `input` field.
+ *
+ * Three outcomes:
+ *   - `{ ok: true, editedInput: undefined }` — field absent (the deny form
+ *     carries no `input` at all) or present but byte-for-byte the same
+ *     proposal reformatted. `canonicalHash` is what makes the second case
+ *     safe: it sorts keys and drops insignificant whitespace, so a
+ *     round-trip through the textarea that changed nothing but key order
+ *     does not get treated as an edit. Without that, `decide` would stamp
+ *     `approved_with_edit` on every approval that merely passed through this
+ *     form, and "edited" would stop meaning anything.
+ *   - `{ ok: true, editedInput: <value> }` — parsed JSON that hashes
+ *     differently from the stored proposal. This is what makes it into
+ *     `Decision.editedInput`.
+ *   - `{ ok: false, raw }` — the text is not valid JSON. `raw` is handed back
+ *     to the caller so the card can be re-rendered with exactly what the
+ *     owner typed, not a silently-reverted original; the approval is left
+ *     untouched (`decide` is never called).
+ */
+function parseEditedInput(
+  raw: string | null,
+  originalInputHash: string,
+): { ok: true; editedInput?: unknown } | { ok: false; raw: string } {
+  if (raw === null) return { ok: true };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false, raw };
+  }
+  if (canonicalHash(parsed) === originalInputHash) return { ok: true };
+  return { ok: true, editedInput: parsed };
+}
+
 async function handleDecision(
   req: IncomingMessage,
   res: ServerResponse,
@@ -355,10 +392,37 @@ async function handleDecision(
   if (!approval) return sendHtml(res, 404, renderNotFound());
 
   const note = noteFrom(form);
+
+  // Only the approve form carries an editable payload — denying something
+  // does not need a version of it to run, so a `deny` post is treated as
+  // if `input` were never sent, whatever a hand-crafted request attaches.
+  const edit = parseEditedInput(
+    outcome === 'approved' ? form.get('input') : null,
+    approval.inputHash,
+  );
+
+  if (!edit.ok) {
+    return sendHtml(
+      res,
+      400,
+      renderApprovalCard({
+        approval,
+        csrf: issueCsrfToken(session.sessionId),
+        editValue: edit.raw,
+        error: 'התוכן שהוזן אינו JSON תקין. אפשר לתקן ולנסות שוב.',
+      }),
+    );
+  }
+
   await applyDecision(
     approvalId,
     outcome,
-    { by: session.username, channel: 'dashboard', ...(note !== undefined ? { note } : {}) },
+    {
+      by: session.username,
+      channel: 'dashboard',
+      ...(note !== undefined ? { note } : {}),
+      ...(edit.editedInput !== undefined ? { editedInput: edit.editedInput } : {}),
+    },
     { businessId },
   );
 

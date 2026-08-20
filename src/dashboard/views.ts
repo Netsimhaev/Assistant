@@ -39,7 +39,9 @@ const STYLE = `
   label { display: block; margin-top: 0.75rem; }
   input[type="text"], input[type="password"], textarea { width: 100%; box-sizing: border-box; padding: 0.4rem; margin-top: 0.2rem; }
   button { margin-top: 1rem; padding: 0.5rem 1.2rem; cursor: pointer; }
-  .row { display: flex; gap: 0.5rem; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-start; }
+  .row form { flex: 1 1 16rem; }
+  .edit-form textarea[name="input"] { font-family: ui-monospace, monospace; font-size: 0.9em; }
   .band-routine { color: #2e7d32; }
   .band-sensitive { color: #ef6c00; }
   .band-anomalous, .band-blocked { color: #c0392b; }
@@ -169,9 +171,24 @@ ${list}`,
   );
 }
 
-export function renderApprovalCard(options: { approval: ApprovalRequest; csrf: string }): string {
+/**
+ * `editValue` is the raw text to put back in the textarea — used only when a
+ * submitted edit failed to parse, so the owner sees exactly what they typed
+ * (not the reformatted original) alongside the error. Absent, it defaults to
+ * the stored payload pretty-printed. Either way it goes through `esc()`
+ * before it reaches a `<textarea>`: element content has different escaping
+ * needs than an attribute value, but the one escaper here handles both —
+ * what matters is that nothing skips it.
+ */
+export function renderApprovalCard(options: {
+  approval: ApprovalRequest;
+  csrf: string;
+  editValue?: string;
+  error?: string;
+}): string {
   const { approval } = options;
-  const proposedInputText = esc(JSON.stringify(approval.proposedInput, null, 2));
+  const editValue = options.editValue ?? JSON.stringify(approval.proposedInput, null, 2);
+  const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
   const risk = approval.risk;
 
   return page(
@@ -192,12 +209,15 @@ export function renderApprovalCard(options: { approval: ApprovalRequest; csrf: s
     <tr><td class="muted">נוצר</td><td>${esc(approval.createdAt)}</td></tr>
     <tr><td class="muted">פג תוקף</td><td>${esc(approval.expiresAt)}</td></tr>
   </table>
-  <p class="muted">התוכן המוצע:</p>
-  <pre>${proposedInputText}</pre>
 </div>
 <div class="row">
-  <form method="post" action="/a/${esc(approval.approvalId)}/approve">
+  <form method="post" action="/a/${esc(approval.approvalId)}/approve" class="edit-form">
     <input type="hidden" name="csrf" value="${esc(options.csrf)}">
+    <label>תוכן מוצע (ניתן לעריכה לפני אישור)
+      <textarea name="input" rows="12" spellcheck="false">${esc(editValue)}</textarea>
+    </label>
+    <p class="muted">עריכת התוכן לפני האישור מריצה את הגרסה הערוכה. השארה כפי שהיא מאשרת את מה שתוכנן.</p>
+    ${errorBlock}
     <label>הערה (רשות)<textarea name="note" rows="2"></textarea></label>
     <button type="submit">אישור</button>
   </form>
