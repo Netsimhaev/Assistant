@@ -134,10 +134,25 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   // the action on the card, `decide` re-bound the approval's hash to that
   // edited input, and running the original would both do the wrong thing and
   // fail the gate's hash check — which is exactly how this was found.
+  //
+  // The job check is not decoration. `getApproval` is scoped by business only,
+  // and `executeStep` is exported and takes `approvalId` from whoever calls it
+  // — so without this predicate an approval belonging to ANOTHER job of the
+  // same business could replace this step's payload before the gate ever saw
+  // it. `consumeApproval` would then return `wrong_job`, which falls through
+  // to the normal path — and that path evaluates the substituted input. If it
+  // classified as routine, one job's edited payload executed under another
+  // job's ordinary allow, with no approval spent and nothing in the audit
+  // trail saying whose text it was. The approval must belong to this job
+  // before it is allowed to influence anything at all.
   let effectiveInput = request.toolInput;
   if (request.approvalId !== undefined) {
     const approval = await getApproval(request.approvalId, { businessId: job.businessId });
-    if (approval?.state === 'approved_with_edit' && approval.editedInput !== null) {
+    if (
+      approval?.jobId === job.jobId &&
+      approval.state === 'approved_with_edit' &&
+      approval.editedInput !== null
+    ) {
       effectiveInput = approval.editedInput as Record<string, unknown>;
     }
   }

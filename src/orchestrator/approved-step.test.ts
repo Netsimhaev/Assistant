@@ -8,6 +8,7 @@ import { createJob, loadJob, transition } from './jobs.js';
 import type { Job } from './jobs.js';
 import { executeStep } from './execute.js';
 import { applyDecision } from './resume.js';
+import { getApproval } from '../governance/approvals.js';
 
 /**
  * What `perform` returns when a step produced nothing an adapter would hand
@@ -118,5 +119,41 @@ describe('a step resumed from an approval', () => {
 
     expect(seen).toHaveLength(1);
     expect((seen[0] as { body: string }).body).toBe('נוסח ערוך');
+  });
+
+  // `executeStep` is exported and takes `approvalId` from its caller, while
+  // `getApproval` is scoped by business alone. Before the job predicate, an
+  // approval-with-edit belonging to a DIFFERENT job of the same business
+  // replaced this step's payload before the gate ever saw it — and the
+  // `wrong_job` refusal that followed fell through to the normal path, which
+  // then evaluated the foreign text. The queued request's `proposedInput` is
+  // what the gate actually judged, so it is the thing to assert on.
+  it('ignores an edit from another job of the same business', async () => {
+    const bundle = await install();
+    const other = await jobInExecute(bundle);
+    const foreignApprovalId = await parkOnApproval(bundle, other);
+    await applyDecision(foreignApprovalId, 'approved',
+      {
+        by: 'p_boss',
+        channel: 'dashboard',
+        editedInput: { ...STRANGER.toolInput, body: 'טקסט של job אחר' },
+      },
+      { businessId: BUSINESS });
+
+    const mine = await jobInExecute(bundle);
+    const outcome = await executeStep({
+      ...STRANGER, job: mine, bundle, approvalId: foreignApprovalId,
+      perform: async () => { throw new Error('perform must not run'); }, now: NOON,
+    });
+
+    expect(outcome.status).toBe('awaiting_approval');
+    if (outcome.status !== 'awaiting_approval') return;
+    const queued = await getApproval(outcome.approvalId, { businessId: BUSINESS });
+    expect(queued?.jobId).toBe(mine.jobId);
+    expect((queued?.proposedInput as { body: string }).body).toBe('נוסח מקורי');
+
+    // And the foreign approval is still unspent — this step never touched it.
+    const foreign = await getApproval(foreignApprovalId, { businessId: BUSINESS });
+    expect(foreign?.state).toBe('approved_with_edit');
   });
 });
