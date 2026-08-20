@@ -1,7 +1,7 @@
 import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { config } from '../config.js';
-import { getPool, withTransaction } from '../db/pool.js';
+import { getPool, withTransaction, type Queryable } from '../db/pool.js';
 
 const scrypt = promisify(scryptCb) as (
   password: string,
@@ -10,8 +10,15 @@ const scrypt = promisify(scryptCb) as (
 ) => Promise<Buffer>;
 
 const KEY_LENGTH = 64;
-const MAX_FAILED = 5;
-const LOCK_MINUTES = 15;
+/**
+ * Exported so recovery-code redemption can share the exact same lockout
+ * counter and threshold as password login — a code guesser must not get a
+ * separate, unlimited budget just because it went through a different
+ * function. Two copies of these numbers would let the two paths drift apart
+ * silently; one export keeps them identical by construction.
+ */
+export const MAX_FAILED = 5;
+export const LOCK_MINUTES = 15;
 const SESSION_HOURS = 12;
 /** Raw session token size. 256 bits — comfortably more than a browser cookie needs to resist guessing. */
 const TOKEN_BYTES = 32;
@@ -246,10 +253,15 @@ export async function verifySession(
 
 export async function revokeAllSessions(
   username: string,
-  options: { businessId?: string } = {},
+  options: { businessId?: string; tx?: Queryable } = {},
 ): Promise<number> {
   const businessId = options.businessId ?? config.businessId;
-  const result = await getPool().query(
+  // Accepts an optional transaction so a caller (recovery-code redemption,
+  // for one) can revoke sessions atomically with whatever else it is doing —
+  // e.g. claiming the code and writing the audit entry — rather than leaving
+  // a window where the code is spent but a stolen session survives it.
+  const db = options.tx ?? getPool();
+  const result = await db.query(
     `UPDATE dashboard_sessions SET revoked_at = now()
       WHERE business_id = $1 AND username = $2 AND revoked_at IS NULL`,
     [businessId, username],
