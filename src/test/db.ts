@@ -32,7 +32,10 @@ export async function resetDatabase(): Promise<void> {
       job_steps,
       jobs,
       charter_active,
-      charter_versions
+      charter_versions,
+      dashboard_sessions,
+      dashboard_recovery_codes,
+      dashboard_users
     RESTART IDENTITY CASCADE
   `);
 }
