@@ -2,7 +2,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import { enqueueApproval, getApproval } from '../governance/approvals.js';
@@ -37,8 +37,8 @@ afterEach(async () => {
   }
 });
 
-async function startServer(businessId: string): Promise<string> {
-  server = createServer({ businessId, port: 0 });
+async function startServer(businessId: string, options: { trustProxy?: boolean } = {}): Promise<string> {
+  server = createServer({ businessId, port: 0, ...options });
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
@@ -359,6 +359,56 @@ describe('recovery-code login', () => {
     const res = await fetch(`${baseUrl}/`, { headers: { cookie } });
     const body = await res.text();
     expect(body).toContain(String(expected));
+  });
+});
+
+describe('the address a recovery redemption is audited from', () => {
+  /** The reason line of the incident entry `redeemRecoveryCode` writes. */
+  async function redemptionAudit(businessId: string): Promise<string> {
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM audit_log
+        WHERE business_id = $1 AND reason LIKE 'recovery code redeemed%'
+        ORDER BY seq DESC LIMIT 1`,
+      [businessId],
+    );
+    const reason = rows[0]?.reason;
+    if (reason === undefined) throw new Error('no redemption audit entry');
+    return reason;
+  }
+
+  async function redeem(baseUrl: string, code: string, forwardedFor: string): Promise<void> {
+    const res = await fetch(`${baseUrl}/login`, {
+      method: 'POST',
+      headers: { 'x-forwarded-for': forwardedFor },
+      body: new URLSearchParams({ username: USERNAME, code }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+  }
+
+  it('records the proxy hop as a proxy hop, and never believes a header it was not told to trust', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+    await redeem(baseUrl, codes[0]!, '203.0.113.9');
+
+    const reason = await redemptionAudit(BUSINESS);
+    // The header was sent by the client on an open socket. Believing it
+    // would let whoever redeems a code choose what the only record of that
+    // event says about where it came from.
+    expect(reason).not.toContain('203.0.113.9');
+    expect(reason).toContain('proxy hop');
+  });
+
+  it('records the nearest hop of a forwarded-for header when the deployment says to trust one', async () => {
+    const baseUrl = await startServer(BUSINESS, { trustProxy: true });
+    const codes = await issueRecoveryCodes({ username: USERNAME, businessId: BUSINESS });
+    // Two entries: the left one is whatever the client sent, the right one
+    // is what the trusted proxy appended. The right one is the answer.
+    await redeem(baseUrl, codes[0]!, '198.51.100.7, 203.0.113.9');
+
+    const reason = await redemptionAudit(BUSINESS);
+    expect(reason).toContain('203.0.113.9');
+    expect(reason).not.toContain('198.51.100.7');
   });
 });
 

@@ -49,6 +49,19 @@ export interface DashboardOptions {
   host?: string;
   /** 0 lets the OS assign a free port; tests always pass 0 so runs never collide. */
   port?: number;
+  /**
+   * Whether a `X-Forwarded-For` header on an incoming request may be
+   * believed. Off by default, and it must stay off unless the only way to
+   * reach this port is through a proxy that sets the header itself.
+   *
+   * The header is client-supplied text on an open socket. Trusting it
+   * unconditionally is worse than ignoring it: an attacker would then choose
+   * what the audit log says about where a credential-recovery event came
+   * from, which is more damaging than a record that plainly says "this is
+   * the proxy's address". So this is opt-in, per deployment, by whoever
+   * knows the topology.
+   */
+  trustProxy?: boolean;
 }
 
 function sessionCookie(token: string): string {
@@ -57,6 +70,50 @@ function sessionCookie(token: string): string {
 
 function clearedCookie(): string {
   return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`;
+}
+
+/** An audited address is never longer than this. A header is attacker-supplied text even when the proxy is trusted. */
+const MAX_ADDRESS_LENGTH = 64;
+
+/**
+ * Where a request came from, as the audit log should name it.
+ *
+ * `req.socket.remoteAddress` is the *previous hop*, and this server is
+ * required to sit behind a tunnel or reverse proxy
+ * (docs/dashboard-deployment.md) — so in every real deployment that address
+ * is the proxy, and recording it bare made every recovery-code redemption
+ * audit as coming from localhost. The only record of a credential-recovery
+ * event named the wrong origin, and named it confidently.
+ *
+ * Two honest answers, and this returns whichever one the deployment has
+ * earned:
+ *
+ *   * `trustProxy` off (the default): the socket address, labelled as the
+ *     proxy's and not the client's. Useless for tracing, but it does not
+ *     claim to be something it is not.
+ *   * `trustProxy` on: the LAST entry of `X-Forwarded-For`. Last, not first:
+ *     each proxy appends the address it saw, so the rightmost entry is the
+ *     one the nearest (and only trusted) proxy wrote, while everything to
+ *     its left may have been sent by the client. Reading the leftmost entry
+ *     — the usual mistake — is reading whatever an attacker typed.
+ */
+function clientAddress(req: IncomingMessage, trustProxy: boolean): string {
+  const socketAddress = req.socket.remoteAddress ?? 'unknown';
+  if (!trustProxy) return `${socketAddress} (proxy hop; not the client address)`;
+
+  const raw = req.headers['x-forwarded-for'];
+  const joined = Array.isArray(raw) ? raw.join(',') : (raw ?? '');
+  const hops = joined
+    .split(',')
+    .map((hop) => hop.trim())
+    .filter((hop) => hop.length > 0);
+  const nearest = hops[hops.length - 1];
+  if (nearest === undefined) {
+    // Trusted proxy configured, no header present: say so rather than
+    // silently reporting the socket as the client.
+    return `${socketAddress} (proxy hop; no forwarded-for header)`;
+  }
+  return nearest.slice(0, MAX_ADDRESS_LENGTH);
 }
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -143,19 +200,23 @@ async function handleLoginGet(res: ServerResponse): Promise<void> {
   sendHtml(res, 200, renderLogin());
 }
 
-async function handleLoginPost(req: IncomingMessage, res: ServerResponse, businessId: string): Promise<void> {
+async function handleLoginPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  trustProxy: boolean,
+): Promise<void> {
   const form = await readFormBody(req);
   const username = form.get('username') ?? '';
   const code = form.get('code');
   const password = form.get('password');
 
   if (code !== null && code.length > 0) {
-    const sourceAddress = req.socket.remoteAddress;
     const result = await redeemRecoveryCode({
       username,
       code,
       businessId,
-      ...(sourceAddress !== undefined ? { sourceAddress } : {}),
+      sourceAddress: clientAddress(req, trustProxy),
     });
     if (!result.ok) {
       return sendHtml(res, 401, renderLogin({ error: 'קוד שגוי, כבר נוצל, או שהמערכת נעולה זמנית.' }));
@@ -275,7 +336,12 @@ async function handleLogout(req: IncomingMessage, res: ServerResponse, businessI
 const CARD_PATH = /^\/a\/([^/]+)$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny)$/;
 
-async function route(req: IncomingMessage, res: ServerResponse, businessId: string): Promise<void> {
+async function route(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  trustProxy: boolean,
+): Promise<void> {
   const method = req.method ?? 'GET';
   const pathname = new URL(req.url ?? '/', 'http://dashboard.local').pathname;
 
@@ -290,7 +356,9 @@ async function route(req: IncomingMessage, res: ServerResponse, businessId: stri
   // account's password or an unredeemed recovery code, at which point the
   // attacker already has direct access and gains nothing by routing it
   // through the victim's browser.
-  if (method === 'POST' && pathname === '/login') return handleLoginPost(req, res, businessId);
+  if (method === 'POST' && pathname === '/login') {
+    return handleLoginPost(req, res, businessId, trustProxy);
+  }
 
   // Everything past this point requires a session.
   const session = await loadSession(req, businessId);
@@ -335,7 +403,7 @@ export function createServer(options: DashboardOptions = {}): Server {
   const host = options.host ?? '127.0.0.1';
 
   const server = createHttpServer((req, res) => {
-    route(req, res, businessId).catch((err: unknown) => {
+    route(req, res, businessId, options.trustProxy ?? false).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {
         sendHtml(res, 500, renderServerError());
