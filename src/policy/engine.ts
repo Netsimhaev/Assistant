@@ -10,9 +10,10 @@ import { mostRestrictiveAutonomy } from '../domain/trust.js';
 import { appendAudit } from '../audit/log.js';
 import { isToolPermitted } from '../charter/capabilities.js';
 import { activeCharterVersion } from '../charter/store.js';
-import { enqueueApproval } from '../governance/approvals.js';
+import { enqueueApproval, getApproval } from '../governance/approvals.js';
 import { consumeApproval } from '../governance/consume.js';
 import { checkKillSwitch } from '../governance/killswitch.js';
+import type { ApprovalNotifier } from '../governance/notify.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import { checkBudget } from './budget.js';
 import { buildFacts, type FactsContext } from './facts.js';
@@ -45,6 +46,18 @@ export interface GateContext extends FactsContext {
    * second request, and the step never runs however many times it is approved.
    */
   approval?: { approvalId: string; stepId: string };
+  /**
+   * How to tell the owner a request is waiting, and where they can act on it.
+   *
+   * Absent by default — that is the state the system is in today, and
+   * `enqueueApproval` already queues correctly without it. This gate is a
+   * pure-ish policy function with no notion of email or a deployment's
+   * externally-reachable address; both come from whichever caller actually
+   * has them (an SMTP transport and the dashboard's origin are deployment
+   * concerns, not policy ones), so they arrive here instead of every caller
+   * being made to know how to send mail.
+   */
+  notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
 }
 
 /**
@@ -342,6 +355,39 @@ export async function evaluateToolCall(
       },
       { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
     );
+
+    if (ctx.notify) {
+      const { notifier, dashboardBaseUrl } = ctx.notify;
+      const approvalLink = (id: string): string => `${dashboardBaseUrl}/a/${id}`;
+      // Delivery failing is not the request failing. The row exists, the screen
+      // shows it, and the scheduler will expire it on schedule either way. An
+      // approval that vanished because an SMTP server was down would be far worse
+      // than one nobody was emailed about.
+      try {
+        const request = await getApproval(approvalId, { businessId, db });
+        if (request === null) {
+          throw new Error('approval vanished immediately after being queued');
+        }
+        const delivered = await notifier.notify(request, approvalLink(approvalId));
+        if (!delivered.ok) throw new Error(delivered.error ?? 'notify returned not-ok');
+      } catch (error) {
+        await appendAudit(
+          {
+            actor: 'system',
+            kind: 'incident',
+            jobId: ctx.jobId ?? null,
+            actionClass: facts.actionClass,
+            charterVersion: currentVersion,
+            provenance: facts.provenance,
+            inputHash: facts.inputHash,
+            reason:
+              `approval_notify_failed:${approvalId} via ${notifier.channel} — ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          },
+          { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
+        );
+      }
+    }
 
     return {
       outcome: 'queue_approval',

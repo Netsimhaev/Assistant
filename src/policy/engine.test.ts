@@ -10,6 +10,7 @@ import { evaluateToolCall, type GateContext } from './engine.js';
 import { refineActionClass } from './classify.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { BusinessCharter } from '../domain/charter.js';
+import type { ApprovalNotifier } from '../governance/notify.js';
 
 const BUSINESS = 'test-business';
 
@@ -304,6 +305,101 @@ describe('exit criterion: approval', () => {
     );
 
     expect(decision.outcome).toBe('queue_approval');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The approval notifier — a courtesy that tells the owner a request is
+// waiting, and must never be able to make the request itself disappear.
+
+function recordingNotifier(): {
+  notifier: ApprovalNotifier;
+  calls: { approvalId: string; link: string }[];
+} {
+  const calls: { approvalId: string; link: string }[] = [];
+  const notifier: ApprovalNotifier = {
+    channel: 'email',
+    async notify(request, link) {
+      calls.push({ approvalId: request.approvalId, link });
+      return { ok: true };
+    },
+  };
+  return { notifier, calls };
+}
+
+function throwingNotifier(message: string): ApprovalNotifier {
+  return {
+    channel: 'email',
+    async notify() {
+      throw new Error(message);
+    },
+  };
+}
+
+const SUBMIT_ORDER_INPUT = { supplierId: 'supplier_a', amountMinor: 210_000, sku: 'PRD-77', qty: 50 };
+
+describe('approval notification', () => {
+  it('calls the notifier with the new approval and a link that contains its id', async () => {
+    const bundle = await install();
+    const { notifier, calls } = recordingNotifier();
+
+    const decision = await evaluateToolCall(
+      'browser.submit_order',
+      SUBMIT_ORDER_INPUT,
+      ctx(bundle, {
+        agent: 'ops.web',
+        notify: { notifier, dashboardBaseUrl: 'https://dash.example.com' },
+      }),
+    );
+
+    expect(decision.outcome).toBe('queue_approval');
+    if (decision.outcome !== 'queue_approval') throw new Error('unreachable');
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.approvalId).toBe(decision.approvalId);
+    expect(calls[0]?.link).toBe(`https://dash.example.com/a/${decision.approvalId}`);
+  });
+
+  // The single most important property in this task: delivery failing is
+  // not the request failing. Remove the try/catch around the notifier call
+  // in engine.ts and this is the test that turns red.
+  it('does not fail enqueueApproval when the notifier throws — the request still exists and is still pending', async () => {
+    const bundle = await install();
+    const notifier = throwingNotifier('smtp connection refused');
+
+    const decision = await evaluateToolCall(
+      'browser.submit_order',
+      SUBMIT_ORDER_INPUT,
+      ctx(bundle, {
+        agent: 'ops.web',
+        notify: { notifier, dashboardBaseUrl: 'https://dash.example.com' },
+      }),
+    );
+
+    expect(decision.outcome).toBe('queue_approval');
+    if (decision.outcome !== 'queue_approval') throw new Error('unreachable');
+
+    const stored = await getApproval(decision.approvalId, { businessId: BUSINESS });
+    expect(stored).not.toBeNull();
+    expect(stored?.state).toBe('pending');
+
+    // The failure is not silent either — it lands in the audit log as an
+    // incident, distinct from the `decision` entry that queued the approval.
+    const entries = await queryAudit({ businessId: BUSINESS, kind: 'incident' }, getPool());
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.reason).toContain(`approval_notify_failed:${decision.approvalId}`);
+    expect(entries[0]?.reason).toContain('smtp connection refused');
+  });
+
+  it('does nothing extra when no notifier is configured — the state the system is in today', async () => {
+    const bundle = await install();
+
+    const decision = await evaluateToolCall('browser.submit_order', SUBMIT_ORDER_INPUT, ctx(bundle, { agent: 'ops.web' }));
+
+    expect(decision.outcome).toBe('queue_approval');
+
+    const entries = await queryAudit({ businessId: BUSINESS, kind: 'incident' }, getPool());
+    expect(entries).toHaveLength(0);
   });
 });
 
