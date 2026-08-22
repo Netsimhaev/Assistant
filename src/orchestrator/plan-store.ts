@@ -1,7 +1,7 @@
 import type pg from 'pg';
 import { config } from '../config.js';
 import { getPool, withTransaction, type Queryable } from '../db/pool.js';
-import type { Plan } from '../domain/plan.js';
+import { Plan } from '../domain/plan.js';
 import { canonicalHash } from '../util/canonical.js';
 
 /**
@@ -267,4 +267,55 @@ export async function recordStepCompletion(
       input.status,
     ],
   );
+}
+
+/** A job's plan as stored, parsed back into the domain type. */
+export interface StoredPlanBody {
+  planHash: string;
+  plan: Plan;
+}
+
+interface PlanBodyRow {
+  plan_hash: string;
+  plan: unknown;
+}
+
+/**
+ * The plan a job is executing, body and all.
+ *
+ * `loadStoredPlan` returns only the hash, which answers "is this job bound?"
+ * and nothing else. Resumption needs the plan itself: the scheduler wakes a
+ * job hours after the run that stored it, in a different process, with no
+ * memory of what the planner produced. The `plan` column has been written
+ * since migration 004 and had no reader until this function.
+ *
+ * A row that no longer parses throws rather than resolving to null. Null means
+ * "this job is bound to nothing", and a caller acting on that would bind a
+ * *new* plan over a job whose completed steps belong to the old one — the
+ * exact merge `bindPlanToJob` refuses. A stored plan this build cannot read is
+ * a different fact and deserves a different, loud ending.
+ */
+export async function loadPlanBody(
+  jobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<StoredPlanBody | null> {
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<PlanBodyRow>(
+    `SELECT plan_hash, plan FROM job_plans
+      WHERE business_id = $1 AND job_id = $2`,
+    [options.businessId ?? config.businessId, jobId],
+  );
+
+  const row = rows[0];
+  if (!row) return null;
+
+  const parsed = Plan.safeParse(row.plan);
+  if (!parsed.success) {
+    throw new Error(
+      `loadPlanBody: stored plan for job ${jobId} does not parse as a Plan — ` +
+        `refusing to treat it as unbound (${parsed.error.message})`,
+    );
+  }
+
+  return { planHash: row.plan_hash, plan: parsed.data };
 }
