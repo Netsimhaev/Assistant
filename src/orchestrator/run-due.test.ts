@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -71,20 +71,25 @@ function runtimeWith(sent: MailMessage[]): Runtime {
 }
 
 /** A job in `execute`, via the real transition chain: intake → understand → plan → execute. */
-async function jobInExecute(charterVersion: string, title: string): Promise<string> {
+async function jobInExecute(
+  charterVersion: string,
+  title: string,
+  businessId: string = BUSINESS,
+): Promise<string> {
   const job = await createJob({
     charterVersion,
     provenance: 'boss',
-    businessId: BUSINESS,
+    businessId,
     title,
   });
   for (const to of ['understand', 'plan', 'execute'] as const) {
-    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId });
   }
   return job.jobId;
 }
 
-async function seedExecutableJob(): Promise<string> {
+/** Everything a real production caller would have already done for one business. */
+async function seedExecutableJob(businessId: string = BUSINESS): Promise<string> {
   // `installCharter` returns the compiled PolicyBundle directly — its
   // `charterVersion` field is the job's, not a `{ charterVersion, bundle }`
   // wrapper the brief's draft assumed.
@@ -99,12 +104,16 @@ async function seedExecutableJob(): Promise<string> {
   // is the ONLY thing that changes between that test and this one.
   const bundle = await installCharter(
     buildCharter({
+      // `charter_versions` keys on `charter_version` alone, globally, not
+      // per business — the version must be unique across every call this
+      // test file makes within one test, not just within one business.
+      version: `2026-08-15.${businessId}`,
       connections: [MAIL_CONNECTION],
       autonomyBase: { 'email.initiate': 'auto' },
     }),
-    { businessId: BUSINESS },
+    { businessId },
   );
-  const jobId = await jobInExecute(bundle.charterVersion, 'run-due');
+  const jobId = await jobInExecute(bundle.charterVersion, 'run-due', businessId);
   await upsertBinding(
     {
       system: 'office-mail',
@@ -114,9 +123,9 @@ async function seedExecutableJob(): Promise<string> {
       lastOkAt: null,
       lastError: null,
     },
-    { businessId: BUSINESS, by: 'test' },
+    { businessId, by: 'test' },
   );
-  await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
+  await bindPlanToJob(jobId, PLAN, { businessId });
   return jobId;
 }
 
@@ -173,13 +182,80 @@ describe('runDueJobs', () => {
   });
 
   it('does not run a job belonging to another business', async () => {
-    const jobId = await seedExecutableJob();
+    // Two real, independently executable jobs, one per business, seeded in
+    // this order so `jobIdHome` (BUSINESS) is strictly older by `updated_at`
+    // than `jobIdOther` (OTHER_BUSINESS). Combined with `limit: 1` below,
+    // this is deliberately the setup that makes the outer query's own
+    // `business_id` filter — and not only `loadJob`'s downstream business
+    // scoping — load-bearing: without that filter, the outer SELECT would
+    // return `jobIdHome` (older, wrong business) instead of `jobIdOther`
+    // within the limit, and `jobIdOther` would never even be fetched to
+    // attempt. A version of this test that only asserted "the wrong job
+    // never appears in `ran`" passed even with the filter stripped, because
+    // `loadJob(jobIdHome, { businessId: OTHER_BUSINESS })` returns null and
+    // is silently skipped either way — that check alone cannot tell a
+    // present filter from an absent one. Asserting the RIGHT job DID run,
+    // under a `limit` that a foreign, older row can crowd out, is what
+    // makes a stripped filter visible. See the task-5 report's "Fix round 1"
+    // section for the exact failure this produced when verified.
+    const OTHER_BUSINESS = 'other-business';
+    const jobIdHome = await seedExecutableJob(BUSINESS);
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    const jobIdOther = await seedExecutableJob(OTHER_BUSINESS);
+    await setRampLevel('email.initiate', 'auto', { businessId: OTHER_BUSINESS });
+
+    const sent: MailMessage[] = [];
     const result = await runDueJobs({
-      businessId: 'other-business',
-      runtime: runtimeWith([]),
+      businessId: OTHER_BUSINESS,
+      runtime: runtimeWith(sent),
       now: NOON,
+      limit: 1,
     });
-    expect(result.ran.map((r) => r.jobId)).not.toContain(jobId);
+
+    expect(result.ran.map((r) => r.jobId)).toEqual([jobIdOther]);
+    expect(result.ran.map((r) => r.jobId)).not.toContain(jobIdHome);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('isolates a job whose stored plan cannot be parsed, and still runs a healthy job in the same pass', async () => {
+    // The poison-pill job is created FIRST, so it sorts before the healthy
+    // job under `ORDER BY updated_at ASC` — the exact ordering the Important
+    // defect exploited: a job that can never advance sorts first on every
+    // pass, so an unisolated throw here would have stopped the healthy job
+    // from ever being reached, on this pass and every pass after it.
+    // `charter_versions` keys on `charter_version` alone, and `seedExecutableJob`
+    // below installs a charter of its own — both must carry distinct
+    // versions or the second `installCharter` collides on the primary key.
+    const bundle = await installCharter(
+      buildCharter({
+        version: '2026-08-15.poison',
+        connections: [MAIL_CONNECTION],
+        autonomyBase: { 'email.initiate': 'auto' },
+      }),
+      { businessId: BUSINESS },
+    );
+    const poisonJobId = await jobInExecute(bundle.charterVersion, 'poison');
+    await bindPlanToJob(poisonJobId, PLAN, { businessId: BUSINESS });
+    // Corrupt the stored plan directly in the database. `loadPlanBody`
+    // (`plan-store.ts`) throws rather than returning null when a stored plan
+    // no longer parses as a `Plan` — by design, per its own docblock — and
+    // this is the only way to produce that condition from outside the
+    // module.
+    await getPool().query('UPDATE job_plans SET plan = $1 WHERE business_id = $2 AND job_id = $3', [
+      JSON.stringify({ goal: 'missing its steps entirely' }),
+      BUSINESS,
+      poisonJobId,
+    ]);
+
+    const healthyJobId = await seedExecutableJob();
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+
+    const sent: MailMessage[] = [];
+    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+
+    expect(result.errored).toEqual([{ jobId: poisonJobId, error: expect.any(String) }]);
+    expect(result.errored[0]?.error).toContain('does not parse as a Plan');
+    expect(result.ran).toEqual([{ jobId: healthyJobId, status: 'done', detail: null }]);
+    expect(sent).toHaveLength(1);
   });
 });
