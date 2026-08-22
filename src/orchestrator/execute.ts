@@ -5,6 +5,7 @@ import type { AutonomyLevel } from '../domain/trust.js';
 import { classifyAction, refineActionClass } from '../policy/classify.js';
 import { evaluateToolCall } from '../policy/engine.js';
 import { getApproval } from '../governance/approvals.js';
+import type { ApprovalNotifier } from '../governance/notify.js';
 import { recordSpend } from '../policy/budget.js';
 import { canonicalHash } from '../util/canonical.js';
 import { transition } from './jobs.js';
@@ -65,6 +66,16 @@ export interface StepRequest {
    * history.
    */
   approvalId?: string;
+  /**
+   * How to tell the owner an approval is waiting.
+   *
+   * Optional because the gate treats notification as best-effort — the request
+   * row and the dashboard exist either way, and `evaluateToolCall` records
+   * `approval_notify_failed` rather than throwing. Absent, an approval is
+   * queued and nobody is told, which is exactly the state this field exists to
+   * end.
+   */
+  notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
 }
 
 export type StepOutcome =
@@ -180,6 +191,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     ...(request.approvalId !== undefined
       ? { approval: { approvalId: request.approvalId, stepId: request.stepId } }
       : {}),
+    ...(request.notify !== undefined ? { notify: request.notify } : {}),
   });
 
   if (decision.outcome === 'queue_approval') {

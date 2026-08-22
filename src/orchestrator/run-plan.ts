@@ -6,6 +6,7 @@ import { planProblems, topologicalOrder, type Plan, type PlanStep } from '../dom
 import { classifyAction, isOutbound, refineActionClass } from '../policy/classify.js';
 import { canonicalHash } from '../util/canonical.js';
 import { unspentApprovalFor } from '../governance/approvals.js';
+import type { ApprovalNotifier } from '../governance/notify.js';
 import type { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
 import { loadBindings } from './bindings.js';
@@ -58,6 +59,8 @@ export interface RunPlanRequest {
    * minute for it. Production callers leave it unset and get the constant.
    */
   adapterTimeoutMs?: number;
+  /** Passed through to the gate so a queued approval reaches the owner. */
+  notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
 }
 
 /**
@@ -314,6 +317,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       planHash,
       ...(request.now !== undefined ? { now: request.now } : {}),
       ...(approvalId !== null ? { approvalId } : {}),
+      ...(request.notify !== undefined ? { notify: request.notify } : {}),
     });
     records.push({
       stepId: step.id,
