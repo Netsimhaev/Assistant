@@ -74,9 +74,15 @@ export function buildRuntime(
         auth: { user: env['SMTP_USER'] as string, pass: env['SMTP_PASS'] as string },
       });
 
+      const mailSystem = env['MAIL_SYSTEM'];
       systemAdapters.push(
         createMailAdapter({
-          system: env['MAIL_SYSTEM'] ?? DEFAULT_MAIL_SYSTEM,
+          // `??` alone would accept `MAIL_SYSTEM=''` and register the mail
+          // adapter under an empty system id — one `resolveChannel` can never
+          // match, so every `mail.send` step would fail as if no adapter
+          // existed at all, silently. Empty is treated as unset here, the
+          // same as every other env value this function reads.
+          system: mailSystem === undefined || mailSystem.length === 0 ? DEFAULT_MAIL_SYSTEM : mailSystem,
           transport,
         }),
       );
@@ -88,9 +94,13 @@ export function buildRuntime(
             `queue and appear on the dashboard, and nobody will be emailed`,
         );
       } else {
+        const dashboardBaseUrl = env['DASHBOARD_BASE_URL'];
         notify = {
           notifier: createEmailNotifier(transport, to),
-          dashboardBaseUrl: env['DASHBOARD_BASE_URL'] ?? DEFAULT_DASHBOARD_BASE_URL,
+          dashboardBaseUrl:
+            dashboardBaseUrl === undefined || dashboardBaseUrl.length === 0
+              ? DEFAULT_DASHBOARD_BASE_URL
+              : dashboardBaseUrl,
         };
       }
     }

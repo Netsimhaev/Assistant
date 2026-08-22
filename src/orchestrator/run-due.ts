@@ -35,6 +35,16 @@ export interface RunDueResult {
   /** Jobs in `execute` with no plan stored — nothing to run, and worth saying. */
   unbound: string[];
   /**
+   * Jobs the initial query found in `execute`, but whose phase had already
+   * moved by the time this runner re-read them under the per-job lock —
+   * another runner finished it, or the scheduler moved it to `followup`, in
+   * the moment between the query and the lock being granted. Nothing is
+   * wrong: this is the race the re-read exists to catch (see the function
+   * docblock). Reported anyway, because a bucket nobody reads is the same as
+   * no bucket at all — see `logErrored` in `run-scheduler.ts`.
+   */
+  phaseMoved: string[];
+  /**
    * Jobs whose processing threw before reaching any outcome — a stored plan
    * that no longer parses (`loadPlanBody` throws by design, see its
    * docblock), or a transient failure from `loadJob`, `loadActiveCharter`,
@@ -112,7 +122,13 @@ export async function runDueJobs(
     [businessId, limit],
   );
 
-  const result: RunDueResult = { ran: [], lockedOut: [], unbound: [], errored: [] };
+  const result: RunDueResult = {
+    ran: [],
+    lockedOut: [],
+    unbound: [],
+    phaseMoved: [],
+    errored: [],
+  };
 
   for (const row of rows) {
     const jobId = row.job_id;
@@ -133,7 +149,10 @@ export async function runDueJobs(
 
         // Re-read under the lock — see the docblock above.
         const job = await loadJob(jobId, { businessId });
-        if (job === null || job.phase !== 'execute') continue;
+        if (job === null || job.phase !== 'execute') {
+          result.phaseMoved.push(jobId);
+          continue;
+        }
 
         const stored = await loadPlanBody(jobId, { businessId });
         if (stored === null) {
@@ -187,10 +206,21 @@ export async function runDueJobs(
       }
     } finally {
       if (holdsLock) {
+        // The unlock attempt and the release are kept apart so `release` is
+        // called exactly once on every path. Nesting `client.release()`
+        // inside the `try` and `client.release(err)` inside its `catch` — the
+        // earlier shape here — released twice if `release()` itself ever
+        // threw: once from the `try`, once more from the `catch` it fell
+        // into.
+        let unlockError: unknown;
         try {
           await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [lockScope]);
+        } catch (error) {
+          unlockError = error;
+        }
+        if (unlockError === undefined) {
           client.release();
-        } catch (unlockError) {
+        } else {
           // The advisory lock is session-scoped, not connection-scoped by
           // magic: it lives on the session pg gave this client, and only
           // ends for certain when that session ends. `client.release()`

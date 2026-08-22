@@ -45,6 +45,21 @@ describe('buildRuntime', () => {
     expect(typeof runtime.credentials.resolve).toBe('function');
   });
 
+  it('treats an explicitly-empty MAIL_SYSTEM as unset, not as a literal empty system id', () => {
+    // `??` alone accepts `''`, and an adapter registered under an empty
+    // system id can never be matched by `resolveChannel` — every mail.send
+    // step would fail silently, with no warning at all, because the earlier
+    // check only looks at the SMTP_* keys. Empty must fall back to the
+    // default, exactly like every other value this function reads.
+    const runtime = buildRuntime({ ...FULL, MAIL_SYSTEM: '' });
+    expect(runtime.registry.get('office-mail')).not.toBeNull();
+  });
+
+  it('treats an explicitly-empty DASHBOARD_BASE_URL as unset, not as a literal empty link', () => {
+    const runtime = buildRuntime({ ...FULL, DASHBOARD_BASE_URL: '' });
+    expect(runtime.notify?.dashboardBaseUrl).toBe('http://127.0.0.1:8787');
+  });
+
   it('registers the browser driver as the browser channel default', () => {
     const runtime = buildRuntime(FULL);
     // AdapterRegistry.systems() lists system-specific entries under their

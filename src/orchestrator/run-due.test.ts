@@ -5,6 +5,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
 import type { CharterConnection } from '../domain/connection.js';
+import type { ApprovalNotifier } from '../governance/notify.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import { upsertBinding } from './bindings.js';
@@ -154,6 +155,60 @@ describe('runDueJobs', () => {
     expect(result.ran[0]?.status).toBe('done');
     expect(sent).toHaveLength(1);
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+  });
+
+  it('forwards runtime.notify into runPlanForJob, so a queued approval actually notifies the owner', async () => {
+    // A dedicated charter with `approve_required` as the BASE autonomy for
+    // `email.initiate` (not `seedExecutableJob`'s `auto`), so this test's
+    // path to `queue_approval` does not depend on `PLAN`'s recipient being an
+    // unknown counterparty — it is forced by autonomy alone, the same as the
+    // `queues approval and notifies` scenario `notify-wiring.test.ts` drives
+    // straight through `runPlan`. This test exists because that one does
+    // not: `runPlan` is handed a `notify` literal directly there, so it
+    // cannot catch `run-due.ts` failing to forward `runtime.notify` at all.
+    // `runtimeWith` above never sets `notify` either — deleting the
+    // forwarding line in `run-due.ts` leaves every other test in this file
+    // green.
+    const bundle = await installCharter(
+      buildCharter({
+        version: `2026-08-15.notify-forward`,
+        connections: [MAIL_CONNECTION],
+        autonomyBase: { 'email.initiate': 'approve_required' },
+      }),
+      { businessId: BUSINESS },
+    );
+    const jobId = await jobInExecute(bundle.charterVersion, 'notify-forward');
+    await upsertBinding(
+      {
+        system: 'office-mail',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OFFICE_MAIL',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { businessId: BUSINESS, by: 'test' },
+    );
+    await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
+
+    const notified: string[] = [];
+    const notifier: ApprovalNotifier = {
+      channel: 'email',
+      async notify(request) {
+        notified.push(request.approvalId);
+        return { ok: true };
+      },
+    };
+    const runtime: Runtime = {
+      ...runtimeWith([]),
+      notify: { notifier, dashboardBaseUrl: 'http://127.0.0.1:8787' },
+    };
+
+    const result = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+
+    expect(result.ran).toEqual([{ jobId, status: 'halted', detail: 'awaiting_approval' }]);
+    expect(notified).toHaveLength(1);
   });
 
   it('reports a job in execute that is bound to no plan, and does not run it', async () => {

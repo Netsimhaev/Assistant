@@ -30,14 +30,6 @@ export interface SeedMailJobOptions {
   subject: string;
   body: string;
   businessId?: string;
-  /**
-   * The charter's system name for the mailbox. Accepted for interface
-   * stability but currently inert: `resolveChannel` (`orchestrator/channels.ts`)
-   * picks the connection that serves `mail.send` from the charter alone, not
-   * from anything the plan step's payload carries. This is where a caller
-   * would pick a specific mailbox once a charter can name more than one.
-   */
-  system?: string;
 }
 
 export async function seedMailJob(

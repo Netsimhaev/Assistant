@@ -1,9 +1,12 @@
 /**
  * The scheduler as a process.
  *
- * Nothing in the system wakes a deferred job or expires an unanswered approval
- * unless this is running. It is deliberately dull: one tick on a timer, a
- * signal handler, and a log line per tick that did something.
+ * Nothing in the system wakes a deferred job, expires an unanswered approval,
+ * or runs a plan that is ready to go unless this is running: each pass calls
+ * `schedulerPass`, which ticks (waking due jobs, expiring overdue approvals)
+ * and then runs every job that pass left sitting in `execute`. It is
+ * deliberately dull: one pass on a timer, a signal handler, and a log line
+ * per pass that found something worth telling an operator about.
  *
  *   npm run scheduler
  */
@@ -22,13 +25,33 @@ console.log(
 const runtime = buildRuntime();
 for (const warning of runtime.warnings) console.warn(`warning: ${warning}`);
 
-// A job whose stored plan no longer parses (or any other per-job failure
-// `runDueJobs` isolates) lands in `due.errored`, not in a thrown error — it
-// never reaches `onError`. An operator has to learn a job is stuck some way,
-// and silence here is exactly the failure mode `errored` exists to end.
+// A job stuck in `execute` — one `runDueJobs` threw on, one with no plan
+// bound, one permanently rejected (`no_active_charter`, `job_not_executable`,
+// a malformed plan, …), or one whose phase moved out from under the lock —
+// never reaches `onError`; `runDueJobs` isolates every one of these into its
+// own bucket on `RunDueResult` instead (see that interface's docblock). Under
+// `ORDER BY updated_at ASC` a job that cannot advance sorts first on every
+// pass, so with enough such jobs the `LIMIT 20` window fills up and no other
+// job of that business runs at all. `errored` alone reported none of this:
+// `unbound` and a rejected `ran` entry were silent forever, and `phaseMoved`
+// was silent for the one pass it happened on. Surfacing all four is the only
+// fix in scope here — deciding a terminal disposition for a job stuck this
+// way (moving it to `failed`, adding an attempt counter) is a policy call for
+// its own change.
 function logErrored(result: SchedulerPassResult): void {
   for (const job of result.due.errored) {
     console.error(`job ${job.jobId} errored: ${job.error}`);
+  }
+  for (const jobId of result.due.unbound) {
+    console.error(`job ${jobId} is in execute with no plan bound`);
+  }
+  for (const job of result.due.ran) {
+    if (job.status === 'rejected') {
+      console.error(`job ${job.jobId} rejected: ${job.detail ?? '(no detail)'}`);
+    }
+  }
+  for (const jobId of result.due.phaseMoved) {
+    console.error(`job ${jobId} moved out of execute between the scan and the lock`);
   }
 }
 
