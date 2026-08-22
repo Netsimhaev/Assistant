@@ -1,6 +1,24 @@
 import type { PromptIo } from './prompt-io.js';
 
 /**
+ * Input read from a pipe but not yet handed to a caller.
+ *
+ * Module-level on purpose: it has to outlive one `readSecret` call, because
+ * one `data` event routinely carries more lines than the read that received
+ * it asked for. Scoping it per call throws the surplus away.
+ */
+let carriedInput = '';
+
+/** The next complete line, or null when the buffer holds no newline yet. */
+function takeBufferedLine(): string | null {
+  const newlineAt = carriedInput.indexOf('\n');
+  if (newlineAt === -1) return null;
+  const line = carriedInput.slice(0, newlineAt);
+  carriedInput = carriedInput.slice(newlineAt + 1);
+  return line.replace(/\r$/, '');
+}
+
+/**
  * Reads one line from stdin without echoing it to the terminal.
  *
  * Node has no built-in masked-input API, so this uses the standard trick
@@ -26,26 +44,56 @@ function readSecret(promptText: string): Promise<string> {
     // stray error here to leave stuck — unlike the TTY branch below, an
     // error simply rejects with nothing further to undo.
     return new Promise((resolve, reject) => {
-      let buffer = '';
-      const onData = (chunk: Buffer): void => {
-        buffer += chunk.toString('utf8');
-        const newlineAt = buffer.indexOf('\n');
-        if (newlineAt !== -1) {
-          stdin.removeListener('data', onData);
-          stdin.removeListener('error', onError);
-          stdin.pause();
-          resolve(buffer.slice(0, newlineAt).replace(/\r$/, ''));
-        }
-      };
-      const onError = (err: Error): void => {
+      // A line already sitting in the carry-over buffer needs no listener at
+      // all. Piped input arrives in chunks that do not respect line
+      // boundaries: `printf 'a\nb\n' | cmd` delivers BOTH lines in one
+      // `data` event, and a buffer scoped to a single read consumed the
+      // first and discarded the second — so the next prompt waited forever
+      // for an event that had already been and gone. `npm run owner:create`
+      // hung on exactly that, asking for a confirmation the pipe had
+      // already supplied.
+      const buffered = takeBufferedLine();
+      if (buffered !== null) {
+        resolve(buffered);
+        return;
+      }
+
+      const detach = (): void => {
         stdin.removeListener('data', onData);
         stdin.removeListener('error', onError);
+        stdin.removeListener('end', onEnd);
         stdin.pause();
+      };
+      const onData = (chunk: Buffer): void => {
+        carriedInput += chunk.toString('utf8');
+        const line = takeBufferedLine();
+        if (line !== null) {
+          detach();
+          resolve(line);
+        }
+      };
+      // Input that ends without a trailing newline is still input. Without
+      // this the promise never settles and the process hangs on EOF, which
+      // Node reports only as an unsettled top-level await — a symptom that
+      // names nothing.
+      const onEnd = (): void => {
+        detach();
+        const remainder = carriedInput;
+        carriedInput = '';
+        if (remainder === '') {
+          reject(new Error('stdin closed before a value was supplied'));
+          return;
+        }
+        resolve(remainder.replace(/\r$/, ''));
+      };
+      const onError = (err: Error): void => {
+        detach();
         reject(err);
       };
       stdin.resume();
       stdin.on('data', onData);
       stdin.on('error', onError);
+      stdin.on('end', onEnd);
     });
   }
 

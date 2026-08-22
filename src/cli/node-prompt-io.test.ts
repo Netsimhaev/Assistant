@@ -15,6 +15,55 @@ import { nodePromptIo } from './node-prompt-io.js';
  * happens to run after this one in the same process, which is a worse bug
  * than the one this test exists to catch.
  */
+/**
+ * The piped-input path, which is how every scripted install reaches these
+ * commands — and where two bugs sat that no test caught, because every
+ * existing test supplied a fake `PromptIo` instead of real stdin.
+ *
+ * `process.stdin` here is genuinely not a TTY, so these need no stubbing at
+ * all: they emit on the real stream and let the real code read it.
+ */
+describe('nodePromptIo.readSecret — piped input', () => {
+  /** Fails loudly instead of hanging the suite when a read never settles. */
+  function within<T>(promise: Promise<T>, ms = 2000): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`read did not settle within ${ms}ms`)), ms),
+      ),
+    ]);
+  }
+
+  it('keeps the lines a single chunk delivered beyond the first', async () => {
+    // `printf 'a\nb\n' | cmd` arrives as ONE data event carrying both
+    // lines. The first read used to consume the chunk, hand back line one
+    // and discard the rest — so the confirmation prompt waited forever for
+    // an event that had already happened. `owner:create` hung on exactly
+    // this, and reported it only as an unsettled top-level await.
+    const first = nodePromptIo.readSecret('one: ');
+    process.stdin.emit('data', Buffer.from('alpha\nbeta\n'));
+
+    expect(await within(first)).toBe('alpha');
+    // No second emit: the line must already be buffered.
+    expect(await within(nodePromptIo.readSecret('two: '))).toBe('beta');
+  });
+
+  it('accepts a final line that arrives without a trailing newline', async () => {
+    const read = nodePromptIo.readSecret('three: ');
+    process.stdin.emit('data', Buffer.from('no-newline'));
+    process.stdin.emit('end');
+
+    expect(await within(read)).toBe('no-newline');
+  });
+
+  it('rejects when stdin closes with nothing left to give', async () => {
+    const read = nodePromptIo.readSecret('four: ');
+    process.stdin.emit('end');
+
+    await expect(within(read)).rejects.toThrow(/stdin closed/);
+  });
+});
+
 describe('nodePromptIo.readSecret — Ctrl-C on a TTY', () => {
   it('restores raw mode before the process exits', () => {
     const stdin = process.stdin;
