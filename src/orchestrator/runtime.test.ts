@@ -47,9 +47,12 @@ describe('buildRuntime', () => {
 
   it('registers the browser driver as the browser channel default', () => {
     const runtime = buildRuntime(FULL);
-    // Registered as a channel default rather than under a system name; the
-    // registry has no public getter for that, so the check is that
-    // construction did not throw and mail is still reachable.
-    expect(runtime.registry.get('office-mail')).not.toBeNull();
+    // AdapterRegistry.systems() lists system-specific entries under their
+    // bare system id and channel defaults prefixed `channel:` (see that
+    // method's docblock). Asserting `channel:browser` is present fails if
+    // browserAdapter were dropped entirely, and asserting plain `browser` is
+    // absent fails if it were registered as a system adapter instead.
+    expect(runtime.registry.systems()).toContain('channel:browser');
+    expect(runtime.registry.systems()).not.toContain('browser');
   });
 });
