@@ -9,7 +9,9 @@
  */
 import { config } from '../config.js';
 import { closePool } from '../db/pool.js';
-import { startScheduler, tick } from './scheduler.js';
+import { schedulerPass, startScheduler } from './scheduler.js';
+import type { SchedulerPassResult } from './scheduler.js';
+import { buildRuntime } from './runtime.js';
 
 const intervalMs = Number(process.env['SCHEDULER_INTERVAL_MS'] ?? 30_000);
 
@@ -17,18 +19,34 @@ console.log(
   `scheduler starting for ${config.businessId}, every ${Math.round(intervalMs / 1000)}s`,
 );
 
-// One tick before the loop, so a misconfiguration surfaces immediately rather
+const runtime = buildRuntime();
+for (const warning of runtime.warnings) console.warn(`warning: ${warning}`);
+
+// A job whose stored plan no longer parses (or any other per-job failure
+// `runDueJobs` isolates) lands in `due.errored`, not in a thrown error — it
+// never reaches `onError`. An operator has to learn a job is stuck some way,
+// and silence here is exactly the failure mode `errored` exists to end.
+function logErrored(result: SchedulerPassResult): void {
+  for (const job of result.due.errored) {
+    console.error(`job ${job.jobId} errored: ${job.error}`);
+  }
+}
+
+// One pass before the loop, so a misconfiguration surfaces immediately rather
 // than at the first interval.
-const first = await tick();
-if (first.skipped) {
+const first = await schedulerPass({ runtime });
+if (first.tick.skipped) {
   console.log('another scheduler holds the lock; this one will keep polling');
 }
+logErrored(first);
 
 const handle = startScheduler({
   businessId: config.businessId,
   intervalMs,
+  runtime,
+  onResult: logErrored,
   onError: (error) => {
-    console.error('tick failed:', error instanceof Error ? error.message : error);
+    console.error('scheduler pass failed:', error instanceof Error ? error.message : error);
   },
 });
 
