@@ -3,7 +3,12 @@ import type { ConnectionBinding } from '../domain/connection.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel } from '../domain/trust.js';
 import { planProblems, topologicalOrder, type Plan, type PlanStep } from '../domain/plan.js';
-import { classifyAction, isOutbound, refineActionClass } from '../policy/classify.js';
+import {
+  classifyAction,
+  ingestsExternalContent,
+  isOutbound,
+  refineActionClass,
+} from '../policy/classify.js';
 import { canonicalHash } from '../util/canonical.js';
 import { unspentApprovalFor } from '../governance/approvals.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
@@ -274,6 +279,15 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
     businessId: job.businessId,
   });
 
+  // The three conditions of the spec, combined positively. Computed once for
+  // the whole plan rather than per step: a plan that reads anything was
+  // authored by a planner that had read it, so ordering within the plan says
+  // nothing about which steps the content could have influenced — a plan
+  // containing a reader disqualifies every step in it, including steps that
+  // run before the reader. See docs/superpowers/specs/2026-08-24-boss-provenance-chain-design.md §4.
+  const planIngests = plan.steps.some((step) => ingestsExternalContent(step.toolName));
+  const provenanceChainDerived = job.provenance === 'boss' && !planIngests && !job.contentIngested;
+
   const records: StepRecord[] = [];
   let current = job;
 
@@ -318,6 +332,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       ...(request.now !== undefined ? { now: request.now } : {}),
       ...(approvalId !== null ? { approvalId } : {}),
       ...(request.notify !== undefined ? { notify: request.notify } : {}),
+      ...(provenanceChainDerived ? { provenanceChainDerived } : {}),
     });
     records.push({
       stepId: step.id,
