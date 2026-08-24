@@ -41,6 +41,10 @@ async function main(): Promise<void> {
     task,
     provenance: 'unknown_external',
     documentRoot,
+    // This script runs a single ad hoc read with no orchestrator job behind
+    // it, so there is no content-ingested flag to update. `null` says that
+    // in the open rather than leaving `jobId` unset.
+    jobId: null,
   });
 
   console.log('--- תוצאה ---');

@@ -41,14 +41,14 @@ async function callHook(
   agent: AgentId,
   toolName: string,
   toolInput: unknown,
-  jobId: string | undefined,
+  jobId: string | null,
 ) {
   const hook = createGateHook({
     agent,
     bundle,
     provenance: 'boss',
     businessId: BUSINESS,
-    ...(jobId !== undefined ? { jobId } : {}),
+    jobId,
     documentRoot: DOCS,
     counterpartyTags: [],
     rampLevel: 'auto',
@@ -124,7 +124,7 @@ describe('the gate hook marks content-ingestion on its own path', () => {
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
   });
 
-  it('does not error when a reading tool runs with no jobId', async () => {
+  it('does not error when a reading tool runs with an explicit null jobId', async () => {
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
 
     const { decision } = await callHook(
@@ -132,9 +132,32 @@ describe('the gate hook marks content-ingestion on its own path', () => {
       'know.reader',
       'Read',
       { file_path: join(DOCS, 'invoice.pdf') },
-      undefined,
+      null,
     );
 
     expect(decision).toBe('allow');
+  });
+
+  it('fails closed instead of allowing when the jobId matches no row', async () => {
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+
+    // Never created via `createJob` — stands in for a stale id, a typo, or a
+    // job that belongs to another business. `markContentIngested`'s UPDATE
+    // matches nothing, and the read must be refused rather than let through
+    // with no memory of having happened: exactly the gap this test is here
+    // to close. If the fail-closed check were removed, `decide` would still
+    // return the gate's original `allow` here, since nothing else in this
+    // path depends on the mark having landed — so a passing assertion of
+    // `deny` genuinely depends on that branch existing.
+    const { decision, reason } = await callHook(
+      bundle,
+      'know.reader',
+      'Read',
+      { file_path: join(DOCS, 'invoice.pdf') },
+      'J-does-not-exist',
+    );
+
+    expect(decision).toBe('deny');
+    expect(reason).toContain('content_ingest_unrecorded');
   });
 });

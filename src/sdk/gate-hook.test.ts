@@ -38,13 +38,18 @@ async function decisionFor(
   agent: AgentId,
   toolName: string,
   toolInput: unknown = {},
+  // No real job behind most of these calls — only the marking behaviour
+  // itself is covered elsewhere (gate-hook-ingest.test.ts), including what
+  // happens when this id names no row. `null` states that explicitly rather
+  // than a fixed id that used to be silently unchecked.
+  jobId: string | null = null,
 ) {
   const hook = createGateHook({
     agent,
     bundle,
     provenance: 'boss',
     businessId: BUSINESS,
-    jobId: 'J-SDK',
+    jobId,
     documentRoot: DOCS,
     counterpartyTags: [],
     rampLevel: 'auto',
@@ -196,6 +201,7 @@ describe('the gate hook', () => {
       bundle,
       provenance: 'boss',
       businessId: BUSINESS,
+      jobId: null,
       documentRoot: DOCS,
       counterpartyTags: [],
       rampLevel: 'auto',
@@ -269,6 +275,7 @@ describe('decision reporting', () => {
       bundle,
       provenance: 'boss',
       businessId: BUSINESS,
+      jobId: null,
       documentRoot: DOCS,
       counterpartyTags: [],
       rampLevel: 'auto',

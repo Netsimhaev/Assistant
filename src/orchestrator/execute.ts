@@ -254,6 +254,12 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   // outside content with no memory of having done so — the one direction that
   // hands out an exemption nobody earned. Marking early can only
   // over-restrict a later step, which is the safe direction.
+  //
+  // The match count `markContentIngested` returns is ignored here on purpose:
+  // `job` above was loaded from the very row this UPDATE targets, so a
+  // zero-row match cannot happen the way it can for the SDK gate hook, which
+  // takes `jobId` and `businessId` as independent caller-supplied fields and
+  // checks the count for exactly that reason.
   if (ingestsExternalContent(toolName)) {
     await markContentIngested(job.jobId, { businessId: job.businessId });
   }

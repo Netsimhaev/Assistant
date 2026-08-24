@@ -237,9 +237,17 @@ function scoreSensitivity(facts: ActionFacts): RiskDimensions['dataSensitivity']
  * claim by the caller that the value in `provenance` was reduced over THIS
  * action's chain (see that field's docblock in `src/domain/policy.ts` for
  * what a caller must guarantee before setting it). Absent, the escalation
- * runs. Nothing sets it today, so the exemption does not currently fire at
- * all — that is the intended state, not an oversight: the safety argument is
- * held by a predicate rather than by the absence of a caller.
+ * runs.
+ *
+ * `runPlan` (`src/orchestrator/run-plan.ts`) is the one caller that sets it,
+ * and only when all three hold for the whole plan being run: the job's
+ * stamped provenance is `boss`, no step in that plan reads external content
+ * (`ingestsExternalContent`), and the job has never ingested any before now
+ * (`job.contentIngested`). Every other caller — `executeStep` invoked on its
+ * own, the SDK gate hook — leaves the field unset, so the escalation still
+ * runs for them. The safety argument is held by the predicate, not by the
+ * absence of a caller — which is exactly why it now has to hold under a real
+ * one.
  */
 const FIRST_CONTACT_EXEMPT: ReadonlySet<TrustLevel> = new Set<TrustLevel>(['boss']);
 

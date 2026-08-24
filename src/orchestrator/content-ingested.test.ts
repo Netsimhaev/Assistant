@@ -39,9 +39,10 @@ describe('the content-ingested flag', () => {
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
   });
 
-  it('is true after marking', async () => {
+  it('is true after marking, and reports one row matched', async () => {
     const jobId = await newJob();
-    await markContentIngested(jobId, { businessId: BUSINESS });
+    const matched = await markContentIngested(jobId, { businessId: BUSINESS });
+    expect(matched).toBe(1);
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(true);
   });
 
@@ -52,9 +53,10 @@ describe('the content-ingested flag', () => {
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(true);
   });
 
-  it('does not mark another business’s job', async () => {
+  it('does not mark another business’s job, and reports zero rows matched', async () => {
     const jobId = await newJob();
-    await markContentIngested(jobId, { businessId: 'other-business' });
+    const matched = await markContentIngested(jobId, { businessId: 'other-business' });
+    expect(matched).toBe(0);
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
   });
 

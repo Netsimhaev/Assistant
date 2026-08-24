@@ -250,15 +250,29 @@ export async function dueJobs(
  * external call and this write — in that window the read happened and nothing
  * remembers it, and the next run would hand out an exemption nobody earned.
  * Marking early can only over-restrict, which is the safe direction.
+ *
+ * Returns the number of rows the UPDATE matched — 0 or 1, since `job_id` is a
+ * primary key. `executeStep` can ignore this safely: `job` there was loaded
+ * from the very row being updated, so a mismatch is not a case that occurs.
+ * The SDK gate hook cannot make that assumption — `jobId` and `businessId`
+ * arrive there as two independent caller-supplied fields, not read off a job
+ * already loaded — so a stale id, a typo, or a job belonging to another
+ * business all produce a zero-row match indistinguishable from success unless
+ * the caller checks. Silently treating that as success is `setPassword`'s
+ * mistake (`src/dashboard/auth.ts`): its own zero-row UPDATE has no way to
+ * report "no such account", and the one caller that cared had to pre-check
+ * with a separate query. This function reports the count itself instead, so
+ * a caller with something to protect does not have to guess.
  */
 export async function markContentIngested(
   jobId: string,
   options: { businessId?: string; db?: Queryable } = {},
-): Promise<void> {
+): Promise<number> {
   const db = options.db ?? getPool();
-  await db.query(
+  const result = await db.query(
     `UPDATE jobs SET content_ingested = true, updated_at = now()
       WHERE job_id = $1 AND business_id = $2`,
     [jobId, options.businessId ?? config.businessId],
   );
+  return result.rowCount ?? 0;
 }
