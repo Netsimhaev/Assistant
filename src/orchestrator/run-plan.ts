@@ -40,6 +40,19 @@ import type { Job } from './jobs.js';
 const ADAPTER_TIMEOUT_MS = 60_000;
 
 export interface RunPlanRequest {
+  /**
+   * Must be loaded fresh — after any read this job has already performed —
+   * not carried over from an earlier load.
+   *
+   * `runPlan` reads `job.contentIngested` straight off this object and never
+   * reloads it; a stale copy taken before a step marked content ingested
+   * would let `provenanceChainDerived` compute `true` for a chain that has, in
+   * fact, read something. Production is safe today because the only caller,
+   * `runPlanForJob` via `run-due.ts`, re-reads the job under that job's
+   * per-job advisory lock immediately before calling in here — but that
+   * freshness lives entirely in the caller and nothing in this type enforces
+   * it, so state it here for whoever calls `runPlan` next.
+   */
   job: Job;
   bundle: PolicyBundle;
   plan: Plan;

@@ -9,7 +9,7 @@ import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import { envCredentials } from './credentials.js';
 import { createJob, loadJob, markContentIngested, transition } from './jobs.js';
-import { runPlan } from './run-plan.js';
+import { runPlan, type RunPlanResult } from './run-plan.js';
 
 const BUSINESS = 'test-business';
 const PREFIX = 'TEST_CRED_';
@@ -45,9 +45,23 @@ function registry(sent: MailMessage[]): AdapterRegistry {
   ]);
 }
 
-async function jobInExecute(bundle: { charterVersion: string }) {
+/**
+ * Asserts the run halted for exactly the reason named, not merely that it
+ * halted. `RunPlanResult['halted']` covers a queued approval, a quiet-hours
+ * deferral and any denial alike — three very different outcomes for a job —
+ * and a bare `toBe('halted')` cannot tell them apart. Narrowing here (rather
+ * than at each call site) is what lets every negative test in this file state
+ * which halt it expects.
+ */
+function expectHalted(result: RunPlanResult, reason: string): void {
+  expect(result.status).toBe('halted');
+  if (result.status !== 'halted') throw new Error('expected a halted result');
+  expect(result.reason).toBe(reason);
+}
+
+async function jobInExecute(bundle: { charterVersion: string }, provenance: 'boss' | 'staff' = 'boss') {
   const job = await createJob({
-    charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
+    charterVersion: bundle.charterVersion, provenance, businessId: BUSINESS,
   });
   for (const to of ['understand', 'plan', 'execute'] as const) {
     await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
@@ -102,7 +116,10 @@ describe('the boss exemption, end to end through runPlan', () => {
       counterpartyTags: [], rampLevel: 'auto', now: NOON,
     });
 
-    expect(result.status).toBe('halted');
+    // provenanceChainDerived is false (contentIngested), so the first-contact
+    // exemption never applies and the send to a stranger queues for approval
+    // rather than being refused outright.
+    expectHalted(result, 'awaiting_approval');
     expect(sent).toEqual([]);
   });
 
@@ -129,30 +146,44 @@ describe('the boss exemption, end to end through runPlan', () => {
       counterpartyTags: [], rampLevel: 'auto', now: NOON,
     });
 
-    expect(result.status).toBe('halted');
+    expectHalted(result, 'awaiting_approval');
     expect(sent).toEqual([]);
   });
 
+  /**
+   * `unknown_external` was tried here first and rejected: its provenance
+   * ceiling (`PROVENANCE_CEILING` in `src/test/fixtures.ts`) is `draft_only`,
+   * so `effectiveAutonomy` denies the step at the gate's autonomy step (step
+   * 8) — before `assessRisk` ever runs. That exercises `draft_only`, not the
+   * first-contact escalation this test is named for.
+   *
+   * `staff` has a ceiling of `auto_notify` (see `PROVENANCE_CEILING`), which
+   * — combined with this test's permissive charter (`autonomyBase:
+   * 'email.initiate': 'auto'`) and `rampLevel: 'auto'` — is not restrictive
+   * enough to deny on its own. The step reaches `assessRisk`, the recipient
+   * is an unresolved stranger (`one_unknown`), and
+   * `FIRST_CONTACT_EXEMPT.has('staff')` is false (the set is `{'boss'}`
+   * only, `src/policy/risk.ts`), so `isUnvettedFirstContact` returns `true`
+   * and the band is `sensitive` — which is what actually queues the
+   * approval here, not an autonomy ceiling.
+   *
+   * This does NOT, on its own, prove `runPlan`'s `job.provenance === 'boss'`
+   * conjunct is load-bearing — see the fix-round report for why no test
+   * through `runPlan` can. It does correctly exercise the control this test
+   * is named for, which the previous `unknown_external` version did not.
+   */
   it('still asks when the job did not come from the boss', async () => {
     const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
-    const job = await createJob({
-      charterVersion: bundle.charterVersion, provenance: 'unknown_external',
-      businessId: BUSINESS,
-    });
-    for (const to of ['understand', 'plan', 'execute'] as const) {
-      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
-    }
-    const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
-    if (loaded === null) throw new Error('job vanished');
+    const job = await jobInExecute(bundle, 'staff');
     const sent: MailMessage[] = [];
 
     const result = await runPlan({
-      job: loaded, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
+      job, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
       credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
       counterpartyTags: [], rampLevel: 'auto', now: NOON,
     });
 
-    expect(result.status).toBe('halted');
+    expectHalted(result, 'awaiting_approval');
     expect(sent).toEqual([]);
   });
 });
