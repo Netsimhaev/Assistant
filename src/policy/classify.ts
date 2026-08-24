@@ -124,6 +124,12 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   'recipe.load': true,
   'media.inspect': true,
   'code_execution': true,
+  // Delegates to another agent and returns its summary. `COLLABORATION_GRAPH`
+  // routes comms.email, comms.whatsapp, prod.docs, prod.media and gov.verify
+  // to know.reader, whose provenance defaults to unknown_external (it exists
+  // to read content the business did not write) — so what comes back is, by
+  // construction, a summary of content this job did not author.
+  'agent.request_help': true,
 
   // — local composition, owner-authored data, and outbound writes —
   'mail.draft': false,
@@ -147,7 +153,6 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   'media.generate_video': false,
   'brand.check': false,
   'escalate_to_human': false,
-  'agent.request_help': false,
   'mail.send': false,
   'wa.send_message': false,
   'calendar.write': false,
