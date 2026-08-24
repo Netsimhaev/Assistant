@@ -7,6 +7,8 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import type { Queryable } from '../db/pool.js';
 import { evaluateToolCall } from '../policy/engine.js';
+import { ingestsExternalContent } from '../policy/classify.js';
+import { markContentIngested } from '../orchestrator/jobs.js';
 import { isPathWithin, readPathArgument, translateToolName } from './tool-names.js';
 
 export interface GateHookBinding {
@@ -172,6 +174,34 @@ async function decide(
           'redaction_unrepresentable',
           'הקלט המצונזר אינו אובייקט ולכן לא ניתן להעביר אותו ל-SDK',
         );
+      }
+
+      // `executeStep` (src/orchestrator/execute.ts) is the other place a tool
+      // call is allowed to run, and it already marks `content_ingested` before
+      // its call goes out. This is not the same call reused: an SDK-driven
+      // agent (know.reader chief among them) never passes through
+      // `executeStep` at all — the model calls the tool directly and this hook
+      // is the only gate it passes. Two writers of a one-way flag sounds like
+      // duplication worth unifying, but it is not: there is no single call
+      // site both paths funnel through, so "unifying" would mean deleting one
+      // of the two places a read can actually happen, and the SDK path is the
+      // one Task 6 exists because it was missing.
+      //
+      // Marked here, not after the SDK executes the tool: a crash between the
+      // read landing and the write would leave the read unremembered, which is
+      // the one direction that hands out an exemption nobody earned. This is
+      // also strictly after the redaction check above and only on the branch
+      // that returns `permissionDecision: 'allow'` — a denial here (including
+      // `redaction_unrepresentable`) means the tool never runs and must not
+      // mark. `translated.internal` is used, never `hook.tool_name`: the
+      // ingest table is keyed by internal names, and marking on the raw SDK
+      // name would either never match (wrong name) or mark on every call
+      // (`ingestsExternalContent` defaults unknown names to `true`).
+      if (binding.jobId != null && ingestsExternalContent(translated.internal)) {
+        await markContentIngested(binding.jobId, {
+          ...(binding.businessId !== undefined ? { businessId: binding.businessId } : {}),
+          ...(binding.db !== undefined ? { db: binding.db } : {}),
+        });
       }
 
       return {
