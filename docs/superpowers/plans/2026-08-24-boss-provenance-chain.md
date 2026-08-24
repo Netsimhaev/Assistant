@@ -64,6 +64,7 @@ await upsertBinding({ system: 'office-mail', status: 'live', endpoint: null,
 - Consumes: nothing new.
 - Produces:
   - `export function ingestsExternalContent(toolName: string): boolean`
+  - `export function toolsWithIngestDecision(): string[]` — the names the table decides explicitly, so the completeness invariant can be asserted without exporting the mutable record. Mirrors the existing `classifiedToolNames()`, which exists for the same reason.
 
 - [ ] **Step 1: Read the spec's §5.1 and transcribe its decisions**
 
@@ -75,16 +76,32 @@ Create `src/policy/ingest-table.test.ts`:
 
 ```ts
 import { describe, expect, it } from 'vitest';
-import { CLASSIFIED_TOOLS, READ_ONLY_TOOLS } from './classify.js';
-import { ingestsExternalContent } from './classify.js';
+import {
+  READ_ONLY_TOOLS,
+  classifiedToolNames,
+  ingestsExternalContent,
+  toolsWithIngestDecision,
+} from './classify.js';
 
 describe('the content-ingesting table', () => {
-  it('covers every tool the system knows about', () => {
-    // A tool in neither bucket would default to "does not ingest" — the
-    // permissive answer — which is exactly what this project forbids.
-    const known = [...CLASSIFIED_TOOLS, ...READ_ONLY_TOOLS];
-    const uncovered = known.filter((t) => ingestsExternalContent(t) === undefined as unknown as boolean);
-    expect(uncovered).toEqual([]);
+  it('decides every tool the system knows about, explicitly', () => {
+    // A known tool absent from the table would fall to the `?? true`
+    // fail-safe. That is the safe direction, but it is also silent: nobody
+    // reasoned about the tool, and the table would drift out of sync with the
+    // tool list without a single test going red. Asserting explicit coverage
+    // is what makes adding a tool a decision rather than an omission.
+    const known = new Set([...classifiedToolNames(), ...READ_ONLY_TOOLS]);
+    const decided = new Set(toolsWithIngestDecision());
+    const undecided = [...known].filter((t) => !decided.has(t)).sort();
+    expect(undecided).toEqual([]);
+  });
+
+  it('carries no decision for a tool the system does not know', () => {
+    // The other direction: a stale entry for a tool that no longer exists is
+    // dead weight that hides the real coverage number.
+    const known = new Set([...classifiedToolNames(), ...READ_ONLY_TOOLS]);
+    const stale = toolsWithIngestDecision().filter((t) => !known.has(t)).sort();
+    expect(stale).toEqual([]);
   });
 
   it('treats an unknown tool as ingesting', () => {
@@ -122,7 +139,7 @@ describe('the content-ingesting table', () => {
 });
 ```
 
-> **Note for the implementer:** the first test needs `CLASSIFIED_TOOLS` — a list of the keys of `TOOL_ACTION_CLASS`. `classify.ts` already exports something for the reachability invariant (see the comment "Every tool that maps to an action class"). Use whatever it actually exports; if the export has a different name, use that name and say so in your report. Do not add a new export if a suitable one exists.
+> **Note for the implementer:** `classifiedToolNames()` and `READ_ONLY_TOOLS` both already exist in `classify.ts` — verified. `toolsWithIngestDecision()` is new and you are adding it; implement it as `Object.keys(INGESTS_EXTERNAL_CONTENT)`. Do not export the record itself: this project keeps such tables private precisely so a caller cannot mutate one and leave the derived answers disagreeing with it (see the note above `NEVER_FULLY_AUTONOMOUS_TABLE`).
 
 - [ ] **Step 3: Run test to verify it fails**
 
@@ -227,6 +244,17 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
  */
 export function ingestsExternalContent(toolName: string): boolean {
   return INGESTS_EXTERNAL_CONTENT[toolName] ?? true;
+}
+
+/**
+ * The tool names the table decides explicitly.
+ *
+ * Exists so the completeness invariant can be asserted without exporting the
+ * record itself — a caller holding the raw table could mutate it and leave
+ * `ingestsExternalContent` disagreeing with it. Mirrors `classifiedToolNames`.
+ */
+export function toolsWithIngestDecision(): string[] {
+  return Object.keys(INGESTS_EXTERNAL_CONTENT);
 }
 ```
 
