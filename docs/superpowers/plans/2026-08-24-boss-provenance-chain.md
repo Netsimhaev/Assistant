@@ -841,3 +841,65 @@ git commit -m "Lock both directions of the exemption, and say what it does not d
 **Type consistency.** `ingestsExternalContent(toolName: string): boolean` is defined in Task 1 and consumed by name in Tasks 3 and 4. `Job.contentIngested` and `markContentIngested` are defined in Task 2 and consumed in Tasks 3 and 4. `StepRequest.provenanceChainDerived` is defined in Task 3 and consumed in Task 4. `FactsContext.provenanceChainDerived` already exists and is unchanged.
 
 **Known gap, deliberately not closed.** `counterpartyTags` remains `[]` on the production path; a tag resolver is separate work. It does not interact with this feature — an unresolved counterparty is what makes the audience `one_unknown` in the first place, which is exactly the case this exemption is about.
+
+---
+
+### Task 6: Close the SDK gate-hook gap
+
+**Added after Task 4's review.** Found by the whole-task reviewer as residual risk #1, and it is a hole in the very control this plan builds.
+
+**The defect:** `src/sdk/gate-hook.ts` accepts a `jobId` and calls `evaluateToolCall` directly. It never calls `markContentIngested`. The only writer of that flag is `executeStep`. So `know.reader`, driven through the SDK against a jobId, can fetch documents while `jobs.content_ingested` stays `false` — and a later reader-free plan on that same job then earns the boss exemption over content the job demonstrably read. `doc.fetch` is read-only and short-circuits the gate at step 4, so nothing else on that path records it either.
+
+**Files:**
+- Modify: `src/sdk/gate-hook.ts`
+- Test: `src/sdk/gate-hook-ingest.test.ts`
+
+**Interfaces:**
+- Consumes: `ingestsExternalContent` from `src/policy/classify.js`, `markContentIngested` from `src/orchestrator/jobs.js`, `translateToolName` from `src/sdk/tool-names.js`.
+- Produces: no new exports.
+
+**The rule:** when the hook is about to let a tool run, the tool ingests external content, and the binding carries a `jobId`, mark that job first.
+
+**Three details that decide whether this is correct:**
+
+1. **Use the INTERNAL tool name.** The SDK's names are translated by `translateToolName`; the ingest table is keyed by internal names. Marking on the raw SDK name would silently never match — and `ingestsExternalContent` returns `true` for unrecognised names, so it would mark *everything* instead. Both directions are wrong; use the translated name, and handle the case where translation fails (an untranslatable tool is already denied — confirm that before relying on it).
+
+2. **Mark before allowing, not after.** Same reasoning as `executeStep`: a crash between the tool running and the write leaves a read nobody remembers. Marking early can only over-restrict.
+
+3. **Do not mark on a denial.** If the gate denied or queued an approval, the tool does not run and nothing is read. Only the allow path marks.
+
+**`jobId` absent is not an error.** A run not tied to a job has no flag to set, and no plan can later claim an exemption for a job that does not exist. Document that as a deliberate no-op rather than treating it as a failure.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `src/sdk/gate-hook-ingest.test.ts`. Model its setup on the existing `src/sdk/gate-hook.test.ts` — read that file first and follow how it builds a binding and invokes the hook; do not invent a different harness.
+
+The tests to write:
+- A reading tool the agent owns, with a `jobId`, allowed by the gate → the job's `contentIngested` becomes `true`.
+- A non-reading tool, with a `jobId`, allowed → the flag stays `false`. **Assert the hook actually allowed**, so the test cannot pass because the call was denied and nothing ran.
+- A reading tool the gate **denies** → the flag stays `false`.
+- A reading tool with **no `jobId`** → no error, hook still returns its normal decision.
+
+- [ ] **Step 2: Run it and confirm it fails for the right reason**
+
+Run: `npx vitest run src/sdk/gate-hook-ingest.test.ts`
+Expected: the first test FAILS — the flag stays `false` because nothing marks it.
+
+- [ ] **Step 3: Implement**
+
+Add the marking to `createGateHook`, honouring the three details above. Write a docblock explaining why the SDK path needs its own call rather than inheriting the executor's — this codebase explains *why*, and "there are two writers of this flag" is exactly the kind of thing a future reader will otherwise try to unify.
+
+- [ ] **Step 4: Run it and confirm green**
+
+- [ ] **Step 5: Prove it bites**
+
+Temporarily remove the marking call; confirm the first test FAILS. Restore it. Report the exact output.
+
+- [ ] **Step 6: Typecheck, full suite, commit**
+
+```bash
+npm run typecheck
+npm test
+git add src/sdk/gate-hook.ts src/sdk/gate-hook-ingest.test.ts
+git commit -m "The SDK path records a read too, not just the executor"
+```
