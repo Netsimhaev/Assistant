@@ -2,6 +2,11 @@ import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
 import { loadJob, transition } from './jobs.js';
+import { runDueJobs } from './run-due.js';
+import type { RunDueResult } from './run-due.js';
+import { closeVerifiedJobs } from './verify.js';
+import type { CloseVerifiedResult } from './verify.js';
+import type { Runtime } from './runtime.js';
 
 export interface TickResult {
   /** Approvals whose fuse ran out on this tick. */
@@ -118,24 +123,73 @@ async function wakeDueJobs(
   return woken;
 }
 
+export interface SchedulerPassResult {
+  tick: TickResult;
+  due: RunDueResult;
+  verified: CloseVerifiedResult;
+}
+
+/**
+ * One full pass: tick, then run whatever the tick made ready.
+ *
+ * Two calls, one after the other, and the order is the whole point — a job
+ * woken by the tick is in `execute` by the time `runDueJobs` looks, so it runs
+ * in the same pass instead of waiting a full interval.
+ *
+ * `runDueJobs` is called **after** `tick` has returned and its transaction has
+ * committed, never inside it: `tick` holds a transaction-scoped advisory lock
+ * for its whole body, and a plan's external calls — bounded only by the
+ * adapter deadline — have no business holding a pooled connection open across
+ * the wire behind that lock.
+ *
+ * A skipped tick — another scheduler holds the business-wide lock — still
+ * runs the due pass. The per-job locks in `runDueJobs` are what actually keep
+ * two runners apart, and they are finer-grained than the tick's lock.
+ */
+export async function schedulerPass(
+  options: { businessId?: string; now?: Date; limit?: number; runtime?: Runtime } = {},
+): Promise<SchedulerPassResult> {
+  const tickResult = await tick(options);
+  const due = await runDueJobs(options);
+  // Third and last, and the order matters as much as the first two: a job
+  // `runDueJobs` just finished is sitting in `verify` by the time this looks,
+  // so it closes in the same pass instead of waiting a full interval. Run
+  // before the plans instead and every close would trail a pass behind the
+  // work that earned it.
+  const verified = await closeVerifiedJobs(options);
+  return { tick: tickResult, due, verified };
+}
+
 export interface SchedulerHandle {
   /** Resolves once the loop has stopped and any in-flight tick has finished. */
   stop: () => Promise<void>;
 }
 
 /**
- * Run `tick` on an interval until stopped.
+ * Run `schedulerPass` on an interval until stopped.
  *
  * Polling Postgres rather than pg-boss. The roadmap names pg-boss and it is
  * the right answer for throughput, but the work here is a handful of rows a
  * minute, and a dependency that owns the job lifecycle is not something to
  * take on before the lifecycle it has to own is finished.
  *
- * Ticks never overlap: the in-flight guard means a slow tick delays the next
+ * Ticks never overlap: the in-flight guard means a slow pass delays the next
  * one instead of running two at once.
  */
 export function startScheduler(
-  options: { businessId?: string; intervalMs?: number; onError?: (error: unknown) => void } = {},
+  options: {
+    businessId?: string;
+    intervalMs?: number;
+    runtime?: Runtime;
+    /**
+     * Called after every pass that completed without throwing — including a
+     * pass whose `due.errored` is non-empty. `runDueJobs` isolates a per-job
+     * failure into `errored` rather than throwing (see its own docblock), so
+     * a stuck job never reaches `onError`; this is the only hook that sees it.
+     */
+    onResult?: (result: SchedulerPassResult) => void;
+    onError?: (error: unknown) => void;
+  } = {},
 ): SchedulerHandle {
   const intervalMs = options.intervalMs ?? 30_000;
   let running = false;
@@ -146,11 +200,20 @@ export function startScheduler(
     if (running || stopped) return;
     running = true;
     const businessId = options.businessId;
-    inFlight = tick(businessId === undefined ? {} : { businessId }).catch((error) => {
-      // A failing tick must not kill the loop — the next one may well succeed,
-      // and a scheduler that dies quietly is worse than one that retries.
-      options.onError?.(error);
-    });
+    const runtime = options.runtime;
+    inFlight = schedulerPass({
+      ...(businessId === undefined ? {} : { businessId }),
+      ...(runtime === undefined ? {} : { runtime }),
+    })
+      .then((result) => {
+        options.onResult?.(result);
+      })
+      .catch((error) => {
+        // A failing pass must not kill the loop — the next one may well
+        // succeed, and a scheduler that dies quietly is worse than one that
+        // retries.
+        options.onError?.(error);
+      });
     try {
       await inFlight;
     } finally {

@@ -2,12 +2,13 @@ import type { AgentId } from '../domain/audit.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { isMoneyBearing } from '../domain/action.js';
 import type { AutonomyLevel } from '../domain/trust.js';
-import { classifyAction, refineActionClass } from '../policy/classify.js';
+import { classifyAction, ingestsExternalContent, refineActionClass } from '../policy/classify.js';
 import { evaluateToolCall } from '../policy/engine.js';
 import { getApproval } from '../governance/approvals.js';
+import type { ApprovalNotifier } from '../governance/notify.js';
 import { recordSpend } from '../policy/budget.js';
 import { canonicalHash } from '../util/canonical.js';
-import { transition } from './jobs.js';
+import { markContentIngested, transition } from './jobs.js';
 import { StepChannelError } from './step-error.js';
 import type { Job } from './jobs.js';
 
@@ -65,6 +66,26 @@ export interface StepRequest {
    * history.
    */
   approvalId?: string;
+  /**
+   * How to tell the owner an approval is waiting.
+   *
+   * Optional because the gate treats notification as best-effort — the request
+   * row and the dashboard exist either way, and `evaluateToolCall` records
+   * `approval_notify_failed` rather than throwing. Absent, an approval is
+   * queued and nobody is told, which is exactly the state this field exists to
+   * end.
+   */
+  notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
+  /**
+   * The caller's claim that this step's content chain is boss-derived —
+   * forwarded verbatim into `GateContext.provenanceChainDerived`.
+   *
+   * The executor does not compute this; `runPlan` does, because it is the
+   * only party holding both the plan (to check no earlier step ingests) and
+   * the job (to check its stamp and its history). See
+   * `ActionFacts.provenanceChainDerived` for the three conditions.
+   */
+  provenanceChainDerived?: boolean;
 }
 
 export type StepOutcome =
@@ -160,16 +181,13 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   const decision = await evaluateToolCall(toolName, effectiveInput, {
     agent: request.agent,
     bundle,
-    // The job's stamp, inherited by every step — which is precisely why
-    // `provenanceChainDerived` is NOT set here. A `PlanStep` carries no
-    // provenance of its own, so nothing reduces the trust of the content an
-    // earlier step read into the level this step is judged by: a job the boss
-    // started reaches the gate as `boss` even when injected content chose the
-    // recipient. Setting the signal here would be a claim this executor cannot
-    // honour, and the first-contact exemption it feeds stays off until a
-    // caller can (see `ActionFacts.provenanceChainDerived`). `chainDepth` is
-    // hardcoded for the same reason and is deliberately not used as a
-    // discriminator anywhere.
+    // The job's stamp, inherited by every step. `provenanceChainDerived` below
+    // is the caller's claim, not something computed here — this function sees
+    // one step, not the plan or the job's ingest history. `runPlan` is what
+    // checks, before setting it: the job's provenance is `boss`, the plan
+    // contains no step that ingests external content, and the job has never
+    // ingested any. `chainDepth` is hardcoded because nothing here derives it
+    // either, and it is deliberately not used as a discriminator anywhere.
     provenance: job.provenance,
     chainDepth: 0,
     businessId: job.businessId,
@@ -179,6 +197,10 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     now,
     ...(request.approvalId !== undefined
       ? { approval: { approvalId: request.approvalId, stepId: request.stepId } }
+      : {}),
+    ...(request.notify !== undefined ? { notify: request.notify } : {}),
+    ...(request.provenanceChainDerived !== undefined
+      ? { provenanceChainDerived: request.provenanceChainDerived }
       : {}),
   });
 
@@ -226,6 +248,22 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   // an adapter reporting `browser_not_implemented` was recorded as an order
   // placed and followed by a confirmation email. `perform` now throws on any
   // non-ok adapter result, and this is where that becomes an outcome.
+  //
+  // Recorded before the call, not after. A crash between the external call
+  // returning and this write landing would otherwise leave a step that read
+  // outside content with no memory of having done so — the one direction that
+  // hands out an exemption nobody earned. Marking early can only
+  // over-restrict a later step, which is the safe direction.
+  //
+  // The match count `markContentIngested` returns is ignored here on purpose:
+  // `job` above was loaded from the very row this UPDATE targets, so a
+  // zero-row match cannot happen the way it can for the SDK gate hook, which
+  // takes `jobId` and `businessId` as independent caller-supplied fields and
+  // checks the count for exactly that reason.
+  if (ingestsExternalContent(toolName)) {
+    await markContentIngested(job.jobId, { businessId: job.businessId });
+  }
+
   let effect: StepEffect;
   try {
     effect = await request.perform(decision.redactedInput);

@@ -40,6 +40,59 @@ Copied verbatim from `CLAUDE.md`; every task's requirements implicitly include t
 - **`npm run typecheck` and `npm test` must both pass before any task is reported done.**
 - **`/security-review` is required at the end** because Task 1 feeds an autonomy ceiling into `evaluateToolCall`.
 
+### Canonical test setup — use these, not the inline setup in task bodies
+
+**The inline test setup shown inside each task below was drafted from greps and carries known signature errors.** A pre-flight scan against the real code on 2026-08-22 found six. Where a task's test code sets up a charter, a job, or a binding, **replace that setup with the helpers here**, which are verified against `src/orchestrator/external.test.ts` and `src/orchestrator/channels.test.ts`. Everything else in each task's test — the assertions, the plan literals, the recording adapters — stands as written.
+
+```ts
+// installCharter returns the PolicyBundle DIRECTLY. There is no { charterVersion, bundle }
+// destructuring and no `actor` option. The version lives on the bundle.
+const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+  businessId: BUSINESS,
+});
+
+// A job reaches `execute` through `understand` first — LEGAL_TRANSITIONS has no
+// intake → plan edge. `actor` is a JobActor: 'orchestrator' | 'human' | 'system' | an AgentId.
+// 'test' is NOT a JobActor and will fail to parse.
+async function jobInExecute(bundle: PolicyBundle): Promise<Job> {
+  const job = await createJob({
+    charterVersion: bundle.charterVersion,
+    provenance: 'boss',
+    businessId: BUSINESS,
+  });
+  for (const to of ['understand', 'plan', 'execute'] as const) {
+    await transition(job.jobId, {
+      to,
+      actor: 'orchestrator',
+      reason: 'setup',
+      businessId: BUSINESS,
+    });
+  }
+  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  if (loaded === null) throw new Error('job vanished');
+  return loaded;
+}
+
+// upsertBinding's second argument requires `by`, not `actor`, and `by` is mandatory.
+await upsertBinding(
+  {
+    system: 'office-mail',
+    status: 'live',
+    endpoint: null,
+    credentialRef: 'OFFICE_MAIL',
+    lastOkAt: null,
+    lastError: null,
+  },
+  { businessId: BUSINESS, by: 'test' },
+);
+```
+
+**`ActionClass` has no member `email.send`.** The outbound email classes are `email.reply` and `email.initiate`. Every reference in this plan is `email.initiate`: the seeded message carries no threading field, so `refineActionClass` classifies it as an initiation, and `email.reply` would be the wrong row to raise.
+
+**To make the gate queue an approval in a test**, pass `autonomyBase` to `buildCharter` — e.g. `buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } })`. `CharterOverrides` supports `autonomyBase`, `connections`, ceilings, and the do-not-contact fields; read `src/test/fixtures.ts` before assuming any other override exists.
+
+**Before transcribing any helper call from a task body, open the real file and check the signature.** The six defects found pre-flight were all of this kind. If a signature in a task body disagrees with the source, the source wins — implement against the source and say so in your report.
+
 ---
 
 ### Task 1: The autonomy ramp reader
@@ -94,46 +147,46 @@ describe('autonomy ramp', () => {
   });
 
   it('returns draft_only when the business has no row for the class', async () => {
-    expect(await loadRampLevel('email.send', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('draft_only');
   });
 
   it('returns the stored level once one is set', async () => {
-    await setRampLevel('email.send', 'approve_required', { businessId: BUSINESS });
-    expect(await loadRampLevel('email.send', { businessId: BUSINESS })).toBe('approve_required');
+    await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
+    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('approve_required');
   });
 
   it('does not read another business’s row', async () => {
-    await setRampLevel('email.send', 'auto', { businessId: 'other-business' });
-    expect(await loadRampLevel('email.send', { businessId: BUSINESS })).toBe('draft_only');
+    await setRampLevel('email.initiate', 'auto', { businessId: 'other-business' });
+    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('draft_only');
   });
 
   it('falls back to draft_only when the stored level is not a known level', async () => {
-    await setRampLevel('email.send', 'auto', { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
     const { getPool } = await import('../db/pool.js');
     await getPool().query(
       `UPDATE autonomy_ramp SET level = 'wide_open'
         WHERE business_id = $1 AND action_class = $2`,
-      [BUSINESS, 'email.send'],
+      [BUSINESS, 'email.initiate'],
     );
-    expect(await loadRampLevel('email.send', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('draft_only');
   });
 
   it('setRampLevel overwrites rather than inserting a second row', async () => {
-    await setRampLevel('email.send', 'auto', { businessId: BUSINESS });
-    await setRampLevel('email.send', 'approve_required', { businessId: BUSINESS });
-    expect(await loadRampLevel('email.send', { businessId: BUSINESS })).toBe('approve_required');
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
+    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('approve_required');
   });
 
   it('takes the most restrictive level across every class a plan declares', async () => {
-    await setRampLevel('email.send', 'auto', { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
     await setRampLevel('crm.write', 'approve_required', { businessId: BUSINESS });
-    const plan = planWith(['email.send', 'crm.write']);
+    const plan = planWith(['email.initiate', 'crm.write']);
     expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('approve_required');
   });
 
   it('treats a step that declares no class as draft_only', async () => {
-    await setRampLevel('email.send', 'auto', { businessId: BUSINESS });
-    const plan = planWith(['email.send', null]);
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+    const plan = planWith(['email.initiate', null]);
     expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('draft_only');
   });
 });
@@ -308,7 +361,7 @@ const PLAN: Plan = Plan.parse({
       intent: 'send the confirmation',
       toolName: 'mail.send',
       input: { to: 'dana@example.com', subject: 'hi', body: 'hello' },
-      expectedActionClass: 'email.send',
+      expectedActionClass: 'email.initiate',
     },
   ],
 });
@@ -527,7 +580,7 @@ const PLAN: Plan = Plan.parse({
       intent: 'send the confirmation',
       toolName: 'mail.send',
       input: { to: 'dana@example.com', subject: 'אישור', body: 'שלום' },
-      expectedActionClass: 'email.send',
+      expectedActionClass: 'email.initiate',
     },
   ],
 });
@@ -653,7 +706,7 @@ describe('approval notification wiring', () => {
 });
 ```
 
-> **Note for the implementer:** if `buildCharter()`'s defaults make `mail.send` at `approve_required` resolve to `allow` rather than `queue_approval`, the first assertion will fail on `calls`. Do **not** weaken the assertion. Inspect `src/test/fixtures.ts` and pass whatever `CharterOverrides` puts `email.send` in the approval band, exactly as `src/orchestrator/external.test.ts` and `src/orchestrator/approved-step.test.ts` already do for their own cases — copy the override shape from whichever of those queues an approval.
+> **Note for the implementer:** if `buildCharter()`'s defaults make `mail.send` at `approve_required` resolve to `allow` rather than `queue_approval`, the first assertion will fail on `calls`. Do **not** weaken the assertion. Inspect `src/test/fixtures.ts` and pass whatever `CharterOverrides` puts `email.initiate` in the approval band, exactly as `src/orchestrator/external.test.ts` and `src/orchestrator/approved-step.test.ts` already do for their own cases — copy the override shape from whichever of those queues an approval.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -998,7 +1051,7 @@ const PLAN: Plan = Plan.parse({
       intent: 'send the confirmation',
       toolName: 'mail.send',
       input: { to: 'dana@example.com', subject: 'נושא', body: 'גוף' },
-      expectedActionClass: 'email.send',
+      expectedActionClass: 'email.initiate',
     },
   ],
 });
@@ -1065,7 +1118,7 @@ describe('runDueJobs', () => {
 
   it('runs a job that is in execute with a stored plan', async () => {
     const jobId = await seedExecutableJob();
-    await setRampLevel('email.send', 'auto', { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     const sent: MailMessage[] = [];
     const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent) });
@@ -1104,7 +1157,7 @@ describe('runDueJobs', () => {
 
   it('does not run a job belonging to another business', async () => {
     const jobId = await seedExecutableJob();
-    await setRampLevel('email.send', 'auto', { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
     const result = await runDueJobs({
       businessId: 'other-business',
       runtime: runtimeWith([]),
@@ -1339,7 +1392,7 @@ const PLAN: Plan = Plan.parse({
       intent: 'send the confirmation',
       toolName: 'mail.send',
       input: { to: 'dana@example.com', subject: 'נושא', body: 'גוף' },
-      expectedActionClass: 'email.send',
+      expectedActionClass: 'email.initiate',
     },
   ],
 });
@@ -1396,7 +1449,7 @@ describe('schedulerPass', () => {
       { businessId: BUSINESS, actor: 'test' },
     );
     await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
-    await setRampLevel('email.send', 'auto', { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     // Park it asleep, due now.
     await transition(job.jobId, {
@@ -1558,10 +1611,10 @@ describe('seedMailJob', () => {
     const stored = await loadPlanBody(jobId, { businessId: BUSINESS });
     expect(stored?.plan.steps).toHaveLength(1);
     expect(stored?.plan.steps[0]?.toolName).toBe('mail.send');
-    expect(stored?.plan.steps[0]?.expectedActionClass).toBe('email.send');
+    expect(stored?.plan.steps[0]?.expectedActionClass).toBe('email.initiate');
   });
 
-  it('raises the ramp for email.send only, and only to approve_required', async () => {
+  it('raises the ramp for email.initiate only, and only to approve_required', async () => {
     await seedMailJob({
       to: 'dana@example.com',
       subject: 'נושא',
@@ -1569,7 +1622,7 @@ describe('seedMailJob', () => {
       businessId: BUSINESS,
     });
 
-    expect(await loadRampLevel('email.send', { businessId: BUSINESS })).toBe('approve_required');
+    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('approve_required');
     // Every other class stays on the floor. A seed command that raised the
     // whole business would be a far larger grant than it appears.
     expect(await loadRampLevel('purchase.place', { businessId: BUSINESS })).toBe('draft_only');
@@ -1620,7 +1673,7 @@ export interface SeedMailJobOptions {
  * execution path, not the planning path. When the planner is wired this
  * command keeps its value as an operational tool — "run exactly this, now".
  *
- * The ramp is raised to `approve_required` for `email.send` and nothing else.
+ * The ramp is raised to `approve_required` for `email.initiate` and nothing else.
  * `auto` would skip the approval, which is half the thread; raising the whole
  * business would be a far larger grant than the command appears to make.
  */
@@ -1645,7 +1698,7 @@ export async function seedMailJob(
         intent: 'send the seeded message',
         toolName: 'mail.send',
         input: { to: options.to, subject: options.subject, body: options.body },
-        expectedActionClass: 'email.send',
+        expectedActionClass: 'email.initiate',
       },
     ],
   });
@@ -1672,7 +1725,7 @@ export async function seedMailJob(
   });
 
   await bindPlanToJob(job.jobId, plan, { businessId });
-  await setRampLevel('email.send', 'approve_required', { businessId });
+  await setRampLevel('email.initiate', 'approve_required', { businessId });
 
   return { jobId: job.jobId, planHash: planHashOf(plan) };
 }
@@ -1702,7 +1755,7 @@ async function main(): Promise<void> {
 
   console.log(`job ${jobId} created, in phase execute`);
   console.log(`plan ${planHash} stored — one step, mail.send to ${to}`);
-  console.log(`ramp: email.send raised to approve_required for ${config.businessId}`);
+  console.log(`ramp: email.initiate raised to approve_required for ${config.businessId}`);
   console.log('every other action class remains at draft_only');
   console.log('start `npm run scheduler` to run it');
   await closePool();

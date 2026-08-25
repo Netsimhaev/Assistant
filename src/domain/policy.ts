@@ -59,15 +59,22 @@ export const ActionFacts = z.object({
    *   2. that chain includes any content read by earlier steps whose output
    *      fed this step's input — an inbound email whose body supplied the
    *      address contributes `unknown_external` to the reduction, and
-   *   3. the reduction was recomputed for this action rather than inherited
-   *      from a value stamped once on the job.
+   *   3. that guarantee holds without recomputing the reduction for this
+   *      specific action — sound only when nothing has entered the chain
+   *      since `provenance` was stamped: no step in the plan being run reads
+   *      external content, and the job has never ingested any before now.
+   *      Under those two conditions the once-stamped value is still the
+   *      chain's lowest trust, because nothing lower has had a chance to
+   *      join it since.
    *
    * `false` means "nobody computed this", which is the only safe reading of
    * an unset signal: the exemption stays off and the first contact escalates
-   * to a human. Nothing in the system sets it to `true` today — no gateway
-   * stamps provenance onto inbound content yet, so no caller can honestly
-   * make the guarantee. The exemption is therefore currently unreachable by
-   * construction, which is the intended state until that wiring exists.
+   * to a human. `runPlan` (`src/orchestrator/run-plan.ts`) is the one caller
+   * that sets this to `true`, and only when the three conditions above hold
+   * for the whole plan: `job.provenance === 'boss'`, no step in that plan
+   * reads external content, and `job.contentIngested` is still `false`. Every
+   * other caller — `executeStep` invoked directly, the SDK gate hook — leaves
+   * the field unset, so the escalation still runs for them.
    */
   provenanceChainDerived: z.boolean(),
   dataClasses: z.array(DataClass),

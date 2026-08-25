@@ -88,6 +88,117 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'agent.request_help',
 ]);
 
+/**
+ * Tools that pull content from outside the instance's trust boundary into the
+ * agent's context, where it could influence a later action.
+ *
+ * This is the input to the first-contact exemption: a job that has run any of
+ * these can no longer claim its instruction came from the boss alone, because
+ * the recipient or the wording may have been chosen by whoever wrote the
+ * content. See `docs/superpowers/specs/2026-08-24-boss-provenance-chain-design.md`
+ * §5.1 for the per-tool reasoning.
+ *
+ * A `Record<string, boolean>` and not a `Set`, for the reason
+ * `NEVER_FULLY_AUTONOMOUS_TABLE` gives: a `Set` is maintained by hand and says
+ * nothing when the tool list grows, so a newly added reader would land
+ * silently outside the check. Every tool is written down with an explicit
+ * answer.
+ */
+const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
+  // — reads that bring in someone else's words —
+  'doc.fetch': true,
+  'browser.navigate': true,
+  'browser.snapshot': true,
+  'browser.screenshot': true,
+  'browser.click': true,
+  'browser.fill': true,
+  'browser.submit_order': true,
+  'crm.read': true,
+  'accounting.read': true,
+  'calendar.read': true,
+  'calendar.propose_slots': true,
+  'memory.recall': true,
+  'memory.recall_shallow': true,
+  'tasks.read': true,
+  'artifact.read': true,
+  'recipe.load': true,
+  'media.inspect': true,
+  'code_execution': true,
+  // Delegates to another agent and returns its summary. `COLLABORATION_GRAPH`
+  // routes comms.email, comms.whatsapp, prod.docs, prod.media and gov.verify
+  // to know.reader, whose provenance defaults to unknown_external (it exists
+  // to read content the business did not write) — so what comes back is, by
+  // construction, a summary of content this job did not author.
+  'agent.request_help': true,
+
+  // — local composition, owner-authored data, and outbound writes —
+  'mail.draft': false,
+  'charter.voice': false,
+  'charter.read': false,
+  'charter.evaluate': false,
+  'charter.propose_amendment': false,
+  'template.render': false,
+  'template.load': false,
+  'wa.can_send_freeform': false,
+  'wa.conversation_state': false,
+  'render.markdown': false,
+  'chart.render': false,
+  'tasks.update_state': false,
+  'followup.schedule': false,
+  'schema.map': false,
+  'norms.query': false,
+  'assert.evaluate': false,
+  'recipe.save': false,
+  'media.generate_image': false,
+  'media.generate_video': false,
+  'brand.check': false,
+  'escalate_to_human': false,
+  'mail.send': false,
+  'wa.send_message': false,
+  'calendar.write': false,
+  'crm.write': false,
+  'accounting.write': false,
+  'credential.request_session': false,
+  'payment.charge': false,
+  'refund.issue': false,
+  'quote.issue': false,
+  'discount.grant': false,
+  'commitment.make': false,
+  'contract.sign': false,
+  'data.export': false,
+  'media.publish': false,
+  'file.write': false,
+  'doc.deliver': false,
+  'memory.write_entity': false,
+  'memory.write_chunk': false,
+  'memory.upsert_preference': false,
+  'memory.retire': false,
+  'charter.apply_amendment': false,
+};
+
+/**
+ * Whether running this tool means the job has touched outside content.
+ *
+ * **An unknown tool answers `true`.** A name nobody classified is a name
+ * nobody reasoned about, and the exemption this feeds must read that as "we
+ * cannot vouch for this chain" — never as "nothing was read". The `?? true`
+ * is the whole fail-safe.
+ */
+export function ingestsExternalContent(toolName: string): boolean {
+  return INGESTS_EXTERNAL_CONTENT[toolName] ?? true;
+}
+
+/**
+ * The tool names the table decides explicitly.
+ *
+ * Exists so the completeness invariant can be asserted without exporting the
+ * record itself — a caller holding the raw table could mutate it and leave
+ * `ingestsExternalContent` disagreeing with it. Mirrors `classifiedToolNames`.
+ */
+export function toolsWithIngestDecision(): string[] {
+  return Object.keys(INGESTS_EXTERNAL_CONTENT);
+}
+
 export function classifyAction(toolName: string): ActionClass | null {
   return TOOL_ACTION_CLASS[toolName] ?? null;
 }

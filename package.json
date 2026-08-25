@@ -21,7 +21,8 @@
     "scheduler": "tsx src/orchestrator/run-scheduler.ts",
     "dashboard": "tsx src/dashboard/run-dashboard.ts",
     "owner:create": "tsx src/cli/create-owner.ts",
-    "owner:password": "tsx src/cli/owner-password.ts"
+    "owner:password": "tsx src/cli/owner-password.ts",
+    "job:seed": "tsx src/cli/seed-job.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.234",

@@ -46,7 +46,14 @@ export interface ReadRequest {
    */
   provenance?: TrustLevel;
   businessId?: string;
-  jobId?: string | null;
+  /**
+   * The job this read belongs to, or explicitly `null` when there isn't one.
+   *
+   * Required so a caller has to say which — see `GateHookBinding.jobId`
+   * (`src/sdk/gate-hook.ts`) for why an omitted job id and a genuinely
+   * job-less run must not be the same value.
+   */
+  jobId: string | null;
   /**
    * Directory the reader may read from, and nothing above it.
    *
@@ -85,7 +92,7 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
       if (event.decision === 'deny') denials.push(event.code);
     },
     ...(request.businessId !== undefined ? { businessId: request.businessId } : {}),
-    ...(request.jobId !== undefined ? { jobId: request.jobId } : {}),
+    jobId: request.jobId,
   };
 
   const definition = knowReaderDefinition(request.bundle);

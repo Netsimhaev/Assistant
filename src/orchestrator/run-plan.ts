@@ -3,9 +3,15 @@ import type { ConnectionBinding } from '../domain/connection.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel } from '../domain/trust.js';
 import { planProblems, topologicalOrder, type Plan, type PlanStep } from '../domain/plan.js';
-import { classifyAction, isOutbound, refineActionClass } from '../policy/classify.js';
+import {
+  classifyAction,
+  ingestsExternalContent,
+  isOutbound,
+  refineActionClass,
+} from '../policy/classify.js';
 import { canonicalHash } from '../util/canonical.js';
 import { unspentApprovalFor } from '../governance/approvals.js';
+import type { ApprovalNotifier } from '../governance/notify.js';
 import type { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
 import { loadBindings } from './bindings.js';
@@ -34,6 +40,19 @@ import type { Job } from './jobs.js';
 const ADAPTER_TIMEOUT_MS = 60_000;
 
 export interface RunPlanRequest {
+  /**
+   * Must be loaded fresh — after any read this job has already performed —
+   * not carried over from an earlier load.
+   *
+   * `runPlan` reads `job.contentIngested` straight off this object and never
+   * reloads it; a stale copy taken before a step marked content ingested
+   * would let `provenanceChainDerived` compute `true` for a chain that has, in
+   * fact, read something. Production is safe today because the only caller,
+   * `runPlanForJob` via `run-due.ts`, re-reads the job under that job's
+   * per-job advisory lock immediately before calling in here — but that
+   * freshness lives entirely in the caller and nothing in this type enforces
+   * it, so state it here for whoever calls `runPlan` next.
+   */
   job: Job;
   bundle: PolicyBundle;
   plan: Plan;
@@ -58,6 +77,8 @@ export interface RunPlanRequest {
    * minute for it. Production callers leave it unset and get the constant.
    */
   adapterTimeoutMs?: number;
+  /** Passed through to the gate so a queued approval reaches the owner. */
+  notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
 }
 
 /**
@@ -271,6 +292,15 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
     businessId: job.businessId,
   });
 
+  // The three conditions of the spec, combined positively. Computed once for
+  // the whole plan rather than per step: a plan that reads anything was
+  // authored by a planner that had read it, so ordering within the plan says
+  // nothing about which steps the content could have influenced — a plan
+  // containing a reader disqualifies every step in it, including steps that
+  // run before the reader. See docs/superpowers/specs/2026-08-24-boss-provenance-chain-design.md §4.
+  const planIngests = plan.steps.some((step) => ingestsExternalContent(step.toolName));
+  const provenanceChainDerived = job.provenance === 'boss' && !planIngests && !job.contentIngested;
+
   const records: StepRecord[] = [];
   let current = job;
 
@@ -314,6 +344,8 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       planHash,
       ...(request.now !== undefined ? { now: request.now } : {}),
       ...(approvalId !== null ? { approvalId } : {}),
+      ...(request.notify !== undefined ? { notify: request.notify } : {}),
+      ...(provenanceChainDerived ? { provenanceChainDerived } : {}),
     });
     records.push({
       stepId: step.id,

@@ -14,6 +14,14 @@ export interface Job {
   title: string | null;
   wakeAt: string | null;
   closedAt: string | null;
+  /**
+   * Whether this job has ever pulled content from outside the instance's
+   * trust boundary. Required, not optional: every construction site must
+   * state its answer, rather than a field that quietly defaults to the
+   * permissive case when a caller forgets it. See migration 011 for the
+   * full rationale and `markContentIngested` for how it is set.
+   */
+  contentIngested: boolean;
 }
 
 interface JobRow {
@@ -25,6 +33,7 @@ interface JobRow {
   title: string | null;
   wake_at: Date | null;
   closed_at: Date | null;
+  content_ingested: boolean;
 }
 
 function toJob(row: JobRow): Job {
@@ -37,6 +46,7 @@ function toJob(row: JobRow): Job {
     title: row.title,
     wakeAt: row.wake_at?.toISOString() ?? null,
     closedAt: row.closed_at?.toISOString() ?? null,
+    contentIngested: row.content_ingested,
   };
 }
 
@@ -227,4 +237,42 @@ export async function dueJobs(
     [options.businessId ?? config.businessId, options.now ?? new Date(), options.limit ?? 50],
   );
   return rows.map(toJob);
+}
+
+/**
+ * Record that this job has pulled content from outside the instance.
+ *
+ * One-way. There is no unmark, deliberately: a job that has read an
+ * attacker-authored document does not become clean again, and the first-contact
+ * exemption must stay off for the rest of its life.
+ *
+ * Called BEFORE the read runs. The window it protects is a crash between the
+ * external call and this write — in that window the read happened and nothing
+ * remembers it, and the next run would hand out an exemption nobody earned.
+ * Marking early can only over-restrict, which is the safe direction.
+ *
+ * Returns the number of rows the UPDATE matched — 0 or 1, since `job_id` is a
+ * primary key. `executeStep` can ignore this safely: `job` there was loaded
+ * from the very row being updated, so a mismatch is not a case that occurs.
+ * The SDK gate hook cannot make that assumption — `jobId` and `businessId`
+ * arrive there as two independent caller-supplied fields, not read off a job
+ * already loaded — so a stale id, a typo, or a job belonging to another
+ * business all produce a zero-row match indistinguishable from success unless
+ * the caller checks. Silently treating that as success is `setPassword`'s
+ * mistake (`src/dashboard/auth.ts`): its own zero-row UPDATE has no way to
+ * report "no such account", and the one caller that cared had to pre-check
+ * with a separate query. This function reports the count itself instead, so
+ * a caller with something to protect does not have to guess.
+ */
+export async function markContentIngested(
+  jobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<number> {
+  const db = options.db ?? getPool();
+  const result = await db.query(
+    `UPDATE jobs SET content_ingested = true, updated_at = now()
+      WHERE job_id = $1 AND business_id = $2`,
+    [jobId, options.businessId ?? config.businessId],
+  );
+  return result.rowCount ?? 0;
 }

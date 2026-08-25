@@ -1,0 +1,189 @@
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { closePool } from '../db/pool.js';
+import { resetDatabase } from '../test/db.js';
+import { buildCharter } from '../test/fixtures.js';
+import { installCharter } from '../charter/store.js';
+import { Plan } from '../domain/plan.js';
+import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
+import { AdapterRegistry } from './adapters/registry.js';
+import { createMailAdapter, type MailMessage } from './adapters/mail.js';
+import { envCredentials } from './credentials.js';
+import { createJob, loadJob, markContentIngested, transition } from './jobs.js';
+import { runPlan, type RunPlanResult } from './run-plan.js';
+
+const BUSINESS = 'test-business';
+const PREFIX = 'TEST_CRED_';
+const NOON = new Date('2026-08-18T09:00:00.000Z');
+
+const MAIL_CONNECTION: CharterConnection = {
+  system: 'office-mail', label: 'תיבת המשרד', channel: 'api',
+  serves: ['mail.send'], target: null, subprocessor: null,
+};
+
+const LIVE: ConnectionBinding = {
+  system: 'office-mail', status: 'live', endpoint: null,
+  credentialRef: 'OFFICE_MAIL', lastOkAt: null, lastError: null,
+};
+
+/** One step, to a stranger, with nothing read. The live thread's own plan. */
+const SEND_ONLY: Plan = Plan.parse({
+  goal: 'send one mail',
+  steps: [{
+    id: 's1', agent: 'comms.email', intent: 'send',
+    toolName: 'mail.send',
+    input: { to: 'stranger@example.com', subject: 'הצעה', body: 'שלום' },
+    expectedActionClass: 'email.initiate',
+  }],
+});
+
+function registry(sent: MailMessage[]): AdapterRegistry {
+  return new AdapterRegistry([
+    createMailAdapter({
+      system: 'office-mail',
+      transport: { async send(m) { sent.push(m); return { messageId: 'MSG-1' }; } },
+    }),
+  ]);
+}
+
+/**
+ * Asserts the run halted for exactly the reason named, not merely that it
+ * halted. `RunPlanResult['halted']` covers a queued approval, a quiet-hours
+ * deferral and any denial alike — three very different outcomes for a job —
+ * and a bare `toBe('halted')` cannot tell them apart. Narrowing here (rather
+ * than at each call site) is what lets every negative test in this file state
+ * which halt it expects.
+ */
+function expectHalted(result: RunPlanResult, reason: string): void {
+  expect(result.status).toBe('halted');
+  if (result.status !== 'halted') throw new Error('expected a halted result');
+  expect(result.reason).toBe(reason);
+}
+
+async function jobInExecute(bundle: { charterVersion: string }, provenance: 'boss' | 'staff' = 'boss') {
+  const job = await createJob({
+    charterVersion: bundle.charterVersion, provenance, businessId: BUSINESS,
+  });
+  for (const to of ['understand', 'plan', 'execute'] as const) {
+    await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+  }
+  const loaded = await loadJob(job.jobId, { businessId: BUSINESS });
+  if (loaded === null) throw new Error('job vanished');
+  return loaded;
+}
+
+/**
+ * The charter must permit the class, or its own ceiling forces an approval
+ * regardless of the exemption — see the spec's §6. This is the charter change
+ * the owner would make in production, expressed as a test override.
+ */
+function permissiveCharter() {
+  return buildCharter({
+    connections: [MAIL_CONNECTION],
+    autonomyBase: { 'email.initiate': 'auto' },
+  });
+}
+
+describe('the boss exemption, end to end through runPlan', () => {
+  beforeEach(async () => { await resetDatabase(); });
+  afterAll(async () => { await closePool(); });
+
+  it('sends without an approval when the boss instructed it and nothing was read', async () => {
+    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const job = await jobInExecute(bundle);
+    const sent: MailMessage[] = [];
+
+    const result = await runPlan({
+      job, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
+      credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
+      counterpartyTags: [], rampLevel: 'auto', now: NOON,
+    });
+
+    expect(result.status).toBe('done');
+    expect(sent).toHaveLength(1);
+  });
+
+  it('still asks when the job has already ingested content', async () => {
+    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const job = await jobInExecute(bundle);
+    await markContentIngested(job.jobId, { businessId: BUSINESS });
+    const fresh = await loadJob(job.jobId, { businessId: BUSINESS });
+    if (fresh === null) throw new Error('job vanished');
+    const sent: MailMessage[] = [];
+
+    const result = await runPlan({
+      job: fresh, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
+      credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
+      counterpartyTags: [], rampLevel: 'auto', now: NOON,
+    });
+
+    // provenanceChainDerived is false (contentIngested), so the first-contact
+    // exemption never applies and the send to a stranger queues for approval
+    // rather than being refused outright.
+    expectHalted(result, 'awaiting_approval');
+    expect(sent).toEqual([]);
+  });
+
+  it('still asks when the plan itself contains a reader, even after the send step', async () => {
+    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const job = await jobInExecute(bundle);
+    const sent: MailMessage[] = [];
+
+    // The reader comes SECOND. Execution order must not matter: the planner
+    // that wrote step 1 is the same planner that had read for step 2.
+    const readAfter: Plan = Plan.parse({
+      goal: 'send then read',
+      steps: [
+        SEND_ONLY.steps[0],
+        { id: 's2', agent: 'know.reader', intent: 'read', toolName: 'doc.fetch',
+          input: { uri: 'https://example.com/d' }, dependsOn: ['s1'],
+          expectedActionClass: null },
+      ],
+    });
+
+    const result = await runPlan({
+      job, bundle, plan: readAfter, registry: registry(sent), bindings: [LIVE],
+      credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
+      counterpartyTags: [], rampLevel: 'auto', now: NOON,
+    });
+
+    expectHalted(result, 'awaiting_approval');
+    expect(sent).toEqual([]);
+  });
+
+  /**
+   * `unknown_external` was tried here first and rejected: its provenance
+   * ceiling (`PROVENANCE_CEILING` in `src/test/fixtures.ts`) is `draft_only`,
+   * so `effectiveAutonomy` denies the step at the gate's autonomy step (step
+   * 8) — before `assessRisk` ever runs. That exercises `draft_only`, not the
+   * first-contact escalation this test is named for.
+   *
+   * `staff` has a ceiling of `auto_notify` (see `PROVENANCE_CEILING`), which
+   * — combined with this test's permissive charter (`autonomyBase:
+   * 'email.initiate': 'auto'`) and `rampLevel: 'auto'` — is not restrictive
+   * enough to deny on its own. The step reaches `assessRisk`, the recipient
+   * is an unresolved stranger (`one_unknown`), and
+   * `FIRST_CONTACT_EXEMPT.has('staff')` is false (the set is `{'boss'}`
+   * only, `src/policy/risk.ts`), so `isUnvettedFirstContact` returns `true`
+   * and the band is `sensitive` — which is what actually queues the
+   * approval here, not an autonomy ceiling.
+   *
+   * This does NOT, on its own, prove `runPlan`'s `job.provenance === 'boss'`
+   * conjunct is load-bearing — see the fix-round report for why no test
+   * through `runPlan` can. It does correctly exercise the control this test
+   * is named for, which the previous `unknown_external` version did not.
+   */
+  it('still asks when the job did not come from the boss', async () => {
+    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const job = await jobInExecute(bundle, 'staff');
+    const sent: MailMessage[] = [];
+
+    const result = await runPlan({
+      job, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
+      credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
+      counterpartyTags: [], rampLevel: 'auto', now: NOON,
+    });
+
+    expectHalted(result, 'awaiting_approval');
+    expect(sent).toEqual([]);
+  });
+});

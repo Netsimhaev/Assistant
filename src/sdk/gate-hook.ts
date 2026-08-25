@@ -7,6 +7,8 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import type { Queryable } from '../db/pool.js';
 import { evaluateToolCall } from '../policy/engine.js';
+import { ingestsExternalContent } from '../policy/classify.js';
+import { markContentIngested } from '../orchestrator/jobs.js';
 import { isPathWithin, readPathArgument, translateToolName } from './tool-names.js';
 
 export interface GateHookBinding {
@@ -32,7 +34,19 @@ export interface GateHookBinding {
    */
   rampLevel: AutonomyLevel;
   businessId?: string;
-  jobId?: string | null;
+  /**
+   * The job this call belongs to, or explicitly `null` for a run with no job
+   * to remember the read against.
+   *
+   * Required, not optional: an omitted field used to mean "do not record
+   * this read" — indistinguishable from a genuinely job-less run — which is
+   * exactly the failure mode `counterpartyTags` and `Job.contentIngested`
+   * document above and in `src/orchestrator/jobs.ts`: an optional field that
+   * silently disabled a control until a caller happened to notice. `null` is
+   * the honest answer for the live script (`run-know-reader.ts`); every
+   * other caller states its real job id.
+   */
+  jobId: string | null;
   envelopeId?: string | null;
   autonomyCeiling?: AutonomyLevel;
   db?: Queryable;
@@ -147,7 +161,7 @@ async function decide(
         rampLevel: binding.rampLevel,
         ...(binding.now !== undefined ? { now: binding.now } : {}),
         ...(binding.businessId !== undefined ? { businessId: binding.businessId } : {}),
-        ...(binding.jobId !== undefined ? { jobId: binding.jobId } : {}),
+        jobId: binding.jobId,
         ...(binding.envelopeId !== undefined ? { envelopeId: binding.envelopeId } : {}),
         ...(binding.autonomyCeiling !== undefined
           ? { autonomyCeiling: binding.autonomyCeiling }
@@ -172,6 +186,54 @@ async function decide(
           'redaction_unrepresentable',
           'הקלט המצונזר אינו אובייקט ולכן לא ניתן להעביר אותו ל-SDK',
         );
+      }
+
+      // `executeStep` (src/orchestrator/execute.ts) is the other place a tool
+      // call is allowed to run, and it already marks `content_ingested` before
+      // its call goes out. This is not the same call reused: an SDK-driven
+      // agent (know.reader chief among them) never passes through
+      // `executeStep` at all — the model calls the tool directly and this hook
+      // is the only gate it passes. Two writers of a one-way flag sounds like
+      // duplication worth unifying, but it is not: there is no single call
+      // site both paths funnel through, so "unifying" would mean deleting one
+      // of the two places a read can actually happen, and the SDK path is the
+      // one Task 6 exists because it was missing.
+      //
+      // Marked here, not after the SDK executes the tool: a crash between the
+      // read landing and the write would leave the read unremembered, which is
+      // the one direction that hands out an exemption nobody earned. This is
+      // also strictly after the redaction check above and only on the branch
+      // that returns `permissionDecision: 'allow'` — a denial here (including
+      // `redaction_unrepresentable`) means the tool never runs and must not
+      // mark. `translated.internal` is used, never `hook.tool_name`: the
+      // ingest table is keyed by internal names, and marking on the raw SDK
+      // name would either never match (wrong name) or mark on every call
+      // (`ingestsExternalContent` defaults unknown names to `true`).
+      if (binding.jobId !== null && ingestsExternalContent(translated.internal)) {
+        const matched = await markContentIngested(binding.jobId, {
+          ...(binding.businessId !== undefined ? { businessId: binding.businessId } : {}),
+          ...(binding.db !== undefined ? { db: binding.db } : {}),
+        });
+        // `jobId` and `businessId` reach this hook as two independent
+        // caller-supplied fields — unlike `executeStep`, nothing here loaded
+        // a job row to derive them from. A stale id, a typo, or a jobId that
+        // names another business's job all produce a zero-row match, and
+        // letting the tool run anyway would mean this read happened with
+        // nothing remembering it — the one direction `content_ingested`
+        // exists to prevent. So this fails closed, overriding the gate's
+        // `allow` from a moment ago, rather than trust a write that did not
+        // land.
+        if (matched === 0) {
+          binding.onDecision?.({
+            tool: translated.internal,
+            decision: 'deny',
+            code: 'content_ingest_unrecorded',
+          });
+          return denial(
+            'content_ingest_unrecorded',
+            `לא ניתן לרשום את קליטת התוכן עבור job ${binding.jobId} — הקריאה נחסמה`,
+          );
+        }
       }
 
       return {
