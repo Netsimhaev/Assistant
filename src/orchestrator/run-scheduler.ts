@@ -53,6 +53,19 @@ function logErrored(result: SchedulerPassResult): void {
   for (const jobId of result.due.phaseMoved) {
     console.error(`job ${jobId} moved out of execute between the scan and the lock`);
   }
+  // The close pass has its own buckets, and the same rule applies to them:
+  // one nobody prints is one that does not exist. A job stopped short of
+  // `closed` is the only kind an operator can act on — a clean close is not
+  // news, so `verified.closed` is deliberately silent.
+  for (const job of result.verified.failed) {
+    console.error(`job ${job.jobId} stopped before closing: ${job.detail}`);
+  }
+  for (const jobId of result.verified.unbound) {
+    console.error(`job ${jobId} is in verify with no plan bound`);
+  }
+  for (const job of result.verified.errored) {
+    console.error(`job ${job.jobId} errored while closing: ${job.error}`);
+  }
 }
 
 // One pass before the loop, so a misconfiguration surfaces immediately rather

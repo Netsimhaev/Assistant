@@ -319,3 +319,39 @@ export async function loadPlanBody(
 
   return { planHash: row.plan_hash, plan: parsed.data };
 }
+
+/**
+ * Every step result written for one plan, `unknown` rows included.
+ *
+ * Deliberately **not** a variant of `completedSteps`, and deliberately not
+ * built by relaxing its `WHERE`. That function answers "which steps may a
+ * resume skip", and an `unknown` row must never appear in its answer — see
+ * its docblock. This one answers a different question: "what does the record
+ * say about every step this plan attempted", which is what the verify phase
+ * needs before it may close a job. A single reader serving both would have to
+ * pick one filter, and either choice reintroduces a real defect on the other
+ * side.
+ *
+ * A step with no row at all is absent from the result. That is information,
+ * not a gap to paper over: the caller decides what an unrecorded step means,
+ * and `closeVerifiedJobs` (`verify.ts`) treats it as disqualifying.
+ */
+export async function stepResults(
+  jobId: string,
+  planHash: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<StepCompletion[]> {
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<StepResultRow & { status: StepResultStatus }>(
+    `SELECT step_id, external_id, status FROM job_step_results
+      WHERE business_id = $1 AND job_id = $2 AND plan_hash = $3
+      ORDER BY step_id`,
+    [options.businessId ?? config.businessId, jobId, planHash],
+  );
+  return rows.map((row) => ({
+    stepId: row.step_id,
+    planHash,
+    externalId: row.external_id,
+    status: row.status,
+  }));
+}

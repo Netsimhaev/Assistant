@@ -4,6 +4,8 @@ import { expireOverdue } from '../governance/approvals.js';
 import { loadJob, transition } from './jobs.js';
 import { runDueJobs } from './run-due.js';
 import type { RunDueResult } from './run-due.js';
+import { closeVerifiedJobs } from './verify.js';
+import type { CloseVerifiedResult } from './verify.js';
 import type { Runtime } from './runtime.js';
 
 export interface TickResult {
@@ -124,6 +126,7 @@ async function wakeDueJobs(
 export interface SchedulerPassResult {
   tick: TickResult;
   due: RunDueResult;
+  verified: CloseVerifiedResult;
 }
 
 /**
@@ -148,7 +151,13 @@ export async function schedulerPass(
 ): Promise<SchedulerPassResult> {
   const tickResult = await tick(options);
   const due = await runDueJobs(options);
-  return { tick: tickResult, due };
+  // Third and last, and the order matters as much as the first two: a job
+  // `runDueJobs` just finished is sitting in `verify` by the time this looks,
+  // so it closes in the same pass instead of waiting a full interval. Run
+  // before the plans instead and every close would trail a pass behind the
+  // work that earned it.
+  const verified = await closeVerifiedJobs(options);
+  return { tick: tickResult, due, verified };
 }
 
 export interface SchedulerHandle {

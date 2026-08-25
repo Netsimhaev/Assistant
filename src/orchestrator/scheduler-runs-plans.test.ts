@@ -9,7 +9,7 @@ import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import { upsertBinding } from './bindings.js';
 import { envCredentials } from './credentials.js';
-import { createJob, transition } from './jobs.js';
+import { createJob, loadJob, transition } from './jobs.js';
 import { bindPlanToJob } from './plan-store.js';
 import { setRampLevel } from './ramp.js';
 import { schedulerPass } from './scheduler.js';
@@ -124,5 +124,49 @@ describe('schedulerPass', () => {
     expect(pass.tick.wokenJobs).toContain(job.jobId);
     expect(pass.due.ran.map((r) => r.jobId)).toContain(job.jobId);
     expect(sent).toHaveLength(1);
+  });
+
+  it('carries a job it just finished all the way to closed, in the same pass', async () => {
+    // `runDueJobs` parks a finished job in `verify`. Before `closeVerifiedJobs`
+    // was wired in after it, that was the end of the line: nothing in
+    // production read `verify`, so every job the engine completed stayed there
+    // for good. Ordering the close after the run — rather than before it — is
+    // what lets one pass take a job from `execute` to `closed`.
+    const bundle = await installCharter(
+      buildCharter({
+        connections: [MAIL_CONNECTION],
+        autonomyBase: { 'email.initiate': 'auto' },
+      }),
+      { businessId: BUSINESS },
+    );
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'run and close',
+    });
+    for (const to of ['understand', 'plan', 'execute'] as const) {
+      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    }
+    await upsertBinding(
+      {
+        system: 'office-mail',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OFFICE_MAIL',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { businessId: BUSINESS, by: 'test' },
+    );
+    await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+
+    const sent: MailMessage[] = [];
+    const pass = await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+
+    expect(sent).toHaveLength(1);
+    expect(pass.verified.closed).toContain(job.jobId);
+    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('closed');
   });
 });
