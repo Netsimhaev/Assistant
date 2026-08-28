@@ -323,10 +323,28 @@ export const CharterPerson = z.object({
   escalationOrder: z.number().int().nonnegative().default(0),
 });
 
+/**
+ * Strings the owner writes that later become **object keys** in a compiled
+ * lookup table — counterparty ids, tags, supplier ids.
+ *
+ * `__proto__` is a string a person can type, and using it as a key is not a
+ * lookup: `bucket['__proto__']` returns `Object.prototype`, and writing to it
+ * pollutes every object in the process. `constructor` and `prototype` are the
+ * same family. Refused here, at the layer the owner actually gets an error
+ * from, rather than normalised silently into something they did not write —
+ * the same argument the asterisk form of an email domain is refused rather
+ * than quietly trimmed.
+ */
+const UNSAFE_OBJECT_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+const SafeLookupKey = z.string().refine((value) => !UNSAFE_OBJECT_KEYS.has(value), {
+  message: 'מזהה או תגית לא יכולים להיות __proto__, constructor או prototype',
+});
+
 export const CharterCounterparty = z.object({
   match: z
     .object({
-      entityId: z.string().optional(),
+      entityId: SafeLookupKey.optional(),
       emailDomain: z
         .string()
         .superRefine((domain, ctx) => {
@@ -338,7 +356,7 @@ export const CharterCounterparty = z.object({
         })
         .optional(),
       phone: z.string().optional(),
-      tag: z.string().optional(),
+      tag: SafeLookupKey.optional(),
     })
     .refine(
       (m) => Boolean(m.entityId ?? m.emailDomain ?? m.phone ?? m.tag),
@@ -374,7 +392,11 @@ export const CharterMoney = z.object({
   approvedSuppliers: z
     .array(
       z.object({
-        entityId: z.string().min(1),
+        // Becomes a key in `approvedSupplierCeilingMinor`. `__proto__` there is
+        // not pollution but something quieter: assigning a number to it is a
+        // silent no-op, so a ceiling the owner signed would never apply and
+        // nothing would say so.
+        entityId: SafeLookupKey.min(1),
         categories: z.array(z.string()).default([]),
         autoOrderCeilingMinor: MinorAmount,
       }),

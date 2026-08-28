@@ -178,9 +178,32 @@ function compileRules(charter: BusinessCharter): CompiledRule[] {
   return rules;
 }
 
+/**
+ * A key that is safe to write into a lookup table.
+ *
+ * Mirrors the schema's own refusal (`SafeLookupKey`, `src/domain/charter.ts`).
+ * Two layers on purpose: the schema is what tells the owner, and this is what
+ * holds if a charter object reaches the compiler without passing it. Loud,
+ * because a silently-dropped rule is a rule the owner still believes in.
+ */
+const UNSAFE_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+function assertSafeKey(key: string): void {
+  if (UNSAFE_KEYS.has(key)) {
+    throw new Error(
+      `refusing to compile a charter that uses ${key} as a lookup key: ` +
+        'it is not a name, it is a property of every object',
+    );
+  }
+}
+
 function compileCeilings(charter: BusinessCharter): CompiledCeilings {
   const approvedSupplierCeilingMinor: Record<string, number> = {};
   for (const supplier of charter.money.approvedSuppliers) {
+    // Same refusal as the counterparty buckets. Here the failure mode is not
+    // pollution but silence: assigning a number to `__proto__` does nothing at
+    // all, so the ceiling would compile, sign, and never once apply.
+    assertSafeKey(supplier.entityId);
     approvedSupplierCeilingMinor[supplier.entityId] = supplier.autoOrderCeilingMinor;
   }
 
@@ -224,9 +247,17 @@ function compileCounterpartyAutonomy(
 
     for (const [bucket, key] of targets) {
       if (key === undefined || key.length === 0) continue;
+      assertSafeKey(key);
       // A later rule matching the same key tightens rather than replaces: two
       // rules that both apply should not let ordering decide the outcome.
-      const existing = bucket[key] ?? {};
+      //
+      // `Object.hasOwn`, not `?? {}`. For `key === '__proto__'` a bare read
+      // returns `Object.prototype` rather than `undefined`, and the loop below
+      // would then write the owner's autonomy overrides onto it — process-wide
+      // pollution, from a document the owner signed. The schema refuses that
+      // key first (`src/domain/charter.ts`); this is the layer that holds when
+      // a charter reaches the compiler some other way.
+      const existing = Object.hasOwn(bucket, key) ? (bucket[key] ?? {}) : {};
       for (const [actionClass, level] of Object.entries(overrides)) {
         if (level === undefined) continue;
         const current = existing[actionClass as ActionClass];
