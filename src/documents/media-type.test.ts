@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, TEXT, XLSX, sniffMediaType } from './media-type.js';
+
+const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
 
 describe('sniffMediaType', () => {
   it('reads the type from the bytes, not the extension', () => {
@@ -45,5 +49,26 @@ describe('sniffMediaType', () => {
 
   it('accepts tab, newline and carriage return as ordinary text whitespace', () => {
     expect(sniffMediaType(Buffer.from('a\tb\nc\r\n'), 'notes.txt')).toBe(TEXT);
+  });
+
+  it('recovers from a UTF-8 character cut off at the buffer boundary', () => {
+    // 'a' followed by Hebrew shin (a 2-byte UTF-8 character: 0xD7 0xA9).
+    // Dropping the last byte leaves a dangling lead byte with no
+    // continuation — exactly what happens when `head` is a prefix of a
+    // larger file and the cut lands mid-character, not evidence the file is
+    // binary.
+    const full = Buffer.from('aש', 'utf-8');
+    const truncated = full.subarray(0, full.length - 1);
+    expect(sniffMediaType(truncated, 'notes.txt')).toBe(TEXT);
+  });
+
+  it('reads the real xlsx fixture bytes as XLSX, not just a constructed header', () => {
+    const head = readFileSync(fixture('tiny.xlsx')).subarray(0, 8);
+    expect(sniffMediaType(head, 'tiny.xlsx')).toBe(XLSX);
+  });
+
+  it('reads the real docx fixture bytes as DOCX, not just a constructed header', () => {
+    const head = readFileSync(fixture('tiny.docx')).subarray(0, 8);
+    expect(sniffMediaType(head, 'tiny.docx')).toBe(DOCX);
   });
 });

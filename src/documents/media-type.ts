@@ -31,10 +31,18 @@ function extensionOf(originalName: string): string {
  *
  * `head` is a prefix of a possibly-larger file, so a UTF-8 sequence can be
  * cut off mid-character at the end of the buffer — that is a truncation
- * artefact, not evidence the file is binary. One retry with up to three
+ * artefact, not evidence the file is binary. Retrying with up to three
  * trailing bytes trimmed (the longest a UTF-8 character can be, minus one)
  * absorbs that without weakening the check anywhere but the very last
  * character.
+ *
+ * Trimming cannot tell "cut off mid-character" apart from "corrupt byte
+ * here": a buffer whose true final bytes are simply invalid UTF-8 recovers
+ * the same way a truncated one does, so this also tolerates a genuinely
+ * corrupt tail of up to three bytes. That is an acceptable trade for a
+ * prefix sniffer — false negatives on legitimate truncated text are more
+ * costly than the sliver of corrupt input it lets through — but it is a
+ * trade, not pure truncation-recovery.
  */
 function looksLikeText(head: Buffer): boolean {
   let decoded: string | null = null;
