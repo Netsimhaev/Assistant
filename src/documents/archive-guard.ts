@@ -9,20 +9,36 @@
  * into `node:zlib`'s inflate, or any other decompressor — there is no code
  * path in this file capable of unpacking a single byte of archive content.
  *
- * The declared sizes are attacker-controlled: an entry's central-directory
- * header can claim any uncompressed size regardless of what its compressed
- * stream truly inflates to. That is fine, not a hole in this guard — a liar
- * is rejected either way. An entry that *understates* its size to slip under
- * these caps still meets Task 5's own output-size cap on the child process,
- * enforced against what actually comes out of the decompressor. This guard's
- * job is narrower: refuse what the archive admits to, before spending a
- * process on it.
+ * The declared **uncompressed** size is attacker-controlled, and that lie is
+ * tolerated on purpose: an entry's central-directory header can claim any
+ * inflated size regardless of what its compressed stream truly produces, and
+ * an entry that *understates* it to slip under these caps still meets Task
+ * 5's own output-size cap on the child process, enforced against what
+ * actually comes out of the decompressor. This guard's job is narrower:
+ * refuse what the archive admits to, before spending a process on it.
+ *
+ * The declared **compressed** size is a different lie, and this guard does
+ * not tolerate it: nothing downstream re-derives the ratio dimension, so an
+ * entry that overstates its compressed size defeats the ratio cap outright
+ * — a 1KB deflate stream can carry a `compressedSize` field of any value up
+ * to 4GB, making a true ~200,000:1 ratio read back as roughly 1:1. That is
+ * checkable for free, because a compressed size cannot exceed the file that
+ * allegedly contains it. `readCentralDirectory` refuses any entry whose
+ * declared compressed size is larger than the archive itself, before the
+ * ratio is ever computed from it.
  *
  * Three checks, in the spec's order — an archive that crosses more than one
  * cap reports the first it crosses, not the most severe:
  *   1. total declared inflated size across all entries > 200MB
  *   2. entry count > 2,000
  *   3. any single entry's declared ratio (uncompressed / compressed) > 120:1
+ *
+ * A ZIP that cannot be parsed as a ZIP at all — including one carrying a
+ * declared size (central directory size, or now compressed entry size) that
+ * is provably impossible given the file's own length — is a fourth outcome,
+ * `archive_malformed`, not an exception. `inspectArchive`'s signature is
+ * `Promise<ArchiveVerdict>`, and a caller that trusts that signature must
+ * never see an uncaught rejection from a single hostile file.
  */
 
 import { open } from 'node:fs/promises';
@@ -41,7 +57,11 @@ export type ArchiveVerdict =
   | { ok: true }
   | {
       ok: false;
-      code: 'archive_too_large' | 'archive_too_many_entries' | 'archive_ratio';
+      code:
+        | 'archive_too_large'
+        | 'archive_too_many_entries'
+        | 'archive_ratio'
+        | 'archive_malformed';
       detail: string;
     };
 
@@ -51,15 +71,20 @@ interface CentralDirectoryEntry {
 }
 
 /**
- * Thrown when `path` is not a well-formed ZIP central directory at all —
- * distinct from the three `ArchiveVerdict` refusal codes, which all mean
+ * Internal signal that `path` is not a well-formed ZIP central directory —
+ * distinct from the three cap-based `ArchiveVerdict` codes, which all mean
  * "this is a ZIP, and it crosses a stated cap". `sniffMediaType` (§5.1)
  * already confirmed the file starts with the ZIP magic bytes before this
- * guard is ever called; a file that still fails to parse here is corrupt or
- * adversarially malformed in a way none of the three caps describes.
- * `inspectArchive` deliberately does not catch this and map it onto one of
- * the three codes — an unreadable central directory is not a value we get
- * to guess a reason for, so it fails the promise instead of the verdict.
+ * guard is ever called; a file that still fails to parse here (or declares
+ * a size — central-directory size, or a single entry's compressed size —
+ * that the file's own length proves impossible) is corrupt or adversarially
+ * forged in a way none of the three numeric caps describes.
+ *
+ * This never crosses the `inspectArchive` function boundary: it is caught
+ * there and turned into an `archive_malformed` verdict. Kept as a thrown
+ * error internally only so `readCentralDirectory` can unwind out of a
+ * nested loop with `throw` instead of threading a result type through every
+ * parsing step.
  */
 class MalformedZipError extends Error {}
 
@@ -131,6 +156,19 @@ async function readCentralDirectory(path: string): Promise<CentralDirectoryEntry
       const extraLength = cd.readUInt16LE(pos + 30);
       const commentLength = cd.readUInt16LE(pos + 32);
 
+      // An entry's compressed bytes have to physically live somewhere
+      // inside this file. A declared `compressedSize` larger than the file
+      // itself cannot be real — and left unchecked, it defeats the ratio
+      // cap below outright: a tiny real deflate stream can carry any
+      // `compressedSize` value up to 4GB in its header, driving the
+      // computed ratio arbitrarily close to 1:1 regardless of what the
+      // entry truly inflates to.
+      if (compressedSize > size) {
+        throw new MalformedZipError(
+          `entry declares a compressed size (${compressedSize}) larger than the file itself (${size})`,
+        );
+      }
+
       entries.push({ compressedSize, uncompressedSize });
       pos += CENTRAL_DIR_HEADER_FIXED_SIZE + nameLength + extraLength + commentLength;
     }
@@ -156,7 +194,20 @@ function ratioOf(entry: CentralDirectoryEntry): number {
 }
 
 export async function inspectArchive(path: string): Promise<ArchiveVerdict> {
-  const entries = await readCentralDirectory(path);
+  let entries: CentralDirectoryEntry[];
+  try {
+    entries = await readCentralDirectory(path);
+  } catch (err) {
+    // A caller that trusts this function's `Promise<ArchiveVerdict>`
+    // signature must never take an uncaught rejection from a single
+    // hostile or corrupt file — that would stop ingestion of every valid
+    // file behind it. Only `MalformedZipError` is converted to a verdict
+    // here; anything else (e.g. the file vanishing between the media-type
+    // sniff and this call) is a genuine, unexpected failure and still
+    // propagates.
+    if (!(err instanceof MalformedZipError)) throw err;
+    return { ok: false, code: 'archive_malformed', detail: `הארכיון פגום: ${err.message}` };
+  }
 
   let totalInflated = 0;
   let maxRatio = 0;
