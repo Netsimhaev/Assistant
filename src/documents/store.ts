@@ -137,12 +137,18 @@ export async function findBySha(
  * Write a document's extracted parts and flip its status to `extracted`, in
  * one transaction.
  *
- * The two writes must land together. A crash or a rejected write between
- * them would otherwise leave a document that claims `extracted` with no
- * artefacts to back it up — or artefacts attached to a document the caller
- * still believes is `pending`, invisible because every reader of `content`
- * goes through `loadArtifacts`, which nothing calls until the status says
- * it is worth calling.
+ * The two writes must land together, and neither may land without the other
+ * — including when the status UPDATE matches zero rows. `document_artifacts.
+ * document_id` references `documents.document_id` alone, not the
+ * `(business_id, document_id)` pair (see the migration header), so the
+ * artefact INSERTs above succeed even when `documentId` does not belong to
+ * `businessId`: the FK is satisfied by the row under its real owner. Left
+ * unchecked, the UPDATE below would then match nothing, the transaction
+ * would commit anyway, and `loadArtifacts` — which does not gate on status —
+ * would surface those rows to the wrong business under a document that still
+ * reads `pending`. Checking `rowCount` and throwing on zero rolls the
+ * artefact inserts back with it, so "invisible until the status says it is
+ * worth calling" stays true rather than merely stated.
  */
 export async function markExtracted(
   documentId: string,
@@ -169,11 +175,20 @@ export async function markExtracted(
       );
     }
 
-    await tx.query(
+    const { rowCount } = await tx.query(
       `UPDATE documents SET status = 'extracted', extracted_at = now()
         WHERE business_id = $1 AND document_id = $2`,
       [businessId, documentId],
     );
+
+    // Zero rows means no document with this id belongs to this business —
+    // wrong tenant, wrong id, or never inserted. Throwing here (inside the
+    // transaction) rolls back every artefact insert above along with it.
+    if ((rowCount ?? 0) === 0) {
+      throw new Error(
+        `markExtracted: no document ${documentId} for business ${businessId}; rolling back its artefacts`,
+      );
+    }
   });
 }
 
@@ -184,11 +199,20 @@ export async function markRejected(
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
   const db = options.db ?? getPool();
-  await db.query(
+  const { rowCount } = await db.query(
     `UPDATE documents SET status = 'rejected', reason = $3
       WHERE business_id = $1 AND document_id = $2`,
     [options.businessId ?? config.businessId, documentId, reason],
   );
+
+  // Same reasoning as markExtracted: a zero-row match here means this
+  // business does not own `documentId`, and writing nothing must not look
+  // like success.
+  if ((rowCount ?? 0) === 0) {
+    throw new Error(
+      `markRejected: no document ${documentId} for business ${options.businessId ?? config.businessId}`,
+    );
+  }
 }
 
 /** A document's extracted parts, ordered the way they were written. */

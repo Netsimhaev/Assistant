@@ -107,6 +107,32 @@ describe('markExtracted', () => {
     const artifacts = await loadArtifacts(doc.documentId, { businessId: BUSINESS });
     expect(artifacts).toHaveLength(0);
   });
+
+  it('refuses a businessId that does not own the document, and leaves no artefact rows behind', async () => {
+    const doc = await insertDocument({ ...INPUT, sha256: '3'.repeat(64) }, { businessId: BUSINESS });
+
+    // `document_artifacts.document_id` FK-references `documents.document_id`
+    // alone (see the migration header) — the FK is satisfied by the row
+    // under its real owner, BUSINESS, so a naive insert-then-update under
+    // the wrong business would insert the artefact rows first and only then
+    // discover the UPDATE matches nothing. Asserting only the throw would
+    // pass even if that insert were never rolled back — so this checks both
+    // businesses see zero artefact rows afterwards.
+    await expect(
+      markExtracted(doc.documentId, [
+        { ordinal: 0, kind: 'table', partName: null, content: { rows: [] }, flags: [] },
+      ], { businessId: OTHER_BUSINESS }),
+    ).rejects.toThrow();
+
+    const underWrongBusiness = await loadArtifacts(doc.documentId, { businessId: OTHER_BUSINESS });
+    expect(underWrongBusiness).toHaveLength(0);
+
+    const underRealOwner = await loadArtifacts(doc.documentId, { businessId: BUSINESS });
+    expect(underRealOwner).toHaveLength(0);
+
+    const stillPending = await findBySha('3'.repeat(64), { businessId: BUSINESS });
+    expect(stillPending?.status).toBe('pending');
+  });
 });
 
 describe('markRejected', () => {
@@ -123,5 +149,17 @@ describe('markRejected', () => {
 
     const artifacts = await loadArtifacts(doc.documentId, { businessId: BUSINESS });
     expect(artifacts).toHaveLength(0);
+  });
+
+  it('refuses a businessId that does not own the document', async () => {
+    const doc = await insertDocument({ ...INPUT, sha256: '4'.repeat(64) }, { businessId: BUSINESS });
+
+    await expect(
+      markRejected(doc.documentId, 'not yours', { businessId: OTHER_BUSINESS }),
+    ).rejects.toThrow();
+
+    const stillPending = await findBySha('4'.repeat(64), { businessId: BUSINESS });
+    expect(stillPending?.status).toBe('pending');
+    expect(stillPending?.reason).toBeNull();
   });
 });
