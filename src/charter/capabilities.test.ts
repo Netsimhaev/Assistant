@@ -5,20 +5,22 @@ import {
   COLLABORATION_GRAPH,
   UNOWNED_TOOLS,
   isToolPermitted,
+  matchesPattern,
 } from './capabilities.js';
 import {
   READ_ONLY_TOOLS,
   REFINEMENT_ONLY_CLASSES,
   classifiedToolNames,
+  classifyAction,
   directlyMappedActionClasses,
 } from '../policy/classify.js';
 import { ActionClass, BROWSER_ADDRESSED_CLASSES, addresseeOf } from '../domain/action.js';
+import { AgentId } from '../domain/audit.js';
 import type { Addressee } from '../domain/action.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { compileCharter } from './compile.js';
 import { buildCharter } from '../test/fixtures.js';
-import type { AgentId } from '../domain/audit.js';
 
 const AGENTS = Object.keys(AGENT_ALLOWLISTS) as AgentId[];
 
@@ -228,5 +230,45 @@ describe('addresseeOf is pinned class by class', () => {
   it('marks only the two browser classes as browser-addressed', () => {
     const browserAddressed = ActionClass.options.filter((cls) => addresseeOf(cls) === 'browser');
     expect(browserAddressed.sort()).toEqual(['browser.interact', 'browser.session']);
+  });
+});
+
+/**
+ * The denylist's stated job is to survive an allowlist widened by accident —
+ * "a second, louder control for the cases where the consequence is severe".
+ * A wildcard is a prefix match, so `memory.write_*` covered `memory.write_entity`
+ * and `memory.write_chunk` and silently left `memory.upsert_preference` and
+ * `memory.retire` protected by allowlist absence alone. For those two the second
+ * control did not exist, and no invariant said so: the closest existing one
+ * checks the opposite direction (no tool in both lists).
+ */
+describe('long-term memory writes are denied by name, not by prefix luck', () => {
+  const memoryWrites = classifiedToolNames().filter(
+    (tool) => classifyAction(tool) === 'memory.write_longterm',
+  );
+
+  it('finds every tool that writes long-term memory', () => {
+    expect(memoryWrites.sort()).toEqual([
+      'memory.retire',
+      'memory.upsert_preference',
+      'memory.write_chunk',
+      'memory.write_entity',
+    ]);
+  });
+
+  it.each(AgentId.options.filter((agent) => agent !== 'know.memory'))(
+    '%s denies all four explicitly',
+    (agent) => {
+      const denied = memoryWrites.filter((tool) =>
+        (AGENT_DENYLISTS[agent] ?? []).some((pattern) => matchesPattern(tool, pattern)),
+      );
+      expect(denied.sort()).toEqual(memoryWrites.sort());
+    },
+  );
+
+  it('leaves the one agent that owns long-term memory able to write it', () => {
+    for (const tool of memoryWrites) {
+      expect(isToolPermitted('know.memory', tool)).toBe(true);
+    }
   });
 });

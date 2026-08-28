@@ -146,22 +146,46 @@ export const UNOWNED_TOOLS: readonly string[] = [
  * so that a future edit which widens an allowlist by accident still trips a
  * second, louder control for the cases where the consequence is severe.
  */
+/**
+ * Every tool that writes long-term memory, named rather than matched.
+ *
+ * `memory.write_*` is a *prefix* pattern (`matchesPattern`), so it covered
+ * `memory.write_entity` and `memory.write_chunk` and silently missed
+ * `memory.upsert_preference` and `memory.retire` — two tools of the same action
+ * class, left standing on allowlist absence alone. That is exactly the case
+ * this table exists to double-cover, and for half of the class it did not. The
+ * list is derived from nothing and written by hand on purpose: a wildcard is
+ * what failed here, and the invariant in `capabilities.test.ts` fails loudly
+ * if `memory.write_longterm` ever gains a fifth tool that is not added here.
+ */
+const LONGTERM_MEMORY_WRITES = [
+  'memory.write_*',
+  'memory.upsert_preference',
+  'memory.retire',
+] as const;
+
 export const AGENT_DENYLISTS: Record<AgentId, string[]> = {
-  'intake.triage': ['mail.send', 'wa.send_message', 'browser.*', 'memory.write_*'],
-  'comms.email': ['browser.*', 'memory.write_*'],
-  'comms.whatsapp': ['browser.*', 'memory.write_*'],
-  'sched.meetings': ['mail.send', 'browser.*'],
-  'know.reader': ['mail.send', 'wa.send_message', 'browser.*', 'memory.write_*', 'file.write'],
+  'intake.triage': ['mail.send', 'wa.send_message', 'browser.*', ...LONGTERM_MEMORY_WRITES],
+  'comms.email': ['browser.*', ...LONGTERM_MEMORY_WRITES],
+  'comms.whatsapp': ['browser.*', ...LONGTERM_MEMORY_WRITES],
+  'sched.meetings': ['mail.send', 'browser.*', ...LONGTERM_MEMORY_WRITES],
+  'know.reader': [
+    'mail.send',
+    'wa.send_message',
+    'browser.*',
+    ...LONGTERM_MEMORY_WRITES,
+    'file.write',
+  ],
   'know.memory': ['mail.send', 'wa.send_message', 'browser.*'],
-  'know.digest': ['mail.send', 'wa.send_message', 'browser.*', 'memory.write_*'],
-  'ops.tasks': ['browser.*', 'memory.write_*'],
-  'ops.web': ['mail.*', 'wa.*', 'memory.write_*', 'crm.write', 'accounting.write'],
-  'ops.systems': ['mail.send', 'wa.send_message', 'browser.*', 'memory.write_*'],
-  'prod.docs': ['mail.*', 'wa.*', 'browser.*', 'memory.write_*'],
-  'prod.media': ['mail.*', 'wa.*', 'browser.*', 'memory.write_*'],
-  'gov.charter': ['mail.*', 'wa.*', 'browser.*', 'memory.write_*'],
-  'gov.risk': ['mail.*', 'wa.*', 'browser.*', 'memory.write_*'],
-  'gov.verify': ['mail.*', 'wa.*', 'browser.*', 'memory.write_*'],
+  'know.digest': ['mail.send', 'wa.send_message', 'browser.*', ...LONGTERM_MEMORY_WRITES],
+  'ops.tasks': ['browser.*', ...LONGTERM_MEMORY_WRITES],
+  'ops.web': ['mail.*', 'wa.*', ...LONGTERM_MEMORY_WRITES, 'crm.write', 'accounting.write'],
+  'ops.systems': ['mail.send', 'wa.send_message', 'browser.*', ...LONGTERM_MEMORY_WRITES],
+  'prod.docs': ['mail.*', 'wa.*', 'browser.*', ...LONGTERM_MEMORY_WRITES],
+  'prod.media': ['mail.*', 'wa.*', 'browser.*', ...LONGTERM_MEMORY_WRITES],
+  'gov.charter': ['mail.*', 'wa.*', 'browser.*', ...LONGTERM_MEMORY_WRITES],
+  'gov.risk': ['mail.*', 'wa.*', 'browser.*', ...LONGTERM_MEMORY_WRITES],
+  'gov.verify': ['mail.*', 'wa.*', 'browser.*', ...LONGTERM_MEMORY_WRITES],
 };
 
 /**
