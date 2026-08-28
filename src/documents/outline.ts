@@ -137,7 +137,11 @@ function dateRangeOf(values: readonly string[]): { from: string; to: string } {
  * shares it — not last-write-wins, not first-write-wins — and the outline
  * carries a `duplicate_header` flag (unioned into `OutlineContent.flags`
  * the same way an extractor's own flags are) so the omission reads as
- * "we deliberately didn't say" rather than as a column with no data.
+ * "we deliberately didn't say" rather than as a column with no data. The
+ * `continue` below that skips a duplicated-header column runs before either
+ * branch that would otherwise record it — this paragraph names
+ * `numericRanges` throughout, but a duplicated header on a wholly-date
+ * column is withheld from `dateRange` the identical way.
  *
  * **More than one wholly-date column.** `OutlinePart.dateRange` is a
  * single `{from, to}`, not a `Record` the way `numericRanges` is — the
