@@ -118,36 +118,82 @@ function dateRangeOf(values: readonly string[]): { from: string; to: string } {
 }
 
 /**
- * One `table` artefact's part entry. `OutlinePart.dateRange` is a single
- * `{from, to}`, not a per-column `Record` the way `numericRanges` is — an
- * ordinary table has at most one date-bearing column, so the range that
- * matters is computed per wholly-date column exactly like the numeric one,
- * and every such column's span is folded into one overall `dateRange`
- * rather than inventing a second `Record` the type does not declare.
+ * Two ways a real per-column fact can outrun what `OutlinePart` can hold,
+ * and what this function does about each — a reader who meets one should
+ * meet the other, so both are recorded here together rather than one being
+ * documented and the other left to be discovered.
+ *
+ * **A header text repeated across two columns.** `numericRanges` is a
+ * `Record<string, …>` keyed by header text, so two columns sharing a
+ * header cannot both get an entry — the second write would silently
+ * replace the first, and the result (a range that looks like an ordinary,
+ * confident single-column answer) would be indistinguishable from a
+ * correct one to anything reading the outline later, including the
+ * sub-project-ב' model this artefact is written for and which will not
+ * reopen the source file to check. That is the exact shape of error this
+ * codebase refuses elsewhere: a value we could not honestly attribute to
+ * one column must not be presented as if we could. So a duplicated header
+ * gets **no** range recorded under that key, for **any** column that
+ * shares it — not last-write-wins, not first-write-wins — and the outline
+ * carries a `duplicate_header` flag (unioned into `OutlineContent.flags`
+ * the same way an extractor's own flags are) so the omission reads as
+ * "we deliberately didn't say" rather than as a column with no data.
+ *
+ * **More than one wholly-date column.** `OutlinePart.dateRange` is a
+ * single `{from, to}`, not a `Record` the way `numericRanges` is — the
+ * schema only ever expected one date-bearing column per table. When a
+ * table genuinely has two (an order date and a delivery date, say), both
+ * still fold into one blended `dateRange` spanning the earliest and latest
+ * date seen across every wholly-date column, because there is no field to
+ * keep them apart. This is a real information loss the current schema
+ * forces, not a bug — recorded here as a known limitation rather than
+ * silently shipped, and different in kind from the duplicate-header case
+ * above: that one is withheld because it would be misleading, this one is
+ * reported anyway, blended, because a wide-but-honest span is judged more
+ * useful than no date information at all for the common case (one date
+ * column) this mostly is.
  */
-function tablePart(name: string | null, content: TableContent): OutlinePart {
+function tablePart(
+  name: string | null,
+  content: TableContent,
+): { part: OutlinePart; flags: string[] } {
   const rows = Array.isArray(content?.rows) ? content.rows : [];
   const headers = detectHeaders(rows);
   const dataRows = headers ? rows.slice(1) : rows;
   const columnCount = dataRows.reduce((max, row) => Math.max(max, row.length), 0);
 
+  const headerCounts = new Map<string, number>();
+  if (headers) {
+    for (const header of headers) headerCounts.set(header, (headerCounts.get(header) ?? 0) + 1);
+  }
+
   const numericRanges: Record<string, { min: number; max: number }> = {};
   const dateSpans: Array<{ from: string; to: string }> = [];
+  let duplicateHeader = false;
 
   for (let column = 0; column < columnCount; column++) {
     const stats = columnStats(dataRows, column);
     if (stats.mixed) continue;
 
+    const key = headers?.[column] ?? String(column);
+    if (headers && (headerCounts.get(key) ?? 0) > 1) {
+      // A repeated header — omit this column's range entirely (see the
+      // docblock above) rather than let one write silently hide another.
+      duplicateHeader = true;
+      continue;
+    }
+
     if (stats.numbers.length > 0 && stats.dates.length === 0) {
-      const key = headers?.[column] ?? String(column);
       numericRanges[key] = numberRangeOf(stats.numbers);
     } else if (stats.dates.length > 0 && stats.numbers.length === 0) {
       dateSpans.push(dateRangeOf(stats.dates));
     }
     // Both empty (a wholly-blank column) or both non-empty (a column that
-    // somehow mixes number-typed and date-typed cells across rows, with no
-    // string ever disqualifying it) contribute no range either way — there
-    // is no single homogeneous type to report a range for.
+    // mixes number-typed and date-typed cells across rows, with no string
+    // ever disqualifying it — reachable today: an ordinary date column
+    // where one row was typed as a plain number, see outline.test.ts)
+    // contribute no range either way — there is no single homogeneous type
+    // to report a range for.
   }
 
   const overallDateRange =
@@ -158,7 +204,7 @@ function tablePart(name: string | null, content: TableContent): OutlinePart {
         }
       : null;
 
-  return {
+  const part: OutlinePart = {
     name,
     kind: 'table',
     rowCount: rows.length,
@@ -166,6 +212,8 @@ function tablePart(name: string | null, content: TableContent): OutlinePart {
     ...(Object.keys(numericRanges).length > 0 ? { numericRanges } : {}),
     ...(overallDateRange ? { dateRange: overallDateRange } : {}),
   };
+
+  return { part, flags: duplicateHeader ? ['duplicate_header'] : [] };
 }
 
 /**
@@ -192,6 +240,16 @@ function textPart(name: string | null): OutlinePart {
  * neither (spec §6). It is pure and synchronous on purpose: every fact it
  * reports is already sitting in the artefacts it was handed.
  *
+ * `content.flags` is the union of every input artefact's own `flags`
+ * **plus** any flag `tablePart` itself raises about the outline's own
+ * computation — today just `duplicate_header` (see `tablePart`'s
+ * docblock). That flag describes a fact about *this function's output*,
+ * not about the sheet or document it read, so it could not have come from
+ * an artefact's own `flags`; folding it into the same set is still the
+ * right call, because a reader checking "is anything about this outline
+ * worth a second look" should not have to check two different places for
+ * "no" versus "no, except for what we computed".
+ *
  * An artefact whose own `kind` is already `'outline'` is skipped rather
  * than nested into a fresh one — no extractor in this codebase ever emits
  * one (`xlsx.ts`/`docx.ts`/`csv.ts`/`passthrough.ts` only ever produce
@@ -207,7 +265,9 @@ export function buildOutline(artifacts: readonly DocumentArtifact[]): DocumentAr
     for (const flag of artifact.flags) flagSet.add(flag);
 
     if (artifact.kind === 'table') {
-      parts.push(tablePart(artifact.partName, artifact.content as TableContent));
+      const { part, flags } = tablePart(artifact.partName, artifact.content as TableContent);
+      parts.push(part);
+      for (const flag of flags) flagSet.add(flag);
     } else if (artifact.kind === 'text') {
       parts.push(textPart(artifact.partName));
     }

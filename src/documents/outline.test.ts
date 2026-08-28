@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { fileURLToPath } from 'node:url';
+import ExcelJS from 'exceljs';
 import { buildOutline } from './outline.js';
 import { extractXlsx } from './extractors/xlsx.js';
 import { extractDocx } from './extractors/docx.js';
@@ -16,6 +17,11 @@ async function tempCsvPath(name: string, content: string): Promise<string> {
   const path = join(dir, name);
   await writeFile(path, content, 'utf8');
   return path;
+}
+
+async function tempXlsxPath(name: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'outline-xlsx-'));
+  return join(dir, name);
 }
 
 function tableArtifact(
@@ -210,5 +216,66 @@ describe('buildOutline — flags union', () => {
     const content = outline.content as OutlineContent;
     expect([...content.flags].sort()).toEqual(['hidden_sheet', 'truncated']);
     expect(outline.flags).toEqual([]);
+  });
+});
+
+// Controller review, round 2, finding 1: two columns sharing a header text
+// must not let one column's range silently overwrite the other's under the
+// same `numericRanges` key. The fix omits the range for *either* column and
+// raises `duplicate_header` instead — both halves are asserted below, and
+// this test would have failed against the pre-fix last-write-wins behaviour
+// (which produced a `מחיר` key with the *second* column's range and no flag
+// at all).
+describe('buildOutline — duplicate header text across two columns', () => {
+  it('omits the range under the shared key and raises duplicate_header, while a differently-named column still gets its own range', () => {
+    const artifact = tableArtifact([
+      [s('פריט'), s('מחיר'), s('מחיר'), s('כמות')],
+      [s('א'), n(10), n(100), n(3)],
+      [s('ב'), n(20), n(200), n(5)],
+    ]);
+    const outline = buildOutline([artifact]);
+    const content = outline.content as OutlineContent;
+
+    // No 'מחיר' key at all — not the first column's range, not the
+    // second's, not a merge of the two.
+    expect(content.parts[0]?.numericRanges).toEqual({ כמות: { min: 3, max: 5 } });
+    expect(content.flags).toContain('duplicate_header');
+  });
+
+  it('does not raise duplicate_header when every header is unique', () => {
+    const artifact = tableArtifact([
+      [s('פריט'), s('מחיר')],
+      [s('א'), n(10)],
+    ]);
+    const outline = buildOutline([artifact]);
+    const content = outline.content as OutlineContent;
+    expect(content.flags).not.toContain('duplicate_header');
+  });
+});
+
+// Controller review, round 2, finding 2: the reviewer showed this branch is
+// reachable *today*, through the already-merged `extractXlsx`, not a
+// hypothetical future extractor — an ordinary date column where one row
+// happens to hold a plain number, no string anywhere. Built as a real
+// workbook via ExcelJS and read back through `extractXlsx`, the same way
+// `xlsx.test.ts` builds its own synthetic fixtures.
+describe('buildOutline — a column mixing number- and date-typed cells (no string), reachable through a real workbook', () => {
+  it('reports neither a numeric range nor a date range for that column', async () => {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('s1');
+    ws.getCell(1, 1).value = 'תאריך';
+    ws.getCell(2, 1).value = new Date('2026-01-01T00:00:00.000Z');
+    ws.getCell(3, 1).value = 42;
+
+    const path = await tempXlsxPath('mixed-number-date.xlsx');
+    await wb.xlsx.writeFile(path);
+
+    const artifacts = await extractXlsx(path);
+    const outline = buildOutline(artifacts);
+    const content = outline.content as OutlineContent;
+
+    expect(content.parts[0]?.headers).toEqual(['תאריך']);
+    expect(content.parts[0]?.numericRanges).toBeUndefined();
+    expect(content.parts[0]?.dateRange).toBeUndefined();
   });
 });
