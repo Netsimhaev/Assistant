@@ -200,7 +200,11 @@ export function toolsWithIngestDecision(): string[] {
 }
 
 export function classifyAction(toolName: string): ActionClass | null {
-  return TOOL_ACTION_CLASS[toolName] ?? null;
+  // Own key only. `TOOL_ACTION_CLASS` is an object literal, so a bare index on
+  // `'constructor'` returns the `Object` constructor — a function that would
+  // then travel onward as if it were an `ActionClass`. See
+  // `src/sdk/tool-name-lookup.test.ts`.
+  return Object.hasOwn(TOOL_ACTION_CLASS, toolName) ? (TOOL_ACTION_CLASS[toolName] ?? null) : null;
 }
 
 /** Every tool that maps to an action class. Used by the reachability invariant. */
@@ -226,7 +230,10 @@ export const REFINEMENT_ONLY_CLASSES: readonly ActionClass[] = [
 ];
 
 export function isKnownTool(toolName: string): boolean {
-  return toolName in TOOL_ACTION_CLASS || READ_ONLY_TOOLS.has(toolName);
+  // `Object.hasOwn`, not `in`: `in` walks the prototype chain, so
+  // `'constructor' in TOOL_ACTION_CLASS` is true and an inherited name counted
+  // as a tool the policy knows.
+  return Object.hasOwn(TOOL_ACTION_CLASS, toolName) || READ_ONLY_TOOLS.has(toolName);
 }
 
 /**

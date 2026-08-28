@@ -88,8 +88,18 @@ export function translateToolName(sdkToolName: string): TranslatedTool | null {
       ? { internal, via: 'mcp', pathScoped: PATH_SCOPED_INTERNAL.has(internal) }
       : null;
   }
-  const internal = SDK_TO_INTERNAL[sdkToolName];
-  return internal === undefined
+  // `Object.hasOwn`, not a bare index. `SDK_TO_INTERNAL` is an object literal,
+  // so `SDK_TO_INTERNAL['constructor']` — and about a dozen other inherited
+  // names — resolve to something that is not `undefined`. The contract this
+  // file states one screen up is "a tool absent from this map is denied", and
+  // an `undefined` test does not implement it: those names sailed past the
+  // denial and were handed to the gate as a *function* posing as a tool name.
+  // They failed closed a layer later, at the agent allowlist, but a boundary
+  // that is documented as the control has to be the control.
+  const internal = Object.hasOwn(SDK_TO_INTERNAL, sdkToolName)
+    ? SDK_TO_INTERNAL[sdkToolName]
+    : undefined;
+  return typeof internal !== 'string'
     ? null
     : { internal, via: 'builtin', pathScoped: PATH_SCOPED_INTERNAL.has(internal) };
 }
