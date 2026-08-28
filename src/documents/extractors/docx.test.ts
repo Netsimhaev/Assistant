@@ -373,6 +373,69 @@ describe('extractDocx', () => {
     await expect(readTrackedChangeInfo(path)).resolves.toEqual({ scanned: false });
   });
 
+  it('readTrackedChangeInfo reports it could not scan when word/document.xml is stored deflated (method 8) with a corrupt stream — readEntryData\'s inflateRawSync catch branch, never reached by buildDocx\'s store-only (method 0) entries', async () => {
+    // buildDocx (../fixtures/build-docx.ts) only ever writes method-0
+    // (store) entries — its own docblock says so — so every other test in
+    // this file that hits `readZipEntry` returns before `readEntryData`'s
+    // `method === 8` branch runs at all. Hand-build a one-entry ZIP with
+    // that entry marked deflate whose "compressed" bytes are not valid
+    // deflate data, so `inflateRawSync` throws and the branch's own
+    // `catch { return null }` is what actually turns this into
+    // `scanned: false` — not the "entry not found" path the tests above
+    // already cover.
+    const nameBuf = Buffer.from('word/document.xml', 'utf8');
+    const corrupt = Buffer.from([0xff, 0xff, 0xff, 0xff, 0x00, 0x00]);
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(8, 8); // method: deflate
+    localHeader.writeUInt16LE(0, 10);
+    localHeader.writeUInt16LE(0, 12);
+    localHeader.writeUInt32LE(0, 14); // crc: never checked by this module's reader
+    localHeader.writeUInt32LE(corrupt.length, 18);
+    localHeader.writeUInt32LE(corrupt.length, 22); // uncompressedSize: not read by readEntryData either
+    localHeader.writeUInt16LE(nameBuf.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+    const localEntry = Buffer.concat([localHeader, nameBuf, corrupt]);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(8, 10); // method: deflate
+    centralHeader.writeUInt16LE(0, 12);
+    centralHeader.writeUInt16LE(0, 14);
+    centralHeader.writeUInt32LE(0, 16);
+    centralHeader.writeUInt32LE(corrupt.length, 20);
+    centralHeader.writeUInt32LE(corrupt.length, 24);
+    centralHeader.writeUInt16LE(nameBuf.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(0, 42); // localHeaderOffset
+    const centralEntry = Buffer.concat([centralHeader, nameBuf]);
+
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(0, 4);
+    eocd.writeUInt16LE(0, 6);
+    eocd.writeUInt16LE(1, 8);
+    eocd.writeUInt16LE(1, 10);
+    eocd.writeUInt32LE(centralEntry.length, 12);
+    eocd.writeUInt32LE(localEntry.length, 16);
+    eocd.writeUInt16LE(0, 20);
+
+    const path = await tempDocxPath('corrupt-deflate.docx');
+    await writeFile(path, Buffer.concat([localEntry, centralEntry, eocd]));
+
+    await expect(readTrackedChangeInfo(path)).resolves.toEqual({ scanned: false });
+  });
+
   // I4: §5.3's content caps, moved into ../cell.ts and applied here the same
   // way xlsx.test.ts already proves them for sheets.
   it('caps table rows at 50,000 and flags the table artefact truncated, dropping what came after the cap', async () => {

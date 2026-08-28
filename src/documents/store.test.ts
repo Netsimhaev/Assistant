@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool } from '../db/pool.js';
+import { closePool, type Queryable } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   insertOrGetDocument,
@@ -69,6 +69,25 @@ describe('insertOrGetDocument', () => {
     // insert under OTHER_BUSINESS, not a lookup of BUSINESS's row.
     expect(elsewhere.created).toBe(true);
     expect(elsewhere.document.businessId).toBe(OTHER_BUSINESS);
+  });
+
+  it('throws when the ON CONFLICT fires but the follow-up re-select finds no row — a concurrent delete between the two statements, not "nothing to dedupe against"', async () => {
+    // A stub `Queryable` whose every query — the INSERT and the re-select
+    // alike — returns no rows, the way a real ON CONFLICT DO NOTHING plus a
+    // SELECT would if the conflicting row were deleted in between. No real
+    // database involved: the throw is unreachable against `assistant_test`
+    // itself, since nothing here can delete a row between two statements
+    // of the same async function.
+    const stubDb: Queryable = {
+      query: (async () => ({ rows: [] })) as unknown as Queryable['query'],
+    };
+
+    await expect(
+      insertOrGetDocument(withId({ sha256: 'f'.repeat(64) }), {
+        businessId: BUSINESS,
+        db: stubDb,
+      }),
+    ).rejects.toThrow(/no row was found on re-select/);
   });
 });
 
