@@ -107,6 +107,22 @@ describe('runExtractor', () => {
     ]);
   });
 
+  it('treats a zero-exit child whose JSON lacks a real artifacts array as extractor_crashed, not a silent undefined', async () => {
+    // bad-shape.ts exits 0 with valid-but-wrong-shaped JSON. Without the
+    // Array.isArray guard, this would resolve `{ ok: true, artifacts:
+    // undefined }` and `buildOutline(undefined)` (ingest.ts) would throw
+    // out of ingestDocument — exactly the uncaught exception this pipeline
+    // exists to avoid.
+    const outcome = await runExtractor('passthrough', fixture('small.txt'), {
+      childPath: stubChild('bad-shape.ts'),
+    });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe('extractor_crashed');
+      expect(outcome.detail.length).toBeGreaterThan(0);
+    }
+  });
+
   it('gives the child PATH and nothing secret, even when the parent process holds secrets', async () => {
     // Simulates what the real parent process holds by the time it would
     // call runExtractor: a database URL and an API key, exactly the two

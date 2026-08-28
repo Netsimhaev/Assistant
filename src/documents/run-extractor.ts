@@ -218,10 +218,27 @@ export async function runExtractor(
       // example, which exits 134 and never reaches the child's own catch.
       if (code === 0) {
         try {
-          const parsed = JSON.parse(Buffer.concat(stdoutChunks).toString('utf8')) as {
-            artifacts: DocumentArtifact[];
-          };
-          finish({ ok: true, artifacts: parsed.artifacts });
+          const parsed: unknown = JSON.parse(Buffer.concat(stdoutChunks).toString('utf8'));
+          // A child that exits 0 is not, by that fact alone, proof its JSON
+          // has the shape this file trusts. Without this check, a child
+          // whose JSON is valid but lacks (or misshapes) `artifacts` would
+          // hand `buildOutline` an `undefined` it throws on
+          // (`buildOutline(undefined)`) — an uncaught exception straight out
+          // of `ingestDocument`, exactly what every controlled failure in
+          // this pipeline exists to avoid. Checking `Array.isArray` here
+          // turns that into the same recorded `extractor_crashed` outcome
+          // as any other malformed child output, before it ever reaches a
+          // caller.
+          const artifacts = (parsed as { artifacts?: unknown } | null)?.artifacts;
+          if (!Array.isArray(artifacts)) {
+            finish({
+              ok: false,
+              code: 'extractor_crashed',
+              detail: 'פלט לא תקין מהתהליך המבודד: artifacts חסר או אינו מערך',
+            });
+            return;
+          }
+          finish({ ok: true, artifacts: artifacts as DocumentArtifact[] });
         } catch (err) {
           finish({
             ok: false,
