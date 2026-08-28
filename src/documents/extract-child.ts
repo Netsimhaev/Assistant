@@ -19,6 +19,7 @@
  */
 
 import { extractPassthrough } from './extractors/passthrough.js';
+import { extractXlsx } from './extractors/xlsx.js';
 import type { ExtractorId } from './registry.js';
 import type { DocumentArtifact } from './types.js';
 
@@ -32,12 +33,13 @@ async function dispatch(extractorId: ExtractorId, sourcePath: string): Promise<D
   switch (extractorId) {
     case 'passthrough':
       return extractPassthrough(sourcePath);
-    case 'csv':
     case 'xlsx':
+      return extractXlsx(sourcePath);
+    case 'csv':
     case 'docx':
-      // Built in later tasks (§3.3, §4.1, §4.2, §4.3). A registry entry
-      // that names an id with no implementation here must fail loudly, not
-      // silently return nothing.
+      // Built in later tasks (§3.3, §4.2). A registry entry that names an
+      // id with no implementation here must fail loudly, not silently
+      // return nothing.
       throw new Error(`extractor not yet implemented: ${extractorId}`);
   }
 }
