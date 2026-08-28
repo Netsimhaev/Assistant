@@ -105,7 +105,12 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
   });
 
   it('the woken job then actually sends, in the morning', async () => {
-    const bundle = await install();
+    // `STEP` writes to `a@b.com`; the charter is given that domain so the send
+    // is `routine` and the subject stays what it says — quiet hours deferring a
+    // job and the wake-up actually sending. An entity id no longer vouches for
+    // an address the charter cannot resolve (`visibility-scoring.test.ts`), and
+    // an escalation here would stop the step before `perform` ever ran.
+    const bundle = await install({ knownCounterpartyEmailDomain: 'b.com' });
     const job = await jobInExecute(bundle);
     let sent = 0;
 

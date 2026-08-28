@@ -226,7 +226,10 @@ describe('quiet hours', () => {
 
 describe('redaction', () => {
   it('strips the charter patterns from an outbound payload', async () => {
-    const bundle = await install();
+    // The recipient's domain is declared known so this stays a `routine` send
+    // and the test can assert on redaction. An id alone no longer vouches for
+    // an address the charter cannot resolve — see `visibility-scoring.test.ts`.
+    const bundle = await install({ knownCounterpartyEmailDomain: 'b.com' });
 
     // The fixture redacts a bare 9-digit number — an Israeli ID.
     const decision = await evaluateToolCall(
@@ -420,7 +423,9 @@ describe('spend accounting', () => {
   });
 
   it('hands the step the redacted payload, not the one it proposed', async () => {
-    const bundle = await install();
+    // Known domain for the same reason as the redaction test above: the
+    // subject here is which payload reaches `perform`, not escalation.
+    const bundle = await install({ knownCounterpartyEmailDomain: 'b.com' });
     const job = await jobInExecute(bundle);
     let sent: unknown = null;
 

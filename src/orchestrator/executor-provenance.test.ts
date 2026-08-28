@@ -10,7 +10,16 @@ const BUSINESS = 'test-business';
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 async function jobInExecute() {
-  const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+  // The counterparty these tests write to has to be one the charter can
+  // actually resolve *from the address*. `c_812` is known by entity id alone,
+  // and since `scoreVisibility` stopped letting an id vouch for an address the
+  // charter does not know (`visibility-scoring.test.ts`), a payload naming both
+  // is a first contact — correctly, because nothing ties that id to that
+  // mailbox. These tests are about the provenance flag, not about escalation,
+  // so the charter is given the domain and the recipient is genuinely known.
+  const bundle = await installCharter(buildCharter({ knownCounterpartyEmailDomain: 'example.com' }), {
+    businessId: BUSINESS,
+  });
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',

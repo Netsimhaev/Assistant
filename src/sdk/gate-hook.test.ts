@@ -194,7 +194,14 @@ describe('the gate hook', () => {
   });
 
   it('hands the SDK the redacted payload rather than the one proposed', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    // The recipient's domain is declared known so the call is allowed and the
+    // test can inspect `updatedInput`. An entity id no longer vouches for an
+    // address the charter cannot resolve (`visibility-scoring.test.ts`), and a
+    // queued approval returns no payload to assert on.
+    const bundle = await installCharter(
+      buildCharter({ knownCounterpartyEmailDomain: 'b.com' }),
+      { businessId: BUSINESS },
+    );
 
     const hook = createGateHook({
       agent: 'comms.email',
