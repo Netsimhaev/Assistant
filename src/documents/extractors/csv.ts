@@ -67,9 +67,14 @@
  * matching `xlsx.ts`'s rule that a blank row between two data rows is
  * "part of the sheet's structure, not padding" rather than something to
  * skip — the three extractors are meant to be interchangeable, and here
- * that means agreeing on what a structural blank means. Because nothing is
- * ever dropped or renumbered, a ragged row's index in `rows` is always its
- * true line position, blank interior lines included.
+ * that means agreeing on what a structural blank means. That match is about
+ * whether the row is *kept*, not about its *width*: a CSV blank line is one
+ * empty field (`['']`, there being nothing to split), while an xlsx blank
+ * row is however many columns wide the sheet's grid is — the two extractors
+ * agree a structural blank must survive, not that it must come out the same
+ * shape. Because nothing is ever dropped or renumbered, a ragged row's
+ * index in `rows` is always its true line position, blank interior lines
+ * included.
  *
  * **Encoding is UTF-8, with a leading BOM stripped if present.** No
  * encoding *detection* is attempted beyond that — §4.3 names UTF-8 as the
@@ -81,10 +86,12 @@
  * "one line, no separator" note above): replacement characters are visible
  * garbage in the output, not a quiet empty table.
  *
- * **Numeric cells: round-trip, not "looks numeric".** A field becomes
- * `{ t: 'number' }` only when `String(Number(field)) === field` — i.e. only
- * when parsing it as a number and printing that number back out gives the
- * exact same text. `"42"` passes. `"007"`, `"3.0"`, `"1e2"`, `"-0"`, and
+ * **Numeric cells: round-trip, not "looks numeric".** Classification itself
+ * (`classifyField`) now lives in `../cell.ts`, shared with `docx.ts` — see
+ * that module's docblock for why `xlsx.ts` alone does not use it. A field
+ * becomes `{ t: 'number' }` only when `String(Number(field)) === field` —
+ * i.e. only when parsing it as a number and printing that number back out
+ * gives the exact same text. `"42"` passes. `"007"`, `"3.0"`, `"1e2"`, `"-0"`, and
  * `" 42"` (leading space) all *parse* fine but do not round-trip, and stay
  * `{ t: 'string' }`. This is deliberate, not an oversight: a leading zero
  * on a code, a trailing zero of precision on a price, or an entry someone
@@ -108,6 +115,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
+import { MAX_ROWS_PER_TABLE, capCellChars, classifyField } from '../cell.js';
 import type { Cell, DocumentArtifact, TableContent } from '../types.js';
 
 const SEPARATOR_CANDIDATES: readonly string[] = [',', ';', '\t', '|'];
@@ -259,15 +267,19 @@ export function parseCsvText(text: string, separator: string): string[][] {
   return rows;
 }
 
-/** Round-trip numeric check — see the module docblock's "round-trip, not 'looks numeric'" note. */
-const NUMERIC_SHAPE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
-
-function classifyField(raw: string): Cell {
-  if (raw === '') return { v: null, t: 'empty' };
-  if (NUMERIC_SHAPE.test(raw) && String(Number(raw)) === raw) {
-    return { v: Number(raw), t: 'number' };
-  }
-  return { v: raw, t: 'string' };
+/**
+ * §3.4/§5.3: rows beyond `MAX_ROWS_PER_TABLE` are cut, not the file
+ * rejected — a genuinely large CSV (§5.3's own 200,000-row price-list
+ * example) must come back `extracted` with `truncated`, matching
+ * `xlsx.ts`'s row cap exactly, rather than either landing in one unbounded
+ * `jsonb` row or dying against the isolated child's 32MB stdout cap.
+ * Decided before classification runs, from the parsed (string) rows — the
+ * cap is a row-count cap, independent of what any individual field
+ * classifies as.
+ */
+function capRows(rows: string[][]): { rows: string[][]; truncated: boolean } {
+  if (rows.length <= MAX_ROWS_PER_TABLE) return { rows, truncated: false };
+  return { rows: rows.slice(0, MAX_ROWS_PER_TABLE), truncated: true };
 }
 
 export async function extractCsv(sourcePath: string): Promise<DocumentArtifact[]> {
@@ -275,8 +287,16 @@ export async function extractCsv(sourcePath: string): Promise<DocumentArtifact[]
   const text = stripBom(buffer.toString('utf8'));
 
   const separator = detectSeparator(text);
-  const stringRows = parseCsvText(text, separator);
-  const rows: Cell[][] = stringRows.map((fields) => fields.map(classifyField));
+  const { rows: keptStringRows, truncated: rowsTruncated } = capRows(parseCsvText(text, separator));
+
+  let cellsTruncated = false;
+  const rows: Cell[][] = keptStringRows.map((fields) =>
+    fields.map((field) => {
+      const { cell, truncated } = capCellChars(classifyField(field));
+      if (truncated) cellsTruncated = true;
+      return cell;
+    }),
+  );
 
   const flags: string[] = [];
   if (rows.length > 0) {
@@ -285,6 +305,10 @@ export async function extractCsv(sourcePath: string): Promise<DocumentArtifact[]
       flags.push('ragged_rows');
     }
   }
+  // Both caps land on the same `truncated` flag as xlsx.ts's row/cell caps
+  // do — a caller that only cares "was something cut" does not need to
+  // know which cap did it.
+  if (rowsTruncated || cellsTruncated) flags.push('truncated');
 
   const content: TableContent = { rows };
   return [{ ordinal: 0, kind: 'table', partName: null, content, flags }];

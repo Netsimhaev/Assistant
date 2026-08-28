@@ -272,6 +272,40 @@ describe('extractCsv', () => {
       ['c', 'd'],
     ]);
   });
+
+  // I4: §5.3's content caps (moved into ../cell.ts) apply to CSV the same
+  // way xlsx.test.ts already proves them for sheets — §5.3's own worked
+  // example is a 200,000-row CSV price list that must come back `extracted`
+  // with `truncated`, not one unbounded jsonb row or a rejection.
+  it('caps rows at 50,000 and flags the artefact truncated, dropping what came after the cap', async () => {
+    const lines = Array.from({ length: 50_001 }, (_, i) => {
+      if (i === 49_999) return 'last-in-cap';
+      if (i === 50_000) return 'beyond-cap';
+      return `r${i}`;
+    });
+    const path = await tempFile('row-cap.csv', `${lines.join('\n')}\n`);
+
+    const [table] = await extractCsv(path);
+    const rows = rowsOf(table?.content);
+
+    expect(rows).toHaveLength(50_000);
+    expect(rows[49_999]).toEqual([{ v: 'last-in-cap', t: 'string' }]);
+    expect(rows.some((row) => row.some((cell) => cell.v === 'beyond-cap'))).toBe(false);
+    expect(table?.flags).toContain('truncated');
+  }, 20_000);
+
+  it('caps a cell at 32,768 characters and flags the artefact truncated', async () => {
+    const longText = 'א'.repeat(40_000);
+    const path = await tempFile('cell-cap.csv', `${longText}\n`);
+
+    const [table] = await extractCsv(path);
+    const rows = rowsOf(table?.content);
+    const cell = rows[0]?.[0];
+
+    expect(cell?.t).toBe('string');
+    expect((cell?.v as string).length).toBe(32_768);
+    expect(table?.flags).toContain('truncated');
+  });
 });
 
 describe('extractPassthrough', () => {
