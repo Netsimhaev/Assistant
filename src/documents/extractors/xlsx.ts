@@ -199,17 +199,24 @@ export async function extractXlsx(sourcePath: string): Promise<DocumentArtifact[
   });
 
   const first = artifacts[0];
-  if (first && (await hasMacroPart(sourcePath))) {
-    first.flags.push('has_macros');
-  }
+  if (first) {
+    if (await hasMacroPart(sourcePath)) {
+      first.flags.push('has_macros');
+    }
 
-  // The 50-sheet cap cuts across the whole workbook, not one sheet, so it
-  // has no single sheet's artefact to naturally live on. The last produced
-  // artefact is the one immediately before the cut — the most discoverable
-  // place for a reader scanning the array to notice something is missing.
-  const last = artifacts[artifacts.length - 1];
-  if (last && sheetsTruncated && !last.flags.includes('truncated')) {
-    last.flags.push('truncated');
+    // The 50-sheet cap is a fact about the whole *document* — "there were
+    // more sheets than we kept" — not about whichever sheet happened to be
+    // produced last. `has_macros` above is document-level too, and both
+    // belong in the same place: the first artefact, so a reader is not
+    // left checking two different spots for the same kind of fact. The
+    // guard against a double push earns its keep specifically here: the
+    // first sheet's own row/cell truncation (`buildSheetGrid` above, via
+    // `truncated` in the `.map` that built `artifacts`) can independently
+    // already have set `truncated` on this exact artefact before the
+    // sheet-count cap ever looks at it.
+    if (sheetsTruncated && !first.flags.includes('truncated')) {
+      first.flags.push('truncated');
+    }
   }
 
   return artifacts;

@@ -209,7 +209,7 @@ describe('extractXlsx', () => {
     expect(sheet?.flags).toContain('truncated');
   });
 
-  it('caps sheets at 50 and flags the last produced artefact truncated, dropping the rest', async () => {
+  it('caps sheets at 50 and flags the first artefact truncated (a document-level fact, same place has_macros lives), dropping the rest', async () => {
     const wb = new ExcelJS.Workbook();
     for (let i = 1; i <= 51; i++) {
       wb.addWorksheet(`sheet-${i}`).getCell(1, 1).value = i;
@@ -224,10 +224,33 @@ describe('extractXlsx', () => {
     expect(artifacts.map((a) => a.partName)).toEqual(
       Array.from({ length: 50 }, (_, i) => `sheet-${i + 1}`),
     );
-    expect(artifacts[49]?.flags).toContain('truncated');
-    // Nothing about the earlier sheets was cut, so none of them should
-    // carry the flag that belongs to the sheet-count cap.
-    expect(artifacts.slice(0, 49).some((a) => a.flags.includes('truncated'))).toBe(false);
+    expect(artifacts[0]?.flags).toContain('truncated');
+    // Nothing about the later sheets themselves was cut, so none of them
+    // should carry the flag that belongs to the sheet-count cap.
+    expect(artifacts.slice(1).some((a) => a.flags.includes('truncated'))).toBe(false);
+  });
+
+  it('does not double the truncated flag when the first sheet is both the sheet-count cut point and independently truncated by its own content', async () => {
+    // The first artefact now carries two independent reasons to be
+    // truncated: its own cell-character cap (this sheet's one cell is far
+    // over 32,768 chars) and the document-level sheet-count cap (51 sheets
+    // exist, only 50 are kept). Both paths push onto the same `artifacts[0]`
+    // now that the sheet-count flag moved there — this is exactly the
+    // collision the `!first.flags.includes('truncated')` guard exists for.
+    const wb = new ExcelJS.Workbook();
+    wb.addWorksheet('sheet-1').getCell(1, 1).value = 'א'.repeat(40_000);
+    for (let i = 2; i <= 51; i++) {
+      wb.addWorksheet(`sheet-${i}`).getCell(1, 1).value = i;
+    }
+
+    const path = await tempXlsxPath('double-truncate.xlsx');
+    await wb.xlsx.writeFile(path);
+
+    const artifacts = await extractXlsx(path);
+
+    expect(artifacts).toHaveLength(50);
+    const first = artifacts[0];
+    expect(first?.flags.filter((f) => f === 'truncated')).toHaveLength(1);
   });
 
   it('flags has_macros on the workbook\'s first artefact when a macro part exists, and not otherwise', async () => {
