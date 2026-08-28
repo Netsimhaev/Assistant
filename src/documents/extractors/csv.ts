@@ -13,19 +13,46 @@
  * explicitly, and for good reason: a spreadsheet exported for a
  * semicolon-decimal locale, or a tab-separated dump, is exactly as common a
  * shape as comma-separated, and guessing wrong silently merges every column
- * into one. `detectSeparator` counts, for each of four candidates (comma,
- * semicolon, tab, pipe) across the first few non-blank lines, how many
- * fields a *naive* (quote-unaware) split on that candidate would produce
- * per line, and picks the candidate whose field count is most consistent
- * (highest-frequency mode) across those lines — provided that mode is
- * actually greater than 1. A candidate that never splits a line at all is
- * not evidence *for* that candidate; it is the absence of evidence, and is
- * scored 0 regardless of how "consistent" that non-split looks. If every
- * candidate scores 0 (a genuinely single-column file — see the "one line,
- * no separator" case below), comma is the explicit fallback: RFC4180's own
- * default, not a silent guess. Detection is intentionally naive (quote-
- * unaware) — it only has to pick a candidate, not parse; the real parse
- * below is fully quote-aware regardless of which separator won.
+ * into one. `detectSeparator` scores each of four candidates (comma,
+ * semicolon, tab, pipe) by running the *real, quote-aware* `parseCsvText`
+ * tokenizer against the whole text once per candidate, taking the first
+ * few resulting rows, and picking the candidate whose field count is most
+ * consistent (highest-frequency mode) across those rows — provided that
+ * mode is actually greater than 1. A candidate that never splits a row at
+ * all is not evidence *for* that candidate; it is the absence of evidence,
+ * and is scored 0 regardless of how "consistent" that non-split looks. If
+ * every candidate scores 0 (a genuinely single-column file — see the "one
+ * line, no separator" case below), comma is the explicit fallback:
+ * RFC4180's own default, not a silent guess.
+ *
+ * **Scoring must be quote-aware, not just parsing.** An earlier version of
+ * this function scored candidates with a naive (quote-unaware) `.split()`,
+ * on the theory that detection "only has to pick a candidate, not parse".
+ * That is wrong for an entirely ordinary file — a semicolon-delimited
+ * export whose first column is a quoted `"Last, First"` name:
+ *
+ * ```
+ * "a,b";c
+ * "d,e";f
+ * "g,h";i
+ * ```
+ *
+ * A naive split on `,` sees one comma per line (inside the quotes) and
+ * scores comma as perfectly consistent (mode 2, every line), while a naive
+ * split on `;` also sees exactly one semicolon per line and ties it. Array
+ * order (`[',', ';', '\t', '|']`) then silently decides in comma's favour
+ * — the wrong one — merging two real columns into one. Worse: because
+ * *every* row comes out equally wrong, `ragged_rows` never fires either;
+ * the corruption is invisible to a consumer of the table. Scoring with the
+ * real tokenizer fixes this at the source: quotes are honoured during
+ * scoring exactly as they are during the real parse, so a quoted comma
+ * never gets counted as a delimiter for the comma candidate, and the
+ * semicolon candidate's fields split cleanly and consistently instead.
+ * Parsing the whole text once per candidate (four full passes) rather than
+ * a cheaper prefix trades some work for correctness; it is bounded by the
+ * same overall file-size cap (§3.4) every other extractor already accepts
+ * running under, and CSV files are not a case where a saved pass matters
+ * more than the separator being right.
  *
  * **Ragged rows are kept, never dropped.** A row whose field count differs
  * from the file's modal (most common) field count stays exactly where it
@@ -35,7 +62,14 @@
  * document fact about the whole table, not a per-row marker (`Cell` has no
  * flag field of its own — only `{ v, t }`, per `../types.ts`), so a reader
  * who wants to find the ragged row(s) recounts fields per row, same as this
- * extractor did.
+ * extractor did. An interior blank line is one such row: it survives as a
+ * one-field empty row (see `parseCsvText` below) at its true position,
+ * matching `xlsx.ts`'s rule that a blank row between two data rows is
+ * "part of the sheet's structure, not padding" rather than something to
+ * skip — the three extractors are meant to be interchangeable, and here
+ * that means agreeing on what a structural blank means. Because nothing is
+ * ever dropped or renumbered, a ragged row's index in `rows` is always its
+ * true line position, blank interior lines included.
  *
  * **Encoding is UTF-8, with a leading BOM stripped if present.** No
  * encoding *detection* is attempted beyond that — §4.3 names UTF-8 as the
@@ -78,7 +112,7 @@ import type { Cell, DocumentArtifact, TableContent } from '../types.js';
 
 const SEPARATOR_CANDIDATES: readonly string[] = [',', ';', '\t', '|'];
 const DEFAULT_SEPARATOR = ',';
-const DETECTION_LINE_LIMIT = 5;
+const DETECTION_ROW_LIMIT = 5;
 
 function stripBom(text: string): string {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
@@ -102,21 +136,18 @@ function modeAndFrequency(counts: number[]): { mode: number; frequency: number }
 }
 
 /**
- * Picks the separator whose naive per-line field count is most consistent
- * across the first `DETECTION_LINE_LIMIT` non-blank lines. See the module
- * docblock for the scoring rule and the comma fallback.
+ * Picks the separator whose *quote-aware* parsed field count is most
+ * consistent across the first `DETECTION_ROW_LIMIT` rows. Scores each
+ * candidate by actually tokenizing the text with it (`parseCsvText`, below
+ * — hoisted, so the declaration order here is fine), not by a naive split;
+ * see the module docblock's "Scoring must be quote-aware" note for the
+ * ordinary-looking file a naive split gets wrong.
  */
 export function detectSeparator(text: string): string {
-  const lines = text
-    .split(/\r\n|\r|\n/)
-    .filter((line) => line.length > 0)
-    .slice(0, DETECTION_LINE_LIMIT);
-
-  if (lines.length === 0) return DEFAULT_SEPARATOR;
-
   let best = { separator: DEFAULT_SEPARATOR, score: 0 };
   for (const separator of SEPARATOR_CANDIDATES) {
-    const counts = lines.map((line) => line.split(separator).length);
+    const rows = parseCsvText(text, separator).slice(0, DETECTION_ROW_LIMIT);
+    const counts = rows.map((row) => row.length);
     const { mode, frequency } = modeAndFrequency(counts);
     const score = mode > 1 ? frequency : 0;
     if (score > best.score) {
@@ -134,12 +165,27 @@ export function detectSeparator(text: string): string {
  * malformed file) degrades gracefully — everything read after the opening
  * quote becomes that field's value — rather than throwing.
  *
- * A trailing newline at end of file produces no spurious final empty row:
- * a row is only emitted once at least one field has actually been started
- * for it (`rowStarted`, or a non-empty pending `field`). The same rule
- * means a wholly blank line (two newlines back to back) contributes no
- * row either — it carries no field content to lose, unlike a ragged row
- * that has real, if fewer, fields.
+ * **Every newline ends a row, including a blank one.** A blank interior
+ * line — two newlines back to back, with real content on both sides —
+ * becomes a genuine row of one empty field: `['']`. That is deliberate,
+ * not a gap in the "never drop data" rule; a blank line is itself a fact
+ * about the file's structure (matching `xlsx.ts`'s interior-blank-row
+ * rule — see the module docblock), and skipping it would silently shift
+ * every row after it up by one, which is exactly the kind of "row is at
+ * the wrong index" corruption this extractor exists to avoid.
+ *
+ * **Except the very last one.** A trailing newline at end of file — the
+ * single line terminator every well-formed text file ends with — produces
+ * no spurious final empty row. The two cases are told apart by state, not
+ * by counting newlines: mid-file, a newline is *always* a row boundary
+ * (unconditional `pushRow()` below); at end of input, a final row is only
+ * flushed if a field was actually pending (`rowStarted`, or a non-empty
+ * `field`) — which is false exactly when the text's very last character
+ * was itself a newline that already closed out the preceding row. A file
+ * ending in *two* newlines (a genuinely blank final line, not just one
+ * terminator) does still produce that blank row — consistent with every
+ * other interior blank line, and distinct from the single-trailing-
+ * newline case this paragraph is about.
  */
 export function parseCsvText(text: string, separator: string): string[][] {
   const rows: string[][] = [];
@@ -196,9 +242,7 @@ export function parseCsvText(text: string, separator: string): string[][] {
 
     if (char === '\n' || char === '\r') {
       if (char === '\r' && text.charAt(i + 1) === '\n') i += 1;
-      if (rowStarted || field !== '') {
-        pushRow();
-      }
+      pushRow();
       i += 1;
       continue;
     }

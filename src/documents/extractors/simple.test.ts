@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -170,6 +170,107 @@ describe('extractCsv', () => {
 
   it('parseCsvText treats an unterminated quote as running to end of input rather than throwing', () => {
     expect(parseCsvText('a,"unterminated', ',')).toEqual([['a', 'unterminated']]);
+  });
+
+  // Controller finding 1 (Important): the reviewer's own counterexample.
+  // A naive, quote-unaware split scored comma and semicolon as an exact
+  // tie here (one comma per line, hidden inside quotes; one semicolon per
+  // line, the real delimiter) and let array order pick the wrong one —
+  // merging every row's two real columns into one, with no ragged_rows
+  // flag to reveal it, since every row came out equally (wrongly) uniform.
+  it('detects the real separator even when a naive scan would tie on a quoted delimiter', async () => {
+    const path = await tempFile(
+      'quoted-decoy-separator.csv',
+      '"a,b";c\n"d,e";f\n"g,h";i\n',
+    );
+    expect(detectSeparator(await readFile(path, 'utf8'))).toBe(';');
+
+    const [table] = await extractCsv(path);
+    const rows = rowsOf(table?.content);
+    expect(rows).toEqual([
+      [{ v: 'a,b', t: 'string' }, { v: 'c', t: 'string' }],
+      [{ v: 'd,e', t: 'string' }, { v: 'f', t: 'string' }],
+      [{ v: 'g,h', t: 'string' }, { v: 'i', t: 'string' }],
+    ]);
+    // Confirms the corruption this finding describes really would have
+    // been invisible: a wrongly-comma-split file has 1 field on every
+    // row, which is uniform and never flagged ragged — so the assertion
+    // above on the actual field values is load-bearing, not the flag.
+    expect(table?.flags).not.toContain('ragged_rows');
+  });
+
+  // Controller finding 2 (Important): an interior blank line must survive
+  // as a row, matching xlsx.ts's rule that a blank row between two data
+  // rows is structure, not padding — and everything after it must keep
+  // its true index rather than shifting up by one.
+  it('keeps an interior blank line as an empty row at its true index', async () => {
+    const path = await tempFile('interior-blank.csv', 'a,b\n1,2\n\n3,4\n');
+    const [table] = await extractCsv(path);
+    const rows = rowsOf(table?.content);
+    expect(rows).toHaveLength(4);
+    expect(rows[2]).toEqual([{ v: null, t: 'empty' }]);
+    // The row after the blank line is still at index 3, not shifted to 2.
+    expect(rows[3]).toEqual([
+      { v: 3, t: 'number' },
+      { v: 4, t: 'number' },
+    ]);
+    // A trailing newline still produces no extra row — the fix must not
+    // have widened "every newline is a row" to "even the very last one".
+    expect(rows[3]).toEqual(rows[rows.length - 1]);
+  });
+
+  it('holds the ragged-row true-index guarantee across a file with both a blank line and a ragged row', async () => {
+    // Row 0: header (2 fields). Row 1: normal (2 fields). Row 2: blank
+    // (1 field, itself ragged). Row 3: genuinely ragged data row (1
+    // field, short by one). Row 4: normal again (2 fields).
+    const path = await tempFile(
+      'blank-and-ragged.csv',
+      'a,b\n1,2\n\nonly-one\n3,4\n',
+    );
+    const [table] = await extractCsv(path);
+    const rows = rowsOf(table?.content);
+    expect(rows).toHaveLength(5);
+    expect(rows[2]).toEqual([{ v: null, t: 'empty' }]);
+    expect(rows[3]).toEqual([{ v: 'only-one', t: 'string' }]);
+    expect(rows[4]).toEqual([
+      { v: 3, t: 'number' },
+      { v: 4, t: 'number' },
+    ]);
+    expect(table?.flags).toContain('ragged_rows');
+  });
+
+  // Controller finding 3 (elevated to Important): CRLF is what Excel
+  // writes when saving a CSV — the most likely real-world input this
+  // parser will ever see — so it gets an explicit, committed test rather
+  // than only having been checked by hand.
+  it('handles CRLF line endings: no leaking \\r, correct separator detection, correct ragged verdict', async () => {
+    const path = await tempFile('crlf.csv', 'a,b,c\r\n1,2,3\r\nonly-two,9\r\n');
+    const [table] = await extractCsv(path);
+    const rows = rowsOf(table?.content);
+    expect(rows).toHaveLength(3);
+    // No trailing \r leaked into the last field of any row.
+    expect(rows[0]?.[2]).toEqual({ v: 'c', t: 'string' });
+    expect(rows[1]?.[2]).toEqual({ v: 3, t: 'number' });
+    expect(rows[2]).toEqual([
+      { v: 'only-two', t: 'string' },
+      { v: 9, t: 'number' },
+    ]);
+    expect(table?.flags).toContain('ragged_rows');
+  });
+
+  it('handles a lone CR (old Mac style) as a line ending, same as CRLF and LF', () => {
+    expect(parseCsvText('a,b\r1,2\r', ',')).toEqual([
+      ['a', 'b'],
+      ['1', '2'],
+    ]);
+  });
+
+  it('parseCsvText: a blank interior line produces a one-field empty row, unaffected by CRLF vs LF', () => {
+    expect(parseCsvText('a,b\r\n\r\nc,d\r\n', ',')).toEqual([
+      ['a', 'b'],
+      [''],
+      ['c', 'd'],
+    ]);
   });
 });
 
