@@ -1,11 +1,47 @@
 import { describe, expect, it } from 'vitest';
 import { fileURLToPath } from 'node:url';
-import { runExtractor } from './run-extractor.js';
+import { defaultChildPath, runExtractor } from './run-extractor.js';
 import type { TextContent } from './types.js';
 
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
 const stubChild = (name: string) =>
   fileURLToPath(new URL(`./fixtures/stub-children/${name}`, import.meta.url));
+
+describe('defaultChildPath', () => {
+  // No compiled dist/ exists in this repository to exercise the real .js
+  // case against, so this pins the relationship against synthetic module
+  // URLs instead: whatever extension run-extractor was loaded with,
+  // extract-child must be asked for under that same extension. Built from
+  // this test file's own real (and therefore platform-valid, absolute)
+  // import.meta.url rather than a hand-written 'file:///...' literal --
+  // Windows requires a drive letter in an absolute file URL, which a
+  // fabricated-from-scratch literal path does not have.
+  //
+  // A hardcoded './extract-child.ts' literal would fail the second
+  // assertion here (it would return a '.ts' path regardless of the '.js'
+  // runner URL) while still passing every other test in this file, since
+  // nothing today actually runs from a compiled dist/.
+  const sourceRunnerUrl = import.meta.url.replace(
+    'run-extractor.test.ts',
+    'run-extractor.ts',
+  );
+  const compiledRunnerUrl = import.meta.url.replace(
+    /src\/documents\/run-extractor\.test\.ts$/,
+    'dist/documents/run-extractor.js',
+  );
+
+  it('matches the source (.ts) extension when the runner itself is source', () => {
+    expect(defaultChildPath(sourceRunnerUrl)).toBe(
+      fileURLToPath(new URL('extract-child.ts', sourceRunnerUrl)),
+    );
+  });
+
+  it('matches the compiled (.js) extension when the runner itself is compiled', () => {
+    expect(defaultChildPath(compiledRunnerUrl)).toBe(
+      fileURLToPath(new URL('extract-child.js', compiledRunnerUrl)),
+    );
+  });
+});
 
 describe('runExtractor', () => {
   it('kills a child that will not stop, and says so', async () => {

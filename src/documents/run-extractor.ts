@@ -76,7 +76,28 @@ const DEFAULT_MEMORY_MB = 256;
 const DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const STDERR_DETAIL_LIMIT_BYTES = 2 * 1024;
 
-const DEFAULT_CHILD_PATH = fileURLToPath(new URL('./extract-child.ts', import.meta.url));
+/**
+ * Derives the default child's path from the extension *this* module was
+ * loaded with, instead of naming `.ts` literally. `tsc` emits `.js` and
+ * never copies `.ts` sources into `dist/`, so a literal `./extract-child.ts`
+ * would ask for a file that does not exist once this module runs compiled
+ * as `dist/documents/run-extractor.js` — where the sibling that *does*
+ * exist is `extract-child.js`. Nothing consumes `dist/` today, which is
+ * exactly why this is easy to get wrong without noticing: the literal form
+ * looks correct and passes every test until the day something actually
+ * runs from `dist/`. Do not replace this with a literal extension again —
+ * that reintroduces the bug this function exists to prevent.
+ *
+ * Exported so `run-extractor.test.ts` can pin the relationship against a
+ * synthetic `.js` module URL, since no compiled `dist/` exists in this
+ * repository to exercise the real one against.
+ */
+export function defaultChildPath(runnerModuleUrl: string): string {
+  const extension = runnerModuleUrl.slice(runnerModuleUrl.lastIndexOf('.'));
+  return fileURLToPath(new URL(`./extract-child${extension}`, runnerModuleUrl));
+}
+
+const DEFAULT_CHILD_PATH = defaultChildPath(import.meta.url);
 
 // Resolved once, from this module's own location, so the spawn below does
 // not depend on the spawning process's current working directory holding a
