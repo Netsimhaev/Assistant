@@ -12,10 +12,24 @@
  * The declared **uncompressed** size is attacker-controlled, and that lie is
  * tolerated on purpose: an entry's central-directory header can claim any
  * inflated size regardless of what its compressed stream truly produces, and
- * an entry that *understates* it to slip under these caps still meets Task
- * 5's own output-size cap on the child process, enforced against what
- * actually comes out of the decompressor. This guard's job is narrower:
- * refuse what the archive admits to, before spending a process on it.
+ * an entry that *understates* it to slip under these caps is not stopped by
+ * any cap in this file, nor by Task 5's child-process output cap — that cap
+ * counts bytes written to the child's **stdout**, i.e. the size of the JSON
+ * this pipeline itself serialises after extraction, which has no fixed
+ * relationship to how many bytes a decompressor allocated while getting
+ * there. What actually contains an understated declaration is process
+ * isolation: the child's `--max-old-space-size` heap cap, and the 30-second
+ * wall-clock timeout the parent kills it at (`run-extractor.ts`) — both
+ * enforced against the process regardless of what any archive claimed about
+ * itself. `docx.ts`'s own tracked-change scan additionally caps
+ * `inflateRawSync`'s output directly (`maxOutputLength`), but the extraction
+ * libraries this pipeline depends on for the main parse — `mammoth`'s
+ * internal ZIP reads, `exceljs`'s — are not bounded by anything this guard
+ * or this codebase controls; isolation, not a byte-accurate cap on every
+ * inflate call anywhere in the dependency tree, is what actually stands
+ * between an understated declaration and the rest of the system. This
+ * guard's job is narrower: refuse what the archive admits to, before
+ * spending a process on it.
  *
  * The declared **compressed** size is a different lie, and this guard does
  * not tolerate it: nothing downstream re-derives the ratio dimension, so an
