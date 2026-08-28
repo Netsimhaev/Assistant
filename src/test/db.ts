@@ -31,6 +31,8 @@ export async function resetDatabase(): Promise<void> {
       kill_switch,
       job_steps,
       jobs,
+      document_artifacts,
+      documents,
       charter_active,
       charter_versions,
       dashboard_sessions,
