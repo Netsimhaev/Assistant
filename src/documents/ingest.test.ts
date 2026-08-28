@@ -122,7 +122,7 @@ describe('ingestDocument', () => {
     expect(artifacts).toHaveLength(0);
   });
 
-  it('rejects a file over the 25MB size cap before sniffing runs the extractor', async () => {
+  it('rejects a file over the 25MB size cap without ever writing it to disk', async () => {
     const bigDir = await mkdtemp(join(tmpdir(), 'ingest-src-'));
     const bigPath = join(bigDir, 'big.txt');
     try {
@@ -130,6 +130,16 @@ describe('ingestDocument', () => {
       const doc = await ingestDocument({ path: bigPath, source: 'manual' }, OPTS);
       expect(doc.status).toBe('rejected');
       expect(doc.reason).toContain('תקרת הגודל');
+      // The whole point of checking the cap before the write: an oversized
+      // file must never reach disk, not merely never reach the extractor.
+      // Checking only "runExtractor never ran" (the previous version of
+      // this test) would still pass if the bytes had been written first —
+      // this is the assertion the Task 10 review's Critical finding said
+      // was missing.
+      expect(existsSync(join(ROOT, doc.storedPath))).toBe(false);
+      // Nothing under the document's own directory either — mkdir itself
+      // must not have run, not just writeFile.
+      expect(existsSync(join(ROOT, BUSINESS, doc.documentId))).toBe(false);
     } finally {
       await rm(bigDir, { recursive: true, force: true });
     }

@@ -4,10 +4,32 @@
  * file composes; the order it calls them in *is* the design, not an
  * implementation detail:
  *
- *   hash the bytes → deduplicate → size cap → sniff the type from content
- *   → store under the document root → archive guard for ZIP-container
- *   types, before spawning anything → runExtractor → buildOutline →
- *   markExtracted
+ *   hash the bytes → sniff the type from content → deduplicate (atomic
+ *   insert) → size cap → store under the document root → archive guard for
+ *   ZIP-container types, before spawning anything → runExtractor →
+ *   buildOutline → markExtracted
+ *
+ * Two of those steps sit in a different order than the naive reading of
+ * the design spec ("hash → dedupe → size cap → sniff → store"). Both are
+ * deliberate, and stated here rather than left to be rediscovered:
+ *
+ * **Sniff runs before dedupe.** The atomic dedupe insert
+ * (`insertOrGetDocument`, a single `INSERT ... ON CONFLICT (business_id,
+ * sha256) DO NOTHING RETURNING *`) writes `media_type` and `stored_path` as
+ * column values on that very statement, and `stored_path`'s extension
+ * comes from the *sniffed* type (§5.5) — there is no way to run that
+ * insert atomically without already knowing what to sniff first.
+ *
+ * **The size cap is decided the instant `readFile` resolves, not after
+ * the disk write.** `bytes.length` needs nothing else computed first, so
+ * that comparison happens immediately after the read, before dedupe ever
+ * runs. What still waits until after dedupe is only *recording* the
+ * rejection — `markRejected` needs the document row dedupe produces — but
+ * the consequence that actually matters is unconditional on that wait:
+ * `mkdir`/`writeFile` are gated behind the cap check and never run for an
+ * oversized file. A 300MB file is refused before a single byte of it
+ * reaches disk, which is the entire reason §3.4 puts this cap under
+ * "protecting the machine."
  *
  * **Rejection is a recorded status, never a thrown exception.** Every
  * failure branch below calls `markRejected` with a Hebrew reason and
@@ -177,6 +199,13 @@ export async function ingestDocument(
   // disk write — works off this same buffer instead of re-reading a file
   // that (unlike our own stored copy) is not ours to assume stays put.
   const bytes = await readFile(input.path);
+
+  // Decided the instant the read resolves — nothing else needs computing
+  // first. Enforced below by gating the disk write itself (never running
+  // mkdir/writeFile for an oversized file), not by checking after the
+  // write already happened.
+  const overSizeCap = bytes.length > MAX_ORIGINAL_BYTES;
+
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   const originalName = input.originalName ?? basename(input.path);
 
@@ -210,20 +239,30 @@ export async function ingestDocument(
   // just hashed are never written anywhere under our discarded documentId.
   if (!created) return document;
 
-  const absolutePath = join(documentRoot, businessId, documentId, `original.${extension}`);
-  await mkdir(dirname(absolutePath), { recursive: true });
-  await writeFile(absolutePath, bytes);
-
   const reject = async (reason: string): Promise<DocumentRecord> => {
     await markRejected(documentId, reason, { businessId });
     return { ...document, status: 'rejected', reason };
   };
 
-  if (bytes.length > MAX_ORIGINAL_BYTES) {
+  // Checked — and enforced — before a single byte reaches disk: this is
+  // the cap §3.4 lists under "protecting the machine," and honouring that
+  // means never writing an oversized file, not writing it and then
+  // noticing.
+  if (overSizeCap) {
     return reject(
       `הקובץ (${bytes.length.toLocaleString('he-IL')} בייטים) חורג מתקרת הגודל המקסימלית של ${MAX_ORIGINAL_BYTES.toLocaleString('he-IL')} בייטים`,
     );
   }
+
+  const absolutePath = join(documentRoot, businessId, documentId, `original.${extension}`);
+  await mkdir(dirname(absolutePath), { recursive: true });
+  // If this throws (disk full, permissions), the row above stays `pending`
+  // with no file behind it — a genuine system fault, not a per-document
+  // one, so it propagates rather than being caught into a rejection. A
+  // retry with the same bytes recovers cleanly: insertOrGetDocument's
+  // re-select finds this same `pending` row instead of racing a second
+  // insert.
+  await writeFile(absolutePath, bytes);
 
   if (sniffed === null) {
     return reject('סוג הקובץ אינו מזוהה או אינו נתמך');
