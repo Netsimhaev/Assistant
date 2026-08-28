@@ -93,8 +93,29 @@ function readAmountMinor(input: Record<string, unknown>): number {
   return raw;
 }
 
+/**
+ * Own properties only — for the readers whose fields, when present, make a
+ * decision GENTLER.
+ *
+ * A bare `input[key]` walks the prototype chain, so a payload carrying an
+ * inherited field answers a lookup for something it never actually said. The
+ * gate and the mail adapter read the same payload with different code, and the
+ * moment one of them traverses a prototype the other does not, they can
+ * disagree about who a message reaches — see `prototype-payload.test.ts`.
+ *
+ * Not applied blindly to every reader in this file, and that is the point:
+ * `readAmountMinor`, `readDataClasses` and `readNumber` deliberately keep
+ * reading through the chain, because there an unstated field makes the action
+ * look bigger or more sensitive, and refusing to see it would be the
+ * permissive move. The rule is "an unstated field may not loosen", never
+ * "ownership for its own sake". `inherited-fields.test.ts` pins both halves.
+ */
+function ownValue(input: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(input, key) ? input[key] : undefined;
+}
+
 function readString(input: Record<string, unknown>, key: string): string | null {
-  const value = input[key];
+  const value = ownValue(input, key);
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
@@ -155,7 +176,7 @@ function readPhones(input: Record<string, unknown>): string[] {
 function collectStrings(input: Record<string, unknown>, keys: string[]): string[] {
   const out: string[] = [];
   for (const key of keys) {
-    const value = input[key];
+    const value = ownValue(input, key);
     if (typeof value === 'string') out.push(value);
     else if (Array.isArray(value)) {
       for (const item of value) if (typeof item === 'string') out.push(item);

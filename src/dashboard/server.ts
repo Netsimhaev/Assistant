@@ -14,6 +14,7 @@
  */
 import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { z } from 'zod';
 import { config } from '../config.js';
 import { getApproval, pendingApprovals } from '../governance/approvals.js';
 import { applyDecision } from '../orchestrator/resume.js';
@@ -380,7 +381,15 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * that is a lie about the shape. Rejecting anything but a plain object here,
  * at the one place a person can type into this value, is what stops both.
  */
-function parseEditedInput(
+/**
+ * Deliberately the same schema as `PlanStep.input` (`src/domain/plan.ts`), not
+ * a lookalike. Both describe "a tool payload a human or a model proposed", and
+ * the only reason this route was exploitable is that it had no schema while the
+ * plan route did. Two shapes for one concept is how they drift apart again.
+ */
+const EDITED_INPUT = z.record(z.string(), z.unknown());
+
+export function parseEditedInput(
   raw: string | null,
   originalInputHash: string,
 ): { ok: true; editedInput?: unknown } | { ok: false; raw: string } {
@@ -394,8 +403,19 @@ function parseEditedInput(
   if (!isPlainObject(parsed)) {
     return { ok: false, raw };
   }
-  if (canonicalHash(parsed) === originalInputHash) return { ok: true };
-  return { ok: true, editedInput: parsed };
+  // Sanitised by the SAME schema `PlanStep.input` uses (`src/domain/plan.ts`),
+  // and that is the whole point: this was the one route into the gate with no
+  // schema behind it. `JSON.parse` makes `__proto__` an ordinary own property,
+  // and `isPlainObject` has no opinion about it — so it survived into
+  // `edited_input`, through the JSONB round-trip, into `effectiveInput`, and
+  // reached the gate, where redaction turned it into a prototype that the mail
+  // adapter reads and the gate's own recipient reader cannot. zod drops the
+  // key, so the payload that gets hashed here is exactly the payload that runs.
+  const sanitised = EDITED_INPUT.safeParse(parsed);
+  if (!sanitised.success) return { ok: false, raw };
+  const edited = sanitised.data;
+  if (canonicalHash(edited) === originalInputHash) return { ok: true };
+  return { ok: true, editedInput: edited };
 }
 
 async function handleDecision(

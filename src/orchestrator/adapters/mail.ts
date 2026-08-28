@@ -343,7 +343,12 @@ function extractEmail(fragment: string): string | null {
  * address twice.
  */
 export function readRecipients(input: Record<string, unknown>): string[] {
-  const raw = input['to'];
+  // Own property only. A bare `input['to']` walks the prototype chain, and the
+  // gate's own reader (`readEmails`, `src/policy/facts.ts`) does not — so an
+  // inherited `to` would be delivered to without ever having been screened.
+  // The parity this function's docblock promises has to hold structurally,
+  // not just for well-shaped payloads.
+  const raw = Object.hasOwn(input, 'to') ? input['to'] : undefined;
   const values: string[] = [];
   if (typeof raw === 'string') values.push(raw);
   else if (Array.isArray(raw)) {

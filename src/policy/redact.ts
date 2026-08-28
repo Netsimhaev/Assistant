@@ -56,7 +56,22 @@ function walk(value: unknown, patterns: RegExp[], depth: number): unknown {
   if (typeof value === 'object' && value !== null) {
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value)) {
-      out[key] = walk(item, patterns, depth + 1);
+      // `defineProperty`, never `out[key] = …`. `JSON.parse` makes `__proto__`
+      // an ordinary own property, and plain assignment to that name invokes
+      // the inherited setter instead: the copy loses the key and gains a
+      // prototype. The gate then screens the original — where `to` is nested
+      // inside the `__proto__` value and invisible — while the adapter reads
+      // the copy, where a plain `input['to']` lookup walks the prototype and
+      // finds a real address. Same key, two different answers, and the one
+      // that decides is not the one that sends. `defineProperty` writes an own
+      // data property for every key, `__proto__` included, which also keeps
+      // this function's promise that keys are left exactly as they came.
+      Object.defineProperty(out, key, {
+        value: walk(item, patterns, depth + 1),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
     return out;
   }
