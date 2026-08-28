@@ -1,4 +1,3 @@
-import { ulid } from 'ulid';
 import type pg from 'pg';
 import { config } from '../config.js';
 import { getPool, withTransaction, type Queryable } from '../db/pool.js';
@@ -68,7 +67,7 @@ function toArtifact(row: ArtifactRow): DocumentArtifact {
   };
 }
 
-/** What the caller of `insertDocument` provides. Everything else is derived. */
+/** What the caller of `insertOrGetDocument` provides. Everything else is derived. */
 export interface NewDocument {
   source: DocumentSource;
   originalName: string;
@@ -76,51 +75,6 @@ export interface NewDocument {
   sha256: string;
   byteSize: number;
   storedPath: string;
-}
-
-/**
- * Store a newly-arrived document as `pending`.
- *
- * Does not deduplicate on its own — a unique index on `(business_id, sha256)`
- * means a caller that checks `findBySha` first and then calls this function
- * has a real race (two concurrent callers can both read nothing and both
- * insert; the loser gets a thrown unique-violation instead of the row that
- * won). `ingestDocument` (`ingest.ts`), the pipeline's real entry point,
- * does not compose these two calls for exactly that reason — it calls
- * `insertOrGetDocument` below instead, whose single `INSERT ... ON CONFLICT
- * DO NOTHING RETURNING *` closes the race. `insertDocument` stays as the
- * simpler primitive for a caller (today, only its own tests) that does not
- * need dedupe-safety.
- */
-export async function insertDocument(
-  input: NewDocument,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<DocumentRecord> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
-  const documentId = `DOC-${ulid()}`;
-
-  const { rows } = await db.query<DocumentRow>(
-    `INSERT INTO documents
-       (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-     RETURNING *`,
-    [
-      documentId,
-      businessId,
-      input.source,
-      input.originalName,
-      input.mediaType,
-      input.sha256,
-      input.byteSize,
-      input.storedPath,
-    ],
-  );
-  const row = rows[0];
-  if (!row) {
-    throw new Error(`insertDocument: INSERT ... RETURNING produced no row for ${documentId}`);
-  }
-  return toDocument(row);
 }
 
 /**
@@ -144,13 +98,18 @@ export interface NewDocumentWithId extends NewDocument {
  *
  * A single `INSERT ... ON CONFLICT (business_id, sha256) DO NOTHING
  * RETURNING *` — the same shape `bindPlanToJob` already uses in
- * `orchestrator/plan-store.ts` — not `findBySha` followed by `insertDocument`.
- * That two-statement form is a real race: two concurrent ingests of
- * identical bytes both read nothing, both insert, and the unique index on
- * `(business_id, sha256)` rejects the loser with a thrown error instead of
- * quietly returning the row that won. Folding the check into the INSERT's
- * own conflict clause makes the database the single point of truth for
- * "did this row already exist," instead of two callers racing a read.
+ * `orchestrator/plan-store.ts` — not a `SELECT` to check for an existing row
+ * followed by a plain `INSERT`. That two-statement form is a real race: two
+ * concurrent ingests of identical bytes both read nothing, both insert, and
+ * the unique index on `(business_id, sha256)` rejects the loser with a
+ * thrown error instead of quietly returning the row that won. Folding the
+ * check into the INSERT's own conflict clause makes the database the single
+ * point of truth for "did this row already exist," instead of two callers
+ * racing a read. (An earlier version of this module exposed that
+ * two-statement form directly as `insertDocument`/`findBySha`, with nothing
+ * in production ever calling either — see I5 of the intake fix wave: both
+ * were deleted, and this function's own dedupe path picked up the direct
+ * unit-test coverage the deleted pair had instead.)
  *
  * When this call loses the race (`created: false`), the caller's own
  * `documentId` and any file already associated with it in memory were never
@@ -205,20 +164,6 @@ export async function insertOrGetDocument(
     );
   }
   return { document: toDocument(existing), created: false };
-}
-
-/** The document with this hash for this business, or null if none was ever stored. */
-export async function findBySha(
-  sha256: string,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<DocumentRecord | null> {
-  const db = options.db ?? getPool();
-  const { rows } = await db.query<DocumentRow>(
-    'SELECT * FROM documents WHERE business_id = $1 AND sha256 = $2',
-    [options.businessId ?? config.businessId, sha256],
-  );
-  const row = rows[0];
-  return row ? toDocument(row) : null;
 }
 
 /**

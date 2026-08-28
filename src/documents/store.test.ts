@@ -1,9 +1,9 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { ulid } from 'ulid';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
-  findBySha,
-  insertDocument,
+  insertOrGetDocument,
   loadArtifacts,
   markExtracted,
   markRejected,
@@ -23,6 +23,11 @@ const INPUT: NewDocument = {
   storedPath: 'test-business/DOC-x/original.xlsx',
 };
 
+/** A fresh `NewDocumentWithId`, the way `ingestDocument` builds one — a caller-generated id, everything else from `INPUT` unless overridden. */
+function withId(overrides: Partial<NewDocument> = {}) {
+  return { ...INPUT, ...overrides, documentId: `DOC-${ulid()}` };
+}
+
 beforeEach(async () => {
   await resetDatabase();
 });
@@ -31,35 +36,46 @@ afterAll(async () => {
   await closePool();
 });
 
-describe('insertDocument', () => {
+describe('insertOrGetDocument', () => {
   it('stores a new document as pending', async () => {
-    const doc = await insertDocument(
-      { ...INPUT, sha256: 'd'.repeat(64) },
+    const { document, created } = await insertOrGetDocument(
+      withId({ sha256: 'd'.repeat(64) }),
       { businessId: BUSINESS },
     );
-    expect(doc.status).toBe('pending');
-    expect(doc.documentId).toMatch(/^DOC-/);
-    expect(doc.businessId).toBe(BUSINESS);
-    expect(doc.reason).toBeNull();
+    expect(created).toBe(true);
+    expect(document.status).toBe('pending');
+    expect(document.documentId).toMatch(/^DOC-/);
+    expect(document.businessId).toBe(BUSINESS);
+    expect(document.reason).toBeNull();
   });
 
   it('returns the existing document rather than storing the same bytes twice', async () => {
-    const first = await insertDocument({ ...INPUT, sha256: 'b'.repeat(64) }, { businessId: BUSINESS });
-    const again = await findBySha('b'.repeat(64), { businessId: BUSINESS });
-    expect(again?.documentId).toBe(first.documentId);
+    const first = await insertOrGetDocument(withId({ sha256: 'b'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
+    const again = await insertOrGetDocument(withId({ sha256: 'b'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
+    expect(again.created).toBe(false);
+    expect(again.document.documentId).toBe(first.document.documentId);
   });
 
   it('does not let one business dedupe against another business\'s bytes', async () => {
-    await insertDocument({ ...INPUT, sha256: 'e'.repeat(64) }, { businessId: BUSINESS });
-    const foundElsewhere = await findBySha('e'.repeat(64), { businessId: OTHER_BUSINESS });
-    expect(foundElsewhere).toBeNull();
+    await insertOrGetDocument(withId({ sha256: 'e'.repeat(64) }), { businessId: BUSINESS });
+    const elsewhere = await insertOrGetDocument(withId({ sha256: 'e'.repeat(64) }), {
+      businessId: OTHER_BUSINESS,
+    });
+    // A different business dedupes against nothing — this is a fresh
+    // insert under OTHER_BUSINESS, not a lookup of BUSINESS's row.
+    expect(elsewhere.created).toBe(true);
+    expect(elsewhere.document.businessId).toBe(OTHER_BUSINESS);
   });
 });
 
 describe('markExtracted', () => {
   it('writes the artefacts and the status together, or neither', async () => {
-    const doc = await insertDocument(
-      { ...INPUT, originalName: 'מחירון.xlsx', sha256: 'a'.repeat(64) },
+    const { document: doc } = await insertOrGetDocument(
+      withId({ originalName: 'מחירון.xlsx', sha256: 'a'.repeat(64) }),
       { businessId: BUSINESS },
     );
     expect(doc.status).toBe('pending');
@@ -72,12 +88,21 @@ describe('markExtracted', () => {
     expect(artifacts).toHaveLength(1);
     expect(artifacts[0]?.flags).toEqual(['hidden_sheet']);
 
-    const again = await findBySha('a'.repeat(64), { businessId: BUSINESS });
-    expect(again?.status).toBe('extracted');
+    // Re-fetch through insertOrGetDocument's own dedupe path (created:
+    // false, since the sha already exists) rather than a dedicated lookup
+    // function — this is the same re-select `ingestDocument`'s dedupe uses
+    // in production, and it reflects markExtracted's write immediately.
+    const again = await insertOrGetDocument(withId({ sha256: 'a'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
+    expect(again.created).toBe(false);
+    expect(again.document.status).toBe('extracted');
   });
 
   it('preserves artefact order by ordinal', async () => {
-    const doc = await insertDocument({ ...INPUT, sha256: 'f'.repeat(64) }, { businessId: BUSINESS });
+    const { document: doc } = await insertOrGetDocument(withId({ sha256: 'f'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
 
     await markExtracted(doc.documentId, [
       { ordinal: 1, kind: 'outline', partName: null, content: { parts: [], flags: [] }, flags: [] },
@@ -90,7 +115,9 @@ describe('markExtracted', () => {
   });
 
   it('rolls back the whole write when one artefact is invalid, leaving status untouched', async () => {
-    const doc = await insertDocument({ ...INPUT, sha256: '1'.repeat(64) }, { businessId: BUSINESS });
+    const { document: doc } = await insertOrGetDocument(withId({ sha256: '1'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
 
     await expect(
       markExtracted(doc.documentId, [
@@ -101,18 +128,23 @@ describe('markExtracted', () => {
       ], { businessId: BUSINESS }),
     ).rejects.toThrow();
 
-    const stillPending = await findBySha('1'.repeat(64), { businessId: BUSINESS });
-    expect(stillPending?.status).toBe('pending');
+    const stillPending = await insertOrGetDocument(withId({ sha256: '1'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
+    expect(stillPending.created).toBe(false);
+    expect(stillPending.document.status).toBe('pending');
 
     const artifacts = await loadArtifacts(doc.documentId, { businessId: BUSINESS });
     expect(artifacts).toHaveLength(0);
   });
 
   it('refuses a businessId that does not own the document, and leaves no artefact rows behind', async () => {
-    const doc = await insertDocument({ ...INPUT, sha256: '3'.repeat(64) }, { businessId: BUSINESS });
+    const { document: doc } = await insertOrGetDocument(withId({ sha256: '3'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
 
     // `document_artifacts.document_id` FK-references `documents.document_id`
-    // alone (see the migration header) — the FK is satisfied by the row
+    // alone (see the migration header), so the FK is satisfied by the row
     // under its real owner, BUSINESS, so a naive insert-then-update under
     // the wrong business would insert the artefact rows first and only then
     // discover the UPDATE matches nothing. Asserting only the throw would
@@ -130,36 +162,49 @@ describe('markExtracted', () => {
     const underRealOwner = await loadArtifacts(doc.documentId, { businessId: BUSINESS });
     expect(underRealOwner).toHaveLength(0);
 
-    const stillPending = await findBySha('3'.repeat(64), { businessId: BUSINESS });
-    expect(stillPending?.status).toBe('pending');
+    const stillPending = await insertOrGetDocument(withId({ sha256: '3'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
+    expect(stillPending.created).toBe(false);
+    expect(stillPending.document.status).toBe('pending');
   });
 });
 
 describe('markRejected', () => {
   it('records why, and leaves no artefacts behind', async () => {
-    const doc = await insertDocument({ ...INPUT, sha256: '2'.repeat(64) }, { businessId: BUSINESS });
+    const { document: doc } = await insertOrGetDocument(withId({ sha256: '2'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
 
     await markRejected(doc.documentId, 'סוג קובץ לא נתמך: application/x-msdownload', {
       businessId: BUSINESS,
     });
 
-    const rejected = await findBySha('2'.repeat(64), { businessId: BUSINESS });
-    expect(rejected?.status).toBe('rejected');
-    expect(rejected?.reason).toBe('סוג קובץ לא נתמך: application/x-msdownload');
+    const rejected = await insertOrGetDocument(withId({ sha256: '2'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
+    expect(rejected.created).toBe(false);
+    expect(rejected.document.status).toBe('rejected');
+    expect(rejected.document.reason).toBe('סוג קובץ לא נתמך: application/x-msdownload');
 
     const artifacts = await loadArtifacts(doc.documentId, { businessId: BUSINESS });
     expect(artifacts).toHaveLength(0);
   });
 
   it('refuses a businessId that does not own the document', async () => {
-    const doc = await insertDocument({ ...INPUT, sha256: '4'.repeat(64) }, { businessId: BUSINESS });
+    const { document: doc } = await insertOrGetDocument(withId({ sha256: '4'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
 
     await expect(
       markRejected(doc.documentId, 'not yours', { businessId: OTHER_BUSINESS }),
     ).rejects.toThrow();
 
-    const stillPending = await findBySha('4'.repeat(64), { businessId: BUSINESS });
-    expect(stillPending?.status).toBe('pending');
-    expect(stillPending?.reason).toBeNull();
+    const stillPending = await insertOrGetDocument(withId({ sha256: '4'.repeat(64) }), {
+      businessId: BUSINESS,
+    });
+    expect(stillPending.created).toBe(false);
+    expect(stillPending.document.status).toBe('pending');
+    expect(stillPending.document.reason).toBeNull();
   });
 });
