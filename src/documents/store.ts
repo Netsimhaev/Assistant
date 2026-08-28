@@ -79,12 +79,12 @@ export interface NewDocument {
 
 /**
  * What the caller of `insertOrGetDocument` provides — `NewDocument` plus a
- * caller-generated `documentId`. Unlike `insertDocument`, the id is not
- * generated inside this function: `stored_path` is built from it
+ * caller-generated `documentId`. The id is not generated inside
+ * `insertOrGetDocument`: `stored_path` is built from it
  * (`<documentRoot>/<businessId>/<documentId>/original.<ext>`, §3.5) by
  * `ingestDocument` *before* this call, since `stored_path` is itself one of
- * the columns this INSERT writes. Generating the id here, as `insertDocument`
- * does, would make that impossible to sequence.
+ * the columns this INSERT writes. Generating the id inside the function
+ * would make that impossible to sequence.
  */
 export interface NewDocumentWithId extends NewDocument {
   documentId: string;

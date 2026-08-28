@@ -337,8 +337,8 @@ const LOCAL_FILE_HEADER_FIXED_SIZE = 30;
  * under the 256MB heap cap the isolated child already runs under (spec
  * §3.4), so a hostile entry cannot force an allocation the process could
  * not have survived anyway. Node's zlib throws `ERR_BUFFER_TOO_LARGE` (a
- * plain `Error`, not a `RangeError`) the instant the decompressed size would
- * exceed this — `readEntryData`'s existing `catch { return null }` already
+ * `RangeError`) the instant the decompressed size would exceed this —
+ * `readEntryData`'s existing `catch { return null }` already
  * turns that into "raw XML unreadable", which `extractDocx` already treats
  * as `scanned: false` and flags `tracked_changes` rather than clearing it —
  * fail-closed for free, no new branch required.
