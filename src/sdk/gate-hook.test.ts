@@ -120,8 +120,9 @@ describe('SDK tool-name translation', () => {
   it('derives an agent tool list from the charter allowlist, never by hand', () => {
     const tools = sdkToolsFor('know.reader');
     expect(tools).toContain('Read');
-    // know.reader's allowlist is doc.fetch / code_execution / memory.recall.
-    // Nothing there maps to a writing tool, so none can appear.
+    // know.reader's allowlist is doc.fetch / memory.recall — `code_execution`
+    // was removed when it was classified. Nothing there maps to a writing
+    // tool, so none can appear.
     expect(tools).not.toContain('Write');
     expect(tools).not.toContain('Bash');
   });

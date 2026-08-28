@@ -54,7 +54,16 @@ export function buildFacts(
     toolName,
     actionClass,
     amountMinor: readAmountMinor(input),
-    amountDeclared: input['amountMinor'] !== undefined && input['amountMinor'] !== null,
+    // Own key only, unlike `readAmountMinor` directly above it. This field is
+    // not "how big is this" — it answers "did the caller state an amount at
+    // all", and `evaluateToolCall` turns a `false` into a hard
+    // `amount_unreadable` deny for the classes that require one. An inherited
+    // value satisfying that requirement is the one way prototype-reading
+    // loosens anything in this file, which is why the two split here.
+    amountDeclared:
+      Object.hasOwn(input, 'amountMinor') &&
+      input['amountMinor'] !== undefined &&
+      input['amountMinor'] !== null,
     counterpartyId: readString(input, 'counterpartyId') ?? readString(input, 'entityId'),
     counterpartyEmails: readEmails(input),
     counterpartyPhones: readPhones(input),
@@ -114,8 +123,26 @@ function ownValue(input: Record<string, unknown>, key: string): unknown {
   return Object.hasOwn(input, key) ? input[key] : undefined;
 }
 
+/**
+ * Reads the chain, like `readNumber` and unlike the recipient readers.
+ *
+ * Its two fields are `counterpartyId` and `supplierId`, and the direction test
+ * comes out the other way for both. `supplierId` has no loosening consumer at
+ * all — its only reader is the approved-supplier ceiling in `budget.ts`, which
+ * can only deny. `counterpartyId` feeds three consumers that tighten (that same
+ * ceiling, `matchDoNotContact`, and the per-counterparty autonomy override,
+ * which takes the most restrictive) against one that loosens, and that one is
+ * already narrow: `scoreVisibility` does not consult identity at all for a
+ * message addressed to a person that carries an address.
+ *
+ * Reading these own-only therefore deleted denials and bought almost nothing.
+ * It also broke the parity this file cares about from the other side:
+ * `channels.ts` has its own reader for the same two fields and reads the chain,
+ * so the gate would have judged a call without the supplier that the executor
+ * then routed by.
+ */
 function readString(input: Record<string, unknown>, key: string): string | null {
-  const value = ownValue(input, key);
+  const value = input[key];
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 

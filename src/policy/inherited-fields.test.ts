@@ -73,4 +73,41 @@ describe('inherited fields that would tighten a decision are still read', () => 
     const facts = buildFacts('mail.send', withInherited({ dataClasses: ['credentials'] }), CTX);
     expect(facts.dataClasses).toEqual(['credentials']);
   });
+
+  // `supplierId` has no loosening consumer at all — its only reader is the
+  // approved-supplier ceiling, which can only deny. `counterpartyId` feeds
+  // three tightening consumers (that ceiling, do-not-contact by entity id, and
+  // the per-counterparty autonomy override) against one that loosens, and that
+  // one was already narrowed: for a message addressed to a person carrying an
+  // address, `scoreVisibility` does not consult identity at all. Reading these
+  // own-only removed denials and bought almost nothing.
+  it('an inherited supplier id is still read, because its only reader denies', () => {
+    const facts = buildFacts('browser.submit_order', withInherited({ supplierId: 'sup_x' }), CTX);
+    expect(facts.supplierId).toBe('sup_x');
+  });
+
+  it('an inherited counterparty id is still read, because do-not-contact uses it', () => {
+    const facts = buildFacts('mail.send', withInherited({ counterpartyId: 'c_blocked' }), CTX);
+    expect(facts.counterpartyId).toBe('c_blocked');
+  });
+});
+
+/**
+ * One reader in `facts.ts` reads the chain for the value and must NOT for the
+ * flag derived from it. `amountDeclared` is not "how big is this" — it answers
+ * "did the caller state an amount at all", and `evaluateToolCall` turns a `false`
+ * into a hard `amount_unreadable` deny for the classes that require one. An
+ * inherited `amountMinor` therefore converts that deny into a pass, which is the
+ * single place in the file where reading the prototype loosens.
+ */
+describe('an inherited amount is a size, not a declaration', () => {
+  it('still counts toward the ceiling', () => {
+    const facts = buildFacts('payment.charge', withInherited({ amountMinor: 900_000 }), CTX);
+    expect(facts.amountMinor).toBe(900_000);
+  });
+
+  it('does not satisfy the requirement to declare one', () => {
+    const facts = buildFacts('payment.charge', withInherited({ amountMinor: 900_000 }), CTX);
+    expect(facts.amountDeclared).toBe(false);
+  });
 });
