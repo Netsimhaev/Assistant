@@ -338,7 +338,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       bundle,
       toolName: step.toolName,
       toolInput: step.input,
-      perform: async (redacted) => performStep(request, step, redacted),
+      perform: async (redacted, effective) => performStep(request, step, redacted, effective),
       counterpartyTags: request.counterpartyTags,
       rampLevel: request.rampLevel,
       planHash,
@@ -431,6 +431,7 @@ async function performStep(
   request: RunPlanRequest,
   step: PlanStep,
   redactedInput: unknown,
+  effectiveInput: Record<string, unknown>,
 ): Promise<StepEffect> {
   if (!needsChannel(step.toolName)) {
     // A local step: nothing leaves the instance, so there is nothing to
@@ -442,11 +443,15 @@ async function performStep(
     return { output: null, externalId: null };
   }
 
+  // Routed by the payload the gate actually judged, not by the one the plan
+  // first proposed. On an approval-with-edit those differ, and choosing the
+  // connection from the proposal means the ceiling that was enforced and the
+  // credential that was used belong to two different counterparties.
   const resolution = resolveChannel(
     request.bundle,
     request.bindings,
     step.toolName,
-    targetIdOf(step),
+    deriveTargetId(step.toolName, effectiveInput, actionClassOf(step)),
   );
   if (resolution.status !== 'resolved') {
     // Retryable. A binding that is `disconnected`, or a row that has not been
@@ -488,7 +493,12 @@ async function performStep(
       idempotencyKey: canonicalHash({
         jobId: request.job.jobId,
         stepId: step.id,
-        input: step.input,
+        // The approved payload, for the same reason the routing above uses it:
+        // the key is supposed to describe what was actually sent. Hashing the
+        // proposal instead gave two different approved edits of one step the
+        // same key, so a far end honouring it would have deduplicated the
+        // second real send away.
+        input: effectiveInput,
       }),
       signal: AbortSignal.timeout(request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS),
     },
@@ -584,6 +594,12 @@ function actionClassOf(step: PlanStep): ActionClass | null {
 }
 
 /** The target this step addresses, derived identically at both resolutions. */
+/**
+ * The target as the PLAN proposes it — used for the feasibility check during
+ * validation, where no approval exists yet and the step's own input is the only
+ * payload there is. Execution derives the target from the approved payload
+ * instead; see `performStep`.
+ */
 function targetIdOf(step: PlanStep): string | null {
   return deriveTargetId(step.toolName, step.input, actionClassOf(step));
 }

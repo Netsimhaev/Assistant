@@ -121,6 +121,41 @@ describe('a step resumed from an approval', () => {
     expect((seen[0] as { body: string }).body).toBe('נוסח ערוך');
   });
 
+  /**
+   * The edited payload has to reach the performer as well as the gate.
+   *
+   * `executeStep` substitutes the edit before the gate sees it, so the budget,
+   * the redaction and the do-not-contact check all judge what the boss actually
+   * approved. But the performer chooses the destination — which signed
+   * connection, which endpoint, which credential — and it was deriving that
+   * from the ORIGINAL step input. An owner who corrects a supplier on the card
+   * got the new supplier's ceiling enforced and the order sent over the old
+   * supplier's connection, with the old supplier's credential, and nothing in
+   * the audit trail disagreed. Same shape for a corrected recipient.
+   */
+  it('hands the performer the approved payload, not the one first proposed', async () => {
+    const bundle = await install();
+    const job = await jobInExecute(bundle);
+    const approvalId = await parkOnApproval(bundle, job);
+    const edited = { ...STRANGER.toolInput, body: 'נוסח ערוך', counterpartyId: 'c_812' };
+
+    await applyDecision(approvalId, 'approved',
+      { by: 'p_boss', channel: 'dashboard', editedInput: edited },
+      { businessId: BUSINESS });
+
+    const resumed = await loadJob(job.jobId, { businessId: BUSINESS });
+    if (resumed === null) throw new Error('job vanished');
+
+    let effective: unknown = null;
+    await executeStep({
+      ...STRANGER, job: resumed, bundle, approvalId,
+      perform: async (_redacted, forRouting) => { effective = forRouting; return NOTHING; },
+      now: NOON,
+    });
+
+    expect(effective).toEqual(edited);
+  });
+
   // "The approval expired" must be a fresh question, never a failure: the
   // work is still wanted and nothing about it went wrong. `expireOverdue`
   // never touches a decided row, so this state — approved, unspent, past its

@@ -43,8 +43,24 @@ export interface StepRequest {
   bundle: PolicyBundle;
   toolName: string;
   toolInput: Record<string, unknown>;
-  /** Performs the actual side effect once the gate has permitted it. */
-  perform: (redactedInput: unknown) => Promise<StepEffect>;
+  /**
+   * Performs the actual side effect once the gate has permitted it.
+   *
+   * Takes two payloads, and the difference matters. `redactedInput` is what
+   * goes on the wire — the charter's patterns already applied — and is the
+   * only thing an adapter ever sees. `effectiveInput` is the same action
+   * *before* redaction, and is what the performer must use to choose a
+   * destination: which signed connection, which endpoint, which credential,
+   * and the idempotency key. On an approval-with-edit those two differ from
+   * the originally proposed step, and routing by the proposal while the gate
+   * judged the edit is how a corrected supplier gets its ceiling enforced and
+   * its order sent to the supplier it replaced.
+   *
+   * Routing off `redactedInput` would be the wrong shortcut: a redaction
+   * pattern that happens to match an id would blank the very field the route
+   * is chosen by.
+   */
+  perform: (redactedInput: unknown, effectiveInput: Record<string, unknown>) => Promise<StepEffect>;
   /** Tags of the resolved counterparty; `[]` when nothing resolved them. */
   counterpartyTags: string[];
   /** Earned autonomy from the ramp; `draft_only` until a ramp exists. */
@@ -266,7 +282,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
 
   let effect: StepEffect;
   try {
-    effect = await request.perform(decision.redactedInput);
+    effect = await request.perform(decision.redactedInput, effectiveInput);
   } catch (error) {
     // An adapter that throws must not escape past the outcome record: the
     // intent is already in the audit log and would otherwise have no ending.
