@@ -1,0 +1,313 @@
+import { describe, expect, it } from 'vitest';
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { crc32 } from 'node:zlib';
+import { extractDocx } from './docx.js';
+import type { Block, TableContent, TextContent } from '../types.js';
+
+const fixture = (name: string) => fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url));
+
+const blocksOf = (content: unknown): Block[] => (content as TextContent).blocks;
+const rowsOf = (content: unknown): TableContent['rows'] => (content as TableContent).rows;
+
+async function tempDocxPath(name: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'docx-extractor-'));
+  return join(dir, name);
+}
+
+/**
+ * A minimal, hand-built ZIP (store method — no deflate needed, since this
+ * module's own reader never checks CRC and neither does `mammoth`'s). Built
+ * from scratch rather than pulled from a library because there is no
+ * "admitted" docx-*writing* dependency (spec §9.1 only ever justified
+ * *reading* one) — the same reasoning `xlsx.test.ts`'s macro-part test
+ * already used to hand-patch raw ZIP bytes instead of reaching for a tool.
+ *
+ * Verified against `mammoth` directly before use here: a docx containing
+ * only `word/document.xml` opens fine (no `[Content_Types].xml`, no
+ * `_rels/`, no `word/styles.xml` required — `docx-reader.js` falls back to
+ * sane defaults for every part but the main document), and
+ * `word/comments.xml` is found by mammoth's own path-fallback
+ * (`findPartPath`'s `fallbackPath: "word/comments.xml"`) with no
+ * relationship entry needed either.
+ */
+function buildDocx(entries: Record<string, string>): Buffer {
+  const names = Object.keys(entries);
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+
+  for (const name of names) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const data = Buffer.from(entries[name] ?? '', 'utf8');
+    const crc = crc32(data);
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(0, 8); // method: store
+    localHeader.writeUInt16LE(0, 10);
+    localHeader.writeUInt16LE(0, 12);
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(data.length, 18);
+    localHeader.writeUInt32LE(data.length, 22);
+    localHeader.writeUInt16LE(nameBuf.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+
+    const localEntry = Buffer.concat([localHeader, nameBuf, data]);
+    localParts.push(localEntry);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(0, 12);
+    centralHeader.writeUInt16LE(0, 14);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(data.length, 20);
+    centralHeader.writeUInt32LE(data.length, 24);
+    centralHeader.writeUInt16LE(nameBuf.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+
+    centralParts.push(Buffer.concat([centralHeader, nameBuf]));
+    offset += localEntry.length;
+  }
+
+  const localSection = Buffer.concat(localParts);
+  const centralSection = Buffer.concat(centralParts);
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(names.length, 8);
+  eocd.writeUInt16LE(names.length, 10);
+  eocd.writeUInt32LE(centralSection.length, 12);
+  eocd.writeUInt32LE(localSection.length, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([localSection, centralSection, eocd]);
+}
+
+async function writeDocx(fileName: string, entries: Record<string, string>): Promise<string> {
+  const path = await tempDocxPath(fileName);
+  await writeFile(path, buildDocx(entries));
+  return path;
+}
+
+const XML_HEADER = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+
+function documentXml(bodyXml: string): string {
+  return `${XML_HEADER}\n<w:document ${W_NS}><w:body>${bodyXml}</w:body></w:document>`;
+}
+
+// Same numbering definition as `tiny.docx` (numId 1 -> a level-0 bullet) —
+// verified against the fixture's own `word/numbering.xml` before writing
+// this.
+const BULLET_NUMBERING = `${XML_HEADER}
+<w:numbering ${W_NS}>
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="bullet"/>
+      <w:lvlText w:val="&#xF0B7;"/>
+      <w:pPr/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>`;
+
+function bulletItemXml(text: string): string {
+  return `<w:p><w:pPr><w:pStyle w:val="ListParagraph"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>${text}</w:t></w:r></w:p>`;
+}
+
+describe('extractDocx', () => {
+  it('keeps a heading a heading', async () => {
+    const [body] = await extractDocx(fixture('tiny.docx'));
+    const blocks = blocksOf(body?.content);
+    expect(blocks[0]).toEqual({ kind: 'heading', level: 1, text: 'הסכם התקשרות' });
+  });
+
+  it('keeps a table a table rather than smearing it into a line', async () => {
+    const artifacts = await extractDocx(fixture('tiny.docx'));
+    expect(artifacts.filter((a) => a.kind === 'table')).toHaveLength(1);
+  });
+
+  it('includes tracked changes and flags them', async () => {
+    const artifacts = await extractDocx(fixture('tiny.docx'));
+    expect(artifacts.some((a) => a.flags.includes('tracked_changes'))).toBe(true);
+  });
+
+  it('produces exactly the blocks tiny.docx contains, in document order — heading, then the bullet list as one block, then the paragraph carrying the inserted sentence inline', async () => {
+    // A single strong assertion pinning down the whole `blocks` array, not
+    // just its length or first element: this is what actually rules out a
+    // smeared table, a dropped list, or a heading downgraded to a
+    // paragraph. `w:ins`'s content (see the fixture's `word/document.xml`)
+    // sits inline with no separating space in the source, so the two runs
+    // concatenate directly — that space (or lack of it) mirrors the source
+    // exactly, not an artefact of this test's expectations.
+    const [body] = await extractDocx(fixture('tiny.docx'));
+    const blocks = blocksOf(body?.content);
+    expect(blocks).toEqual([
+      { kind: 'heading', level: 1, text: 'הסכם התקשרות' },
+      { kind: 'list', items: ['סעיף ראשון בהסכם', 'סעיף שני בהסכם'] },
+      {
+        kind: 'paragraph',
+        text: 'בין הצדדים נחתם הסכם זה בתנאים הרגילים.סעיף שהוסף בעדכון האחרון למען הסר ספק.',
+      },
+    ]);
+  });
+
+  it("shapes the table's cells exactly like xlsx.ts's TableContent — {v, t: 'string'} — so a reader cannot tell the two apart", async () => {
+    const artifacts = await extractDocx(fixture('tiny.docx'));
+    const table = artifacts.find((a) => a.kind === 'table');
+    expect(rowsOf(table?.content)).toEqual([
+      [
+        { v: 'עמודה א', t: 'string' },
+        { v: 'עמודה ב', t: 'string' },
+      ],
+      [
+        { v: 'ערך 1', t: 'string' },
+        { v: 'ערך 2', t: 'string' },
+      ],
+    ]);
+  });
+
+  it('puts the tracked_changes flag on the first (text) artefact, the document-level slot has_macros already uses in xlsx.ts', async () => {
+    const artifacts = await extractDocx(fixture('tiny.docx'));
+    expect(artifacts[0]?.kind).toBe('text');
+    expect(artifacts[0]?.flags).toContain('tracked_changes');
+    expect(artifacts.slice(1).every((a) => !a.flags.includes('tracked_changes'))).toBe(true);
+  });
+
+  it('orders the text artefact first (ordinal 0) and each table after it, in document order', async () => {
+    const artifacts = await extractDocx(fixture('tiny.docx'));
+    expect(artifacts.map((a) => [a.ordinal, a.kind])).toEqual([
+      [0, 'text'],
+      [1, 'table'],
+    ]);
+  });
+
+  it('keeps the deleted text of a tracked-change deletion in the output, not only the surviving and inserted text', async () => {
+    const path = await writeDocx(
+      'deletion.docx',
+      {
+        'word/document.xml': documentXml(
+          '<w:p>' +
+            '<w:r><w:t>טקסט שנשאר. </w:t></w:r>' +
+            '<w:del w:id="1" w:author="עורך" w:date="2026-08-25T00:00:00Z">' +
+            '<w:r><w:delText>טקסט שנמחק בעדכון.</w:delText></w:r>' +
+            '</w:del>' +
+            '</w:p>',
+        ),
+      },
+    );
+
+    const [body] = await extractDocx(path);
+    const blocks = blocksOf(body?.content);
+
+    // The surviving run is its own ordinary paragraph — mammoth drops the
+    // deleted run entirely from the tree, exactly as verified against the
+    // library directly before writing this extractor.
+    expect(blocks[0]).toEqual({ kind: 'paragraph', text: 'טקסט שנשאר.' });
+
+    // The deleted text is not silently gone: it is present, somewhere in
+    // the text artefact's blocks, recovered from `word/document.xml`'s raw
+    // `w:delText` runs.
+    const allText = blocks.map((b) => (b.kind === 'list' ? b.items.join(' ') : b.text)).join(' ');
+    expect(allText).toContain('טקסט שנמחק בעדכון.');
+
+    expect(body?.flags).toContain('tracked_changes');
+  });
+
+  it('flags tracked_changes for a comment alone, with no w:ins or w:del in the body', async () => {
+    const path = await writeDocx('comment-only.docx', {
+      'word/document.xml': documentXml(
+        '<w:p><w:r><w:t>טקסט רגיל בלי מעקב שינויים.</w:t></w:r></w:p>',
+      ),
+      'word/comments.xml': `${XML_HEADER}
+<w:comments ${W_NS}>
+  <w:comment w:id="1" w:author="בודק/ת"><w:p><w:r><w:t>הערה לבדיקה</w:t></w:r></w:p></w:comment>
+</w:comments>`,
+    });
+
+    const [body] = await extractDocx(path);
+    expect(body?.flags).toContain('tracked_changes');
+    expect(blocksOf(body?.content)).toEqual([
+      { kind: 'paragraph', text: 'טקסט רגיל בלי מעקב שינויים.' },
+    ]);
+  });
+
+  it('does not flag tracked_changes when there is no insertion, deletion, or comment', async () => {
+    const path = await writeDocx('plain.docx', {
+      'word/document.xml': documentXml('<w:p><w:r><w:t>מסמך רגיל.</w:t></w:r></w:p>'),
+    });
+
+    const [body] = await extractDocx(path);
+    expect(body?.flags).not.toContain('tracked_changes');
+  });
+
+  it('closes one list and opens a new one when a real paragraph interrupts a run of list items, rather than merging them into one block', async () => {
+    const path = await writeDocx('interrupted-list.docx', {
+      'word/document.xml': documentXml(
+        bulletItemXml('פריט א') +
+          bulletItemXml('פריט ב') +
+          '<w:p><w:r><w:t>פסקה שמפרידה בין הרשימות.</w:t></w:r></w:p>' +
+          bulletItemXml('פריט ג'),
+      ),
+      'word/numbering.xml': BULLET_NUMBERING,
+    });
+
+    const [body] = await extractDocx(path);
+    expect(blocksOf(body?.content)).toEqual([
+      { kind: 'list', items: ['פריט א', 'פריט ב'] },
+      { kind: 'paragraph', text: 'פסקה שמפרידה בין הרשימות.' },
+      { kind: 'list', items: ['פריט ג'] },
+    ]);
+  });
+
+  it('does not crash on a table nested inside another table’s cell, and keeps the inner cells’ text readable rather than dropping them', async () => {
+    const innerTable =
+      '<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid>' +
+      '<w:tr><w:tc><w:p><w:r><w:t>פנימי</w:t></w:r></w:p></w:tc></w:tr>' +
+      '</w:tbl>';
+    const path = await writeDocx('nested-table.docx', {
+      'word/document.xml': documentXml(
+        '<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid>' +
+          `<w:tr><w:tc><w:p><w:r><w:t>לפני</w:t></w:r></w:p>${innerTable}</w:tc></w:tr>` +
+          '</w:tbl>',
+      ),
+    });
+
+    const artifacts = await extractDocx(path);
+    const table = artifacts.find((a) => a.kind === 'table');
+    const rows = rowsOf(table?.content);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveLength(1);
+    // The nested table's own cell text is flattened into the outer cell
+    // rather than lost — "sane, not crash" per this task's self-review
+    // bar, not a claim that the inner table is extracted as its own
+    // artefact (it deliberately is not; see the module docblock).
+    expect(rows[0]?.[0]?.v).toContain('פנימי');
+    expect(artifacts.filter((a) => a.kind === 'table')).toHaveLength(1);
+  });
+
+  it('produces only the text artefact, with an empty blocks array, for a document with a body but no content at all', async () => {
+    const path = await writeDocx('empty.docx', { 'word/document.xml': documentXml('') });
+
+    const artifacts = await extractDocx(path);
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0]).toEqual({ ordinal: 0, kind: 'text', partName: null, content: { blocks: [] }, flags: [] });
+  });
+});
