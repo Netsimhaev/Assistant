@@ -97,6 +97,7 @@ export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise
   );
 
   log(`מסמך ${doc.documentId}`);
+  log(`מקור: ${doc.source}`);
   log(`סטטוס: ${doc.status}`);
   log(`סוג מדיה: ${doc.mediaType}`);
 

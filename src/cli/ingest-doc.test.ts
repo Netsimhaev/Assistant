@@ -97,7 +97,12 @@ describe('runIngestCli', () => {
       businessId: BUSINESS,
       documentRoot: ROOT,
     });
-    expect(lines.join('\n')).toContain('extracted');
+    const out = lines.join('\n');
+    expect(out).toContain('extracted');
+    // Asserting only 'extracted' would still pass if --source were parsed
+    // and silently discarded (ingestDocument defaults to 'manual') — this
+    // is the assertion that actually proves the flag reached the pipeline.
+    expect(out).toContain('מקור: mail');
   });
 
   it('prints the Hebrew rejection reason for an unsupported type instead of throwing', async () => {
