@@ -61,6 +61,12 @@
  * failure here would only ever mean this narrow fallback met something
  * outside its scope. "Unreadable" is not "clean", though: see
  * `TrackedChangeScan` below for what `extractDocx` does with that outcome.
+ * One of those failure sources is deliberate, not incidental:
+ * `MAX_INFLATED_ENTRY_BYTES` bounds `inflateRawSync`'s own output, because
+ * the archive guard's declared-size caps can be lied to by an entry that
+ * *understates* its true inflated size (see `archive-guard.ts`'s docblock)
+ * — this is the one inflate call in the pipeline that is not otherwise
+ * bounded by anything but the child process's own heap and timeout.
  *
  * **Merged/spanning table cells are expanded, matching `xlsx.ts`.** §4.2
  * says nothing about `w:gridSpan`/`w:vMerge` the way §4.1 explicitly
@@ -96,11 +102,31 @@
  * rows and cells joined with separators) instead of crashing or being
  * dropped silently — sane behaviour for something outside this task's
  * scope, not full support for it.
+ *
+ * **Cells classify through the same `../cell.ts` function `csv.ts` uses,
+ * not an unconditional `{ v: text, t: 'string' }`.** Before this existed,
+ * every Word table cell — including an empty one — came out as a string,
+ * which meant no Word table could ever produce headers, a numeric range, or
+ * a date range in `outline.ts` (both of those need a non-string cell
+ * somewhere to detect). `collectText(cellNode).trim()`'s result is still
+ * trimmed before classification (see `../cell.ts`'s docblock for why that
+ * differs from `csv.ts`, which trims nothing), then run through
+ * `classifyField` the same way a CSV field is.
+ *
+ * **§5.3's content caps apply here too.** A table's rows are capped at
+ * `MAX_ROWS_PER_TABLE` and each cell's text at `MAX_CELL_CHARS` — the same
+ * two numbers `xlsx.ts` already enforces — and a document's `text`
+ * artefact's block text (a paragraph, heading, or list item) is capped at
+ * `MAX_CELL_CHARS` too, since a `jsonb` row has the same reason to bound one
+ * piece of prose as one spreadsheet cell. Either kind of truncation pushes
+ * `truncated` onto the artefact it happened in — the table it shortened, or
+ * the text artefact (ordinal 0) for capped block text.
  */
 
 import { readFile } from 'node:fs/promises';
 import { inflateRawSync } from 'node:zlib';
 import mammoth from 'mammoth';
+import { MAX_ROWS_PER_TABLE, capCellChars, capText, classifyField } from '../cell.js';
 import type { Block, Cell, DocumentArtifact, TableContent, TextContent } from '../types.js';
 
 // The subset of mammoth's internal document-tree shape
@@ -211,10 +237,22 @@ interface PendingSpan {
  * surviving cells straight to sequential indices would silently shift every
  * cell after the gap into the wrong column.
  */
-function expandTableRows(table: MammothNode): Cell[][] {
-  const rows = (table.children ?? []).filter((row) => row.type === 'tableRow');
+interface ExpandedTable {
+  rows: Cell[][];
+  truncated: boolean;
+}
+
+function expandTableRows(table: MammothNode): ExpandedTable {
+  const allRows = (table.children ?? []).filter((row) => row.type === 'tableRow');
+  // §5.3/§3.4: capped up front, matching xlsx.ts's row cap — a table beyond
+  // MAX_ROWS_PER_TABLE is cut and flagged truncated, never rejected outright
+  // or left to grow an unbounded jsonb row.
+  const rowsTruncated = allRows.length > MAX_ROWS_PER_TABLE;
+  const rows = rowsTruncated ? allRows.slice(0, MAX_ROWS_PER_TABLE) : allRows;
+
   const pending = new Map<number, PendingSpan>();
   const grid: Cell[][] = [];
+  let cellsTruncated = false;
 
   for (const row of rows) {
     const cells = (row.children ?? []).filter((cell) => cell.type === 'tableCell');
@@ -240,7 +278,13 @@ function expandTableRows(table: MammothNode): Cell[][] {
       if (cellNode === undefined) break; // unreachable given the loop condition; satisfies noUncheckedIndexedAccess
       cellIndex += 1;
 
-      const value: Cell = { v: collectText(cellNode).trim(), t: 'string' };
+      // Trimmed before classification (docx keeps `.trim()`; see the module
+      // docblock for why that differs from csv.ts), then capped at
+      // MAX_CELL_CHARS the same way xlsx.ts caps a cell's string value.
+      const { cell: value, truncated: cellTruncated } = capCellChars(
+        classifyField(collectText(cellNode).trim()),
+      );
+      if (cellTruncated) cellsTruncated = true;
       const colSpan = spanOf(cellNode, 'colSpan');
       const rowSpan = spanOf(cellNode, 'rowSpan');
 
@@ -265,11 +309,12 @@ function expandTableRows(table: MammothNode): Cell[][] {
     grid.push(outputRow);
   }
 
-  return grid;
+  return { rows: grid, truncated: rowsTruncated || cellsTruncated };
 }
 
-function tableContentOf(table: MammothNode): TableContent {
-  return { rows: expandTableRows(table) };
+function tableContentOf(table: MammothNode): { content: TableContent; truncated: boolean } {
+  const { rows, truncated } = expandTableRows(table);
+  return { content: { rows }, truncated };
 }
 
 // --- Raw-ZIP fallback for tracked-change deletions (see module docblock) ---
@@ -280,6 +325,25 @@ const MAX_COMMENT_SIZE = 0xffff;
 const CENTRAL_DIR_SIGNATURE = 0x02014b50;
 const CENTRAL_DIR_FIXED_SIZE = 46;
 const LOCAL_FILE_HEADER_FIXED_SIZE = 30;
+
+/**
+ * Caps `inflateRawSync`'s output for this raw-XML fallback read alone
+ * (`archive-guard.ts`'s guard already ran upstream, but — see that module's
+ * docblock — it cannot stop an entry whose declared `uncompressedSize`
+ * understates what its compressed stream truly inflates to; nothing in this
+ * codebase bounds that except a cap placed directly on the inflate call
+ * itself). 64MB is far beyond any real `word/document.xml` — even a
+ * multi-thousand-page contract's XML runs to a few MB — while staying well
+ * under the 256MB heap cap the isolated child already runs under (spec
+ * §3.4), so a hostile entry cannot force an allocation the process could
+ * not have survived anyway. Node's zlib throws `ERR_BUFFER_TOO_LARGE` (a
+ * plain `Error`, not a `RangeError`) the instant the decompressed size would
+ * exceed this — `readEntryData`'s existing `catch { return null }` already
+ * turns that into "raw XML unreadable", which `extractDocx` already treats
+ * as `scanned: false` and flags `tracked_changes` rather than clearing it —
+ * fail-closed for free, no new branch required.
+ */
+const MAX_INFLATED_ENTRY_BYTES = 64 * 1024 * 1024;
 
 /** One named ZIP entry's decompressed bytes, or `null` — see module docblock for what "degrades" here rather than throwing. */
 function readZipEntry(buffer: Buffer, entryName: string): Buffer | null {
@@ -346,7 +410,7 @@ function readEntryData(
   if (method === 0) return Buffer.from(compressed);
   if (method === 8) {
     try {
-      return inflateRawSync(compressed);
+      return inflateRawSync(compressed, { maxOutputLength: MAX_INFLATED_ENTRY_BYTES });
     } catch {
       return null;
     }
@@ -437,8 +501,13 @@ export async function extractDocx(sourcePath: string): Promise<DocumentArtifact[
   const document: MammothDocument = captured ?? { type: 'document', children: [], comments: [] };
 
   const blocks: Block[] = [];
-  const tables: TableContent[] = [];
+  const tables: { content: TableContent; truncated: boolean }[] = [];
   let listItems: string[] | null = null;
+  // §5.3/§3.4: a block's text (paragraph, heading, or list item) is capped
+  // at MAX_CELL_CHARS the same way a table cell's string value is — one
+  // flag on the document-level text artefact, not per-block, since
+  // TextContent's `Block` type carries no flag field of its own.
+  let textTruncated = false;
 
   const flushList = (): void => {
     if (listItems !== null && listItems.length > 0) {
@@ -456,7 +525,8 @@ export async function extractDocx(sourcePath: string): Promise<DocumentArtifact[
 
     if (node.type !== 'paragraph') continue;
 
-    const text = collectText(node).trim();
+    const { text, truncated: paragraphTruncated } = capText(collectText(node).trim());
+    if (paragraphTruncated) textTruncated = true;
 
     if (isListItem(node)) {
       // An empty list item contributes nothing but also does not interrupt
@@ -476,7 +546,11 @@ export async function extractDocx(sourcePath: string): Promise<DocumentArtifact[
     // unconditionally here and only gated the *push* on `text !== ''`,
     // which flushed (and so split) a list across exactly this kind of blank
     // paragraph. A real, non-empty paragraph or heading is a genuine break
-    // in the list and does still flush, below.
+    // in the list and does still flush, below. A blank paragraph carrying a
+    // heading style (an empty "Heading1" paragraph, say) hits this same
+    // check first and is skipped identically — it never reaches
+    // `headingLevelOf` below, so it does not produce an empty `heading`
+    // block either.
     if (text === '') continue;
 
     flushList();
@@ -498,26 +572,31 @@ export async function extractDocx(sourcePath: string): Promise<DocumentArtifact[
   const trackedChanges = !scan.scanned || scan.hasInsOrDel || document.comments.length > 0;
 
   if (deletedTexts.length > 0) {
-    blocks.push({
-      kind: 'paragraph',
-      text: `טקסט שנמחק במעקב שינויים: ${deletedTexts.join(' | ')}`,
-    });
+    const { text: deletedBlockText, truncated: deletedTruncated } = capText(
+      `טקסט שנמחק במעקב שינויים: ${deletedTexts.join(' | ')}`,
+    );
+    if (deletedTruncated) textTruncated = true;
+    blocks.push({ kind: 'paragraph', text: deletedBlockText });
   }
+
+  const textFlags: string[] = [];
+  if (trackedChanges) textFlags.push('tracked_changes');
+  if (textTruncated) textFlags.push('truncated');
 
   const textArtifact: DocumentArtifact = {
     ordinal: 0,
     kind: 'text',
     partName: null,
     content: { blocks } satisfies TextContent,
-    flags: trackedChanges ? ['tracked_changes'] : [],
+    flags: textFlags,
   };
 
-  const tableArtifacts: DocumentArtifact[] = tables.map((content, index) => ({
+  const tableArtifacts: DocumentArtifact[] = tables.map(({ content, truncated }, index) => ({
     ordinal: index + 1,
     kind: 'table',
     partName: null,
     content,
-    flags: [],
+    flags: truncated ? ['truncated'] : [],
   }));
 
   return [textArtifact, ...tableArtifacts];

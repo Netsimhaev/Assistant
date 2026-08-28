@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { crc32 } from 'node:zlib';
 import { extractDocx, readTrackedChangeInfo } from './docx.js';
+import {
+  W_NS,
+  XML_HEADER,
+  documentXml,
+  tempDocxPath,
+  writeDocx,
+} from '../fixtures/build-docx.js';
 import type { Block, TableContent, TextContent } from '../types.js';
 
 const fixture = (name: string) => fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url));
@@ -12,105 +16,10 @@ const fixture = (name: string) => fileURLToPath(new URL(`../fixtures/${name}`, i
 const blocksOf = (content: unknown): Block[] => (content as TextContent).blocks;
 const rowsOf = (content: unknown): TableContent['rows'] => (content as TableContent).rows;
 
-async function tempDocxPath(name: string): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), 'docx-extractor-'));
-  return join(dir, name);
-}
-
-/**
- * A minimal, hand-built ZIP (store method — no deflate needed, since this
- * module's own reader never checks CRC and neither does `mammoth`'s). Built
- * from scratch rather than pulled from a library because there is no
- * "admitted" docx-*writing* dependency (spec §9.1 only ever justified
- * *reading* one) — the same reasoning `xlsx.test.ts`'s macro-part test
- * already used to hand-patch raw ZIP bytes instead of reaching for a tool.
- *
- * Verified against `mammoth` directly before use here: a docx containing
- * only `word/document.xml` opens fine (no `[Content_Types].xml`, no
- * `_rels/`, no `word/styles.xml` required — `docx-reader.js` falls back to
- * sane defaults for every part but the main document), and
- * `word/comments.xml` is found by mammoth's own path-fallback
- * (`findPartPath`'s `fallbackPath: "word/comments.xml"`) with no
- * relationship entry needed either.
- */
-function buildDocx(entries: Record<string, string>): Buffer {
-  const names = Object.keys(entries);
-  const localParts: Buffer[] = [];
-  const centralParts: Buffer[] = [];
-  let offset = 0;
-
-  for (const name of names) {
-    const nameBuf = Buffer.from(name, 'utf8');
-    const data = Buffer.from(entries[name] ?? '', 'utf8');
-    const crc = crc32(data);
-
-    const localHeader = Buffer.alloc(30);
-    localHeader.writeUInt32LE(0x04034b50, 0);
-    localHeader.writeUInt16LE(20, 4);
-    localHeader.writeUInt16LE(0, 6);
-    localHeader.writeUInt16LE(0, 8); // method: store
-    localHeader.writeUInt16LE(0, 10);
-    localHeader.writeUInt16LE(0, 12);
-    localHeader.writeUInt32LE(crc, 14);
-    localHeader.writeUInt32LE(data.length, 18);
-    localHeader.writeUInt32LE(data.length, 22);
-    localHeader.writeUInt16LE(nameBuf.length, 26);
-    localHeader.writeUInt16LE(0, 28);
-
-    const localEntry = Buffer.concat([localHeader, nameBuf, data]);
-    localParts.push(localEntry);
-
-    const centralHeader = Buffer.alloc(46);
-    centralHeader.writeUInt32LE(0x02014b50, 0);
-    centralHeader.writeUInt16LE(20, 4);
-    centralHeader.writeUInt16LE(20, 6);
-    centralHeader.writeUInt16LE(0, 8);
-    centralHeader.writeUInt16LE(0, 10);
-    centralHeader.writeUInt16LE(0, 12);
-    centralHeader.writeUInt16LE(0, 14);
-    centralHeader.writeUInt32LE(crc, 16);
-    centralHeader.writeUInt32LE(data.length, 20);
-    centralHeader.writeUInt32LE(data.length, 24);
-    centralHeader.writeUInt16LE(nameBuf.length, 28);
-    centralHeader.writeUInt16LE(0, 30);
-    centralHeader.writeUInt16LE(0, 32);
-    centralHeader.writeUInt16LE(0, 34);
-    centralHeader.writeUInt16LE(0, 36);
-    centralHeader.writeUInt32LE(0, 38);
-    centralHeader.writeUInt32LE(offset, 42);
-
-    centralParts.push(Buffer.concat([centralHeader, nameBuf]));
-    offset += localEntry.length;
-  }
-
-  const localSection = Buffer.concat(localParts);
-  const centralSection = Buffer.concat(centralParts);
-
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0);
-  eocd.writeUInt16LE(0, 4);
-  eocd.writeUInt16LE(0, 6);
-  eocd.writeUInt16LE(names.length, 8);
-  eocd.writeUInt16LE(names.length, 10);
-  eocd.writeUInt32LE(centralSection.length, 12);
-  eocd.writeUInt32LE(localSection.length, 16);
-  eocd.writeUInt16LE(0, 20);
-
-  return Buffer.concat([localSection, centralSection, eocd]);
-}
-
-async function writeDocx(fileName: string, entries: Record<string, string>): Promise<string> {
-  const path = await tempDocxPath(fileName);
-  await writeFile(path, buildDocx(entries));
-  return path;
-}
-
-const XML_HEADER = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
-const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
-
-function documentXml(bodyXml: string): string {
-  return `${XML_HEADER}\n<w:document ${W_NS}><w:body>${bodyXml}</w:body></w:document>`;
-}
+// `word/comments.xml` is found by mammoth's own path-fallback
+// (`findPartPath`'s `fallbackPath: "word/comments.xml"`) with no
+// relationship entry needed — verified directly against the library before
+// this file's comment-only test below was written.
 
 // Same numbering definition as `tiny.docx` (numId 1 -> a level-0 bullet) —
 // verified against the fixture's own `word/numbering.xml` before writing
@@ -169,7 +78,12 @@ describe('extractDocx', () => {
     ]);
   });
 
-  it("shapes the table's cells exactly like xlsx.ts's TableContent — {v, t: 'string'} — so a reader cannot tell the two apart", async () => {
+  it("shapes the table's non-empty text cells exactly like xlsx.ts's TableContent, with genuine string content typed 'string'", async () => {
+    // tiny.docx's own table is all plain text ("עמודה א" over "ערך 1", …) —
+    // this only proves the shape survives for a genuinely string-typed cell.
+    // It does not prove a numeric-looking or empty cell classifies the way
+    // xlsx.ts's does; the test below does, using a hand-built table this
+    // fixture cannot express.
     const artifacts = await extractDocx(fixture('tiny.docx'));
     const table = artifacts.find((a) => a.kind === 'table');
     expect(rowsOf(table?.content)).toEqual([
@@ -180,6 +94,41 @@ describe('extractDocx', () => {
       [
         { v: 'ערך 1', t: 'string' },
         { v: 'ערך 2', t: 'string' },
+      ],
+    ]);
+  });
+
+  it('classifies a numeric-looking cell as number and an empty cell as empty, not unconditionally string — the fix for I3: a Word table must be interchangeable with an xlsx/csv table', async () => {
+    // Before this fix, expandTableRows built every cell as
+    // `{ v: text.trim(), t: 'string' }` unconditionally, which meant no
+    // Word table could ever produce a numeric range or headers in
+    // outline.ts (detectHeaders/columnStats need a non-string cell
+    // somewhere). Cells now classify through the same ../cell.ts
+    // `classifyField` csv.ts uses.
+    const path = await writeDocx('typed-cells.docx', {
+      'word/document.xml': documentXml(
+        '<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid>' +
+          '<w:tr><w:tc><w:p><w:r><w:t>פריט</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>מחיר</w:t></w:r></w:p></w:tc></w:tr>' +
+          '<w:tr><w:tc><w:p><w:r><w:t>עט</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>10</w:t></w:r></w:p></w:tc></w:tr>' +
+          '<w:tr><w:tc><w:p/></w:tc><w:tc><w:p><w:r><w:t>20</w:t></w:r></w:p></w:tc></w:tr>' +
+          '</w:tbl>',
+      ),
+    });
+
+    const artifacts = await extractDocx(path);
+    const table = artifacts.find((a) => a.kind === 'table');
+    expect(rowsOf(table?.content)).toEqual([
+      [
+        { v: 'פריט', t: 'string' },
+        { v: 'מחיר', t: 'string' },
+      ],
+      [
+        { v: 'עט', t: 'string' },
+        { v: 10, t: 'number' },
+      ],
+      [
+        { v: null, t: 'empty' },
+        { v: 20, t: 'number' },
       ],
     ]);
   });
@@ -422,5 +371,65 @@ describe('extractDocx', () => {
     });
 
     await expect(readTrackedChangeInfo(path)).resolves.toEqual({ scanned: false });
+  });
+
+  // I4: §5.3's content caps, moved into ../cell.ts and applied here the same
+  // way xlsx.test.ts already proves them for sheets.
+  it('caps table rows at 50,000 and flags the table artefact truncated, dropping what came after the cap', async () => {
+    const totalRows = 50_001;
+    const rowsXml = Array.from({ length: totalRows }, (_, i) => {
+      const label = i === 49_999 ? 'last-in-cap' : i === 50_000 ? 'beyond-cap' : `r${i}`;
+      return `<w:tr><w:tc><w:p><w:r><w:t>${label}</w:t></w:r></w:p></w:tc></w:tr>`;
+    }).join('');
+    const path = await writeDocx('row-cap.docx', {
+      'word/document.xml': documentXml(
+        `<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid>${rowsXml}</w:tbl>`,
+      ),
+    });
+
+    const artifacts = await extractDocx(path);
+    const table = artifacts.find((a) => a.kind === 'table');
+    const rows = rowsOf(table?.content);
+
+    expect(rows).toHaveLength(50_000);
+    expect(rows[49_999]?.[0]).toEqual({ v: 'last-in-cap', t: 'string' });
+    expect(rows.some((row) => row.some((cell) => cell.v === 'beyond-cap'))).toBe(false);
+    expect(table?.flags).toContain('truncated');
+  }, 30_000);
+
+  it('caps a table cell at 32,768 characters and flags the table artefact truncated', async () => {
+    const longText = 'א'.repeat(40_000);
+    const path = await writeDocx('table-cell-cap.docx', {
+      'word/document.xml': documentXml(
+        '<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/></w:tblGrid>' +
+          `<w:tr><w:tc><w:p><w:r><w:t>${longText}</w:t></w:r></w:p></w:tc></w:tr></w:tbl>`,
+      ),
+    });
+
+    const artifacts = await extractDocx(path);
+    const table = artifacts.find((a) => a.kind === 'table');
+    const rows = rowsOf(table?.content);
+    const cell = rows[0]?.[0];
+
+    expect(cell?.t).toBe('string');
+    expect((cell?.v as string).length).toBe(32_768);
+    expect(table?.flags).toContain('truncated');
+  });
+
+  it("caps a paragraph block's text at 32,768 characters and flags the text artefact truncated — the document-level slot tracked_changes already uses", async () => {
+    const longText = 'ב'.repeat(40_000);
+    const path = await writeDocx('block-text-cap.docx', {
+      'word/document.xml': documentXml(`<w:p><w:r><w:t>${longText}</w:t></w:r></w:p>`),
+    });
+
+    const [body] = await extractDocx(path);
+    const blocks = blocksOf(body?.content);
+    const paragraph = blocks.find((b) => b.kind === 'paragraph');
+
+    expect(paragraph?.kind).toBe('paragraph');
+    if (paragraph?.kind === 'paragraph') {
+      expect(paragraph.text.length).toBe(32_768);
+    }
+    expect(body?.flags).toContain('truncated');
   });
 });
