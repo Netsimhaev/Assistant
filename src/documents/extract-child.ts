@@ -18,6 +18,8 @@
  * convenience.
  */
 
+import { extractCsv } from './extractors/csv.js';
+import { extractDocx } from './extractors/docx.js';
 import { extractPassthrough } from './extractors/passthrough.js';
 import { extractXlsx } from './extractors/xlsx.js';
 import type { ExtractorId } from './registry.js';
@@ -36,11 +38,9 @@ async function dispatch(extractorId: ExtractorId, sourcePath: string): Promise<D
     case 'xlsx':
       return extractXlsx(sourcePath);
     case 'csv':
+      return extractCsv(sourcePath);
     case 'docx':
-      // Built in later tasks (§3.3, §4.2). A registry entry that names an
-      // id with no implementation here must fail loudly, not silently
-      // return nothing.
-      throw new Error(`extractor not yet implemented: ${extractorId}`);
+      return extractDocx(sourcePath);
   }
 }
 

@@ -82,11 +82,15 @@ export interface NewDocument {
  * Store a newly-arrived document as `pending`.
  *
  * Does not deduplicate on its own — a unique index on `(business_id, sha256)`
- * enforces that a caller must check `findBySha` first (§8: "same sha256
- * already exists → the existing document is returned; no duplicate is
- * created"). Racing that check against a concurrent insert is a real gap,
- * left to whichever caller (Task 7's `doc:ingest`) can serialise per business
- * — this function's job is only to refuse writing the same bytes twice.
+ * means a caller that checks `findBySha` first and then calls this function
+ * has a real race (two concurrent callers can both read nothing and both
+ * insert; the loser gets a thrown unique-violation instead of the row that
+ * won). `ingestDocument` (`ingest.ts`), the pipeline's real entry point,
+ * does not compose these two calls for exactly that reason — it calls
+ * `insertOrGetDocument` below instead, whose single `INSERT ... ON CONFLICT
+ * DO NOTHING RETURNING *` closes the race. `insertDocument` stays as the
+ * simpler primitive for a caller (today, only its own tests) that does not
+ * need dedupe-safety.
  */
 export async function insertDocument(
   input: NewDocument,
@@ -117,6 +121,90 @@ export async function insertDocument(
     throw new Error(`insertDocument: INSERT ... RETURNING produced no row for ${documentId}`);
   }
   return toDocument(row);
+}
+
+/**
+ * What the caller of `insertOrGetDocument` provides — `NewDocument` plus a
+ * caller-generated `documentId`. Unlike `insertDocument`, the id is not
+ * generated inside this function: `stored_path` is built from it
+ * (`<documentRoot>/<businessId>/<documentId>/original.<ext>`, §3.5) by
+ * `ingestDocument` *before* this call, since `stored_path` is itself one of
+ * the columns this INSERT writes. Generating the id here, as `insertDocument`
+ * does, would make that impossible to sequence.
+ */
+export interface NewDocumentWithId extends NewDocument {
+  documentId: string;
+}
+
+/**
+ * Store a newly-arrived document as `pending`, or hand back the document
+ * already stored under this business for the same `sha256` (§8: "same
+ * sha256 already exists → the existing document is returned; no duplicate
+ * is created").
+ *
+ * A single `INSERT ... ON CONFLICT (business_id, sha256) DO NOTHING
+ * RETURNING *` — the same shape `bindPlanToJob` already uses in
+ * `orchestrator/plan-store.ts` — not `findBySha` followed by `insertDocument`.
+ * That two-statement form is a real race: two concurrent ingests of
+ * identical bytes both read nothing, both insert, and the unique index on
+ * `(business_id, sha256)` rejects the loser with a thrown error instead of
+ * quietly returning the row that won. Folding the check into the INSERT's
+ * own conflict clause makes the database the single point of truth for
+ * "did this row already exist," instead of two callers racing a read.
+ *
+ * When this call loses the race (`created: false`), the caller's own
+ * `documentId` and any file already associated with it in memory were never
+ * written anywhere — `ingestDocument` only writes bytes to disk after a
+ * `created: true` result, so a lost race leaves no orphaned file.
+ */
+export async function insertOrGetDocument(
+  input: NewDocumentWithId,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<{ document: DocumentRecord; created: boolean }> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  const documentId = input.documentId;
+
+  const inserted = await db.query<DocumentRow>(
+    `INSERT INTO documents
+       (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+     ON CONFLICT (business_id, sha256) DO NOTHING
+     RETURNING *`,
+    [
+      documentId,
+      businessId,
+      input.source,
+      input.originalName,
+      input.mediaType,
+      input.sha256,
+      input.byteSize,
+      input.storedPath,
+    ],
+  );
+  const insertedRow = inserted.rows[0];
+  if (insertedRow) return { document: toDocument(insertedRow), created: true };
+
+  // Lost the race (or simply arrived second): another row already holds
+  // this (business_id, sha256) pair. Read it back rather than fabricate a
+  // record from what we tried to insert — a concurrent winner's row may
+  // carry a different documentId, source or storedPath than ours would
+  // have.
+  const { rows } = await db.query<DocumentRow>(
+    'SELECT * FROM documents WHERE business_id = $1 AND sha256 = $2',
+    [businessId, input.sha256],
+  );
+  const existing = rows[0];
+  if (!existing) {
+    // The ON CONFLICT fired, which means a row for this (business_id,
+    // sha256) existed a statement ago — only a concurrent delete of that
+    // exact document explains its absence now. Louder than pretending we
+    // found nothing.
+    throw new Error(
+      `insertOrGetDocument: ON CONFLICT fired for business ${businessId} sha256 ${input.sha256}, but no row was found on re-select`,
+    );
+  }
+  return { document: toDocument(existing), created: false };
 }
 
 /** The document with this hash for this business, or null if none was ever stored. */

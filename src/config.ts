@@ -36,4 +36,12 @@ export const config = {
   // spend ledger and the audit chain; a deploy that forgets it would run under
   // someone else's name and interleave two businesses' audit chains.
   businessId: required('BUSINESS_ID'),
+  // Required, not defaulted — same reasoning as BUSINESS_ID above. This is
+  // the one directory the reading agent (`know.reader`, gate-hook.ts's path
+  // check) is scoped to, and it is where ingestDocument stores every
+  // document's bytes (spec §3.5: "same root, not a second root"). A deploy
+  // that forgot this and fell back to some default would write documents
+  // into a directory the reader was never told about — ingested and
+  // unreadable.
+  documentRoot: required('DOCUMENT_ROOT'),
 } as const;
