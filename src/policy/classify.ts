@@ -35,6 +35,14 @@ const TOOL_ACTION_CLASS: Record<string, ActionClass> = {
   // unrecorded code execution. It is classified now, which costs an agent
   // nothing it should have had.
   'file.write': 'artifact.write',
+  // Same argument as `file.write` above, one step stronger. `code_execution`
+  // sat in `READ_ONLY_TOOLS`, which does not mean "harmless" — it means the
+  // call skips gate steps 5–10 and leaves no audit row at all, because steps
+  // 1–4 do not log. It was also allowlisted for `know.reader`, the agent whose
+  // input is untrusted by construction; the quarantine invariant passed only
+  // because an unclassified tool is invisible to it. Classified here and
+  // removed from that allowlist, so the invariant now actually covers it.
+  'code_execution': 'artifact.write',
   'doc.deliver': 'doc.deliver',
   'memory.write_entity': 'memory.write_longterm',
   'memory.write_chunk': 'memory.write_longterm',
@@ -63,7 +71,6 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'wa.can_send_freeform',
   'wa.conversation_state',
   'doc.fetch',
-  'code_execution',
   'render.markdown',
   'chart.render',
   'tasks.read',

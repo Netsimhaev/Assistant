@@ -53,7 +53,11 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
 
   // --- Knowledge & Memory -------------------------------------------------
   // Reads untrusted content; holds zero capability by construction.
-  'know.reader': ['doc.fetch', 'code_execution', 'memory.recall'],
+  // `code_execution` was here and is gone. It is classified now
+  // (`src/policy/classify.ts`), and the quarantine rule is that this agent
+  // holds zero classified tools — it reads untrusted documents, so anything it
+  // holds is something injected text can ask it to do.
+  'know.reader': ['doc.fetch', 'memory.recall'],
 
   // The only agent permitted to write long-term memory.
   'know.memory': [
