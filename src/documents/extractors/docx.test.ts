@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { crc32 } from 'node:zlib';
-import { extractDocx } from './docx.js';
+import { extractDocx, readTrackedChangeInfo } from './docx.js';
 import type { Block, TableContent, TextContent } from '../types.js';
 
 const fixture = (name: string) => fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url));
@@ -309,5 +309,118 @@ describe('extractDocx', () => {
     const artifacts = await extractDocx(path);
     expect(artifacts).toHaveLength(1);
     expect(artifacts[0]).toEqual({ ordinal: 0, kind: 'text', partName: null, content: { blocks: [] }, flags: [] });
+  });
+
+  it('does not split a list across a blank paragraph between two bullet points — the blank line Word leaves behind mid-edit must not read as a real break', async () => {
+    const path = await writeDocx('blank-paragraph-in-list.docx', {
+      'word/document.xml': documentXml(bulletItemXml('פריט א') + '<w:p/>' + bulletItemXml('פריט ב')),
+      'word/numbering.xml': BULLET_NUMBERING,
+    });
+
+    const [body] = await extractDocx(path);
+    expect(blocksOf(body?.content)).toEqual([{ kind: 'list', items: ['פריט א', 'פריט ב'] }]);
+  });
+
+  it('expands a horizontal merge (w:gridSpan): the merged cell fills every column it visually covers', async () => {
+    const path = await writeDocx('horizontal-merge.docx', {
+      'word/document.xml': documentXml(
+        '<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid>' +
+          '<w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>ממוזג רוחבית</w:t></w:r></w:p></w:tc></w:tr>' +
+          '<w:tr><w:tc><w:p><w:r><w:t>שורה2 עמודה1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>שורה2 עמודה2</w:t></w:r></w:p></w:tc></w:tr>' +
+          '</w:tbl>',
+      ),
+    });
+
+    const artifacts = await extractDocx(path);
+    const table = artifacts.find((a) => a.kind === 'table');
+    expect(rowsOf(table?.content)).toEqual([
+      [
+        { v: 'ממוזג רוחבית', t: 'string' },
+        { v: 'ממוזג רוחבית', t: 'string' },
+      ],
+      [
+        { v: 'שורה2 עמודה1', t: 'string' },
+        { v: 'שורה2 עמודה2', t: 'string' },
+      ],
+    ]);
+  });
+
+  it('expands a vertical merge (w:vMerge) without shifting the surviving cell into the wrong column — this is the exact bug the ruling named', async () => {
+    const path = await writeDocx('vertical-merge.docx', {
+      'word/document.xml': documentXml(
+        '<w:tbl><w:tblPr/><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid>' +
+          '<w:tr>' +
+          '<w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>ממוזג אנכית</w:t></w:r></w:p></w:tc>' +
+          '<w:tc><w:p><w:r><w:t>שורה1 עמודה2</w:t></w:r></w:p></w:tc>' +
+          '</w:tr>' +
+          '<w:tr>' +
+          '<w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>' +
+          '<w:tc><w:p><w:r><w:t>שורה2 עמודה2</w:t></w:r></w:p></w:tc>' +
+          '</w:tr>' +
+          '</w:tbl>',
+      ),
+    });
+
+    const artifacts = await extractDocx(path);
+    const table = artifacts.find((a) => a.kind === 'table');
+    const rows = rowsOf(table?.content);
+
+    // mammoth filters the second row's vMerge-continuation cell out of
+    // row.children entirely, leaving only one real cell there
+    // ("שורה2 עמודה2") — a naive index-0 placement of that surviving cell
+    // is exactly the shift the ruling reported (a reviewer's repro showed
+    // column 2's value landing at index 0). The correct row 2 is
+    // [column0: the merged value carried down, column1: its own cell] —
+    // not [column0: "שורה2 עמודה2"].
+    expect(rows).toEqual([
+      [
+        { v: 'ממוזג אנכית', t: 'string' },
+        { v: 'שורה1 עמודה2', t: 'string' },
+      ],
+      [
+        { v: 'ממוזג אנכית', t: 'string' },
+        { v: 'שורה2 עמודה2', t: 'string' },
+      ],
+    ]);
+  });
+
+  it('flags tracked_changes when the raw-XML scan cannot find word/document.xml at its expected name — fails closed, not open', async () => {
+    // A legal (if unusual) OOXML package: the main document part lives at
+    // a non-default path, reachable only via the relationship
+    // `_rels/.rels` declares. mammoth follows the relationship and reads
+    // it fine — verified directly against the library before writing this
+    // test — but this module's raw-XML fallback only ever looks for the
+    // literal name "word/document.xml", which this package does not have.
+    const rels = `${XML_HEADER}
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/main.xml"/>
+</Relationships>`;
+    const path = await writeDocx('redirected-main-part.docx', {
+      '_rels/.rels': rels,
+      'word/main.xml': documentXml('<w:p><w:r><w:t>מסמך בנתיב לא רגיל</w:t></w:r></w:p>'),
+    });
+
+    const [body] = await extractDocx(path);
+    // The document itself was read correctly (proof mammoth succeeded)...
+    expect(blocksOf(body?.content)).toEqual([{ kind: 'paragraph', text: 'מסמך בנתיב לא רגיל' }]);
+    // ...but the scan that should have looked for tracked changes could
+    // not complete, and a scan that could not complete must flag rather
+    // than silently report "none found".
+    expect(body?.flags).toContain('tracked_changes');
+  });
+
+  it('readTrackedChangeInfo reports it could not scan — not "no tracked changes" — for bytes that are not a ZIP at all', async () => {
+    const path = await tempDocxPath('not-a-zip.docx');
+    await writeFile(path, 'this is not a zip file, just plain bytes, no PK signature anywhere');
+
+    await expect(readTrackedChangeInfo(path)).resolves.toEqual({ scanned: false });
+  });
+
+  it('readTrackedChangeInfo reports it could not scan when word/document.xml is simply absent from an otherwise well-formed ZIP', async () => {
+    const path = await writeDocx('scan-missing-entry.docx', {
+      'word/other.xml': documentXml('<w:p><w:r><w:t>לא במקום הרגיל</w:t></w:r></w:p>'),
+    });
+
+    await expect(readTrackedChangeInfo(path)).resolves.toEqual({ scanned: false });
   });
 });

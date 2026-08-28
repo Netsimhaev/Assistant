@@ -55,20 +55,41 @@
  * shape `archive-guard.ts` already walks for a different purpose. Only
  * `deflate` (method 8, what every part Word/`mammoth` write) and `store`
  * (method 0) are handled; anything else, or a part that isn't found at all,
- * degrades to "no tracked-changes info recovered from raw XML" rather than
- * throwing — the archive guard has already run, upstream, before this
- * extractor is ever invoked, so a `.docx` that reaches here is a ZIP mammoth
- * itself could open, and a failure here would only ever mean this narrow
- * fallback met something outside its scope.
+ * degrades to "raw XML unreadable" rather than throwing — the archive guard
+ * has already run, upstream, before this extractor is ever invoked, so a
+ * `.docx` that reaches here is a ZIP mammoth itself could open, and a
+ * failure here would only ever mean this narrow fallback met something
+ * outside its scope. "Unreadable" is not "clean", though: see
+ * `TrackedChangeScan` below for what `extractDocx` does with that outcome.
  *
- * **Merged/spanning table cells are not expanded.** Unlike `xlsx.ts`'s
- * merged-cell handling (spec §4.1 requires it explicitly), §4.2 says
- * nothing about `w:gridSpan`/`w:vMerge`, and the fixture has no merged
- * cell. Each `w:tc` becomes exactly one `Cell`, in document order — a
- * spanning cell is not repeated across the columns it visually covers, so a
- * row that spans unevenly can come out shorter than its neighbours. Adding
- * span-expansion untested would be exactly the "branch nobody exercises"
- * this task's brief warns against.
+ * **Merged/spanning table cells are expanded, matching `xlsx.ts`.** §4.2
+ * says nothing about `w:gridSpan`/`w:vMerge` the way §4.1 explicitly
+ * requires merge-expansion for Excel, but the brief's own bar — a table
+ * from Word and a table from a spreadsheet must be interchangeable — rules
+ * out leaving them raw. Two different things go wrong if a merge is left
+ * unexpanded, and only one of them is cosmetic: a `w:gridSpan` (horizontal
+ * merge) just makes a `Cell` for one column instead of several, so the row
+ * comes out short — visibly wrong, easy to notice. A `w:vMerge` (vertical
+ * merge) is worse: mammoth's own `body-reader.js` *removes* a merge's
+ * continuation cell from `row.children` entirely once it has folded that
+ * cell's presence into the anchor cell's `rowSpan` one column over
+ * (`calculateRowSpans`) — so every cell after it in that row silently
+ * shifts one index to the left. Read positionally, that is not a short row,
+ * it is the wrong column's value sitting at another column's index.
+ *
+ * `expandTableRows` below reconstructs the true grid from `colSpan`/
+ * `rowSpan`: a `Map` of columns still "occupied" by a still-open vertical
+ * span is consulted at every column position before consuming the row's
+ * next real cell, so a continuation row's surviving cells land at their
+ * real column index rather than sliding into a gap the tree no longer
+ * marks. A spanned cell's value is written to every coordinate it covers,
+ * the same rule `xlsx.ts`'s `anchorOf`/merge-spreading already applies to
+ * Excel. If the tree ever failed to carry enough to reconstruct a position
+ * (colSpan/rowSpan resolving to something other than a positive integer),
+ * an explicit `{ v: null, t: 'empty' }` placeholder fills that coordinate
+ * instead of ever letting a real cell's value drift into it — the ruling
+ * this responds to was explicit that a shifted row is worse than a short
+ * one, and must never happen silently.
  *
  * **A nested table does not get its own `table` artefact.** A table inside
  * a table cell is flattened into that cell's text by `collectText` (its
@@ -104,6 +125,19 @@ interface MammothDocument {
 function styleIdOf(node: MammothNode): string | null {
   const value = (node as { styleId?: unknown }).styleId;
   return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/**
+ * `colSpan`/`rowSpan` on a `tableCell` node, defensively — a positive
+ * integer if the tree carries one, `1` (the "no span" default) for
+ * anything else. mammoth's own `documents.js` `TableCell` always
+ * initialises both to `1` when absent, so `1` is not a guess, it is this
+ * module's own copy of that same default for the one field
+ * (`documents.js`'s constructor default) it cannot import a type for.
+ */
+function spanOf(node: MammothNode, key: 'colSpan' | 'rowSpan'): number {
+  const value = (node as { colSpan?: unknown; rowSpan?: unknown })[key];
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : 1;
 }
 
 /**
@@ -161,15 +195,81 @@ function collectText(node: MammothNode): string {
   }
 }
 
+interface PendingSpan {
+  value: Cell;
+  remainingRows: number;
+}
+
+/**
+ * Reconstructs a table's true grid from mammoth's row/cell tree, expanding
+ * `colSpan` and `rowSpan` the way a browser lays out `rowspan`/`colspan` in
+ * HTML — a running `pending` map of columns still covered by a vertical
+ * span from an earlier row, consulted at every column position before ever
+ * consuming the row's own next cell. See the module docblock for why this
+ * exists: a `w:vMerge` continuation cell is missing from `row.children`
+ * entirely by the time the tree reaches this module, and mapping a row's
+ * surviving cells straight to sequential indices would silently shift every
+ * cell after the gap into the wrong column.
+ */
+function expandTableRows(table: MammothNode): Cell[][] {
+  const rows = (table.children ?? []).filter((row) => row.type === 'tableRow');
+  const pending = new Map<number, PendingSpan>();
+  const grid: Cell[][] = [];
+
+  for (const row of rows) {
+    const cells = (row.children ?? []).filter((cell) => cell.type === 'tableCell');
+    const outputRow: Cell[] = [];
+    let column = 0;
+    let cellIndex = 0;
+
+    while (cellIndex < cells.length || pending.has(column)) {
+      const occupied = pending.get(column);
+      if (occupied) {
+        outputRow[column] = occupied.value;
+        const remainingRows = occupied.remainingRows - 1;
+        if (remainingRows > 0) {
+          pending.set(column, { value: occupied.value, remainingRows });
+        } else {
+          pending.delete(column);
+        }
+        column += 1;
+        continue;
+      }
+
+      const cellNode = cells[cellIndex];
+      if (cellNode === undefined) break; // unreachable given the loop condition; satisfies noUncheckedIndexedAccess
+      cellIndex += 1;
+
+      const value: Cell = { v: collectText(cellNode).trim(), t: 'string' };
+      const colSpan = spanOf(cellNode, 'colSpan');
+      const rowSpan = spanOf(cellNode, 'rowSpan');
+
+      for (let offset = 0; offset < colSpan; offset++) {
+        outputRow[column + offset] = value;
+        if (rowSpan > 1) {
+          pending.set(column + offset, { value, remainingRows: rowSpan - 1 });
+        }
+      }
+      column += colSpan;
+    }
+
+    // Never let a hole in `outputRow` surface as a shifted row: the loop
+    // above should never leave one (every column from 0 up is accounted for
+    // by either a pending span or a real cell), but the ruling this
+    // responds to was explicit that a position the tree didn't carry enough
+    // to reconstruct must get a placeholder, not a neighbour's value.
+    for (let i = 0; i < outputRow.length; i++) {
+      if (outputRow[i] === undefined) outputRow[i] = { v: null, t: 'empty' };
+    }
+
+    grid.push(outputRow);
+  }
+
+  return grid;
+}
+
 function tableContentOf(table: MammothNode): TableContent {
-  const rows: Cell[][] = (table.children ?? [])
-    .filter((row) => row.type === 'tableRow')
-    .map((row) =>
-      (row.children ?? [])
-        .filter((cell) => cell.type === 'tableCell')
-        .map((cell): Cell => ({ v: collectText(cell).trim(), t: 'string' })),
-    );
-  return { rows };
+  return { rows: expandTableRows(table) };
 }
 
 // --- Raw-ZIP fallback for tracked-change deletions (see module docblock) ---
@@ -264,19 +364,42 @@ function unescapeXmlText(value: string): string {
     .replace(/&amp;/g, '&');
 }
 
-interface TrackedChangeInfo {
-  /** Whether raw XML shows an insertion or a deletion element at all. */
-  hasInsOrDel: boolean;
-  /** Every `w:delText` run's content, in document order, unescaped. */
-  deletedTexts: string[];
-}
+/**
+ * `scanned: false` means the raw-XML pass could not complete — the entry
+ * wasn't found under its expected name, the ZIP couldn't be parsed at all,
+ * or its declared sizes didn't fit the file. This is a distinct outcome
+ * from `scanned: true, hasInsOrDel: false`, which means the pass *did*
+ * complete and genuinely found nothing. Collapsing the two into one
+ * "no tracked changes" value is exactly the bug this type exists to
+ * prevent: a value this module could not read must never be written down
+ * as the permissive one (`CLAUDE.md`'s rule for the sibling
+ * governance codebase, and no less true here — see `extractDocx` below,
+ * which treats `scanned: false` as "flag it", not "clear it").
+ */
+type TrackedChangeScan =
+  | { scanned: true; hasInsOrDel: boolean; deletedTexts: string[] }
+  | { scanned: false };
 
-const NO_TRACKED_CHANGES: TrackedChangeInfo = { hasInsOrDel: false, deletedTexts: [] };
+const SCAN_INCOMPLETE: TrackedChangeScan = { scanned: false };
 
-async function readTrackedChangeInfo(sourcePath: string): Promise<TrackedChangeInfo> {
+/**
+ * Exported for `docx.test.ts` alone: end-to-end coverage of "the raw scan
+ * could not complete" needs mammoth to still succeed while this function's
+ * *own* read of the same `word/document.xml` fails — achievable (a
+ * relationship pointing the main document part at a non-default path,
+ * verified against `mammoth` directly) for "the entry isn't where this
+ * function assumes it is", but every corruption tried against a truly
+ * malformed central directory or compressed stream broke `mammoth`'s own
+ * (`JSZip`-based) read identically, since both readers are bound by the
+ * same declared sizes/signatures for the one entry both need. Testing this
+ * function directly against bytes that are not a ZIP at all is what
+ * actually exercises its "malformed package" branches without that
+ * confound.
+ */
+export async function readTrackedChangeInfo(sourcePath: string): Promise<TrackedChangeScan> {
   const buffer = await readFile(sourcePath);
   const xml = readZipEntry(buffer, 'word/document.xml');
-  if (!xml) return NO_TRACKED_CHANGES;
+  if (!xml) return SCAN_INCOMPLETE;
   const text = xml.toString('utf8');
 
   // `<w:del` also matches `<w:delText`'s prefix, which is correct here: a
@@ -291,7 +414,7 @@ async function readTrackedChangeInfo(sourcePath: string): Promise<TrackedChangeI
     deletedTexts.push(unescapeXmlText(match[1] ?? ''));
   }
 
-  return { hasInsOrDel, deletedTexts };
+  return { scanned: true, hasInsOrDel, deletedTexts };
 }
 
 // --- Block assembly ---
@@ -334,13 +457,6 @@ export async function extractDocx(sourcePath: string): Promise<DocumentArtifact[
     if (node.type !== 'paragraph') continue;
 
     const text = collectText(node).trim();
-    const level = headingLevelOf(node);
-
-    if (level !== null) {
-      flushList();
-      if (text !== '') blocks.push({ kind: 'heading', level, text });
-      continue;
-    }
 
     if (isListItem(node)) {
       // An empty list item contributes nothing but also does not interrupt
@@ -353,13 +469,33 @@ export async function extractDocx(sourcePath: string): Promise<DocumentArtifact[
       continue;
     }
 
+    // An empty non-list paragraph — the blank line Word leaves behind when
+    // someone presses Enter between two bullets while editing — carries no
+    // content of its own and must not interrupt a list run either. Checked
+    // *before* `flushList()` runs: the earlier version called `flushList()`
+    // unconditionally here and only gated the *push* on `text !== ''`,
+    // which flushed (and so split) a list across exactly this kind of blank
+    // paragraph. A real, non-empty paragraph or heading is a genuine break
+    // in the list and does still flush, below.
+    if (text === '') continue;
+
     flushList();
-    if (text !== '') blocks.push({ kind: 'paragraph', text });
+    const level = headingLevelOf(node);
+    if (level !== null) {
+      blocks.push({ kind: 'heading', level, text });
+    } else {
+      blocks.push({ kind: 'paragraph', text });
+    }
   }
   flushList();
 
-  const { hasInsOrDel, deletedTexts } = await readTrackedChangeInfo(sourcePath);
-  const trackedChanges = hasInsOrDel || document.comments.length > 0;
+  const scan = await readTrackedChangeInfo(sourcePath);
+  // A scan that could not complete is treated as "flag it", never "clear
+  // it" — see `TrackedChangeScan`'s docblock. `deletedTexts` has nothing to
+  // contribute when the scan didn't complete either; there is no raw text
+  // to have recovered anything from.
+  const deletedTexts = scan.scanned ? scan.deletedTexts : [];
+  const trackedChanges = !scan.scanned || scan.hasInsOrDel || document.comments.length > 0;
 
   if (deletedTexts.length > 0) {
     blocks.push({
