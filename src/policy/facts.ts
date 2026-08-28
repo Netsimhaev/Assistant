@@ -185,6 +185,16 @@ function collectStrings(input: Record<string, unknown>, keys: string[]): string[
   return out;
 }
 
+/**
+ * Reads through the prototype chain, deliberately, unlike `readString` above.
+ *
+ * Its only caller is `discountPercent`, where a value that is present makes the
+ * action look BIGGER — it is compared against the charter's discount ceiling.
+ * Ignoring an inherited one would be the permissive move, and "own properties
+ * only" is a rule about not letting an unstated field loosen a decision, not a
+ * rule about ownership for its own sake. See `inherited-fields.test.ts`, which
+ * pins both directions.
+ */
 function readNumber(input: Record<string, unknown>, key: string): number | null {
   const value = input[key];
   return typeof value === 'number' && Number.isFinite(value) ? value : null;

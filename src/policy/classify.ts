@@ -318,10 +318,18 @@ export function refineActionClass(
   input: Record<string, unknown>,
 ): ActionClass {
   switch (base) {
+    // `Object.hasOwn` on both: a thread reference is the one field here whose
+    // presence makes the class GENTLER — `email.reply` carries `auto_notify`
+    // in the reference charter where `email.initiate` carries
+    // `approve_required`. An inherited value must not buy that downgrade. The
+    // amount and operation branches below deliberately keep reading through
+    // the chain, because there presence makes the class stricter.
     case 'email.reply':
-      return hasThreadRef(input['inReplyTo']) ? 'email.reply' : 'email.initiate';
+      return Object.hasOwn(input, 'inReplyTo') && hasThreadRef(input['inReplyTo'])
+        ? 'email.reply'
+        : 'email.initiate';
     case 'whatsapp.reply':
-      return hasThreadRef(input['conversationId'])
+      return Object.hasOwn(input, 'conversationId') && hasThreadRef(input['conversationId'])
         ? 'whatsapp.reply'
         : 'whatsapp.initiate';
     case 'browser.interact': {

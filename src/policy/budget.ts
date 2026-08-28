@@ -114,7 +114,14 @@ export async function checkBudget(
   // layer already treats an unrecognised counterparty as sensitive. Denying
   // here would be terminal and would silently forbid every first-time purchase.
   if (facts.supplierId !== null) {
-    const supplierCeiling = ceilings.approvedSupplierCeilingMinor[facts.supplierId];
+    // `Object.hasOwn`: `supplierId` comes from the payload, and a bare index on
+    // `'toString'` returns a function rather than `undefined`. The comparison
+    // that follows would be false either way, so nothing loosens today — but
+    // the table is keyed by owner-written ids and this is the read side of the
+    // same pattern the compiler now refuses on the write side.
+    const supplierCeiling = Object.hasOwn(ceilings.approvedSupplierCeilingMinor, facts.supplierId)
+      ? ceilings.approvedSupplierCeilingMinor[facts.supplierId]
+      : undefined;
     if (supplierCeiling !== undefined && facts.amountMinor > supplierCeiling) {
       return {
         permitted: false,

@@ -264,7 +264,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function readString(input: Record<string, unknown>, key: string): string | null {
+/**
+ * Own properties only, for the same reason as `readRecipients` below.
+ *
+ * `subject` and `body` are not policy inputs, but redaction rewrites the
+ * payload the gate approved, and this adapter is handed that rewritten copy.
+ * A field reachable only through the prototype is a field redaction never
+ * walked — sending it would put text on the wire that the charter's own
+ * patterns were never applied to.
+ *
+ * Exported so `inherited-fields.test.ts` can pin it directly, the same way
+ * `readRecipients` is pinned against the gate's reader.
+ */
+export function readString(input: Record<string, unknown>, key: string): string | null {
+  if (!Object.hasOwn(input, key)) return null;
   const value = input[key];
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
