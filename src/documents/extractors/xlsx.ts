@@ -30,8 +30,10 @@ import ExcelJS from 'exceljs';
 import type { Cell, DocumentArtifact, TableContent } from '../types.js';
 
 const MAX_SHEETS = 50;
-const MAX_ROWS_PER_SHEET = 50_000;
-const MAX_CELL_CHARS = 32_768;
+// Exported solely so cell.test.ts can lock these against ../cell.ts's own
+// copies (see that module's docblock) — not for any other caller's use.
+export const MAX_ROWS_PER_SHEET = 50_000;
+export const MAX_CELL_CHARS = 32_768;
 
 // Any conformant ZIP stores an entry's path as literal, uncompressed bytes
 // in both its local file header and its central directory record —
