@@ -48,16 +48,24 @@
  * a remote sender supplied (§5.5). A name containing `..` or a path
  * separator is inert data in that column.
  *
- * **A rejected document keeps its stored file.** Every rejection branch
- * below runs after the bytes are already written to disk — so someone can
- * open `stored_path` and see why a document was refused. The two branches
- * that must cost nothing on a hostile file — an unsupported type and a
- * malicious archive — both still write the file first: identifying a type
- * from a few kilobytes of header and reading a ZIP's central directory are
- * both cheap regardless of what the file contains, and neither spawns a
- * process. Spawning the isolated child (`runExtractor`) is the one
- * genuinely expensive step, and the archive guard runs strictly before it
- * for exactly that reason.
+ * **A rejected document keeps its stored file — with one exception.** Every
+ * rejection branch below except the size cap runs after the bytes are
+ * already written to disk — so someone can open `stored_path` and see why a
+ * document was refused. The two branches that must cost nothing on a
+ * hostile file — an unsupported type and a malicious archive — both still
+ * write the file first: identifying a type from a few kilobytes of header
+ * and reading a ZIP's central directory are both cheap regardless of what
+ * the file contains, and neither spawns a process. Spawning the isolated
+ * child (`runExtractor`) is the one genuinely expensive step, and the
+ * archive guard runs strictly before it for exactly that reason. The
+ * oversize branch is the one genuine exception, by design (see "The size
+ * cap" above): it returns *before* `mkdir`/`writeFile` ever run, because the
+ * entire point of checking it first is to never let an oversized file touch
+ * disk. A document rejected that way therefore carries a `stored_path`
+ * column naming a file that was never created — `stored_path` is still
+ * derived and stored (it is one of the dedupe INSERT's own columns), but
+ * nothing exists at that path, and a caller that expects to open every
+ * rejected document's stored copy must check for this one case first.
  */
 
 import { createHash } from 'node:crypto';
@@ -105,8 +113,15 @@ const SNIFF_HEAD_BYTES = 8192;
  */
 const UNKNOWN_MEDIA_TYPE = 'application/octet-stream';
 
-/** The extension `stored_path` gets for each type `sniffMediaType` can name — never the caller-supplied name's own extension (§5.5, §3.5). */
-const EXTENSION_BY_MEDIA_TYPE: Readonly<Record<string, string>> = {
+/**
+ * The extension `stored_path` gets for each type `sniffMediaType` can name —
+ * never the caller-supplied name's own extension (§5.5, §3.5). Exported so
+ * `media-type-tables.test.ts` can lock it against `media-type.ts`'s own
+ * constants and `registry.ts`'s `SUPPORTED` — three tables that must stay in
+ * sync, the same pattern `charter/capabilities.test.ts` already locks for
+ * the policy tables (CLAUDE.md's "structural tests are a guardrail" note).
+ */
+export const EXTENSION_BY_MEDIA_TYPE: Readonly<Record<string, string>> = {
   [XLSX]: 'xlsx',
   [DOCX]: 'docx',
   [CSV]: 'csv',
@@ -258,10 +273,23 @@ export async function ingestDocument(
   await mkdir(dirname(absolutePath), { recursive: true });
   // If this throws (disk full, permissions), the row above stays `pending`
   // with no file behind it — a genuine system fault, not a per-document
-  // one, so it propagates rather than being caught into a rejection. A
-  // retry with the same bytes recovers cleanly: insertOrGetDocument's
-  // re-select finds this same `pending` row instead of racing a second
-  // insert.
+  // one, so it propagates rather than being caught into a rejection.
+  //
+  // A `pending` row is terminal today, not a recoverable state. A retry
+  // with the same bytes does **not** resume it: `insertOrGetDocument`'s
+  // `ON CONFLICT (business_id, sha256) DO NOTHING` fires because the sha is
+  // already taken, its re-select finds this same `pending` row, and
+  // `ingestDocument` returns it unchanged (`if (!created) return document`,
+  // above) — nothing re-drives extraction. The three windows that produce a
+  // stuck `pending` row: this `writeFile` throwing, a transient database
+  // error inside `markExtracted`'s transaction after extraction already
+  // succeeded, or the process being killed between the insert and either of
+  // those completing. The only repair today is deleting the row (and, if
+  // one was written, its file) by hand — making `pending` genuinely
+  // resumable needs `SELECT ... FOR UPDATE` or `ON CONFLICT DO NOTHING` on
+  // the artefact inserts to survive two concurrent resumers, which is
+  // deliberately out of scope here (see the fix-wave notes this docblock
+  // was corrected against).
   await writeFile(absolutePath, bytes);
 
   if (sniffed === null) {
