@@ -25,7 +25,10 @@ import { extractXlsx } from './extractors/xlsx.js';
 import type { ExtractorId } from './registry.js';
 import type { DocumentArtifact } from './types.js';
 
-const KNOWN_EXTRACTORS: readonly ExtractorId[] = ['xlsx', 'docx', 'csv', 'passthrough'];
+// Exported so `media-type-tables.test.ts` can lock it against `registry.ts`'s
+// `ExtractorId` union — an ExtractorId with no entry here would dispatch to
+// nothing at runtime despite compiling fine everywhere else.
+export const KNOWN_EXTRACTORS: readonly ExtractorId[] = ['xlsx', 'docx', 'csv', 'passthrough'];
 
 function isExtractorId(value: string): value is ExtractorId {
   return (KNOWN_EXTRACTORS as readonly string[]).includes(value);
