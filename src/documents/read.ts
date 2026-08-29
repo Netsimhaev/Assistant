@@ -1,0 +1,162 @@
+/**
+ * `readDocument` — artefacts in, a stored reading out (spec §6).
+ *
+ * The order these steps run in *is* the design, the same way it is in
+ * `ingestDocument`:
+ *
+ *   loadArtifacts → renderReadingBrief → hash → cache lookup →
+ *   markContentIngested → runKnowReader → saveReading
+ *
+ * **`markContentIngested` fires before the model sees a byte.** The flag is
+ * monotonic and exists so a job that consumed outside content can never be
+ * granted the first-contact exemption; a crash between the read and the write
+ * would otherwise leave a job that read and does not remember it. Early is the
+ * safe direction — migration 011 carries the full argument.
+ *
+ * **The cache lookup comes first, and a cache hit does not set the flag.** A
+ * hit performs no read, and marking a job as having consumed external content
+ * for a call that consumed nothing would tighten a control on the strength of
+ * something that did not happen.
+ *
+ * **Nothing here throws for a bad response.** An unparseable answer is stored
+ * as `unreadable` and returned, exactly as `ingestDocument` records a rejected
+ * document. A genuine fault — the database unreachable, no API key — still
+ * propagates, because that is not a property of the document.
+ */
+
+import { createHash } from 'node:crypto';
+import { ulid } from 'ulid';
+import { config } from '../config.js';
+import type { Queryable } from '../db/pool.js';
+import type { PolicyBundle } from '../domain/policy.js';
+import type { Reading } from '../domain/reading.js';
+import type { TrustLevel } from '../domain/trust.js';
+import { markContentIngested } from '../orchestrator/jobs.js';
+import { runKnowReader, type ReadOutcome, type ReadRequest } from '../sdk/know-reader.js';
+import { READING_PROMPT_VERSION } from '../sdk/reading-prompt.js';
+import { renderReadingBrief } from './brief.js';
+import { findReadingForBrief, saveReading, type ReadingRecord } from './reading-store.js';
+import { loadArtifacts } from './store.js';
+
+export interface ReadDocumentInput {
+  documentId: string;
+  bundle: PolicyBundle;
+  /** Trust of the source. Stored on the reading and never raised by it. */
+  provenance: TrustLevel;
+  /**
+   * The job this read belongs to, or explicitly `null` when there is none.
+   *
+   * Required rather than optional, for the reason `GateHookBinding.jobId`
+   * records: an omitted id and a genuinely job-less run must not be the same
+   * value, or the content-ingested flag stops being set by accident.
+   */
+  jobId: string | null;
+}
+
+export interface ReadDocumentOptions {
+  businessId?: string;
+  db?: Queryable;
+  documentRoot?: string;
+  /**
+   * The one step that costs money, injectable so the composition can be tested
+   * without an API key. Not a mock of the SDK — every other step in this
+   * function runs for real against the real database.
+   */
+  reader?: (request: ReadRequest) => Promise<ReadOutcome>;
+}
+
+export type ReadDocumentResult =
+  | { status: 'read'; reading: Reading; record: ReadingRecord; cached: boolean }
+  | { status: 'unreadable'; reason: string; record: ReadingRecord; cached: boolean }
+  | { status: 'no_artifacts' };
+
+function hashBrief(brief: string): string {
+  return createHash('sha256').update(brief, 'utf8').digest('hex');
+}
+
+/** The model this reader runs on, recorded so a reading can be attributed. */
+const READER_MODEL = 'haiku';
+
+export async function readDocument(
+  input: ReadDocumentInput,
+  options: ReadDocumentOptions = {},
+): Promise<ReadDocumentResult> {
+  const businessId = options.businessId ?? config.businessId;
+  const documentRoot = options.documentRoot ?? config.documentRoot;
+  const reader = options.reader ?? runKnowReader;
+
+  const artifacts = await loadArtifacts(input.documentId, {
+    businessId,
+    ...(options.db !== undefined ? { db: options.db } : {}),
+  });
+  if (artifacts.length === 0) {
+    // Not a failed reading — there was nothing to read. Storing an
+    // `unreadable` row here would blame the reader for the extractor's
+    // silence.
+    return { status: 'no_artifacts' };
+  }
+
+  const brief = renderReadingBrief(artifacts);
+  const briefHash = hashBrief(brief);
+
+  const cached = await findReadingForBrief(
+    input.documentId,
+    briefHash,
+    READING_PROMPT_VERSION,
+    { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
+  );
+  if (cached !== null) return fromRecord(cached, true);
+
+  if (input.jobId !== null) {
+    // Before the read, never after. See this module's header.
+    await markContentIngested(input.jobId, {
+      businessId,
+      ...(options.db !== undefined ? { db: options.db } : {}),
+    });
+  }
+
+  const outcome = await reader({
+    bundle: input.bundle,
+    artifacts,
+    provenance: input.provenance,
+    businessId,
+    jobId: input.jobId,
+    documentRoot,
+  });
+
+  const { record } = await saveReading(
+    {
+      readingId: `RDG-${ulid()}`,
+      documentId: input.documentId,
+      status: outcome.status,
+      reason: outcome.status === 'unreadable' ? outcome.reason : null,
+      content: outcome.status === 'read' ? outcome.reading : null,
+      provenance: input.provenance,
+      model: READER_MODEL,
+      promptVersion: READING_PROMPT_VERSION,
+      briefHash,
+    },
+    { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
+  );
+
+  return fromRecord(record, false);
+}
+
+/**
+ * One record, read back as a result.
+ *
+ * A stored row is the single source of truth for both paths — a cache hit and
+ * a fresh read return the same shape from the same place, so the two can never
+ * disagree about what was concluded.
+ */
+function fromRecord(record: ReadingRecord, cached: boolean): ReadDocumentResult {
+  if (record.status === 'read' && record.content !== null) {
+    return { status: 'read', reading: record.content, record, cached };
+  }
+  return {
+    status: 'unreadable',
+    reason: record.reason ?? 'unreadable, with no reason recorded',
+    record,
+    cached,
+  };
+}
