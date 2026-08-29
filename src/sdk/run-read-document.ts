@@ -66,6 +66,14 @@ async function main(): Promise<void> {
     console.log(`לא ניתן לקרוא: ${result.reason}`);
   }
   console.log(`\nמזהה קריאה: ${result.record.readingId}`);
+  // Nothing persists these — see spec §11. Printing them is the only place a
+  // gate denial during a read becomes visible, since stages 1–4 of the gate
+  // write no audit row.
+  console.log(
+    result.denials.length > 0
+      ? `דחיות מהשער במהלך הקריאה: ${result.denials.join(', ')}`
+      : 'השער לא דחה דבר במהלך הקריאה.',
+  );
 }
 
 try {

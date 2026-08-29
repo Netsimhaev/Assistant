@@ -84,6 +84,35 @@ describe('readDocument', () => {
     expect(result.cached).toBe(false);
   });
 
+  it('carries the gate denials the read collected, and reports an empty list on a cache hit', async () => {
+    // Gate stages 1–4 write no audit row, so if this field is dropped a
+    // denial during a read leaves no trace anywhere at all (spec §9).
+    const documentId = await anExtractedDocument();
+    const reader = async (request: { artifacts: readonly DocumentArtifact[] }): Promise<ReadOutcome> => {
+      const { interpretReaderResponse } = await import('../sdk/know-reader.js');
+      const { renderReadingBrief } = await import('./brief.js');
+      const { includedOrdinals } = renderReadingBrief(request.artifacts);
+      return interpretReaderResponse(
+        JSON.stringify(READING_JSON),
+        includedOrdinals,
+        ['tool_not_allowlisted'],
+        1,
+      );
+    };
+    const input = { documentId, bundle, provenance: 'boss' as const, jobId: null };
+
+    const fresh = await readDocument(input, { businessId: BUSINESS, reader });
+    expect(fresh.status).toBe('read');
+    expect(fresh.denials).toEqual(['tool_not_allowlisted']);
+
+    // The second read runs no tools of its own, so its empty list is a fact
+    // about this call and not the first call's list carried forward.
+    const cached = await readDocument(input, { businessId: BUSINESS, reader });
+    if (cached.status !== 'read') throw new Error('expected a reading');
+    expect(cached.cached).toBe(true);
+    expect(cached.denials).toEqual([]);
+  });
+
   it('does not call the model twice for the same document and brief', async () => {
     const documentId = await anExtractedDocument();
     const { reader, calls } = stubReader(JSON.stringify(READING_JSON));

@@ -85,10 +85,29 @@ export interface ReadDocumentOptions {
   reader?: (request: ReadRequest) => Promise<ReadOutcome>;
 }
 
+/**
+ * `denials` rides on every branch, and an empty array is an answer.
+ *
+ * Spec §9 records a gate denial during a read as an outcome of the read, and
+ * §6 puts the field on both branches of `ReadOutcome` — but it stopped at this
+ * composition boundary and was dropped. Gate stages 1–4 write no audit row, so
+ * a `tool_not_allowlisted` denial inside a read left no trace anywhere at all.
+ *
+ * A cache hit and a `no_artifacts` return both report `[]`: neither ran a
+ * tool, so "nothing was denied" is true of them, not missing from them. The
+ * field is **not** persisted — see spec §11; what belongs in the audit surface
+ * is its own decision and not a side effect of this one.
+ */
 export type ReadDocumentResult =
-  | { status: 'read'; reading: Reading; record: ReadingRecord; cached: boolean }
-  | { status: 'unreadable'; reason: string; record: ReadingRecord; cached: boolean }
-  | { status: 'no_artifacts' };
+  | { status: 'read'; reading: Reading; record: ReadingRecord; cached: boolean; denials: string[] }
+  | {
+      status: 'unreadable';
+      reason: string;
+      record: ReadingRecord;
+      cached: boolean;
+      denials: string[];
+    }
+  | { status: 'no_artifacts'; denials: string[] };
 
 function hashBrief(brief: string): string {
   return createHash('sha256').update(brief, 'utf8').digest('hex');
@@ -110,7 +129,7 @@ export async function readDocument(
     // Not a failed reading — there was nothing to read. Storing an
     // `unreadable` row here would blame the reader for the extractor's
     // silence.
-    return { status: 'no_artifacts' };
+    return { status: 'no_artifacts', denials: [] };
   }
 
   if (input.jobId !== null) {
@@ -157,7 +176,9 @@ export async function readDocument(
     input.provenance,
     { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
   );
-  if (cached !== null) return fromRecord(cached, true);
+  // A cache hit ran no tools of its own, so its denial list is empty as a
+  // fact and not as an omission.
+  if (cached !== null) return fromRecord(cached, true, []);
 
   const outcome = await reader({
     bundle: input.bundle,
@@ -186,7 +207,7 @@ export async function readDocument(
     { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
   );
 
-  return fromRecord(record, false);
+  return fromRecord(record, false, outcome.denials);
 }
 
 /**
@@ -196,14 +217,19 @@ export async function readDocument(
  * a fresh read return the same shape from the same place, so the two can never
  * disagree about what was concluded.
  */
-function fromRecord(record: ReadingRecord, cached: boolean): ReadDocumentResult {
+function fromRecord(
+  record: ReadingRecord,
+  cached: boolean,
+  denials: string[],
+): ReadDocumentResult {
   if (record.status === 'read' && record.content !== null) {
-    return { status: 'read', reading: record.content, record, cached };
+    return { status: 'read', reading: record.content, record, cached, denials };
   }
   return {
     status: 'unreadable',
     reason: record.reason ?? 'unreadable, with no reason recorded',
     record,
     cached,
+    denials,
   };
 }
