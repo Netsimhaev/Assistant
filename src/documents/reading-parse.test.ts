@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parseReading, readingProblems } from './reading-parse.js';
 import type { DocumentArtifact } from './types.js';
+import type { Reading } from '../domain/reading.js';
 
 const ARTIFACTS: DocumentArtifact[] = [
   { ordinal: 0, kind: 'outline', partName: null, content: { parts: [], flags: [] }, flags: [] },
@@ -96,5 +97,18 @@ describe('readingProblems', () => {
     const problems = readingProblems(outcome.reading, [ARTIFACTS[0]!]);
     expect(problems).toHaveLength(1);
     expect(problems[0]).toMatchObject({ kind: 'unknown_source', ordinal: 1, where: 'finding' });
+  });
+
+  it('detects bad citations on intents, not only findings', () => {
+    const outcome = parseReading(JSON.stringify(VALID), ARTIFACTS);
+    if (outcome.status !== 'read') throw new Error('expected a reading');
+    // Modify the reading to have an intent with a bad ordinal, but keep findings valid
+    const readingWithBadIntent: Reading = {
+      ...outcome.reading,
+      intents: [{ intent: 'no_action', subject: { kind: 'sender' }, sourceRef: { ordinal: 99, locator: null }, note: '' }],
+    };
+    const problems = readingProblems(readingWithBadIntent, ARTIFACTS);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toMatchObject({ kind: 'unknown_source', ordinal: 99, where: 'intent' });
   });
 });
