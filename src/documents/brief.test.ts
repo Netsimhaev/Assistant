@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BRIEF_TABLE_ROWS, BRIEF_TEXT_CHARS, renderReadingBrief } from './brief.js';
+import { BRIEF_TABLE_ROWS, BRIEF_TEXT_CHARS, BRIEF_TOTAL_CHARS, renderReadingBrief } from './brief.js';
 import type { Cell, DocumentArtifact } from './types.js';
 
 function s(v: string): Cell { return { v, t: 'string' }; }
@@ -85,12 +85,83 @@ describe('renderReadingBrief', () => {
     expect(brief.length).toBeLessThan(long.length);
   });
 
-  it('drops table rows before it drops the outline', () => {
-    // Ten fat tables together exceed the total cap; the outline must survive.
-    const fat = Array.from({ length: 10 }, (_, i) => tableArtifact(500, i + 1));
-    const brief = renderReadingBrief([OUTLINE, ...fat]);
+  it('caps the total brief length and keeps the outline', () => {
+    // Four text artefacts, each with BRIEF_TEXT_CHARS length, exceed the total cap significantly.
+    // ~32,000 chars vs 24,000 cap ensures truncation actually happens.
+    const marker1 = 'מזהה_ראשון_';
+    const marker4 = 'מזהה_רביעי_';
+    const longText = 'א'.repeat(BRIEF_TEXT_CHARS - marker1.length);
+
+    const artifacts: DocumentArtifact[] = [
+      OUTLINE,
+      {
+        ordinal: 1, kind: 'text', partName: 'חלק1',
+        content: { blocks: [{ kind: 'paragraph', text: marker1 + longText }] },
+        flags: [],
+      },
+      {
+        ordinal: 2, kind: 'text', partName: 'חלק2',
+        content: { blocks: [{ kind: 'paragraph', text: 'א'.repeat(BRIEF_TEXT_CHARS) }] },
+        flags: [],
+      },
+      {
+        ordinal: 3, kind: 'text', partName: 'חלק3',
+        content: { blocks: [{ kind: 'paragraph', text: 'א'.repeat(BRIEF_TEXT_CHARS) }] },
+        flags: [],
+      },
+      {
+        ordinal: 4, kind: 'text', partName: 'חלק4',
+        content: { blocks: [{ kind: 'paragraph', text: marker4 + 'א'.repeat(BRIEF_TEXT_CHARS - marker4.length) }] },
+        flags: [],
+      },
+    ];
+
+    const brief = renderReadingBrief(artifacts);
+
+    // The outline must survive when total cap is hit.
     expect(brief).toContain('מחירון');
     expect(brief).toContain('has_macros');
+
+    // First artefact's marker is present (early enough to be included).
+    expect(brief).toContain(marker1);
+
+    // Last artefact's marker is absent (dropped by the total cap).
+    expect(brief).not.toContain(marker4);
+
+    // Brief length is bounded, with small allowance for the truncation marker.
+    expect(brief.length).toBeLessThanOrEqual(BRIEF_TOTAL_CHARS + 200);
+  });
+
+  it('renders a stated gap when content shape does not match its declared kind', () => {
+    // Table with no rows
+    const missingRows: DocumentArtifact = {
+      ordinal: 0, kind: 'table', partName: 'broken_table',
+      content: {}, // missing rows
+      flags: [],
+    };
+    const briefTable = renderReadingBrief([missingRows]);
+    expect(briefTable).toContain('(טבלה לא קריאה)');
+    expect(() => renderReadingBrief([missingRows])).not.toThrow();
+
+    // Text with no blocks
+    const missingBlocks: DocumentArtifact = {
+      ordinal: 0, kind: 'text', partName: 'broken_text',
+      content: {}, // missing blocks
+      flags: [],
+    };
+    const briefText = renderReadingBrief([missingBlocks]);
+    expect(briefText).toContain('(טקסט לא קריא)');
+    expect(() => renderReadingBrief([missingBlocks])).not.toThrow();
+
+    // Outline with no parts
+    const missingParts: DocumentArtifact = {
+      ordinal: 0, kind: 'outline', partName: null,
+      content: {}, // missing parts
+      flags: [],
+    };
+    const briefOutline = renderReadingBrief([missingParts]);
+    expect(briefOutline).toContain('(מתאר לא קריא)');
+    expect(() => renderReadingBrief([missingParts])).not.toThrow();
   });
 
   it('is deterministic — the same artefacts render byte-identically', () => {
