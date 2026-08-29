@@ -18,6 +18,7 @@
     "migrate": "tsx src/db/migrate.ts",
     "migrate:test": "tsx src/db/migrate.ts --test-db",
     "sdk:know-reader": "tsx src/sdk/run-know-reader.ts",
+    "sdk:read-document": "tsx scripts/read-document.ts",
     "scheduler": "tsx src/orchestrator/run-scheduler.ts",
     "dashboard": "tsx src/dashboard/run-dashboard.ts",
     "owner:create": "tsx src/cli/create-owner.ts",

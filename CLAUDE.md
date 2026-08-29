@@ -8,12 +8,13 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 876 מבחנים
+npm test          # vitest run — 947 מבחנים
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_URL
 npm run test:watch
 npm run sdk:know-reader  # הרצה חיה מול ה-Agent SDK — דורש ANTHROPIC_API_KEY
+npm run sdk:read-document -- <documentId>  # קריאה חיה של מסמך שנקלט — דורש ANTHROPIC_API_KEY
 npm run scheduler        # מעיר jobs רדומים ומפקיע אישורים — תהליך מתמשך
 ```
 
@@ -216,6 +217,16 @@ npm run scheduler        # מעיר jobs רדומים ומפקיע אישורי�
 
 **סריקת מעקב-שינויים שלא הצליחה להסתיים מדגלת, לא מנקה.** `TrackedChangeScan` ב-[src/documents/extractors/docx.ts](src/documents/extractors/docx.ts) מבחין `{ scanned: false }` מ-`{ scanned: true, hasInsOrDel: false }` — ורק הראשון מטופל כ"לא הצלחנו לקרוא". `trackedChanges` נגזר מ-`!scan.scanned || scan.hasInsOrDel || …` — סריקה שלא הושלמה מניבה `true` בדיוק כמו שהיא הייתה מוצאת `w:ins`/`w:del` בפועל. מה שלא הצלחנו לקרוא אף פעם אינו התשובה המתירנית.
 
+**כוונה שמה תוצאה, לעולם לא כלי.** `IntentName` ב-[src/domain/reading.ts](src/domain/reading.ts) הוא enum סגור של עשר תוצאות עסקיות — `reply_to_sender`, לא `mail.send`. קורא שנוקב בכלי הוא קורא שבוחר סמכות, ו-`know.reader` הוא סוכן הסגר שהקלט שלו עוין בהגדרה; המיפוי מכוונה לצעדים הוא עבודת המתכנן, שרואה את הקטלוג ואת התקנון. מבחן ב-`reading-invariants.test.ts` דוחה שם כוונה שמכיל נקודה — הצורה של מזהה כלי.
+
+**כוונה אינה נושאת כתובת.** `EntityRef` הוא איחוד מובחן משלושה ענפים: ישות מוכרת, `sender` (שנפתר מרשומת ה-job ולא מהתוכן), או `unresolved` עם תיאור מילולי. **אין ענף שמקבל כתובת.** מסמך יכול לומר שצריך לפנות למישהו; הוא אינו יכול לומר לאן ההודעה תלך. `entityId` עובר דרך `SafeLookupKey` — אותו שומר שדוחה `__proto__` בתקנון, מיוצא ולא משוכפל, כי `JSON.parse` על תשובת מודל יוצר את המפתח הזה בדיוק כמו על מסמך חתום.
+
+**`findings` הם ייעוץ, ואף מודול ב-`src/policy/` לא קורא אותם.** סכום שמודל קרא מחוזה, אילו הגיע ל-`readAmountMinor`, היה נותן למסמך לקבוע את התקרה של עצמו — הצורה המדויקת של הבאג שהתקרות קיימות כדי למנוע. הסריקה ב-[src/documents/reading-invariants.test.ts](src/documents/reading-invariants.test.ts) נועלת את זה, ומאשרת קודם שהיא מצאה קבצים לסרוק: סריקה ריקה שעוברת אינה בקרה.
+
+**קריאה אינה ארטיפקט.** ארטיפקט הוא מה שחולץ מהקובץ דטרמיניסטית; קריאה היא טענה של מודל עליו, ולכן `document_readings` ולא `kind` רביעי ב-`document_artifacts`. באותה טבלה, קורא עתידי לא היה יכול להבחין בין מה שכתוב בקובץ לבין מה שמודל אמר עליו. המפתח כולל `brief_hash` ולא את ה-`sha256` של המסמך — שינוי בתקרת קיצוץ משנה את מה שנקרא בלי לשנות את הקובץ — ו-`prompt_version`, שהוא קבוע שמרימים ביד ולא גיבוב, כי גיבוב משתנה מפסיק ומוחק כל קריאה שמורה בזמן שהשאלה נשארה זהה.
+
+**`markContentIngested` נדלק לפני הקריאה, וקריאה שמורה אינה מדליקה אותו.** `readDocument` ([src/documents/read.ts](src/documents/read.ts)) הוא הכותב השלישי של הדגל, אחרי `executeStep` ו-`gate-hook`. פגיעה במטמון לא קראה תוכן חיצוני, והדלקת הדגל עבורה הייתה מהדקת בקרה על סמך משהו שלא קרה.
+
 ---
 
 ## מה שסקירת האבטחה של 28/08 שינתה
@@ -280,7 +291,9 @@ npm run scheduler        # מעיר jobs רדומים ומפקיע אישורי�
 
 ## מה עוד לא נבנה בשלב 0
 
-פרוטוקול ה-envelope ומרשם ה-intents · CredentialBroker · **מכניקת** רמפת האוטונומיה · pgvector ושכבות L1/L3/L4.
+פרוטוקול ה-envelope · CredentialBroker · **מכניקת** רמפת האוטונומיה · pgvector ושכבות L1/L3/L4.
+
+**מרשם הכוונות שנבנה הוא לא מרשם ה-intents של הפרוטוקול.** תת-פרויקט ב' (קריאת מסמכים) בנה `IntentName` — עשר תוצאות סגורות שקורא יכול להסיק ממסמך — ב-[src/domain/reading.ts](src/domain/reading.ts). זה מרשם **אחר** ממה שסעיף 3 ב-[docs/03-protocol.md](docs/03-protocol.md) מתאר: שם, `intent` הוא שדה על ה-envelope עם סכמת zod רשומה **לכל סוכן-נמען**, וזיהוי לולאות נשען על `contextRefsHash`. שום דבר מזה לא נבנה — ה-envelope, `hops`, ו-`help_request` כולם עדיין בלתי קיימים בקוד. שני הדברים לא התבלבלו כאן: המרשם שכן קיים לא מזין את הפרוטוקול, וגם לא את המתכנן — `PlanRequest.intents` ב-[src/sdk/planner.ts](src/sdk/planner.ts) עדיין מוקלד `unknown`, וישאר כך עד שתת-פרויקט ג' יחווט `Intent[]` לתוכו.
 
 **"רמפת האוטונומיה" כאן היא המכניקה, לא הקורא.** `orchestrator/ramp.ts` קיים, נקרא ב-`runDueJobs` ונאכף בשלב 8 — הרשימה הזו טענה שהוא לא נבנה עוד אחרי שנבנה. מה שבאמת חסר הוא מי שמעלה רמה: מדידת שיעור הסכמה, קידום מדורג, והחלטה מתי מחלקה יוצאת מ-`draft_only`. `setRampLevel` נקרא היום רק מסקריפט CLI ידני וממבחנים.
 
