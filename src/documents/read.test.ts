@@ -169,7 +169,7 @@ describe('readDocument', () => {
     expect(rows).toHaveLength(0);
   });
 
-  it('does not mark content ingested when a cached reading is returned', async () => {
+  it('marks content ingested on a cache hit too, because the job still receives the document', async () => {
     const documentId = await anExtractedDocument();
     const job = await createJob({
       charterVersion: bundle.charterVersion,
@@ -177,7 +177,7 @@ describe('readDocument', () => {
       businessId: BUSINESS,
       title: 'לקרוא שוב',
     });
-    const { reader } = stubReader(JSON.stringify(READING_JSON));
+    const { reader, calls } = stubReader(JSON.stringify(READING_JSON));
     // First read, with no job, populates the cache.
     await readDocument(
       { documentId, bundle, provenance: 'boss', jobId: null },
@@ -188,12 +188,18 @@ describe('readDocument', () => {
       { businessId: BUSINESS, reader },
     );
     if (second.status !== 'read') throw new Error('expected a reading');
+
+    // Both halves are load-bearing. Without them this would pass for the
+    // ordinary reason — a fresh read marks the job — and prove nothing about
+    // the cache path at all.
     expect(second.cached).toBe(true);
+    expect(calls).toHaveLength(1);
+
     const { rows } = await getPool().query<{ content_ingested: boolean }>(
       'SELECT content_ingested FROM jobs WHERE job_id = $1',
       [job.jobId],
     );
-    expect(rows[0]?.content_ingested).toBe(false);
+    expect(rows[0]?.content_ingested).toBe(true);
   });
 
   it('reports no_artifacts for a document that was never extracted', async () => {

@@ -4,22 +4,34 @@
  * The order these steps run in *is* the design, the same way it is in
  * `ingestDocument`:
  *
- *   loadArtifacts → renderReadingBrief → hash → cache lookup →
- *   markContentIngested → runKnowReader → saveReading
+ *   loadArtifacts → (no artefacts? return) → markContentIngested →
+ *   renderReadingBrief → hash → cache lookup → runKnowReader → saveReading
  *
- * **`markContentIngested` fires before the model sees a byte.** The flag is
- * monotonic and exists so a job that consumed outside content can never be
- * granted the first-contact exemption; a crash between the read and the write
- * would otherwise leave a job that read and does not remember it. Early is the
- * safe direction — migration 011 carries the full argument. **And it fails
- * closed:** a zero-row match means the job id does not resolve, and the read
- * does not run — the same decision `src/sdk/gate-hook.ts` makes for the same
- * reason.
+ * **`markContentIngested` fires before anything can hand this job the
+ * document's conclusions.** The flag is monotonic and exists so a job that
+ * consumed outside content can never be granted the first-contact exemption; a
+ * crash between the read and the write would otherwise leave a job that read
+ * and does not remember it. Early is the safe direction — migration 011
+ * carries the full argument. **And it fails closed:** a zero-row match means
+ * the job id does not resolve, and the read does not run — the same decision
+ * `src/sdk/gate-hook.ts` makes for the same reason.
  *
- * **The cache lookup comes first, and a cache hit does not set the flag.** A
- * hit performs no read, and marking a job as having consumed external content
- * for a call that consumed nothing would tighten a control on the strength of
- * something that did not happen.
+ * **A cache hit sets the flag too, and the earlier reasoning here was wrong.**
+ * This docblock used to argue that a hit performs no read, so marking the job
+ * would tighten a control on the strength of something that did not happen.
+ * That conflated *did we call the model* with *did this job consume outside
+ * content*. On the cache path the caller receives the whole `Reading` —
+ * summary, findings, and intents naming counterparties, every one of them
+ * derived from the document — exactly as it does on the fresh path. The flag
+ * records what the job consumed, not what it paid for, so the lookup now sits
+ * after the mark rather than in front of it. Otherwise job A reads a hostile
+ * document, job B hits the cache, receives its intents, and keeps its
+ * first-contact exemption.
+ *
+ * **The mark comes after the `no_artifacts` return, not before it.** A
+ * document that yielded nothing hands the job nothing, and marking there would
+ * restrict a job on the strength of an empty extraction — that is the case the
+ * old argument was actually reaching for.
  *
  * **Nothing here throws for a bad response.** An unparseable answer is stored
  * as `unreadable` and returned, exactly as `ingestDocument` records a rejected
@@ -99,19 +111,10 @@ export async function readDocument(
     return { status: 'no_artifacts' };
   }
 
-  const brief = renderReadingBrief(artifacts);
-  const briefHash = hashBrief(brief);
-
-  const cached = await findReadingForBrief(
-    input.documentId,
-    briefHash,
-    READING_PROMPT_VERSION,
-    { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
-  );
-  if (cached !== null) return fromRecord(cached, true);
-
   if (input.jobId !== null) {
-    // Before the read, never after. See this module's header.
+    // Before anything that could hand this job the document's conclusions —
+    // which is the cache lookup, not just the model call. See this module's
+    // header.
     const matched = await markContentIngested(input.jobId, {
       businessId,
       ...(options.db !== undefined ? { db: options.db } : {}),
@@ -134,6 +137,17 @@ export async function readDocument(
       );
     }
   }
+
+  const brief = renderReadingBrief(artifacts);
+  const briefHash = hashBrief(brief);
+
+  const cached = await findReadingForBrief(
+    input.documentId,
+    briefHash,
+    READING_PROMPT_VERSION,
+    { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
+  );
+  if (cached !== null) return fromRecord(cached, true);
 
   const outcome = await reader({
     bundle: input.bundle,
