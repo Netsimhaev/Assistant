@@ -99,6 +99,30 @@ function renderContent(artifact: DocumentArtifact): string {
   return Array.isArray(blocks) ? renderText(content as TextContent) : '(טקסט לא קריא)';
 }
 
+/** Between two part sections. Counted against the total ceiling like any text. */
+const SECTION_GAP = '\n\n';
+
+/**
+ * A brief, and the claim about it that citation integrity needs.
+ *
+ * Two values and not one, because the second is not derivable from the first
+ * by anyone downstream: `readingProblems` was building its known-ordinal set
+ * from the artefact array, and the total-brief ceiling can drop later parts
+ * from the text entirely. A reading citing a part that was cut away therefore
+ * passed the check — a claim attributed to text the model never saw, which is
+ * exactly what the control exists to catch. Only the function that did the
+ * cutting knows what survived it, so it says so.
+ */
+export interface ReadingBrief {
+  /** The text the reader is asked about. */
+  brief: string;
+  /**
+   * The ordinals whose section is in `brief` — and therefore the only ordinals
+   * a `sourceRef` may legitimately cite.
+   */
+  includedOrdinals: number[];
+}
+
 /**
  * The brief, with the outline first and every part labelled by the ordinal a
  * `SourceRef` must cite.
@@ -107,9 +131,22 @@ function renderContent(artifact: DocumentArtifact): string {
  * the caller happened to pass them: `loadArtifacts` already returns them by
  * ordinal, and a brief whose ordering depends on the caller is a brief whose
  * hash — and therefore whose cache key — depends on it too.
+ *
+ * The total ceiling now drops whole sections rather than slicing the joined
+ * text mid-part. A half-rendered section is a part the model was shown some of
+ * and cannot be told it was shown some of, and it made `includedOrdinals`
+ * unanswerable: in or out, with no honest third answer. Sections are taken in
+ * order until the next one would not fit, and the rest are dropped with the
+ * cut stated in the brief itself.
+ *
+ * The one exception is the first section: if it alone overruns the ceiling it
+ * is kept, cut to the ceiling and marked. A brief with no parts in it at all
+ * is not a cheaper brief, it is a question about nothing.
  */
-export function renderReadingBrief(artifacts: readonly DocumentArtifact[]): string {
-  if (artifacts.length === 0) return 'המסמך נקלט ולא הופק ממנו שום חלק.';
+export function renderReadingBrief(artifacts: readonly DocumentArtifact[]): ReadingBrief {
+  if (artifacts.length === 0) {
+    return { brief: 'המסמך נקלט ולא הופק ממנו שום חלק.', includedOrdinals: [] };
+  }
 
   const ordered = [...artifacts].sort((a, b) => {
     if (a.kind === 'outline' && b.kind !== 'outline') return -1;
@@ -117,14 +154,39 @@ export function renderReadingBrief(artifacts: readonly DocumentArtifact[]): stri
     return a.ordinal - b.ordinal;
   });
 
-  const sections: string[] = [];
+  const sections: { ordinal: number; text: string }[] = [];
   for (const artifact of ordered) {
     const head = `[חלק ${artifact.ordinal}] ${artifact.partName ?? '(ללא שם)'} — ${artifact.kind}`;
     const flags = artifact.flags.length > 0 ? `\nדגלים: ${artifact.flags.join(', ')}` : '';
-    sections.push(`${head}${flags}\n${renderContent(artifact)}`);
+    sections.push({ ordinal: artifact.ordinal, text: `${head}${flags}\n${renderContent(artifact)}` });
   }
 
-  const brief = sections.join('\n\n');
-  if (brief.length <= BRIEF_TOTAL_CHARS) return brief;
-  return brief.slice(0, BRIEF_TOTAL_CHARS) + TRUNCATED('תווים', BRIEF_TOTAL_CHARS);
+  const kept: string[] = [];
+  const includedOrdinals: number[] = [];
+  let used = 0;
+  let dropped = false;
+
+  for (const section of sections) {
+    const cost = kept.length === 0 ? section.text.length : section.text.length + SECTION_GAP.length;
+    if (kept.length > 0 && used + cost > BRIEF_TOTAL_CHARS) {
+      dropped = true;
+      break;
+    }
+    kept.push(section.text);
+    includedOrdinals.push(section.ordinal);
+    used += cost;
+  }
+
+  const joined = kept.join(SECTION_GAP);
+  if (joined.length > BRIEF_TOTAL_CHARS) {
+    // Only reachable for a lone first section over the ceiling.
+    return {
+      brief: joined.slice(0, BRIEF_TOTAL_CHARS) + TRUNCATED('תווים', BRIEF_TOTAL_CHARS),
+      includedOrdinals,
+    };
+  }
+  return {
+    brief: dropped ? joined + TRUNCATED('חלקים', includedOrdinals.length) : joined,
+    includedOrdinals,
+  };
 }

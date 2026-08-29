@@ -7,6 +7,7 @@ import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createJob } from '../orchestrator/jobs.js';
 import type { ReadOutcome } from '../sdk/know-reader.js';
+import type { DocumentArtifact } from './types.js';
 import { insertOrGetDocument, markExtracted } from './store.js';
 import { readDocument } from './read.js';
 
@@ -23,10 +24,14 @@ const READING_JSON = {
 /** A reader that returns a fixed response without a model. Counts its calls. */
 function stubReader(raw: string) {
   const calls: number[] = [];
-  const reader = async (request: { artifacts: readonly unknown[] }): Promise<ReadOutcome> => {
+  const reader = async (request: { artifacts: readonly DocumentArtifact[] }): Promise<ReadOutcome> => {
     calls.push(request.artifacts.length);
     const { interpretReaderResponse } = await import('../sdk/know-reader.js');
-    return interpretReaderResponse(raw, request.artifacts as never, [], 1);
+    const { renderReadingBrief } = await import('./brief.js');
+    // The same two-step the real reader performs: render, then judge citations
+    // against what the rendering kept.
+    const { includedOrdinals } = renderReadingBrief(request.artifacts);
+    return interpretReaderResponse(raw, includedOrdinals, [], 1);
   };
   return { reader, calls };
 }
@@ -145,14 +150,16 @@ describe('readDocument', () => {
       title: 'לקרוא חשבונית',
     });
     let flagDuringRead: boolean | null = null;
-    const reader = async (request: { artifacts: readonly unknown[] }): Promise<ReadOutcome> => {
+    const reader = async (request: { artifacts: readonly DocumentArtifact[] }): Promise<ReadOutcome> => {
       const { rows } = await getPool().query<{ content_ingested: boolean }>(
         'SELECT content_ingested FROM jobs WHERE job_id = $1',
         [job.jobId],
       );
       flagDuringRead = rows[0]?.content_ingested ?? null;
       const { interpretReaderResponse } = await import('../sdk/know-reader.js');
-      return interpretReaderResponse(JSON.stringify(READING_JSON), request.artifacts as never, [], 1);
+      const { renderReadingBrief } = await import('./brief.js');
+      const { includedOrdinals } = renderReadingBrief(request.artifacts);
+      return interpretReaderResponse(JSON.stringify(READING_JSON), includedOrdinals, [], 1);
     };
 
     const result = await readDocument(

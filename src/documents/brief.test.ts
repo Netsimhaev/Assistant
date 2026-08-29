@@ -38,30 +38,30 @@ const TEXT: DocumentArtifact = {
 
 describe('renderReadingBrief', () => {
   it('leads with the outline, so the cheapest certain facts come first', () => {
-    const brief = renderReadingBrief([OUTLINE, TEXT]);
+    const { brief } = renderReadingBrief([OUTLINE, TEXT]);
     expect(brief.indexOf('מחירון')).toBeLessThan(brief.indexOf('שוטף פלוס שלושים'));
   });
 
   it('labels every part with the ordinal a citation must use', () => {
-    const brief = renderReadingBrief([OUTLINE, TEXT]);
+    const { brief } = renderReadingBrief([OUTLINE, TEXT]);
     expect(brief).toContain('[חלק 0]');
     expect(brief).toContain('[חלק 1]');
   });
 
   it('carries the document-level and part-level flags through', () => {
-    const brief = renderReadingBrief([OUTLINE, TEXT]);
+    const { brief } = renderReadingBrief([OUTLINE, TEXT]);
     expect(brief).toContain('has_macros');
     expect(brief).toContain('tracked_changes');
   });
 
   it('renders text blocks with their structure intact', () => {
-    const brief = renderReadingBrief([TEXT]);
+    const { brief } = renderReadingBrief([TEXT]);
     expect(brief).toContain('שוטף פלוס שלושים.');
     expect(brief).toContain('מע"מ בנפרד');
   });
 
   it('caps a long table and says out loud that it did', () => {
-    const brief = renderReadingBrief([tableArtifact(500)]);
+    const { brief } = renderReadingBrief([tableArtifact(500)]);
     expect(brief).toContain('שורה 0');
     expect(brief).not.toContain('שורה 400');
     expect(brief).toContain('קוצץ');
@@ -69,7 +69,7 @@ describe('renderReadingBrief', () => {
   });
 
   it('keeps the header row on a capped table, over and above the row cap', () => {
-    const brief = renderReadingBrief([tableArtifact(500)]);
+    const { brief } = renderReadingBrief([tableArtifact(500)]);
     expect(brief).toContain('פריט');
     expect(brief).toContain('מחיר');
   });
@@ -80,7 +80,7 @@ describe('renderReadingBrief', () => {
       ordinal: 0, kind: 'text', partName: null,
       content: { blocks: [{ kind: 'paragraph', text: long }] }, flags: [],
     };
-    const brief = renderReadingBrief([artifact]);
+    const { brief } = renderReadingBrief([artifact]);
     expect(brief).toContain('קוצץ');
     expect(brief.length).toBeLessThan(long.length);
   });
@@ -116,7 +116,7 @@ describe('renderReadingBrief', () => {
       },
     ];
 
-    const brief = renderReadingBrief(artifacts);
+    const { brief } = renderReadingBrief(artifacts);
 
     // The outline must survive when total cap is hit.
     expect(brief).toContain('מחירון');
@@ -132,6 +132,45 @@ describe('renderReadingBrief', () => {
     expect(brief.length).toBeLessThanOrEqual(BRIEF_TOTAL_CHARS + 200);
   });
 
+  it('reports which parts it kept, so a citation can be judged against the brief', () => {
+    const artifacts: DocumentArtifact[] = [OUTLINE];
+    for (let ordinal = 1; ordinal <= 5; ordinal += 1) {
+      artifacts.push({
+        ordinal, kind: 'text', partName: `חלק${ordinal}`,
+        content: { blocks: [{ kind: 'paragraph', text: 'א'.repeat(BRIEF_TEXT_CHARS) }] },
+        flags: [],
+      });
+    }
+    const { brief, includedOrdinals } = renderReadingBrief(artifacts);
+
+    // Whatever the ceiling let through, the claim and the text must agree —
+    // every reported ordinal is labelled in the brief, and every part the
+    // brief does not label is absent from the claim.
+    expect(includedOrdinals.length).toBeGreaterThan(0);
+    expect(includedOrdinals.length).toBeLessThan(artifacts.length);
+    for (const artifact of artifacts) {
+      expect(brief.includes(`[חלק ${artifact.ordinal}]`)).toBe(
+        includedOrdinals.includes(artifact.ordinal),
+      );
+    }
+    expect(brief).toContain('קוצץ');
+  });
+
+  it('keeps a single oversized part rather than returning a brief about nothing', () => {
+    // A lone section past the ceiling is cut and marked. Dropping it whole
+    // would leave a question with no document attached to it.
+    const huge: DocumentArtifact = {
+      ordinal: 3, kind: 'table', partName: 'ענקית',
+      content: { rows: [[s('פריט')], ...Array.from({ length: BRIEF_TABLE_ROWS }, () => [s('א'.repeat(1_000))])] },
+      flags: [],
+    };
+    const { brief, includedOrdinals } = renderReadingBrief([huge]);
+    expect(includedOrdinals).toEqual([3]);
+    expect(brief).toContain('[חלק 3]');
+    expect(brief).toContain('קוצץ');
+    expect(brief.length).toBeLessThanOrEqual(BRIEF_TOTAL_CHARS + 200);
+  });
+
   it('renders a stated gap when content shape does not match its declared kind', () => {
     // Table with no rows
     const missingRows: DocumentArtifact = {
@@ -139,7 +178,7 @@ describe('renderReadingBrief', () => {
       content: {}, // missing rows
       flags: [],
     };
-    const briefTable = renderReadingBrief([missingRows]);
+    const { brief: briefTable } = renderReadingBrief([missingRows]);
     expect(briefTable).toContain('(טבלה לא קריאה)');
     expect(() => renderReadingBrief([missingRows])).not.toThrow();
 
@@ -149,7 +188,7 @@ describe('renderReadingBrief', () => {
       content: {}, // missing blocks
       flags: [],
     };
-    const briefText = renderReadingBrief([missingBlocks]);
+    const { brief: briefText } = renderReadingBrief([missingBlocks]);
     expect(briefText).toContain('(טקסט לא קריא)');
     expect(() => renderReadingBrief([missingBlocks])).not.toThrow();
 
@@ -159,17 +198,18 @@ describe('renderReadingBrief', () => {
       content: {}, // missing parts
       flags: [],
     };
-    const briefOutline = renderReadingBrief([missingParts]);
+    const { brief: briefOutline } = renderReadingBrief([missingParts]);
     expect(briefOutline).toContain('(מתאר לא קריא)');
     expect(() => renderReadingBrief([missingParts])).not.toThrow();
   });
 
   it('is deterministic — the same artefacts render byte-identically', () => {
-    expect(renderReadingBrief([OUTLINE, TEXT])).toBe(renderReadingBrief([OUTLINE, TEXT]));
+    expect(renderReadingBrief([OUTLINE, TEXT]).brief).toBe(renderReadingBrief([OUTLINE, TEXT]).brief);
+    expect(renderReadingBrief([OUTLINE, TEXT])).toEqual(renderReadingBrief([OUTLINE, TEXT]));
   });
 
   it('produces a brief for an empty artefact list rather than an empty string', () => {
     // An empty document is a fact to state, not a prompt with nothing in it.
-    expect(renderReadingBrief([]).trim()).not.toBe('');
+    expect(renderReadingBrief([]).brief.trim()).not.toBe('');
   });
 });

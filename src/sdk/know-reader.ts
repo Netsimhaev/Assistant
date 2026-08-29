@@ -118,11 +118,11 @@ export type ReadOutcome =
  */
 export function interpretReaderResponse(
   raw: string,
-  artifacts: readonly DocumentArtifact[],
+  includedOrdinals: readonly number[],
   denials: string[],
   turns: number,
 ): ReadOutcome {
-  const parsed = parseReading(raw, artifacts);
+  const parsed = parseReading(raw, includedOrdinals);
   if (parsed.status === 'read') {
     return { status: 'read', reading: parsed.reading, raw, denials, turns };
   }
@@ -135,7 +135,11 @@ export function interpretReaderResponse(
  */
 export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> {
   const denials: string[] = [];
-  const brief = renderReadingBrief(request.artifacts);
+  // Both halves are used: the text goes to the model, and the ordinals it
+  // survived with are what a citation is checked against. Checking against
+  // `request.artifacts` instead would accept a citation to a part the total
+  // ceiling dropped out of the brief.
+  const { brief, includedOrdinals } = renderReadingBrief(request.artifacts);
 
   const binding: GateHookBinding = {
     agent: AGENT,
@@ -217,5 +221,5 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> 
     }
   }
 
-  return interpretReaderResponse(text, request.artifacts, denials, turns);
+  return interpretReaderResponse(text, includedOrdinals, denials, turns);
 }

@@ -14,7 +14,6 @@
  */
 
 import { Reading } from '../domain/reading.js';
-import type { DocumentArtifact } from './types.js';
 
 export type ParseOutcome =
   | { status: 'read'; reading: Reading }
@@ -28,18 +27,25 @@ export type ReadingProblem = {
 };
 
 /**
- * Citation integrity: the check zod cannot do, because it needs the artefacts.
+ * Citation integrity: the check zod cannot do, because it needs to know what
+ * the reader was actually shown.
  *
- * A reading that attributes a claim to a part of the document that does not
- * exist is not a report about that document. This is the same class of control
- * as `planProblems` — the schema says the field is a number, and this says the
- * number addresses something real.
+ * A reading that attributes a claim to a part of the document that was not in
+ * the brief is not a report about that document. This is the same class of
+ * control as `planProblems` — the schema says the field is a number, and this
+ * says the number addresses something real.
+ *
+ * `includedOrdinals` and **not** the artefact array. The two differ whenever
+ * the total-brief ceiling drops a part (`renderReadingBrief`), and it is the
+ * difference that matters: a citation to a part cut out of the brief is a
+ * claim about text the model never saw, which is precisely the fabrication
+ * this check exists to catch. Passing every artefact here would accept it.
  */
 export function readingProblems(
   reading: Reading,
-  artifacts: readonly DocumentArtifact[],
+  includedOrdinals: readonly number[],
 ): ReadingProblem[] {
-  const known = new Set(artifacts.map((artifact) => artifact.ordinal));
+  const known = new Set(includedOrdinals);
   const problems: ReadingProblem[] = [];
 
   for (const finding of reading.findings) {
@@ -57,7 +63,7 @@ export function readingProblems(
 
 export function parseReading(
   raw: string,
-  artifacts: readonly DocumentArtifact[],
+  includedOrdinals: readonly number[],
 ): ParseOutcome {
   const candidates = extractJsonObjects(raw);
   if (candidates.length === 0) {
@@ -75,7 +81,7 @@ export function parseReading(
       continue;
     }
 
-    const problems = readingProblems(parsed.data, artifacts);
+    const problems = readingProblems(parsed.data, includedOrdinals);
     if (problems.length > 0) {
       // A well-formed reading with a fabricated citation is a real answer to
       // report, not something to keep looking past.

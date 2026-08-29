@@ -140,7 +140,10 @@ export async function readDocument(
     }
   }
 
-  const brief = renderReadingBrief(artifacts);
+  // Only the text here: `readDocument` does not parse the response, so the
+  // ordinals the brief survived with are the reader's business (`runKnowReader`
+  // renders the same brief from the same artefacts, deterministically).
+  const { brief } = renderReadingBrief(artifacts);
   const briefHash = hashBrief(brief);
 
   const cached = await findReadingForBrief(
