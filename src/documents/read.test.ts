@@ -145,6 +145,30 @@ describe('readDocument', () => {
     expect(flagDuringRead).toBe(true);
   });
 
+  it('refuses to read when the content-ingested flag cannot be recorded', async () => {
+    const documentId = await anExtractedDocument();
+    const { reader, calls } = stubReader(JSON.stringify(READING_JSON));
+
+    // A job id that resolves to nothing — a stale id, a typo, or a job
+    // belonging to another business all look exactly like this to the UPDATE.
+    await expect(
+      readDocument(
+        { documentId, bundle, provenance: 'boss', jobId: `JOB-${ulid()}` },
+        { businessId: BUSINESS, reader },
+      ),
+    ).rejects.toThrow(/content ingestion was not recorded/);
+
+    // The read must not have happened, and nothing must have been stored:
+    // failing closed after calling the model would record conclusions for a
+    // job that does not remember consuming them.
+    expect(calls).toHaveLength(0);
+    const { rows } = await getPool().query(
+      'SELECT 1 FROM document_readings WHERE document_id = $1',
+      [documentId],
+    );
+    expect(rows).toHaveLength(0);
+  });
+
   it('does not mark content ingested when a cached reading is returned', async () => {
     const documentId = await anExtractedDocument();
     const job = await createJob({

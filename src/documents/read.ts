@@ -11,7 +11,10 @@
  * monotonic and exists so a job that consumed outside content can never be
  * granted the first-contact exemption; a crash between the read and the write
  * would otherwise leave a job that read and does not remember it. Early is the
- * safe direction — migration 011 carries the full argument.
+ * safe direction — migration 011 carries the full argument. **And it fails
+ * closed:** a zero-row match means the job id does not resolve, and the read
+ * does not run — the same decision `src/sdk/gate-hook.ts` makes for the same
+ * reason.
  *
  * **The cache lookup comes first, and a cache hit does not set the flag.** A
  * hit performs no read, and marking a job as having consumed external content
@@ -109,10 +112,27 @@ export async function readDocument(
 
   if (input.jobId !== null) {
     // Before the read, never after. See this module's header.
-    await markContentIngested(input.jobId, {
+    const matched = await markContentIngested(input.jobId, {
       businessId,
       ...(options.db !== undefined ? { db: options.db } : {}),
     });
+    // Fail closed on a zero-row match, for the reason `src/sdk/gate-hook.ts`
+    // records at its own call site: `jobId` and `businessId` arrive here as
+    // two independent caller-supplied fields, not read off a job row already
+    // loaded, so a stale id, a typo, or a job belonging to another business
+    // all produce a match of nothing that is indistinguishable from success.
+    // Reading anyway would deliver the document's conclusions to a job whose
+    // flag stayed false, and that job would later qualify for the
+    // first-contact exemption on a chain that consumed outside content.
+    //
+    // This throws rather than returning a status. A job id that does not
+    // resolve is not a property of the document — it is the same class as an
+    // unreachable database, which spec §9 also says propagates.
+    if (matched === 0) {
+      throw new Error(
+        `readDocument: content ingestion was not recorded for job ${input.jobId} — the read was not run`,
+      );
+    }
   }
 
   const outcome = await reader({
