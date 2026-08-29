@@ -1,4 +1,4 @@
-import { query, type AgentDefinition, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { renderReadingBrief } from '../documents/brief.js';
 import { parseReading } from '../documents/reading-parse.js';
 import type { DocumentArtifact } from '../documents/types.js';
@@ -26,39 +26,6 @@ const AGENT = 'know.reader' as const;
  * itself had no `model` at all and took the CLI default.
  */
 export const KNOW_READER_MODEL = 'haiku';
-
-/**
- * `know.reader` as the SDK sees it.
- *
- * The prompt comes from the compiled bundle rather than from a string here, so
- * the charter the owner signed is the same text the model reads. The tool list
- * is derived from the same allowlist the gate enforces — writing it twice is
- * how the two drift apart.
- *
- * `definition.prompt` is the charter fragment alone. `runKnowReader` does not
- * use it directly as the system prompt any more — it composes the full one via
- * `buildReadingSystemPrompt`, which appends the intent registry and the output
- * schema. This definition still documents the agent's shape (tools, model,
- * disallowed tools) and is what `gate-hook.test.ts` asserts against.
- *
- * Haiku because this is the highest-volume, most mechanical work in the system
- * (docs/08-risks.md, cost controls). Note the caching caveat recorded there:
- * Haiku's minimum cacheable prefix is larger than Opus's, so a short prefix
- * silently never caches.
- */
-export function knowReaderDefinition(bundle: PolicyBundle): AgentDefinition {
-  return {
-    description:
-      'Reads a document or message and returns a structured summary. Holds no authority to act.',
-    prompt: bundle.promptFragments[AGENT],
-    tools: sdkToolsFor(AGENT),
-    // Belt and braces. The hook is the control that decides, but there is no
-    // reason to offer a shell — or web egress — to an agent whose entire job is
-    // reading, and whose input is untrusted by construction.
-    disallowedTools: [...ALWAYS_DISALLOWED_SDK_TOOLS],
-    model: KNOW_READER_MODEL,
-  };
-}
 
 export interface ReadRequest {
   bundle: PolicyBundle;
@@ -163,10 +130,12 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> 
     //
     // An AgentDefinition only takes effect for a *subagent* invoked through the
     // Agent tool — and that tool is unmapped, so the hook denies it. Registering
-    // the definition and then sending the task as a top-level prompt meant the
+    // a definition and then sending the task as a top-level prompt meant the
     // model doing the reading never received the charter's quarantine
-    // instruction, never ran on Haiku, and never saw `disallowedTools`. The
-    // tests asserted on a definition that nothing used.
+    // instruction, never ran on Haiku, and never saw `disallowedTools`, while
+    // the tests asserted on the definition that nothing used. That definition
+    // is gone: every claim it made is made here, where it takes effect, and
+    // `gate-hook.test.ts` asserts on these values instead.
     //
     // The charter fragment is still the first thing in it; the intent registry
     // and output schema follow, and all of it is byte-identical across reads.
