@@ -96,7 +96,7 @@ export async function saveReading(
        (reading_id, business_id, document_id, status, reason, content,
         provenance, model, prompt_version, brief_hash)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-     ON CONFLICT (business_id, document_id, brief_hash, prompt_version) DO NOTHING
+     ON CONFLICT (business_id, document_id, brief_hash, prompt_version, provenance) DO NOTHING
      RETURNING ${COLUMNS}`,
     [
       input.readingId,
@@ -119,6 +119,7 @@ export async function saveReading(
     input.documentId,
     input.briefHash,
     input.promptVersion,
+    input.provenance,
     { businessId, db },
   );
   if (existing === null) {
@@ -131,19 +132,29 @@ export async function saveReading(
   return { record: existing, created: false };
 }
 
-/** The reading made from this exact brief under this exact prompt version, if any. */
+/**
+ * The reading made from this exact brief, under this exact prompt version, of
+ * material carrying this exact trust level — if any.
+ *
+ * `provenance` is part of the question and not a detail of the answer
+ * (migration 014). Matching without it let a reading made under `boss` be
+ * handed back for the same bytes arriving from an untrusted sender, which
+ * raised a trust level through the cache — the one thing the stored column's
+ * own comment forbids.
+ */
 export async function findReadingForBrief(
   documentId: string,
   briefHash: string,
   promptVersion: string,
+  provenance: TrustLevel,
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ReadingRecord | null> {
   const db = options.db ?? getPool();
   const { rows } = await db.query<ReadingRow>(
     `SELECT ${COLUMNS} FROM document_readings
       WHERE business_id = $1 AND document_id = $2
-        AND brief_hash = $3 AND prompt_version = $4`,
-    [options.businessId ?? config.businessId, documentId, briefHash, promptVersion],
+        AND brief_hash = $3 AND prompt_version = $4 AND provenance = $5`,
+    [options.businessId ?? config.businessId, documentId, briefHash, promptVersion, provenance],
   );
   const row = rows[0];
   return row === undefined ? null : toReading(row);

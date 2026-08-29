@@ -115,6 +115,27 @@ describe('readDocument', () => {
     expect(result.record.provenance).toBe('open_web');
   });
 
+  it('never serves a reading made under one trust level to a read asking under another', async () => {
+    // Intake dedupes on the bytes, so the same file arriving from the owner
+    // and later from a stranger is one document. The cache must not turn the
+    // first read into an answer for the second — that is a trust level raised
+    // by a lookup (migration 014).
+    const documentId = await anExtractedDocument();
+    const { reader, calls } = stubReader(JSON.stringify(READING_JSON));
+    await readDocument(
+      { documentId, bundle, provenance: 'boss', jobId: null },
+      { businessId: BUSINESS, reader },
+    );
+    const second = await readDocument(
+      { documentId, bundle, provenance: 'unknown_external', jobId: null },
+      { businessId: BUSINESS, reader },
+    );
+    if (second.status !== 'read') throw new Error('expected a reading');
+    expect(second.cached).toBe(false);
+    expect(calls).toHaveLength(2);
+    expect(second.record.provenance).toBe('unknown_external');
+  });
+
   it('marks the job as having ingested content before the read', async () => {
     const documentId = await anExtractedDocument();
     const job = await createJob({

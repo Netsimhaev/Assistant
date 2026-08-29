@@ -145,6 +145,11 @@ export async function readDocument(
     input.documentId,
     briefHash,
     READING_PROMPT_VERSION,
+    // The trust level is part of the key: the same bytes arriving from a
+    // different source are the same question asked by a different asker, and
+    // a cache that ignored it would hand back a reading stamped `boss` for
+    // material that arrived as `unknown_external` (migration 014).
+    input.provenance,
     { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
   );
   if (cached !== null) return fromRecord(cached, true);

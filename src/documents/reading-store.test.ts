@@ -99,6 +99,30 @@ describe('saveReading', () => {
     expect(second.created).toBe(true);
   });
 
+  it('treats a different trust level as a different question', async () => {
+    // Intake dedupes on `(business_id, sha256)`, so the same bytes arriving
+    // from the owner and later from a stranger are one `documents` row. Two
+    // readings, not one — and neither lookup may be served the other's row,
+    // or the cache becomes a way to raise a trust level (migration 014).
+    const documentId = await aDocument();
+    const boss = await saveReading(newReading(documentId, { provenance: 'boss' }), { businessId: BUSINESS });
+    const stranger = await saveReading(
+      newReading(documentId, { provenance: 'unknown_external' }),
+      { businessId: BUSINESS },
+    );
+    expect(stranger.created).toBe(true);
+    expect(stranger.record.readingId).not.toBe(boss.record.readingId);
+
+    const asBoss = await findReadingForBrief(documentId, 'a'.repeat(64), 'v1', 'boss', { businessId: BUSINESS });
+    const asStranger = await findReadingForBrief(
+      documentId, 'a'.repeat(64), 'v1', 'unknown_external', { businessId: BUSINESS },
+    );
+    expect(asBoss?.readingId).toBe(boss.record.readingId);
+    expect(asBoss?.provenance).toBe('boss');
+    expect(asStranger?.readingId).toBe(stranger.record.readingId);
+    expect(asStranger?.provenance).toBe('unknown_external');
+  });
+
   it('refuses a read row with no content', async () => {
     const documentId = await aDocument();
     await expect(
@@ -111,19 +135,21 @@ describe('findReadingForBrief', () => {
   it('finds the reading made from this exact brief', async () => {
     const documentId = await aDocument();
     const { record } = await saveReading(newReading(documentId), { businessId: BUSINESS });
-    const found = await findReadingForBrief(documentId, 'a'.repeat(64), 'v1', { businessId: BUSINESS });
+    const found = await findReadingForBrief(documentId, 'a'.repeat(64), 'v1', 'unknown_external', { businessId: BUSINESS });
     expect(found?.readingId).toBe(record.readingId);
   });
 
   it('returns null for a brief nobody has read', async () => {
     const documentId = await aDocument();
-    expect(await findReadingForBrief(documentId, 'c'.repeat(64), 'v1', { businessId: BUSINESS })).toBeNull();
+    expect(
+      await findReadingForBrief(documentId, 'c'.repeat(64), 'v1', 'unknown_external', { businessId: BUSINESS }),
+    ).toBeNull();
   });
 
   it('does not cross the business boundary', async () => {
     const documentId = await aDocument();
     await saveReading(newReading(documentId), { businessId: BUSINESS });
-    const found = await findReadingForBrief(documentId, 'a'.repeat(64), 'v1', { businessId: OTHER_BUSINESS });
+    const found = await findReadingForBrief(documentId, 'a'.repeat(64), 'v1', 'unknown_external', { businessId: OTHER_BUSINESS });
     expect(found).toBeNull();
   });
 });
