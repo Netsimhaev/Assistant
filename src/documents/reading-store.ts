@@ -160,18 +160,34 @@ export async function findReadingForBrief(
   return row === undefined ? null : toReading(row);
 }
 
-/** The most recent reading of a document, whatever brief produced it. */
+/**
+ * The most recent reading of this document under this exact trust level,
+ * whatever brief produced it.
+ *
+ * `provenance` is a required parameter and not an optional filter, for the
+ * same reason `findReadingForBrief` takes it (migration 014): "the latest
+ * reading of this document" is not a well-formed question on its own,
+ * because the answer would silently prefer whichever provenance happened to
+ * be read most recently. A caller holding `unknown_external` material has no
+ * business receiving a reading stamped `boss` just because it is newer — that
+ * is the trust-raise migration 014 closed in `findReadingForBrief`, reopened
+ * here if this function picked "latest" across provenances instead of within
+ * one. "The latest reading under this trust level" is a coherent and safe
+ * question; "the latest regardless of trust" is the one that raises trust
+ * silently.
+ */
 export async function loadLatestReading(
   documentId: string,
+  provenance: TrustLevel,
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ReadingRecord | null> {
   const db = options.db ?? getPool();
   const { rows } = await db.query<ReadingRow>(
     `SELECT ${COLUMNS} FROM document_readings
-      WHERE business_id = $1 AND document_id = $2
+      WHERE business_id = $1 AND document_id = $2 AND provenance = $3
       ORDER BY created_at DESC, reading_id DESC
       LIMIT 1`,
-    [options.businessId ?? config.businessId, documentId],
+    [options.businessId ?? config.businessId, documentId, provenance],
   );
   const row = rows[0];
   return row === undefined ? null : toReading(row);

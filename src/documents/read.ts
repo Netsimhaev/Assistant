@@ -154,7 +154,8 @@ export async function readDocument(
     // unreachable database, which spec §9 also says propagates.
     if (matched === 0) {
       throw new Error(
-        `readDocument: content ingestion was not recorded for job ${input.jobId} — the read was not run`,
+        `readDocument: content ingestion was not recorded for job ${input.jobId} ` +
+          `in business ${businessId} — the read was not run`,
       );
     }
   }

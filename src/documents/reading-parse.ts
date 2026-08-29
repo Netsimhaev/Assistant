@@ -88,7 +88,7 @@ export function parseReading(
       const first = problems[0];
       return {
         status: 'unreadable',
-        reason: `citation to a part that does not exist: ordinal ${first?.ordinal} in a ${first?.where}`,
+        reason: `citation to a part not included in the brief: ordinal ${first?.ordinal} in a ${first?.where}`,
       };
     }
 

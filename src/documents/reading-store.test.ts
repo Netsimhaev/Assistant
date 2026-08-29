@@ -171,7 +171,7 @@ describe('loadLatestReading', () => {
     );
     const second = await saveReading(newReading(documentId, { promptVersion: 'v2' }), { businessId: BUSINESS });
 
-    const latest = await loadLatestReading(documentId, { businessId: BUSINESS });
+    const latest = await loadLatestReading(documentId, 'unknown_external', { businessId: BUSINESS });
     expect(latest).not.toBeNull();
     expect(latest?.readingId).toBe(second.record.readingId);
     expect(latest?.promptVersion).toBe('v2');
@@ -179,7 +179,25 @@ describe('loadLatestReading', () => {
 
   it('returns null when a document has never been read', async () => {
     const documentId = await aDocument();
-    expect(await loadLatestReading(documentId, { businessId: BUSINESS })).toBeNull();
+    expect(await loadLatestReading(documentId, 'unknown_external', { businessId: BUSINESS })).toBeNull();
+  });
+
+  it('does not hand back a reading made under a different trust level', async () => {
+    // The hole migration 014 closed in `findReadingForBrief`, checked again
+    // here: a lookup under one provenance must never return another
+    // provenance's row, even when that row is newer.
+    const documentId = await aDocument();
+    const boss = await saveReading(newReading(documentId, { provenance: 'boss' }), { businessId: BUSINESS });
+    const stranger = await saveReading(
+      newReading(documentId, { provenance: 'unknown_external', promptVersion: 'v2' }),
+      { businessId: BUSINESS },
+    );
+
+    const asBoss = await loadLatestReading(documentId, 'boss', { businessId: BUSINESS });
+    expect(asBoss?.readingId).toBe(boss.record.readingId);
+
+    const asStranger = await loadLatestReading(documentId, 'unknown_external', { businessId: BUSINESS });
+    expect(asStranger?.readingId).toBe(stranger.record.readingId);
   });
 });
 
