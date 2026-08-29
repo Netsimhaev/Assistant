@@ -7,11 +7,11 @@
  * skips silently without one reports green for work it did not do. Everything
  * this script composes is covered by tests that need neither.
  */
-import { config } from '../src/config.js';
-import { buildCharter } from '../src/test/fixtures.js';
-import { installCharter, loadActiveCharter } from '../src/charter/store.js';
-import { closePool } from '../src/db/pool.js';
-import { readDocument } from '../src/documents/read.js';
+import { config } from '../config.js';
+import { buildCharter } from '../test/fixtures.js';
+import { installCharter, loadActiveCharter } from '../charter/store.js';
+import { closePool } from '../db/pool.js';
+import { readDocument } from '../documents/read.js';
 
 const documentId = process.argv[2];
 
