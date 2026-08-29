@@ -64,7 +64,7 @@ describe('parseReading', () => {
     expect(parseReading(JSON.stringify(fabricated), INCLUDED).status).toBe('unreadable');
   });
 
-  it('rejects __proto__ arriving as an entityId through JSON.parse', () => {
+  it('rejects the string __proto__ supplied as an entityId — SafeLookupKey', () => {
     const hostile = {
       ...VALID,
       intents: [
@@ -76,6 +76,29 @@ describe('parseReading', () => {
       ],
     };
     expect(parseReading(JSON.stringify(hostile), INCLUDED).status).toBe('unreadable');
+  });
+
+  it('does not let a __proto__ key in the response reach any object it builds', () => {
+    // The case the test above used to be named for and did not cover: the key
+    // arriving as a key, not as a value. `JSON.parse` makes `__proto__` an
+    // ordinary own property rather than a prototype, so what matters is that
+    // nothing downstream copies it onto an object by assignment.
+    const raw = [
+      '{"summary":"סיכום","__proto__":{"polluted":true},"findings":[],',
+      '"intents":[{"intent":"no_action","subject":{"kind":"sender"},',
+      '"sourceRef":{"ordinal":1,"locator":null}}],"unreadable":[]}',
+    ].join('');
+
+    const outcome = parseReading(raw, INCLUDED);
+    // Judged on its own fields — the stray key is not what makes it valid or
+    // invalid, and asserting `read` here proves the parse actually ran.
+    expect(outcome.status).toBe('read');
+    if (outcome.status !== 'read') throw new Error('expected a reading');
+
+    const asRecord = outcome.reading as unknown as Record<string, unknown>;
+    expect(asRecord['polluted']).toBeUndefined();
+    expect(Object.hasOwn(outcome.reading, '__proto__')).toBe(false);
+    expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
   });
 });
 
