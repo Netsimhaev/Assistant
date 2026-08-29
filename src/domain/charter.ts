@@ -337,7 +337,7 @@ export const CharterPerson = z.object({
  */
 const UNSAFE_OBJECT_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
-const SafeLookupKey = z.string().refine((value) => !UNSAFE_OBJECT_KEYS.has(value), {
+export const SafeLookupKey = z.string().refine((value) => !UNSAFE_OBJECT_KEYS.has(value), {
   message: 'מזהה או תגית לא יכולים להיות __proto__, constructor או prototype',
 });
 
