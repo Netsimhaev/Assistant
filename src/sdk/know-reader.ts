@@ -12,6 +12,22 @@ import { ALWAYS_DISALLOWED_SDK_TOOLS, sdkToolsFor } from './tool-names.js';
 const AGENT = 'know.reader' as const;
 
 /**
+ * The model this reader runs on.
+ *
+ * Haiku because this is the highest-volume, most mechanical work in the system
+ * (docs/08-risks.md, cost controls). Note the caching caveat recorded there:
+ * Haiku's minimum cacheable prefix is larger than Opus's, so a short prefix
+ * silently never caches.
+ *
+ * Exported and declared once because it has two consumers that must not drift:
+ * the `Options` this module hands the SDK, and the `model` column
+ * `document_readings` stores for attribution. They were two literals in two
+ * files, and the reading table recorded `haiku` on every row while the run
+ * itself had no `model` at all and took the CLI default.
+ */
+export const KNOW_READER_MODEL = 'haiku';
+
+/**
  * `know.reader` as the SDK sees it.
  *
  * The prompt comes from the compiled bundle rather than from a string here, so
@@ -40,7 +56,7 @@ export function knowReaderDefinition(bundle: PolicyBundle): AgentDefinition {
     // reason to offer a shell — or web egress — to an agent whose entire job is
     // reading, and whose input is untrusted by construction.
     disallowedTools: [...ALWAYS_DISALLOWED_SDK_TOOLS],
-    model: 'haiku',
+    model: KNOW_READER_MODEL,
   };
 }
 
@@ -155,6 +171,12 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> 
     // available. Using the latter alone left every built-in tool on the table.
     tools: sdkToolsFor(AGENT),
     disallowedTools: [...ALWAYS_DISALLOWED_SDK_TOOLS],
+    // Named, not defaulted. `Options.model` defaults to the CLI default
+    // model, so leaving it out meant the reader never ran on Haiku — the very
+    // bug the comment above records — while `document_readings.model` went on
+    // recording `haiku` on every row. The column whose whole purpose is
+    // attribution has to name what actually ran.
+    model: KNOW_READER_MODEL,
     // A second boundary under the hook's path check, so a filesystem read is
     // scoped by the SDK as well as by us.
     cwd: request.documentRoot,

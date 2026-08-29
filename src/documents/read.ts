@@ -47,7 +47,12 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { Reading } from '../domain/reading.js';
 import type { TrustLevel } from '../domain/trust.js';
 import { markContentIngested } from '../orchestrator/jobs.js';
-import { runKnowReader, type ReadOutcome, type ReadRequest } from '../sdk/know-reader.js';
+import {
+  KNOW_READER_MODEL,
+  runKnowReader,
+  type ReadOutcome,
+  type ReadRequest,
+} from '../sdk/know-reader.js';
 import { READING_PROMPT_VERSION } from '../sdk/reading-prompt.js';
 import { renderReadingBrief } from './brief.js';
 import { findReadingForBrief, saveReading, type ReadingRecord } from './reading-store.js';
@@ -88,9 +93,6 @@ export type ReadDocumentResult =
 function hashBrief(brief: string): string {
   return createHash('sha256').update(brief, 'utf8').digest('hex');
 }
-
-/** The model this reader runs on, recorded so a reading can be attributed. */
-const READER_MODEL = 'haiku';
 
 export async function readDocument(
   input: ReadDocumentInput,
@@ -171,7 +173,10 @@ export async function readDocument(
       reason: outcome.status === 'unreadable' ? outcome.reason : null,
       content: outcome.status === 'read' ? outcome.reading : null,
       provenance: input.provenance,
-      model: READER_MODEL,
+      // The constant the reader's own `Options` uses, imported rather than
+      // repeated: an attribution column that names a second literal is a
+      // column that can be wrong while both files look right.
+      model: KNOW_READER_MODEL,
       promptVersion: READING_PROMPT_VERSION,
       briefHash,
     },
