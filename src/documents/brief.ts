@@ -1,0 +1,130 @@
+/**
+ * `renderReadingBrief` — the artefacts of one document, rendered into the text
+ * the reader is asked about (spec §5).
+ *
+ * Pure and synchronous: no filesystem, no network, no database, nothing async.
+ * The same property that holds `buildOutline` (`./outline.ts`), and for the
+ * same reason — it is fully testable on a machine with no API key, which is
+ * where the bulk of this sub-project's coverage has to live.
+ *
+ * The ceilings here are far below intake's own (50,000 rows per sheet, §5.3 of
+ * the intake spec). Those protect the machine; these protect cost and the
+ * model's attention. Truncation is graded — table rows first, then text, then
+ * the brief as a whole — so the outline, the cheapest and most certain part of
+ * the document, is never the first thing to go.
+ */
+
+import type {
+  Block,
+  Cell,
+  DocumentArtifact,
+  OutlineContent,
+  TableContent,
+  TextContent,
+} from './types.js';
+
+/** Data rows shown per table, over and above the header row. */
+export const BRIEF_TABLE_ROWS = 40;
+/** Characters shown per text artefact. */
+export const BRIEF_TEXT_CHARS = 8_000;
+/** Characters in the whole brief. */
+export const BRIEF_TOTAL_CHARS = 24_000;
+
+const TRUNCATED = (what: string, kept: number): string =>
+  `\n(קוצץ — מוצגים ${kept} ${what} בלבד; במסמך יש יותר)`;
+
+function cellText(cell: Cell): string {
+  if (cell.v === null) return '';
+  return String(cell.v);
+}
+
+function renderTable(content: TableContent): string {
+  const rows = content.rows;
+  const header = rows[0];
+  if (header === undefined) return '(טבלה ריקה)';
+
+  const body = rows.slice(1);
+  const shown = body.slice(0, BRIEF_TABLE_ROWS);
+  const lines = [header.map(cellText).join(' | '), '---'];
+  for (const row of shown) lines.push(row.map(cellText).join(' | '));
+
+  const text = lines.join('\n');
+  return body.length > shown.length ? text + TRUNCATED('שורות', shown.length) : text;
+}
+
+function renderBlock(block: Block): string {
+  if (block.kind === 'heading') return `${'#'.repeat(Math.max(1, block.level))} ${block.text}`;
+  if (block.kind === 'list') return block.items.map((item) => `- ${item}`).join('\n');
+  return block.text;
+}
+
+function renderText(content: TextContent): string {
+  const text = content.blocks.map(renderBlock).join('\n\n');
+  if (text.length <= BRIEF_TEXT_CHARS) return text;
+  return text.slice(0, BRIEF_TEXT_CHARS) + TRUNCATED('תווים', BRIEF_TEXT_CHARS);
+}
+
+function renderOutline(content: OutlineContent): string {
+  const lines: string[] = [];
+  for (const part of content.parts) {
+    const bits = [`- ${part.name ?? '(ללא שם)'} — ${part.kind}`];
+    if (part.rowCount !== undefined) bits.push(`${part.rowCount} שורות`);
+    if (part.headers !== undefined && part.headers.length > 0) {
+      bits.push(`עמודות: ${part.headers.join(', ')}`);
+    }
+    if (part.dateRange !== undefined) bits.push(`תאריכים: ${part.dateRange.from}–${part.dateRange.to}`);
+    lines.push(bits.join(' · '));
+  }
+  if (content.flags.length > 0) lines.push(`דגלים: ${content.flags.join(', ')}`);
+  return lines.length > 0 ? lines.join('\n') : '(אין מתאר)';
+}
+
+/**
+ * `content` is `unknown` at the storage boundary (`./types.ts`), so each shape
+ * is narrowed here rather than trusted. A shape that does not match its
+ * declared `kind` renders as a stated gap — silence would read as "this part
+ * was empty", which is a different and untrue claim.
+ */
+function renderContent(artifact: DocumentArtifact): string {
+  const content = artifact.content;
+  if (artifact.kind === 'outline') {
+    const parts = (content as OutlineContent | null)?.parts;
+    return Array.isArray(parts) ? renderOutline(content as OutlineContent) : '(מתאר לא קריא)';
+  }
+  if (artifact.kind === 'table') {
+    const rows = (content as TableContent | null)?.rows;
+    return Array.isArray(rows) ? renderTable(content as TableContent) : '(טבלה לא קריאה)';
+  }
+  const blocks = (content as TextContent | null)?.blocks;
+  return Array.isArray(blocks) ? renderText(content as TextContent) : '(טקסט לא קריא)';
+}
+
+/**
+ * The brief, with the outline first and every part labelled by the ordinal a
+ * `SourceRef` must cite.
+ *
+ * Artefacts are ordered outline-first and then by ordinal, not by the order
+ * the caller happened to pass them: `loadArtifacts` already returns them by
+ * ordinal, and a brief whose ordering depends on the caller is a brief whose
+ * hash — and therefore whose cache key — depends on it too.
+ */
+export function renderReadingBrief(artifacts: readonly DocumentArtifact[]): string {
+  if (artifacts.length === 0) return 'המסמך נקלט ולא הופק ממנו שום חלק.';
+
+  const ordered = [...artifacts].sort((a, b) => {
+    if (a.kind === 'outline' && b.kind !== 'outline') return -1;
+    if (b.kind === 'outline' && a.kind !== 'outline') return 1;
+    return a.ordinal - b.ordinal;
+  });
+
+  const sections: string[] = [];
+  for (const artifact of ordered) {
+    const head = `[חלק ${artifact.ordinal}] ${artifact.partName ?? '(ללא שם)'} — ${artifact.kind}`;
+    const flags = artifact.flags.length > 0 ? `\nדגלים: ${artifact.flags.join(', ')}` : '';
+    sections.push(`${head}${flags}\n${renderContent(artifact)}`);
+  }
+
+  const brief = sections.join('\n\n');
+  if (brief.length <= BRIEF_TOTAL_CHARS) return brief;
+  return brief.slice(0, BRIEF_TOTAL_CHARS) + TRUNCATED('תווים', BRIEF_TOTAL_CHARS);
+}
