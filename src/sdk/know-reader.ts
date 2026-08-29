@@ -1,7 +1,12 @@
 import { query, type AgentDefinition, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { renderReadingBrief } from '../documents/brief.js';
+import { parseReading } from '../documents/reading-parse.js';
+import type { DocumentArtifact } from '../documents/types.js';
+import type { Reading } from '../domain/reading.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { TrustLevel } from '../domain/trust.js';
 import { createGateHook, type GateHookBinding } from './gate-hook.js';
+import { buildReadingSystemPrompt } from './reading-prompt.js';
 import { ALWAYS_DISALLOWED_SDK_TOOLS, sdkToolsFor } from './tool-names.js';
 
 const AGENT = 'know.reader' as const;
@@ -13,6 +18,12 @@ const AGENT = 'know.reader' as const;
  * the charter the owner signed is the same text the model reads. The tool list
  * is derived from the same allowlist the gate enforces — writing it twice is
  * how the two drift apart.
+ *
+ * `definition.prompt` is the charter fragment alone. `runKnowReader` does not
+ * use it directly as the system prompt any more — it composes the full one via
+ * `buildReadingSystemPrompt`, which appends the intent registry and the output
+ * schema. This definition still documents the agent's shape (tools, model,
+ * disallowed tools) and is what `gate-hook.test.ts` asserts against.
  *
  * Haiku because this is the highest-volume, most mechanical work in the system
  * (docs/08-risks.md, cost controls). Note the caching caveat recorded there:
@@ -35,8 +46,15 @@ export function knowReaderDefinition(bundle: PolicyBundle): AgentDefinition {
 
 export interface ReadRequest {
   bundle: PolicyBundle;
-  /** What to read, in the agent's own terms. */
-  task: string;
+  /**
+   * The document's extracted parts, as `loadArtifacts` returns them.
+   *
+   * Not a free-text task and not a path: the brief is rendered from these
+   * deterministically (`renderReadingBrief`), so what the reader is asked
+   * about is a function of what intake extracted rather than of a string a
+   * caller composed. It also means `sourceRef` has something real to cite.
+   */
+  artifacts: readonly DocumentArtifact[];
   /**
    * Trust of the content this job originates from.
    *
@@ -64,19 +82,44 @@ export interface ReadRequest {
   documentRoot: string;
 }
 
-export interface ReadResult {
-  text: string;
-  /** Deny codes the gate produced during the run, in order. */
-  denials: string[];
-  turns: number;
+/**
+ * What a read produced. Free text is not among the possibilities.
+ *
+ * `raw` rides on both branches: on failure it is the evidence for the recorded
+ * reason, and on success it is what the stored reading was derived from.
+ */
+export type ReadOutcome =
+  | { status: 'read'; reading: Reading; raw: string; denials: string[]; turns: number }
+  | { status: 'unreadable'; reason: string; raw: string; denials: string[]; turns: number };
+
+/**
+ * Everything about a read except the model call.
+ *
+ * Separated so it can be tested without an API key — the same split
+ * `parsePlan` has from `makePlan`. The interesting failures here are malformed
+ * output and fabricated citations, neither of which needs network behaviour to
+ * reproduce.
+ */
+export function interpretReaderResponse(
+  raw: string,
+  artifacts: readonly DocumentArtifact[],
+  denials: string[],
+  turns: number,
+): ReadOutcome {
+  const parsed = parseReading(raw, artifacts);
+  if (parsed.status === 'read') {
+    return { status: 'read', reading: parsed.reading, raw, denials, turns };
+  }
+  return { status: 'unreadable', reason: parsed.reason, raw, denials, turns };
 }
 
 /**
  * Run `know.reader` end to end: SDK harness, charter-derived prompt, and every
  * tool call passing through `evaluateToolCall` before it executes.
  */
-export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
+export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> {
   const denials: string[] = [];
+  const brief = renderReadingBrief(request.artifacts);
 
   const binding: GateHookBinding = {
     agent: AGENT,
@@ -95,8 +138,6 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
     jobId: request.jobId,
   };
 
-  const definition = knowReaderDefinition(request.bundle);
-
   const options: Options = {
     // The prompt goes in `systemPrompt`, not into an `agents` entry.
     //
@@ -106,7 +147,10 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
     // model doing the reading never received the charter's quarantine
     // instruction, never ran on Haiku, and never saw `disallowedTools`. The
     // tests asserted on a definition that nothing used.
-    systemPrompt: definition.prompt,
+    //
+    // The charter fragment is still the first thing in it; the intent registry
+    // and output schema follow, and all of it is byte-identical across reads.
+    systemPrompt: buildReadingSystemPrompt(request.bundle),
     // `tools` restricts; `allowedTools` only auto-approves what is already
     // available. Using the latter alone left every built-in tool on the table.
     tools: sdkToolsFor(AGENT),
@@ -139,7 +183,7 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
   let text = '';
   let turns = 0;
 
-  for await (const message of query({ prompt: request.task, options })) {
+  for await (const message of query({ prompt: brief, options })) {
     if (message.type === 'assistant') {
       turns += 1;
       for (const block of message.message.content) {
@@ -151,5 +195,5 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
     }
   }
 
-  return { text, denials, turns };
+  return interpretReaderResponse(text, request.artifacts, denials, turns);
 }
