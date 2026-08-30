@@ -8,7 +8,6 @@
  *   npm run sdk:know-reader -- "סכם את הקובץ README.md"
  */
 import { mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
 import { config } from '../config.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
@@ -32,13 +31,25 @@ async function main(): Promise<void> {
   const active = await loadActiveCharter(config.businessId);
   const bundle = active?.bundle ?? (await installCharter(buildCharter()));
 
-  // Never the repository root: that is where .env lives.
-  const documentRoot = process.env['DOCUMENT_ROOT'] ?? join(process.cwd(), 'documents');
+  // DOCUMENT_ROOT is required config now (src/config.ts) — the same
+  // directory ingestDocument (src/documents/ingest.ts) stores under.
+  const documentRoot = config.documentRoot;
   await mkdir(documentRoot, { recursive: true });
 
-  const result = await runKnowReader({
+  const outcome = await runKnowReader({
     bundle,
-    task,
+    // A one-part stand-in so the script exercises the real path without
+    // needing a document in the database. `npm run sdk:read-document` is the
+    // end-to-end script; this one stays the minimal SDK probe it always was.
+    artifacts: [
+      {
+        ordinal: 0,
+        kind: 'text',
+        partName: 'הודעה',
+        content: { blocks: [{ kind: 'paragraph', text: task }] },
+        flags: [],
+      },
+    ],
     provenance: 'unknown_external',
     documentRoot,
     // This script runs a single ad hoc read with no orchestrator job behind
@@ -48,11 +59,16 @@ async function main(): Promise<void> {
   });
 
   console.log('--- תוצאה ---');
-  console.log(result.text);
-  console.log(`\nתורות: ${result.turns}`);
+  if (outcome.status === 'read') {
+    console.log(JSON.stringify(outcome.reading, null, 2));
+  } else {
+    console.log(`לא ניתן לקרוא: ${outcome.reason}`);
+    console.log(`--- מה שהוחזר בפועל ---\n${outcome.raw}`);
+  }
+  console.log(`\nתורות: ${outcome.turns}`);
   console.log(
-    result.denials.length > 0
-      ? `דחיות מהשער: ${result.denials.join(', ')}`
+    outcome.denials.length > 0
+      ? `דחיות מהשער: ${outcome.denials.join(', ')}`
       : 'השער לא דחה דבר.',
   );
 }

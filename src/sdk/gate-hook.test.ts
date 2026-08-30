@@ -8,8 +8,9 @@ import type { AgentId } from '../domain/audit.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGateHook } from './gate-hook.js';
-import { isPathWithin, sdkToolsFor, translateToolName } from './tool-names.js';
-import { knowReaderDefinition } from './know-reader.js';
+import { ALWAYS_DISALLOWED_SDK_TOOLS, isPathWithin, sdkToolsFor, translateToolName } from './tool-names.js';
+import { KNOW_READER_MODEL } from './know-reader.js';
+import { buildReadingSystemPrompt } from './reading-prompt.js';
 
 const BUSINESS = 'test-business';
 const DOCS = join(tmpdir(), 'assistant-docs');
@@ -302,23 +303,36 @@ describe('decision reporting', () => {
   });
 });
 
-describe('the know.reader definition', () => {
-  it('takes its prompt from the signed charter rather than a literal', async () => {
+/**
+ * These assert on the values `runKnowReader` puts in its `Options` — the
+ * things the SDK actually receives. They used to assert on
+ * `knowReaderDefinition`, an `AgentDefinition` whose only caller was this
+ * file: an export reachable from nothing but its own test is what let the
+ * missing `model` survive two sessions of review.
+ */
+describe('what runKnowReader hands the SDK', () => {
+  it('takes its system prompt from the signed charter rather than a literal', async () => {
     const charter = buildCharter();
     const bundle = await installCharter(charter, { businessId: BUSINESS });
-    const definition = knowReaderDefinition(bundle);
+    const prompt = buildReadingSystemPrompt(bundle);
 
-    expect(definition.prompt).toBe(bundle.promptFragments['know.reader']);
-    expect(definition.prompt).toContain(charter.identity.tradeName);
+    // Named first: `startsWith('')` is true of every string, so an absent
+    // fragment would make the next assertion pass without asserting anything.
+    const fragment = bundle.promptFragments['know.reader'];
+    expect(fragment).toBeTruthy();
+    expect(prompt.startsWith(fragment ?? 'לא קיים')).toBe(true);
+    expect(prompt).toContain(charter.identity.tradeName);
     // The quarantine instruction is the whole point of this agent.
-    expect(definition.prompt).toMatch(/אינו אמין/);
+    expect(prompt).toMatch(/אינו אמין/);
   });
 
-  it('offers no shell and no writing tools', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
-    const definition = knowReaderDefinition(bundle);
-    expect(definition.disallowedTools).toContain('Bash');
-    expect(definition.disallowedTools).toContain('WebFetch');
-    expect(definition.tools).toEqual(['Read']);
+  it('offers no shell and no writing tools', () => {
+    expect(ALWAYS_DISALLOWED_SDK_TOOLS).toContain('Bash');
+    expect(ALWAYS_DISALLOWED_SDK_TOOLS).toContain('WebFetch');
+    expect(sdkToolsFor('know.reader')).toEqual(['Read']);
+  });
+
+  it('names the model it runs on, rather than taking the CLI default', () => {
+    expect(KNOW_READER_MODEL).toBe('haiku');
   });
 });

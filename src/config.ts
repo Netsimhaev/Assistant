@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import { config as loadDotenv } from 'dotenv';
 
 loadDotenv();
@@ -36,4 +37,25 @@ export const config = {
   // spend ledger and the audit chain; a deploy that forgets it would run under
   // someone else's name and interleave two businesses' audit chains.
   businessId: required('BUSINESS_ID'),
+  // Required, not defaulted — same reasoning as BUSINESS_ID above. This is
+  // the one directory the reading agent (`know.reader`, gate-hook.ts's path
+  // check) is scoped to, and it is where ingestDocument stores every
+  // document's bytes (spec §3.5: "same root, not a second root"). A deploy
+  // that forgot this and fell back to some default would write documents
+  // into a directory the reader was never told about — ingested and
+  // unreadable.
+  //
+  // Resolved against `process.cwd()` here, once, rather than left relative:
+  // a relative DOCUMENT_ROOT (the .env.example default, `./documents`) is
+  // otherwise interpreted independently by every consumer that reads
+  // `config.documentRoot` — `ingest.ts`'s `join(documentRoot, ...)`,
+  // `gate-hook.ts`'s `isPathWithin` comparison, and `know-reader.ts`'s own
+  // subprocess `cwd` — and none of them share a guarantee about the
+  // process's current working directory at the time they run. Resolving
+  // once here means every consumer agrees on the same absolute path
+  // regardless of where the process was launched from; `resolve()` is a
+  // no-op for a path that is already absolute (every test in this codebase
+  // passes one via `documentRoot` overrides), so this changes nothing for
+  // them.
+  documentRoot: resolve(required('DOCUMENT_ROOT')),
 } as const;

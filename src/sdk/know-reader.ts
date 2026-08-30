@@ -1,42 +1,43 @@
-import { query, type AgentDefinition, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { renderReadingBrief } from '../documents/brief.js';
+import { parseReading } from '../documents/reading-parse.js';
+import type { DocumentArtifact } from '../documents/types.js';
+import type { Reading } from '../domain/reading.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { TrustLevel } from '../domain/trust.js';
 import { createGateHook, type GateHookBinding } from './gate-hook.js';
+import { buildReadingSystemPrompt } from './reading-prompt.js';
 import { ALWAYS_DISALLOWED_SDK_TOOLS, sdkToolsFor } from './tool-names.js';
 
 const AGENT = 'know.reader' as const;
 
 /**
- * `know.reader` as the SDK sees it.
- *
- * The prompt comes from the compiled bundle rather than from a string here, so
- * the charter the owner signed is the same text the model reads. The tool list
- * is derived from the same allowlist the gate enforces — writing it twice is
- * how the two drift apart.
+ * The model this reader runs on.
  *
  * Haiku because this is the highest-volume, most mechanical work in the system
  * (docs/08-risks.md, cost controls). Note the caching caveat recorded there:
  * Haiku's minimum cacheable prefix is larger than Opus's, so a short prefix
  * silently never caches.
+ *
+ * Exported and declared once because it has two consumers that must not drift:
+ * the `Options` this module hands the SDK, and the `model` column
+ * `document_readings` stores for attribution. They were two literals in two
+ * files, and the reading table recorded `haiku` on every row while the run
+ * itself had no `model` at all and took the CLI default.
  */
-export function knowReaderDefinition(bundle: PolicyBundle): AgentDefinition {
-  return {
-    description:
-      'Reads a document or message and returns a structured summary. Holds no authority to act.',
-    prompt: bundle.promptFragments[AGENT],
-    tools: sdkToolsFor(AGENT),
-    // Belt and braces. The hook is the control that decides, but there is no
-    // reason to offer a shell — or web egress — to an agent whose entire job is
-    // reading, and whose input is untrusted by construction.
-    disallowedTools: [...ALWAYS_DISALLOWED_SDK_TOOLS],
-    model: 'haiku',
-  };
-}
+export const KNOW_READER_MODEL = 'haiku';
 
 export interface ReadRequest {
   bundle: PolicyBundle;
-  /** What to read, in the agent's own terms. */
-  task: string;
+  /**
+   * The document's extracted parts, as `loadArtifacts` returns them.
+   *
+   * Not a free-text task and not a path: the brief is rendered from these
+   * deterministically (`renderReadingBrief`), so what the reader is asked
+   * about is a function of what intake extracted rather than of a string a
+   * caller composed. It also means `sourceRef` has something real to cite.
+   */
+  artifacts: readonly DocumentArtifact[];
   /**
    * Trust of the content this job originates from.
    *
@@ -64,19 +65,48 @@ export interface ReadRequest {
   documentRoot: string;
 }
 
-export interface ReadResult {
-  text: string;
-  /** Deny codes the gate produced during the run, in order. */
-  denials: string[];
-  turns: number;
+/**
+ * What a read produced. Free text is not among the possibilities.
+ *
+ * `raw` rides on both branches: on failure it is the evidence for the recorded
+ * reason, and on success it is what the stored reading was derived from.
+ */
+export type ReadOutcome =
+  | { status: 'read'; reading: Reading; raw: string; denials: string[]; turns: number }
+  | { status: 'unreadable'; reason: string; raw: string; denials: string[]; turns: number };
+
+/**
+ * Everything about a read except the model call.
+ *
+ * Separated so it can be tested without an API key — the same split
+ * `parsePlan` has from `makePlan`. The interesting failures here are malformed
+ * output and fabricated citations, neither of which needs network behaviour to
+ * reproduce.
+ */
+export function interpretReaderResponse(
+  raw: string,
+  includedOrdinals: readonly number[],
+  denials: string[],
+  turns: number,
+): ReadOutcome {
+  const parsed = parseReading(raw, includedOrdinals);
+  if (parsed.status === 'read') {
+    return { status: 'read', reading: parsed.reading, raw, denials, turns };
+  }
+  return { status: 'unreadable', reason: parsed.reason, raw, denials, turns };
 }
 
 /**
  * Run `know.reader` end to end: SDK harness, charter-derived prompt, and every
  * tool call passing through `evaluateToolCall` before it executes.
  */
-export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
+export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> {
   const denials: string[] = [];
+  // Both halves are used: the text goes to the model, and the ordinals it
+  // survived with are what a citation is checked against. Checking against
+  // `request.artifacts` instead would accept a citation to a part the total
+  // ceiling dropped out of the brief.
+  const { brief, includedOrdinals } = renderReadingBrief(request.artifacts);
 
   const binding: GateHookBinding = {
     agent: AGENT,
@@ -95,22 +125,31 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
     jobId: request.jobId,
   };
 
-  const definition = knowReaderDefinition(request.bundle);
-
   const options: Options = {
     // The prompt goes in `systemPrompt`, not into an `agents` entry.
     //
     // An AgentDefinition only takes effect for a *subagent* invoked through the
     // Agent tool — and that tool is unmapped, so the hook denies it. Registering
-    // the definition and then sending the task as a top-level prompt meant the
+    // a definition and then sending the task as a top-level prompt meant the
     // model doing the reading never received the charter's quarantine
-    // instruction, never ran on Haiku, and never saw `disallowedTools`. The
-    // tests asserted on a definition that nothing used.
-    systemPrompt: definition.prompt,
+    // instruction, never ran on Haiku, and never saw `disallowedTools`, while
+    // the tests asserted on the definition that nothing used. That definition
+    // is gone: every claim it made is made here, where it takes effect, and
+    // `gate-hook.test.ts` asserts on these values instead.
+    //
+    // The charter fragment is still the first thing in it; the intent registry
+    // and output schema follow, and all of it is byte-identical across reads.
+    systemPrompt: buildReadingSystemPrompt(request.bundle),
     // `tools` restricts; `allowedTools` only auto-approves what is already
     // available. Using the latter alone left every built-in tool on the table.
     tools: sdkToolsFor(AGENT),
     disallowedTools: [...ALWAYS_DISALLOWED_SDK_TOOLS],
+    // Named, not defaulted. `Options.model` defaults to the CLI default
+    // model, so leaving it out meant the reader never ran on Haiku — the very
+    // bug the comment above records — while `document_readings.model` went on
+    // recording `haiku` on every row. The column whose whole purpose is
+    // attribution has to name what actually ran.
+    model: KNOW_READER_MODEL,
     // A second boundary under the hook's path check, so a filesystem read is
     // scoped by the SDK as well as by us.
     cwd: request.documentRoot,
@@ -139,7 +178,7 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
   let text = '';
   let turns = 0;
 
-  for await (const message of query({ prompt: request.task, options })) {
+  for await (const message of query({ prompt: brief, options })) {
     if (message.type === 'assistant') {
       turns += 1;
       for (const block of message.message.content) {
@@ -151,5 +190,5 @@ export async function runKnowReader(request: ReadRequest): Promise<ReadResult> {
     }
   }
 
-  return { text, denials, turns };
+  return interpretReaderResponse(text, includedOrdinals, denials, turns);
 }
