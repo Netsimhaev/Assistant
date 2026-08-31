@@ -32,6 +32,7 @@ export async function resetDatabase(): Promise<void> {
       job_steps,
       job_authorizations,
       jobs,
+      proposals,
       document_readings,
       document_artifacts,
       documents,
