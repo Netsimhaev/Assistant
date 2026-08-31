@@ -72,6 +72,7 @@ function riskFixture(overrides: Partial<RiskAssessment> = {}): RiskAssessment {
 async function makeApproval(options: {
   proposedInput?: unknown;
   summary?: string;
+  riskOverrides?: Partial<RiskAssessment>;
   secretMarker?: string;
 } = {}): Promise<ApprovalRequest> {
   const secret = options.secretMarker ?? 'SECRET-CARD-4111-1111-1111-1111';
@@ -83,7 +84,7 @@ async function makeApproval(options: {
   const approvalId = await enqueueApproval(
     {
       facts: factsFixture(proposedInput),
-      risk: riskFixture(),
+      risk: riskFixture(options.riskOverrides),
       proposedInput,
       summary: options.summary ?? 'הזמנה מספק א׳ טעונה אישור',
     },
@@ -129,7 +130,7 @@ describe('createEmailNotifier', () => {
     expect(sent[0]?.body).toContain(request.approvalId);
   });
 
-  it('does not leak the proposed payload — only the summary and the label reach the mail', async () => {
+  it('does not leak the proposed payload — only the risk sentence and the label reach the mail', async () => {
     const { transport, sent } = recordingTransport();
     const notifier = createEmailNotifier(transport, 'owner@example.com');
     const secret = 'SECRET-CARD-4111-1111-1111-1111';
@@ -144,9 +145,26 @@ describe('createEmailNotifier', () => {
     // dashboard behind a login.
     expect(wholeMessage).not.toContain(secret);
     expect(wholeMessage).not.toContain(JSON.stringify(request.proposedInput));
-    // The summary — the one piece of content the dashboard shows on the
-    // pending list without a click — is expected to travel.
-    expect(wholeMessage).toContain(request.summary);
+    // The risk sentence — the one piece of content the dashboard shows on the
+    // pending list without a click — is expected to travel. Not
+    // `request.summary`: as of fix round 1 (F3) that field can carry a
+    // proposal's own headline, which this notifier deliberately never sees.
+    expect(wholeMessage).toContain(request.risk.explanation);
+    expect(wholeMessage).toContain(`${request.proposedTool} · ${request.actionClass} · רצועה ${request.risk.band}`);
+  });
+
+  it('never lets a proposal headline reach the mail, even when it differs from the risk sentence', async () => {
+    const { transport, sent } = recordingTransport();
+    const notifier = createEmailNotifier(transport, 'owner@example.com');
+    // A headline a model could have written from ingested content — distinct
+    // from `summary` in every other fixture here on purpose.
+    const request = await makeApproval({ summary: 'אשלח מייל לדנה עוד היום' });
+
+    await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
+
+    const wholeMessage = `${sent[0]?.subject}\n${sent[0]?.body}`;
+    expect(wholeMessage).not.toContain(request.summary);
+    expect(wholeMessage).toContain(request.risk.explanation);
   });
 
   it('turns a throwing transport into a graceful { ok: false }, never a rejected promise', async () => {
@@ -172,11 +190,13 @@ describe('createEmailNotifier', () => {
   });
 
   it('surfaces the real SMTP transport\'s CRLF rejection as { ok: false }, without ever dialing out', async () => {
-    // A newline smuggled into the summary (the one field this notifier does
-    // put in the subject line) must not be able to open a `Bcc:` header on
-    // the real transport. `createSmtpTransport` rejects it before it ever
-    // calls out to a socket — see src/mail/transport.ts — so this exercises
-    // the real implementation, not a fake, with no network involved.
+    // A newline smuggled into the risk explanation (the field this notifier
+    // now puts in the subject line, as of fix round 1 — F3 moved this off
+    // `summary`, which can carry a proposal's own words) must not be able to
+    // open a `Bcc:` header on the real transport. `createSmtpTransport`
+    // rejects it before it ever calls out to a socket — see
+    // src/mail/transport.ts — so this exercises the real implementation, not
+    // a fake, with no network involved.
     const transport = createSmtpTransport({
       host: 'smtp.invalid.example',
       port: 587,
@@ -186,7 +206,7 @@ describe('createEmailNotifier', () => {
     });
     const notifier: ApprovalNotifier = createEmailNotifier(transport, 'owner@example.com');
     const request = await makeApproval({
-      summary: 'שלום\r\nBcc: attacker@evil.com',
+      riskOverrides: { explanation: 'שלום\r\nBcc: attacker@evil.com' },
     });
 
     const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);

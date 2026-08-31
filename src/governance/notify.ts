@@ -48,20 +48,31 @@ const BAND_LABELS: Record<string, string> = {
  * Deliberately excludes `request.proposedInput` — the raw tool call, which
  * may carry a customer's details, a supplier's price, or anything else the
  * agent read to build it — because the whole point of routing this through
- * the dashboard is that those details sit behind a login. `summary` and
- * `detail` are safe to repeat here: `summary` is `risk.explanation`, one
- * sentence written to be "shown to the boss" (`RiskAssessment`'s own
- * docblock, `src/domain/risk.ts`); `detail` is `` `${toolName} · ${actionClass}
- * · רצועה ${band}` `` (`src/policy/engine.ts`) — a label, not a payload. The
- * mailbox is assumed less trusted than the dashboard, so nothing beyond that
- * label and sentence travels here.
+ * the dashboard is that those details sit behind a login.
+ *
+ * Deliberately excludes `request.summary`/`request.detail` too, as of fix
+ * round 1 (F3). Those two fields carry the proposal's own headline and
+ * description when `GateContext.proposalText` was supplied
+ * (`src/policy/engine.ts`) — words a model wrote from whatever it read,
+ * ingested content included. This function instead reconstructs the same
+ * two lines the pre-proposal card always showed, from fields that are never
+ * proposal-supplied: `risk.explanation`, one sentence written to be "shown
+ * to the boss" (`RiskAssessment`'s own docblock, `src/domain/risk.ts`), and
+ * `` `${proposedTool} · ${actionClass} · רצועה ${band}` `` — a label built
+ * from the tool the gate itself resolved, not text an attacker's content
+ * could shape. The mailbox is assumed less trusted than the dashboard, so
+ * only text the system authored travels here; the proposal's own words wait
+ * behind the login, on the card, where `renderApprovalCard` already shows
+ * them.
  */
 function buildMessage(request: ApprovalRequest, link: string): { subject: string; body: string } {
   const band = BAND_LABELS[request.risk.band] ?? request.risk.band;
-  const subject = `בקשה לאישור: ${request.summary}`;
+  const summary = request.risk.explanation;
+  const detail = `${request.proposedTool} · ${request.actionClass} · רצועה ${request.risk.band}`;
+  const subject = `בקשה לאישור: ${summary}`;
   const body = [
-    request.summary,
-    request.detail,
+    summary,
+    detail,
     `רמת סיכון: ${band}`,
     `פג תוקף: ${request.expiresAt}`,
     '',

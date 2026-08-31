@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { domainMatches, extractDomain } from '../util/address.js';
 import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
-import { coveredByAuthorization, type StandingAuthorization } from '../orchestrator/authorization.js';
+import { coveredByAuthorization, loadAuthorization } from '../orchestrator/authorization.js';
 import type { AgentId } from '../domain/audit.js';
 import type { ActionFacts, PolicyBundle, PolicyDecision } from '../domain/policy.js';
 import { DENY_CODES } from '../domain/policy.js';
@@ -48,15 +48,27 @@ export interface GateContext extends FactsContext {
    */
   approval?: { approvalId: string; stepId: string };
   /**
-   * The instruction the owner already gave for this job, if any.
+   * Whether to consult a standing authorisation for this job at all.
    *
-   * Loaded by the caller from `job_authorizations` — never constructed here
-   * and never derived from a payload. When it covers the call, `needsApproval`
-   * is satisfied by it instead of by a fresh question (spec §6). It cannot
-   * reach `NEVER_FULLY_AUTONOMOUS`, and `coveredByAuthorization` refuses
-   * anything carrying money.
+   * Deliberately a boolean, not the row itself. `ctx.approval` proves
+   * permission by re-proving an id against `approval_requests` inside a
+   * guarded `UPDATE` — no caller can hand the gate a fabricated approval.
+   * The first round of this feature took a whole `StandingAuthorization`
+   * object by value instead, and review found the asymmetry: the
+   * `jobId`/`businessId` equality check inside `coveredByAuthorization` was
+   * comparing two fields the very same caller supplied, so forgery was only
+   * documented against, not structurally impossible — a real risk once a
+   * model-produced proposal is what shapes `GateContext`.
+   *
+   * The gate now loads the row itself with `loadAuthorization(ctx.jobId, {
+   * businessId, db })` — the same `businessId` and `db` every other step in
+   * this call already trusts — so a caller can only ask "does one apply",
+   * never assert what it says. When it covers the call, `needsApproval` is
+   * satisfied by it instead of by a fresh question (spec §6). It cannot
+   * reach `NEVER_FULLY_AUTONOMOUS` or the charter's own `approve_required`
+   * ceiling, and `coveredByAuthorization` refuses anything carrying money.
    */
-  standingAuthorization?: StandingAuthorization | null;
+  useStandingAuthorization?: boolean;
   /**
    * What the proposal said, in the owner's language.
    *
@@ -346,14 +358,23 @@ export async function evaluateToolCall(
   }
 
   // An instruction the owner already gave for this job, if it covers this
-  // call. Sourced from the executing job's own id and the gate's resolved
-  // business — never from `toolInput`, which the payload's author could
-  // shape. Without an executing job there is nothing for the authorisation to
-  // belong to, so it cannot apply (`coveredByAuthorization` itself checks
-  // `jobId`/`businessId` again, as a second line of defence).
+  // call. Loaded here, by id, rather than trusted from `ctx` — see
+  // `useStandingAuthorization`'s docblock for why a whole row handed over by
+  // value was the finding. Sourced from the executing job's own id and the
+  // gate's resolved business — never from `toolInput`, which the payload's
+  // author could shape. Without an executing job there is nothing for the
+  // authorisation to belong to, so it cannot apply
+  // (`coveredByAuthorization` itself checks `jobId`/`businessId` again, as a
+  // second line of defence against a mismatch this loader cannot produce but
+  // a future caller of `coveredByAuthorization` elsewhere might).
+  const standingAuth =
+    ctx.useStandingAuthorization === true && ctx.jobId != null
+      ? await loadAuthorization(ctx.jobId, { businessId, db })
+      : null;
+
   const standing =
     ctx.jobId != null &&
-    coveredByAuthorization(ctx.standingAuthorization ?? null, {
+    coveredByAuthorization(standingAuth, {
       jobId: ctx.jobId,
       businessId,
       actionClass: facts.actionClass,
@@ -366,7 +387,15 @@ export async function evaluateToolCall(
     // Absolute, and standing authorisation cannot reach it. A class that is
     // never fully autonomous is never fully autonomous.
     NEVER_FULLY_AUTONOMOUS.has(facts.actionClass) ||
-    (!standing && (effective === 'approve_required' || risk.band !== 'routine'));
+    // The charter ceiling the owner signed, and any hard cap an envelope
+    // carried, stand outside `standing`'s reach too — controller ruling
+    // (fix round 1, F1). An instruction is momentary; a signed ceiling is a
+    // durable, deliberate statement, and every prior relaxation in this
+    // codebase — the first-contact exemption chief among them — stops short
+    // of it. Standing authorisation removes only the risk-band escalation
+    // below, exactly the scope that exemption has.
+    effective === 'approve_required' ||
+    (!standing && risk.band !== 'routine');
 
   if (needsApproval) {
     const approvalId = await enqueueApproval(
@@ -376,10 +405,8 @@ export async function evaluateToolCall(
         facts,
         risk,
         proposedInput: toolInput,
-        summary: ctx.proposalText?.headline ?? risk.explanation,
-        detail:
-          ctx.proposalText?.detail ??
-          `${facts.toolName} · ${facts.actionClass} · רצועה ${risk.band}`,
+        summary: proposalHeadline(ctx.proposalText) ?? risk.explanation,
+        detail: proposalDetail(ctx.proposalText) ?? defaultApprovalDetail(facts, risk),
       },
       { businessId, db },
     );
@@ -439,6 +466,29 @@ export async function evaluateToolCall(
       code: `queued_for_approval:${approvalId}`,
       reason: risk.explanation,
     };
+  }
+
+  // A standing authorisation is what let this run without a question — the
+  // approval path leaves `approval_consumed:<id>` for the same reason. Without
+  // this row a `sensitive`-band send that ran unattended is indistinguishable
+  // in the trail from a routine one that never needed asking; reconstructing
+  // why something was permitted is the one thing the trail exists for.
+  if (standing) {
+    await appendAudit(
+      {
+        actor: ctx.agent,
+        kind: 'decision',
+        jobId: ctx.jobId ?? null,
+        envelopeId: ctx.envelopeId ?? null,
+        actionClass: facts.actionClass,
+        charterVersion: currentVersion,
+        provenance: facts.provenance,
+        inputHash: facts.inputHash,
+        risk,
+        reason: `standing_authorization:${ctx.jobId} (intent seq ${intent.seq})`,
+      },
+      { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
+    );
   }
 
   return {
@@ -576,4 +626,34 @@ function deny(code: string, reason: string): PolicyDecision {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// `summary`/`detail` are `TEXT NOT NULL` with no bound in `approval_requests`,
+// and this text is model-generated. The dashboard already size-limits
+// owner-supplied text (`MAX_BODY_BYTES`, `src/dashboard/server.ts`); text
+// arriving from the other direction deserves the same discipline.
+const MAX_PROPOSAL_HEADLINE_LENGTH = 200;
+const MAX_PROPOSAL_DETAIL_LENGTH = 2000;
+
+/**
+ * A caller-supplied proposal field counts as present only when it is a
+ * non-empty string after trimming — the `refineActionClass` rule (CLAUDE.md):
+ * a field that merely "normalises to something" is not the same as one that
+ * was actually written. `??` alone let `{ headline: '', detail: '' }` through
+ * and rendered an approval card with a blank title (fix round 1, F4).
+ */
+function proposalHeadline(proposalText: GateContext['proposalText']): string | undefined {
+  const headline = proposalText?.headline;
+  if (headline === undefined || headline.trim().length === 0) return undefined;
+  return headline.slice(0, MAX_PROPOSAL_HEADLINE_LENGTH);
+}
+
+function proposalDetail(proposalText: GateContext['proposalText']): string | undefined {
+  const detail = proposalText?.detail;
+  if (detail === undefined || detail.trim().length === 0) return undefined;
+  return detail.slice(0, MAX_PROPOSAL_DETAIL_LENGTH);
+}
+
+function defaultApprovalDetail(facts: ActionFacts, risk: RiskAssessment): string {
+  return `${facts.toolName} · ${facts.actionClass} · רצועה ${risk.band}`;
 }
