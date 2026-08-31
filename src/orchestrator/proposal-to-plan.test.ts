@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Plan, planProblems } from '../domain/plan.js';
 import type { Proposal } from '../domain/proposal.js';
-import { proposalToPlan } from './proposal-to-plan.js';
+import { proposalToApprovalText, proposalToPlan } from './proposal-to-plan.js';
 
 const SOURCE = { ordinal: 0, locator: null };
 
@@ -58,5 +58,45 @@ describe('proposalToPlan', () => {
     const a = proposalToPlan(PROPOSAL, { goal: 'x' });
     const b = proposalToPlan(PROPOSAL, { goal: 'x' });
     expect(JSON.stringify(a)).toBe(JSON.stringify(b));
+  });
+});
+
+describe('proposalToApprovalText', () => {
+  it('titles the card with the action, so the owner reads what will happen', () => {
+    expect(proposalToApprovalText(PROPOSAL)?.headline).toBe('אשלח מייל לדנה');
+  });
+
+  // Spec §4, and the reason is the whole reason: the objection is not the
+  // thing being approved. A card headed "אני נגד חתימה" over an Approve
+  // button leaves the owner unable to tell whether they approved the
+  // objection or the send.
+  it('titles an advise_against card with the alternative action, never with the objection', () => {
+    const text = proposalToApprovalText({
+      ...PROPOSAL,
+      stance: 'advise_against',
+      headline: 'אני נגד חתימה',
+      action: { ...PROPOSAL.action!, headline: 'אשלח לו הודעה בוואטסאפ' },
+    });
+
+    expect(text?.headline).toBe('אשלח לו הודעה בוואטסאפ');
+    expect(text?.headline).not.toBe('אני נגד חתימה');
+  });
+
+  it('carries the purpose and every reason into the detail line', () => {
+    const text = proposalToApprovalText({
+      ...PROPOSAL,
+      reasons: [
+        { text: 'התנאים הורעו', findingLabel: 'תנאי תשלום', sourceRef: SOURCE },
+        { text: 'המועד לא נקבע', findingLabel: 'מועד', sourceRef: SOURCE },
+      ],
+    });
+
+    expect(text?.detail).toContain('כדי לאשר את התנאים');
+    expect(text?.detail).toContain('התנאים הורעו');
+    expect(text?.detail).toContain('המועד לא נקבע');
+  });
+
+  it('returns null when the proposal carries no action, because no approval will be raised', () => {
+    expect(proposalToApprovalText({ ...PROPOSAL, stance: 'no_action', action: null })).toBeNull();
   });
 });
