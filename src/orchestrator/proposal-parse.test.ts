@@ -109,7 +109,7 @@ describe('parseProposal', () => {
 
   it('refuses an expectedActionClass that contradicts the real classification', () => {
     const outcome = parseProposal(
-      JSON.stringify({ ...VALID, action: { ...ACTION, expectedActionClass: 'payment.execute' } }),
+      JSON.stringify({ ...VALID, action: { ...ACTION, expectedActionClass: 'whatsapp.reply' } }),
       READING, CATALOGUE,
     );
     expect(outcome.status).toBe('unproposable');
