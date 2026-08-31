@@ -14,7 +14,7 @@
 
 import { Proposal } from '../domain/proposal.js';
 import type { Reading } from '../domain/reading.js';
-import { classifyAction } from '../policy/classify.js';
+import { classifiedToolNames, classifyAction } from '../policy/classify.js';
 import type { CatalogueEntry } from './catalogue.js';
 
 export type ProposalProblem = {
@@ -24,7 +24,8 @@ export type ProposalProblem = {
     | 'ask_without_question'
     | 'reason_cites_unknown_finding'
     | 'tool_not_in_catalogue'
-    | 'action_class_mismatch';
+    | 'action_class_mismatch'
+    | 'headline_is_tool_name';
   detail: string;
 };
 
@@ -91,6 +92,18 @@ export function proposalProblems(
       problems.push({
         kind: 'action_class_mismatch',
         detail: `תוכנן ${action.expectedActionClass}, יסווג ${actual}`,
+      });
+    }
+
+    // Rule 4 of the prompt: a headline says what happens, never a tool name.
+    // Checked against a closed set — `classifiedToolNames()` — rather than a
+    // pattern on dots or spaces, which would refuse a legitimate Hebrew
+    // headline the first time one happened to look like a tool name.
+    const headline = action.headline.trim();
+    if (headline === action.toolName || classifiedToolNames().includes(headline)) {
+      problems.push({
+        kind: 'headline_is_tool_name',
+        detail: `הכותרת "${action.headline}" היא שם כלי, לא תיאור של מה שקורה`,
       });
     }
   }

@@ -114,6 +114,22 @@ describe('parseProposal', () => {
     );
     expect(outcome.status).toBe('unproposable');
   });
+
+  it("refuses a headline that is the action's own tool name", () => {
+    const outcome = parseProposal(
+      JSON.stringify({ ...VALID, action: { ...ACTION, headline: 'mail.send' } }),
+      READING, CATALOGUE,
+    );
+    expect(outcome.status).toBe('unproposable');
+  });
+
+  it('refuses a headline that is a different known tool name', () => {
+    const outcome = parseProposal(
+      JSON.stringify({ ...VALID, action: { ...ACTION, headline: 'wa.send_message' } }),
+      READING, CATALOGUE,
+    );
+    expect(outcome.status).toBe('unproposable');
+  });
 });
 
 describe('proposalProblems', () => {
