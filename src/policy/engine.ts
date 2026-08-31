@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { domainMatches, extractDomain } from '../util/address.js';
 import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
+import { coveredByAuthorization, type StandingAuthorization } from '../orchestrator/authorization.js';
 import type { AgentId } from '../domain/audit.js';
 import type { ActionFacts, PolicyBundle, PolicyDecision } from '../domain/policy.js';
 import { DENY_CODES } from '../domain/policy.js';
@@ -46,6 +47,25 @@ export interface GateContext extends FactsContext {
    * second request, and the step never runs however many times it is approved.
    */
   approval?: { approvalId: string; stepId: string };
+  /**
+   * The instruction the owner already gave for this job, if any.
+   *
+   * Loaded by the caller from `job_authorizations` — never constructed here
+   * and never derived from a payload. When it covers the call, `needsApproval`
+   * is satisfied by it instead of by a fresh question (spec §6). It cannot
+   * reach `NEVER_FULLY_AUTONOMOUS`, and `coveredByAuthorization` refuses
+   * anything carrying money.
+   */
+  standingAuthorization?: StandingAuthorization | null;
+  /**
+   * What the proposal said, in the owner's language.
+   *
+   * Fills the approval card's title and description, which today carry the
+   * risk engine's own prose. The risk explanation is not replaced — it stays
+   * in the card's risk row. A person needs both what is proposed and why the
+   * system is uneasy; they are two facts, not one.
+   */
+  proposalText?: { headline: string; detail: string };
   /**
    * How to tell the owner a request is waiting, and where they can act on it.
    *
@@ -325,10 +345,28 @@ export async function evaluateToolCall(
     // approved something, and it was not this.
   }
 
+  // An instruction the owner already gave for this job, if it covers this
+  // call. Sourced from the executing job's own id and the gate's resolved
+  // business — never from `toolInput`, which the payload's author could
+  // shape. Without an executing job there is nothing for the authorisation to
+  // belong to, so it cannot apply (`coveredByAuthorization` itself checks
+  // `jobId`/`businessId` again, as a second line of defence).
+  const standing =
+    ctx.jobId != null &&
+    coveredByAuthorization(ctx.standingAuthorization ?? null, {
+      jobId: ctx.jobId,
+      businessId,
+      actionClass: facts.actionClass,
+      input: isRecord(toolInput) ? toolInput : {},
+      amountDeclared: facts.amountDeclared,
+      amountMinor: facts.amountMinor,
+    });
+
   const needsApproval =
-    effective === 'approve_required' ||
-    risk.band !== 'routine' ||
-    NEVER_FULLY_AUTONOMOUS.has(facts.actionClass);
+    // Absolute, and standing authorisation cannot reach it. A class that is
+    // never fully autonomous is never fully autonomous.
+    NEVER_FULLY_AUTONOMOUS.has(facts.actionClass) ||
+    (!standing && (effective === 'approve_required' || risk.band !== 'routine'));
 
   if (needsApproval) {
     const approvalId = await enqueueApproval(
@@ -338,8 +376,10 @@ export async function evaluateToolCall(
         facts,
         risk,
         proposedInput: toolInput,
-        summary: risk.explanation,
-        detail: `${facts.toolName} · ${facts.actionClass} · רצועה ${risk.band}`,
+        summary: ctx.proposalText?.headline ?? risk.explanation,
+        detail:
+          ctx.proposalText?.detail ??
+          `${facts.toolName} · ${facts.actionClass} · רצועה ${risk.band}`,
       },
       { businessId, db },
     );
@@ -532,4 +572,8 @@ async function recordIntent(
 
 function deny(code: string, reason: string): PolicyDecision {
   return { outcome: 'deny', code, reason };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
