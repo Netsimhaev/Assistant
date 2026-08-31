@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { domainMatches, extractDomain } from '../util/address.js';
 import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
-import { coveredByAuthorization, loadAuthorization } from '../orchestrator/authorization.js';
+import { coveredByAuthorization, loadAuthorization } from '../governance/authorization.js';
 import type { AgentId } from '../domain/audit.js';
 import type { ActionFacts, PolicyBundle, PolicyDecision } from '../domain/policy.js';
 import { DENY_CODES } from '../domain/policy.js';

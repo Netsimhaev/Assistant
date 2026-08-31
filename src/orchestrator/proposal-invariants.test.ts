@@ -53,12 +53,12 @@ describe('the authorisation boundary this sub-project drew', () => {
     // approval, and a second writer is how an instruction gets forged —
     // written anywhere other than the one place that first checks the job's
     // own stamped provenance (`grantAuthorization` in
-    // `src/orchestrator/authorization.ts`).
+    // `src/governance/authorization.ts`).
     const writers = PRODUCTION_SOURCES.filter((path) =>
       readFileSync(path, 'utf8').includes('INSERT INTO job_authorizations'),
     );
     expect(writers).toHaveLength(1);
-    expect(writers[0]?.replace(/\\/g, '/')).toMatch(/\/src\/orchestrator\/authorization\.ts$/);
+    expect(writers[0]?.replace(/\\/g, '/')).toMatch(/\/src\/governance\/authorization\.ts$/);
   });
 
   it('has no module under src/documents/ importing the authorisation module', () => {
@@ -69,8 +69,13 @@ describe('the authorisation boundary this sub-project drew', () => {
     const documentSources = PRODUCTION_SOURCES.filter((path) => path.startsWith(DOCUMENTS_DIR));
     expect(documentSources.length).toBeGreaterThan(5);
 
+    // Matched on the module's file name, not on the directory it currently
+    // sits in. The module moved once already (orchestrator -> governance),
+    // and a directory-anchored pattern would have kept passing while
+    // checking for a path nothing imports any more — a control that quietly
+    // stops applying is the failure mode the move itself was about.
     const offenders = documentSources.filter((path) =>
-      /from\s+['"].*orchestrator\/authorization\.js['"]/.test(readFileSync(path, 'utf8')),
+      /from\s+['"][^'"]*\/authorization\.js['"]/.test(readFileSync(path, 'utf8')),
     );
     expect(offenders).toEqual([]);
   });

@@ -5,7 +5,7 @@ import { compileCharter } from '../charter/compile.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createJob } from '../orchestrator/jobs.js';
-import { grantAuthorization } from '../orchestrator/authorization.js';
+import { grantAuthorization } from '../governance/authorization.js';
 import { queryAudit } from '../audit/log.js';
 import { evaluateToolCall } from './engine.js';
 

@@ -2,6 +2,18 @@
  * Standing authorisation: the owner's instruction, on record, standing in for
  * an approval question (spec §6).
  *
+ * **It lives under `governance/` and not `orchestrator/` for a layering
+ * reason, not a taxonomic one.** `policy/engine.ts` imports this module and
+ * this module imports `policy/facts.js`; while it sat in `orchestrator/`,
+ * that held only because it happened to import nothing from its own
+ * directory, and the day it needed `jobs.js` or `channels.js` — which
+ * `orchestrator/execute.ts` already reaches through `policy/engine.js` — the
+ * loop would have closed. `src/orchestrator/step-error.ts` exists as its own
+ * module because this project already paid that price once. Beside
+ * `approvals.ts`, `consume.ts` and `killswitch.ts` it is also simply in the
+ * right company: all three are imported by the gate, and standing
+ * authorisation *is* an approval substitute.
+ *
  * **Where the instruction is read from is the entire control.** It comes from
  * a row written when the owner opened the job, and from the job's stamped
  * provenance column — never from content. `grantAuthorization` refuses a job

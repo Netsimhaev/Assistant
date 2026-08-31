@@ -4,7 +4,7 @@ import { resetDatabase } from '../test/db.js';
 import { compileCharter } from '../charter/compile.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
-import { createJob } from './jobs.js';
+import { createJob } from '../orchestrator/jobs.js';
 import {
   AuthorizationAlreadyGrantedError,
   coveredByAuthorization,
