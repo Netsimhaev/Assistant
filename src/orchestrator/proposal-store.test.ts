@@ -78,6 +78,16 @@ describe('saveProposal', () => {
     ).rejects.toThrow();
   });
 
+  it('refuses an unproposable row that carries content', async () => {
+    const readingId = await aReading();
+    await expect(
+      saveProposal(
+        newProposal(readingId, { status: 'unproposable', reason: 'no JSON object', content: PROPOSAL }),
+        { businessId: BUSINESS },
+      ),
+    ).rejects.toThrow();
+  });
+
   it('does not cross the business boundary', async () => {
     const readingId = await aReading();
     await saveProposal(newProposal(readingId), { businessId: BUSINESS });
