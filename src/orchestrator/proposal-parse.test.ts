@@ -115,6 +115,31 @@ describe('parseProposal', () => {
     expect(outcome.status).toBe('unproposable');
   });
 
+  // The guard that used to stand here (`actual !== null`) let this exact
+  // shape through: a read-only tool with a declared class was stored as
+  // `proposed` and compiled, and `classMismatch` in `run-plan.ts` — which
+  // has no such guard — then rejected the whole plan at execution. §8 says
+  // this check catches an infeasible plan before it runs.
+  it('refuses a read-only tool that still declares an action class, exactly as run-plan does', () => {
+    const outcome = parseProposal(
+      JSON.stringify({
+        ...VALID,
+        action: { ...ACTION, agent: 'know.reader', toolName: 'memory.recall' },
+      }),
+      READING,
+      [
+        ...CATALOGUE,
+        { agent: 'know.reader', tools: [{ toolName: 'memory.recall', actionClass: null, effectiveAutonomy: 'auto' }] },
+      ],
+    );
+
+    expect(outcome.status).toBe('unproposable');
+    if (outcome.status !== 'unproposable') throw new Error('expected an unproposable outcome');
+    // Named, not merely refused: without this the test would pass on
+    // `tool_not_in_catalogue` and prove nothing about the guard.
+    expect(outcome.reason).toContain('action_class_mismatch');
+  });
+
   it("refuses a headline that is the action's own tool name", () => {
     const outcome = parseProposal(
       JSON.stringify({ ...VALID, action: { ...ACTION, headline: 'mail.send' } }),

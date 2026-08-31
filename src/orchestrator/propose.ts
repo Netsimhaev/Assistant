@@ -70,6 +70,18 @@ export interface ProposeForReadingOptions {
    * tested without an API key — a stand-in for the one step that costs
    * money, not a mock of the SDK. Every other step in this function runs for
    * real against the real database.
+   *
+   * **The seam is trusted by construction, and nothing re-checks what it
+   * returns.** In production the value is `makeProposal`, which runs
+   * `parseProposal` internally: schema, stance constraints, citation
+   * integrity and the catalogue check all happen there, so a second pass
+   * here would only repeat them. An injected proposer bypasses all of it and
+   * can hand back a `Proposal` naming a tool no agent holds. That is
+   * acceptable because the only injector is a test in this repository — a
+   * test that lies to itself proves nothing and harms nobody. It stops being
+   * acceptable the moment anything outside this repository can supply this
+   * function, and at that point the validation belongs here, not in the
+   * caller.
    */
   proposer?: (request: ProposeRequest) => Promise<ProposeOutcome>;
 }

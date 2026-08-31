@@ -468,11 +468,20 @@ export async function evaluateToolCall(
     };
   }
 
-  // A standing authorisation is what let this run without a question — the
-  // approval path leaves `approval_consumed:<id>` for the same reason. Without
-  // this row a `sensitive`-band send that ran unattended is indistinguishable
-  // in the trail from a routine one that never needed asking; reconstructing
-  // why something was permitted is the one thing the trail exists for.
+  // The standing authorisation was consulted and covered this call — the
+  // approval path leaves `approval_consumed:<id>` for the same reason.
+  // Without this row a `sensitive`-band send that ran unattended is
+  // indistinguishable in the trail from a routine one that never needed
+  // asking; reconstructing why something was permitted is the one thing the
+  // trail exists for.
+  //
+  // Deliberately not narrowed to `risk.band !== 'routine'`, which is the only
+  // case where the authorisation is what *changed* the outcome. The row is
+  // written whenever it applied, and says only that — "covered", not "and
+  // therefore permitted". A row that appears only when it was decisive would
+  // make its absence ambiguous between "no authorisation" and "one that did
+  // not need to matter", and the trail is read to reconstruct what the gate
+  // consulted, not only what tipped it.
   if (standing) {
     await appendAudit(
       {

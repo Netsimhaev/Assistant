@@ -42,6 +42,14 @@ export type Reason = z.infer<typeof Reason>;
  * `purpose` is required. "I will send Dana an email" is an act; "to confirm
  * the installation date" is why anyone would approve it, and an approval
  * screen without it asks the owner to guess.
+ *
+ * **`intent` is validation-only and deliberately not propagated.** It exists
+ * so a proposal naming an intent outside the closed ten fails to parse, which
+ * is a real check on the model's answer; `proposalToPlan` then drops it,
+ * because `PlanStep.intent` is a free-text sentence a person reads in the
+ * audit row ("אשלח מייל לדנה — כדי לאשר את התנאים") and not this enum. Two
+ * fields named `intent` meaning different things is the reason this is
+ * written down rather than left to be rediscovered.
  */
 export const ProposedAction = z.object({
   headline: z.string().min(1),

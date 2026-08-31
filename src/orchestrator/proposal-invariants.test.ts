@@ -54,9 +54,14 @@ describe('the authorisation boundary this sub-project drew', () => {
     // written anywhere other than the one place that first checks the job's
     // own stamped provenance (`grantAuthorization` in
     // `src/governance/authorization.ts`).
-    const writers = PRODUCTION_SOURCES.filter((path) =>
-      readFileSync(path, 'utf8').includes('INSERT INTO job_authorizations'),
-    );
+    // Every write, not only the literal `INSERT INTO`. An
+    // `UPDATE job_authorizations SET recipients = ...` — precisely the silent
+    // widening the migration's primary key was chosen to forbid — passed a
+    // substring match on the insert, and so did `INSERT  INTO` with two
+    // spaces. `TRUNCATE` stays permitted on purpose: `src/test/db.ts` empties
+    // the table between tests, and emptying a table grants nobody anything.
+    const WRITE = /(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+job_authorizations/i;
+    const writers = PRODUCTION_SOURCES.filter((path) => WRITE.test(readFileSync(path, 'utf8')));
     expect(writers).toHaveLength(1);
     expect(writers[0]?.replace(/\\/g, '/')).toMatch(/\/src\/governance\/authorization\.ts$/);
   });

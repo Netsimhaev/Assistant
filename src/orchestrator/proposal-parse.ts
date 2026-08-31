@@ -87,11 +87,20 @@ export function proposalProblems(
 
     // Advisory, but a mismatch means the planner intended something other than
     // what will happen — the same rule `Plan` already holds for its steps.
+    //
+    // `actual === null` (a read-only tool) is a mismatch too, and used not to
+    // be: a `null !== undefined` guard stood here and let a proposal that
+    // named a read-only tool *and* declared a class through, only for
+    // `classMismatch` in `run-plan.ts` — which carries no such guard — to
+    // reject the whole compiled plan at execution. §8 claims this check
+    // catches an infeasible plan before it runs; a check that disagrees with
+    // the executor about what is feasible catches nothing, it just moves the
+    // rejection somewhere with no reason attached.
     const actual = classifyAction(action.toolName);
-    if (action.expectedActionClass !== null && actual !== null && action.expectedActionClass !== actual) {
+    if (action.expectedActionClass !== null && action.expectedActionClass !== actual) {
       problems.push({
         kind: 'action_class_mismatch',
-        detail: `תוכנן ${action.expectedActionClass}, יסווג ${actual}`,
+        detail: `תוכנן ${action.expectedActionClass}, יסווג ${actual ?? 'קריאה-בלבד'}`,
       });
     }
 
