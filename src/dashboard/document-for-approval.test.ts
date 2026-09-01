@@ -278,6 +278,42 @@ describe('documentForApproval', () => {
     expect(result?.documentId).not.toBe(older.documentId);
   });
 
+  it('breaks a created_at tie by proposal_id, deterministically (M4)', async () => {
+    // Two proposals on one job that land on the exact same `created_at` —
+    // the case `p.created_at DESC` alone cannot order, and the case M4's
+    // signing flow needs resolved the same way twice (once for the card,
+    // once for the POST). Without `p.proposal_id DESC` as a tiebreaker,
+    // which of the two documents comes back is whatever order Postgres
+    // happens to produce for tied sort keys — unspecified, not "the older
+    // one" or "the newer one".
+    const bundle = await install(BUSINESS);
+    const job = await aJob(BUSINESS, bundle, 'תיקו בזמן היצירה');
+    const a = await aDocumentAndReading(BUSINESS);
+    const b = await aDocumentAndReading(BUSINESS);
+
+    const proposalA = await aProposal(BUSINESS, a.readingId, job.jobId);
+    const proposalB = await aProposal(BUSINESS, b.readingId, job.jobId);
+    // Force an exact tie — one explicit, shared timestamp for both rows,
+    // not "however close together the two inserts landed".
+    await getPool().query(
+      `UPDATE proposals SET created_at = now() WHERE proposal_id IN ($1, $2)`,
+      [proposalA.proposalId, proposalB.proposalId],
+    );
+
+    // `proposal_id` is a ulid (`PR-${ulid()}`, monotonic on creation order),
+    // so proposalB — created second — has the lexicographically higher id.
+    // Assert that directly rather than assume it, so this test does not
+    // silently start asserting the wrong thing if `aProposal`'s id scheme
+    // ever changes.
+    expect(proposalB.proposalId > proposalA.proposalId).toBe(true);
+
+    const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
+    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+
+    expect(result?.documentId).toBe(b.documentId);
+    expect(result?.documentId).not.toBe(a.documentId);
+  });
+
   it('does not leak a document whose reading belongs to another business', async () => {
     const bundle = await install(BUSINESS);
     // The approval and the proposal both live under BUSINESS — so

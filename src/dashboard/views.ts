@@ -196,23 +196,29 @@ ${list}`,
  * and stamp — the card resolves the document once when it renders, and the
  * POST resolves it again; without this, the two resolutions could disagree.
  *
- * `noteValue` and `signError` mirror the approve form's own reasoning: a
- * refusal that resets what the owner typed, or that renders where a
- * different form's control sits, both misattribute the refusal.
+ * `noteValue` mirrors the approve form's own reasoning: a refusal that
+ * resets what the owner typed is losing their work by half.
+ *
+ * `signError` is deliberately NOT a parameter here. Two of the route's sign
+ * refusals — the approval is already decided, or no document is behind it
+ * at all — have no `document` to render this form with, so an error block
+ * living inside `signForm` would silently vanish exactly on those two
+ * refusals (a regression caught in round-2 review: the "no document" case
+ * used to render, misplaced, in the approve form — after this file's first
+ * pass it rendered nowhere at all). `renderApprovalCard` renders
+ * `signError` itself, unconditionally, before deciding whether `signForm`
+ * exists.
  */
 function signForm(
   approvalId: string,
   csrf: string,
   document: DocumentRecord,
   noteValue: string,
-  signError?: string,
 ): string {
-  const errorBlock = signError ? `<p class="error">${esc(signError)}</p>` : '';
   return `<form method="post" action="/a/${esc(approvalId)}/sign">
     <input type="hidden" name="csrf" value="${esc(csrf)}">
     <input type="hidden" name="documentId" value="${esc(document.documentId)}">
     <p class="muted">חתימה מאשרת את הבקשה וקובעת שהמסמך "${esc(document.originalName)}" נתקבל כמחייב.</p>
-    ${errorBlock}
     <label>הערה (רשות)<textarea name="note" rows="2">${esc(noteValue)}</textarea></label>
     <button type="submit">חתום ואשר</button>
   </form>`;
@@ -225,13 +231,20 @@ export function renderApprovalCard(options: {
   editValue?: string;
   noteValue?: string;
   error?: string;
-  /** A refusal that belongs to the sign form, not the approve form (see `signForm`'s docblock). */
+  /**
+   * A refusal that belongs to the sign action, not the approve form (see
+   * `signForm`'s docblock). Rendered at card level, unconditionally — NOT
+   * inside `signForm`, because two of the route's sign refusals (already
+   * decided; no document at all) have no document to render that form with,
+   * and this text must still reach the owner when they don't.
+   */
   signError?: string;
 }): string {
   const { approval } = options;
   const editValue = options.editValue ?? JSON.stringify(approval.proposedInput, null, 2);
   const noteValue = options.noteValue ?? '';
   const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
+  const signErrorBlock = options.signError ? `<p class="error">${esc(options.signError)}</p>` : '';
   const risk = approval.risk;
 
   return page(
@@ -253,6 +266,7 @@ export function renderApprovalCard(options: {
     <tr><td class="muted">פג תוקף</td><td>${esc(approval.expiresAt)}</td></tr>
   </table>
 </div>
+${signErrorBlock}
 <div class="row">
   <form method="post" action="/a/${esc(approval.approvalId)}/approve" class="edit-form">
     <input type="hidden" name="csrf" value="${esc(options.csrf)}">
@@ -269,7 +283,7 @@ export function renderApprovalCard(options: {
     <label>הערה (רשות)<textarea name="note" rows="2"></textarea></label>
     <button type="submit">דחייה</button>
   </form>
-  ${options.document ? signForm(approval.approvalId, options.csrf, options.document, noteValue, options.signError) : ''}
+  ${options.document ? signForm(approval.approvalId, options.csrf, options.document, noteValue) : ''}
 </div>`,
   );
 }

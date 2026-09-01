@@ -483,6 +483,11 @@ describe('signing an approval', () => {
       redirect: 'manual',
     });
     expect(signRes.status).toBe(400);
+    // D1 (round 2): this refusal has no `document` to render `signForm`
+    // with, so it must render at card level or it silently vanishes —
+    // the owner would otherwise see a normal-looking card with the sign
+    // button simply gone, no explanation.
+    expect(await signRes.text()).toContain('הבקשה כבר הוכרעה');
 
     expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
     expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('denied');
@@ -601,6 +606,12 @@ describe('signing an approval', () => {
       redirect: 'manual',
     });
     expect(signRes.status).toBe(400);
+    // D1 (round 2): a regression the first pass introduced — this refusal
+    // has no `document` either, and used to render (misplaced, in the
+    // approve form) before this file's first fix; the first fix moved the
+    // text into `signForm`, which never renders here at all, so the owner
+    // got no message instead of a misplaced one.
+    expect(await signRes.text()).toContain('לא נמצא מסמך המשויך לבקשה זו');
 
     const approval = await getApproval(approvalId, { businessId: BUSINESS });
     expect(approval?.state).toBe('pending');
