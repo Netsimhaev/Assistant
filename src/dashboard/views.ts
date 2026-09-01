@@ -190,12 +190,30 @@ ${list}`,
  * supplied — the same rule the route follows when deciding whether to accept
  * a POST there at all. `originalName` is a sender-chosen string, so it goes
  * through `esc` like everything else in this file.
+ *
+ * `documentId` travels as a hidden field so the route can refuse a sign
+ * whose form named a different document than the one it is about to verify
+ * and stamp — the card resolves the document once when it renders, and the
+ * POST resolves it again; without this, the two resolutions could disagree.
+ *
+ * `noteValue` and `signError` mirror the approve form's own reasoning: a
+ * refusal that resets what the owner typed, or that renders where a
+ * different form's control sits, both misattribute the refusal.
  */
-function signForm(approvalId: string, csrf: string, document: DocumentRecord): string {
+function signForm(
+  approvalId: string,
+  csrf: string,
+  document: DocumentRecord,
+  noteValue: string,
+  signError?: string,
+): string {
+  const errorBlock = signError ? `<p class="error">${esc(signError)}</p>` : '';
   return `<form method="post" action="/a/${esc(approvalId)}/sign">
     <input type="hidden" name="csrf" value="${esc(csrf)}">
+    <input type="hidden" name="documentId" value="${esc(document.documentId)}">
     <p class="muted">חתימה מאשרת את הבקשה וקובעת שהמסמך "${esc(document.originalName)}" נתקבל כמחייב.</p>
-    <label>הערה (רשות)<textarea name="note" rows="2"></textarea></label>
+    ${errorBlock}
+    <label>הערה (רשות)<textarea name="note" rows="2">${esc(noteValue)}</textarea></label>
     <button type="submit">חתום ואשר</button>
   </form>`;
 }
@@ -207,6 +225,8 @@ export function renderApprovalCard(options: {
   editValue?: string;
   noteValue?: string;
   error?: string;
+  /** A refusal that belongs to the sign form, not the approve form (see `signForm`'s docblock). */
+  signError?: string;
 }): string {
   const { approval } = options;
   const editValue = options.editValue ?? JSON.stringify(approval.proposedInput, null, 2);
@@ -249,7 +269,7 @@ export function renderApprovalCard(options: {
     <label>הערה (רשות)<textarea name="note" rows="2"></textarea></label>
     <button type="submit">דחייה</button>
   </form>
-  ${options.document ? signForm(approval.approvalId, options.csrf, options.document) : ''}
+  ${options.document ? signForm(approval.approvalId, options.csrf, options.document, noteValue, options.signError) : ''}
 </div>`,
   );
 }

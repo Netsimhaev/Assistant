@@ -59,9 +59,18 @@ function toDocument(row: DocumentRow): DocumentRecord {
  * The document behind an approval, if any.
  *
  * A job may have several proposals over time — a rejected one and a later
- * retry, for instance. Ordered by the proposal's own `created_at DESC` and
- * limited to one: the card shows the most recent proposal made for this job,
- * the same one the dashboard would show if it rendered the proposal itself.
+ * retry, for instance. Ordered by the proposal's own `created_at DESC`,
+ * `proposal_id DESC` and limited to one: the card shows the most recent
+ * proposal made for this job, the same one the dashboard would show if it
+ * rendered the proposal itself. The `proposal_id` tiebreaker matters because
+ * this query runs twice for one sign — once to render the card, once again
+ * when the POST resolves the document to verify and stamp — and two
+ * proposals sharing a `created_at` (same batch, clock resolution) would
+ * otherwise let Postgres pick either row on either run, so the signature
+ * could end up attesting to a different document than the one the card
+ * showed. `proposal_id` is a ulid, so `DESC` also happens to agree with
+ * "most recently created" whenever `created_at` alone cannot tell two rows
+ * apart.
  */
 export async function documentForApproval(
   approvalId: string,
@@ -81,7 +90,7 @@ export async function documentForApproval(
        JOIN documents d
          ON d.document_id = r.document_id AND d.business_id = a.business_id
       WHERE a.approval_id = $1 AND a.business_id = $2
-      ORDER BY p.created_at DESC
+      ORDER BY p.created_at DESC, p.proposal_id DESC
       LIMIT 1`,
     [approvalId, businessId],
   );

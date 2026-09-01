@@ -412,7 +412,7 @@ describe('signing an approval', () => {
 
   it('signing an unchanged document records a signature, an audit row, and approves', async () => {
     const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
-    const { approvalId, jobId, documentId } = await aSignableApproval(
+    const { approvalId, jobId, documentId, sha256 } = await aSignableApproval(
       BUSINESS,
       docRoot,
       Buffer.from('הסכם שיווק — גרסה סופית', 'utf8'),
@@ -425,7 +425,7 @@ describe('signing an approval', () => {
     const signRes = await fetch(`${baseUrl}/a/${approvalId}/sign`, {
       method: 'POST',
       headers: { cookie },
-      body: new URLSearchParams({ csrf }),
+      body: new URLSearchParams({ csrf, documentId }),
       redirect: 'manual',
     });
     expect(signRes.status).toBe(302);
@@ -437,13 +437,56 @@ describe('signing an approval', () => {
     expect(signature).not.toBeNull();
     expect(signature?.signedBy).toBe(USERNAME);
     expect(signature?.approvalId).toBe(approvalId);
+    // M1: the row records what was actually re-hashed at signing time, not
+    // just that *some* signature exists.
+    expect(signature?.signedSha256).toBe(sha256);
 
     const audit = await queryAudit({ businessId: BUSINESS, kind: 'signature' });
     expect(audit.length).toBe(1);
     expect(audit[0]?.jobId).toBe(jobId);
+    expect(audit[0]?.reason).toContain(`signature:${documentId}`);
+    expect(audit[0]?.reason).toContain(`for approval ${approvalId}`);
 
     const updatedJob = await loadJob(jobId, { businessId: BUSINESS });
     expect(updatedJob?.phase).toBe('execute');
+  });
+
+  it('refuses to sign an approval already denied in another tab, and writes no signature', async () => {
+    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const { approvalId, documentId } = await aSignableApproval(
+      BUSINESS,
+      docRoot,
+      Buffer.from('הסכם שיווק — טאב שני', 'utf8'),
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const csrf = extractCsrf(await cardRes.text());
+
+    // Tab 1: deny.
+    const denyRes = await fetch(`${baseUrl}/a/${approvalId}/deny`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf }),
+      redirect: 'manual',
+    });
+    expect(denyRes.status).toBe(302);
+    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('denied');
+
+    // Tab 2, stale: sign the same, now-denied approval. `documentId` matches
+    // the real document — this must be refused on the approval's state
+    // alone, not incidentally by some other check.
+    const signRes = await fetch(`${baseUrl}/a/${approvalId}/sign`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, documentId }),
+      redirect: 'manual',
+    });
+    expect(signRes.status).toBe(400);
+
+    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
+    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('denied');
+    expect(await queryAudit({ businessId: BUSINESS, kind: 'signature' })).toEqual([]);
   });
 
   it('refuses to sign a document that changed on disk, and leaves the approval pending', async () => {
@@ -464,7 +507,7 @@ describe('signing an approval', () => {
     const signRes = await fetch(`${baseUrl}/a/${approvalId}/sign`, {
       method: 'POST',
       headers: { cookie },
-      body: new URLSearchParams({ csrf }),
+      body: new URLSearchParams({ csrf, documentId }),
       redirect: 'manual',
     });
     expect(signRes.status).toBe(400);
@@ -500,7 +543,7 @@ describe('signing an approval', () => {
     const signRes = await fetch(`${baseUrl}/a/${unreadable.approvalId}/sign`, {
       method: 'POST',
       headers: { cookie },
-      body: new URLSearchParams({ csrf }),
+      body: new URLSearchParams({ csrf, documentId: unreadableDoc.documentId }),
       redirect: 'manual',
     });
     expect(signRes.status).toBe(400);
@@ -522,7 +565,7 @@ describe('signing an approval', () => {
     const missingRes = await fetch(`${baseUrl}/a/${missing.approvalId}/sign`, {
       method: 'POST',
       headers: { cookie },
-      body: new URLSearchParams({ csrf: missingCsrf }),
+      body: new URLSearchParams({ csrf: missingCsrf, documentId: missingDoc.documentId }),
       redirect: 'manual',
     });
     expect(missingRes.status).toBe(400);
@@ -580,7 +623,7 @@ describe('signing an approval', () => {
     const firstSignRes = await fetch(`${baseUrl}/a/${first.approvalId}/sign`, {
       method: 'POST',
       headers: { cookie },
-      body: new URLSearchParams({ csrf: firstCsrf }),
+      body: new URLSearchParams({ csrf: firstCsrf, documentId }),
       redirect: 'manual',
     });
     expect(firstSignRes.status).toBe(302);
@@ -592,7 +635,7 @@ describe('signing an approval', () => {
     const secondSignRes = await fetch(`${baseUrl}/a/${second.approvalId}/sign`, {
       method: 'POST',
       headers: { cookie },
-      body: new URLSearchParams({ csrf: secondCsrf }),
+      body: new URLSearchParams({ csrf: secondCsrf, documentId }),
       redirect: 'manual',
     });
     expect(secondSignRes.status).toBe(400);
@@ -619,6 +662,49 @@ describe('signing an approval', () => {
 
     const approval = await getApproval(approvalId, { businessId: BUSINESS });
     expect(approval?.state).toBe('pending');
+  });
+
+  it('renders the resolved document id on the sign form', async () => {
+    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const { approvalId, documentId } = await aSignableApproval(
+      BUSINESS,
+      docRoot,
+      Buffer.from('הסכם שיווק — שדה מוסתר', 'utf8'),
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const body = await cardRes.text();
+
+    expect(body).toContain(`name="documentId" value="${documentId}"`);
+  });
+
+  // M4: the sign form names the document the owner was looking at when the
+  // card was rendered. A POST that names a different one — the page was
+  // stale, or a request was hand-crafted — must not sign whatever document
+  // `documentForApproval` happens to resolve to right now.
+  it('refuses to sign when the submitted documentId does not match the resolved document', async () => {
+    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const { approvalId, documentId } = await aSignableApproval(
+      BUSINESS,
+      docRoot,
+      Buffer.from('הסכם שיווק — אי-התאמת מסמך', 'utf8'),
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const csrf = extractCsrf(await cardRes.text());
+
+    const signRes = await fetch(`${baseUrl}/a/${approvalId}/sign`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, documentId: `DOC-${ulid()}` }),
+      redirect: 'manual',
+    });
+    expect(signRes.status).toBe(400);
+
+    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
+    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
   });
 });
 

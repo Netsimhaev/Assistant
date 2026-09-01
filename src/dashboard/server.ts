@@ -506,12 +506,38 @@ async function handleDecision(
   const note = noteFrom(form);
 
   // A `signed` outcome does everything `approved` does, and first: refuses
-  // unless a real document backs this request, re-verifies its bytes on
-  // disk, and only then records the signature and its audit row. Any
-  // refusal here re-renders the card exactly like the edited-payload error
-  // path below — it never throws, never approves, and leaves the approval
-  // `pending` so the owner can fix the file and try again.
+  // unless the approval is still open, a real document backs this request,
+  // that document is the one the sign form actually named, and re-verifying
+  // its bytes on disk finds them unchanged — and only then records the
+  // signature and its audit row. Any refusal here re-renders the card
+  // exactly like the edited-payload error path below — it never throws,
+  // never approves, and leaves the approval `pending` so the owner can fix
+  // the problem and try again. Errors from this block go on `signError`, not
+  // `error`: `error` renders inside the approve form, and a refusal about
+  // the document being signed does not belong attached to a different
+  // control (see `signForm`'s docblock).
   if (outcome === 'signed') {
+    // I1: mirrors exactly what `decide` (called via `applyDecision` below)
+    // itself refuses — `state !== 'pending'` and an expired `expiresAt` —
+    // checked here, before anything below runs. Without this, a stale tab
+    // could still verify the file, record a signature and write its audit
+    // row before `decide` finally threw on an approval that was already
+    // denied (or timed out) in another tab: the signature would then be
+    // real and permanent — `signatures_one_per_document_idx` allows exactly
+    // one per document — over a decision the owner never actually made.
+    if (approval.state !== 'pending' || Date.parse(approval.expiresAt) <= Date.now()) {
+      return sendHtml(
+        res,
+        400,
+        renderApprovalCard({
+          approval,
+          csrf: issueCsrfToken(session.sessionId),
+          ...(note !== undefined ? { noteValue: note } : {}),
+          signError: 'הבקשה כבר הוכרעה או שפג תוקפה, ולא ניתן לחתום עליה כעת.',
+        }),
+      );
+    }
+
     const document = await documentForApproval(approvalId, { businessId });
     if (document === null) {
       // The button that posts here would not have been rendered without a
@@ -523,7 +549,28 @@ async function handleDecision(
           approval,
           csrf: issueCsrfToken(session.sessionId),
           ...(note !== undefined ? { noteValue: note } : {}),
-          error: 'לא נמצא מסמך המשויך לבקשה זו. לא ניתן לחתום.',
+          signError: 'לא נמצא מסמך המשויך לבקשה זו. לא ניתן לחתום.',
+        }),
+      );
+    }
+
+    // M4: the sign form carries a hidden `documentId` naming the document it
+    // was rendered with. `documentForApproval`'s ordering has no tiebreaker
+    // for two proposals sharing a `created_at` (fixed alongside this, in
+    // `document-for-approval.ts`), and this route resolves the document a
+    // second, independent time — so without this check the two resolutions
+    // could disagree, and the signature would attest to a document the
+    // owner never saw on screen.
+    if (form.get('documentId') !== document.documentId) {
+      return sendHtml(
+        res,
+        400,
+        renderApprovalCard({
+          approval,
+          csrf: issueCsrfToken(session.sessionId),
+          document,
+          ...(note !== undefined ? { noteValue: note } : {}),
+          signError: 'המסמך המוצג אינו תואם עוד את הבקשה. יש לרענן את הדף ולנסות שוב.',
         }),
       );
     }
@@ -541,7 +588,7 @@ async function handleDecision(
           csrf: issueCsrfToken(session.sessionId),
           document,
           ...(note !== undefined ? { noteValue: note } : {}),
-          error: signRefusalReason(verifyResult),
+          signError: signRefusalReason(verifyResult),
         }),
       );
     }
@@ -570,11 +617,19 @@ async function handleDecision(
           csrf: issueCsrfToken(session.sessionId),
           document,
           ...(note !== undefined ? { noteValue: note } : {}),
-          error: 'המסמך כבר נחתם בעבר. אין צורך לחתום שוב.',
+          signError: 'המסמך כבר נחתם בעבר. אין צורך לחתום שוב.',
         }),
       );
     }
 
+    // I3: English, in the `verb_noun:<id>` prefix form every other
+    // production `appendAudit` call site in the repo already uses
+    // (`engine.ts`, `killswitch.ts`, `bindings.ts`, `recovery.ts`) —
+    // `audit_log.reason` is a forensic field nothing in the dashboard,
+    // `render.ts` or the CLI ever displays, so it is not covered by
+    // CLAUDE.md's "Hebrew for what the owner reads" rule. `originalName` is
+    // deliberately left out: it is a sender-chosen string, and no other
+    // audit reason in the repo carries attacker-influenced free text.
     await appendAudit(
       {
         ...(approval.jobId !== null ? { jobId: approval.jobId } : {}),
@@ -588,9 +643,7 @@ async function handleDecision(
           approvalId,
           sha256: verifyResult.sha256,
         }),
-        reason:
-          `${session.username} חתם על המסמך ${document.documentId} ` +
-          `("${document.originalName}") כחלק מאישור ${approvalId}`,
+        reason: `signature:${document.documentId} by ${session.username} for approval ${approvalId}`,
       },
       { businessId },
     );
