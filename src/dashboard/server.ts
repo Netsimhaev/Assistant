@@ -15,9 +15,15 @@
 import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { z } from 'zod';
+import { ulid } from 'ulid';
 import { config } from '../config.js';
+import { appendAudit } from '../audit/log.js';
 import { getApproval, pendingApprovals } from '../governance/approvals.js';
+import { DocumentAlreadySignedError, recordSignature } from '../governance/signatures.js';
 import { applyDecision } from '../orchestrator/resume.js';
+import { documentForApproval } from './document-for-approval.js';
+import { verifyDocumentUnchanged } from '../documents/verify.js';
+import type { VerifyOutcome } from '../documents/verify.js';
 import { canonicalHash } from '../util/canonical.js';
 import {
   login,
@@ -70,6 +76,13 @@ export interface DashboardOptions {
    * knows the topology.
    */
   trustProxy?: boolean;
+  /**
+   * Where a signed document's bytes live on disk, for `verifyDocumentUnchanged`
+   * to re-hash at signing time. Defaults to `config.documentRoot` when unset —
+   * this option exists so tests can point the sign route at an isolated temp
+   * directory instead of the real deployment's document store.
+   */
+  documentRoot?: string;
 }
 
 function sessionCookie(token: string): string {
@@ -339,7 +352,19 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
   // does not exist at all, so both come back 404, never 403.
   const approval = await getApproval(approvalId, { businessId });
   if (!approval) return sendHtml(res, 404, renderNotFound());
-  sendHtml(res, 200, renderApprovalCard({ approval, csrf: issueCsrfToken(session.sessionId) }));
+  // `null` (no document behind this approval) is the ordinary case — most
+  // approvals never had a document — and renderApprovalCard's sign button
+  // only appears when a document is actually supplied.
+  const document = await documentForApproval(approvalId, { businessId });
+  sendHtml(
+    res,
+    200,
+    renderApprovalCard({
+      approval,
+      csrf: issueCsrfToken(session.sessionId),
+      ...(document !== null ? { document } : {}),
+    }),
+  );
 }
 
 /** JSON.parse can hand back an object, an array, a string, a number, a boolean, or null — only the first is a tool payload. */
@@ -418,13 +443,35 @@ export function parseEditedInput(
   return { ok: true, editedInput: edited };
 }
 
+/**
+ * Hebrew refusal text for every `VerifyOutcome` except `unchanged` — the one
+ * outcome that lets signing proceed at all, so it is never asked to explain
+ * itself. `missing` and `unreadable` read differently on purpose (see
+ * `verify.ts`'s own header): one says the file is gone, the other says the
+ * deployment cannot read it and names the OS error code, because those point
+ * an operator at two different problems.
+ */
+function signRefusalReason(outcome: Exclude<VerifyOutcome, { status: 'unchanged' }>): string {
+  switch (outcome.status) {
+    case 'changed':
+      return 'תוכן הקובץ השתנה מאז שנקרא לראשונה. יש לבדוק את הגרסה העדכנית לפני שחותמים עליה.';
+    case 'missing':
+      return 'הקובץ שעליו מבוססת הבקשה נעדר מהדיסק. יש לוודא שהוא לא נמחק ולנסות שוב.';
+    case 'unreadable':
+      return `לא ניתן היה לקרוא את הקובץ השמור (שגיאה: ${outcome.cause}). זו כנראה תקלת הרשאות בפריסה ולא מחיקה של הקובץ — יש לפנות לגורם טכני.`;
+    case 'unknown_document':
+      return 'המסמך שעליו מבוססת הבקשה אינו נמצא. לא ניתן לחתום.';
+  }
+}
+
 async function handleDecision(
   req: IncomingMessage,
   res: ServerResponse,
   businessId: string,
   session: Session,
   approvalId: string,
-  outcome: 'approved' | 'denied',
+  outcome: 'approved' | 'denied' | 'signed',
+  documentRoot: string | undefined,
 ): Promise<void> {
   let form: URLSearchParams;
   try {
@@ -458,9 +505,102 @@ async function handleDecision(
 
   const note = noteFrom(form);
 
-  // Only the approve form carries an editable payload — denying something
-  // does not need a version of it to run, so a `deny` post is treated as
-  // if `input` were never sent, whatever a hand-crafted request attaches.
+  // A `signed` outcome does everything `approved` does, and first: refuses
+  // unless a real document backs this request, re-verifies its bytes on
+  // disk, and only then records the signature and its audit row. Any
+  // refusal here re-renders the card exactly like the edited-payload error
+  // path below — it never throws, never approves, and leaves the approval
+  // `pending` so the owner can fix the file and try again.
+  if (outcome === 'signed') {
+    const document = await documentForApproval(approvalId, { businessId });
+    if (document === null) {
+      // The button that posts here would not have been rendered without a
+      // document — a direct POST is a stale page or someone probing.
+      return sendHtml(
+        res,
+        400,
+        renderApprovalCard({
+          approval,
+          csrf: issueCsrfToken(session.sessionId),
+          ...(note !== undefined ? { noteValue: note } : {}),
+          error: 'לא נמצא מסמך המשויך לבקשה זו. לא ניתן לחתום.',
+        }),
+      );
+    }
+
+    const verifyResult = await verifyDocumentUnchanged(document.documentId, {
+      businessId,
+      ...(documentRoot !== undefined ? { documentRoot } : {}),
+    });
+    if (verifyResult.status !== 'unchanged') {
+      return sendHtml(
+        res,
+        400,
+        renderApprovalCard({
+          approval,
+          csrf: issueCsrfToken(session.sessionId),
+          document,
+          ...(note !== undefined ? { noteValue: note } : {}),
+          error: signRefusalReason(verifyResult),
+        }),
+      );
+    }
+
+    // `verifyResult.sha256` — what verification just measured — not
+    // `document.sha256`: the whole point of re-hashing is to sign the bytes
+    // actually on disk right now, not the row's stale claim about them.
+    try {
+      await recordSignature(
+        {
+          signatureId: `SIG-${ulid()}`,
+          documentId: document.documentId,
+          signedSha256: verifyResult.sha256,
+          approvalId,
+          signedBy: session.username,
+        },
+        { businessId },
+      );
+    } catch (err) {
+      if (!(err instanceof DocumentAlreadySignedError)) throw err;
+      return sendHtml(
+        res,
+        400,
+        renderApprovalCard({
+          approval,
+          csrf: issueCsrfToken(session.sessionId),
+          document,
+          ...(note !== undefined ? { noteValue: note } : {}),
+          error: 'המסמך כבר נחתם בעבר. אין צורך לחתום שוב.',
+        }),
+      );
+    }
+
+    await appendAudit(
+      {
+        ...(approval.jobId !== null ? { jobId: approval.jobId } : {}),
+        actor: 'human',
+        onBehalfOf: session.username,
+        kind: 'signature',
+        charterVersion: 'unknown',
+        provenance: 'boss',
+        inputHash: canonicalHash({
+          documentId: document.documentId,
+          approvalId,
+          sha256: verifyResult.sha256,
+        }),
+        reason:
+          `${session.username} חתם על המסמך ${document.documentId} ` +
+          `("${document.originalName}") כחלק מאישור ${approvalId}`,
+      },
+      { businessId },
+    );
+  }
+
+  // Only the approve form carries an editable payload — denying something,
+  // and signing (which runs the ordinary approve path unedited, on exactly
+  // what was proposed), do not need a version of it to run, so those posts
+  // are treated as if `input` were never sent, whatever a hand-crafted
+  // request attaches.
   const edit = parseEditedInput(
     outcome === 'approved' ? form.get('input') : null,
     approval.inputHash,
@@ -482,7 +622,9 @@ async function handleDecision(
 
   await applyDecision(
     approvalId,
-    outcome,
+    // `applyDecision` only knows 'approved' | 'denied' — a signature is an
+    // extra act performed before this, not a third outcome it records itself.
+    outcome === 'denied' ? 'denied' : 'approved',
     {
       by: session.username,
       channel: 'dashboard',
@@ -505,13 +647,21 @@ async function handleLogout(req: IncomingMessage, res: ServerResponse, businessI
 }
 
 const CARD_PATH = /^\/a\/([^/]+)$/;
-const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny)$/;
+const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
+
+/** The outcome `handleDecision` records for each `DECISION_PATH` action. */
+const OUTCOME_FOR_ACTION = {
+  approve: 'approved',
+  deny: 'denied',
+  sign: 'signed',
+} as const;
 
 async function route(
   req: IncomingMessage,
   res: ServerResponse,
   businessId: string,
   trustProxy: boolean,
+  documentRoot: string | undefined,
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const pathname = new URL(req.url ?? '/', 'http://dashboard.local').pathname;
@@ -557,8 +707,9 @@ async function route(
   if (method === 'POST' && decisionMatch) {
     const id = decisionMatch[1];
     const action = decisionMatch[2];
-    if (id !== undefined && action !== undefined) {
-      return handleDecision(req, res, businessId, session, id, action === 'approve' ? 'approved' : 'denied');
+    // The regex only ever captures one of the three keys below.
+    if (id !== undefined && (action === 'approve' || action === 'deny' || action === 'sign')) {
+      return handleDecision(req, res, businessId, session, id, OUTCOME_FOR_ACTION[action], documentRoot);
     }
   }
 
@@ -616,7 +767,7 @@ export function createServer(options: DashboardOptions = {}): Server {
   assertBindableHost(host, options.allowNonLoopbackBind ?? false);
 
   const server = createHttpServer((req, res) => {
-    route(req, res, businessId, options.trustProxy ?? false).catch((err: unknown) => {
+    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {
         sendHtml(res, 500, renderServerError());

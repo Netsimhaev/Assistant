@@ -12,6 +12,7 @@
  * kind of file where "this one's always safe" quietly stops being true.
  */
 import type { ApprovalRequest } from '../governance/approvals.js';
+import type { DocumentRecord } from '../documents/types.js';
 import { formatMinor } from '../util/money.js';
 
 /** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
@@ -184,9 +185,25 @@ ${list}`,
  * owner already typed, right next to the payload it took such care to
  * preserve, is losing their work by half.
  */
+/**
+ * A third form, posting to `/a/:id/sign`, appears only when `document` is
+ * supplied — the same rule the route follows when deciding whether to accept
+ * a POST there at all. `originalName` is a sender-chosen string, so it goes
+ * through `esc` like everything else in this file.
+ */
+function signForm(approvalId: string, csrf: string, document: DocumentRecord): string {
+  return `<form method="post" action="/a/${esc(approvalId)}/sign">
+    <input type="hidden" name="csrf" value="${esc(csrf)}">
+    <p class="muted">חתימה מאשרת את הבקשה וקובעת שהמסמך "${esc(document.originalName)}" נתקבל כמחייב.</p>
+    <label>הערה (רשות)<textarea name="note" rows="2"></textarea></label>
+    <button type="submit">חתום ואשר</button>
+  </form>`;
+}
+
 export function renderApprovalCard(options: {
   approval: ApprovalRequest;
   csrf: string;
+  document?: DocumentRecord;
   editValue?: string;
   noteValue?: string;
   error?: string;
@@ -232,6 +249,7 @@ export function renderApprovalCard(options: {
     <label>הערה (רשות)<textarea name="note" rows="2"></textarea></label>
     <button type="submit">דחייה</button>
   </form>
+  ${options.document ? signForm(approval.approvalId, options.csrf, options.document) : ''}
 </div>`,
   );
 }
