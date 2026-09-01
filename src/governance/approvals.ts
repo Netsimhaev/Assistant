@@ -216,6 +216,24 @@ export async function pendingApprovals(
   return rows.map(toRequest);
 }
 
+/**
+ * Thrown when an approval cannot be decided: it is not `pending` any more, its
+ * fuse has burned out, or another statement claimed it between this call's
+ * read and its own `UPDATE`.
+ *
+ * A named class, not a bare `Error`, because callers have to tell "a person
+ * already answered this / the clock ran out" apart from a real fault. The
+ * dashboard renders the first as a refusal the owner can act on and the second
+ * as a 500; message-matching to make that distinction would be a control held
+ * together by prose. The messages themselves are unchanged.
+ */
+export class ApprovalNotDecidableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ApprovalNotDecidableError';
+  }
+}
+
 export interface Decision {
   by: string;
   channel: 'dashboard' | 'whatsapp' | 'email';
@@ -245,7 +263,7 @@ export async function decide(
   const existing = await getApproval(approvalId, { businessId, db });
   if (!existing) throw new Error(`unknown approval ${approvalId}`);
   if (existing.state !== 'pending') {
-    throw new Error(
+    throw new ApprovalNotDecidableError(
       `approval ${approvalId} is already ${existing.state}; refusing to decide it twice`,
     );
   }
@@ -254,7 +272,7 @@ export async function decide(
   // caller yet — so without this check an approval three days past its expiry
   // was still approvable, and the TTL was decoration.
   if (Date.parse(existing.expiresAt) <= Date.now()) {
-    throw new Error(
+    throw new ApprovalNotDecidableError(
       `approval ${approvalId} expired at ${existing.expiresAt}; it must be re-queued, not decided`,
     );
   }
@@ -293,7 +311,9 @@ export async function decide(
   if (!row) {
     // The predicate above is the authority, not the read that preceded it: the
     // scheduler may have expired this row between the two statements.
-    throw new Error(`approval ${approvalId} was decided or expired concurrently`);
+    throw new ApprovalNotDecidableError(
+      `approval ${approvalId} was decided or expired concurrently`,
+    );
   }
   return toRequest(row);
 }

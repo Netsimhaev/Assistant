@@ -17,10 +17,11 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import { appendAudit } from '../audit/log.js';
-import { getApproval, pendingApprovals } from '../governance/approvals.js';
-import { DocumentAlreadySignedError, recordSignature } from '../governance/signatures.js';
-import { applyDecision } from '../orchestrator/resume.js';
+import { ApprovalNotDecidableError, getApproval, pendingApprovals } from '../governance/approvals.js';
+import type { ApprovalRequest } from '../governance/approvals.js';
+import { DocumentAlreadySignedError } from '../governance/signatures.js';
+import { decideAndSign } from '../governance/sign-decision.js';
+import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
 import { documentForApproval } from './document-for-approval.js';
 import { verifyDocumentUnchanged } from '../documents/verify.js';
 import type { VerifyOutcome } from '../documents/verify.js';
@@ -509,13 +510,22 @@ async function handleDecision(
   // unless the approval is still open, a real document backs this request,
   // that document is the one the sign form actually named, and re-verifying
   // its bytes on disk finds them unchanged — and only then records the
-  // signature and its audit row. Any refusal here re-renders the card
-  // exactly like the edited-payload error path below — it never throws,
-  // never approves, and leaves the approval `pending` so the owner can fix
-  // the problem and try again. Errors from this block go on `signError`, not
-  // `error`: `error` renders inside the approve form, and a refusal about
-  // the document being signed does not belong attached to a different
-  // control (see `signForm`'s docblock).
+  // signature, its audit row and the approval decision, which
+  // `decideAndSign` commits as one transaction or not at all (F1).
+  //
+  // What the refusals below actually guarantee, stated exactly: each of them
+  // re-renders the card, leaves the approval `pending`, and writes nothing.
+  // What runs AFTER them does not have that shape — `decideAndSign` decides
+  // the approval, and it can still throw. The guarantee that replaces
+  // "never throws" is atomicity: whatever it throws, no signature row, no
+  // audit row and no decision survives it, so the owner can fix the problem
+  // and try again on an approval that is exactly where they left it.
+  // `DocumentAlreadySignedError` and `ApprovalNotDecidableError` are caught
+  // and rendered as refusals; anything else is a real fault and becomes a
+  // 500. Errors from this block go on `signError`, not `error`: `error`
+  // renders inside the approve form, and a refusal about the document being
+  // signed does not belong attached to a different control (see `signForm`'s
+  // docblock).
   if (outcome === 'signed') {
     // I1: mirrors exactly what `decide` (called via `applyDecision` below)
     // itself refuses — `state !== 'pending'` and an expired `expiresAt` —
@@ -596,57 +606,88 @@ async function handleDecision(
     // `verifyResult.sha256` — what verification just measured — not
     // `document.sha256`: the whole point of re-hashing is to sign the bytes
     // actually on disk right now, not the row's stale claim about them.
-    try {
-      await recordSignature(
-        {
-          signatureId: `SIG-${ulid()}`,
-          documentId: document.documentId,
-          signedSha256: verifyResult.sha256,
-          approvalId,
-          signedBy: session.username,
-        },
-        { businessId },
-      );
-    } catch (err) {
-      if (!(err instanceof DocumentAlreadySignedError)) throw err;
-      return sendHtml(
-        res,
-        400,
-        renderApprovalCard({
-          approval,
-          csrf: issueCsrfToken(session.sessionId),
-          document,
-          ...(note !== undefined ? { noteValue: note } : {}),
-          signError: 'המסמך כבר נחתם בעבר. אין צורך לחתום שוב.',
-        }),
-      );
-    }
-
-    // I3: English, in the `verb_noun:<id>` prefix form every other
-    // production `appendAudit` call site in the repo already uses
+    //
+    // I3: the audit reason is English, in the `verb_noun:<id>` prefix form
+    // every other production `appendAudit` call site in the repo already uses
     // (`engine.ts`, `killswitch.ts`, `bindings.ts`, `recovery.ts`) —
     // `audit_log.reason` is a forensic field nothing in the dashboard,
     // `render.ts` or the CLI ever displays, so it is not covered by
     // CLAUDE.md's "Hebrew for what the owner reads" rule. `originalName` is
-    // deliberately left out: it is a sender-chosen string, and no other
-    // audit reason in the repo carries attacker-influenced free text.
-    await appendAudit(
-      {
-        ...(approval.jobId !== null ? { jobId: approval.jobId } : {}),
-        actor: 'human',
-        onBehalfOf: session.username,
-        kind: 'signature',
-        charterVersion: 'unknown',
-        provenance: 'boss',
-        inputHash: canonicalHash({
-          documentId: document.documentId,
+    // deliberately left out: it is a sender-chosen string, and no other audit
+    // reason in the repo carries attacker-influenced free text.
+    let decided: ApprovalRequest;
+    try {
+      decided = await decideAndSign(
+        {
           approvalId,
-          sha256: verifyResult.sha256,
-        }),
-        reason: `signature:${document.documentId} by ${session.username} for approval ${approvalId}`,
-      },
-      { businessId },
-    );
+          decision: {
+            by: session.username,
+            channel: 'dashboard',
+            ...(note !== undefined ? { note } : {}),
+          },
+          signature: {
+            signatureId: `SIG-${ulid()}`,
+            documentId: document.documentId,
+            signedSha256: verifyResult.sha256,
+            approvalId,
+            signedBy: session.username,
+          },
+          audit: {
+            ...(approval.jobId !== null ? { jobId: approval.jobId } : {}),
+            actor: 'human',
+            onBehalfOf: session.username,
+            kind: 'signature',
+            charterVersion: 'unknown',
+            provenance: 'boss',
+            inputHash: canonicalHash({
+              documentId: document.documentId,
+              approvalId,
+              sha256: verifyResult.sha256,
+            }),
+            reason: `signature:${document.documentId} by ${session.username} for approval ${approvalId}`,
+          },
+        },
+        { businessId },
+      );
+    } catch (err) {
+      if (err instanceof DocumentAlreadySignedError) {
+        return sendHtml(
+          res,
+          400,
+          renderApprovalCard({
+            approval,
+            csrf: issueCsrfToken(session.sessionId),
+            document,
+            ...(note !== undefined ? { noteValue: note } : {}),
+            signError: 'המסמך כבר נחתם בעבר. אין צורך לחתום שוב.',
+          }),
+        );
+      }
+      if (err instanceof ApprovalNotDecidableError) {
+        // The guard above read `state` and `expires_at`; a document join, a
+        // file read and a SHA-256 later, `decide`'s own predicate disagreed.
+        // Nothing was written — that is what `decideAndSign` guarantees — so
+        // this is the same refusal the guard renders, not a fault.
+        return sendHtml(
+          res,
+          400,
+          renderApprovalCard({
+            approval,
+            csrf: issueCsrfToken(session.sessionId),
+            document,
+            ...(note !== undefined ? { noteValue: note } : {}),
+            signError: 'הבקשה כבר הוכרעה או שפג תוקפה, ולא ניתן לחתום עליה כעת.',
+          }),
+        );
+      }
+      throw err;
+    }
+
+    // The job-phase half of `applyDecision`, run after the signature
+    // transaction commits: `transition` opens its own transaction and takes
+    // `FOR UPDATE` on the job row, so it cannot join the one above.
+    await resumeAfterDecision(decided, session.username, { businessId });
+    return redirect(res, '/');
   }
 
   // Only the approve form carries an editable payload — denying something,
