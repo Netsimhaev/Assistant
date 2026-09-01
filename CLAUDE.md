@@ -48,6 +48,8 @@ npm run scheduler        # מעיר jobs רדומים ומפקיע אישורי�
 
 **שכבת היכולות דוחה לפני התקנון.** כלל `forbidden` בתקנון שמכוון למחלקת פעולה שאף סוכן לא נגיש אליה הוא **קוד מת** — השער יחזיר `tool_not_allowlisted` ולא `forbidden`. שלושה כלים בבעלות אף אחד בכוונה (`UNOWNED_TOOLS` ב-`capabilities.ts`).
 
+**חתימה היא תוצאת אישור, לא כלי שהעוזרת מחזיקה.** "חתום ואשר" על כרטיס האישור עושה בדיוק מה שאישור עושה, ועוד: מגבב מחדש את הקובץ **מהדיסק** ומשווה לגיבוב שנקלט — אי-התאמה מסרבת ברעש והאישור נשאר `pending`. `contract.sign` נשאר ב-`UNOWNED_TOOLS`; אין allowlist להוציא אותו ממנו, ו-[src/charter/unowned-tools.test.ts](src/charter/unowned-tools.test.ts) נוקב בשלושת הכלים חסרי הבעלים בשם ובודק גם שאף דפוס allowlist (כולל wildcard כמו `contract.*`) לא מכסה אחד מהם. מסמך נחתם **פעם אחת** — ייחוד על `(business_id, document_id)`, וחתימה שנייה מסורבת ולא דורסת את הראשונה.
+
 **כלי כתיבה חדש דורש שתי עריכות.** להוסיף ל-`TOOL_ACTION_CLASS` ב-[src/policy/classify.ts](src/policy/classify.ts) **וגם** ל-allowlist של סוכן ב-[src/charter/capabilities.ts](src/charter/capabilities.ts). כלי שחסר בשתיהן מטופל כקריאה-בלבד ו**עובר את השער בשקט**. זה הבאג שהפיל תשעה מבחנים בסשן שבנה את השלד.
 
 **`READ_ONLY_TOOLS` עוקף את שלבים 5–9 לגמרי.** מי שנשאר שם עם תופעות לוואי אמיתיות: `file.write`, `media.generate_image`, `media.generate_video`. אם מוסיפים שם משהו, לוודא שהוא באמת לא צריך שער.
