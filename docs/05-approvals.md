@@ -129,7 +129,7 @@ export interface ApprovalRequest {
 
 ### "חתום ואשר" — תוצאה שלישית, רק כשיש מסמך מאחורי הבקשה
 
-לצד **אישור** ו**דחייה**, כרטיס שיש לו מסמך מאחוריו (`docs/superpowers/specs/2026-09-01-signature-design.md`) מציג כפתור שלישי: **חתום ואשר**. הכפתור עצמו מותנה — הוא מופיע רק כשהשרשרת `approval_requests.job_id → proposals.job_id → document_readings → documents` (`src/dashboard/document-for-approval.ts`) מוצאת מסמך; רוב האישורים, כמו שליחת מייל, אינם נושאים אחד ולא מציגים אותו. `proposals` נושאת עמודת `job_id` רק ממיגרציה `018_proposal_job.sql` — שורה שנכתבה לפני שהעמודה קיימת אינה ניתנת לאיתור אחורה, והכפתור לא יופיע גם עבורה.
+לצד **אישור** ו**דחייה**, כרטיס שיש לו מסמך מאחוריו (`docs/superpowers/specs/2026-09-01-signature-design.md`) מציג כפתור שלישי: **חתום ואשר**. הכפתור עצמו מותנה — הוא מופיע רק כשהשרשרת `approval_requests.job_id → proposals.job_id`, ומשם `proposals.reading_id → document_readings.document_id → documents` (`src/dashboard/document-for-approval.ts`) מוצאת מסמך; רוב האישורים, כמו שליחת מייל, אינם נושאים אחד ולא מציגים אותו. `proposals` נושאת עמודת `job_id` רק ממיגרציה `018_proposal_job.sql` — שורה שנכתבה לפני שהעמודה קיימת אינה ניתנת לאיתור אחורה, והכפתור לא יופיע גם עבורה.
 
 **זו לא זרימה מקבילה.** "חתום ואשר" עושה בדיוק את מה שאישור עושה — אותו `applyDecision`, אותה `state: 'approved'` — ולפני כן בלבד: מגבב מחדש את הקובץ **מהדיסק**, לא מקריאת `documents.sha256` שנשמרה בקליטה (`verifyDocumentUnchanged`, `src/documents/verify.ts`), ומשווה. אי-התאמה — **סירוב**, עם סיבה בעברית, והאישור נשאר `pending` כדי שהבעלים יתקן ויחזור. מסמך שהשתנה מאז שנקרא הוא מסמך שהבוס לא ראה; חתימה על הגיבוב הישן הייתה מייצרת רשומה שמעידה על קובץ אחר מזה שיושב על הדיסק.
 
