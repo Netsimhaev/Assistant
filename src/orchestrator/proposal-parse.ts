@@ -130,11 +130,20 @@ export function parseProposal(
     return { status: 'unproposable', reason: 'no JSON object in the response' };
   }
 
-  let reason = 'schema mismatch';
+  // Keep the first candidate's complaint, not the last. `extractJsonObjects`
+  // yields the outermost object first and then every object nested inside it
+  // — a `sourceRef` like `{"ordinal": 1, "locator": "..."}` is itself a
+  // candidate. Every such fragment fails `Proposal.safeParse` for a reason
+  // that has nothing to do with the real answer (typically a missing
+  // `stance` enum), and overwriting `reason` on each iteration lets the last
+  // nested fragment's unrelated complaint bury the outermost object's actual
+  // problem — the outermost object is the one that was meant to be the
+  // answer, so its reason is the one worth keeping.
+  let reason: string | undefined;
   for (const candidate of candidates) {
     const parsed = Proposal.safeParse(candidate);
     if (!parsed.success) {
-      reason = parsed.error.issues[0]?.message ?? reason;
+      reason ??= parsed.error.issues[0]?.message;
       continue;
     }
 
@@ -147,7 +156,7 @@ export function parseProposal(
     return { status: 'proposed', proposal: parsed.data };
   }
 
-  return { status: 'unproposable', reason };
+  return { status: 'unproposable', reason: reason ?? 'schema mismatch' };
 }
 
 /** Every balanced JSON object in a response that may be wrapped in prose or a fence. */

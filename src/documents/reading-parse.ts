@@ -73,11 +73,21 @@ export function parseReading(
   // Every candidate is tried. A response that opens with an illustrative
   // object and then gives the real reading would otherwise be judged on the
   // example — the same reasoning as `parsePlan`.
-  let reason = 'schema mismatch';
+  //
+  // Keep the first candidate's complaint, not the last. `extractJsonObjects`
+  // yields the outermost object first and then every object nested inside it
+  // — a `sourceRef` like `{"ordinal": 1, "locator": "..."}` is itself a
+  // candidate, and it is the ordinary case here, not an exotic one. Every
+  // such fragment fails `Reading.safeParse` for a reason that has nothing to
+  // do with the real answer, and overwriting `reason` on each iteration lets
+  // the last nested fragment's unrelated complaint bury the outermost
+  // object's actual problem — the outermost object is the one that was meant
+  // to be the answer, so its reason is the one worth keeping.
+  let reason: string | undefined;
   for (const candidate of candidates) {
     const parsed = Reading.safeParse(candidate);
     if (!parsed.success) {
-      reason = parsed.error.issues[0]?.message ?? reason;
+      reason ??= parsed.error.issues[0]?.message;
       continue;
     }
 
@@ -95,7 +105,7 @@ export function parseReading(
     return { status: 'read', reading: parsed.data };
   }
 
-  return { status: 'unreadable', reason };
+  return { status: 'unreadable', reason: reason ?? 'schema mismatch' };
 }
 
 /**

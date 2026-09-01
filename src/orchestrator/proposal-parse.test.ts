@@ -140,6 +140,27 @@ describe('parseProposal', () => {
     expect(outcome.reason).toContain('action_class_mismatch');
   });
 
+  // `extractJsonObjects` yields the outermost object first and then every
+  // object nested inside it — here, the `sourceRef` inside `reasons[0]`. That
+  // nested fragment always fails `Proposal.safeParse` at `stance` (there is
+  // no `stance` key on a bare `sourceRef`), with zod's message for a missing
+  // enum. The bug this locks: the loop used to overwrite `reason` on every
+  // failing candidate, so the nested fragment's unrelated "invalid stance"
+  // complaint clobbered the outermost object's real, distinctive problem.
+  it('reports the outermost object\'s reason, not a nested sourceRef\'s', () => {
+    const brokenHeadline = {
+      ...VALID,
+      headline: '',
+      reasons: [{ text: 'x', findingLabel: 'תנאי תשלום', sourceRef: SOURCE }],
+    };
+    const outcome = parseProposal(JSON.stringify(brokenHeadline), READING, CATALOGUE);
+    expect(outcome.status).toBe('unproposable');
+    if (outcome.status !== 'unproposable') throw new Error('expected unproposable');
+    expect(outcome.reason).toBe('Too small: expected string to have >=1 characters');
+    expect(outcome.reason).not.toContain('option');
+    expect(outcome.reason).not.toContain('stance');
+  });
+
   it("refuses a headline that is the action's own tool name", () => {
     const outcome = parseProposal(
       JSON.stringify({ ...VALID, action: { ...ACTION, headline: 'mail.send' } }),

@@ -78,6 +78,24 @@ describe('parseReading', () => {
     expect(parseReading(JSON.stringify(hostile), INCLUDED).status).toBe('unreadable');
   });
 
+  // `extractJsonObjects` yields the outermost object first and then every
+  // object nested inside it — here, the `sourceRef` inside `intents[0]`. A
+  // reading with a nested `sourceRef` is the ordinary case, not an exotic
+  // one, so this fragment is always present. It fails `Reading.safeParse` at
+  // `summary` (there is no `summary` key on a bare `sourceRef`) with zod's
+  // "received undefined" message. The bug this locks: the loop used to
+  // overwrite `reason` on every failing candidate, so the nested fragment's
+  // unrelated complaint clobbered the outermost object's real, distinctive
+  // problem.
+  it('reports the outermost object\'s reason, not a nested sourceRef\'s', () => {
+    const brokenSummary = { ...VALID, summary: '' };
+    const outcome = parseReading(JSON.stringify(brokenSummary), INCLUDED);
+    expect(outcome.status).toBe('unreadable');
+    if (outcome.status !== 'unreadable') throw new Error('expected unreadable');
+    expect(outcome.reason).toBe('Too small: expected string to have >=1 characters');
+    expect(outcome.reason).not.toContain('undefined');
+  });
+
   it('does not let a __proto__ key in the response reach any object it builds', () => {
     // The case the test above used to be named for and did not cover: the key
     // arriving as a key, not as a value. `JSON.parse` makes `__proto__` an
