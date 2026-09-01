@@ -143,6 +143,7 @@ export async function proposeForReading(
     {
       proposalId: `PRP-${ulid()}`,
       readingId: reading.readingId,
+      jobId: input.jobId,
       status: outcome.status,
       reason: outcome.status === 'unproposable' ? outcome.reason : null,
       content: outcome.status === 'proposed' ? outcome.proposal : null,

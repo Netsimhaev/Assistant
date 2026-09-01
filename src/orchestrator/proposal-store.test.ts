@@ -2,12 +2,17 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
+import { compileCharter } from '../charter/compile.js';
+import { installCharter } from '../charter/store.js';
+import { buildCharter } from '../test/fixtures.js';
 import type { Proposal } from '../domain/proposal.js';
 import { insertOrGetDocument } from '../documents/store.js';
 import { saveReading } from '../documents/reading-store.js';
+import { createJob } from './jobs.js';
 import { loadProposalsForReading, saveProposal, type NewProposal } from './proposal-store.js';
 
 const BUSINESS = 'test-business';
+const bundle = compileCharter(buildCharter());
 const SOURCE = { ordinal: 0, locator: null };
 
 const PROPOSAL: Proposal = {
@@ -34,14 +39,34 @@ async function aReading(): Promise<string> {
   return record.readingId;
 }
 
+async function aJob() {
+  return createJob({
+    charterVersion: bundle.charterVersion,
+    provenance: 'unknown_external',
+    businessId: BUSINESS,
+  });
+}
+
+// Every proposal needs a real job to satisfy the `job_id` foreign key, and
+// most tests here don't care which one — they're exercising the reading
+// relationship, not the job relationship. `DEFAULT_JOB_ID` is recreated fresh
+// in `beforeEach` so tests stay isolated, and `newProposal` falls back to it
+// unless a test overrides `jobId` itself (as the job-tracking test below does).
+let DEFAULT_JOB_ID: string;
+
 function newProposal(readingId: string, overrides: Partial<NewProposal> = {}): NewProposal {
   return {
     proposalId: `PRP-${ulid()}`, readingId, status: 'proposed', reason: null,
-    content: PROPOSAL, raw: '{"stance": "act"}', model: 'sonnet', promptVersion: 'v1', ...overrides,
+    content: PROPOSAL, raw: '{"stance": "act"}', model: 'sonnet', promptVersion: 'v1',
+    jobId: DEFAULT_JOB_ID, ...overrides,
   };
 }
 
-beforeEach(async () => { await resetDatabase(); });
+beforeEach(async () => {
+  await resetDatabase();
+  await installCharter(buildCharter(), { businessId: BUSINESS });
+  DEFAULT_JOB_ID = (await aJob()).jobId;
+});
 afterAll(async () => { await closePool(); });
 
 describe('saveProposal', () => {
@@ -115,5 +140,18 @@ describe('saveProposal', () => {
       { businessId: BUSINESS },
     );
     expect(record.raw).toBe('זו לא תשובת JSON תקינה');
+  });
+
+  it('records which job the proposal was made for', async () => {
+    const readingId = await aReading();
+    const job = await createJob({
+      charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
+    });
+    const record = await saveProposal(
+      newProposal(readingId, { jobId: job.jobId }), { businessId: BUSINESS },
+    );
+    expect(record.jobId).toBe(job.jobId);
+    const all = await loadProposalsForReading(readingId, { businessId: BUSINESS });
+    expect(all[0]?.jobId).toBe(job.jobId);
   });
 });

@@ -17,6 +17,14 @@ export interface ProposalRecord {
   proposalId: string;
   businessId: string;
   readingId: string;
+  /**
+   * The job this proposal was made for. Nullable in the type because it is
+   * nullable in SQL: rows written before migration 018 have no job to name,
+   * and `job_id` is set null again if that job is ever deleted. Every row
+   * written from now on carries a real value — see `NewProposal.jobId`, which
+   * is required — but a read cannot promise that of a row it did not write.
+   */
+  jobId: string | null;
   status: ProposalStatus;
   reason: string | null;
   content: Proposal | null;
@@ -37,6 +45,14 @@ export interface ProposalRecord {
 export interface NewProposal {
   proposalId: string;
   readingId: string;
+  /**
+   * The job this proposal was made for. Required, not optional: a proposal is
+   * always made in service of a specific job — `proposeForReading` loads that
+   * job to derive provenance before it ever calls `makeProposal` — and a
+   * caller that could omit it could write a proposal nothing downstream can
+   * trace back to a document.
+   */
+  jobId: string;
   status: ProposalStatus;
   reason: string | null;
   content: Proposal | null;
@@ -49,6 +65,7 @@ interface ProposalRow {
   proposal_id: string;
   business_id: string;
   reading_id: string;
+  job_id: string | null;
   status: string;
   reason: string | null;
   content: unknown;
@@ -64,6 +81,7 @@ function toProposal(row: ProposalRow): ProposalRecord {
     proposalId: row.proposal_id,
     businessId: row.business_id,
     readingId: row.reading_id,
+    jobId: row.job_id,
     status: row.status as ProposalStatus,
     reason: row.reason,
     // Stored as validated JSON, read back without re-validation: what went in
@@ -79,7 +97,7 @@ function toProposal(row: ProposalRow): ProposalRecord {
   };
 }
 
-const COLUMNS = `proposal_id, business_id, reading_id, status, reason, content, raw,
+const COLUMNS = `proposal_id, business_id, reading_id, job_id, status, reason, content, raw,
                  model, prompt_version, decided_at, decided_note`;
 
 /**
@@ -99,14 +117,15 @@ export async function saveProposal(
 
   const { rows } = await db.query<ProposalRow>(
     `INSERT INTO proposals
-       (proposal_id, business_id, reading_id, status, reason, content, raw,
+       (proposal_id, business_id, reading_id, job_id, status, reason, content, raw,
         model, prompt_version)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING ${COLUMNS}`,
     [
       input.proposalId,
       businessId,
       input.readingId,
+      input.jobId,
       input.status,
       input.reason,
       input.content === null ? null : JSON.stringify(input.content),
