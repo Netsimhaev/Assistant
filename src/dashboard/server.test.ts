@@ -528,7 +528,18 @@ describe('signing an approval', () => {
     expect(missingRes.status).toBe(400);
     const missingBody = await missingRes.text();
 
-    expect(unreadableBody).not.toBe(missingBody);
+    // I2: assert the substance, not that two full pages differ (they always
+    // do — approval id, timestamps and CSRF token vary too). `EISDIR` proves
+    // `verifyResult.cause` actually reaches the rendered page for the
+    // `unreadable` branch, and its absence from `missing`'s page proves the
+    // two `VerifyOutcome` arms produce genuinely different refusal text, not
+    // just different surrounding pages.
+    expect(unreadableBody).toContain('EISDIR');
+    expect(missingBody).not.toContain('EISDIR');
+    expect(unreadableBody).toContain('לא ניתן היה לקרוא את הקובץ השמור');
+    expect(missingBody).toContain('נעדר מהדיסק');
+    expect(unreadableBody).not.toContain('נעדר מהדיסק');
+    expect(missingBody).not.toContain('לא ניתן היה לקרוא את הקובץ השמור');
   });
 
   it('refuses to sign an approval that has no document behind it', async () => {
