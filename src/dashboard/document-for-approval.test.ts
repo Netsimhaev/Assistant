@@ -67,9 +67,26 @@ async function riskFor(input: unknown, bundle: PolicyBundle) {
   return assessRisk(factsFor(input), bundle);
 }
 
-/** A document with a stored reading, both real rows. */
+/** A document with a stored reading, both real rows, both under the same business. */
 async function aDocumentAndReading(
   businessId: string,
+): Promise<{ documentId: string; readingId: string }> {
+  return aReadingAcross(businessId, businessId);
+}
+
+/**
+ * A document and a reading of it, filed under two possibly-different
+ * businesses. Neither `document_readings.document_id` nor
+ * `proposals.reading_id` is scoped by `(business_id, ...)` in its foreign
+ * key — only by the bare id (see `documents/store.ts`'s note on
+ * `document_artifacts.document_id` for the same shape) — so nothing in the
+ * schema itself stops a reading from naming a document that belongs to a
+ * different business. That gap is exactly what lets these fixtures isolate
+ * one join predicate at a time below.
+ */
+async function aReadingAcross(
+  documentBusinessId: string,
+  readingBusinessId: string,
 ): Promise<{ documentId: string; readingId: string }> {
   const documentId = `DOC-${ulid()}`;
   await insertOrGetDocument(
@@ -80,9 +97,9 @@ async function aDocumentAndReading(
       mediaType: 'text/plain',
       sha256: ulid().padEnd(64, '0'),
       byteSize: 20,
-      storedPath: `${businessId}/${documentId}/original.txt`,
+      storedPath: `${documentBusinessId}/${documentId}/original.txt`,
     },
-    { businessId },
+    { businessId: documentBusinessId },
   );
   const { record } = await saveReading(
     {
@@ -103,7 +120,7 @@ async function aDocumentAndReading(
       promptVersion: 'v1',
       briefHash: ulid().padEnd(64, '0'),
     },
-    { businessId },
+    { businessId: readingBusinessId },
   );
   return { documentId, readingId: record.readingId };
 }
@@ -197,6 +214,12 @@ describe('documentForApproval', () => {
   });
 
   it('does not leak a document across the business boundary', async () => {
+    // Proposal, reading and document all live under BUSINESS while the
+    // approval lives under OTHER_BUSINESS, so every one of `p`, `r` and `d`'s
+    // scoping predicates disagrees with `a.business_id` here at once. That
+    // makes this a coarse end-to-end boundary check, not proof that each
+    // predicate individually holds — the three dedicated tests below isolate
+    // `p`, `r` and `d` one at a time for that.
     const bundle = await install(BUSINESS);
     const otherBundle = await install(OTHER_BUSINESS);
     const { readingId } = await aDocumentAndReading(BUSINESS);
@@ -209,6 +232,25 @@ describe('documentForApproval', () => {
     const approvalId = await anApproval(OTHER_BUSINESS, job.jobId, otherBundle);
 
     const result = await documentForApproval(approvalId, { businessId: OTHER_BUSINESS });
+
+    expect(result).toBeNull();
+  });
+
+  it('does not leak a document reached through a proposal filed under another business', async () => {
+    const bundle = await install(BUSINESS);
+    // The approval, the reading and the document all live under BUSINESS —
+    // so both `r.business_id = a.business_id` and `d.business_id =
+    // a.business_id` already hold. Only the proposal disagrees: it is filed
+    // under OTHER_BUSINESS even though it points at BUSINESS's own reading
+    // (proposals.reading_id has no business-scoped foreign key either — see
+    // `aReadingAcross`'s note). Only `p.business_id = a.business_id` can
+    // exclude it.
+    const { readingId } = await aDocumentAndReading(BUSINESS);
+    const job = await aJob(BUSINESS, bundle, 'הצעה של עסק אחר');
+    await aProposal(OTHER_BUSINESS, readingId, job.jobId);
+    const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
+
+    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
 
     expect(result).toBeNull();
   });
@@ -234,5 +276,39 @@ describe('documentForApproval', () => {
 
     expect(result?.documentId).toBe(newer.documentId);
     expect(result?.documentId).not.toBe(older.documentId);
+  });
+
+  it('does not leak a document whose reading belongs to another business', async () => {
+    const bundle = await install(BUSINESS);
+    // The approval and the proposal both live under BUSINESS — so
+    // `p.business_id = a.business_id` already holds and cannot be the
+    // predicate that excludes this row. Only the reading disagrees: it is
+    // filed under OTHER_BUSINESS even though the document it reads is
+    // BUSINESS's own. Only `r.business_id = a.business_id` can exclude it.
+    const { readingId } = await aReadingAcross(BUSINESS, OTHER_BUSINESS);
+    const job = await aJob(BUSINESS, bundle, 'קריאה של עסק אחר');
+    await aProposal(BUSINESS, readingId, job.jobId);
+    const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
+
+    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+
+    expect(result).toBeNull();
+  });
+
+  it('does not leak a document that belongs to another business', async () => {
+    const bundle = await install(BUSINESS);
+    // The approval, the proposal and the reading all live under BUSINESS —
+    // so both `p.business_id = a.business_id` and `r.business_id =
+    // a.business_id` already hold. Only the document disagrees: it is
+    // filed under OTHER_BUSINESS even though the reading that names it is
+    // BUSINESS's own. Only `d.business_id = a.business_id` can exclude it.
+    const { readingId } = await aReadingAcross(OTHER_BUSINESS, BUSINESS);
+    const job = await aJob(BUSINESS, bundle, 'מסמך של עסק אחר');
+    await aProposal(BUSINESS, readingId, job.jobId);
+    const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
+
+    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+
+    expect(result).toBeNull();
   });
 });
