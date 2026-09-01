@@ -69,7 +69,22 @@ describe('verifyDocumentUnchanged', () => {
       .toBe('unknown_document');
   });
 
-  it('never throws for any of the four outcomes', async () => {
+  it('reports unreadable, not missing, when a directory sits where the file should be', async () => {
+    const documentId = await aStoredDocument(BYTES, HASH);
+    const filePath = join(root, BUSINESS, documentId, 'original.txt');
+    // Replace the file itself with a directory of the same name — a real
+    // filesystem error distinct from ENOENT (EISDIR here), not a stubbed
+    // throw. This is what a misconfigured deploy or a botched restore looks
+    // like: the row exists, something is at the path, it just isn't a file.
+    await rm(filePath, { force: true });
+    await mkdir(filePath);
+    const outcome = await verifyDocumentUnchanged(documentId, { businessId: BUSINESS, documentRoot: root });
+    expect(outcome.status).toBe('unreadable');
+    if (outcome.status !== 'unreadable') throw new Error('expected unreadable');
+    expect(outcome.cause.length).toBeGreaterThan(0);
+  });
+
+  it('never throws for any of the five outcomes', async () => {
     const documentId = await aStoredDocument(BYTES, HASH);
     await rm(join(root, BUSINESS, documentId), { recursive: true, force: true });
     await expect(
