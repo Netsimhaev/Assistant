@@ -65,7 +65,7 @@
 
 ## 5. מה הרשומה מכילה
 
-מיגרציה `018_signatures.sql`.
+מיגרציה `019_signatures.sql`.
 
 | עמודה | למה |
 |---|---|
@@ -88,7 +88,7 @@
 
 זה פער קיים ולא חדש: הצעה שאינה זוכרת עבור איזו משימה נעשתה אינה ניתנת לאיתור לאחור.
 
-`proposals` מקבל עמודת `job_id` (מיגרציה `019_proposal_job.sql`), ואז השרשרת נפתרת: `approval.jobId → proposals → document_readings → documents`.
+`proposals` מקבל עמודת `job_id` (מיגרציה `018_proposal_job.sql`), ואז השרשרת נפתרת: `approval.jobId → proposals → document_readings → documents`.
 
 ---
 
