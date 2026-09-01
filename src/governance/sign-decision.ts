@@ -54,7 +54,15 @@ export interface SignAndDecideInput {
  * the point) or a rewrite of a function five other callers depend on. It runs
  * after this commits, exactly as `applyDecision` runs it after `decide` — and
  * a crash between the two leaves "decided and signed but the job did not
- * move", which a re-run of the scheduler's own path can still repair.
+ * move", which **nothing repairs on its own**. `expireApprovals` sweeps only
+ * `pending` rows, `wakeDueJobs` needs a `wake_at`, and `runDueJobs` selects
+ * `phase = 'execute'` — none of them loads a job parked in `await_approval`
+ * behind a decided approval. The owner cannot retry it either: the document
+ * holds its one permitted signature and the approval is no longer `pending`,
+ * so both guards refuse. It needs manual repair. The window is older than
+ * this function — `applyDecision` has always had it, and `resume.ts` says why
+ * it stays open — but a comment claiming a recovery path that does not exist
+ * is the same defect this module was written to remove.
  */
 export async function decideAndSign(
   input: SignAndDecideInput,
