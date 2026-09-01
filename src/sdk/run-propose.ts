@@ -56,6 +56,8 @@ async function main(): Promise<void> {
 
   if (result.status === 'unproposable') {
     console.log(`לא ניתן להציע: ${result.reason}`);
+    console.log('\n--- תגובת המודל הגולמית ---');
+    console.log(result.record.raw);
     console.log(`\nמזהה הצעה: ${result.record.proposalId}`);
     return;
   }

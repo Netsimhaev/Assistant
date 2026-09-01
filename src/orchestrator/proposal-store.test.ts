@@ -37,7 +37,7 @@ async function aReading(): Promise<string> {
 function newProposal(readingId: string, overrides: Partial<NewProposal> = {}): NewProposal {
   return {
     proposalId: `PRP-${ulid()}`, readingId, status: 'proposed', reason: null,
-    content: PROPOSAL, model: 'sonnet', promptVersion: 'v1', ...overrides,
+    content: PROPOSAL, raw: '{"stance": "act"}', model: 'sonnet', promptVersion: 'v1', ...overrides,
   };
 }
 
@@ -92,5 +92,28 @@ describe('saveProposal', () => {
     const readingId = await aReading();
     await saveProposal(newProposal(readingId), { businessId: BUSINESS });
     expect(await loadProposalsForReading(readingId, { businessId: 'other' })).toEqual([]);
+  });
+
+  it('carries the raw model text back on a proposed row', async () => {
+    const readingId = await aReading();
+    const record = await saveProposal(
+      newProposal(readingId, { raw: '{"stance": "act", "headline": "..."}' }),
+      { businessId: BUSINESS },
+    );
+    expect(record.raw).toBe('{"stance": "act", "headline": "..."}');
+  });
+
+  it('carries the raw model text back on an unproposable row, for diagnosis', async () => {
+    const readingId = await aReading();
+    const record = await saveProposal(
+      newProposal(readingId, {
+        status: 'unproposable',
+        reason: 'no JSON object',
+        content: null,
+        raw: 'זו לא תשובת JSON תקינה',
+      }),
+      { businessId: BUSINESS },
+    );
+    expect(record.raw).toBe('זו לא תשובת JSON תקינה');
   });
 });

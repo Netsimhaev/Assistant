@@ -20,6 +20,13 @@ export interface ProposalRecord {
   status: ProposalStatus;
   reason: string | null;
   content: Proposal | null;
+  /**
+   * The model's raw response text, kept on every row regardless of status.
+   * On an `unproposable` row this is the only way to see what the model
+   * actually said when the schema refused it; on a `proposed` row it is a
+   * known-good example to compare a later failure against.
+   */
+  raw: string;
   model: string;
   promptVersion: string;
   decidedAt: string | null;
@@ -33,6 +40,7 @@ export interface NewProposal {
   status: ProposalStatus;
   reason: string | null;
   content: Proposal | null;
+  raw: string;
   model: string;
   promptVersion: string;
 }
@@ -44,6 +52,7 @@ interface ProposalRow {
   status: string;
   reason: string | null;
   content: unknown;
+  raw: string;
   model: string;
   prompt_version: string;
   decided_at: string | null;
@@ -62,6 +71,7 @@ function toProposal(row: ProposalRow): ProposalRecord {
     // make every read of the table able to fail for a reason the caller
     // cannot act on.
     content: (row.content ?? null) as Proposal | null,
+    raw: row.raw,
     model: row.model,
     promptVersion: row.prompt_version,
     decidedAt: row.decided_at,
@@ -69,7 +79,7 @@ function toProposal(row: ProposalRow): ProposalRecord {
   };
 }
 
-const COLUMNS = `proposal_id, business_id, reading_id, status, reason, content,
+const COLUMNS = `proposal_id, business_id, reading_id, status, reason, content, raw,
                  model, prompt_version, decided_at, decided_note`;
 
 /**
@@ -89,9 +99,9 @@ export async function saveProposal(
 
   const { rows } = await db.query<ProposalRow>(
     `INSERT INTO proposals
-       (proposal_id, business_id, reading_id, status, reason, content,
+       (proposal_id, business_id, reading_id, status, reason, content, raw,
         model, prompt_version)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      RETURNING ${COLUMNS}`,
     [
       input.proposalId,
@@ -100,6 +110,7 @@ export async function saveProposal(
       input.status,
       input.reason,
       input.content === null ? null : JSON.stringify(input.content),
+      input.raw,
       input.model,
       input.promptVersion,
     ],

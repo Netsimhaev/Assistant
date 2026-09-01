@@ -12,7 +12,8 @@
  */
 
 import { Stance } from '../domain/proposal.js';
-import { INTENT_MEANING, type Reading } from '../domain/reading.js';
+import { AgentId } from '../domain/audit.js';
+import { INTENT_MEANING, IntentName, type Reading } from '../domain/reading.js';
 import type { PolicyBundle } from '../domain/policy.js';
 
 /**
@@ -48,6 +49,21 @@ const STANCE_MEANING: Record<Stance, string> = {
 function stanceSection(): string {
   const lines = Stance.options.map((stance) => `- \`${stance}\` — ${STANCE_MEANING[stance]}`);
   return lines.join('\n');
+}
+
+/**
+ * Renders a zod enum's options as an inline literal union — `"a"|"b"|"c"` —
+ * for the JSON-schema example below.
+ *
+ * Generated, never hand-typed, for the same reason `stanceSection` is: a
+ * hand-typed copy of a closed enum drifts the first time a member is added.
+ * The schema block sits closest to generation and wins over prose written
+ * earlier in the prompt, so a field that says `string` where the enum is
+ * closed is a standing invitation for the model to invent a value — which is
+ * exactly what happened to `stance` before this function existed.
+ */
+function literalUnion(options: readonly string[]): string {
+  return options.map((option) => `"${option}"`).join('|');
 }
 
 export function buildProposalSystemPrompt(bundle: PolicyBundle, catalogue: string): string {
@@ -87,11 +103,21 @@ export function buildProposalSystemPrompt(bundle: PolicyBundle, catalogue: strin
     '',
     '# מה לייצר',
     'החזר JSON יחיד התואם לסכמה, בלי טקסט לפניו או אחריו:',
-    '{"stance": string, "headline": string,',
+    `{"stance": ${literalUnion(Stance.options)}, "headline": string,`,
     ' "reasons": [{"text": string, "findingLabel": string,',
     '              "sourceRef": {"ordinal": number, "locator": string|null}}],',
-    ' "action": {"headline": string, "purpose": string, "intent": string,',
-    '             "agent": string, "toolName": string, "input": object,',
+    ' "action": {"headline": string, "purpose": string,',
+    `             "intent": ${literalUnion(IntentName.options)},`,
+    `             "agent": ${literalUnion(AgentId.options)},`,
+    '             "toolName": string, "input": object,',
+    // expectedActionClass stays a general string, not an inlined literal
+    // union: ActionClass has two dozen members and the rendered union runs
+    // to roughly 400 characters — past what any other line in this file's
+    // prompts runs to, and long enough that it stops being readable as a
+    // schema field rather than serving as one. The field is advisory only
+    // (see the note below) and null is explicitly preferred to a guess, so
+    // the cost of leaving it unenumerated here is lower than for the three
+    // fields above.
     '             "expectedActionClass": string|null} | null,',
     ' "clarifyingQuestion": string|null}',
     '',

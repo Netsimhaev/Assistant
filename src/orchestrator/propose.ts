@@ -146,6 +146,7 @@ export async function proposeForReading(
       status: outcome.status,
       reason: outcome.status === 'unproposable' ? outcome.reason : null,
       content: outcome.status === 'proposed' ? outcome.proposal : null,
+      raw: outcome.raw,
       // The constant the proposer's own `Options` uses, imported rather
       // than repeated — see the comment on `PROPOSER_MODEL` in
       // `src/sdk/proposer.ts` for the incident this guards against.
