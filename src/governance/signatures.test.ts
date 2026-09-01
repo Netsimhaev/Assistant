@@ -3,7 +3,7 @@ import { ulid } from 'ulid';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { insertOrGetDocument, loadDocument } from '../documents/store.js';
-import { loadSignature, recordSignature } from './signatures.js';
+import { DocumentAlreadySignedError, loadSignature, recordSignature } from './signatures.js';
 
 const BUSINESS = 'test-business';
 
@@ -41,7 +41,7 @@ describe('recordSignature', () => {
     await recordSignature(newSignature(documentId), { businessId: BUSINESS });
     await expect(
       recordSignature(newSignature(documentId), { businessId: BUSINESS }),
-    ).rejects.toThrow();
+    ).rejects.toThrow(DocumentAlreadySignedError);
   });
 
   it('leaves the first signature untouched when a second is refused', async () => {
@@ -49,7 +49,7 @@ describe('recordSignature', () => {
     const first = await recordSignature(newSignature(documentId), { businessId: BUSINESS });
     await expect(
       recordSignature(newSignature(documentId), { businessId: BUSINESS }),
-    ).rejects.toThrow();
+    ).rejects.toThrow(DocumentAlreadySignedError);
     const loaded = await loadSignature(documentId, { businessId: BUSINESS });
     expect(loaded?.signatureId).toBe(first.signatureId);
   });
