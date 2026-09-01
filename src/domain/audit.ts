@@ -37,6 +37,12 @@ export const AuditKind = z.enum([
   'tool_result',
   'decision',
   'approval',
+  /**
+   * The owner signed a document. Distinct from `approval` on purpose: someone
+   * reading the trail must be able to tell "the owner permitted an action"
+   * from "the owner accepted a document as binding".
+   */
+  'signature',
   'policy_denial',
   'phase_change',
   'memory_write',

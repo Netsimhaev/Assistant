@@ -35,6 +35,7 @@ export async function resetDatabase(): Promise<void> {
       proposals,
       document_readings,
       document_artifacts,
+      signatures,
       documents,
       charter_active,
       charter_versions,
