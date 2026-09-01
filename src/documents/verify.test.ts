@@ -84,11 +84,57 @@ describe('verifyDocumentUnchanged', () => {
     expect(outcome.cause.length).toBeGreaterThan(0);
   });
 
-  it('never throws for any of the five outcomes', async () => {
-    const documentId = await aStoredDocument(BYTES, HASH);
-    await rm(join(root, BUSINESS, documentId), { recursive: true, force: true });
-    await expect(
-      verifyDocumentUnchanged(documentId, { businessId: BUSINESS, documentRoot: root }),
-    ).resolves.toBeDefined();
+  // The sibling tests above each assert one outcome. This one asserts the
+  // property that spans them: the union really does have five members, every
+  // one of them is reachable, and NONE of them arrives as a thrown error —
+  // the whole reason `verify.ts` returns a discriminated union instead of
+  // throwing is that the route has to render a different Hebrew refusal for
+  // each. Its predecessor set up one document, deleted it, and asserted the
+  // promise resolved: it drove one outcome, and a `verifyDocumentUnchanged`
+  // that returned a constant kept it green.
+  it('resolves to each of the five outcomes in turn, and throws for none of them', async () => {
+    // Distinct bytes per case, and each row's hash is its own: intake
+    // deduplicates on `(business_id, sha256)`, so five documents sharing one
+    // hash would be one row wearing five ids.
+    const stored = async (label: string): Promise<string> => {
+      const bytes = Buffer.from(`הסכם שיווק — ${label}`, 'utf8');
+      return aStoredDocument(bytes, createHash('sha256').update(bytes).digest('hex'));
+    };
+
+    const unchanged = await stored('ללא שינוי');
+
+    // The row keeps a hash of something else; the bytes on disk are these.
+    const changedBytes = Buffer.from('הסכם שיווק — נוסח שנערך', 'utf8');
+    const changed = await aStoredDocument(
+      changedBytes,
+      createHash('sha256').update(Buffer.from('הנוסח שנקלט', 'utf8')).digest('hex'),
+    );
+
+    const missing = await stored('נמחק');
+    await rm(join(root, BUSINESS, missing), { recursive: true, force: true });
+
+    const unreadable = await stored('לא קריא');
+    const unreadablePath = join(root, BUSINESS, unreadable, 'original.txt');
+    await rm(unreadablePath, { force: true });
+    await mkdir(unreadablePath);
+
+    // Asked for under another business, so `loadDocument` finds nothing.
+    const unknown = await stored('של עסק אחר');
+
+    const cases: [string, Promise<{ status: string }>][] = [
+      ['unchanged', verifyDocumentUnchanged(unchanged, { businessId: BUSINESS, documentRoot: root })],
+      ['changed', verifyDocumentUnchanged(changed, { businessId: BUSINESS, documentRoot: root })],
+      ['missing', verifyDocumentUnchanged(missing, { businessId: BUSINESS, documentRoot: root })],
+      ['unreadable', verifyDocumentUnchanged(unreadable, { businessId: BUSINESS, documentRoot: root })],
+      ['unknown_document', verifyDocumentUnchanged(unknown, { businessId: 'other', documentRoot: root })],
+    ];
+
+    const seen: string[] = [];
+    for (const [expected, pending] of cases) {
+      const outcome = await pending;
+      expect(outcome.status).toBe(expected);
+      seen.push(outcome.status);
+    }
+    expect(new Set(seen).size).toBe(5);
   });
 });

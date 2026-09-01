@@ -71,6 +71,14 @@ function toDocument(row: DocumentRow): DocumentRecord {
  * showed. `proposal_id` is a ulid, so `DESC` also happens to agree with
  * "most recently created" whenever `created_at` alone cannot tell two rows
  * apart.
+ *
+ * Recorded and deliberately not changed: this filters on neither the
+ * proposal's `status` nor the document's. An `unproposable` proposal still
+ * carries `reading_id` and `job_id` and can win the ordering. It is harmless
+ * as things stand — both proposals for one job name the same reading, so the
+ * document resolved is the same either way — but the query's contract is "the
+ * latest proposal", not "the latest usable one", and a future caller reading
+ * the name for the second meaning would be wrong.
  */
 export async function documentForApproval(
   approvalId: string,

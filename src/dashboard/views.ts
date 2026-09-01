@@ -29,6 +29,33 @@ export function escapeHtml(value: unknown): string {
 
 const esc = escapeHtml;
 
+/**
+ * Unicode's bidirectional formatting controls, removed from a value before it
+ * is escaped and rendered.
+ *
+ * `escapeHtml` neutralises markup and nothing else, which is correct for
+ * every other field on these pages. It is not enough for a document's
+ * `original_name`: that string is stored verbatim from whoever sent the file
+ * (by design — it is inert as a path), and it is the label the owner reads
+ * when deciding whether to sign. On an RTL page a right-to-left override can
+ * make `invoice‮gpj.exe` render as `invoiceexe.jpg`, so a name that
+ * *looks* like the document the owner is expecting can be a different one.
+ * Stripping the controls does not make the name trustworthy — nothing can —
+ * which is why the sign form shows a prefix of the file's own hash beside it.
+ *
+ * `esc` itself is deliberately left alone: many call sites depend on it, and
+ * a display field is the only place where dropping characters is the right
+ * trade.
+ *
+ * The set: U+061C ALM, U+200E/U+200F LRM/RLM, U+202A-U+202E (the embedding
+ * and override family), U+2066-U+2069 (the isolate family).
+ */
+const BIDI_CONTROLS = /[؜‎‏‪-‮⁦-⁩]/g;
+
+function escLabel(value: string): string {
+  return esc(value.replace(BIDI_CONTROLS, ''));
+}
+
 const STYLE = `
   :root { color-scheme: light dark; }
   body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; }
@@ -188,8 +215,14 @@ ${list}`,
 /**
  * A third form, posting to `/a/:id/sign`, appears only when `document` is
  * supplied — the same rule the route follows when deciding whether to accept
- * a POST there at all. `originalName` is a sender-chosen string, so it goes
- * through `esc` like everything else in this file.
+ * a POST there at all. `originalName` is a sender-chosen string, and the one
+ * field on these pages that goes through `escLabel` rather than `esc`: it is
+ * the label the owner reads before signing, and `esc` alone leaves bidi
+ * overrides intact (see `escLabel`). Beside it the form prints a prefix of
+ * `documents.sha256` — the re-hash at signing time proves the bytes did not
+ * change, but without this nothing on the card is derived from those bytes at
+ * all, so the owner is told "unchanged" about a document identified only by a
+ * name its sender chose.
  *
  * `documentId` travels as a hidden field so the route can refuse a sign
  * whose form named a different document than the one it is about to verify
@@ -209,6 +242,14 @@ ${list}`,
  * `signError` itself, unconditionally, before deciding whether `signForm`
  * exists.
  */
+/**
+ * How much of `documents.sha256` the card shows. Twelve hex characters is
+ * 48 bits — far past what anyone will collide by accident among one
+ * business's documents, and short enough that the owner can actually compare
+ * it against a hash they were sent.
+ */
+const HASH_PREFIX_LENGTH = 12;
+
 function signForm(
   approvalId: string,
   csrf: string,
@@ -218,7 +259,8 @@ function signForm(
   return `<form method="post" action="/a/${esc(approvalId)}/sign">
     <input type="hidden" name="csrf" value="${esc(csrf)}">
     <input type="hidden" name="documentId" value="${esc(document.documentId)}">
-    <p class="muted">חתימה מאשרת את הבקשה וקובעת שהמסמך "${esc(document.originalName)}" נתקבל כמחייב.</p>
+    <p class="muted">חתימה מאשרת את הבקשה וקובעת שהמסמך "${escLabel(document.originalName)}" נתקבל כמחייב.</p>
+    <p class="muted">טביעת האצבע של הקובץ (12 התווים הראשונים): <code>${esc(document.sha256.slice(0, HASH_PREFIX_LENGTH))}</code></p>
     <label>הערה (רשות)<textarea name="note" rows="2">${esc(noteValue)}</textarea></label>
     <button type="submit">חתום ואשר</button>
   </form>`;

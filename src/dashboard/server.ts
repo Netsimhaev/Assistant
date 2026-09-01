@@ -19,7 +19,8 @@ import { ulid } from 'ulid';
 import { config } from '../config.js';
 import { ApprovalNotDecidableError, getApproval, pendingApprovals } from '../governance/approvals.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
-import { DocumentAlreadySignedError } from '../governance/signatures.js';
+import { DocumentAlreadySignedError, loadSignature } from '../governance/signatures.js';
+import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
 import { documentForApproval } from './document-for-approval.js';
@@ -465,6 +466,32 @@ function signRefusalReason(outcome: Exclude<VerifyOutcome, { status: 'unchanged'
   }
 }
 
+/**
+ * When and by whom, in the refusal itself (spec §8: "the uniqueness holds,
+ * and the message says when and who").
+ *
+ * "The document is already signed" alone tells the owner that something
+ * happened and gives them no way to find out what — they would have to ask
+ * whoever runs the database. `loadSignature` returning `null` here means the
+ * row vanished between the unique violation and this read, which is a
+ * genuinely strange state and not one to invent a name and a date for.
+ *
+ * The timestamp is formatted in the process's own timezone: this dashboard is
+ * a single-tenant install run for one business, so the server's clock is the
+ * owner's clock, and an ISO string in UTC would be the honest-looking answer
+ * to a question nobody asked.
+ */
+function alreadySignedReason(signature: SignatureRecord | null): string {
+  if (signature === null) {
+    return 'המסמך כבר נחתם בעבר. אין צורך לחתום שוב.';
+  }
+  const when = new Intl.DateTimeFormat('he-IL', {
+    dateStyle: 'short',
+    timeStyle: 'short',
+  }).format(new Date(signature.signedAt));
+  return `המסמך כבר נחתם בתאריך ${when} על ידי ${signature.signedBy}. אין צורך לחתום שוב.`;
+}
+
 async function handleDecision(
   req: IncomingMessage,
   res: ServerResponse,
@@ -651,6 +678,7 @@ async function handleDecision(
       );
     } catch (err) {
       if (err instanceof DocumentAlreadySignedError) {
+        const existing = await loadSignature(document.documentId, { businessId });
         return sendHtml(
           res,
           400,
@@ -659,7 +687,7 @@ async function handleDecision(
             csrf: issueCsrfToken(session.sessionId),
             document,
             ...(note !== undefined ? { noteValue: note } : {}),
-            signError: 'המסמך כבר נחתם בעבר. אין צורך לחתום שוב.',
+            signError: alreadySignedReason(existing),
           }),
         );
       }

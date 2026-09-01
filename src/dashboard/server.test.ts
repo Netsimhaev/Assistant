@@ -650,6 +650,11 @@ describe('signing an approval', () => {
       redirect: 'manual',
     });
     expect(secondSignRes.status).toBe(400);
+    // F3, spec §8: "the message says when and who". A refusal that only says
+    // "already signed" sends the owner to a DBA to find out by whom.
+    const secondBody = await secondSignRes.text();
+    expect(secondBody).toContain(USERNAME);
+    expect(secondBody).toContain(String(new Date().getUTCFullYear()));
 
     const secondApproval = await getApproval(second.approvalId, { businessId: BUSINESS });
     expect(secondApproval?.state).toBe('pending');
@@ -716,6 +721,51 @@ describe('signing an approval', () => {
 
     expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
     expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+  });
+
+  // F2: the filename is chosen by whoever sent the document. It is the only
+  // thing on the card naming what is about to be signed, and `escapeHtml`
+  // does not touch bidi controls — so on an RTL page a sender can make a name
+  // render as something other than what it is. The card must also show
+  // something derived from the bytes themselves.
+  it('shows a hash prefix beside the name and strips bidi controls from it', async () => {
+    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const bytes = Buffer.from('הסכם שיווק — שם עוין', 'utf8');
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    // U+202E RIGHT-TO-LEFT OVERRIDE, then a name that renders reversed.
+    const { documentId, sha256 } = await aDocument(
+      BUSINESS,
+      docRoot,
+      bytes,
+      'invoice‮gpj.exe',
+    );
+    const readingId = await aReadingOf(documentId, BUSINESS);
+    const { approvalId } = await anApprovalForReading(BUSINESS, bundle, readingId);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+    expect(body).toContain(sha256.slice(0, 12));
+    expect(body).not.toContain('‮');
+    // The visible characters of the name survive; only the control is gone.
+    expect(body).toContain('invoice');
+  });
+
+  // F6, spec §8 and §9: no document behind the approval, no sign control at
+  // all. The route refuses such a POST (tested above), but the button must
+  // never be on the page to begin with.
+  it('renders no sign control on a card with no document behind it', async () => {
+    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const job = await jobAwaitingApproval(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+    expect(body).toContain(`/a/${approvalId}/approve`);
+    expect(body).not.toContain(`/a/${approvalId}/sign`);
+    expect(body).not.toContain('name="documentId"');
+    expect(body).not.toContain('חתום ואשר');
   });
 });
 

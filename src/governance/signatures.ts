@@ -26,6 +26,15 @@ export interface SignatureRecord {
   signedSha256: string;
   approvalId: string;
   signedBy: string;
+  /**
+   * When the row was written, as an ISO-8601 string. Read back, never
+   * supplied: `signed_at` defaults to `now()` in the table, so the clock
+   * belongs to the database and not to whichever process happened to handle
+   * the click. The already-signed refusal has to say when the document was
+   * signed and by whom (spec §8), and "who" alone sends the owner to a DBA
+   * for the other half.
+   */
+  signedAt: string;
 }
 
 /** What a caller supplies to `recordSignature`. */
@@ -44,6 +53,7 @@ interface SignatureRow {
   signed_sha256: string;
   approval_id: string;
   signed_by: string;
+  signed_at: Date;
 }
 
 function toSignature(row: SignatureRow): SignatureRecord {
@@ -54,10 +64,14 @@ function toSignature(row: SignatureRow): SignatureRecord {
     signedSha256: row.signed_sha256,
     approvalId: row.approval_id,
     signedBy: row.signed_by,
+    signedAt: row.signed_at.toISOString(),
   };
 }
 
-const COLUMNS = `signature_id, business_id, document_id, signed_sha256, approval_id, signed_by`;
+/** Everything a reader gets back. `signed_at` is in here but not in `INSERT_COLUMNS`: the table's `now()` default owns it. */
+const COLUMNS = `signature_id, business_id, document_id, signed_sha256, approval_id, signed_by, signed_at`;
+
+const INSERT_COLUMNS = `signature_id, business_id, document_id, signed_sha256, approval_id, signed_by`;
 
 /**
  * Thrown when a document already carries a signature.
@@ -89,7 +103,7 @@ export async function recordSignature(
 
   try {
     const { rows } = await db.query<SignatureRow>(
-      `INSERT INTO signatures (${COLUMNS})
+      `INSERT INTO signatures (${INSERT_COLUMNS})
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING ${COLUMNS}`,
       [
