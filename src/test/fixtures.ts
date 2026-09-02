@@ -1,5 +1,5 @@
 import type { ActionClass } from '../domain/action.js';
-import type { BusinessCharter, UnsignedCharter } from '../domain/charter.js';
+import type { BusinessCharter, ForbiddenRule, UnsignedCharter } from '../domain/charter.js';
 import { BusinessCharter as CharterSchema } from '../domain/charter.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import type { CharterConnection } from '../domain/connection.js';
@@ -69,6 +69,15 @@ export interface CharterOverrides {
   knownCounterpartyEmailDomain?: string;
   /** Connections the charter declares. Empty by default. */
   connections?: CharterConnection[];
+  /**
+   * Replaces the default `forbidden` list wholesale rather than appending to
+   * it — a test that needs a charter *without* `no_customer_data_export`
+   * (fix round 1, F2) cannot express that by adding a rule, only by omitting
+   * one, and appending can never omit. Mutating a signed charter after the
+   * fact was rejected for the same reason `compileCharter` exists at all:
+   * post-signature mutation breaks the signature.
+   */
+  forbidden?: ForbiddenRule[];
 }
 
 /** A realistic small-business charter: an Israeli firm working Sun–Thu. */
@@ -223,7 +232,7 @@ export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter 
       subprocessorsAllowed: ['anthropic', 'google-workspace'],
     },
 
-    forbidden: [
+    forbidden: overrides.forbidden ?? [
       // Reachable: ops.systems owns `data.export`, so this rule is genuinely
       // enforced by the charter layer rather than pre-empted by the allowlist.
       {

@@ -248,6 +248,22 @@ export async function markRejected(
   }
 }
 
+/** One document by id, scoped to its business. `null` when this business does not own it. */
+export async function loadDocument(
+  documentId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<DocumentRecord | null> {
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<DocumentRow>(
+    `SELECT document_id, business_id, source, original_name, media_type, sha256,
+            byte_size, stored_path, status, reason
+       FROM documents WHERE business_id = $1 AND document_id = $2`,
+    [options.businessId ?? config.businessId, documentId],
+  );
+  const row = rows[0];
+  return row === undefined ? null : toDocument(row);
+}
+
 /** A document's extracted parts, ordered the way they were written. */
 export async function loadArtifacts(
   documentId: string,
