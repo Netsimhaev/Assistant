@@ -401,6 +401,7 @@ export function renderApprovalCard(options: {
     <tr><td class="muted">פג תוקף</td><td>${esc(approval.expiresAt)}</td></tr>
   </table>
 </div>
+${options.document ? documentBlock(options.document) : ''}
 ${signErrorBlock}
 <div class="row">
   <form method="post" action="/a/${esc(approval.approvalId)}/approve" class="edit-form">
@@ -419,8 +420,7 @@ ${signErrorBlock}
     <button type="submit">דחייה</button>
   </form>
   ${options.document && isDocumentDecisionIntent(options.documentIntent ?? null) ? signForm(approval.approvalId, options.csrf, options.document, noteValue) : ''}
-</div>
-${options.document ? documentBlock(options.document) : ''}`,
+</div>`,
   );
 }
 
