@@ -129,8 +129,13 @@ async function wakeDueJobs(
 
 export interface SchedulerPassResult {
   tick: TickResult;
-  /** Null when no inbox is configured — the scan is off, not broken. */
+  /** Null when no inbox is configured, or when the scan itself faulted. */
   scan: ScanResult | null;
+  /**
+   * `scanInbox`'s thrown message, if it threw. Null on a clean scan and null
+   * when no inbox is configured at all — those two are not failures.
+   */
+  scanError: string | null;
   conduct: ConductResult;
   due: RunDueResult;
   verified: CloseVerifiedResult;
@@ -156,6 +161,20 @@ export interface SchedulerPassResult {
  * configured a watched folder is a switch, not a fault, and the pass must
  * neither throw nor pretend a scan happened.
  *
+ * A configured inbox that `scanInbox` cannot actually read — the folder is
+ * missing, permissions are wrong, a path component is a plain file — is a
+ * different thing from an absent one, and the spec's own failure table
+ * (§9) says so: recorded, and the scheduler carries on. `scanInbox` genuinely
+ * throws on that class of fault (its own docblock only documents one case,
+ * a reserved subdirectory name occupied by a file, but any `mkdir`/`readdir`
+ * error not caught there propagates the same way), so the call is wrapped
+ * here rather than left to reach the caller. Letting it escape would stop
+ * `conduct`, `due` and `verified` from running for as long as the path stays
+ * broken — every interval, forever — and would crash `run-scheduler.ts`'s
+ * unguarded startup call outright. `scanError` carries the message so an
+ * operator watching the process log sees it; `scan` stays `null`, the same
+ * value an absent inbox produces, because no scan result exists either way.
+ *
  * A skipped tick — another scheduler holds the business-wide lock — still
  * runs the rest of the pass. The per-job locks in `runDueJobs` and the
  * conductor's own advisory lock are what actually keep two runners apart, and
@@ -180,14 +199,22 @@ export async function schedulerPass(
   // Both conductor loops run after the tick's transaction has committed, not
   // inside it — see the docblock above.
   const inbox = options.inbox !== undefined ? options.inbox : config.documentInbox;
-  const scan =
-    inbox === null
-      ? null
-      : await scanInbox({
-          inbox,
-          ...(options.businessId !== undefined ? { businessId: options.businessId } : {}),
-          ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
-        });
+  let scan: ScanResult | null = null;
+  let scanError: string | null = null;
+  if (inbox !== null) {
+    try {
+      scan = await scanInbox({
+        inbox,
+        ...(options.businessId !== undefined ? { businessId: options.businessId } : {}),
+        ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
+      });
+    } catch (err) {
+      // See the docblock above: a broken inbox must not stop the rest of the
+      // pass. `scan` stays `null` and `conduct`/`due`/`verified` still run
+      // below, exactly as if no inbox had been configured at all.
+      scanError = err instanceof Error ? err.message : String(err);
+    }
+  }
 
   const conduct = await conductPendingDocuments(options);
 
@@ -198,7 +225,7 @@ export async function schedulerPass(
   // instead and every close would trail a pass behind the work that earned
   // it.
   const verified = await closeVerifiedJobs(options);
-  return { tick: tickResult, scan, conduct, due, verified };
+  return { tick: tickResult, scan, scanError, conduct, due, verified };
 }
 
 export interface SchedulerHandle {

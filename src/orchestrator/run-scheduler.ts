@@ -39,6 +39,14 @@ for (const warning of runtime.warnings) console.warn(`warning: ${warning}`);
 // way (moving it to `failed`, adding an attempt counter) is a policy call for
 // its own change.
 function logErrored(result: SchedulerPassResult): void {
+  // A folder that is missing, unreadable, or blocked by a plain file where a
+  // directory belongs (see `scheduler.ts`'s docblock above `schedulerPass`)
+  // is recorded here, once per pass for as long as it persists — never
+  // thrown, because a broken inbox must not stop the approvals and plans
+  // below it from running.
+  if (result.scanError !== null) {
+    console.error(`document inbox scan failed: ${result.scanError}`);
+  }
   for (const job of result.due.errored) {
     console.error(`job ${job.jobId} errored: ${job.error}`);
   }
