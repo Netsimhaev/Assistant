@@ -38,6 +38,8 @@ interface DocumentRow {
   stored_path: string;
   status: string;
   reason: string | null;
+  read_attempts: number;
+  read_error: string | null;
 }
 
 function toDocument(row: DocumentRow): DocumentRecord {
@@ -52,6 +54,8 @@ function toDocument(row: DocumentRow): DocumentRecord {
     storedPath: row.stored_path,
     status: row.status as DocumentStatus,
     reason: row.reason,
+    readAttempts: row.read_attempts,
+    readError: row.read_error,
   };
 }
 
@@ -89,7 +93,8 @@ export async function documentForApproval(
 
   const { rows } = await db.query<DocumentRow>(
     `SELECT d.document_id, d.business_id, d.source, d.original_name, d.media_type,
-            d.sha256, d.byte_size, d.stored_path, d.status, d.reason
+            d.sha256, d.byte_size, d.stored_path, d.status, d.reason,
+            d.read_attempts, d.read_error
        FROM approval_requests a
        JOIN proposals p
          ON p.job_id = a.job_id AND p.business_id = a.business_id

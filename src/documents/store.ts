@@ -28,6 +28,8 @@ interface DocumentRow {
   stored_path: string;
   status: string;
   reason: string | null;
+  read_attempts: number;
+  read_error: string | null;
 }
 
 function toDocument(row: DocumentRow): DocumentRecord {
@@ -46,6 +48,8 @@ function toDocument(row: DocumentRow): DocumentRecord {
     storedPath: row.stored_path,
     status: row.status as DocumentStatus,
     reason: row.reason,
+    readAttempts: row.read_attempts,
+    readError: row.read_error,
   };
 }
 
@@ -256,7 +260,7 @@ export async function loadDocument(
   const db = options.db ?? getPool();
   const { rows } = await db.query<DocumentRow>(
     `SELECT document_id, business_id, source, original_name, media_type, sha256,
-            byte_size, stored_path, status, reason
+            byte_size, stored_path, status, reason, read_attempts, read_error
        FROM documents WHERE business_id = $1 AND document_id = $2`,
     [options.businessId ?? config.businessId, documentId],
   );
@@ -277,4 +281,89 @@ export async function loadArtifacts(
     [options.businessId ?? config.businessId, documentId],
   );
   return rows.map(toArtifact);
+}
+
+/** Understanding attempts before a document stops being selected. */
+export const MAX_READ_ATTEMPTS = 3;
+
+/**
+ * Documents that have bytes and no reading yet.
+ *
+ * "Has a reading" is the completion marker rather than a column of our own:
+ * a reading row is the thing the conductor exists to produce, so its presence
+ * is the fact, not a flag that could disagree with it.
+ *
+ * Provenance is deliberately NOT in the NOT EXISTS. A document read once under
+ * any trust level has been through the pipeline; re-reading it under a second
+ * provenance is a different question than this loop asks, and would spend money
+ * on a document the owner has already been told about.
+ */
+export async function documentsAwaitingRead(
+  limit: number,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<DocumentRecord[]> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+
+  const { rows } = await db.query<DocumentRow>(
+    `SELECT d.* FROM documents d
+      WHERE d.business_id = $1
+        AND d.status = 'extracted'
+        AND d.read_attempts < $2
+        AND NOT EXISTS (
+              SELECT 1 FROM document_readings r
+               WHERE r.document_id = d.document_id
+                 AND r.business_id = d.business_id
+            )
+      ORDER BY d.created_at ASC, d.document_id ASC
+      LIMIT $3`,
+    [businessId, MAX_READ_ATTEMPTS, limit],
+  );
+  return rows.map(toDocument);
+}
+
+/**
+ * Record one failed understanding attempt.
+ *
+ * A no-op when the id does not resolve for this business, rather than a throw:
+ * the caller is a scheduler loop recording why something did not work, and a
+ * failure to record a failure must not become a second, louder failure.
+ */
+export async function recordReadFailure(
+  documentId: string,
+  message: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<void> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+
+  await db.query(
+    `UPDATE documents
+        SET read_attempts = read_attempts + 1,
+            read_error = $3
+      WHERE document_id = $1 AND business_id = $2`,
+    [documentId, businessId, message.slice(0, 2000)],
+  );
+}
+
+/**
+ * Readings written today, which is what the daily ceiling measures.
+ *
+ * Counting rows rather than keeping a counter means there is nothing to reset
+ * and nothing that can drift. And because a cache hit writes no row, a read
+ * that cost no money is not counted — the measure matches the thing the
+ * ceiling is meant to bound.
+ */
+export async function readingsToday(
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<number> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+
+  const { rows } = await db.query<{ n: string }>(
+    `SELECT count(*)::text AS n FROM document_readings
+      WHERE business_id = $1 AND created_at >= date_trunc('day', now())`,
+    [businessId],
+  );
+  return Number(rows[0]?.n ?? '0');
 }

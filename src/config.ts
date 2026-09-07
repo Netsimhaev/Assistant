@@ -14,6 +14,28 @@ function required(name: string): string {
 }
 
 /**
+ * Absent means off, never a permissive default.
+ *
+ * `DOCUMENT_INBOX` unset is how an installation says "do not watch a folder".
+ * The scheduler reports it once and carries on, exactly as `buildRuntime`
+ * treats absent SMTP settings — a missing setting is a switch, not a fault.
+ */
+function optional(name: string): string | null {
+  const value = process.env[name];
+  return value === undefined || value === '' ? null : value;
+}
+
+function positiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer (got: ${raw})`);
+  }
+  return parsed;
+}
+
+/**
  * Vitest sets NODE_ENV=test via vitest.config.ts. A CLI run cannot rely on
  * that: `NODE_ENV=test <cmd>` is not portable to Windows shells, and pulling
  * in cross-env for one script is a dependency for nothing. `--test-db` selects
@@ -58,4 +80,6 @@ export const config = {
   // passes one via `documentRoot` overrides), so this changes nothing for
   // them.
   documentRoot: resolve(required('DOCUMENT_ROOT')),
+  documentInbox: optional('DOCUMENT_INBOX'),
+  documentReadsPerDay: positiveInt('DOCUMENT_READS_PER_DAY', 20),
 } as const;
