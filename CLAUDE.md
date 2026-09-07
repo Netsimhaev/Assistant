@@ -8,7 +8,7 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 1169 מבחנים
+npm test          # vitest run — 1174 מבחנים
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_URL
@@ -17,6 +17,7 @@ npm run sdk:know-reader  # הרצה חיה מול ה-Agent SDK — דורש ANTH
 npm run sdk:read-document -- <documentId>  # קריאה חיה של מסמך שנקלט — דורש ANTHROPIC_API_KEY
 npm run sdk:propose -- <documentId> <jobId>  # הצעה חיה מקריאה שמורה — דורש ANTHROPIC_API_KEY
 npm run scheduler        # מעיר jobs רדומים ומפקיע אישורים — תהליך מתמשך
+npm run ramp:set -- <מחלקה> <רמה>  # מעלה מחלקת פעולה מהרצפה, ומדפיס היכן ההעלאה באמת מורגשת
 ```
 
 **המבחנים דורשים Postgres אמיתי.** אין mock ואין DB בזיכרון. נדרשים שני בסיסי נתונים — `assistant_dev` ו-`assistant_test` — ו-`.env` עם `DATABASE_URL` ו-`TEST_DATABASE_URL` (ראה `.env.example`). נבדק על PostgreSQL 17.11.
