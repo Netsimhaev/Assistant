@@ -162,8 +162,10 @@ describe('the conductor queries', () => {
     const documentId = await anExtractedDocument('שלום');
     await getPool().query(
       `INSERT INTO document_readings
-         (reading_id, business_id, document_id, brief_hash, prompt_version, provenance, reading, raw)
-       VALUES ('RD-1', $1, $2, 'h', 'v1', 'unknown_external', '{}'::jsonb, '')`,
+         (reading_id, business_id, document_id, status, reason, content,
+          provenance, model, prompt_version, brief_hash)
+       VALUES ('RD-1', $1, $2, 'read', NULL, '{}'::jsonb,
+               'unknown_external', 'test', 'v1', 'h')`,
       [BUSINESS, documentId],
     );
     const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
@@ -202,13 +204,19 @@ describe('the conductor queries', () => {
     const documentId = await anExtractedDocument('שלום');
     await getPool().query(
       `INSERT INTO document_readings
-         (reading_id, business_id, document_id, brief_hash, prompt_version, provenance, reading, raw, created_at)
+         (reading_id, business_id, document_id, status, reason, content,
+          provenance, model, prompt_version, brief_hash, created_at)
        VALUES
-         ('RD-today', $1, $2, 'h1', 'v1', 'unknown_external', '{}'::jsonb, '', now()),
-         ('RD-old',   $1, $2, 'h2', 'v1', 'unknown_external', '{}'::jsonb, '', now() - interval '2 days'),
-         ('RD-other', 'other-biz', $2, 'h3', 'v1', 'unknown_external', '{}'::jsonb, '', now())`,
+         ('RD-today', $1, $2, 'read', NULL, '{}'::jsonb, 'unknown_external', 'test', 'v1', 'h1', now()),
+         ('RD-old',   $1, $2, 'read', NULL, '{}'::jsonb, 'unknown_external', 'test', 'v1', 'h2', now() - interval '2 days'),
+         ('RD-other', 'other-biz', $2, 'read', NULL, '{}'::jsonb, 'unknown_external', 'test', 'v1', 'h3', now())`,
       [BUSINESS, documentId],
     );
+
+    // `RD-other` names a document belonging to BUSINESS, which the foreign key
+    // allows — `document_readings` references `documents (document_id)` alone.
+    // That is the point: the count must exclude it on `business_id`, not on
+    // whether the join happens to resolve.
     expect(await readingsToday({ businessId: BUSINESS })).toBe(1);
   });
 });
@@ -310,7 +318,7 @@ export async function readingsToday(
 }
 ```
 
-Add `read_attempts: number` and `read_error: string | null` to the private `DocumentRow` interface and to `DocumentRecord` (as `readAttempts` / `readError`), and map them in `toDocument`.
+Add `read_attempts: number` and `read_error: string | null` to the private `DocumentRow` interface in `store.ts`, add `readAttempts: number` and `readError: string | null` to `DocumentRecord` in **`src/documents/types.ts`** (not `store.ts` — that is where the interface lives), and map them in `toDocument`.
 
 - [ ] **Step 7: Run the tests**
 
@@ -908,7 +916,9 @@ function deps(proposal: Proposal = ACTING) {
     calls,
     reader: async () => {
       calls.reads += 1;
-      return { status: 'read' as const, reading: READING, raw: '{}' };
+      // `ReadOutcome` (src/sdk/know-reader.ts) carries `denials` and `turns`
+      // on both branches — a stub missing them does not typecheck.
+      return { status: 'read' as const, reading: READING, raw: '{}', denials: [], turns: 1 };
     },
     proposer: async () => {
       calls.proposals += 1;
@@ -1426,14 +1436,17 @@ async function seed(businessId: string, documentId: string, stance: string): Pro
   );
   await getPool().query(
     `INSERT INTO document_readings
-       (reading_id, business_id, document_id, brief_hash, prompt_version, provenance, reading, raw)
-     VALUES ($1, $2, $3, 'h', 'v1', 'unknown_external', $4::jsonb, '')`,
+       (reading_id, business_id, document_id, status, reason, content,
+        provenance, model, prompt_version, brief_hash)
+     VALUES ($1, $2, $3, 'read', NULL, $4::jsonb,
+             'unknown_external', 'test', 'v1', 'h')`,
     [`RD-${documentId}`, businessId, documentId, JSON.stringify({ summary: 'סיכום', findings: [], intents: [] })],
   );
   await getPool().query(
     `INSERT INTO proposals
-       (proposal_id, business_id, reading_id, job_id, status, proposal, raw)
-     VALUES ($1, $2, $3, NULL, 'proposed', $4::jsonb, '')`,
+       (proposal_id, business_id, reading_id, job_id, status, reason, content, raw,
+        model, prompt_version)
+     VALUES ($1, $2, $3, NULL, 'proposed', NULL, $4::jsonb, '', 'test', 'v1')`,
     [
       `PR-${documentId}`,
       businessId,
@@ -1551,15 +1564,15 @@ export async function recentReadings(
             d.original_name,
             d.sha256,
             r.created_at::text AS read_at,
-            r.reading,
-            p.proposal,
+            r.content AS reading,
+            p.content AS proposal,
             a.approval_id
        FROM document_readings r
        JOIN documents d
          ON d.document_id = r.document_id
         AND d.business_id = r.business_id
        LEFT JOIN LATERAL (
-            SELECT pr.proposal, pr.job_id
+            SELECT pr.content, pr.job_id
               FROM proposals pr
              WHERE pr.reading_id = r.reading_id
                AND pr.business_id = r.business_id

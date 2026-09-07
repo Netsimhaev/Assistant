@@ -222,6 +222,40 @@ describe('runDueJobs', () => {
     expect(result.ran).toEqual([]);
   });
 
+  // I2: an unbound job used to be reported and then left exactly where it
+  // was. `updated_at` never moved, so under `ORDER BY updated_at ASC LIMIT 20`
+  // it sorted first on every pass afterwards, forever. Twenty of them and the
+  // window is permanently full of rows nothing can advance, and no genuinely
+  // runnable job of that business is ever reached again. The conductor is the
+  // first production producer of unbound `execute` jobs — every approved
+  // conductor card lands here — so this went from a documented hypothetical
+  // to a certainty.
+  it('moves an unbound job out of execute so it cannot hold the window forever', async () => {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+      businessId: BUSINESS,
+    });
+    const jobId = await jobInExecute(bundle.charterVersion, 'unbound-twice');
+
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
+
+    const job = await loadJob(jobId, { businessId: BUSINESS });
+    expect(job?.phase).toBe('failed');
+    expect(job?.closedAt).not.toBeNull();
+
+    // The point of the disposition, stated as behaviour: a second pass does
+    // not find it at all. Without the transition this assertion fails — the
+    // row is still in `execute` and still first in line.
+    const second = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
+    expect(second.unbound).toEqual([]);
+
+    // And the reason is on the record, not only in the returned bucket.
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'failed'`,
+      [jobId],
+    );
+    expect(rows[0]?.reason).toContain('no_plan_bound');
+  });
+
   it('honours the ramp: with no ramp row the send is capped and no mail goes out', async () => {
     const jobId = await seedExecutableJob();
     // No setRampLevel call at all — the floor is draft_only, which must be

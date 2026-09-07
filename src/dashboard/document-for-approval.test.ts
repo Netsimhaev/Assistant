@@ -191,7 +191,61 @@ describe('documentForApproval', () => {
     const result = await documentForApproval(approvalId, { businessId: BUSINESS });
 
     expect(result).not.toBeNull();
-    expect(result?.documentId).toBe(documentId);
+    expect(result?.document.documentId).toBe(documentId);
+    // I4: the proposal's own intent travels with the document, because that
+    // is what decides whether the card may carry a sign form at all.
+    expect(result?.intent).toBe('reply_to_sender');
+  });
+
+  it('reports a null intent when the proposal carries no action', async () => {
+    const bundle = await install(BUSINESS);
+    const { readingId } = await aDocumentAndReading(BUSINESS);
+    const job = await aJob(BUSINESS, bundle, 'הצעה בלי פעולה');
+    await saveProposal(
+      {
+        proposalId: `PR-${ulid()}`,
+        readingId,
+        jobId: job.jobId,
+        status: 'proposed',
+        reason: null,
+        content: { ...ACTING_PROPOSAL, stance: 'advise_against', action: null },
+        raw: '{}',
+        model: 'haiku',
+        promptVersion: 'v1',
+      },
+      { businessId: BUSINESS },
+    );
+    const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
+
+    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+
+    // The document still resolves — the card should still say what it is
+    // about — but there is no intent, so nothing may be signed.
+    expect(result?.document).not.toBeUndefined();
+    expect(result?.intent).toBeNull();
+  });
+
+  it('reports a null intent when the stored intent is not a member of the enum', async () => {
+    // The value comes out of JSONB written from a model's answer. A name the
+    // closed enum does not know must arrive as `null` — the reading that
+    // means "no sign form" — never as a string that survives to be compared
+    // against an allowlist somewhere further downstream.
+    const bundle = await install(BUSINESS);
+    const { readingId } = await aDocumentAndReading(BUSINESS);
+    const job = await aJob(BUSINESS, bundle, 'כוונה שאינה בסכמה');
+    const proposal = await aProposal(BUSINESS, readingId, job.jobId);
+    await getPool().query(
+      `UPDATE proposals
+          SET content = jsonb_set(content, '{action,intent}', '"sign_everything"')
+        WHERE proposal_id = $1`,
+      [proposal.proposalId],
+    );
+    const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
+
+    const result = await documentForApproval(approvalId, { businessId: BUSINESS });
+
+    expect(result?.document).not.toBeUndefined();
+    expect(result?.intent).toBeNull();
   });
 
   it('returns null when the job has no proposal', async () => {
@@ -274,8 +328,8 @@ describe('documentForApproval', () => {
 
     const result = await documentForApproval(approvalId, { businessId: BUSINESS });
 
-    expect(result?.documentId).toBe(newer.documentId);
-    expect(result?.documentId).not.toBe(older.documentId);
+    expect(result?.document.documentId).toBe(newer.documentId);
+    expect(result?.document.documentId).not.toBe(older.documentId);
   });
 
   it('breaks a created_at tie by proposal_id, deterministically (M4)', async () => {
@@ -310,8 +364,8 @@ describe('documentForApproval', () => {
     const approvalId = await anApproval(BUSINESS, job.jobId, bundle);
     const result = await documentForApproval(approvalId, { businessId: BUSINESS });
 
-    expect(result?.documentId).toBe(b.documentId);
-    expect(result?.documentId).not.toBe(a.documentId);
+    expect(result?.document.documentId).toBe(b.documentId);
+    expect(result?.document.documentId).not.toBe(a.documentId);
   });
 
   it('does not leak a document whose reading belongs to another business', async () => {

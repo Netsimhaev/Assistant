@@ -73,6 +73,8 @@ export interface DocumentRecord {
   storedPath: string;
   status: DocumentStatus;
   reason: string | null;
+  readAttempts: number;
+  readError: string | null;
 }
 
 /**

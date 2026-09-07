@@ -25,6 +25,7 @@
     "owner:create": "tsx src/cli/create-owner.ts",
     "owner:password": "tsx src/cli/owner-password.ts",
     "job:seed": "tsx src/cli/seed-job.ts",
+    "ramp:set": "tsx src/cli/set-ramp.ts",
     "doc:ingest": "tsx src/cli/ingest-doc.ts"
   },
   "dependencies": {

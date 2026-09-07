@@ -13,6 +13,9 @@
  */
 import type { ApprovalRequest } from '../governance/approvals.js';
 import type { DocumentRecord } from '../documents/types.js';
+import type { IntentName } from '../domain/reading.js';
+import type { ReadingSummary } from './readings-list.js';
+import { isDocumentDecisionIntent } from './signable-intents.js';
 import { formatMinor } from '../util/money.js';
 
 /** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
@@ -195,7 +198,66 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
+<p><a href="/readings">מה קראתי</a></p>
 ${list}`,
+  );
+}
+
+const STANCE_LABEL: Record<string, string> = {
+  act: 'מציעה לפעול',
+  advise_against: 'ממליצה שלא',
+  ask: 'יש לי שאלה',
+  no_action: 'אין מה לעשות',
+};
+
+/**
+ * What the assistant read, and what it concluded — every reading, whether or
+ * not its proposal carries an action.
+ *
+ * Read-only. No form, no button that decides anything: deciding lives on the
+ * approval card, which carries expiry, decision, signing and audit. A second
+ * screen that decided would be a second path to the same table.
+ *
+ * `escLabel` on the filename for the same reason the approval card uses it:
+ * `original_name` is stored verbatim from whoever sent the file, and bidi
+ * control characters make a name render as something other than what it is.
+ */
+export function renderReadings(rows: ReadingSummary[], csrf: string): string {
+  const items = rows
+    .map((r) => {
+      const stance = r.stance === null ? '' : (STANCE_LABEL[r.stance] ?? r.stance);
+      const reasons = r.reasons.map((t) => `<li>${esc(t)}</li>`).join('');
+      // M2: three cases, not two. A missing card because the stance proposed
+      // nothing is an ordinary outcome; a missing card for a proposal that
+      // DID propose something is a gap the owner should be told about
+      // instead of being assured there was nothing to approve.
+      const link =
+        r.approvalId !== null
+          ? `<a href="/a/${esc(r.approvalId)}">לכרטיס האישור</a>`
+          : r.hasAction
+            ? '<span class="muted">הוצעה פעולה, אך לא נוצר עבורה כרטיס אישור.</span>'
+            : '<span class="muted">אין כרטיס — אין פעולה לאשר</span>';
+      return `
+        <article class="card">
+          <h3>${escLabel(r.originalName)} <span class="hash">${esc(r.sha256.slice(0, HASH_PREFIX_LENGTH))}</span></h3>
+          <p class="when">${esc(r.readAt)}</p>
+          <p>${esc(r.summary)}</p>
+          ${stance === '' ? '' : `<p class="stance"><strong>${esc(stance)}</strong>${r.headline === null ? '' : ` — ${esc(r.headline)}`}</p>`}
+          ${reasons === '' ? '' : `<ul>${reasons}</ul>`}
+          <p>${link}</p>
+        </article>`;
+    })
+    .join('');
+
+  return page(
+    'מה קראתי',
+    `<header>
+  <h1>מה קראתי</h1>
+  ${logoutForm(csrf)}
+</header>
+<p><a href="/">&rarr; חזרה לרשימה</a></p>
+<p class="muted">כל מסמך שנקלט ונקרא, ומה שהוסק ממנו. המסך הזה מציג בלבד — הכרעה נעשית בכרטיס האישור.</p>
+${rows.length === 0 ? '<p>עדיין לא נקרא אף מסמך.</p>' : items}`,
   );
 }
 
@@ -213,16 +275,47 @@ ${list}`,
  * preserve, is losing their work by half.
  */
 /**
- * A third form, posting to `/a/:id/sign`, appears only when `document` is
- * supplied — the same rule the route follows when deciding whether to accept
- * a POST there at all. `originalName` is a sender-chosen string, and the one
- * field on these pages that goes through `escLabel` rather than `esc`: it is
- * the label the owner reads before signing, and `esc` alone leaves bidi
- * overrides intact (see `escLabel`). Beside it the form prints a prefix of
- * `documents.sha256` — the re-hash at signing time proves the bytes did not
- * change, but without this nothing on the card is derived from those bytes at
- * all, so the owner is told "unchanged" about a document identified only by a
- * name its sender chose.
+ * How much of `documents.sha256` the card shows. Twelve hex characters is
+ * 48 bits — far past what anyone will collide by accident among one
+ * business's documents, and short enough that the owner can actually compare
+ * it against a hash they were sent.
+ */
+const HASH_PREFIX_LENGTH = 12;
+
+/**
+ * The document behind this card, shown for what it is.
+ *
+ * Rendered whenever a document resolves, whether or not the card may be
+ * signed. A card raised about a document should say which document — and
+ * before this the only place that information appeared was inside the sign
+ * form, so removing the form on a non-signable card would have taken the
+ * document off the page along with it.
+ *
+ * `originalName` is a sender-chosen string, and the one field on these pages
+ * that goes through `escLabel` rather than `esc`: it is the label the owner
+ * reads, and `esc` alone leaves bidi overrides intact (see `escLabel`).
+ * Beside it goes a prefix of `documents.sha256` — the re-hash at signing time
+ * proves the bytes did not change, but without this nothing on the card is
+ * derived from those bytes at all, so the owner is told "unchanged" about a
+ * document identified only by a name its sender chose.
+ */
+function documentBlock(document: DocumentRecord): string {
+  return `<div class="card">
+  <h3>המסמך שהבקשה נוגעת אליו</h3>
+  <p>${escLabel(document.originalName)}</p>
+  <p class="muted">טביעת האצבע של הקובץ (12 התווים הראשונים): <code>${esc(document.sha256.slice(0, HASH_PREFIX_LENGTH))}</code></p>
+</div>`;
+}
+
+/**
+ * A third form, posting to `/a/:id/sign`.
+ *
+ * Rendered only when a document resolves **and** the proposal's intent is one
+ * of `DOCUMENT_DECISION_INTENTS` — an allowlist, defaulting to no form. See
+ * `signable-intents.ts` for why each member is on it and why the other nine
+ * are not; the short version is that this form's own text asserts the document
+ * was accepted as binding, and the row it writes cannot be undone, so it may
+ * not ride along on a card whose real subject is an email.
  *
  * `documentId` travels as a hidden field so the route can refuse a sign
  * whose form named a different document than the one it is about to verify
@@ -232,24 +325,16 @@ ${list}`,
  * `noteValue` mirrors the approve form's own reasoning: a refusal that
  * resets what the owner typed is losing their work by half.
  *
- * `signError` is deliberately NOT a parameter here. Two of the route's sign
- * refusals — the approval is already decided, or no document is behind it
- * at all — have no `document` to render this form with, so an error block
- * living inside `signForm` would silently vanish exactly on those two
- * refusals (a regression caught in round-2 review: the "no document" case
- * used to render, misplaced, in the approve form — after this file's first
- * pass it rendered nowhere at all). `renderApprovalCard` renders
+ * `signError` is deliberately NOT a parameter here. Three of the route's sign
+ * refusals — the approval is already decided, no document is behind it at
+ * all, or the proposal is not a document decision — have no form to render a
+ * message inside, so an error block living in here would silently vanish
+ * exactly on those (a regression caught in round-2 review: the "no document"
+ * case used to render, misplaced, in the approve form — after this file's
+ * first pass it rendered nowhere at all). `renderApprovalCard` renders
  * `signError` itself, unconditionally, before deciding whether `signForm`
  * exists.
  */
-/**
- * How much of `documents.sha256` the card shows. Twelve hex characters is
- * 48 bits — far past what anyone will collide by accident among one
- * business's documents, and short enough that the owner can actually compare
- * it against a hash they were sent.
- */
-const HASH_PREFIX_LENGTH = 12;
-
 function signForm(
   approvalId: string,
   csrf: string,
@@ -260,7 +345,6 @@ function signForm(
     <input type="hidden" name="csrf" value="${esc(csrf)}">
     <input type="hidden" name="documentId" value="${esc(document.documentId)}">
     <p class="muted">חתימה מאשרת את הבקשה וקובעת שהמסמך "${escLabel(document.originalName)}" נתקבל כמחייב.</p>
-    <p class="muted">טביעת האצבע של הקובץ (12 התווים הראשונים): <code>${esc(document.sha256.slice(0, HASH_PREFIX_LENGTH))}</code></p>
     <label>הערה (רשות)<textarea name="note" rows="2">${esc(noteValue)}</textarea></label>
     <button type="submit">חתום ואשר</button>
   </form>`;
@@ -270,6 +354,15 @@ export function renderApprovalCard(options: {
   approval: ApprovalRequest;
   csrf: string;
   document?: DocumentRecord;
+  /**
+   * The intent of the proposal action behind `document`, when one resolved.
+   *
+   * Only a member of `DOCUMENT_DECISION_INTENTS` gets the sign form. Absent,
+   * `null`, or a value the enum does not know all mean no form — which is the
+   * whole point of writing this as an allowlist: the safe answer is the
+   * default, not a case somebody has to remember to handle.
+   */
+  documentIntent?: IntentName | null;
   editValue?: string;
   noteValue?: string;
   error?: string;
@@ -308,6 +401,7 @@ export function renderApprovalCard(options: {
     <tr><td class="muted">פג תוקף</td><td>${esc(approval.expiresAt)}</td></tr>
   </table>
 </div>
+${options.document ? documentBlock(options.document) : ''}
 ${signErrorBlock}
 <div class="row">
   <form method="post" action="/a/${esc(approval.approvalId)}/approve" class="edit-form">
@@ -325,7 +419,7 @@ ${signErrorBlock}
     <label>הערה (רשות)<textarea name="note" rows="2"></textarea></label>
     <button type="submit">דחייה</button>
   </form>
-  ${options.document ? signForm(approval.approvalId, options.csrf, options.document, noteValue) : ''}
+  ${options.document && isDocumentDecisionIntent(options.documentIntent ?? null) ? signForm(approval.approvalId, options.csrf, options.document, noteValue) : ''}
 </div>`,
   );
 }
