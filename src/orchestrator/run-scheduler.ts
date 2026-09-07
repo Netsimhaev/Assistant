@@ -34,10 +34,16 @@ for (const warning of runtime.warnings) console.warn(`warning: ${warning}`);
 // pass, so with enough such jobs the `LIMIT 20` window fills up and no other
 // job of that business runs at all. `errored` alone reported none of this:
 // `unbound` and a rejected `ran` entry were silent forever, and `phaseMoved`
-// was silent for the one pass it happened on. Surfacing all four is the only
-// fix in scope here — deciding a terminal disposition for a job stuck this
-// way (moving it to `failed`, adding an attempt counter) is a policy call for
-// its own change.
+// was silent for the one pass it happened on. Surfacing all four is what this
+// function does.
+//
+// One of the four no longer starves the window: an unbound job is now moved
+// to `failed` by `runDueJobs` itself before it reaches this bucket (I2, see
+// `RunDueResult.unbound`), so it is reported once and then gone. The other
+// three still sit where they were — a permanently rejected `ran` entry and a
+// job `runDueJobs` threw on both keep their frozen `updated_at`, and deciding
+// a terminal disposition for those (an attempt counter, a dead-letter phase)
+// is still a policy call for its own change.
 function logErrored(result: SchedulerPassResult): void {
   // A folder that is missing, unreadable, or blocked by a plain file where a
   // directory belongs (see `scheduler.ts`'s docblock above `schedulerPass`)
@@ -51,7 +57,7 @@ function logErrored(result: SchedulerPassResult): void {
     console.error(`job ${job.jobId} errored: ${job.error}`);
   }
   for (const jobId of result.due.unbound) {
-    console.error(`job ${jobId} is in execute with no plan bound`);
+    console.error(`job ${jobId} was in execute with no plan bound; moved to failed`);
   }
   for (const job of result.due.ran) {
     if (job.status === 'rejected') {

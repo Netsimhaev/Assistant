@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { loadJob } from './jobs.js';
+import { loadJob, transition } from './jobs.js';
 import { loadPlanBody } from './plan-store.js';
 import { rampLevelForPlan } from './ramp.js';
 import { runPlanForJob } from './run-plan.js';
@@ -32,7 +32,27 @@ export interface RunDueResult {
   ran: RanJob[];
   /** Jobs another runner held the lock on during this pass. */
   lockedOut: string[];
-  /** Jobs in `execute` with no plan stored — nothing to run, and worth saying. */
+  /**
+   * Jobs found in `execute` with no plan stored — nothing to run, so each is
+   * transitioned to `failed` before being listed here.
+   *
+   * **Why terminal rather than left alone (I2).** Reporting without moving
+   * the row was the earlier shape, and it starved this loop: the initial
+   * `SELECT` orders by `updated_at ASC LIMIT 20`, an unbound job's
+   * `updated_at` never moves, so it sorts first on every subsequent pass
+   * forever. Twenty such rows and the window is permanently full of jobs
+   * nothing can advance, and no genuinely runnable job of that business is
+   * ever reached again. `run-scheduler.ts` had already documented the
+   * mechanism as an outstanding policy call; the conductor made it certain
+   * by becoming the first production producer of unbound `execute` jobs —
+   * `conduct.ts` parks a job in `await_approval`, the owner approves,
+   * `resume.ts` moves it to `execute`, and no plan was ever bound to it.
+   *
+   * Still listed here after the transition. The bucket is what
+   * `run-scheduler.ts` prints, and an operator needs to know this happened;
+   * a disposition nobody is told about is the same silence in a different
+   * phase.
+   */
   unbound: string[];
   /**
    * Jobs the initial query found in `execute`, but whose phase had already
@@ -156,6 +176,28 @@ export async function runDueJobs(
 
         const stored = await loadPlanBody(jobId, { businessId });
         if (stored === null) {
+          // Terminal, not merely reported — see `RunDueResult.unbound`.
+          //
+          // **The open question this deliberately does not answer.** The
+          // other shape available here is to bind the one-step plan
+          // `proposeForReading` already returns and run it, which would make
+          // spec §6 literally true and produce an audit row for the work.
+          // It is not taken here because it routes a payload a document
+          // authored into `evaluateToolCall`, and that is a security decision
+          // for the owner to make deliberately rather than acquire as the
+          // side effect of a starvation fix.
+          //
+          // The honest consequence, and the code reads this way on purpose:
+          // an approved conductor card records the owner's decision and does
+          // nothing else. That is exactly what `RAMP_HONESTY`
+          // (`proposal-approval.ts`) already tells the owner on the card, so
+          // the card and the runner agree.
+          await transition(jobId, {
+            to: 'failed',
+            actor: 'system',
+            reason: 'run_due: no_plan_bound',
+            businessId,
+          });
           result.unbound.push(jobId);
           continue;
         }
