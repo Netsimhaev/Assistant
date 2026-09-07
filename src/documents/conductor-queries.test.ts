@@ -36,7 +36,12 @@ describe('the conductor queries', () => {
     expect(waiting.map((d) => d.documentId)).toEqual([documentId]);
   });
 
-  it('stops offering a document once it has a reading', async () => {
+  it('still offers a document that has a reading but no proposal yet', async () => {
+    // A throw between `readDocument` returning and `proposeForReading`
+    // writing its row must not retire the document forever — the reading
+    // alone is not the completion marker (see `documentsAwaitingRead`'s own
+    // docblock, ruling I2). A re-offer costs nothing: the same brief hits the
+    // reading cache instead of the model.
     const documentId = await anExtractedDocument('שלום');
     await getPool().query(
       `INSERT INTO document_readings
@@ -47,7 +52,56 @@ describe('the conductor queries', () => {
       [BUSINESS, documentId],
     );
     const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    expect(waiting.map((d) => d.documentId)).toEqual([documentId]);
+  });
+
+  it('stops offering a document once it has a proposal', async () => {
+    // The completion marker: a proposal reachable through the reading, even
+    // an `unproposable` one — a genuine dead end must still terminate.
+    const documentId = await anExtractedDocument('שלום');
+    await getPool().query(
+      `INSERT INTO document_readings
+         (reading_id, business_id, document_id, status, reason, content,
+          provenance, model, prompt_version, brief_hash)
+       VALUES ('RD-1', $1, $2, 'read', NULL, '{}'::jsonb,
+               'unknown_external', 'test', 'v1', 'h')`,
+      [BUSINESS, documentId],
+    );
+    await getPool().query(
+      `INSERT INTO proposals
+         (proposal_id, business_id, reading_id, job_id, status, reason, content, raw,
+          model, prompt_version)
+       VALUES ('PRP-1', $1, 'RD-1', NULL, 'unproposable', 'nothing to act on', NULL, '{}',
+               'test', 'v1')`,
+      [BUSINESS],
+    );
+    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
     expect(waiting).toEqual([]);
+  });
+
+  it('never lets another business\'s proposal suppress this one\'s document', async () => {
+    // Both hops of the join (`document_readings`, `proposals`) are scoped by
+    // `business_id` independently — a proposal that happens to reference the
+    // same `reading_id` under a different business must not count.
+    const documentId = await anExtractedDocument('שלום');
+    await getPool().query(
+      `INSERT INTO document_readings
+         (reading_id, business_id, document_id, status, reason, content,
+          provenance, model, prompt_version, brief_hash)
+       VALUES ('RD-1', $1, $2, 'read', NULL, '{}'::jsonb,
+               'unknown_external', 'test', 'v1', 'h')`,
+      [BUSINESS, documentId],
+    );
+    await getPool().query(
+      `INSERT INTO proposals
+         (proposal_id, business_id, reading_id, job_id, status, reason, content, raw,
+          model, prompt_version)
+       VALUES ('PRP-1', 'other-biz', 'RD-1', NULL, 'unproposable', 'not mine', NULL, '{}',
+               'test', 'v1')`,
+      [],
+    );
+    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    expect(waiting.map((d) => d.documentId)).toEqual([documentId]);
   });
 
   it('stops offering a document after three failures', async () => {

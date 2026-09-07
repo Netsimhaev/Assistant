@@ -287,16 +287,46 @@ export async function loadArtifacts(
 export const MAX_READ_ATTEMPTS = 3;
 
 /**
- * Documents that have bytes and no reading yet.
+ * Documents that have bytes and no proposal yet.
  *
- * "Has a reading" is the completion marker rather than a column of our own:
- * a reading row is the thing the conductor exists to produce, so its presence
- * is the fact, not a flag that could disagree with it.
+ * **"Has a proposal" is the completion marker, not "has a reading."** An
+ * earlier version of this function excluded on `document_readings` alone,
+ * and that made a throw anywhere *after* `readDocument` returns `read`
+ * unrecoverable: the reading was already paid for, the document would never
+ * be selected again, and no card would ever reach the owner. This is
+ * reachable in production, not hypothetical — `raiseProposalApproval` →
+ * `buildFacts` → `readAmountMinor` (`src/policy/facts.ts`) throws a
+ * `TypeError` on a non-integer, and `ProposedAction.input` is
+ * `z.record(z.string(), z.unknown())`, so a model reading "4,000.50 ₪" off a
+ * hostile invoice produces exactly that value. A document able to suppress
+ * its own card is worth closing even though it escalates no authority.
  *
- * Provenance is deliberately NOT in the NOT EXISTS. A document read once under
- * any trust level has been through the pipeline; re-reading it under a second
- * provenance is a different question than this loop asks, and would spend money
- * on a document the owner has already been told about.
+ * Moving the marker to the proposal is not a retry hack; three things make it
+ * the right shape:
+ *
+ * - **A retry costs nothing.** The reading cache is keyed on `(business_id,
+ *   document_id, brief_hash, prompt_version, provenance)` — a second pass
+ *   over the same document under the same provenance is a cache hit, makes
+ *   no model call, writes no `document_readings` row, and therefore draws
+ *   nothing from the daily ceiling, which counts reading rows.
+ * - **A genuine dead end still terminates.** `proposeForReading` writes a
+ *   `proposals` row even when the model returns `unproposable`, so a
+ *   document the model truly could not act on stops being offered. Only the
+ *   throw path — where no proposal row was ever written — comes back.
+ * - **It stays bounded.** `read_attempts < 3` still caps it, so a
+ *   deterministic failure (like the decimal amount above) stops after three
+ *   passes instead of looping forever.
+ *
+ * The join runs through `document_readings` on `reading_id` — `proposals`
+ * itself names no `document_id` — with both hops scoped by `business_id` so
+ * a proposal belonging to another business can never suppress this one's
+ * document.
+ *
+ * Provenance is deliberately NOT in the NOT EXISTS, same reasoning as
+ * before: a document proposed on once under any trust level has been
+ * through the pipeline; asking again under a second provenance is a
+ * different question than this loop asks, and would spend money on a
+ * document the owner has already been told about.
  */
 export async function documentsAwaitingRead(
   limit: number,
@@ -312,6 +342,9 @@ export async function documentsAwaitingRead(
         AND d.read_attempts < $2
         AND NOT EXISTS (
               SELECT 1 FROM document_readings r
+                JOIN proposals p
+                  ON p.reading_id = r.reading_id
+                 AND p.business_id = r.business_id
                WHERE r.document_id = d.document_id
                  AND r.business_id = d.business_id
             )

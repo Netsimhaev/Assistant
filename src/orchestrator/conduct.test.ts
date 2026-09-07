@@ -134,6 +134,16 @@ describe('conductPendingDocuments', () => {
     expect(approvals.rows).toHaveLength(0);
     const proposals = await getPool().query(`SELECT 1 FROM proposals`);
     expect(proposals.rows, 'the proposal must still be stored').toHaveLength(1);
+
+    // I4: `readOnly += 1` and `continue` sit outside the `to: 'closed'`
+    // transition, so without this assertion the test held whether or not
+    // that transition ran at all — the third instance of that pattern in
+    // this plan. The job must actually close, not sit in `plan` forever.
+    const jobs = await getPool().query<{ phase: string }>(
+      `SELECT phase FROM jobs WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    expect(jobs.rows[0]?.phase).toBe('closed');
   });
 
   it('stops at the daily ceiling and leaves the rest for tomorrow', async () => {
@@ -155,6 +165,19 @@ describe('conductPendingDocuments', () => {
       [BUSINESS],
     );
     expect(rows[0]?.n).toBe('1');
+
+    // M6: the test's own title is "leaves the rest for tomorrow" — assert
+    // that, not just that the first document's reading count stopped at one.
+    const docs = await getPool().query<{ read_attempts: number }>(
+      `SELECT read_attempts FROM documents WHERE business_id = $1 ORDER BY created_at ASC`,
+      [BUSINESS],
+    );
+    expect(
+      docs.rows[1]?.read_attempts,
+      'the skipped document must be untouched',
+    ).toBe(0);
+    const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
+    expect(jobs.rows, 'no job for the document left for tomorrow').toHaveLength(1);
   });
 
   it('records a failure and carries on to the next document', async () => {
@@ -182,6 +205,20 @@ describe('conductPendingDocuments', () => {
     );
     expect(rows[0]?.read_attempts).toBe(1);
     expect(rows[0]?.read_error).toContain('model exploded');
+
+    // I1: the throw happens inside `readDocument`, after `createJob` already
+    // put a row in `intake → understand`. No phase reader anywhere in
+    // production selects `intake`, `understand` or `plan` — `run-due.ts`
+    // selects `execute`, `wakeDueJobs` selects `followup`,
+    // `closeVerifiedJobs` selects `verify`/`remember` — so a job left there
+    // is not resting, it is leaked forever. The first job must be closed out
+    // to `failed`; the second must still reach its card.
+    const jobs = await getPool().query<{ phase: string }>(
+      `SELECT phase FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
+      [BUSINESS],
+    );
+    expect(jobs.rows[0]?.phase, 'the orphaned job must not be stranded').toBe('failed');
+    expect(jobs.rows[1]?.phase).toBe('await_approval');
   });
 
   it('does nothing at all when no charter is installed', async () => {
@@ -197,5 +234,30 @@ describe('conductPendingDocuments', () => {
 
     expect(result.considered).toBe(0);
     expect(d.calls.reads).toBe(0);
+  });
+
+  it('two overlapping passes never both take the same document (I3)', async () => {
+    // Without the advisory lock, two overlapping passes read the same
+    // `remaining` budget and the same waiting-document list, and can turn
+    // one document into two jobs, two model calls and two cards. With it,
+    // whichever pass loses the race does nothing at all — and even in the
+    // (unlikely, event-loop-timing-dependent) case where the two passes
+    // happen not to overlap, `documentsAwaitingRead`'s proposal marker (I2)
+    // still stops the second one from finding a document the first already
+    // finished. Either way these two invariants hold regardless of which
+    // pass wins: only one job is ever created, and the model is called
+    // exactly once — never twice, never zero.
+    await aDocument('חוזה מירוץ');
+    const d = deps();
+
+    const [a, b] = await Promise.all([
+      conductPendingDocuments({ businessId: BUSINESS, reader: d.reader, proposer: d.proposer }),
+      conductPendingDocuments({ businessId: BUSINESS, reader: d.reader, proposer: d.proposer }),
+    ]);
+
+    expect(a.considered + b.considered, 'the single document is considered exactly once').toBe(1);
+    expect(d.calls.reads, 'the model must not be called twice for one document').toBe(1);
+    const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
+    expect(jobs.rows, 'exactly one job for the one document').toHaveLength(1);
   });
 });
