@@ -8,6 +8,7 @@ import type { ScanResult } from './inbox-scan.js';
 import { loadJob, transition } from './jobs.js';
 import { runDueJobs } from './run-due.js';
 import type { RunDueResult } from './run-due.js';
+import { buildRuntime } from './runtime.js';
 import { closeVerifiedJobs } from './verify.js';
 import type { CloseVerifiedResult } from './verify.js';
 import type { Runtime } from './runtime.js';
@@ -136,7 +137,15 @@ export interface SchedulerPassResult {
    * when no inbox is configured at all — those two are not failures.
    */
   scanError: string | null;
-  conduct: ConductResult;
+  /**
+   * Null when no inbox is configured — the same switch that stops the scan
+   * stops the understanding loop, and for a stronger reason: this half is the
+   * one that costs money. `null` is not `{ considered: 0, ... }`; "the
+   * conductor did not run" and "the conductor ran and found nothing" are
+   * different facts about an installation, and only the first is a statement
+   * about how it is configured.
+   */
+  conduct: ConductResult | null;
   due: RunDueResult;
   verified: CloseVerifiedResult;
 }
@@ -156,10 +165,17 @@ export interface SchedulerPassResult {
  * by their own deadlines — has any business holding a pooled connection open
  * across the wire behind that lock.
  *
- * `scan` is `null`, not run with a no-op default, when `config.documentInbox`
- * (or an explicit `options.inbox`) is absent: an installation that has not
- * configured a watched folder is a switch, not a fault, and the pass must
- * neither throw nor pretend a scan happened.
+ * **Both loops are behind the same switch.** `scan` and `conduct` are both
+ * `null`, and neither runs, when `config.documentInbox` (or an explicit
+ * `options.inbox`) is absent: an installation that has not configured a
+ * watched folder is a switch, not a fault, and the pass must neither throw
+ * nor pretend a scan happened. `conductPendingDocuments` used to sit outside
+ * this guard, which meant an installation that upgraded with an API key
+ * present and no `DOCUMENT_INBOX` set began paying to read every `extracted`
+ * document already in its database within one interval of launch — spec §10
+ * says a missing `DOCUMENT_INBOX` means the conductor does not run, and the
+ * half that ran was the half that costs. `DOCUMENT_READS_PER_DAY=0` is a
+ * ceiling, not a switch, and must never be the only way to turn this off.
  *
  * A configured inbox that `scanInbox` cannot actually read — the folder is
  * missing, permissions are wrong, a path component is a plain file — is a
@@ -199,8 +215,10 @@ export async function schedulerPass(
   // Both conductor loops run after the tick's transaction has committed, not
   // inside it — see the docblock above.
   const inbox = options.inbox !== undefined ? options.inbox : config.documentInbox;
+  const runtime = options.runtime ?? buildRuntime();
   let scan: ScanResult | null = null;
   let scanError: string | null = null;
+  let conduct: ConductResult | null = null;
   if (inbox !== null) {
     try {
       scan = await scanInbox({
@@ -209,16 +227,26 @@ export async function schedulerPass(
         ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
       });
     } catch (err) {
-      // See the docblock above: a broken inbox must not stop the rest of the
-      // pass. `scan` stays `null` and `conduct`/`due`/`verified` still run
-      // below, exactly as if no inbox had been configured at all.
+      // A broken inbox must not stop the rest of the pass. `scan` stays
+      // `null` and `conduct`/`due`/`verified` still run below. Note the
+      // asymmetry with an *absent* inbox: a folder that is configured but
+      // unreadable is still a configured installation, so the understanding
+      // loop below still runs against whatever is already in the database —
+      // documents ingested on earlier passes do not stop deserving a reading
+      // because today's `readdir` failed.
       scanError = err instanceof Error ? err.message : String(err);
     }
+
+    conduct = await conductPendingDocuments({
+      ...options,
+      // The conductor writes approvals without passing through the gate, and
+      // the gate was carrying the notification. Threaded here so a conductor
+      // card reaches the owner's mailbox exactly as a gate-raised one does.
+      ...(runtime.notify !== undefined ? { notify: runtime.notify } : {}),
+    });
   }
 
-  const conduct = await conductPendingDocuments(options);
-
-  const due = await runDueJobs(options);
+  const due = await runDueJobs({ ...options, runtime });
   // Last, and the order matters as much as the rest: a job `runDueJobs` just
   // finished is sitting in `verify` by the time this looks, so it closes in
   // the same pass instead of waiting a full interval. Run before the plans

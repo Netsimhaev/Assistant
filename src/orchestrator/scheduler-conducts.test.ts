@@ -155,8 +155,12 @@ describe('schedulerPass and the conductor', () => {
     expect(result.scanError).toBeNull();
     // The conductor's own loop ran too (forwarded from the same options),
     // and with the ceiling at zero it reports so rather than a hardcoded
-    // zero result standing in for a call that never happened.
-    expect(result.conduct.ceilingReached).toBe(true);
+    // zero result standing in for a call that never happened. `not.toBeNull`
+    // first, and separately: `conduct` is now null when no inbox is
+    // configured, and this is the half of I1's evidence that says a
+    // configured inbox does still run it.
+    expect(result.conduct).not.toBeNull();
+    expect(result.conduct?.ceilingReached).toBe(true);
 
     const { rows } = await getPool().query<{ document_id: string; stored_path: string }>(
       `SELECT document_id, stored_path FROM documents WHERE business_id = $1`,
@@ -173,11 +177,28 @@ describe('schedulerPass and the conductor', () => {
     await stat(join(documentRoot, row.stored_path));
   });
 
-  it('does not scan and does not fail when no inbox is configured', async () => {
-    const result = await schedulerPass({ businessId: BUSINESS, readsPerDay: 0 });
-    expect(result.scan).toBeNull();
-    expect(result.scanError).toBeNull();
-    expect(result.conduct.ceilingReached).toBe(true);
+  it('runs neither loop, and does not fail, when no inbox is configured', async () => {
+    // Makes its own precondition true rather than relying on `.env` happening
+    // to leave `DOCUMENT_INBOX` unset — the shape the sibling test below
+    // already used. The moment anyone actually configured the feature, the
+    // earlier version of this test scanned a real folder and went red:
+    // configuring the feature broke the suite.
+    const mutableConfig = config as { documentInbox: string | null };
+    const original = mutableConfig.documentInbox;
+    mutableConfig.documentInbox = null;
+    try {
+      // Deliberately no `readsPerDay: 0`. The ceiling must not be what stops
+      // the conductor here — the switch must. With the ceiling left at its
+      // configured default, a regression that moved `conductPendingDocuments`
+      // back outside the `inbox !== null` guard would return a real
+      // `ConductResult` and fail the last assertion (I1).
+      const result = await schedulerPass({ businessId: BUSINESS });
+      expect(result.scan).toBeNull();
+      expect(result.scanError).toBeNull();
+      expect(result.conduct).toBeNull();
+    } finally {
+      mutableConfig.documentInbox = original;
+    }
   });
 
   it('an explicit null inbox wins over a configured one', async () => {
@@ -229,11 +250,17 @@ describe('schedulerPass and the conductor', () => {
       return { status: 'proposed' as const, proposal: ACTING, raw: '{}' };
     };
 
-    const result = await schedulerPass({ businessId: conductBusiness, reader, proposer });
+    // An explicit (empty) inbox, not the ambient `config.documentInbox`: the
+    // conductor runs only behind the same switch as the scan (I1), and a test
+    // about the conductor must state that precondition itself rather than
+    // inherit whatever `.env` happens to hold.
+    const inbox = await mkdtemp(join(tmpdir(), 'sched-conduct-inbox-'));
+
+    const result = await schedulerPass({ businessId: conductBusiness, inbox, reader, proposer });
 
     expect(reads).toBe(1);
     expect(proposals).toBe(1);
-    expect(result.conduct.carded).toBe(1);
+    expect(result.conduct?.carded).toBe(1);
     const approvals = await getPool().query(
       `SELECT 1 FROM approval_requests ar
          JOIN jobs j ON j.job_id = ar.job_id
