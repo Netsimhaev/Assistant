@@ -13,6 +13,7 @@
  */
 import type { ApprovalRequest } from '../governance/approvals.js';
 import type { DocumentRecord } from '../documents/types.js';
+import type { ReadingSummary } from './readings-list.js';
 import { formatMinor } from '../util/money.js';
 
 /** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
@@ -195,7 +196,60 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
+<p><a href="/readings">מה קראתי</a></p>
 ${list}`,
+  );
+}
+
+const STANCE_LABEL: Record<string, string> = {
+  act: 'מציעה לפעול',
+  advise_against: 'ממליצה שלא',
+  ask: 'יש לי שאלה',
+  no_action: 'אין מה לעשות',
+};
+
+/**
+ * What the assistant read, and what it concluded — every reading, whether or
+ * not its proposal carries an action.
+ *
+ * Read-only. No form, no button that decides anything: deciding lives on the
+ * approval card, which carries expiry, decision, signing and audit. A second
+ * screen that decided would be a second path to the same table.
+ *
+ * `escLabel` on the filename for the same reason the approval card uses it:
+ * `original_name` is stored verbatim from whoever sent the file, and bidi
+ * control characters make a name render as something other than what it is.
+ */
+export function renderReadings(rows: ReadingSummary[], csrf: string): string {
+  const items = rows
+    .map((r) => {
+      const stance = r.stance === null ? '' : (STANCE_LABEL[r.stance] ?? r.stance);
+      const reasons = r.reasons.map((t) => `<li>${esc(t)}</li>`).join('');
+      const link =
+        r.approvalId === null
+          ? '<span class="muted">אין כרטיס — אין פעולה לאשר</span>'
+          : `<a href="/a/${esc(r.approvalId)}">לכרטיס האישור</a>`;
+      return `
+        <article class="card">
+          <h3>${escLabel(r.originalName)} <span class="hash">${esc(r.sha256.slice(0, HASH_PREFIX_LENGTH))}</span></h3>
+          <p class="when">${esc(r.readAt)}</p>
+          <p>${esc(r.summary)}</p>
+          ${stance === '' ? '' : `<p class="stance"><strong>${esc(stance)}</strong>${r.headline === null ? '' : ` — ${esc(r.headline)}`}</p>`}
+          ${reasons === '' ? '' : `<ul>${reasons}</ul>`}
+          <p>${link}</p>
+        </article>`;
+    })
+    .join('');
+
+  return page(
+    'מה קראתי',
+    `<header>
+  <h1>מה קראתי</h1>
+  ${logoutForm(csrf)}
+</header>
+<p><a href="/">&rarr; חזרה לרשימה</a></p>
+<p class="muted">כל מסמך שנקלט ונקרא, ומה שהוסק ממנו. המסך הזה מציג בלבד — הכרעה נעשית בכרטיס האישור.</p>
+${rows.length === 0 ? '<p>עדיין לא נקרא אף מסמך.</p>' : items}`,
   );
 }
 

@@ -332,6 +332,25 @@ describe('GET /', () => {
   });
 });
 
+describe('GET /readings', () => {
+  it('serves the readings screen behind a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/readings`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('מה קראתי');
+  });
+
+  it('refuses the readings screen without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+
+    const res = await fetch(`${baseUrl}/readings`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+});
+
 describe('CSRF', () => {
   it('refuses an approve without a CSRF token', async () => {
     const baseUrl = await startServer(BUSINESS);

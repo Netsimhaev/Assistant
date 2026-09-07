@@ -24,6 +24,7 @@ import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
 import { documentForApproval } from './document-for-approval.js';
+import { recentReadings } from './readings-list.js';
 import { verifyDocumentUnchanged } from '../documents/verify.js';
 import type { VerifyOutcome } from '../documents/verify.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -45,6 +46,7 @@ import {
   renderNotFound,
   renderPasswordChange,
   renderPendingList,
+  renderReadings,
   renderServerError,
 } from './views.js';
 
@@ -346,6 +348,14 @@ async function handlePendingList(res: ServerResponse, businessId: string, sessio
     200,
     renderPendingList({ approvals, remainingCodes: remaining, csrf: issueCsrfToken(session.sessionId) }),
   );
+}
+
+/** How many recent readings the "מה קראתי" screen shows. */
+const READINGS_LIST_LIMIT = 50;
+
+async function handleReadings(res: ServerResponse, businessId: string, session: Session): Promise<void> {
+  const rows = await recentReadings(READINGS_LIST_LIMIT, { businessId });
+  sendHtml(res, 200, renderReadings(rows, issueCsrfToken(session.sessionId)));
 }
 
 async function handleCard(res: ServerResponse, businessId: string, session: Session, approvalId: string): Promise<void> {
@@ -818,6 +828,7 @@ async function route(
   if (session.mustChangePassword) return redirect(res, '/password');
 
   if (method === 'GET' && pathname === '/') return handlePendingList(res, businessId, session);
+  if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
 
   const cardMatch = CARD_PATH.exec(pathname);
   if (method === 'GET' && cardMatch) {
