@@ -23,9 +23,33 @@
 
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
+import { IntentName } from '../domain/reading.js';
 import type { DocumentRecord, DocumentSource, DocumentStatus } from '../documents/types.js';
 
 export type { DocumentRecord } from '../documents/types.js';
+
+/**
+ * The document behind an approval, and what the proposal meant to do about it.
+ *
+ * The two travel together because they are resolved by one query over one
+ * proposal row, and separating them is how they come to disagree: the card
+ * renders the document from the latest proposal and the sign decision is
+ * taken on a different one. `documentForApproval`'s ordering already carries a
+ * tiebreaker for exactly that reason — see its docblock.
+ */
+export interface ApprovalDocument {
+  document: DocumentRecord;
+  /**
+   * The `intent` of the proposal's action.
+   *
+   * `null` when the proposal carries no action, when the stored proposal
+   * predates the field, or when the stored value is not a member of the
+   * closed `IntentName` enum. All three collapse to the same answer on
+   * purpose: a caller asking "may this be signed" must read an unparseable
+   * value as "no", and `isDocumentDecisionIntent` does.
+   */
+  intent: IntentName | null;
+}
 
 interface DocumentRow {
   document_id: string;
@@ -40,6 +64,8 @@ interface DocumentRow {
   reason: string | null;
   read_attempts: number;
   read_error: string | null;
+  /** `proposals.content -> 'action' ->> 'intent'`; NULL when the proposal carries no action. */
+  action_intent: string | null;
 }
 
 function toDocument(row: DocumentRow): DocumentRecord {
@@ -87,14 +113,15 @@ function toDocument(row: DocumentRow): DocumentRecord {
 export async function documentForApproval(
   approvalId: string,
   options: { businessId?: string; db?: Queryable } = {},
-): Promise<DocumentRecord | null> {
+): Promise<ApprovalDocument | null> {
   const db = options.db ?? getPool();
   const businessId = options.businessId ?? config.businessId;
 
   const { rows } = await db.query<DocumentRow>(
     `SELECT d.document_id, d.business_id, d.source, d.original_name, d.media_type,
             d.sha256, d.byte_size, d.stored_path, d.status, d.reason,
-            d.read_attempts, d.read_error
+            d.read_attempts, d.read_error,
+            p.content -> 'action' ->> 'intent' AS action_intent
        FROM approval_requests a
        JOIN proposals p
          ON p.job_id = a.job_id AND p.business_id = a.business_id
@@ -109,5 +136,11 @@ export async function documentForApproval(
   );
 
   const row = rows[0];
-  return row === undefined ? null : toDocument(row);
+  if (row === undefined) return null;
+  // `safeParse`, not a cast. The value comes out of JSONB written by a model's
+  // answer; the enum is the only thing that says which names exist, and a name
+  // it does not know must arrive here as `null` rather than as a string that
+  // happens to fail an `includes` check later on.
+  const parsed = IntentName.safeParse(row.action_intent);
+  return { document: toDocument(row), intent: parsed.success ? parsed.data : null };
 }

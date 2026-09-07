@@ -24,6 +24,7 @@ import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
 import { documentForApproval } from './document-for-approval.js';
+import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { verifyDocumentUnchanged } from '../documents/verify.js';
 import type { VerifyOutcome } from '../documents/verify.js';
@@ -365,16 +366,19 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
   const approval = await getApproval(approvalId, { businessId });
   if (!approval) return sendHtml(res, 404, renderNotFound());
   // `null` (no document behind this approval) is the ordinary case — most
-  // approvals never had a document — and renderApprovalCard's sign button
-  // only appears when a document is actually supplied.
-  const document = await documentForApproval(approvalId, { businessId });
+  // approvals never had a document. When one does resolve, the card shows it
+  // either way; the sign form is a second, narrower question, answered by the
+  // proposal's own intent against `DOCUMENT_DECISION_INTENTS` (I4).
+  const resolved = await documentForApproval(approvalId, { businessId });
   sendHtml(
     res,
     200,
     renderApprovalCard({
       approval,
       csrf: issueCsrfToken(session.sessionId),
-      ...(document !== null ? { document } : {}),
+      ...(resolved !== null
+        ? { document: resolved.document, documentIntent: resolved.intent }
+        : {}),
     }),
   );
 }
@@ -585,8 +589,8 @@ async function handleDecision(
       );
     }
 
-    const document = await documentForApproval(approvalId, { businessId });
-    if (document === null) {
+    const resolved = await documentForApproval(approvalId, { businessId });
+    if (resolved === null) {
       // The button that posts here would not have been rendered without a
       // document — a direct POST is a stale page or someone probing.
       return sendHtml(
@@ -597,6 +601,30 @@ async function handleDecision(
           csrf: issueCsrfToken(session.sessionId),
           ...(note !== undefined ? { noteValue: note } : {}),
           signError: 'לא נמצא מסמך המשויך לבקשה זו. לא ניתן לחתום.',
+        }),
+      );
+    }
+    const { document } = resolved;
+
+    // I4: the same allowlist the card renders by, enforced again here. A
+    // control that only removes a button is a control an old tab, a bookmark
+    // or a hand-written POST walks straight past — and what is on the other
+    // side of it is a `signatures` row that is unique per document and
+    // protected by `ON DELETE RESTRICT`, so there is no undo to fall back on.
+    // Checked before the file is read and hashed: nothing about this refusal
+    // needs to touch the disk.
+    if (!isDocumentDecisionIntent(resolved.intent)) {
+      return sendHtml(
+        res,
+        400,
+        renderApprovalCard({
+          approval,
+          csrf: issueCsrfToken(session.sessionId),
+          document,
+          documentIntent: resolved.intent,
+          ...(note !== undefined ? { noteValue: note } : {}),
+          signError:
+            'הבקשה הזו אינה הכרעה על המסמך עצמו, ולכן לא ניתן לחתום עליה. אפשר לאשר או לדחות אותה כרגיל.',
         }),
       );
     }
@@ -616,6 +644,7 @@ async function handleDecision(
           approval,
           csrf: issueCsrfToken(session.sessionId),
           document,
+          documentIntent: resolved.intent,
           ...(note !== undefined ? { noteValue: note } : {}),
           signError: 'המסמך המוצג אינו תואם עוד את הבקשה. יש לרענן את הדף ולנסות שוב.',
         }),
@@ -634,6 +663,7 @@ async function handleDecision(
           approval,
           csrf: issueCsrfToken(session.sessionId),
           document,
+          documentIntent: resolved.intent,
           ...(note !== undefined ? { noteValue: note } : {}),
           signError: signRefusalReason(verifyResult),
         }),
@@ -696,6 +726,7 @@ async function handleDecision(
             approval,
             csrf: issueCsrfToken(session.sessionId),
             document,
+            documentIntent: resolved.intent,
             ...(note !== undefined ? { noteValue: note } : {}),
             signError: alreadySignedReason(existing),
           }),
@@ -713,6 +744,7 @@ async function handleDecision(
             approval,
             csrf: issueCsrfToken(session.sessionId),
             document,
+            documentIntent: resolved.intent,
             ...(note !== undefined ? { noteValue: note } : {}),
             signError: 'הבקשה כבר הוכרעה או שפג תוקפה, ולא ניתן לחתום עליה כעת.',
           }),

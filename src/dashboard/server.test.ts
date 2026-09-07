@@ -139,12 +139,40 @@ async function jobAwaitingApproval(businessId: string) {
 
 const SOURCE = { ordinal: 0, locator: null };
 
-const ACTING_PROPOSAL: Proposal = {
+/**
+ * A proposal whose intent IS a decision about the document — the only kind
+ * that may carry a sign form (I4, `signable-intents.ts`). Every sign test
+ * below builds on this: with a non-document-decision intent the form is not
+ * rendered at all, so a test that meant to exercise signing would be
+ * exercising its absence instead and passing for the wrong reason.
+ */
+const FILING_PROPOSAL: Proposal = {
   stance: 'act',
-  headline: 'אחתום על המסמך',
+  headline: 'אתייק את המסמך',
   reasons: [{ text: 'התנאים תקינים', findingLabel: 'תנאי תשלום', sourceRef: SOURCE }],
   action: {
-    headline: 'אשלח מייל אישור',
+    headline: 'אתייק את המסמך בתיק הספק',
+    purpose: 'לשמור את ההסכם במקומו',
+    intent: 'file_document',
+    agent: 'prod.docs',
+    toolName: 'file.write',
+    input: { path: 'suppliers/agreement.txt', body: 'אושר' },
+    expectedActionClass: 'artifact.write',
+  },
+  clarifyingQuestion: null,
+};
+
+/**
+ * A proposal about sending an email. It happens to hang off a reading of a
+ * document — every conductor proposal does — but the owner's decision here is
+ * about a message, not about accepting the document as binding.
+ */
+const MAILING_PROPOSAL: Proposal = {
+  stance: 'act',
+  headline: 'אשיב לדנה',
+  reasons: [{ text: 'התנאים תקינים', findingLabel: 'תנאי תשלום', sourceRef: SOURCE }],
+  action: {
+    headline: 'אשלח מייל לדנה',
     purpose: 'לאשר את קבלת המסמך',
     intent: 'reply_to_sender',
     agent: 'comms.email',
@@ -210,6 +238,7 @@ async function anApprovalForReading(
   businessId: string,
   bundle: PolicyBundle,
   readingId: string,
+  proposal: Proposal = FILING_PROPOSAL,
 ): Promise<{ approvalId: string; jobId: string }> {
   const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
   for (const to of ['understand', 'plan', 'await_approval'] as const) {
@@ -222,7 +251,7 @@ async function anApprovalForReading(
       jobId: job.jobId,
       status: 'proposed',
       reason: null,
-      content: ACTING_PROPOSAL,
+      content: proposal,
       raw: '{}',
       model: 'haiku',
       promptVersion: 'v1',
@@ -238,11 +267,12 @@ async function aSignableApproval(
   businessId: string,
   docRoot: string,
   bytes: Buffer,
+  proposal: Proposal = FILING_PROPOSAL,
 ): Promise<{ approvalId: string; jobId: string; documentId: string; sha256: string }> {
   const bundle = await installCharter(buildCharter(), { businessId });
   const { documentId, sha256 } = await aDocument(businessId, docRoot, bytes);
   const readingId = await aReadingOf(documentId, businessId);
-  const { approvalId, jobId } = await anApprovalForReading(businessId, bundle, readingId);
+  const { approvalId, jobId } = await anApprovalForReading(businessId, bundle, readingId, proposal);
   return { approvalId, jobId, documentId, sha256 };
 }
 
@@ -861,6 +891,80 @@ describe('signing an approval', () => {
     expect(body).not.toContain('‮');
     // The visible characters of the name survive; only the control is gone.
     expect(body).toContain('invoice');
+  });
+
+  // I4. `views.ts` rendered the sign form whenever a document resolved, and
+  // after the conductor shipped, `documentForApproval` resolves one for EVERY
+  // conductor card — each has a proposal with a `job_id` and a reading with a
+  // document behind it. So a card proposing to email Dana carried a form
+  // whose own text says signing establishes that the document was received as
+  // binding, and the row it writes cannot be undone: unique on
+  // `(business_id, document_id)`, a second signature refused, the row
+  // protected by `ON DELETE RESTRICT` since migration 020.
+  it('renders no sign form on a card whose proposal is about sending an email', async () => {
+    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const { approvalId } = await aSignableApproval(
+      BUSINESS,
+      docRoot,
+      Buffer.from('הסכם שיווק — כרטיס של מייל', 'utf8'),
+      MAILING_PROPOSAL,
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+    expect(body).not.toContain(`/a/${approvalId}/sign`);
+    expect(body).not.toContain('חתום ואשר');
+    expect(body).not.toContain('נתקבל כמחייב');
+    // The card still names the document it is about — removing the form must
+    // not remove the only thing on the page identifying what was read.
+    expect(body).toContain('חוזה עם קבלן');
+    expect(body).toContain('המסמך שהבקשה נוגעת אליו');
+    // And the ordinary controls are untouched.
+    expect(body).toContain(`/a/${approvalId}/approve`);
+  });
+
+  it('renders the sign form on a card whose proposal is a decision about the document', async () => {
+    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const { approvalId } = await aSignableApproval(
+      BUSINESS,
+      docRoot,
+      Buffer.from('הסכם שיווק — כרטיס של תיוק', 'utf8'),
+      FILING_PROPOSAL,
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+    expect(body).toContain(`/a/${approvalId}/sign`);
+    expect(body).toContain('חתום ואשר');
+  });
+
+  // The button is not the control; the route is. A stale tab, a bookmark or a
+  // hand-written POST reaches `/sign` with no form involved at all, and on
+  // the other side of it is a permanent, un-deletable `signatures` row.
+  it('refuses a signing POST on a card whose proposal is not a document decision', async () => {
+    const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
+    const { approvalId, documentId } = await aSignableApproval(
+      BUSINESS,
+      docRoot,
+      Buffer.from('הסכם שיווק — POST ישיר', 'utf8'),
+      MAILING_PROPOSAL,
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const cardRes = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const csrf = extractCsrf(await cardRes.text());
+
+    const signRes = await fetch(`${baseUrl}/a/${approvalId}/sign`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, documentId }),
+      redirect: 'manual',
+    });
+    expect(signRes.status).toBe(400);
+
+    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
+    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
   });
 
   // F6, spec §8 and §9: no document behind the approval, no sign control at
