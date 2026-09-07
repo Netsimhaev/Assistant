@@ -176,12 +176,32 @@ export async function scanInbox(options: ScanInboxOptions): Promise<ScanResult> 
 
     // Decided positively — `DocumentStatus` is three-way, and there is no
     // permissive `else` left to swallow a value none of these three named.
+    //
+    // Each branch's move is wrapped on its own: the document already has a
+    // verdict at this point, but filing the file into its folder is a
+    // second, independent filesystem operation that can still fail (full
+    // disk, permissions) — the exact fault class I1 already guards for the
+    // throw-recovery move above. A failure here must not propagate out of
+    // the loop (that would abandon every file still waiting behind this
+    // one), and it must not credit the outcome counter either: the folder
+    // is the owner's record of what happened to the *file*, and a document
+    // that was ingested but never actually filed into `processed/` did not
+    // happen from that record's point of view. It counts as `deferred`
+    // instead — the claimed copy stays in `working/`, unfiled either way.
     if (document.status === 'extracted') {
-      await moveWithoutClobber(claimed, join(inbox, PROCESSED), name);
-      result.ingested += 1;
+      try {
+        await moveWithoutClobber(claimed, join(inbox, PROCESSED), name);
+        result.ingested += 1;
+      } catch {
+        result.deferred += 1;
+      }
     } else if (document.status === 'rejected') {
-      await moveWithoutClobber(claimed, join(inbox, REJECTED), name);
-      result.rejected += 1;
+      try {
+        await moveWithoutClobber(claimed, join(inbox, REJECTED), name);
+        result.rejected += 1;
+      } catch {
+        result.deferred += 1;
+      }
     } else if (document.status === 'pending') {
       // Terminal and never a success (see ingest.ts's own docblock): a
       // `writeFile` throw, a transient failure inside `markExtracted`'s
@@ -190,8 +210,12 @@ export async function scanInbox(options: ScanInboxOptions): Promise<ScanResult> 
       // row — without throwing — for every later arrival of the same bytes,
       // so this is not a one-off outcome to shrug off: it must never be
       // counted as ingested.
-      await moveWithoutClobber(claimed, join(inbox, FAILED), name);
-      result.failed += 1;
+      try {
+        await moveWithoutClobber(claimed, join(inbox, FAILED), name);
+        result.failed += 1;
+      } catch {
+        result.deferred += 1;
+      }
     }
   }
 

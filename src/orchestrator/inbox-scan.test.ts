@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,6 +6,29 @@ import { join } from 'node:path';
 import { getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { scanInbox } from './inbox-scan.js';
+
+// Module-boundary stub for the single "filing an ingested document fails"
+// test below. Chosen over a read-only destination directory because NTFS
+// permission bits are not a reliable way to force a write failure for the
+// same user that owns the directory — a chmod-based test would be flaky on
+// this platform. Every other test still gets the real filesystem: only
+// `link` is overridden, and only for the one target path the test cares
+// about (`processed/jammed.txt`) — everything else falls through to the
+// genuine implementation.
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    link: async (existingPath: string, newPath: string): Promise<void> => {
+      if (newPath.includes('jammed.txt') && newPath.includes('processed')) {
+        const err = new Error('EACCES: permission denied, link') as NodeJS.ErrnoException;
+        err.code = 'EACCES';
+        throw err;
+      }
+      return actual.link(existingPath, newPath);
+    },
+  };
+});
 
 const BUSINESS = 'biz-scan';
 
@@ -122,5 +145,30 @@ describe('scanInbox', () => {
     expect(result.ingested, 'a pending document is stuck, never a success').toBe(0);
     expect(await readdir(join(inbox, 'failed'))).toEqual(['stuck.txt']);
     expect(await readdir(join(inbox, 'processed'))).toEqual([]);
+  });
+
+  it('does not abort the batch when filing an ingested document fails', async () => {
+    const { inbox, documentRoot } = await anInbox();
+    // 'jammed.txt' is the one name the module-level `link` stub above
+    // refuses to file into processed/ (EACCES) — everything else about this
+    // scan, including 'clean.txt', goes through the real filesystem.
+    await writeFile(join(inbox, 'jammed.txt'), 'ראשון', 'utf8');
+    await writeFile(join(inbox, 'clean.txt'), 'שני', 'utf8');
+
+    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+
+    // The document behind jammed.txt was genuinely ingested — only the move
+    // into processed/ failed — so the counters must describe the file, not
+    // the ingest verdict: deferred, not ingested.
+    expect(result.deferred, 'a failed move must not be silently dropped').toBe(1);
+    expect(result.ingested, 'only the file actually filed counts as ingested').toBe(1);
+
+    // clean.txt still made it through — one poisoned file must not abandon
+    // the rest of the batch.
+    expect(await readdir(join(inbox, 'processed'))).toEqual(['clean.txt']);
+
+    // jammed.txt was claimed (moved into working/) but never filed anywhere
+    // else, since the move that would have filed it threw.
+    expect(await readdir(join(inbox, 'working'))).toEqual(['jammed.txt']);
   });
 });
