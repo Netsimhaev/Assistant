@@ -349,6 +349,99 @@ describe('GET /readings', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
   });
+
+  // I3: the previous test only proved the page's own heading renders, which
+  // says nothing about the row content — dropping STANCE_LABEL, mangling a
+  // reason, or breaking escLabel would all still pass it. This seeds a real
+  // reading -> proposal chain and checks what actually reached the page: the
+  // Hebrew stance label (not the raw enum value), the headline, a reason, and
+  // a bidi-hostile filename with its visible characters intact and its
+  // override character gone — the same guarantee the approval card's own
+  // sign form is tested for.
+  it('renders the stance label, headline, a reason and a bidi-safe filename from a real reading', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    // `NewProposal.jobId` is required, not nullable — every proposal is made
+    // in service of a real job (`proposeForReading` always loads or creates
+    // one first). The job never reaches `await_approval`: an `advise_against`
+    // with no alternative raises no approval at all, which is exactly the
+    // "no card" case this test also checks for.
+    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+
+    const documentId = `DOC-${ulid()}`;
+    // U+202E RIGHT-TO-LEFT OVERRIDE, exactly the payload
+    // `document-for-approval`'s own bidi test uses.
+    const originalName = 'invoice‮gpj.exe';
+    await insertOrGetDocument(
+      {
+        documentId,
+        source: 'manual',
+        originalName,
+        mediaType: 'text/plain',
+        sha256: createHash('sha256').update(documentId).digest('hex'),
+        byteSize: 10,
+        storedPath: `${BUSINESS}/${documentId}/original.txt`,
+      },
+      { businessId: BUSINESS },
+    );
+
+    const { record } = await saveReading(
+      {
+        readingId: `RDG-${ulid()}`,
+        documentId,
+        status: 'read',
+        reason: null,
+        content: {
+          summary: 'תקציר קצר של החוזה',
+          findings: [],
+          intents: [],
+          unreadable: [],
+        },
+        provenance: 'boss',
+        model: 'haiku',
+        promptVersion: 'v1',
+        briefHash: ulid().padEnd(64, '0'),
+      },
+      { businessId: BUSINESS },
+    );
+
+    const proposal: Proposal = {
+      stance: 'advise_against',
+      headline: 'אני נגד חתימה על ההסכם',
+      reasons: [{ text: 'המחיר השתנה מהותית מהסיכום המקורי', findingLabel: 'מחיר', sourceRef: SOURCE }],
+      action: null,
+      clarifyingQuestion: null,
+    };
+    await saveProposal(
+      {
+        proposalId: `PR-${ulid()}`,
+        readingId: record.readingId,
+        jobId: job.jobId,
+        status: 'proposed',
+        reason: null,
+        content: proposal,
+        raw: '{}',
+        model: 'haiku',
+        promptVersion: 'v1',
+      },
+      { businessId: BUSINESS },
+    );
+
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const res = await fetch(`${baseUrl}/readings`, { headers: { cookie } });
+    const body = await res.text();
+
+    // STANCE_LABEL['advise_against'] — the Hebrew label, not the raw enum.
+    expect(body).toContain('ממליצה שלא');
+    expect(body).not.toContain('advise_against');
+    expect(body).toContain('אני נגד חתימה על ההסכם');
+    expect(body).toContain('המחיר השתנה מהותית מהסיכום המקורי');
+    expect(body).toContain('invoice');
+    expect(body).not.toContain('‮');
+    // No approval behind this proposal (job_id is null): the screen must say
+    // so, not silently omit the row or link to nothing.
+    expect(body).toContain('אין כרטיס — אין פעולה לאשר');
+  });
 });
 
 describe('CSRF', () => {

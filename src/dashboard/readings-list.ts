@@ -30,9 +30,20 @@ interface ReadingRow {
   original_name: string;
   sha256: string;
   read_at: string;
-  reading: { summary?: unknown };
+  // NULL exactly when `document_readings.status = 'unreadable'`
+  // (`document_readings_content_present`, migration 013) — genuinely written
+  // by `read.ts` on every failed read, not an edge case this screen gets to
+  // ignore. `unreadable_reason` is that row's `reason` column, non-null in
+  // exactly the case `reading` is null.
+  reading: { summary?: unknown } | null;
+  unreadable_reason: string | null;
   proposal: { stance?: unknown; headline?: unknown; reasons?: unknown } | null;
   approval_id: string | null;
+}
+
+/** Shown as the "summary" line for a reading that failed. Hebrew, since it is what the owner reads. */
+function unreadableSummary(reason: string | null): string {
+  return `לא ניתן היה לקרוא את המסמך: ${reason ?? 'סיבה לא ידועה'}`;
 }
 
 function toSummary(row: ReadingRow): ReadingSummary {
@@ -43,12 +54,21 @@ function toSummary(row: ReadingRow): ReadingSummary {
         .filter((t) => t !== '')
     : [];
 
+  // `row.reading === null` is the unreadable case — see the field comment.
+  // A "what I read" screen that silently dropped the documents it could not
+  // read would be answering a different question than its own title, and
+  // CLAUDE.md's rule is that an unreadable result is stored, not discarded.
+  const summary =
+    row.reading !== null && typeof row.reading.summary === 'string'
+      ? row.reading.summary
+      : unreadableSummary(row.unreadable_reason);
+
   return {
     documentId: row.document_id,
     originalName: row.original_name,
     sha256: row.sha256,
     readAt: row.read_at,
-    summary: typeof row.reading.summary === 'string' ? row.reading.summary : '',
+    summary,
     stance: typeof proposal?.stance === 'string' ? proposal.stance : null,
     headline: typeof proposal?.headline === 'string' ? proposal.headline : null,
     reasons,
@@ -76,7 +96,19 @@ function toSummary(row: ReadingRow): ReadingSummary {
  * one leaves it spent files a new one). A plain join on either would multiply
  * one reading into several output rows the moment either history existed.
  * `LIMIT 1 ... ORDER BY created_at DESC` picks the latest of each, mirroring
- * `documentForApproval`'s own ordering.
+ * `documentForApproval`'s own ordering — and, like that query, breaks a
+ * `created_at` tie with the row's own ulid-shaped id (`proposal_id`,
+ * `approval_id`) rather than leaving Postgres free to pick either row on
+ * either run: `documentForApproval` already documents why an ordering with no
+ * tiebreaker is a real bug and not a theoretical one (two proposals from the
+ * same batch can share a timestamp at clock resolution).
+ *
+ * No `status` filter on `document_readings`. A row whose reading failed
+ * (`status = 'unreadable'`, `content IS NULL` — enforced by
+ * `document_readings_content_present`, migration 013) is exactly as real a
+ * fact as one that succeeded, and CLAUDE.md is explicit that an unreadable
+ * result is stored, not discarded. `toSummary` renders `r.reason` for those
+ * rows instead of a summary it does not have.
  */
 export async function recentReadings(
   limit: number,
@@ -91,6 +123,7 @@ export async function recentReadings(
             d.sha256,
             r.created_at::text AS read_at,
             r.content AS reading,
+            r.reason AS unreadable_reason,
             p.content AS proposal,
             ap.approval_id AS approval_id
        FROM document_readings r
@@ -110,7 +143,7 @@ export async function recentReadings(
               FROM approval_requests a
              WHERE a.job_id = p.job_id
                AND a.business_id = r.business_id
-             ORDER BY a.created_at DESC
+             ORDER BY a.created_at DESC, a.approval_id DESC
              LIMIT 1
        ) ap ON p.job_id IS NOT NULL
       WHERE r.business_id = $1
