@@ -1,6 +1,10 @@
 import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
+import { conductPendingDocuments } from './conduct.js';
+import type { ConductOptions, ConductResult } from './conduct.js';
+import { scanInbox } from './inbox-scan.js';
+import type { ScanResult } from './inbox-scan.js';
 import { loadJob, transition } from './jobs.js';
 import { runDueJobs } from './run-due.js';
 import type { RunDueResult } from './run-due.js';
@@ -125,6 +129,9 @@ async function wakeDueJobs(
 
 export interface SchedulerPassResult {
   tick: TickResult;
+  /** Null when no inbox is configured — the scan is off, not broken. */
+  scan: ScanResult | null;
+  conduct: ConductResult;
   due: RunDueResult;
   verified: CloseVerifiedResult;
 }
@@ -132,32 +139,66 @@ export interface SchedulerPassResult {
 /**
  * One full pass: tick, then run whatever the tick made ready.
  *
- * Two calls, one after the other, and the order is the whole point — a job
+ * Four calls, one after the other, and the order is the whole point — a job
  * woken by the tick is in `execute` by the time `runDueJobs` looks, so it runs
  * in the same pass instead of waiting a full interval.
  *
- * `runDueJobs` is called **after** `tick` has returned and its transaction has
+ * The two document-conductor loops (`scanInbox`, `conductPendingDocuments`)
+ * sit between the tick and `runDueJobs`, for the same reason `runDueJobs`
+ * itself is called after `tick` has returned and its transaction has
  * committed, never inside it: `tick` holds a transaction-scoped advisory lock
- * for its whole body, and a plan's external calls — bounded only by the
- * adapter deadline — have no business holding a pooled connection open across
- * the wire behind that lock.
+ * for its whole body, and neither a file read nor a model call — bounded only
+ * by their own deadlines — has any business holding a pooled connection open
+ * across the wire behind that lock.
+ *
+ * `scan` is `null`, not run with a no-op default, when `config.documentInbox`
+ * (or an explicit `options.inbox`) is absent: an installation that has not
+ * configured a watched folder is a switch, not a fault, and the pass must
+ * neither throw nor pretend a scan happened.
  *
  * A skipped tick — another scheduler holds the business-wide lock — still
- * runs the due pass. The per-job locks in `runDueJobs` are what actually keep
- * two runners apart, and they are finer-grained than the tick's lock.
+ * runs the rest of the pass. The per-job locks in `runDueJobs` and the
+ * conductor's own advisory lock are what actually keep two runners apart, and
+ * they are finer-grained than the tick's lock.
  */
 export async function schedulerPass(
-  options: { businessId?: string; now?: Date; limit?: number; runtime?: Runtime } = {},
+  options: {
+    businessId?: string;
+    now?: Date;
+    limit?: number;
+    runtime?: Runtime;
+    /** Defaults to `config.documentInbox`. */
+    inbox?: string | null;
+    documentRoot?: string;
+    readsPerDay?: number;
+    reader?: ConductOptions['reader'];
+    proposer?: ConductOptions['proposer'];
+  } = {},
 ): Promise<SchedulerPassResult> {
   const tickResult = await tick(options);
+
+  // Both conductor loops run after the tick's transaction has committed, not
+  // inside it — see the docblock above.
+  const inbox = options.inbox !== undefined ? options.inbox : config.documentInbox;
+  const scan =
+    inbox === null
+      ? null
+      : await scanInbox({
+          inbox,
+          ...(options.businessId !== undefined ? { businessId: options.businessId } : {}),
+          ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
+        });
+
+  const conduct = await conductPendingDocuments(options);
+
   const due = await runDueJobs(options);
-  // Third and last, and the order matters as much as the first two: a job
-  // `runDueJobs` just finished is sitting in `verify` by the time this looks,
-  // so it closes in the same pass instead of waiting a full interval. Run
-  // before the plans instead and every close would trail a pass behind the
-  // work that earned it.
+  // Last, and the order matters as much as the rest: a job `runDueJobs` just
+  // finished is sitting in `verify` by the time this looks, so it closes in
+  // the same pass instead of waiting a full interval. Run before the plans
+  // instead and every close would trail a pass behind the work that earned
+  // it.
   const verified = await closeVerifiedJobs(options);
-  return { tick: tickResult, due, verified };
+  return { tick: tickResult, scan, conduct, due, verified };
 }
 
 export interface SchedulerHandle {
