@@ -97,18 +97,21 @@ describe('raiseProposalApproval', () => {
     expect(rows).toHaveLength(0);
   });
 
-  it('stamps the facts as external and not chain-derived', async () => {
+  it('stamps the approval\'s risk with external provenance', async () => {
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
     const approvalId = await raiseProposalApproval(
       { jobId: null, proposal: aProposal(), bundle },
       { businessId: BUSINESS },
     );
-    const { rows } = await getPool().query<{ risk: { band: string } }>(
+    const { rows } = await getPool().query<{ risk: { dimensions: { provenance: { level: string; chainDepth: number } } } }>(
       `SELECT risk FROM approval_requests WHERE approval_id = $1`,
       [approvalId],
     );
-    // An external first contact never scores `routine`; if it did, the
-    // provenance stamp did not reach the risk engine.
-    expect(rows[0]?.risk.band).not.toBe('routine');
+    // `assessRisk` copies `facts.provenance` straight onto this dimension, and
+    // the whole assessment is stored as jsonb — so this is the stamp itself,
+    // not a band inferred from it. The band is `sensitive` under either value,
+    // which is why asserting on the band proved nothing.
+    expect(rows[0]?.risk.dimensions.provenance.level).toBe('unknown_external');
+    expect(rows[0]?.risk.dimensions.provenance.chainDepth).toBe(1);
   });
 });
