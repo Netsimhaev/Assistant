@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,9 +39,13 @@ describe('scanInbox', () => {
 
   it('moves a rejected file to rejected and still counts it', async () => {
     const { inbox, documentRoot } = await anInbox();
-    // A .xlsx name over bytes that are not a zip: sniffed as text, never sent
-    // to the Excel decoder, and rejected by ingest as a mismatch it will not
-    // guess about.
+    // A .xlsx name over bytes that are not a zip. `sniffMediaType` checks the
+    // bytes first: these aren't a ZIP signature, so it falls through to the
+    // text sniff, and `.xlsx` isn't one of the extensions (.csv/.md/.json)
+    // that disambiguates a text sniff — so it lands as plain text and is
+    // ingested, not rejected. The assertion below is deliberately written to
+    // accept either outcome, because what this test actually pins down is
+    // that the file ends up in exactly one folder, not which one.
     await writeFile(join(inbox, 'bad.xlsx'), 'not a spreadsheet', 'utf8');
 
     const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
@@ -79,7 +84,43 @@ describe('scanInbox', () => {
   it('creates its subdirectories on a bare folder', async () => {
     const { inbox, documentRoot } = await anInbox();
     const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
-    expect(result).toEqual({ ingested: 0, rejected: 0, skipped: 0 });
-    expect((await readdir(inbox)).sort()).toEqual(['processed', 'rejected', 'working']);
+    expect(result).toEqual({ ingested: 0, rejected: 0, failed: 0, deferred: 0, skipped: 0 });
+    expect((await readdir(inbox)).sort()).toEqual(['failed', 'processed', 'rejected', 'working']);
+  });
+
+  it('files a stuck pending document into failed, never processed', async () => {
+    const { inbox, documentRoot } = await anInbox();
+    const bytes = Buffer.from('תקוע', 'utf8');
+    await writeFile(join(inbox, 'stuck.txt'), bytes);
+
+    // Pre-seed a `documents` row under the same (business, sha256) pair as
+    // the bytes about to be dropped in the inbox, already `pending` — the
+    // stuck, terminal state `ingest.ts` documents as produced by a
+    // `writeFile` throw, a transient failure inside `markExtracted`'s
+    // transaction, or the process being killed mid-ingest. `insertOrGetDocument`'s
+    // `ON CONFLICT (business_id, sha256) DO NOTHING` then fires when
+    // `scanInbox` calls `ingestDocument` below, and it hands back this exact
+    // row instead of creating a new one — the same thing a second real
+    // arrival of these bytes would see.
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    await getPool().query(
+      `INSERT INTO documents
+         (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status)
+       VALUES ($1, $2, 'manual', 'stuck.txt', 'text/plain', $3, $4, $5, 'pending')`,
+      [
+        'DOC-stuck-pending-test',
+        BUSINESS,
+        sha256,
+        bytes.length,
+        `${BUSINESS}/DOC-stuck-pending-test/original.txt`,
+      ],
+    );
+
+    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+
+    expect(result.failed).toBe(1);
+    expect(result.ingested, 'a pending document is stuck, never a success').toBe(0);
+    expect(await readdir(join(inbox, 'failed'))).toEqual(['stuck.txt']);
+    expect(await readdir(join(inbox, 'processed'))).toEqual([]);
   });
 });
