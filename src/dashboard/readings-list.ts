@@ -23,6 +23,19 @@ export interface ReadingSummary {
   headline: string | null;
   reasons: string[];
   approvalId: string | null;
+  /**
+   * Whether the stored proposal carries an action at all.
+   *
+   * Separate from `approvalId` because the two answer different questions,
+   * and the screen used to conflate them (M2): an `approvalId` of `null` was
+   * rendered as "no card — nothing to approve", which is true when the stance
+   * carries no action and false when it carries one and
+   * `raiseProposalApproval` did not produce a card — it threw, or the
+   * proposed tool turned out to be read-only and has no action class to
+   * assess. Telling the owner "nothing to approve" about a proposal that
+   * proposed something is telling them the wrong thing.
+   */
+  hasAction: boolean;
 }
 
 interface ReadingRow {
@@ -37,7 +50,7 @@ interface ReadingRow {
   // exactly the case `reading` is null.
   reading: { summary?: unknown } | null;
   unreadable_reason: string | null;
-  proposal: { stance?: unknown; headline?: unknown; reasons?: unknown } | null;
+  proposal: { stance?: unknown; headline?: unknown; reasons?: unknown; action?: unknown } | null;
   approval_id: string | null;
 }
 
@@ -73,6 +86,10 @@ function toSummary(row: ReadingRow): ReadingSummary {
     headline: typeof proposal?.headline === 'string' ? proposal.headline : null,
     reasons,
     approvalId: row.approval_id,
+    // Positive: an action exists when the stored value is an object. `null`
+    // (the schema's own "no action"), a missing key on an older row, and any
+    // other shape all read as "no action" — the answer that says less.
+    hasAction: typeof proposal?.action === 'object' && proposal.action !== null,
   };
 }
 

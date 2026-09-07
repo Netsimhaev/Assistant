@@ -3,6 +3,12 @@
  * behaviour — they hold three properties that a future edit could quietly
  * remove while every behavioural test stayed green.
  *
+ * **Anchored per call, never per file.** Each provenance check extracts the
+ * text of the one call it is about (`callBlock`) before asserting anything.
+ * A file-wide check lets one call's literal satisfy an assertion meant for
+ * another — which is exactly how a parameterised `createJob` once passed a
+ * check that `readDocument`'s untouched literal was quietly answering.
+ *
  * **What the standing-authorisation and ramp checks do not cover.** They scan
  * `conduct.ts`, `proposal-approval.ts` (and `inbox-scan.ts` for the ramp
  * check) as text for the literal identifiers `useStandingAuthorization`,
@@ -36,9 +42,9 @@ function source(rel: string): string {
  * exactly that reason. Extracting the call's own text first means each call
  * is judged only by what it itself sets.
  *
- * Assumes exactly one call to `name` in the source — true for both calls this
+ * Assumes exactly one call to `name` in the source — true for every call this
  * file inspects — and simple paren balance (no unbalanced parens inside
- * string or template contents, which holds for this file's actual source).
+ * string or template contents, which holds for these files' actual source).
  */
 function callBlock(src: string, name: string): string {
   const marker = `${name}(`;
@@ -97,6 +103,32 @@ describe('the conductor cannot grant authority', () => {
     const conduct = source('orchestrator/conduct.ts');
     const readDocumentCall = callBlock(conduct, 'readDocument');
     expectOnlyLiteralProvenance(readDocumentCall, 'conduct.ts readDocument(...)');
+  });
+
+  // M4: the third site, and the one nothing structural held. `conduct.ts`'s
+  // two literals decide what the JOB is stamped as and what the READING is
+  // filed under; `proposal-approval.ts`'s `buildFacts` call decides the risk
+  // band actually stored on the approval row the owner answers. A refactor
+  // that parameterised this one while leaving the other two alone passed
+  // every check in this file.
+  it('builds the approval facts under the same fixed provenance', () => {
+    const raise = source('orchestrator/proposal-approval.ts');
+    const buildFactsCall = callBlock(raise, 'buildFacts');
+    expectOnlyLiteralProvenance(buildFactsCall, 'proposal-approval.ts buildFacts(...)');
+  });
+
+  // The other half of the same call, and it moves the band in the opposite
+  // direction: `provenanceChainDerived: true` is the first-contact exemption,
+  // which drops a `sensitive` band to `routine`. The chain that produced this
+  // proposal read a document that arrived from outside, which is exactly the
+  // condition that disqualifies the exemption — so the only acceptable value
+  // here is the literal `false`, never an expression a caller could steer.
+  it('never claims the first-contact exemption for a document that came from outside', () => {
+    const raise = source('orchestrator/proposal-approval.ts');
+    const buildFactsCall = callBlock(raise, 'buildFacts');
+    const matches = [...buildFactsCall.matchAll(/provenanceChainDerived\s*:\s*([^,\n}]+)/g)];
+    expect(matches.length, 'buildFacts must set provenanceChainDerived').toBe(1);
+    expect((matches[0]?.[1] ?? '').trim()).toBe('false');
   });
 
   it('never turns on standing authorisation', () => {

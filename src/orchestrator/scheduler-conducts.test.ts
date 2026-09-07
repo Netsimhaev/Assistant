@@ -323,6 +323,57 @@ describe('schedulerPass and the conductor', () => {
     expect(notified).toHaveLength(1);
   });
 
+  // Spec §11's headline safety case, end to end: a hostile file is rejected
+  // by the scan and never reaches the half that costs money. `inbox-scan.test.ts`
+  // holds the rejection and the folder it lands in; what only a full pass can
+  // show is that the conductor made zero model calls because of it.
+  it('a hostile file is rejected by the scan and costs nothing', async () => {
+    const hostileBusiness = 'biz-sched-conduct-hostile';
+    await installCharter(buildCharter(), { businessId: hostileBusiness });
+    const inbox = await mkdtemp(join(tmpdir(), 'sched-hostile-inbox-'));
+    const documentRoot = await mkdtemp(join(tmpdir(), 'sched-hostile-root-'));
+    // A `.xlsx` name over bytes that begin as a ZIP and then are not one:
+    // sniffed as a spreadsheet from the bytes, refused by the archive guard
+    // before any extractor library sees the content.
+    await writeFile(
+      join(inbox, 'evil.xlsx'),
+      Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('not really a zip')]),
+    );
+
+    let reads = 0;
+    let proposals = 0;
+    const result = await schedulerPass({
+      businessId: hostileBusiness,
+      inbox,
+      documentRoot,
+      // Both throw rather than return: nothing here should call them at all,
+      // and a stub that returns something plausible would let a regression
+      // continue quietly past the point this test exists to catch.
+      reader: async () => {
+        reads += 1;
+        throw new Error('the reader must not be called for a rejected document');
+      },
+      proposer: async () => {
+        proposals += 1;
+        throw new Error('the proposer must not be called for a rejected document');
+      },
+    });
+
+    expect(result.scan?.rejected).toBe(1);
+    expect(result.scan?.ingested).toBe(0);
+    expect(await readdir(join(inbox, 'rejected'))).toEqual(['evil.xlsx']);
+
+    // The conductor ran — it is behind the same switch as the scan, and the
+    // inbox is configured here, so `conduct` must not be null. It simply
+    // found nothing to consider, because a rejected document never reaches
+    // `status = 'extracted'`.
+    expect(result.conduct).not.toBeNull();
+    expect(result.conduct?.considered).toBe(0);
+    expect(result.conduct?.carded).toBe(0);
+    expect(reads).toBe(0);
+    expect(proposals).toBe(0);
+  });
+
   it('a broken inbox is recorded, not thrown, and the rest of the pass still runs', async () => {
     // A second version: `beforeEach` already installed one for `BUSINESS` at
     // the default `buildCharter()` version, and `charter_versions` refuses a

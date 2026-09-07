@@ -227,10 +227,16 @@ export function renderReadings(rows: ReadingSummary[], csrf: string): string {
     .map((r) => {
       const stance = r.stance === null ? '' : (STANCE_LABEL[r.stance] ?? r.stance);
       const reasons = r.reasons.map((t) => `<li>${esc(t)}</li>`).join('');
+      // M2: three cases, not two. A missing card because the stance proposed
+      // nothing is an ordinary outcome; a missing card for a proposal that
+      // DID propose something is a gap the owner should be told about
+      // instead of being assured there was nothing to approve.
       const link =
-        r.approvalId === null
-          ? '<span class="muted">אין כרטיס — אין פעולה לאשר</span>'
-          : `<a href="/a/${esc(r.approvalId)}">לכרטיס האישור</a>`;
+        r.approvalId !== null
+          ? `<a href="/a/${esc(r.approvalId)}">לכרטיס האישור</a>`
+          : r.hasAction
+            ? '<span class="muted">הוצעה פעולה, אך לא נוצר עבורה כרטיס אישור.</span>'
+            : '<span class="muted">אין כרטיס — אין פעולה לאשר</span>';
       return `
         <article class="card">
           <h3>${escLabel(r.originalName)} <span class="hash">${esc(r.sha256.slice(0, HASH_PREFIX_LENGTH))}</span></h3>

@@ -8,6 +8,7 @@
  */
 import { link, mkdir, readdir, rename, stat, unlink } from 'node:fs/promises';
 import { basename, extname, join } from 'node:path';
+import { ulid } from 'ulid';
 import { ingestDocument } from '../documents/ingest.js';
 
 export interface ScanInboxOptions {
@@ -93,6 +94,37 @@ async function moveWithoutClobber(from: string, dir: string, name: string): Prom
 }
 
 /**
+ * The name a file is claimed under inside `working/`.
+ *
+ * Unique by construction, and that is the whole point (M3). The claim itself
+ * has to stay a bare `rename` — it *is* the write-in-progress test, and
+ * `rename` overwrites an existing destination on every platform Node targets
+ * — so the only place to put the collision-avoidance is in the target name.
+ * `moveWithoutClobber` argues at length that silently replacing a file
+ * destroys the owner's own record of what happened, and the claim was the one
+ * move in this file that did exactly that.
+ *
+ * It is reachable, not theoretical: a fault strands a claimed copy in
+ * `working/` (see the recovery path below, which gives up and leaves it
+ * there), the owner drops a new file of the same name into the inbox, and the
+ * stranded one is gone. `working/` is never scanned, so nothing would ever
+ * have noticed.
+ *
+ * A ulid rather than a counter: a counter needs a "is this name free" read
+ * before the `rename`, and the gap between that read and the rename is the
+ * same race this is here to close. The suffix goes before the extension so a
+ * human looking inside `working/` still sees a recognisable filename, and it
+ * never reaches the database — `ingestDocument` is handed the original `name`
+ * as `originalName`, and `stored_path` is built from ids the system generated
+ * plus the *sniffed* extension, never from either of these names.
+ */
+function claimNameFor(name: string): string {
+  const ext = extname(name);
+  const stem = ext === '' ? name : name.slice(0, -ext.length);
+  return `${stem}.${ulid()}${ext}`;
+}
+
+/**
  * Ingest every file sitting in the inbox root.
  *
  * **Claiming is the write-in-progress check.** A file still open for writing
@@ -132,7 +164,7 @@ export async function scanInbox(options: ScanInboxOptions): Promise<ScanResult> 
     if (!entry.isFile()) continue;
 
     const name = basename(entry.name);
-    const claimed = join(inbox, WORKING, name);
+    const claimed = join(inbox, WORKING, claimNameFor(name));
 
     try {
       await rename(join(inbox, name), claimed);

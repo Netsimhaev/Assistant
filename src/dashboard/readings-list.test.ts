@@ -9,13 +9,19 @@ import { recentReadings } from './readings-list.js';
 const BUSINESS = 'biz-readings';
 const OTHER_BUSINESS = 'biz-readings-other';
 
+/**
+ * `sha256` is derived from the document id rather than being a fixed
+ * constant: `documents_business_sha_idx` is unique on `(business_id, sha256)`,
+ * so a shared literal meant one seeded document per business per test and any
+ * test needing two collided on insert.
+ */
 async function seedDocument(businessId: string, documentId: string): Promise<void> {
   await getPool().query(
     `INSERT INTO documents
        (document_id, business_id, source, original_name, media_type, byte_size,
         sha256, stored_path, status)
      VALUES ($1, $2, 'manual', 'חוזה.txt', 'text/plain', 10,
-             repeat('a', 64), 'p/1.txt', 'extracted')`,
+             rpad(md5($1), 64, '0'), 'p/1.txt', 'extracted')`,
     [documentId, businessId],
   );
 }
@@ -62,6 +68,8 @@ async function seedProposal(params: {
   stance: string;
   /** Overrides `created_at`, so a test can force a tiebreak or an ordering. */
   createdAt?: string;
+  /** The proposal's `action`. `null` (the default) is a stance with nothing to approve. */
+  action?: unknown;
 }): Promise<void> {
   await getPool().query(
     `INSERT INTO proposals
@@ -78,7 +86,7 @@ async function seedProposal(params: {
         headline: params.headline,
         stance: params.stance,
         reasons: [{ text: 'המחיר השתנה', findingLabel: 'מחיר' }],
-        action: null,
+        action: params.action ?? null,
       }),
       params.createdAt ?? null,
     ],
@@ -133,6 +141,50 @@ describe('recentReadings', () => {
     expect(rows[0]?.stance).toBe('advise_against');
     expect(rows[0]?.headline).toBe('אני נגד חתימה');
     expect(rows[0]?.reasons).toEqual(['המחיר השתנה']);
+  });
+
+  // M2: `approvalId === null` alone cannot tell "the stance proposed nothing"
+  // apart from "something was proposed and no card came of it" — and the
+  // screen rendered the first sentence for both.
+  it('reports whether the proposal carried an action, separately from whether a card exists', async () => {
+    await seedDocument(BUSINESS, 'DOC-NOACT');
+    await seedReading(BUSINESS, 'DOC-NOACT', 'RD-DOC-NOACT');
+    await seedProposal({
+      proposalId: 'PR-DOC-NOACT',
+      businessId: BUSINESS,
+      readingId: 'RD-DOC-NOACT',
+      headline: 'אני נגד חתימה',
+      stance: 'advise_against',
+    });
+
+    await seedDocument(BUSINESS, 'DOC-ACT');
+    await seedReading(BUSINESS, 'DOC-ACT', 'RD-DOC-ACT');
+    await seedProposal({
+      proposalId: 'PR-DOC-ACT',
+      businessId: BUSINESS,
+      readingId: 'RD-DOC-ACT',
+      headline: 'אשלח מייל אישור',
+      stance: 'act',
+      action: {
+        headline: 'אשלח מייל לדנה',
+        purpose: 'לאשר קבלה',
+        intent: 'reply_to_sender',
+        agent: 'comms.email',
+        toolName: 'mail.send',
+        input: { to: 'dana@example.com' },
+        expectedActionClass: 'email.initiate',
+      },
+    });
+
+    const rows = await recentReadings(10, { businessId: BUSINESS });
+    const byDocument = new Map(rows.map((r) => [r.documentId, r]));
+
+    // Neither has a card — no job, so no approval. What separates them is
+    // whether anything was proposed at all.
+    expect(byDocument.get('DOC-NOACT')?.approvalId).toBeNull();
+    expect(byDocument.get('DOC-NOACT')?.hasAction).toBe(false);
+    expect(byDocument.get('DOC-ACT')?.approvalId).toBeNull();
+    expect(byDocument.get('DOC-ACT')?.hasAction).toBe(true);
   });
 
   it('never returns another business\'s reading', async () => {

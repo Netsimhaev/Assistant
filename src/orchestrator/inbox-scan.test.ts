@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getPool } from '../db/pool.js';
@@ -60,23 +60,41 @@ describe('scanInbox', () => {
     expect(rows.map((r) => r.original_name)).toEqual(['hello.txt']);
   });
 
-  it('moves a rejected file to rejected and still counts it', async () => {
+  // Spec §11's headline safety case: a hostile file is rejected, and nothing
+  // downstream of it runs. The earlier version of this test was honest in its
+  // comment and then asserted `ingested + rejected === 1` — which holds for
+  // either outcome, so the `rejected` branch of the three-way switch had no
+  // test anywhere. Its fixture was a `.xlsx` NAME over plain text, which
+  // `sniffMediaType` correctly reads as `text/plain` (the bytes decide, the
+  // extension may only disambiguate) and ingests.
+  //
+  // This one is a `.xlsx` name over bytes that genuinely ARE a ZIP header and
+  // then are not a ZIP: `sniffMediaType` answers XLSX, so `guardZipArchive`
+  // runs, cannot read a central directory, and returns `archive_malformed` —
+  // a verdict about this document, never a throw. The extractor never runs.
+  it('rejects a malformed archive, files it under rejected/, and records the reason', async () => {
     const { inbox, documentRoot } = await anInbox();
-    // A .xlsx name over bytes that are not a zip. `sniffMediaType` checks the
-    // bytes first: these aren't a ZIP signature, so it falls through to the
-    // text sniff, and `.xlsx` isn't one of the extensions (.csv/.md/.json)
-    // that disambiguates a text sniff — so it lands as plain text and is
-    // ingested, not rejected. The assertion below is deliberately written to
-    // accept either outcome, because what this test actually pins down is
-    // that the file ends up in exactly one folder, not which one.
-    await writeFile(join(inbox, 'bad.xlsx'), 'not a spreadsheet', 'utf8');
+    await writeFile(
+      join(inbox, 'evil.xlsx'),
+      Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('not really a zip')]),
+    );
 
     const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
 
-    expect(result.ingested + result.rejected).toBe(1);
-    const processed = await readdir(join(inbox, 'processed'));
-    const rejected = await readdir(join(inbox, 'rejected'));
-    expect(processed.length + rejected.length).toBe(1);
+    expect(result.rejected).toBe(1);
+    expect(result.ingested, 'a rejected document is never also an ingested one').toBe(0);
+    expect(result.failed + result.deferred + result.skipped).toBe(0);
+    expect(await readdir(join(inbox, 'rejected'))).toEqual(['evil.xlsx']);
+    expect(await readdir(join(inbox, 'processed'))).toEqual([]);
+
+    // The verdict is on the row, with a reason the owner can read — a
+    // rejection is a recorded status, never a thrown exception.
+    const { rows } = await getPool().query<{ status: string; reason: string | null }>(
+      `SELECT status, reason FROM documents WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    expect(rows[0]?.status).toBe('rejected');
+    expect(rows[0]?.reason).toBeTruthy();
   });
 
   it('leaves the subdirectories themselves alone', async () => {
@@ -168,7 +186,37 @@ describe('scanInbox', () => {
     expect(await readdir(join(inbox, 'processed'))).toEqual(['clean.txt']);
 
     // jammed.txt was claimed (moved into working/) but never filed anywhere
-    // else, since the move that would have filed it threw.
-    expect(await readdir(join(inbox, 'working'))).toEqual(['jammed.txt']);
+    // else, since the move that would have filed it threw. The claim name
+    // carries a ulid between the stem and the extension (M3), so this matches
+    // the shape rather than the literal name.
+    const stranded = await readdir(join(inbox, 'working'));
+    expect(stranded).toHaveLength(1);
+    expect(stranded[0]).toMatch(/^jammed\.[0-9A-HJKMNP-TV-Z]{26}\.txt$/);
+  });
+
+  // M3: the claim was a bare `rename` into `working/<name>`, and `rename`
+  // overwrites its destination on every platform Node targets. A previous
+  // fault leaves a claimed copy stranded in `working/` (the recovery path
+  // above does exactly that when the move back also fails), the owner drops a
+  // new file of the same name, and the stranded one is silently destroyed —
+  // in a folder nothing ever scans, so nobody would learn of it.
+  it('does not clobber a file already stranded in working/ when the same name arrives again', async () => {
+    const { inbox, documentRoot } = await anInbox();
+    // Create the subdirectories, then strand a file inside working/ by hand,
+    // exactly as an interrupted earlier pass would have left one.
+    await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+    await writeFile(join(inbox, 'working', 'stranded.txt'), 'התקוע מאתמול', 'utf8');
+
+    await writeFile(join(inbox, 'stranded.txt'), 'החדש של היום', 'utf8');
+    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+
+    // The new file went through as usual.
+    expect(result.ingested).toBe(1);
+    expect(await readdir(join(inbox, 'processed'))).toEqual(['stranded.txt']);
+
+    // And the stranded one is still there, still itself. Without the
+    // uniquified claim name this file is gone: the claim renamed the new
+    // arrival straight over it.
+    expect(await readFile(join(inbox, 'working', 'stranded.txt'), 'utf8')).toBe('התקוע מאתמול');
   });
 });
