@@ -270,6 +270,59 @@ describe('schedulerPass and the conductor', () => {
     expect(approvals.rows).toHaveLength(1);
   });
 
+  // I3, the wiring half: `conduct.test.ts` proves `raiseProposalApproval`
+  // notifies when handed a notifier, but it hands it one directly. What that
+  // cannot show — and what actually broke — is whether anything in production
+  // ever hands it one. This runs the whole pass with a `Runtime` shaped
+  // exactly as `buildRuntime` returns it, and fails if `schedulerPass` drops
+  // `runtime.notify` on the way into the conductor.
+  it('forwards the runtime notifier all the way to the conductor card', async () => {
+    const notifyBusiness = 'biz-sched-conduct-notify';
+    await installCharter(buildCharter(), { businessId: notifyBusiness });
+    const dir = await mkdtemp(join(tmpdir(), 'sched-notify-doc-'));
+    const path = join(dir, 'doc.txt');
+    await writeFile(path, 'חוזה שיווק להתראה', 'utf8');
+    await ingestDocument(
+      { path, source: 'manual' },
+      { businessId: notifyBusiness, documentRoot: dir },
+    );
+
+    const notified: string[] = [];
+    const runtime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, PREFIX),
+      notify: {
+        notifier: {
+          channel: 'email',
+          async notify(request) {
+            notified.push(request.approvalId);
+            return { ok: true };
+          },
+        },
+        dashboardBaseUrl: 'http://127.0.0.1:8787',
+      },
+      warnings: [],
+    };
+
+    const inbox = await mkdtemp(join(tmpdir(), 'sched-notify-inbox-'));
+    const result = await schedulerPass({
+      businessId: notifyBusiness,
+      inbox,
+      runtime,
+      reader: async () => ({
+        status: 'read' as const,
+        reading: READING,
+        raw: '{}',
+        denials: [],
+        turns: 1,
+      }),
+      proposer: async () => ({ status: 'proposed' as const, proposal: ACTING, raw: '{}' }),
+    });
+
+    expect(result.conduct?.carded).toBe(1);
+    expect(notified).toHaveLength(1);
+  });
+
   it('a broken inbox is recorded, not thrown, and the rest of the pass still runs', async () => {
     // A second version: `beforeEach` already installed one for `BUSINESS` at
     // the default `buildCharter()` version, and `charter_versions` refuses a

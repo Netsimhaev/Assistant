@@ -22,7 +22,7 @@ import {
 } from '../documents/store.js';
 import { createJob, transition, type Job } from './jobs.js';
 import { proposeForReading, type ProposeForReadingOptions } from './propose.js';
-import { raiseProposalApproval } from './proposal-approval.js';
+import { raiseProposalApproval, type NotifyTarget } from './proposal-approval.js';
 
 export interface ConductOptions {
   businessId?: string;
@@ -32,6 +32,17 @@ export interface ConductOptions {
   limit?: number;
   reader?: ReadDocumentOptions['reader'];
   proposer?: ProposeForReadingOptions['proposer'];
+  /**
+   * Where to tell the owner a card is waiting. Threaded from `buildRuntime`
+   * through `schedulerPass`, and absent exactly when that function could not
+   * assemble a notifier — six SMTP variables plus `APPROVAL_NOTIFY_TO`.
+   *
+   * Absent is a real production state, not a test-only one, and it is not a
+   * failure: the card is written and the dashboard shows it either way. What
+   * it must never be is silent, which is why `buildRuntime` returns a warning
+   * for it rather than simply omitting the field (I3).
+   */
+  notify?: NotifyTarget;
 }
 
 export interface ConductResult {
@@ -91,9 +102,19 @@ export async function conductPendingDocuments(
   // (`run-due.ts`) already documents avoiding, for the same reason: a ten-
   // connection pool does not survive two concurrent passes each parking a
   // transaction behind an external call. The lock is taken on a client
-  // checked out for exactly this purpose and released in a `finally`,
-  // following that function's precedent — including the "destroy rather than
-  // pool" handling of a failed unlock.
+  // checked out for exactly this purpose and released in a `finally`.
+  //
+  // **Where the parity with `run-due.ts` stops, stated because an earlier
+  // version of this comment claimed more than the code does (M9).** What is
+  // genuinely shared is the `finally` block's shape: the unlock attempt and
+  // the release kept apart so `release` is called exactly once, and a failed
+  // unlock destroying the connection rather than returning a session that
+  // still holds the lock. The checkout scope is *not* shared. `run-due`
+  // checks out and releases one connection per job, so a slow job holds one
+  // pool slot for its own duration; this function holds a single connection
+  // for the whole pass — every document, every model call inside it. On a
+  // ten-connection pool that is one slot parked for as long as the batch
+  // takes, which is a real difference and not a detail.
   //
   // `pg_try_advisory_lock`, not the blocking form: a second pass that cannot
   // get the lock must skip this round and come back later, never queue
@@ -143,6 +164,17 @@ export async function conductPendingDocuments(
       // one that fails before `readDocument` ever runs, still spends a slot
       // here (M1). That can only under-run the daily budget, never exceed
       // it, and `remaining` is recomputed fresh on the next pass regardless.
+      //
+      // What it does **not** bound, said plainly: `readsPerDay` is measured
+      // against `readingsToday`, which counts `document_readings` rows, and
+      // every document that gets this far also makes a paid *proposer* call
+      // that writes no such row. On the re-offer path — reading already
+      // cached, no proposal yet — the proposer runs while `readingsToday`
+      // does not move at all. So spec §8's "how many documents may be
+      // understood in a day" bounds one of the two model calls that
+      // understanding costs. The exposure is small and bounded from the other
+      // side (`documentsAwaitingRead` filters on `read_attempts < 3`, and
+      // `limit` caps a pass), but it is not what the name promises.
       remaining -= 1;
 
       // Hoisted above the `try` so the `catch` below can tell whether a job
@@ -230,7 +262,7 @@ export async function conductPendingDocuments(
         stage = 'raising the approval';
         const approvalId = await raiseProposalApproval(
           { jobId: job.jobId, proposal: proposed.proposal, bundle: active.bundle },
-          { businessId },
+          { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
         );
 
         if (approvalId === null) {

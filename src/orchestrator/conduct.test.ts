@@ -93,6 +93,89 @@ describe('conductPendingDocuments', () => {
     await installCharter(buildCharter(), { businessId: BUSINESS });
   });
 
+  // I3: the conductor writes `approval_requests` without passing through the
+  // gate, and the gate was carrying two things at that point — the row, and
+  // the notification that the row exists. The only `notifier.notify(...)`
+  // call in the codebase is inside `evaluateToolCall`, so before this a fully
+  // configured installation (six SMTP variables plus APPROVAL_NOTIFY_TO) got
+  // no email at all for a conductor card: the card existed, the fuse burned,
+  // `expireOverdue` retired it, and the owner never knew.
+  it('emails the owner about the card it raised', async () => {
+    await aDocument('חוזה שיווק להודעה');
+    const d = deps();
+    const notified: { approvalId: string; link: string }[] = [];
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+      notify: {
+        notifier: {
+          channel: 'email',
+          async notify(request, link) {
+            notified.push({ approvalId: request.approvalId, link });
+            return { ok: true };
+          },
+        },
+        dashboardBaseUrl: 'http://127.0.0.1:8787',
+      },
+    });
+
+    expect(result.carded).toBe(1);
+    const { rows } = await getPool().query<{ approval_id: string }>(
+      `SELECT approval_id FROM approval_requests`,
+    );
+    const approvalId = rows[0]?.approval_id;
+    expect(approvalId).toBeTruthy();
+    // Not just "something was notified": the notification names the card that
+    // was actually written, and the link points at it.
+    expect(notified).toEqual([
+      { approvalId, link: `http://127.0.0.1:8787/a/${approvalId}` },
+    ]);
+  });
+
+  // The gate's contract, kept exactly: delivery failing is not the request
+  // failing. The row exists, the dashboard shows it, and the scheduler will
+  // expire it on schedule either way.
+  it('cards the document anyway when the notification fails, and records why', async () => {
+    await aDocument('חוזה שיווק כשל שליחה');
+    const d = deps();
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+      notify: {
+        notifier: {
+          channel: 'email',
+          async notify() {
+            return { ok: false, error: 'SMTP unreachable' };
+          },
+        },
+        dashboardBaseUrl: 'http://127.0.0.1:8787',
+      },
+    });
+
+    // The card was still raised and the job still moved — nothing about the
+    // failed send is load-bearing.
+    expect(result.carded).toBe(1);
+    expect(result.failed).toBe(0);
+    const jobs = await getPool().query<{ phase: string }>(
+      `SELECT phase FROM jobs WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    expect(jobs.rows[0]?.phase).toBe('await_approval');
+
+    // And the failure is on the audit chain under the same code the gate
+    // writes, not swallowed.
+    const audit = await getPool().query<{ reason: string; kind: string }>(
+      `SELECT reason, kind FROM audit_log WHERE business_id = $1 AND kind = 'incident'`,
+      [BUSINESS],
+    );
+    expect(audit.rows[0]?.reason).toContain('approval_notify_failed:');
+    expect(audit.rows[0]?.reason).toContain('SMTP unreachable');
+  });
+
   it('takes a document all the way to a pending card', async () => {
     const documentId = await aDocument('חוזה שיווק');
     const d = deps();
