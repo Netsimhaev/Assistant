@@ -171,6 +171,11 @@ describe('the planner prompt', () => {
 
     const prefixOf = (p: string): string => p.slice(0, p.lastIndexOf('# '));
     expect(prefixOf(withInstruction)).toBe(prefixOf(withIntents));
+    // And they must actually differ below it — without this the assertion
+    // above holds trivially when the feature is absent, since the extra
+    // property is simply ignored and both prompts come out identical.
+    expect(withInstruction).toContain('תשלחי לדנה');
+    expect(withIntents).not.toContain('תשלחי לדנה');
   });
 
   it('still renders the intents array when no instruction is given', async () => {
