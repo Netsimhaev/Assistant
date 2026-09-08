@@ -149,6 +149,38 @@ const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const TRAILING_PUNCTUATION = /[.,;:!?)"']+$/;
 
 /**
+ * A leading Hebrew prefix particle glued directly onto the next word with no
+ * space — exactly how "to Dana" is ordinarily written as `ל-דנה`, not as an
+ * edge case but as the default way a Hebrew speaker writes it. Round 2
+ * reworded three tests to insert a space instead of handling this, on the
+ * reasoning that stripping it would mean inventing new parsing logic; the
+ * ruling that followed was that a design an owner has to write around for
+ * their own language's ordinary grammar is the wrong design, and named the
+ * exact fix: a closed, positive list of one-letter particles, never "any
+ * leading non-Latin character" or a general prefix stripper.
+ *
+ * The list is exactly `ל ב מ ה ו כ ש` (to / in / from / the / and / as / that),
+ * each followed by either an ASCII hyphen-minus or the Hebrew maqaf (U+05BE)
+ * — the punctuation Hebrew text actually uses for this join, distinct from
+ * the visually similar hyphen-minus. Nothing else strips: a token starting
+ * with any other character, or one of these letters NOT followed by one of
+ * the two join marks, passes through unchanged.
+ *
+ * This does not reopen N1. Only a fixed, short, LEADING particle is ever
+ * removed — never a search for where an address "really" starts partway
+ * through the token — and the entire remainder must still pass
+ * `EMAIL_SHAPE` as a whole afterwards, exactly as an un-prefixed token must.
+ * `ל-dana@example.co.il2` strips to `dana@example.co.il2`: the leading-
+ * particle strip has nothing more to say about it, and it is then compared
+ * to whatever the plan proposes the same way any other token is — as a
+ * complete, extracted value, never as a stretch to be found inside a larger
+ * one. There is no sub-token scanning anywhere in this pipeline and nothing
+ * for a backtracking engine to settle for, regardless of what precedes or
+ * follows the particle.
+ */
+const LEADING_HEBREW_PARTICLE = /^[לבמהוכש][-\u05BE]/;
+
+/**
  * Email-shaped tokens in free text, found the way `readEmails`
  * (`src/policy/facts.ts`) finds them in a `to` field: split into fragments,
  * clean each one up, then ask whether the *whole* fragment is an address —
@@ -162,7 +194,8 @@ const TRAILING_PUNCTUATION = /[.,;:!?)"']+$/;
  * regex, and backtracking on that regex's trailing boundary is exactly what
  * let `dana@example.co.il2` produce a match ending at `dana@example.co` — the
  * boundary the regex needed was satisfied by the `.` two characters early,
- * not by the true end of the address. A token, once isolated by whitespace,
+ * not by the true end of the address. A token, once isolated by whitespace
+ * and stripped of a leading Hebrew particle (see `LEADING_HEBREW_PARTICLE`),
  * is tested whole (`EMAIL_SHAPE` is anchored at both ends): it is a
  * candidate in its entirety or it is not a candidate at all, so there is no
  * shorter match for a backtracking engine to settle for.
@@ -177,10 +210,23 @@ const TRAILING_PUNCTUATION = /[.,;:!?)"']+$/;
  * what unwraps that, exactly as it does for a comma-split `to` fragment. A
  * token with no brackets at all passes through it unchanged; the branch that
  * actually unwraps a display name is reached only when a token has one.
+ *
+ * Note on `EMAIL_SHAPE` itself: it is loose enough that a token like
+ * `dana@example.co.il2` (once any leading particle is stripped) still
+ * matches it as a whole — `EMAIL_SHAPE`'s domain half accepts any non-space,
+ * non-`@` characters, including a trailing digit, since it mirrors
+ * `mail.ts`'s deliberately permissive validator rather than a strict TLD
+ * check. That is not a gap: the extracted value in that case is the FULL
+ * glued string, `dana@example.co.il2`, and this function's caller compares
+ * it for exact equality against whatever the plan proposes — never against
+ * a shorter candidate like `dana@example.co`. Whichever of the two checks
+ * ends up doing the rejecting, nothing is authorised that the owner did not
+ * type in full.
  */
 function emailAddressesIn(instruction: string): string[] {
   return instruction
     .split(/\s+/)
+    .map((token) => token.replace(LEADING_HEBREW_PARTICLE, ''))
     .map((token) => token.replace(TRAILING_PUNCTUATION, ''))
     .map((token) => extractAddressCandidate(token))
     .filter((value): value is string => value !== null)

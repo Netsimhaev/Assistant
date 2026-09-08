@@ -29,7 +29,7 @@ describe('authorisedRecipients', () => {
   it('matches an address case-insensitively', () => {
     expect(
       authorisedRecipients({
-        instruction: 'תשלחי אל Dana@Example.COM',
+        instruction: 'תשלחי ל-Dana@Example.COM',
         actionClass: 'email.reply',
         candidates: ['dana@example.com'],
         known: NO_ONE_KNOWN,
@@ -89,7 +89,7 @@ describe('authorisedRecipients', () => {
   it('returns only the covered subset when a step reaches several people', () => {
     expect(
       authorisedRecipients({
-        instruction: 'תשלחי אל dana@example.com',
+        instruction: 'תשלחי ל-dana@example.com',
         actionClass: 'email.initiate',
         candidates: ['dana@example.com', 'stranger@elsewhere.com'],
         known: NO_ONE_KNOWN,
@@ -197,7 +197,7 @@ describe('authorisedRecipients', () => {
   it('covers a doc.deliver recipient typed verbatim', () => {
     expect(
       authorisedRecipients({
-        instruction: 'תשלחי את המסמך אל dana@example.com',
+        instruction: 'תשלחי את המסמך ל-dana@example.com',
         actionClass: 'doc.deliver',
         candidates: ['dana@example.com'],
         known: NO_ONE_KNOWN,
@@ -300,6 +300,55 @@ describe('authorisedRecipients', () => {
         instruction: 'תשלחי ל dana@sub.example.co.il_',
         actionClass: 'email.initiate',
         candidates: ['dana@sub.example.co'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('strips a leading Hebrew particle glued to the address, then still requires the whole remainder', () => {
+    // Round 3: `ל-dana@example.com` (no space) is not an edge case, it is
+    // how "to Dana" is ordinarily written in Hebrew. The owner should not
+    // have to phrase around their own language's grammar to have a typed
+    // address recognised.
+    expect(
+      authorisedRecipients({
+        instruction: 'תשלחי ל-dana@example.com',
+        actionClass: 'email.initiate',
+        candidates: ['dana@example.com'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual(['dana@example.com']);
+  });
+
+  it('does not authorise a shorter domain via a particle-glued address with a footnote', () => {
+    // Pins the interaction between the two rules rather than assuming it:
+    // stripping the leading `ל-` particle is not a licence to also drop
+    // whatever glued suffix follows the domain. `ל-dana@example.co.il2`
+    // strips to `dana@example.co.il2` -- one token, tested whole -- which is
+    // not equal to `dana@example.co` either way this module decides that
+    // (see `EMAIL_SHAPE`'s docblock in typed-recipients.ts for why "not
+    // equal" and "not shaped like an address" are both live possibilities
+    // here, and why either one is a correct rejection).
+    expect(
+      authorisedRecipients({
+        instruction: 'תשלחי ל-dana@example.co.il2',
+        actionClass: 'email.initiate',
+        candidates: ['dana@example.co'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not strip a Hebrew letter that is not a recognised particle', () => {
+    // The list is closed and positive: `LEADING_HEBREW_PARTICLE` names seven
+    // letters, never "any leading Hebrew character". `נ` (nun) is not one of
+    // them, so `נ-dana@example.com` is a single token that does not equal
+    // `dana@example.com` -- it is rejected, not silently over-stripped.
+    expect(
+      authorisedRecipients({
+        instruction: 'תשלחי נ-dana@example.com',
+        actionClass: 'email.initiate',
+        candidates: ['dana@example.com'],
         known: NO_ONE_KNOWN,
       }),
     ).toEqual([]);
