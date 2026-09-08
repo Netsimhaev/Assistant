@@ -609,8 +609,17 @@ function targetIdOf(step: PlanStep): string | null {
  *
  * Only checked when the planner stated an expectation. Silence is not a claim,
  * and demanding one would push planners toward guessing.
+ *
+ * Exported so `instruct.ts` can run this same check before a plan is ever
+ * bound — a job that reaches `execute` with a class-mismatched step is
+ * rejected by `runPlan` on every subsequent pass and `runDueJobs` does not
+ * move its phase on that rejection, so the job sits at the front of the
+ * scheduler's window forever. Both `classMismatch` and `planStepIsFeasible`
+ * (`catalogue.ts`) are pure — no database, no channel — which is exactly what
+ * lets the instruction door run them before granting or binding anything,
+ * catching the same defect earlier rather than duplicating the check.
  */
-function classMismatch(step: PlanStep): string | null {
+export function classMismatch(step: PlanStep): string | null {
   if (step.expectedActionClass === null) return null;
 
   const actual = actionClassOf(step);
