@@ -103,12 +103,16 @@ function phoneKey(value: string): string | null {
  *     An order number, a company registration id, or several unrelated
  *     figures run together by the scan will not, by construction, start
  *     with one of those two.
+ *   - After `972`, a single trunk zero if one follows it, because
+ *     `+972 054-123-4567` is an ordinary spelling and that zero is dialling
+ *     notation rather than part of the number. See the comment at the
+ *     branch itself for the two symptoms of not doing this.
  *   - What follows the prefix is the key, and it must be exactly 8 or 9
  *     digits. Nine is a mobile (`054-1234567` → `541234567`); eight is a
- *     landline (`03-1234567` → `31234567`). Both the local and the
- *     international spelling of one number reduce to the same key, which is
- *     what the old last-nine rule was reaching for and got wrong for every
- *     landline in the country.
+ *     landline (`03-1234567` → `31234567`). Every spelling of one number —
+ *     local, international, international with the trunk zero — reduces to
+ *     the same key, which is what the old last-nine rule was reaching for
+ *     and got wrong for every landline in the country.
  *
  * The separator-group cap and the digit-count range are both gone.
  * Prefix-anchoring replaces them: a run that does not begin with a
@@ -121,9 +125,10 @@ function phoneKey(value: string): string | null {
  * stripped before the prefix is read, so any run whose digits happen to
  * spell the target number authorises it however those digits were spaced:
  * `סעיף 0-521234567`, `שורה 0 521234567 בקובץ`, `פריט (0) 521234567`,
- * `קוד 972 521234567`, `פריט 05 21234567` and `0-5-2-1-2-3-4-5-6-7` all
- * still authorise `0521234567`. That is not fixable while
- * `054-123-4567` and `+972 54 123 4567` must also be accepted — after
+ * `קוד 972 521234567`, `קוד 972 0521234567`, `פריט 05 21234567` and
+ * `0-5-2-1-2-3-4-5-6-7` all still authorise `0521234567`. That is not
+ * fixable while `054-123-4567` and `+972 54 123 4567` must also be
+ * accepted — after
  * separator-stripping they are the same digits, and no rule can prefer one
  * spacing over another without refusing a real number somebody writes that
  * way. The residual is narrow and honest: **the instruction must contain
@@ -138,7 +143,21 @@ function phoneNumberKey(run: string): string | null {
 
   let significant: string;
   if (digits.startsWith('972')) {
-    significant = digits.slice(3);
+    // A single trunk zero after the country code, if one is there. It is
+    // the local form's leading `0` left in place -- `+972 054-123-4567` --
+    // and it is dialling notation, never part of the subscriber number.
+    // Counting it made ten significant digits, so the 8-or-9 rule refused
+    // the whole spelling; worse, `+972-0-3-1234567` keyed to `031234567`
+    // while `03-1234567` keyed to `31234567`, so two spellings of one
+    // landline stopped matching each other -- the exact defect
+    // prefix-anchoring exists to fix, one digit further left. Stripping it
+    // loosens nothing: what remains still has to be 8 or 9 digits, and a
+    // leading `0` with no country code in front of it is still what
+    // identifies the local form below.
+    const afterCountryCode = digits.slice(3);
+    significant = afterCountryCode.startsWith('0')
+      ? afterCountryCode.slice(1)
+      : afterCountryCode;
   } else if (digits.startsWith('0')) {
     significant = digits.slice(1);
   } else {
@@ -152,12 +171,16 @@ function phoneNumberKey(run: string): string | null {
 /**
  * The keys of every phone number written in free text.
  *
- * The run bridges plain spaces (U+0020) and nothing else in the whitespace
- * family. Spaces have to be bridged — `+972 54 123 4567` and `054 123 4567`
- * are ordinary spellings — but a tab or a newline is a *cell* or *line*
- * boundary, never a separator inside one number. Bridging `\s` wholesale
- * read a pasted two-column table (`ח.פ.` │ `0` │ `521234567`) as a single
- * run, which is one of the splices this round had to close.
+ * The run bridges exactly two characters of the whitespace family and no
+ * others: the plain space (U+0020) and the non-breaking space (U+00A0).
+ * Both have to bridge — `+972 54 123 4567` is an ordinary spelling, and a
+ * number copied out of a web page or a Word document carries U+00A0
+ * between its groups rather than U+0020, so bridging only the plain space
+ * split `054 123 4567` into three runs and refused a number the owner
+ * really had typed. A tab or a newline is a *cell* or *line* boundary,
+ * never a separator inside one number, and both stay out: bridging `\s`
+ * wholesale read a pasted two-column table (`ח.פ.` │ `0` │ `521234567`) as
+ * a single run, which is one of the splices this had to close.
  *
  * Runs are maximal: two numbers separated only by a space join into one run
  * and then fail `phoneNumberKey`'s 8-or-9 rule, so a real number sitting
@@ -168,7 +191,7 @@ function phoneNumberKey(run: string): string | null {
  * refuse.
  */
 function phoneNumbersIn(instruction: string): string[] {
-  const runs = instruction.match(/[+\d][\d ().-]*/g) ?? [];
+  const runs = instruction.match(/[+\d][\d \u00A0().-]*/g) ?? [];
   return runs
     .map((run) => phoneNumberKey(run))
     .filter((key): key is string => key !== null);

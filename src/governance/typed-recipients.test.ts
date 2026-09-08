@@ -522,6 +522,67 @@ describe('authorisedRecipients', () => {
     }
   });
 
+  it('authorises a number written with a country code and a trunk zero', () => {
+    // Round 5, A: `+972 054-123-4567` is a very common way to write the
+    // number -- the trunk zero of the local form left in place after the
+    // country code. Counting it as significant makes ten digits and the
+    // 8-or-9 rule refuses the whole number.
+    expect(
+      authorisedRecipients({
+        instruction: 'תשלחי הודעה ל-+972 054-123-4567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['0541234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual(['0541234567']);
+  });
+
+  it('gives one landline the same key with and without a trunk zero after the country code', () => {
+    // Round 5, A's second symptom: without stripping the trunk zero,
+    // `+972-0-3-1234567` keys to `031234567` while `03-1234567` keys to
+    // `31234567`, so two spellings of one landline stop matching each
+    // other -- the exact failure prefix-anchoring was introduced to fix,
+    // one digit further left. Both directions asserted.
+    expect(
+      authorisedRecipients({
+        instruction: 'תתקשרי ל-+972-0-3-1234567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['03-1234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual(['03-1234567']);
+    expect(
+      authorisedRecipients({
+        instruction: 'תתקשרי ל-03-1234567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['+972-0-3-1234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual(['+972-0-3-1234567']);
+  });
+
+  it('bridges a non-breaking space inside a number', () => {
+    // Round 5, B: a number copied out of a web page or a Word document
+    // carries U+00A0 between its groups, not U+0020. Bridging U+0020 alone
+    // split `054 123 4567` into three runs and refused a number the owner
+    // did type. The tab-and-newline test below stays closed either way --
+    // those are cell and line boundaries, never separators inside one
+    // number -- so exactly two space characters bridge and no more.
+    //
+    // The non-breaking spaces are written as `\u00A0` escapes on purpose: a
+    // literal U+00A0 in source is invisible, and an editor normalising it
+    // to a plain space would quietly turn this into a duplicate of the
+    // spaced-groups test above -- still green, testing nothing.
+    expect(
+      authorisedRecipients({
+        instruction: 'תשלחי הודעה ל-054\u00A0123\u00A04567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['0541234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual(['0541234567']);
+  });
+
   it('does not authorise a number whose significant digits are one too many', () => {
     // R1: `יתרה 00 521234567` is a balance figure and a reference number,
     // not a phone number. Under the old rule the run's LAST NINE digits
@@ -565,7 +626,10 @@ describe('authorisedRecipients', () => {
     // `054-123-4567` and `+972 54 123 4567` can tell them apart, because
     // after separator-stripping they are the same digits. What the module
     // now guarantees is narrower and honest: the instruction must contain
-    // the target number's own digits behind a recognised prefix. If a later
+    // the target number's own digits behind a recognised prefix. (Round 5
+    // widened this by one spelling: the trunk-zero strip after `972` means
+    // `972 0521234567` reduces here too, where it used to be one digit too
+    // long. Same class, same reason -- those digits are the number.) If a later
     // round narrows this further, this test is the one to update -- and
     // deleting it without narrowing anything hides the gap again.
     for (const instruction of [
@@ -573,6 +637,7 @@ describe('authorisedRecipients', () => {
       'שורה 0 521234567 בקובץ',
       'פריט (0) 521234567',
       'קוד 972 521234567',
+      'קוד 972 0521234567',
       'פריט 05 21234567',
       'לתשלום 0-5-2-1-2-3-4-5-6-7',
     ]) {
