@@ -171,7 +171,7 @@ describe('runInstruction', () => {
     expect(result.status).toBe('refused');
   });
 
-  it('refuses an instruction past the cap before calling the planner', async () => {
+  it('refuses an over-long instruction before creating anything', async () => {
     let called = false;
     const result = await runInstruction(
       { text: 'א'.repeat(4001) },
@@ -186,5 +186,12 @@ describe('runInstruction', () => {
 
     expect(result.status).toBe('refused');
     expect(called, 'the cap exists to stop a paste before it costs money').toBe(false);
+    // The planner not being called was always true, because saveInstruction
+    // enforces the same cap and throws first regardless of this function's
+    // own check. What the check in runInstruction actually buys is that no
+    // job is created at all for an over-long paste, rather than a job row
+    // that gets created and then has to be marked failed.
+    const jobs = await getPool().query(`SELECT 1 FROM jobs`);
+    expect(jobs.rows).toHaveLength(0);
   });
 });
