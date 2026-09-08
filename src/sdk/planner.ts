@@ -10,6 +10,20 @@ export interface PlanRequest {
   intents: unknown;
   provenance: TrustLevel;
   rampLevel: AutonomyLevel;
+  /**
+   * The owner's own words, when the job came through the instruction door.
+   *
+   * Mutually exclusive with `intents` in practice: triage produces intents
+   * from content nobody vouches for, and this carries a sentence the owner
+   * typed behind a session. Both land in the same final section of the prompt
+   * so the cacheable prefix above it is untouched either way — see the
+   * assembly order in `buildPlannerPrompt`.
+   *
+   * The planner's own header says "never the raw message", and that rule was
+   * written about hostile input. Spec §4 of the instruction door records the
+   * deliberate exception and why it does not extend to any other caller.
+   */
+  instruction?: string;
 }
 
 export type PlanOutcome =
@@ -56,17 +70,18 @@ export function buildPlannerPrompt(request: PlanRequest): string {
     'שאלת הבהרה אחת לכל היותר · expectedActionClass הוא מה שאתה מאמין שהצעד ייחשב,',
     'ואי-התאמה לשער תפסול את התוכנית — עדיף null מאשר ניחוש.',
     '',
-    '# ה-intents',
     // Last, and the only part that varies per job: everything above is the
     // cacheable prefix.
-    JSON.stringify(request.intents),
+    ...(request.instruction === undefined
+      ? ['# ה-intents', JSON.stringify(request.intents)]
+      : ['# ההוראה מבעל העסק', request.instruction]),
   ].join('\n');
 }
 
 export async function makePlan(request: PlanRequest): Promise<PlanOutcome> {
   const options: Options = {
     systemPrompt:
-      'אתה המתכנן. אתה מקבל intents מובנים ומחזיר תוכנית JSON. ' +
+      'אתה המתכנן. אתה מקבל intents מובנים או הוראה ישירה מבעל העסק, ומחזיר תוכנית JSON. ' +
       'אינך מבצע דבר ואין לך כלים — התוכנית שלך היא הצעה שעוברת אימות.',
     // No tools at all. The planner reasons; it does not act, and a planner
     // that could act would be a second, ungated path to every capability.
