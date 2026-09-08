@@ -173,11 +173,34 @@ export async function loadAuthorization(
  * dead member of a security-critical positive list, reading as a live
  * control while being unreachable.
  *
- * `memory.write_longterm` joins it for the same reason `crm.write` is there:
- * remembering a preference the owner stated reaches nobody, spends nothing,
- * and can be corrected. Spec §7 of the instruction door names these two and
- * says why writing a file is not among them — the same action class covers
- * running code.
+ * `memory.write_longterm` joins it for the reason the owner asked: "record
+ * and remember" is a real instruction and this class is the mechanism that
+ * exists for it. That reason is narrower than the class it is attached to,
+ * and the gap is worth stating plainly rather than leaving it implicit.
+ * `classify.ts` maps FOUR tools onto `memory.write_longterm` —
+ * `memory.write_entity`, `memory.write_chunk`, `memory.upsert_preference`,
+ * and `memory.retire` — and the last of those is forgetting, not
+ * remembering a stated preference. `capabilities.ts` singles this class out
+ * for a hand-written denylist (`LONGTERM_MEMORY_WRITES`) precisely because
+ * its consequences are severe. The entailed shortcut here consults neither
+ * `auth.actionClass` nor `auth.recipients` — the same gap `artifact.write`
+ * was removed for above — so "reply to Dana" would also cover a
+ * `memory.retire` call during a job that had ingested a hostile attachment,
+ * if this check were the only thing standing between them.
+ *
+ * It is not. Exposure today is zero, and it is zero for a reason that has
+ * nothing to do with this list being safe on its own: stage 8 of the gate
+ * (`policy/engine.ts`) checks `effectiveAutonomy` before stage 10 is ever
+ * reached, `RAMP_FLOOR` (`orchestrator/ramp.ts`) holds every action class at
+ * `draft_only` until something raises it, and nothing in production does —
+ * see CLAUDE.md's account of the first-contact exemption for the identical
+ * argument made about a different control. Once a class's ramp does rise
+ * past `draft_only`, this entry stops being inert, and whether that memory
+ * write happened during a job that ingested untrusted content is a question
+ * this function still cannot answer. Narrowing to tool-level entailment
+ * would answer it properly; that is a larger change than this task carries,
+ * and this paragraph exists so the next reader does not have to rediscover
+ * the gap before deciding whether to make it.
  */
 const ENTAILED_INTERNAL_CLASSES: readonly ActionClass[] = ['crm.write', 'memory.write_longterm'];
 
@@ -241,6 +264,12 @@ export function coveredByAuthorization(
   // dedicated test — any test written against this line alone would pass
   // with it deleted, and a test that cannot fail is not a test.
   if (named.size === 0) return false;
+  // `named` is only ever a set of exact strings, and `going` below is only
+  // ever `readPhones`' digits-only output alongside `readEmails`' lower-cased
+  // output — never what the owner literally typed. A caller that starts
+  // storing recipients as-typed (a phone with dashes, an address with mixed
+  // case) reopens the exact bug Task 3 fixed: a WhatsApp recipient that can
+  // never match because the two sides were normalised differently, silently.
 
   // Emails and phones both, because a WhatsApp step's recipient is a number
   // and an authorisation that cannot see it could never cover one. The
