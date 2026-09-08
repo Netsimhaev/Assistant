@@ -51,15 +51,12 @@ export const TYPED_RECIPIENT_CLASSES: readonly ActionClass[] = [
 
 /**
  * Digits only, and the last nine of them, or `null` when there are not even
- * nine.
+ * nine. **The charter side only** — see `phoneNumberKey` below for the
+ * instruction side, and the paragraph at the end of this block for why the
+ * two deliberately do not share one rule.
  *
  * Nine is the length of an Israeli subscriber number without its leading
  * zero, which is what survives both `054-123-4567` and `+972541234567`.
- * Shorter than that is not a phone number, and comparing it would match half
- * the digits in the instruction by accident — the exact shape of the
- * `12345` / "הזמנה מספר 12345" false positive fixed below: an all-digit
- * candidate must be rejected here, on its own length, and never fall
- * through to a textual path that has no length floor at all.
  *
  * The nine-digit key is a deliberate cost, not an oversight: it drops the
  * country code, so two numbers that merely share their last nine digits
@@ -68,6 +65,15 @@ export const TYPED_RECIPIENT_CLASSES: readonly ActionClass[] = [
  * because the alternative — a locale table to normalise country codes
  * properly — does not exist yet, and the current cost is a coarser match,
  * never a missed one.
+ *
+ * Why the charter keeps this coarser rule while the instruction path does
+ * not: `known.phones` is signed charter data the owner curated, not free
+ * text an attacker can paste into. Coarseness there costs a slightly wider
+ * match against a list the owner wrote on purpose. It also matches numbers
+ * from ANY country, which `phoneNumberKey`'s Israeli-prefix rule cannot —
+ * a foreign counterparty on file would stop matching the day the charter
+ * side adopted a prefix-anchored key, which is a live regression and not a
+ * theoretical one.
  */
 function phoneKey(value: string): string | null {
   const digits = value.replace(/\D/g, '');
@@ -75,64 +81,97 @@ function phoneKey(value: string): string | null {
 }
 
 /**
- * Whether `run` looks like an actual Israeli phone number, not merely a
- * digit string of plausible length.
+ * The phone number a run of digits and separators actually names, or `null`
+ * when it does not name one. **The instruction side**, used for both the
+ * candidate and the runs found in the owner's text, so the two are compared
+ * under one identical rule.
  *
- * Fix round 1 tried "digit count in 9–15, at most one whitespace gap" and
- * both clauses turned out to be decorative: the regex in `phoneRunsIn` only
- * ever handed this function a match with zero or one `\s` in it, so
- * `spaceCount <= 1` could never see the input it was written to reject, and
- * `digitCount < 9` only restated `phoneKey`'s own floor one call later. That
- * left a single live clause (`> 15`), which nothing tested, and it still
- * missed a whole family of splices that use a separator other than a space:
- * `100-521-234-567`, `1.521.234.567`, `521234567` sitting after a company-id
- * label — none of those contain two spaces, so the old guard waved all of
- * them through, each synthesising a real subscriber number's last nine
- * digits out of a number that never appeared in the instruction.
+ * The question is not "are these digits plausible" but "**is this run a
+ * phone number, and if so which one**". Rounds 1 and 2 asked the first
+ * question — a digit-count range, a cap on separator groups, a prefix
+ * anywhere at the start of the run — and then took the key off the run's
+ * TAIL (`phoneKey`'s last nine). Nothing tied the prefix that had been
+ * checked to the digits that became the key, so the whole splice class
+ * survived behind any unrelated leading figure that started with `0`, and
+ * the fixed 9-or-10 length simultaneously refused every Israeli landline.
+ * One wrong rule, failing in both directions at once.
  *
- * This asks a different question: does `run` have the *shape* of a phone
- * number, not just a length in some range. A real Israeli number starts
- * with a recognisable prefix — a bare `0` (national dialling) or `972`
- * (international, with or without the `+`) — and nothing else does; an
- * order number, a company registration id, or several unrelated figures run
- * together by a whitespace-tolerant scan will not, by construction, start
- * with one of those two prefixes. After stripping the recognised prefix,
- * what remains must be nine or ten digits — an Israeli subscriber number —
- * and the run may bridge at most two separator groups, because a number is
- * written as one glued token, split by an area code, or split by an area
- * code and a country code: never four or five fragments stitched together.
+ * The key is now anchored to the prefix:
+ *
+ *   - `972` at the front (international, with or without the `+`) or a bare
+ *     `0` (national dialling) — and nothing else is a phone number at all.
+ *     An order number, a company registration id, or several unrelated
+ *     figures run together by the scan will not, by construction, start
+ *     with one of those two.
+ *   - What follows the prefix is the key, and it must be exactly 8 or 9
+ *     digits. Nine is a mobile (`054-1234567` → `541234567`); eight is a
+ *     landline (`03-1234567` → `31234567`). Both the local and the
+ *     international spelling of one number reduce to the same key, which is
+ *     what the old last-nine rule was reaching for and got wrong for every
+ *     landline in the country.
+ *
+ * The separator-group cap and the digit-count range are both gone.
+ * Prefix-anchoring replaces them: a run that does not begin with a
+ * recognised prefix is not a number, and one that does is bounded by the
+ * 8-or-9 rule. Keeping the cap would have gone on refusing
+ * `+972-54-123-4567` and `+972 54 123 4567`, two ordinary ways to write a
+ * mobile.
+ *
+ * **What this still does not close, stated plainly.** Separators are
+ * stripped before the prefix is read, so any run whose digits happen to
+ * spell the target number authorises it however those digits were spaced:
+ * `סעיף 0-521234567`, `שורה 0 521234567 בקובץ`, `פריט (0) 521234567`,
+ * `קוד 972 521234567`, `פריט 05 21234567` and `0-5-2-1-2-3-4-5-6-7` all
+ * still authorise `0521234567`. That is not fixable while
+ * `054-123-4567` and `+972 54 123 4567` must also be accepted — after
+ * separator-stripping they are the same digits, and no rule can prefer one
+ * spacing over another without refusing a real number somebody writes that
+ * way. The residual is narrow and honest: **the instruction must contain
+ * the target number's own digits behind a recognised prefix.** That is a
+ * far weaker claim than round 2's "no phone number appears in the text at
+ * all", and it is where this stops. `records the residual: …` in the test
+ * file pins the exact strings so nobody reads the closed cases as proof
+ * that this one is closed too.
  */
-function looksLikePhoneNumber(run: string): boolean {
+function phoneNumberKey(run: string): string | null {
   const digits = run.replace(/\D/g, '');
+
   let significant: string;
   if (digits.startsWith('972')) {
     significant = digits.slice(3);
   } else if (digits.startsWith('0')) {
     significant = digits.slice(1);
   } else {
-    return false;
+    return null;
   }
-  if (significant.length !== 9 && significant.length !== 10) return false;
 
-  const separatorGroups = run.match(/[\s().-]+/g) ?? [];
-  return separatorGroups.length <= 2;
+  if (significant.length !== 8 && significant.length !== 9) return null;
+  return significant;
 }
 
 /**
- * Phone-shaped runs in free text, filtered to the ones `looksLikePhoneNumber`
- * accepts before anything is keyed off them.
+ * The keys of every phone number written in free text.
  *
- * Deliberately broad on its own: this used to also try to structurally limit
- * whitespace inside the match, which review found unreachable in practice
- * (see `looksLikePhoneNumber`'s docblock) and which did nothing to stop a
- * splice joined by dots or dashes instead of spaces. All of the real
- * filtering now lives in one place, on the fully-formed candidate run, where
- * it can see the whole shape at once rather than a fragment the regex
- * happened to bound.
+ * The run bridges plain spaces (U+0020) and nothing else in the whitespace
+ * family. Spaces have to be bridged — `+972 54 123 4567` and `054 123 4567`
+ * are ordinary spellings — but a tab or a newline is a *cell* or *line*
+ * boundary, never a separator inside one number. Bridging `\s` wholesale
+ * read a pasted two-column table (`ח.פ.` │ `0` │ `521234567`) as a single
+ * run, which is one of the splices this round had to close.
+ *
+ * Runs are maximal: two numbers separated only by a space join into one run
+ * and then fail `phoneNumberKey`'s 8-or-9 rule, so a real number sitting
+ * immediately beside another number can go unrecognised. That is a false
+ * negative — the owner is asked to confirm a recipient they did name — and
+ * it is the safe direction. Splitting a run into every sub-run to avoid it
+ * would manufacture exactly the false positives this function exists to
+ * refuse.
  */
-function phoneRunsIn(instruction: string): string[] {
-  const runs = instruction.match(/[+\d][\d\s().-]*/g) ?? [];
-  return runs.map((run) => run.trim()).filter(looksLikePhoneNumber);
+function phoneNumbersIn(instruction: string): string[] {
+  const runs = instruction.match(/[+\d][\d ().-]*/g) ?? [];
+  return runs
+    .map((run) => phoneNumberKey(run))
+    .filter((key): key is string => key !== null);
 }
 
 /**
@@ -241,14 +280,18 @@ function typedInInstruction(candidate: string, instruction: string): boolean {
   // Shape decides the pathway, and a numeric candidate never falls through
   // to the address path below. That fallthrough is exactly how `12345`
   // used to reach a bare `.includes()` with no length floor at all (C1):
-  // the old code tried the substring match first and only reached
-  // `phoneKey` if that failed, so a short numeric candidate was authorised
-  // by matching itself as a text fragment before its length was ever
-  // checked as a phone number.
+  // the old code tried the substring match first and only reached the phone
+  // rule if that failed, so a numeric candidate was authorised by matching
+  // itself as a text fragment before it was ever asked whether it was a
+  // phone number at all.
+  //
+  // Candidate and instruction go through the SAME `phoneNumberKey`. A
+  // candidate that is not itself a phone number under that rule authorises
+  // nobody, however it is written in the text.
   if (/^[+\d][\d\s().-]*$/.test(trimmed)) {
-    const wanted = phoneKey(trimmed);
+    const wanted = phoneNumberKey(trimmed);
     if (wanted === null) return false;
-    return phoneRunsIn(instruction).some((run) => phoneKey(run) === wanted);
+    return phoneNumbersIn(instruction).includes(wanted);
   }
 
   const target = trimmed.toLowerCase();
@@ -273,6 +316,11 @@ function knownToCharter(
   const domain = extractDomain(lower);
   if (domain !== null && known.emailDomains.includes(domain)) return true;
 
+  // `phoneKey` (last nine digits), not `phoneNumberKey` (prefix-anchored,
+  // Israeli). Both sides here are charter data the owner curated, so the
+  // adversarial parse the instruction path needs buys nothing — and the
+  // Israeli-prefix rule would drop every foreign counterparty on file,
+  // which the last-nine rule matches today. Both docblocks say so.
   const wanted = phoneKey(candidate);
   if (wanted !== null && known.phones.some((p) => phoneKey(p) === wanted)) return true;
 

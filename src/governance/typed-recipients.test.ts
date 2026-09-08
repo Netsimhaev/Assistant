@@ -250,9 +250,13 @@ describe('authorisedRecipients', () => {
   });
 
   it('does not authorise a short numeric candidate via the text path', () => {
-    // C1's numeric row: a candidate too short to be a phone number must be
-    // rejected on length alone, never authorised because it also happens to
-    // appear as a substring of some unrelated longer number in the text.
+    // C1's numeric row: a numeric candidate must be judged as a phone
+    // number, never authorised because it also happens to appear as a
+    // substring of some unrelated number in the text. (What rejects `12345`
+    // today is the prefix rule, not a length floor -- it starts with `1`,
+    // so it names no phone number at all. An earlier version of this
+    // comment said "rejected on length alone", which was true of round 1's
+    // nine-digit floor and is not true of the rule that replaced it.)
     expect(
       authorisedRecipients({
         instruction: 'לפי הזמנה מספר 12345',
@@ -324,11 +328,14 @@ describe('authorisedRecipients', () => {
     // Pins the interaction between the two rules rather than assuming it:
     // stripping the leading `ל-` particle is not a licence to also drop
     // whatever glued suffix follows the domain. `ל-dana@example.co.il2`
-    // strips to `dana@example.co.il2` -- one token, tested whole -- which is
-    // not equal to `dana@example.co` either way this module decides that
-    // (see `EMAIL_SHAPE`'s docblock in typed-recipients.ts for why "not
-    // equal" and "not shaped like an address" are both live possibilities
-    // here, and why either one is a correct rejection).
+    // strips to `dana@example.co.il2` -- one token, tested whole -- and
+    // exact equality is what rejects it. `EMAIL_SHAPE` is deliberately
+    // loose (its domain half accepts a trailing digit, mirroring
+    // `mail.ts`), so the stripped token PASSES the shape test here; "not
+    // shaped like an address" is not a live possibility for this input and
+    // an earlier version of this comment was wrong to hedge that it was.
+    // The source docblock in typed-recipients.ts already says this
+    // correctly.
     expect(
       authorisedRecipients({
         instruction: 'תשלחי ל-dana@example.co.il2',
@@ -339,19 +346,43 @@ describe('authorisedRecipients', () => {
     ).toEqual([]);
   });
 
-  it('does not strip a Hebrew letter that is not a recognised particle', () => {
-    // The list is closed and positive: `LEADING_HEBREW_PARTICLE` names seven
-    // letters, never "any leading Hebrew character". `נ` (nun) is not one of
-    // them, so `נ-dana@example.com` is a single token that does not equal
-    // `dana@example.com` -- it is rejected, not silently over-stripped.
-    expect(
+  it('strips exactly the seven named particles and no other Hebrew letter', () => {
+    // Pinned the way `TYPED_RECIPIENT_CLASSES` is pinned: both sides
+    // enumerated, so a mutation that widens the character class is caught
+    // wherever it widens. Sampling one rejected letter (this test used to
+    // try only `נ`) survives any mutation that adds a different letter.
+    //
+    // Accepted: ל ב מ ה ו כ ש (to / in / from / the / and / as / that).
+    // Rejected: every other letter of the alphabet. Both lists are written
+    // out rather than derived from the pattern, so the pattern cannot
+    // define its own test.
+    const particles = ['ל', 'ב', 'מ', 'ה', 'ו', 'כ', 'ש'];
+    const notParticles = [
+      'א', 'ג', 'ד', 'ז', 'ח', 'ט', 'י', 'נ',
+      'ס', 'ע', 'פ', 'צ', 'ק', 'ר', 'ת',
+    ];
+    const ask = (instruction: string): string[] =>
       authorisedRecipients({
-        instruction: 'תשלחי נ-dana@example.com',
+        instruction,
         actionClass: 'email.initiate',
         candidates: ['dana@example.com'],
         known: NO_ONE_KNOWN,
-      }),
-    ).toEqual([]);
+      });
+
+    for (const letter of particles) {
+      // Both join marks: ASCII hyphen-minus and the Hebrew maqaf (U+05BE).
+      expect(ask(`תשלחי ${letter}-dana@example.com`)).toEqual(['dana@example.com']);
+      expect(ask(`תשלחי ${letter}־dana@example.com`)).toEqual(['dana@example.com']);
+    }
+    for (const letter of notParticles) {
+      expect(ask(`תשלחי ${letter}-dana@example.com`)).toEqual([]);
+      expect(ask(`תשלחי ${letter}־dana@example.com`)).toEqual([]);
+    }
+    // A particle needs its join mark: glued straight onto the address with
+    // no hyphen or maqaf, nothing is stripped and the token does not match.
+    for (const letter of particles) {
+      expect(ask(`תשלחי ${letter}dana@example.com`)).toEqual([]);
+    }
   });
 
   it('does not authorise a phone number spliced together with dashes', () => {
@@ -395,13 +426,15 @@ describe('authorisedRecipients', () => {
     ).toEqual([]);
   });
 
-  it('does not authorise a phone-prefixed run of the wrong overall length', () => {
-    // Isolates looksLikePhoneNumber's significant-length clause: this run
-    // does start with `0` (the recognised prefix), and its last nine digits
-    // are the candidate's, but eleven digits remain after stripping the
-    // leading zero -- too many to be a real subscriber number. If this
-    // clause were stubbed to always pass, the shared last-nine digits alone
-    // would authorise the candidate.
+  it('anchors the key to the prefix rather than slicing it off the tail', () => {
+    // The core of R1. This run starts with the recognised `0` prefix and
+    // ENDS with the candidate's nine digits, which is precisely what the
+    // old last-nine key looked at. Anchoring to the prefix instead makes
+    // the run's key `00521234567` -- everything after the leading zero --
+    // which is not the candidate's `521234567`, so the two do not compare
+    // equal. (This test does NOT isolate the 8-or-9 length rule: with that
+    // rule removed the two keys still differ and the rejection still
+    // stands. The test below isolates it.)
     expect(
       authorisedRecipients({
         instruction: 'מספר לקוח 000521234567',
@@ -412,20 +445,172 @@ describe('authorisedRecipients', () => {
     ).toEqual([]);
   });
 
-  it('does not authorise a phone number bridging more than two separator groups', () => {
-    // Isolates looksLikePhoneNumber's separator-group clause on its own:
-    // this run has a valid prefix (`0`) and a valid significant length
-    // (nine digits), so only the excess of separators -- nine single
-    // dashes, not "one glued token, or split by an area code" -- can be
-    // rejecting it. If this clause were stubbed to always pass, the digits
-    // alone would authorise the candidate.
+  it('does not authorise a digit string of no phone number length, even typed verbatim', () => {
+    // Isolates the 8-or-9 rule, which needs BOTH sides to be the same
+    // string to be the only thing deciding: candidate and instruction carry
+    // an identical twelve-digit figure behind a `0`, so the keys would be
+    // equal and the candidate authorised if the length rule were dropped.
+    // Eleven digits after the prefix is neither a mobile nor a landline, so
+    // this figure names no phone number and authorises nobody -- a customer
+    // number the owner typed is still not a recipient.
     expect(
       authorisedRecipients({
-        instruction: 'לתשלום 0-5-2-1-2-3-4-5-6-7',
+        instruction: 'מספר לקוח 000521234567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['000521234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('authorises an Israeli landline typed in local form', () => {
+    // R2: `03-1234567` is a real Tel Aviv landline and has EIGHT significant
+    // digits after the leading `0`, not nine. The round-2 rule demanded nine
+    // or ten and so refused every landline in the country -- a false
+    // negative that makes the feature useless to the owner it is for.
+    expect(
+      authorisedRecipients({
+        instruction: 'תתקשרי ל-03-1234567 ותאשרי את הפגישה',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['031234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual(['031234567']);
+  });
+
+  it('gives one landline the same key in local and international form', () => {
+    // R2, the other half: prefix-anchoring is what makes `03-1234567` and
+    // `+972-3-1234567` reduce to the same eight significant digits
+    // (`31234567`). The old last-nine rule sliced `031234567` off one and
+    // `231234567` off the other, so a landline never matched its own
+    // international spelling.
+    expect(
+      authorisedRecipients({
+        instruction: 'תתקשרי ל-03-1234567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['+972-3-1234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual(['+972-3-1234567']);
+    expect(
+      authorisedRecipients({
+        instruction: 'תתקשרי ל-+972-3-1234567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['031234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual(['031234567']);
+  });
+
+  it('authorises a mobile written with a country code and three separator groups', () => {
+    // R2: `+972-54-123-4567` and `+972 54 123 4567` are both ordinary ways
+    // to write a mobile, and both carry three separator groups -- refused
+    // outright by round 2's `<= 2` cap. The cap is gone; prefix-anchoring
+    // plus the 8-or-9 rule bounds the run instead.
+    for (const instruction of [
+      'תשלחי הודעה ל-+972-54-123-4567',
+      'תשלחי הודעה ל-+972 54 123 4567',
+    ]) {
+      expect(
+        authorisedRecipients({
+          instruction,
+          actionClass: 'whatsapp.initiate',
+          candidates: ['0541234567'],
+          known: NO_ONE_KNOWN,
+        }),
+      ).toEqual(['0541234567']);
+    }
+  });
+
+  it('does not authorise a number whose significant digits are one too many', () => {
+    // R1: `יתרה 00 521234567` is a balance figure and a reference number,
+    // not a phone number. Under the old rule the run's LAST NINE digits
+    // were the key, so the unrelated leading `0` fell off the front and the
+    // splice matched. The key is now anchored to the prefix: the digits
+    // after the leading `0` are `0521234567`, ten of them, which is not a
+    // subscriber number and does not equal the candidate's `521234567`.
+    expect(
+      authorisedRecipients({
+        instruction: 'יתרה 00 521234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0521234567'],
         known: NO_ONE_KNOWN,
       }),
     ).toEqual([]);
   });
+
+  it('does not bridge a tab or a newline into one phone number', () => {
+    // R1's pasted-table row: two columns of a spreadsheet -- a company-id
+    // label, a `0`, and a reference number -- must not be read as one
+    // number because the whitespace between the cells happens to match
+    // `\s`. A phone number is written with plain spaces, never across a
+    // line break or a tab stop, so the run only bridges U+0020.
+    for (const instruction of ['ח.פ.\t0\t521234567', 'ח.פ.\n0\n521234567']) {
+      expect(
+        authorisedRecipients({
+          instruction,
+          actionClass: 'whatsapp.initiate',
+          candidates: ['0521234567'],
+          known: NO_ONE_KNOWN,
+        }),
+      ).toEqual([]);
+    }
+  });
+
+  it('records the residual: separators between a prefix and the digits still authorise', () => {
+    // NOT a desired behaviour -- a recorded gap, so nobody reads the tests
+    // above as proof the splice class is closed. Every string here reduces,
+    // once non-digits are stripped, to exactly `0521234567` or its
+    // international spelling. No rule that also has to accept
+    // `054-123-4567` and `+972 54 123 4567` can tell them apart, because
+    // after separator-stripping they are the same digits. What the module
+    // now guarantees is narrower and honest: the instruction must contain
+    // the target number's own digits behind a recognised prefix. If a later
+    // round narrows this further, this test is the one to update -- and
+    // deleting it without narrowing anything hides the gap again.
+    for (const instruction of [
+      'סעיף 0-521234567',
+      'שורה 0 521234567 בקובץ',
+      'פריט (0) 521234567',
+      'קוד 972 521234567',
+      'פריט 05 21234567',
+      'לתשלום 0-5-2-1-2-3-4-5-6-7',
+    ]) {
+      expect(
+        authorisedRecipients({
+          instruction,
+          actionClass: 'whatsapp.initiate',
+          candidates: ['0521234567'],
+          known: NO_ONE_KNOWN,
+        }),
+      ).toEqual(['0521234567']);
+    }
+  });
+
+  it('does not authorise a candidate that is neither an address nor a phone number', () => {
+    // R3: `EMAIL_SHAPE` is the only thing standing between a candidate that
+    // merely APPEARS in the owner's text and authorisation. `candidates`
+    // carries entity ids (see the known-entity-id test above), so without
+    // the whole-token shape test, `cust-42` would be authorised purely
+    // because those seven characters occur in the instruction -- including
+    // when the instruction is quoting text somebody else wrote. Remove the
+    // `EMAIL_SHAPE` filter from `emailAddressesIn` and this test fails; no
+    // other test in this file does.
+    expect(
+      authorisedRecipients({
+        instruction: 'תשלחי הצעה ללקוח cust-42 לפי מה שסיכמנו',
+        actionClass: 'email.initiate',
+        candidates: ['cust-42'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  // A test named 'does not authorise a phone number bridging more than two
+  // separator groups' used to sit here, pinning round 2's `<= 2` cap on
+  // `0-5-2-1-2-3-4-5-6-7`. The cap is gone -- it refused
+  // `+972-54-123-4567` and `+972 54 123 4567`, both ordinary spellings of a
+  // mobile (see the test for them above) -- so its string moved into
+  // 'records the residual: ...', where it is now correctly recorded as
+  // authorised rather than silently dropped.
 });
