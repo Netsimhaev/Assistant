@@ -29,7 +29,7 @@ describe('authorisedRecipients', () => {
   it('matches an address case-insensitively', () => {
     expect(
       authorisedRecipients({
-        instruction: 'תשלחי ל-Dana@Example.COM',
+        instruction: 'תשלחי אל Dana@Example.COM',
         actionClass: 'email.reply',
         candidates: ['dana@example.com'],
         known: NO_ONE_KNOWN,
@@ -89,7 +89,7 @@ describe('authorisedRecipients', () => {
   it('returns only the covered subset when a step reaches several people', () => {
     expect(
       authorisedRecipients({
-        instruction: 'תשלחי ל-dana@example.com',
+        instruction: 'תשלחי אל dana@example.com',
         actionClass: 'email.initiate',
         candidates: ['dana@example.com', 'stranger@elsewhere.com'],
         known: NO_ONE_KNOWN,
@@ -144,10 +144,19 @@ describe('authorisedRecipients', () => {
   });
 
   it('rejects a lookalike domain against a known one', () => {
-    // Pins the ruling half of C2 that the passing suite never exercised:
-    // delete the domain-matching branch entirely and every prior test still
-    // stays green, because none of them ever supplied a candidate whose
-    // domain should have been rejected.
+    // A sanity check on exact equality, not itself what distinguishes it
+    // from the forbidden `domainMatches`: that function is anchored on the
+    // label boundary too, so it already rejects 'evil-supplier.co.il'
+    // against 'supplier.co.il' for the same reason this assertion holds --
+    // the character before 'supplier' is '-', never '.'. The test that
+    // actually tells exact equality apart from `domainMatches` is the one
+    // below ('rejects a subdomain...'), confirmed by mutation in fix round
+    // 1: restoring `domainMatches`'s subdomain rule fails only that test.
+    // (A version of this comment once claimed deleting the domain-matching
+    // branch entirely would leave every prior test green. That was false --
+    // it fails 'covers a counterparty the charter already knows, even
+    // unnamed in the text' above, which needs this branch to return `true`
+    // for exactly this reason.)
     expect(
       authorisedRecipients({
         instruction: 'תשלחי הצעה',
@@ -188,7 +197,7 @@ describe('authorisedRecipients', () => {
   it('covers a doc.deliver recipient typed verbatim', () => {
     expect(
       authorisedRecipients({
-        instruction: 'תשלחי את המסמך ל-dana@example.com',
+        instruction: 'תשלחי את המסמך אל dana@example.com',
         actionClass: 'doc.deliver',
         candidates: ['dana@example.com'],
         known: NO_ONE_KNOWN,
@@ -249,6 +258,123 @@ describe('authorisedRecipients', () => {
         instruction: 'לפי הזמנה מספר 12345',
         actionClass: 'whatsapp.initiate',
         candidates: ['12345'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not authorise a domain glued to a footnote or order number', () => {
+    // N1: fix round 1's own \b-anchored regex backtracked on its trailing
+    // boundary and produced exactly the C1 failure mode again -- typing
+    // `billing@acme.co.il2024` (a real address with a year glued straight
+    // onto the TLD, the paste case spec §6 admits) let the regex settle for
+    // a match ending at `billing@acme.co`, because a `.` two characters
+    // early already satisfied `\b`. Whole-token comparison has no shorter
+    // match to settle for: the token either equals the candidate in full or
+    // it does not.
+    expect(
+      authorisedRecipients({
+        instruction: 'תשלחי ל billing@acme.co.il2024',
+        actionClass: 'email.initiate',
+        candidates: ['billing@acme.co'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not authorise a domain glued to a trailing underscore-suffixed word', () => {
+    // N1's second row: the same backtracking truncation, one character
+    // class over -- `dana@example.co.il_new` must not authorise
+    // `dana@example.co`, and `dana@sub.example.co.il_` must not authorise
+    // `dana@sub.example.co`.
+    expect(
+      authorisedRecipients({
+        instruction: 'תשלחי ל dana@example.co.il_new',
+        actionClass: 'email.initiate',
+        candidates: ['dana@example.co'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+    expect(
+      authorisedRecipients({
+        instruction: 'תשלחי ל dana@sub.example.co.il_',
+        actionClass: 'email.initiate',
+        candidates: ['dana@sub.example.co'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not authorise a phone number spliced together with dashes', () => {
+    // N2's first row: a different separator than the space fix round 1
+    // guarded against. `100-521-234-567` is three unrelated numbers, not
+    // one -- and it does not start with `0` or `972`, which is what
+    // actually excludes it.
+    expect(
+      authorisedRecipients({
+        instruction: 'הזמנה 100-521-234-567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['0521234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not authorise a phone number spliced together with dots', () => {
+    // N2's second row.
+    expect(
+      authorisedRecipients({
+        instruction: 'לפי חשבונית 1.521.234.567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['0521234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not authorise a company-registration number sharing a phone number\'s digits', () => {
+    // N2's third row: a single, unspliced number with no recognisable phone
+    // prefix at all -- `ח.פ.` (company id) is not a phone number's
+    // introduction, and `521234567` alone does not start with `0` or `972`.
+    expect(
+      authorisedRecipients({
+        instruction: 'ח.פ. 521234567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['0521234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not authorise a phone-prefixed run of the wrong overall length', () => {
+    // Isolates looksLikePhoneNumber's significant-length clause: this run
+    // does start with `0` (the recognised prefix), and its last nine digits
+    // are the candidate's, but eleven digits remain after stripping the
+    // leading zero -- too many to be a real subscriber number. If this
+    // clause were stubbed to always pass, the shared last-nine digits alone
+    // would authorise the candidate.
+    expect(
+      authorisedRecipients({
+        instruction: 'מספר לקוח 000521234567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['0521234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not authorise a phone number bridging more than two separator groups', () => {
+    // Isolates looksLikePhoneNumber's separator-group clause on its own:
+    // this run has a valid prefix (`0`) and a valid significant length
+    // (nine digits), so only the excess of separators -- nine single
+    // dashes, not "one glued token, or split by an area code" -- can be
+    // rejecting it. If this clause were stubbed to always pass, the digits
+    // alone would authorise the candidate.
+    expect(
+      authorisedRecipients({
+        instruction: 'לתשלום 0-5-2-1-2-3-4-5-6-7',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['0521234567'],
         known: NO_ONE_KNOWN,
       }),
     ).toEqual([]);

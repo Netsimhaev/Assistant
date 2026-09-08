@@ -75,83 +75,116 @@ function phoneKey(value: string): string | null {
 }
 
 /**
- * Whether `run` is plausibly a single phone number rather than several
- * unrelated numbers a whitespace-tolerant scan spliced together.
+ * Whether `run` looks like an actual Israeli phone number, not merely a
+ * digit string of plausible length.
  *
- * Two independent guards. First, a total digit count outside 9–15 — below
- * the shortest real subscriber number or above the longest number E.164
- * allows — cannot be a phone number at all. Second, at most one single-space
- * gap: a real number is written as one glued token (`054-123-4567`) or, at
- * most, split into two groups by a single space (`050 1234567`). Four
- * separate single-space gaps — `100 200 521 234 567` — is not how anyone
- * writes a phone number; it is how five unrelated three-digit numbers look
- * once a whitespace-tolerant regex has run a comma-free sentence together.
- * That exact string's last nine digits equal a real subscriber number's
- * last nine, with no address and no phone number appearing in the
- * instruction at all — the digit-count floor alone does not catch it (the
- * spliced total can itself land inside 9–15), so the space-count guard is
- * load-bearing on its own, not redundant with the count check beside it.
+ * Fix round 1 tried "digit count in 9–15, at most one whitespace gap" and
+ * both clauses turned out to be decorative: the regex in `phoneRunsIn` only
+ * ever handed this function a match with zero or one `\s` in it, so
+ * `spaceCount <= 1` could never see the input it was written to reject, and
+ * `digitCount < 9` only restated `phoneKey`'s own floor one call later. That
+ * left a single live clause (`> 15`), which nothing tested, and it still
+ * missed a whole family of splices that use a separator other than a space:
+ * `100-521-234-567`, `1.521.234.567`, `521234567` sitting after a company-id
+ * label — none of those contain two spaces, so the old guard waved all of
+ * them through, each synthesising a real subscriber number's last nine
+ * digits out of a number that never appeared in the instruction.
+ *
+ * This asks a different question: does `run` have the *shape* of a phone
+ * number, not just a length in some range. A real Israeli number starts
+ * with a recognisable prefix — a bare `0` (national dialling) or `972`
+ * (international, with or without the `+`) — and nothing else does; an
+ * order number, a company registration id, or several unrelated figures run
+ * together by a whitespace-tolerant scan will not, by construction, start
+ * with one of those two prefixes. After stripping the recognised prefix,
+ * what remains must be nine or ten digits — an Israeli subscriber number —
+ * and the run may bridge at most two separator groups, because a number is
+ * written as one glued token, split by an area code, or split by an area
+ * code and a country code: never four or five fragments stitched together.
  */
-function phoneRunPlausible(run: string): boolean {
-  const digitCount = run.replace(/\D/g, '').length;
-  if (digitCount < 9 || digitCount > 15) return false;
+function looksLikePhoneNumber(run: string): boolean {
+  const digits = run.replace(/\D/g, '');
+  let significant: string;
+  if (digits.startsWith('972')) {
+    significant = digits.slice(3);
+  } else if (digits.startsWith('0')) {
+    significant = digits.slice(1);
+  } else {
+    return false;
+  }
+  if (significant.length !== 9 && significant.length !== 10) return false;
 
-  const spaceCount = (run.match(/\s/g) ?? []).length;
-  return spaceCount <= 1;
+  const separatorGroups = run.match(/[\s().-]+/g) ?? [];
+  return separatorGroups.length <= 2;
 }
 
 /**
- * Phone-shaped runs in free text, filtered to the ones `phoneRunPlausible`
+ * Phone-shaped runs in free text, filtered to the ones `looksLikePhoneNumber`
  * accepts before anything is keyed off them.
  *
- * The regex itself already refuses to bridge two single-space gaps: the
- * optional trailing group matches *at most once*, so `100 200 521 234 567`
- * splits into three separate candidate runs (`100 200`, `521 234`, `567`)
- * rather than one that concatenates all five groups — each on its own falls
- * under the nine-digit floor before `phoneRunPlausible` is even consulted.
- * The plausibility filter is defence in depth for the runs the regex shape
- * alone does not rule out (a long dash-joined digit string with no spaces
- * at all, e.g. an invoice or tracking number).
+ * Deliberately broad on its own: this used to also try to structurally limit
+ * whitespace inside the match, which review found unreachable in practice
+ * (see `looksLikePhoneNumber`'s docblock) and which did nothing to stop a
+ * splice joined by dots or dashes instead of spaces. All of the real
+ * filtering now lives in one place, on the fully-formed candidate run, where
+ * it can see the whole shape at once rather than a fragment the regex
+ * happened to bound.
  */
 function phoneRunsIn(instruction: string): string[] {
-  const runs = instruction.match(/[+\d][\d().-]*(?:\s[\d().-]+){0,1}/g) ?? [];
-  return runs.filter(phoneRunPlausible);
+  const runs = instruction.match(/[+\d][\d\s().-]*/g) ?? [];
+  return runs.map((run) => run.trim()).filter(looksLikePhoneNumber);
 }
 
 /**
- * Email-shaped tokens in free text, anchored so a glued prefix (`ל-` typed
- * with no space before the address) is excluded but a real address is
- * extracted in full — greedy backtracking on the domain group means a
- * multi-label domain (`example.co.il`) is captured whole, never truncated
- * to a shorter domain that happens to be a substring of it (`example.co`).
- * That truncation was C1: `haystack.includes(candidate)` authorised
- * `dana@example.co` against text that actually said `dana@example.co.il`,
- * because a substring search cannot tell "the whole address" from "a prefix
- * of it that happens to look like one." Extracting the full token first and
- * comparing extracted-to-extracted makes that impossible: the two strings
- * are simply unequal.
+ * A deliberately loose but shape-checked address: no internal whitespace,
+ * exactly one `@`, and at least one `.` in the domain part. Mirrors
+ * `EMAIL_SHAPE` in `src/orchestrator/adapters/mail.ts` — not imported from
+ * there, since that module sits in the execution layer this one must not
+ * depend on, but kept to the same shape on purpose so "looks like an
+ * address" means the same thing wherever this codebase asks it.
+ */
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Sentence punctuation a token can trail without it being part of an address. */
+const TRAILING_PUNCTUATION = /[.,;:!?)"']+$/;
+
+/**
+ * Email-shaped tokens in free text, found the way `readEmails`
+ * (`src/policy/facts.ts`) finds them in a `to` field: split into fragments,
+ * clean each one up, then ask whether the *whole* fragment is an address —
+ * never search for an address-shaped stretch inside a larger fragment.
  *
- * `\b` on both ends is what excludes the glued prefix: at the boundary
- * between a non-word character (`-` or a Hebrew letter, neither in `\w`)
- * and the first word character of the real address, `\b` holds; between two
- * non-word characters (`ל` then `-`) it does not, so the match cannot start
- * there. The same asymmetry is why `reply@example.com` cannot match inside
- * `noreply@example.com`: there is no boundary between the `o` and the `r`
- * of "noreply", so the regex is never offered a starting position there at
- * all — a boundary check, not a domain check, and not hand-rolled against
- * `knownCounterparties`'s forbidden subdomain matcher (see `knownToCharter`).
+ * Free text has no commas to split a `to` field on, so the split here is on
+ * whitespace instead; everything else is the same shared pipeline. Splitting
+ * first and testing the whole token second is what closes both C1 and its
+ * round-1 recurrence: a fix-round-1 version of this function matched an
+ * address-shaped *stretch* inside the running text with a `\b`-anchored
+ * regex, and backtracking on that regex's trailing boundary is exactly what
+ * let `dana@example.co.il2` produce a match ending at `dana@example.co` — the
+ * boundary the regex needed was satisfied by the `.` two characters early,
+ * not by the true end of the address. A token, once isolated by whitespace,
+ * is tested whole (`EMAIL_SHAPE` is anchored at both ends): it is a
+ * candidate in its entirety or it is not a candidate at all, so there is no
+ * shorter match for a backtracking engine to settle for.
  *
- * Each match is passed through `extractAddressCandidate`
- * (`src/util/address.ts`) — the one place a raw fragment turns into an
- * address everywhere else in this codebase — so a `Name <addr@x.com>` form
- * embedded in free text unwraps the same way it would in a `to` field,
- * rather than this module inventing a second opinion about what counts.
+ * `TRAILING_PUNCTUATION` is stripped first so ordinary sentence punctuation
+ * glued to the end of a typed address — a period closing the sentence, a
+ * comma before the next clause — does not stay attached and defeat the exact
+ * comparison this function's caller makes. It only strips punctuation, never
+ * `<`/`>`: a token can genuinely be a bracket-wrapped `<addr@x.com>` form,
+ * and `extractAddressCandidate` (`src/util/address.ts`) — the one place a
+ * raw fragment turns into an address everywhere else in this codebase — is
+ * what unwraps that, exactly as it does for a comma-split `to` fragment. A
+ * token with no brackets at all passes through it unchanged; the branch that
+ * actually unwraps a display name is reached only when a token has one.
  */
 function emailAddressesIn(instruction: string): string[] {
-  const runs = instruction.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g) ?? [];
-  return runs
-    .map((run) => extractAddressCandidate(run))
+  return instruction
+    .split(/\s+/)
+    .map((token) => token.replace(TRAILING_PUNCTUATION, ''))
+    .map((token) => extractAddressCandidate(token))
     .filter((value): value is string => value !== null)
+    .filter((value) => EMAIL_SHAPE.test(value))
     .map((value) => value.toLowerCase());
 }
 
