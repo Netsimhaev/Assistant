@@ -33,7 +33,7 @@ import { DatabaseError } from 'pg';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
-import { readEmails } from '../policy/facts.js';
+import { readEmails, readPhones } from '../policy/facts.js';
 
 /** Postgres' unique/primary-key-violation error code (see `src/cli/create-owner.ts`). */
 const UNIQUE_VIOLATION = '23505';
@@ -172,8 +172,14 @@ export async function loadAuthorization(
  * conditions never overlap, so the entry could never change an outcome — a
  * dead member of a security-critical positive list, reading as a live
  * control while being unreachable.
+ *
+ * `memory.write_longterm` joins it for the same reason `crm.write` is there:
+ * remembering a preference the owner stated reaches nobody, spends nothing,
+ * and can be corrected. Spec §7 of the instruction door names these two and
+ * says why writing a file is not among them — the same action class covers
+ * running code.
  */
-const ENTAILED_INTERNAL_CLASSES: readonly ActionClass[] = ['crm.write'];
+const ENTAILED_INTERNAL_CLASSES: readonly ActionClass[] = ['crm.write', 'memory.write_longterm'];
 
 /**
  * Does the instruction already on record cover this call?
@@ -236,7 +242,11 @@ export function coveredByAuthorization(
   // with it deleted, and a test that cannot fail is not a test.
   if (named.size === 0) return false;
 
-  const going = readEmails(facts.input);
+  // Emails and phones both, because a WhatsApp step's recipient is a number
+  // and an authorisation that cannot see it could never cover one. The
+  // `every` below still applies to the combined list: one authorised address
+  // does not vouch for a stranger's number standing beside it.
+  const going = [...readEmails(facts.input), ...readPhones(facts.input)];
   if (going.length === 0) return false;
 
   // `every`, not `some`: one authorised recipient does not vouch for the
