@@ -68,17 +68,27 @@ describe('the instruction record', () => {
 
   it('refuses an empty instruction', async () => {
     const jobId = await aBossJob();
+    // Asserts on the Hebrew message, not just any rejection: a bare
+    // toThrow() would stay green even if the TypeScript check vanished and
+    // only the database CHECK caught it, leaving the owner with a raw
+    // Postgres error instead of a Hebrew sentence.
     await expect(
       saveInstruction({ jobId, text: '   ' }, { businessId: BUSINESS }),
-    ).rejects.toThrow();
+    ).rejects.toThrow('ההוראה ריקה');
   });
 
   it('refuses an instruction past the cap', async () => {
     const jobId = await aBossJob();
     const tooLong = 'א'.repeat(MAX_INSTRUCTION_CHARS + 1);
+    // Same reasoning as above, plus the intake-folder sentence: that phrasing
+    // is what tells the owner where a whole document belongs instead of the
+    // instruction box. A Postgres CHECK violation carries neither.
     await expect(
       saveInstruction({ jobId, text: tooLong }, { businessId: BUSINESS }),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/4000/);
+    await expect(
+      saveInstruction({ jobId, text: tooLong }, { businessId: BUSINESS }),
+    ).rejects.toThrow(/תיקיית הקליטה/);
   });
 
   it('never returns another business\'s instruction', async () => {
