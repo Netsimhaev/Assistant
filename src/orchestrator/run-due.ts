@@ -14,6 +14,10 @@ import type { Runtime } from './runtime.js';
  * Mirrors `RunPlanResult['status']` exactly (`run-plan.ts`), because that is
  * exactly what it reports — this function adds no status of its own for a
  * job that actually ran.
+ *
+ * A `rejected` entry has already been moved to `failed` by the time it is
+ * listed here, the same way `unbound` is (I1) — see the transition at the
+ * call site for why, and for why `halted` deliberately is not.
  */
 export interface RanJob {
   jobId: string;
@@ -206,6 +210,14 @@ export async function runDueJobs(
         if (active === null) {
           // Fatal, never permissive: a job cannot run without the policy
           // that governs it.
+          //
+          // Deliberately NOT transitioned to `failed`, unlike the `rejected`
+          // outcomes below. This is the one rejection that is a property of
+          // the BUSINESS rather than of the job: no job of this business can
+          // run while the charter is missing, so there is nothing behind
+          // this row for it to starve — and installing a charter makes every
+          // one of them runnable again. Failing them all on the way past
+          // would be an irreversible answer to a repairable condition.
           result.ran.push({ jobId, status: 'rejected', detail: 'no_active_charter' });
           continue;
         }
@@ -226,6 +238,37 @@ export async function runDueJobs(
           ...(runtime.notify !== undefined ? { notify: runtime.notify } : {}),
           ...(options.now !== undefined ? { now: options.now } : {}),
         });
+
+        if (outcome.status === 'rejected') {
+          // Terminal, for exactly the reason `RunDueResult.unbound` gives
+          // (I1). `rejected` means `runPlan` refused before performing
+          // anything, and it refused on a property of the stored plan and
+          // the charter — `no_channel_for_tool`, `ambiguous_channel`,
+          // `no_adapter_for_system` — none of which the next pass will find
+          // any different. Reported and left alone, the phase never moves,
+          // `updated_at` stays frozen, and the row sorts first under
+          // `ORDER BY updated_at ASC LIMIT 20` on every pass forever;
+          // twenty of them and that business's execution loop is dead.
+          //
+          // The instruction door is what made this reachable: `instruct.ts`
+          // is the only production caller of `bindPlanToJob`, and its
+          // pre-checks deliberately cover only what needs no database, so
+          // the three channel rejections above can arrive here and nowhere
+          // else. An owner with no WhatsApp connection in the charter typing
+          // "תשלחי לדנה וואטסאפ" produces one on the first pass.
+          //
+          // `halted` is NOT treated this way and must not be: `executeStep`
+          // has already moved the phase itself for every halt — to
+          // `await_approval`, `followup` or `failed` — so this job is not in
+          // `execute` any more and a transition from here would either be
+          // illegal or would overwrite a decision that was made properly.
+          await transition(jobId, {
+            to: 'failed',
+            actor: 'system',
+            reason: `run_due: ${outcome.code}`,
+            businessId,
+          });
+        }
 
         result.ran.push({
           jobId,
