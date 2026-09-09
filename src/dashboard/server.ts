@@ -23,6 +23,8 @@ import { DocumentAlreadySignedError, loadSignature } from '../governance/signatu
 import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
+import { runInstruction } from '../orchestrator/instruct.js';
+import { loadInstructionForJob, recordAnswer } from '../governance/instructions.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -43,6 +45,7 @@ import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
 import {
   renderApprovalCard,
   renderForbidden,
+  renderInstruct,
   renderLogin,
   renderNotFound,
   renderPasswordChange,
@@ -357,6 +360,93 @@ const READINGS_LIST_LIMIT = 50;
 async function handleReadings(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   const rows = await recentReadings(READINGS_LIST_LIMIT, { businessId });
   sendHtml(res, 200, renderReadings(rows, issueCsrfToken(session.sessionId)));
+}
+
+/**
+ * Renders `runInstruction`'s outcome exactly the same way whether it came
+ * from a fresh submission or from an answer to a clarifying question — the
+ * pipeline does not care which one produced the text it just planned (or
+ * refused, or asked about again).
+ */
+function renderInstructionOutcome(
+  res: ServerResponse,
+  session: Session,
+  outcome: Awaited<ReturnType<typeof runInstruction>>,
+): void {
+  const csrf = issueCsrfToken(session.sessionId);
+
+  if (outcome.status === 'refused') {
+    sendHtml(res, 400, renderInstruct({ csrf, error: outcome.reason }));
+    return;
+  }
+  if (outcome.status === 'needs_answer') {
+    sendHtml(
+      res,
+      200,
+      renderInstruct({ csrf, pending: { jobId: outcome.jobId, question: outcome.question } }),
+    );
+    return;
+  }
+  redirect(res, '/');
+}
+
+async function handleInstructGet(res: ServerResponse, session: Session): Promise<void> {
+  sendHtml(res, 200, renderInstruct({ csrf: issueCsrfToken(session.sessionId) }));
+}
+
+async function handleInstructPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const outcome = await runInstruction({ text: form.get('text') ?? '' }, { businessId });
+  renderInstructionOutcome(res, session, outcome);
+}
+
+/**
+ * The reply to a clarifying question `runInstruction` asked.
+ *
+ * A job waiting on a question sits in the `understand` phase, which nothing
+ * else in the system reads — `runDueJobs` only ever picks up jobs in
+ * `execute`, and the scheduler has no notion of "answer pending". This route
+ * is the only thing that ever moves such a job forward: it re-runs the same
+ * pipeline with the owner's answer appended to the original text, exactly as
+ * if the owner had typed both in one go from the start.
+ *
+ * `loadInstructionForJob` is scoped to `businessId` and returns `null` for a
+ * job that belongs to another business — indistinguishable, on purpose, from
+ * a job id that never existed at all, the same reasoning `handleCard` already
+ * applies to an approval id (both come back 404, never 403).
+ */
+async function handleInstructAnswer(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  jobId: string,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const instruction = await loadInstructionForJob(jobId, { businessId });
+  if (instruction === null) return sendHtml(res, 404, renderNotFound());
+
+  const answer = form.get('answer') ?? '';
+  await recordAnswer(instruction.instructionId, answer, { businessId });
+
+  const outcome = await runInstruction(
+    { text: `${instruction.text}\n\n${answer}` },
+    { businessId },
+  );
+  renderInstructionOutcome(res, session, outcome);
 }
 
 async function handleCard(res: ServerResponse, businessId: string, session: Session, approvalId: string): Promise<void> {
@@ -812,6 +902,7 @@ async function handleLogout(req: IncomingMessage, res: ServerResponse, businessI
 
 const CARD_PATH = /^\/a\/([^/]+)$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
+const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
 
 /** The outcome `handleDecision` records for each `DECISION_PATH` action. */
 const OUTCOME_FOR_ACTION = {
@@ -861,6 +952,15 @@ async function route(
 
   if (method === 'GET' && pathname === '/') return handlePendingList(res, businessId, session);
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
+
+  if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, session);
+  if (method === 'POST' && pathname === '/instruct') return handleInstructPost(req, res, businessId, session);
+
+  const instructAnswerMatch = INSTRUCT_ANSWER_PATH.exec(pathname);
+  if (method === 'POST' && instructAnswerMatch) {
+    const jobId = instructAnswerMatch[1];
+    if (jobId !== undefined) return handleInstructAnswer(req, res, businessId, session, jobId);
+  }
 
   const cardMatch = CARD_PATH.exec(pathname);
   if (method === 'GET' && cardMatch) {

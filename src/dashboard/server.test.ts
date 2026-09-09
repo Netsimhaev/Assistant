@@ -23,6 +23,7 @@ import { saveReading } from '../documents/reading-store.js';
 import { saveProposal } from '../orchestrator/proposal-store.js';
 import { loadSignature } from '../governance/signatures.js';
 import { queryAudit } from '../audit/log.js';
+import { loadInstructionForJob, saveInstruction } from '../governance/instructions.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
 import { assertBindableHost, createServer } from './server.js';
@@ -471,6 +472,155 @@ describe('GET /readings', () => {
     // No approval behind this proposal (job_id is null): the screen must say
     // so, not silently omit the row or link to nothing.
     expect(body).toContain('אין כרטיס — אין פעולה לאשר');
+  });
+});
+
+describe('GET /instruct, POST /instruct', () => {
+  it('serves the instruction box behind a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('מה לעשות');
+  });
+
+  it('refuses the instruction box without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+
+    const res = await fetch(`${baseUrl}/instruct`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  it('refuses a submitted instruction without a CSRF token', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/instruct`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ text: 'תשלחי לדנה' }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  // The brief for this test named '4,000' as the expected substring, but
+  // `instruct.ts` interpolates `MAX_INSTRUCTION_CHARS` (a bare number) with
+  // no locale formatting anywhere on this path — the refusal reads "...
+  // מ-4000 תווים...", not "4,000". Asserting the comma form would fail
+  // against the actual (correct) refusal text, so this checks '4000'.
+  it('shows the refusal when the instruction is too long, and opens no job', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, text: 'א'.repeat(4001) }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('4000');
+    const { rows } = await getPool().query(`SELECT 1 FROM boss_instructions`);
+    expect(rows).toHaveLength(0);
+  });
+});
+
+describe('POST /instruct/:jobId/answer', () => {
+  /**
+   * A job carrying a real instruction, wired up the same way `runInstruction`
+   * itself would (a real `charter_versions` row, so `jobs.charter_version`'s
+   * FK is satisfied) but with the charter never activated for anyone but the
+   * business under test. That keeps the second `runInstruction` call inside
+   * these tests from ever reaching `loadActiveCharter` with a hit — and so
+   * from ever reaching the live planner, which is exactly the model call
+   * CLAUDE.md says has never been exercised outside `npm run sdk:*` scripts.
+   */
+  async function anInstructionJob(businessId: string, text: string): Promise<string> {
+    const bundle = await installCharter(buildCharter(), { businessId });
+    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
+    await saveInstruction({ jobId: job.jobId, text }, { businessId });
+    return job.jobId;
+  }
+
+  it('refuses without a CSRF token', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ answer: 'דנה כהן' }),
+    });
+    expect(res.status).toBe(403);
+
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
+  });
+
+  it('refuses without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      body: new URLSearchParams({ answer: 'דנה כהן' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  // The exact case the task calls out: `loadInstructionForJob` returns
+  // `null` for a job that belongs to another business — a value, not a
+  // throw — and the route has to turn that into a clean refusal itself.
+  it("refuses to answer another business's job instead of throwing", async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const otherJobId = await anInstructionJob(OTHER_BUSINESS, 'תשלחי לדנה את ההצעה');
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${otherJobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'דנה כהן' }),
+    });
+    expect(res.status).toBe(404);
+
+    const stored = await loadInstructionForJob(otherJobId, { businessId: OTHER_BUSINESS });
+    expect(stored?.answer).toBeNull();
+  });
+
+  // The route must actually move a job stuck waiting on a question: this
+  // proves `recordAnswer` ran (the row now carries the owner's answer) and
+  // that the follow-up `runInstruction` call is reached and handled cleanly
+  // (400, not a throw or a hang) rather than skipped. No charter is active
+  // for this business at answer time, so the follow-up refuses with "no
+  // active charter" before it would ever reach the live planner.
+  it('records the answer and re-runs the pipeline instead of leaving the job stuck', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    // Undoes the activation `anInstructionJob` needed only to satisfy the
+    // `jobs.charter_version` foreign key — leaving `charter_versions` intact.
+    await getPool().query(`DELETE FROM charter_active WHERE business_id = $1`, [BUSINESS]);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'דנה כהן, dana@example.com' }),
+    });
+
+    expect(res.status).toBe(400);
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBe('דנה כהן, dana@example.com');
   });
 });
 

@@ -198,7 +198,7 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/readings">מה קראתי</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/readings">מה קראתי</a></p>
 ${list}`,
   );
 }
@@ -421,6 +421,54 @@ ${signErrorBlock}
   </form>
   ${options.document && isDocumentDecisionIntent(options.documentIntent ?? null) ? signForm(approval.approvalId, options.csrf, options.document, noteValue) : ''}
 </div>`,
+  );
+}
+
+/**
+ * The instruction box.
+ *
+ * One field and one button. The note under it is not decoration: an
+ * instruction is its own approval, and the owner should know that before they
+ * type, not discover it afterwards.
+ */
+export function renderInstruct(options: {
+  csrf: string;
+  error?: string;
+  pending?: { jobId: string; question: string } | null;
+}): string {
+  const error =
+    options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
+
+  const pending =
+    options.pending == null
+      ? ''
+      : `<article class="card">
+           <h3>שאלה לפני שאמשיך</h3>
+           <p>${esc(options.pending.question)}</p>
+           <form method="POST" action="/instruct/${esc(options.pending.jobId)}/answer">
+             <input type="hidden" name="csrf" value="${esc(options.csrf)}">
+             <textarea name="answer" rows="2" required></textarea>
+             <button>לענות ולהמשיך</button>
+           </form>
+         </article>`;
+
+  return page(
+    'מה לעשות',
+    `<h1>מה לעשות</h1>
+     ${error}
+     ${pending}
+     <form method="POST" action="/instruct">
+       <input type="hidden" name="csrf" value="${esc(options.csrf)}">
+       <textarea name="text" rows="4" maxlength="4000" required
+                 placeholder="למשל: תשלחי לדנה dana@example.com את ההצעה"></textarea>
+       <button>שלח</button>
+     </form>
+     <p class="muted">
+       מה שתכתוב כאן נחשב אישור בפני עצמו — לא אישאל אותך שוב על מה שביקשת.
+       פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — עדיין תעצור ותשאל.
+     </p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a></p>
+     ${logoutForm(options.csrf)}`,
   );
 }
 
