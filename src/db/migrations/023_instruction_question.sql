@@ -24,9 +24,12 @@
 
 ALTER TABLE boss_instructions ADD COLUMN question TEXT;
 
--- The same bound the instruction and the answer already live under. A question
--- is model output, and model output that can grow without limit is a storage
--- bound nobody set.
+-- The same bound `text` already lives under (see 022_boss_instructions.sql).
+-- `answer` carries no CHECK at all — it is bounded only in TypeScript, at the
+-- dashboard route (see src/dashboard/server.ts) — so this is not "the same
+-- bound both already live under"; it is `question`'s own. A question is model
+-- output, and model output that can grow without limit is a storage bound
+-- nobody set.
 ALTER TABLE boss_instructions
   ADD CONSTRAINT boss_instructions_question_bounded
   CHECK (question IS NULL OR length(question) <= 4000);
