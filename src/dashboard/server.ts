@@ -24,7 +24,7 @@ import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
 import { runInstruction } from '../orchestrator/instruct.js';
-import { transition } from '../orchestrator/jobs.js';
+import { loadJob, transition } from '../orchestrator/jobs.js';
 import { MAX_INSTRUCTION_CHARS, loadInstructionForJob, recordAnswer } from '../governance/instructions.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
@@ -424,28 +424,26 @@ async function handleInstructPost(
 
 /**
  * The `job_steps.reason` recorded when the job parked on a clarifying
- * question is closed out after its answer is processed.
+ * question is closed out after its answer produced a replacement job.
  *
- * `runInstruction` calls `createJob` unconditionally — the answer does not
- * resume the parked job, it opens a brand-new one (see `handleInstructAnswer`
- * below). This is what lets an operator reading the audit trail follow it
- * from the parked job to whatever replaced it, when a replacement was
- * actually created; a re-run that refuses before `createJob` (an over-length
- * join, no active charter) never creates one, so that branch says so instead
- * of inventing an id that does not exist. It also stays in English rather
- * than folding in `outcome.reason`: that string is the owner-facing Hebrew
- * refusal (CLAUDE.md: Hebrew for what the owner reads, English for internal
- * records), and `job_steps.reason` is the latter — the instruction row this
- * job already carries is where the detail lives.
+ * Only ever called when `runInstruction` actually created one — `planned`
+ * and `needs_answer` both carry a `jobId`, and the parameter type is
+ * restricted to exactly that (`Extract<..., { jobId: string }>` drops
+ * `refused`, which has no such field). A `refused` re-run never reaches
+ * `createJob` — checked before this is ever invoked, in the phase guard and
+ * the length/emptiness guards inside `handleInstructAnswer` — so there is
+ * never a case where this function needs to say "no replacement exists";
+ * that used to be a runtime branch here, and is now a compile-time
+ * impossibility instead.
  *
- * Exported and pure so both branches — including the one behind a bound plan,
- * which needs a live model call this dashboard route has no way to inject
- * around — can be tested without a network call or a database.
+ * Exported and pure so it can be tested without a network call or a
+ * database — producing a genuine `planned` outcome through this HTTP route
+ * would need a live model call this route has no way to inject around.
  */
-export function reasonForSupersededJob(outcome: Awaited<ReturnType<typeof runInstruction>>): string {
-  return outcome.status === 'refused'
-    ? 'instruction door: answered; re-run refused before a replacement job was created'
-    : `instruction door: answered; superseded by ${outcome.jobId}`;
+export function reasonForSupersededJob(
+  outcome: Extract<Awaited<ReturnType<typeof runInstruction>>, { jobId: string }>,
+): string {
+  return `instruction door: answered; superseded by ${outcome.jobId}`;
 }
 
 /**
@@ -457,13 +455,39 @@ export function reasonForSupersededJob(outcome: Awaited<ReturnType<typeof runIns
  * is the only thing that ever acts on such a job again: it records the
  * answer, then re-runs the pipeline with the owner's answer appended to the
  * original text, exactly as if the owner had typed both in one go from the
- * start. That re-run is a **new** job, not a resumption of the parked one —
- * `runInstruction` calls `createJob` unconditionally — so the parked job is
- * closed out (`transition` to `failed`, reason from `reasonForSupersededJob`)
- * rather than left sitting in `understand` forever, which is exactly the
- * orphan-phase leak CLAUDE.md names ("פאזה בלי קורא אינה מקום מנוחה אלא
- * דלף"). Resuming the parked job itself instead of superseding it would be a
- * larger change than this route carries.
+ * start.
+ *
+ * **Only a job actually parked in `understand` may be answered** — checked
+ * first, before `recordAnswer`, before `runInstruction`, before any
+ * transition. An earlier version of this route skipped that check and
+ * transitioned unconditionally, which broke two ways from the same line:
+ *
+ *   - A re-run that refuses (an over-length join, no active charter) used to
+ *     close the ORIGINAL job out anyway, even though nothing replaced it. The
+ *     owner's obvious next move — shorten the answer and resubmit from the
+ *     same page — then landed on a job already `failed`, and
+ *     `failed → failed` is illegal: `transition` throws, uncaught, straight
+ *     to the top-level 500 handler. A retry that used to work stopped
+ *     working.
+ *   - Nothing scoped this route to a job actually waiting for an answer —
+ *     only to "a job in this business with an instruction row", which any
+ *     successfully PLANNED instruction has too. A job sitting in `execute`
+ *     qualifies, and `execute → failed` is a legal transition, so a POST here
+ *     against the wrong job could overwrite its instruction's answer, open a
+ *     redundant job, and fail an in-flight, already-authorised plan.
+ *
+ * The phase guard fixes both at once: refused, the parked job is left
+ * exactly where it was (so the retry above lands on a job still in
+ * `understand`, not one already `failed`); already resolved into something
+ * else, the request is refused before touching anything.
+ *
+ * The re-run itself is always a **new** job, not a resumption of the parked
+ * one — `runInstruction` calls `createJob` unconditionally — so the parked
+ * job is closed out (`transition` to `failed`, reason from
+ * `reasonForSupersededJob`) only on `planned` or `needs_answer`, i.e. only
+ * when a replacement actually exists to name. Resuming the parked job itself
+ * instead of superseding it would be a larger change than this route
+ * carries.
  *
  * `loadInstructionForJob` is scoped to `businessId` and returns `null` for a
  * job that belongs to another business — indistinguishable, on purpose, from
@@ -484,6 +508,21 @@ async function handleInstructAnswer(
 
   const instruction = await loadInstructionForJob(jobId, { businessId });
   if (instruction === null) return sendHtml(res, 404, renderNotFound());
+
+  // Scoped to a job that is actually waiting on this answer — see this
+  // function's own docblock for the two ways skipping this check broke.
+  const job = await loadJob(jobId, { businessId });
+  if (job === null) return sendHtml(res, 404, renderNotFound());
+  if (job.phase !== 'understand') {
+    return sendHtml(
+      res,
+      400,
+      renderInstruct({
+        csrf: issueCsrfToken(session.sessionId),
+        error: 'הבקשה הזו כבר אינה ממתינה לתשובה.',
+      }),
+    );
+  }
 
   const answer = form.get('answer') ?? '';
   // The textarea's `required` is client-side only, and unlike `text` this
@@ -517,12 +556,17 @@ async function handleInstructAnswer(
     { businessId },
   );
 
-  await transition(jobId, {
-    to: 'failed',
-    actor: 'human',
-    reason: reasonForSupersededJob(outcome),
-    businessId,
-  });
+  // Only when a replacement actually exists — a `refused` re-run leaves the
+  // parked job exactly where it was, so a shortened retry finds it still
+  // waiting in `understand` instead of already `failed`.
+  if (outcome.status !== 'refused') {
+    await transition(jobId, {
+      to: 'failed',
+      actor: 'human',
+      reason: reasonForSupersededJob(outcome),
+      businessId,
+    });
+  }
 
   renderInstructionOutcome(res, session, outcome);
 }

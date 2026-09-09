@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { createJob, jobHistory, loadJob, transition } from '../orchestrator/jobs.js';
+import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import { enqueueApproval, getApproval } from '../governance/approvals.js';
 import type { ActionFacts } from '../domain/policy.js';
 import type { RiskAssessment } from '../domain/risk.js';
@@ -574,7 +574,14 @@ describe('renderInstruct — grantNote (fix round 1, C1)', () => {
   });
 });
 
-describe('reasonForSupersededJob (fix round 1, I2)', () => {
+describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N2)', () => {
+  // Fix round 2: `reasonForSupersededJob` no longer accepts a `refused`
+  // outcome at all — its parameter type is `Extract<..., { jobId: string }>`,
+  // which `refused` (no `jobId` field) does not satisfy. That used to be a
+  // runtime branch ("says no replacement was created..."); the route now
+  // never calls this function on a `refused` outcome in the first place (see
+  // `handleInstructAnswer`), so the "no replacement" case is a compile-time
+  // impossibility rather than a string this function has to produce.
   it('names the replacement job when the re-run produced one', () => {
     expect(
       reasonForSupersededJob({
@@ -595,28 +602,39 @@ describe('reasonForSupersededJob (fix round 1, I2)', () => {
       }),
     ).toContain('J-ASKS-AGAIN');
   });
-
-  it('says no replacement was created when the re-run refused, without inventing an id', () => {
-    const reason = reasonForSupersededJob({ status: 'refused', reason: 'ההוראה ריקה.' });
-    expect(reason).not.toContain('J-');
-    expect(reason.toLowerCase()).toContain('refused');
-  });
 });
 
 describe('POST /instruct/:jobId/answer', () => {
   /**
-   * A job carrying a real instruction, wired up the same way `runInstruction`
-   * itself would (a real `charter_versions` row, so `jobs.charter_version`'s
-   * FK is satisfied) but with the charter never activated for anyone but the
-   * business under test. That keeps the second `runInstruction` call inside
-   * these tests from ever reaching `loadActiveCharter` with a hit — and so
-   * from ever reaching the live planner, which is exactly the model call
-   * CLAUDE.md says has never been exercised outside `npm run sdk:*` scripts.
+   * A job parked in `understand` carrying a real instruction, wired up the
+   * same way `runInstruction` itself would leave it while waiting on an
+   * answer (a real `charter_versions` row, so `jobs.charter_version`'s FK is
+   * satisfied, and the `intake → understand` move `saveInstruction` is
+   * followed by in production).
+   *
+   * `installCharter` activates the charter it installs — there is no
+   * "installed but inactive" variant in this helper (an earlier version of
+   * this file deactivated it again with a `DELETE FROM charter_active` after
+   * calling this, to keep `loadActiveCharter` missing; that line is gone).
+   * So every test in this block that re-runs the pipeline for real DOES reach
+   * `loadActiveCharter` with a hit, and would proceed toward the live
+   * planner. What keeps these tests off the network instead is entirely the
+   * length cap: every answer POSTed here is sized so the joined instruction
+   * either exceeds `MAX_INSTRUCTION_CHARS` on its own or fails a guard before
+   * `runInstruction` is ever called — `runInstruction` checks that cap before
+   * `loadActiveCharter`, so a long-enough join refuses before the charter (or
+   * the planner) is ever consulted. There is no other guard here doing that
+   * job; a future test in this block that posts a short answer against a job
+   * with an active charter WILL reach the live planner.
+   *
+   * A test that needs the job somewhere OTHER than `understand` (fix round 2,
+   * N2's phase guard tests) transitions it further after calling this.
    */
   async function anInstructionJob(businessId: string, text: string): Promise<string> {
     const bundle = await installCharter(buildCharter(), { businessId });
     const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
     await saveInstruction({ jobId: job.jobId, text }, { businessId });
+    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup', businessId });
     return job.jobId;
   }
 
@@ -689,12 +707,15 @@ describe('POST /instruct/:jobId/answer', () => {
       body: new URLSearchParams({ csrf, answer: '   ' }),
     });
     expect(res.status).toBe(400);
+    expect(await res.text()).toContain('התשובה ריקה');
 
     const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
     expect(stored?.answer).toBeNull();
-    // The parked job is untouched — refused before the close-out transition too.
+    // The parked job is untouched — refused before the close-out transition
+    // too, and still `understand` (fix round 2: `anInstructionJob` parks the
+    // job there directly, matching where a real answer-pending job sits).
     const job = await loadJob(jobId, { businessId: BUSINESS });
-    expect(job?.phase).toBe('intake');
+    expect(job?.phase).toBe('understand');
   });
 
   // Fix round 1, M2: `answer` has no CHECK constraint bounding it the way
@@ -759,19 +780,69 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(stored?.answer).toBe(answer);
   });
 
-  // Fix round 1, I2: the parked job must not be left in `understand` forever
-  // once its answer has been processed — `runInstruction` opens a new job
-  // rather than resuming this one, so the docblock's claim only holds if the
-  // route itself closes the parked job out. The re-run above refuses before
-  // ever creating a replacement (the join alone exceeds the length cap), so
-  // this checks the "no replacement" branch of `reasonForSupersededJob` end
-  // to end; the "names an actual replacement id" branch is exercised directly
-  // by the `reasonForSupersededJob` unit tests, since producing a real bound
-  // plan through this HTTP route would require a live model call.
-  it('closes the parked job out instead of leaving it stuck in understand', async () => {
+  // Fix round 2, N1: a refused re-run must leave the parked job exactly where
+  // it was, not close it out. Before this fix, `handleInstructAnswer`
+  // transitioned unconditionally: the first refused POST here would have
+  // moved the job to `failed`, and the second POST — the owner's obvious
+  // next move, resubmitting from the same page — would have hit
+  // `transition(jobId, { to: 'failed' })` again on a job already `failed`,
+  // which is an illegal transition that throws uncaught to the top-level 500
+  // handler. Both POSTs below stay under the length cap's live-planner
+  // avoidance strategy (see the note on `anInstructionJob`): each answer
+  // alone is well under `MAX_INSTRUCTION_CHARS`, but joined with the
+  // ~3,990-character original both cross it, so both refuse deterministically
+  // before `createJob` — never reaching the planner.
+  it('lets a second POST retry after a refused re-run instead of 500ing', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const originalText = 'א'.repeat(3990);
+    const jobId = await anInstructionJob(BUSINESS, originalText);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const firstRes = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'ב'.repeat(20) }),
+    });
+    expect(firstRes.status).toBe(400);
+    expect(await firstRes.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+
+    const afterFirst = await loadJob(jobId, { businessId: BUSINESS });
+    expect(afterFirst?.phase).toBe('understand');
+
+    // The retry — same job, a different (still over-cap-when-joined) answer.
+    // Pre-fix this 500s; post-fix it refuses the same clean way the first
+    // POST did, because the job is still `understand`, not `failed`.
+    const secondRes = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'ג'.repeat(20) }),
+    });
+    expect(secondRes.status).toBe(400);
+    expect(await secondRes.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+
+    const afterSecond = await loadJob(jobId, { businessId: BUSINESS });
+    expect(afterSecond?.phase).toBe('understand');
+  });
+
+  // Fix round 2, N1 (the other side): once a re-run DOES produce a
+  // replacement, the parked job is closed out — and a second POST against
+  // the now-closed job must meet the phase guard, not attempt (and illegally
+  // repeat) another close-out. Reaching a genuine `planned`/`needs_answer`
+  // outcome through this route needs a live model call (see the module
+  // docblock), so this simulates the post-success state directly: transition
+  // the parked job to `failed` the same way `handleInstructAnswer` itself
+  // would after a successful re-run, then POST again.
+  it('refuses a second POST after the parked job has already been closed out', async () => {
     const baseUrl = await startServer(BUSINESS);
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
-    await transition(jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup', businessId: BUSINESS });
+    await transition(jobId, {
+      to: 'failed',
+      actor: 'human',
+      reason: 'instruction door: answered; superseded by J-SIMULATED-REPLACEMENT',
+      businessId: BUSINESS,
+    });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
     const csrf = extractCsrf(await boxPage.text());
@@ -779,23 +850,44 @@ describe('POST /instruct/:jobId/answer', () => {
     const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
       method: 'POST',
       headers: { cookie },
-      // Exactly `MAX_INSTRUCTION_CHARS` on its own (passes the per-field
-      // check above, which only refuses STRICTLY more), but joined with the
-      // ~20-character original this crosses 4,000 — refusing inside
-      // `runInstruction`, before `createJob` and so before any live planner
-      // call, exactly like the join-probe test above. That keeps this test
-      // network-free while still landing on a real `transition` call this
-      // test can observe.
-      body: new URLSearchParams({ csrf, answer: 'ג'.repeat(4000) }),
+      body: new URLSearchParams({ csrf, answer: 'תשובה כלשהי' }),
     });
     expect(res.status).toBe(400);
+    expect(await res.text()).toContain('כבר אינה ממתינה לתשובה');
+
+    // The guard fires before `recordAnswer` — the row from the original
+    // answer (never set in this test) stays untouched, not overwritten.
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
+  });
+
+  // Fix round 2, N2: the route must not be able to fail an unrelated,
+  // in-flight job just because it shares a business and carries an
+  // instruction row — which any successfully planned instruction does.
+  // `execute → failed` is a legal transition, so without the phase guard this
+  // would silently kill a running plan.
+  it("refuses to answer a job that isn't parked (e.g. already executing), and leaves it untouched", async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    for (const to of ['plan', 'execute'] as const) {
+      await transition(jobId, { to, actor: 'orchestrator', reason: 'test setup', businessId: BUSINESS });
+    }
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'תשובה כלשהי' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('כבר אינה ממתינה לתשובה');
 
     const job = await loadJob(jobId, { businessId: BUSINESS });
-    expect(job?.phase).toBe('failed');
-    const history = await jobHistory(jobId);
-    const last = history[history.length - 1];
-    expect(last?.to).toBe('failed');
-    expect(last?.reason).toContain('re-run refused');
+    expect(job?.phase).toBe('execute');
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
   });
 });
 
