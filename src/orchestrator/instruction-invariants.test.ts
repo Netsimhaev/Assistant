@@ -67,9 +67,34 @@ describe('the instruction door cannot widen its own authority', () => {
  * with raw SQL; it does not — and by its own design cannot — notice a second
  * *caller* of the exported `grantAuthorization` function that reached the
  * table through that one writer while skipping `authorisedRecipients`
- * entirely. This closes that gap: it fails if a second production call site
- * to `grantAuthorization` appears anywhere, and it fails if the one call site
- * that remains stops routing through `authorisedRecipients` first.
+ * entirely. This closes part of that gap: it fails if a second production
+ * file contains the literal text `grantAuthorization(`, and it fails if the
+ * one remaining call site stops routing through `authorisedRecipients` first
+ * or drops the ordering between the two.
+ *
+ * **What this still does not close.** Both checks below are textual, over
+ * the literal identifier `grantAuthorization`. None of the following would be
+ * caught: an aliased import (`import { grantAuthorization as grant } from
+ * './authorization.js'`, then calling `grant(...)`); a re-export from a third
+ * module that a caller imports instead of the original; or a wrapper function
+ * — `function widen(x) { return grantAuthorization(x); }` — called from a
+ * second production file, since that file's own text never contains the
+ * banned literal. Each is a real gap, not a hypothetical one: nothing in this
+ * codebase's tooling forbids any of the three. What this test actually locks
+ * is narrower and still worth having — a second *literal, unaliased* call to
+ * `grantAuthorization(`, and the fixed order inside the one call this
+ * codebase currently makes.
+ *
+ * **The two-part sweep below is coupled to `authorization.ts` by name and
+ * path, not just by the function it defines.** `AUTHORIZATION_MODULE` is
+ * excluded from the caller search by comparing the swept file's path against
+ * a hardcoded `governance/authorization.ts` — the one exclusion needed so the
+ * function's own `export async function grantAuthorization(` declaration line
+ * doesn't count as a call to itself. A pure rename or move of that module
+ * (with every call site updated to match) would make this test fail on a
+ * refactor that changed nothing about the property being guarded, rather than
+ * on a real regression — the same trade-off `proposal-invariants.test.ts`
+ * accepts for the same reason in its own writer-sweep test.
  *
  * `fileURLToPath(new URL(...))`, never `.pathname` — on Windows the latter
  * yields a leading-slash drive path (`/C:/...`) that `readdirSync` rejects.
