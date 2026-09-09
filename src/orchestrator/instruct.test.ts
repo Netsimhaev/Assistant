@@ -132,6 +132,14 @@ describe('runInstruction', () => {
     expect(jobs.rows[0]?.phase).toBe('understand');
     const auths = await getPool().query(`SELECT 1 FROM job_authorizations`);
     expect(auths.rows).toHaveLength(0);
+
+    // I3: the question is written down, not merely returned. Without this
+    // row it lives only in the HTTP response that carried it, and a reload
+    // orphans the job in `understand` with the owner unable to see what they
+    // were asked.
+    const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
+    expect(stored?.question).toBe('איזו דנה?');
+    expect(result.instructionText).toBe('תשלחי לדנה את ההצעה');
   });
 
   it('refuses an unparseable plan without opening anything runnable', async () => {

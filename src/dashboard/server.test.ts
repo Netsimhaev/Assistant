@@ -23,7 +23,12 @@ import { saveReading } from '../documents/reading-store.js';
 import { saveProposal } from '../orchestrator/proposal-store.js';
 import { loadSignature } from '../governance/signatures.js';
 import { queryAudit } from '../audit/log.js';
-import { loadInstructionForJob, saveInstruction } from '../governance/instructions.js';
+import {
+  loadInstructionForJob,
+  recordAnswer,
+  recordQuestion,
+  saveInstruction,
+} from '../governance/instructions.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
 import { assertBindableHost, createServer, reasonForSupersededJob } from './server.js';
@@ -544,6 +549,85 @@ describe('GET /instruct, POST /instruct', () => {
     expect(await res.text()).toContain('ארוכה מ-4000 תווים');
     const { rows } = await getPool().query(`SELECT 1 FROM boss_instructions`);
     expect(rows).toHaveLength(0);
+    // M3: an empty `boss_instructions` is also true if the cap is deleted and
+    // `saveInstruction` throws instead — `runInstruction` catches that throw,
+    // fails the job it already opened, and returns a refusal that reads
+    // differently but still leaves this table empty. What the cap uniquely
+    // buys is that no job is opened at all, so that is what is asserted.
+    const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
+    expect(jobs.rows).toHaveLength(0);
+  });
+
+  /**
+   * I3: a clarifying question has to survive the page it was born on.
+   *
+   * `GET /instruct` rendered the empty box with no lookup at all, so the
+   * parked job's id and its question existed only in the HTML of the POST
+   * response that created them. Reload, navigate away or close the tab, and
+   * the job was orphaned in `understand` — a phase nothing in the scheduler
+   * touches — with the owner unable to ever see what they were asked.
+   *
+   * Set up the way `runInstruction` leaves it: an instruction row carrying
+   * the question, on a job parked in `understand`, with no answer yet.
+   */
+  it('shows a parked question and its answer form on a fresh GET', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    const instruction = await saveInstruction(
+      { jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
+      { businessId: BUSINESS },
+    );
+    await recordQuestion(instruction.instructionId, 'לאיזו דנה — כהן או לוי?', {
+      businessId: BUSINESS,
+    });
+    await transition(job.jobId, {
+      to: 'understand',
+      actor: 'orchestrator',
+      reason: 'test setup',
+      businessId: BUSINESS,
+    });
+
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const body = await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text();
+
+    expect(body).toContain('לאיזו דנה — כהן או לוי?');
+    // The question without a way to answer it is half the feature.
+    expect(body).toContain(`action="/instruct/${job.jobId}/answer"`);
+  });
+
+  it('does not list a question that has already been answered', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    const instruction = await saveInstruction(
+      { jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
+      { businessId: BUSINESS },
+    );
+    await recordQuestion(instruction.instructionId, 'לאיזו דנה?', { businessId: BUSINESS });
+    await transition(job.jobId, {
+      to: 'understand',
+      actor: 'orchestrator',
+      reason: 'test setup',
+      businessId: BUSINESS,
+    });
+    // The answer is recorded but the re-run refused, so the job is still
+    // parked in `understand`. Phase alone would keep listing this as an open
+    // question the owner has in fact already answered.
+    await recordAnswer(instruction.instructionId, 'דנה כהן', { businessId: BUSINESS });
+
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const body = await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text();
+
+    expect(body).not.toContain('לאיזו דנה?');
   });
 });
 
@@ -599,6 +683,7 @@ describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N
         jobId: 'J-ASKS-AGAIN',
         instructionId: 'INS-1',
         question: 'איזו דנה?',
+        instructionText: 'תשלחי לדנה את ההצעה',
       }),
     ).toContain('J-ASKS-AGAIN');
   });

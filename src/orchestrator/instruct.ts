@@ -59,6 +59,7 @@ import { planProblems, type Plan } from '../domain/plan.js';
 import { grantAuthorization } from '../governance/authorization.js';
 import {
   MAX_INSTRUCTION_CHARS,
+  recordQuestion,
   saveInstruction,
   type InstructionRecord,
 } from '../governance/instructions.js';
@@ -95,7 +96,20 @@ export type InstructionOutcome =
        */
       grantNote: string | null;
     }
-  | { status: 'needs_answer'; jobId: string; instructionId: string; question: string }
+  | {
+      status: 'needs_answer';
+      jobId: string;
+      instructionId: string;
+      question: string;
+      /**
+       * The text this question was asked about — exactly what was stored.
+       *
+       * Carried on the outcome rather than re-read by the caller so the card
+       * rendered immediately after a POST shows the same pairing the parked
+       * list on `GET /instruct` shows, from one source.
+       */
+      instructionText: string;
+    }
   | { status: 'refused'; reason: string };
 
 export async function runInstruction(
@@ -200,11 +214,18 @@ export async function runInstruction(
   // A question is not a plan. The job stops here and waits, and nothing is
   // bound or granted — see spec §8.
   if (plan.clarifyingQuestion !== null) {
+    // Written down before the answer is returned, so the question outlives
+    // the HTTP response that carries it (I3). Until this line the question
+    // existed only in that response: a reload orphaned the job in
+    // `understand`, a phase nothing in the scheduler touches, with the owner
+    // unable to see what they had been asked.
+    await recordQuestion(instruction.instructionId, plan.clarifyingQuestion, { businessId });
     return {
       status: 'needs_answer',
       jobId: job.jobId,
       instructionId: instruction.instructionId,
       question: plan.clarifyingQuestion,
+      instructionText: instruction.text,
     };
   }
 

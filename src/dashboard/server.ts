@@ -26,7 +26,12 @@ import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
 import { runInstruction } from '../orchestrator/instruct.js';
 import { loadJob, transition } from '../orchestrator/jobs.js';
-import { MAX_INSTRUCTION_CHARS, loadInstructionForJob, recordAnswer } from '../governance/instructions.js';
+import {
+  MAX_INSTRUCTION_CHARS,
+  loadInstructionForJob,
+  pendingQuestions,
+  recordAnswer,
+} from '../governance/instructions.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -393,7 +398,10 @@ function renderInstructionOutcome(
     sendHtml(
       res,
       200,
-      renderInstruct({ csrf, pending: { jobId: outcome.jobId, question: outcome.question } }),
+      renderInstruct({
+        csrf,
+        pending: [{ jobId: outcome.jobId, question: outcome.question, text: outcome.instructionText }],
+      }),
     );
     return;
   }
@@ -404,8 +412,35 @@ function renderInstructionOutcome(
   redirect(res, '/');
 }
 
-async function handleInstructGet(res: ServerResponse, session: Session): Promise<void> {
-  sendHtml(res, 200, renderInstruct({ csrf: issueCsrfToken(session.sessionId) }));
+/**
+ * The instruction box, and every question still waiting on an answer (I3).
+ *
+ * This used to render the empty box with no lookup at all, which meant a
+ * parked job's id and its question existed only in the HTML of the POST
+ * response that created them: reload the page and the job was orphaned in
+ * `understand`, a phase nothing in the scheduler touches, with no way for the
+ * owner to see what they had been asked. Spec §8 says the question appears on
+ * the dashboard with an answer box; until now it appeared in one HTTP
+ * response and then ceased to exist.
+ */
+async function handleInstructGet(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const waiting = await pendingQuestions({ businessId });
+  sendHtml(
+    res,
+    200,
+    renderInstruct({
+      csrf: issueCsrfToken(session.sessionId),
+      pending: waiting.map((row) => ({
+        jobId: row.jobId,
+        question: row.question,
+        text: row.text,
+      })),
+    }),
+  );
 }
 
 /**
@@ -1188,7 +1223,7 @@ async function route(
   if (method === 'GET' && pathname === '/') return handlePendingList(res, businessId, session);
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
 
-  if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, session);
+  if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
   if (method === 'POST' && pathname === '/instruct') return handleInstructPost(req, res, businessId, session);
 
   const instructAnswerMatch = INSTRUCT_ANSWER_PATH.exec(pathname);

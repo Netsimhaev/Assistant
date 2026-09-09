@@ -446,10 +446,41 @@ ${signErrorBlock}
  * so the exposure is low, but it is the second model-authored string to reach
  * a screen and the cheap decision is to treat it that way from the start.
  */
+/**
+ * One instruction still waiting on the owner's answer.
+ *
+ * `question` is nullable because migration 023 is what gave it a home: a job
+ * parked before that migration has no stored question and cannot be given
+ * one. Such a row is still listed — the owner can answer it, and an answer
+ * box with no question is far better than an orphaned job nothing shows.
+ */
+export interface PendingQuestion {
+  jobId: string;
+  question: string | null;
+  /** The owner's own words, so a question with no stored text still has context. */
+  text: string;
+}
+
+/** Shown in place of a question that predates migration 023. */
+const QUESTION_UNAVAILABLE = 'נשאלה שאלה שלא נשמרה. אפשר לענות כאן בכל זאת.';
+
+function pendingCard(item: PendingQuestion, csrf: string): string {
+  return `<article class="card">
+           <h3>שאלה לפני שאמשיך</h3>
+           <p class="muted">${escLabel(item.text)}</p>
+           <p>${item.question === null ? esc(QUESTION_UNAVAILABLE) : escLabel(item.question)}</p>
+           <form method="POST" action="/instruct/${esc(item.jobId)}/answer">
+             <input type="hidden" name="csrf" value="${esc(csrf)}">
+             <textarea name="answer" rows="2" required></textarea>
+             <button>לענות ולהמשיך</button>
+           </form>
+         </article>`;
+}
+
 export function renderInstruct(options: {
   csrf: string;
   error?: string;
-  pending?: { jobId: string; question: string } | null;
+  pending?: PendingQuestion[] | null;
   grantNote?: string | null;
 }): string {
   const error =
@@ -461,15 +492,7 @@ export function renderInstruct(options: {
   const pending =
     options.pending == null
       ? ''
-      : `<article class="card">
-           <h3>שאלה לפני שאמשיך</h3>
-           <p>${escLabel(options.pending.question)}</p>
-           <form method="POST" action="/instruct/${esc(options.pending.jobId)}/answer">
-             <input type="hidden" name="csrf" value="${esc(options.csrf)}">
-             <textarea name="answer" rows="2" required></textarea>
-             <button>לענות ולהמשיך</button>
-           </form>
-         </article>`;
+      : options.pending.map((item) => pendingCard(item, options.csrf)).join('\n');
 
   return page(
     'מה לעשות',
