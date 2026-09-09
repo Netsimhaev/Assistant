@@ -482,13 +482,18 @@ describe('GET /readings', () => {
 });
 
 describe('GET /instruct, POST /instruct', () => {
+  // M2: this asserted `toContain('מה לעשות')`, which is also the pending
+  // list's own link label to this page — and `fetch` follows redirects, so a
+  // handler replaced by `redirect(res, '/')` still returned 200 with that
+  // string in the body and the test still passed. `name="text"` is the box
+  // itself, and appears on no other page.
   it('serves the instruction box behind a session', async () => {
     const baseUrl = await startServer(BUSINESS);
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const res = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain('מה לעשות');
+    expect(await res.text()).toContain('name="text"');
   });
 
   it('refuses the instruction box without a session', async () => {

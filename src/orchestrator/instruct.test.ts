@@ -94,6 +94,12 @@ describe('runInstruction', () => {
     );
     expect(rows[0]?.action_class).toBe('email.initiate');
     expect(rows[0]?.recipients).toEqual(['dana@example.com']);
+
+    // M4, the other half: nothing anywhere pinned `grantNote` to `null` on
+    // the ordinary single-class path, so a bug that produced the multi-class
+    // note here — and sent the owner a sentence saying no authorisation was
+    // given, next to one that was — would have gone unnoticed.
+    expect(result.grantNote).toBeNull();
   });
 
   it('grants nothing when the owner never named the address', async () => {
@@ -260,7 +266,10 @@ describe('runInstruction', () => {
     // function typed to return an outcome, and not a silent pick of whichever
     // class happened to sort first.
     expect(result.granted).toEqual([]);
-    expect(result.grantNote).not.toBeNull();
+    // M4: `not.toBeNull()` is satisfied by `undefined`, so the assertion held
+    // whether or not the field was ever set. Pinned to the sentence the owner
+    // actually reads instead.
+    expect(result.grantNote).toContain('ביותר מסוג פעולה אחד שאתה נקבת בנמען שלו');
 
     const { rows } = await getPool().query(`SELECT 1 FROM job_authorizations WHERE job_id = $1`, [
       result.jobId,

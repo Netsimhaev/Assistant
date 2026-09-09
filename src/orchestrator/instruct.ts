@@ -333,7 +333,14 @@ interface GrantForPlanResult {
  * one: `coveredByAuthorization` already refuses an empty recipient list, and a
  * row that authorises nobody is a record of permission that was never given.
  *
- * **A plan spanning more than one action class gets no grant at all.**
+ * **A plan spanning more than one action class WITH A NON-EMPTY COVERED SET
+ * gets no grant at all.** The qualifier is the whole trigger and it used to
+ * be missing here (M1): `byClass` only ever gains an entry for a class whose
+ * `authorisedRecipients` came back non-empty, so a plan of `email.initiate`
+ * to an address the owner typed plus `calendar.create` to one they never
+ * named contributes exactly one entry and DOES get its grant. Counting
+ * classes rather than covered classes would have described a stricter rule
+ * than the code has, in a comment the next reader would have trusted.
  * `job_authorizations` is `PRIMARY KEY (business_id, job_id)` — one row per
  * job, by the schema's own shape — and `grantAuthorization` turns a second
  * insert for the same job into a thrown `AuthorizationAlreadyGrantedError`.
@@ -386,9 +393,14 @@ async function grantForPlan(
   if (byClass.size > 1) {
     return {
       granted: [],
+      // The owner's own sentence, and it says what actually happened rather
+      // than a simplification of it (M1): more than one class had a
+      // recipient this instruction covers. A class whose recipients the
+      // owner never named was never in the running and is not what caused
+      // this.
       grantNote:
-        'ההוראה נגעה ביותר ממחלקת פעולה אחת, ולכן לא ניתנה הרשאה אוטומטית לאף אחת מהן — ' +
-        'כל צעד בתוכנית יעבור את מסלול האישור הרגיל.',
+        'ההוראה נגעה ביותר מסוג פעולה אחד שאתה נקבת בנמען שלו, ולכן לא ניתנה הרשאה ' +
+        'אוטומטית לאף אחד מהם — כל צעד בתוכנית יעבור את מסלול האישור הרגיל.',
     };
   }
 
