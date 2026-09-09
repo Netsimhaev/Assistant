@@ -20,6 +20,36 @@
  * anywhere else is simply never read. This paragraph exists so the ordering
  * above is not read as a claim that the four commits are atomic — they are
  * not, and do not need to be.
+ *
+ * **What the grant this module writes actually buys today: nothing yet.**
+ * `executeStep` does now set `useStandingAuthorization: true`, so the gate
+ * reads the row instead of ignoring it — but reading it and being changed by
+ * it are different things, and the next reader will meet this module
+ * believing the owner has stopped being asked. They have not.
+ * `needsApproval` (`src/policy/engine.ts`) is three disjuncts:
+ *
+ *   1. `NEVER_FULLY_AUTONOMOUS.has(actionClass)`
+ *   2. `effective === 'approve_required'` — the ceiling the owner signed
+ *   3. `!standing && risk.band !== 'routine'`
+ *
+ * A standing authorisation can only cancel the third. The first two stand
+ * entirely outside its reach, deliberately: an instruction is momentary and a
+ * signed ceiling is a durable, considered statement, which is the same limit
+ * the first-contact exemption already keeps.
+ *
+ * And a third condition makes the point moot in every installation that
+ * exists right now. `RAMP_FLOOR` (`orchestrator/ramp.ts`) is `draft_only` for
+ * any class with no ramp row, nothing in production raises one — `ramp:set`
+ * is a command a person runs — and stage 8 of the gate runs BEFORE stage 10,
+ * so every outbound step of an instruction is denied `draft_only:
+ * persist_as_draft` before the risk band this grant would relax is even
+ * computed.
+ *
+ * So: the row is written, the row is read, and the owner keeps being asked,
+ * until they raise a class's ramp above `approve_required` AND their signed
+ * charter gives that class a ceiling above `approve_required`. Do not write
+ * a sentence anywhere — comment, document or dashboard — that promises
+ * otherwise.
  */
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
