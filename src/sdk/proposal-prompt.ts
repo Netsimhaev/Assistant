@@ -24,7 +24,12 @@ import { READ_ONLY_CLASS_LABEL } from '../orchestrator/catalogue.js';
  * would invalidate every stored proposal while the question asked stayed
  * identical. This value becomes part of a database column (spec §10).
  */
-export const PROPOSAL_PROMPT_VERSION = 'v1';
+// Raised to v2 (09/09): the read-only-sentinel rule for `expectedActionClass`
+// (commit "The catalogue's class column no longer offers a token the schema
+// rejects") is a new hard constraint on a valid answer, not prose — a
+// proposal cached under v1 was generated without the model ever having been
+// told that rule.
+export const PROPOSAL_PROMPT_VERSION = 'v2';
 
 /**
  * What each stance means and what it does to `action` (spec §4).
