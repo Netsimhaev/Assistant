@@ -1,6 +1,11 @@
 /**
- * Standing authorisation: the owner's instruction, on record, standing in for
- * an approval question (spec §6).
+ * Standing authorisation: the owner's instruction, on record, meant to stand
+ * in for an approval question (spec §6) — but doing so today requires two
+ * conditions neither of which is met in any production install: the action
+ * class's autonomy ramp above `approve_required`, and the signed charter
+ * granting that class a ceiling above `approve_required` too. Until both
+ * hold, `needsApproval` in `policy/engine.ts` is refused earlier, at the ramp
+ * floor, and this module's grant changes nothing the owner experiences.
  *
  * **It lives under `governance/` and not `orchestrator/` for a layering
  * reason, not a taxonomic one.** `policy/engine.ts` imports this module and
