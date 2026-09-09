@@ -514,10 +514,16 @@ export function reasonForSupersededJob(
  * behind a multi-second model call and then allowed to repeat it.
  *
  * **Session-scoped, on a client of its own.** The window this covers is a
- * live call to the Agent SDK, and holding a transaction open across it is
- * how a ten-connection pool dies. The release mirrors `run-due.ts` exactly:
- * a failed unlock hands the connection back to `pg` as an error so the
- * session is destroyed rather than pooled while still holding the lock.
+ * live call to the Agent SDK. What that buys is narrower than it sounds:
+ * `pg_try_advisory_lock` is session-scoped, not transaction-scoped, so the
+ * connection itself is checked out of the pool for the whole call regardless
+ * — a concurrent answer POST on a different job occupies its own connection
+ * for as long as its model call runs, same as this one does. What is avoided
+ * is an open *transaction* held across that call: no row locks, no held MVCC
+ * snapshot, nothing blocking `VACUUM` for minutes while the network call
+ * runs. The release mirrors `run-due.ts` exactly: a failed unlock hands the
+ * connection back to `pg` as an error so the session is destroyed rather
+ * than pooled while still holding the lock.
  */
 async function withJobClaim<T>(
   scope: string,
