@@ -1,4 +1,5 @@
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { config } from '../config.js';
 import { Plan, planProblems } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
@@ -78,7 +79,38 @@ export function buildPlannerPrompt(request: PlanRequest): string {
   ].join('\n');
 }
 
+/**
+ * The one guard standing between the test suite and a billed call.
+ *
+ * This machine carries a real `ANTHROPIC_API_KEY` (CLAUDE.md says so). No
+ * committed test calls `makePlan` on purpose — `runInstruction` takes an
+ * injectable `planner`, and every `instruct.test.ts` case supplies one — but
+ * `src/dashboard/server.ts`'s `/instruct` and `/instruct/:jobId/answer`
+ * routes call `runInstruction` with no `planner` option at all, because
+ * production must reach the real one. `server.test.ts` drives those routes
+ * over real HTTP and relies entirely on oversized input — three separate
+ * character counts (an instruction over 4,000 chars, an answer over 4,000,
+ * and an original-plus-answer pair that only exceeds the cap once joined) —
+ * refusing before `createJob` so the planner is never reached. A test that
+ * quietly gets one of those three counts wrong stops refusing early and
+ * falls through to this function instead, and nothing before this line would
+ * have stopped it: that is precisely what happened in two review rounds.
+ *
+ * `config.isTest` mirrors `vitest.config.ts`'s `env.NODE_ENV = 'test'`, so
+ * this fires for every test file without any of them opting in, and does not
+ * fire for the manual `npm run sdk:*` scripts or the dashboard in
+ * production, neither of which run under `NODE_ENV=test`.
+ */
+function refuseUnderTest(): void {
+  if (!config.isTest) return;
+  throw new Error(
+    'makePlan: refusing to run under NODE_ENV=test — this is a live, billed call to the Agent SDK. ' +
+      'Inject a planner (see RunInstructionOptions.planner) instead of relying on the default reaching this function.',
+  );
+}
+
 export async function makePlan(request: PlanRequest): Promise<PlanOutcome> {
+  refuseUnderTest();
   const options: Options = {
     systemPrompt:
       'אתה המתכנן. אתה מקבל intents מובנים או הוראה ישירה מבעל העסק, ומחזיר תוכנית JSON. ' +
