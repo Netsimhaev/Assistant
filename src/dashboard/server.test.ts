@@ -861,6 +861,59 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(stored?.answer).toBeNull();
   });
 
+  /**
+   * I2: two POSTs of the same answer must produce one job, and the loser must
+   * refuse cleanly.
+   *
+   * The phase guard is a read, and `runInstruction` makes a live model call
+   * before anything writes — nothing held a lock across that window. Two
+   * POSTs (a double-click on the answer button, with a multi-second gap) both
+   * passed the guard, both recorded an answer, and both created a job, a
+   * grant, a binding and a promotion to `execute`. Then both transitioned the
+   * parked job to `failed`, and the second met a job already `failed` and
+   * threw uncaught to the 500 handler: two authorised, bound plans for one
+   * answer, and an error suggesting nothing happened.
+   *
+   * Unlike every other test in this block, this one deliberately posts a
+   * SHORT answer, so the pipeline runs past the length cap and reaches
+   * `createJob` — that is the write this test counts. It still never touches
+   * the network: `makePlan`'s `refuseUnderTest` throws under
+   * `NODE_ENV=test`, `runInstruction` catches it, fails the new job and
+   * returns `refused`. So a winning request creates exactly one job and a
+   * losing one creates none.
+   */
+  it('lets only one of two concurrent answers through, and the loser refuses without a 500', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const post = () =>
+      fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+        method: 'POST',
+        headers: { cookie },
+        body: new URLSearchParams({ csrf, answer: 'דנה כהן' }),
+      });
+
+    const [a, b] = await Promise.all([post(), post()]);
+    const bodies = [await a.text(), await b.text()];
+
+    // Nobody gets a 500 — the shape the owner actually met.
+    expect([a.status, b.status]).not.toContain(500);
+    // Exactly one of the two was turned away by the claim.
+    expect(bodies.filter((body) => body.includes('כבר בטיפול'))).toHaveLength(1);
+
+    // The count is the point: the parked job, plus the one job the winner
+    // opened. Without the claim both requests reach `createJob` and there are
+    // three.
+    const { rows } = await getPool().query<{ n: string }>(
+      'SELECT count(*)::text AS n FROM jobs WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(rows[0]?.n).toBe('2');
+  });
+
   // Fix round 2, N2: the route must not be able to fail an unrelated,
   // in-flight job just because it shares a business and carries an
   // instruction row — which any successfully planned instruction does.

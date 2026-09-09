@@ -17,6 +17,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
+import { getPool } from '../db/pool.js';
 import { ApprovalNotDecidableError, getApproval, pendingApprovals } from '../governance/approvals.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
 import { DocumentAlreadySignedError, loadSignature } from '../governance/signatures.js';
@@ -407,6 +408,20 @@ async function handleInstructGet(res: ServerResponse, session: Session): Promise
   sendHtml(res, 200, renderInstruct({ csrf: issueCsrfToken(session.sessionId) }));
 }
 
+/**
+ * A fresh instruction from the box.
+ *
+ * **Deliberately not claimed the way the answer route is (I2).** There is
+ * nothing here to claim: each POST is a distinct instruction with no
+ * pre-existing row to key a lock on, and two submissions genuinely are two
+ * instructions — the door's own rule, which `boss_instructions.job_id UNIQUE`
+ * states in the schema. A double-click therefore opens two jobs, each with
+ * its own instruction, grant and plan. That is a duplicate-work problem, not
+ * a correctness one: neither job authorises anything the owner did not type,
+ * and neither can fail the other, which was the whole of the answer route's
+ * defect. Deduplicating a fresh submission needs an idempotency key minted
+ * with the form, which is a larger change than this one.
+ */
 async function handleInstructPost(
   req: IncomingMessage,
   res: ServerResponse,
@@ -444,6 +459,62 @@ export function reasonForSupersededJob(
   outcome: Extract<Awaited<ReturnType<typeof runInstruction>>, { jobId: string }>,
 ): string {
   return `instruction door: answered; superseded by ${outcome.jobId}`;
+}
+
+/**
+ * Holds an exclusive claim on one parked job for the duration of `body`, or
+ * returns `null` when someone else already holds it (I2).
+ *
+ * **Why a lock and not a transition.** Claiming by moving the job out of
+ * `understand` would work, but it would undo fix round 2's N1: a re-run that
+ * refuses — an over-cap join, no active charter — deliberately leaves the
+ * parked job exactly where it was, so the owner's obvious next move (shorten
+ * the answer, resubmit from the same page) lands on a job still waiting
+ * rather than one already `failed`. A lock claims the *work* without
+ * changing the job's story.
+ *
+ * **`pg_try_advisory_lock`, not the blocking form**, and for the reason
+ * `conduct.ts` and `run-due.ts` give for theirs: the second request must be
+ * turned away immediately with something the owner can read, never queued
+ * behind a multi-second model call and then allowed to repeat it.
+ *
+ * **Session-scoped, on a client of its own.** The window this covers is a
+ * live call to the Agent SDK, and holding a transaction open across it is
+ * how a ten-connection pool dies. The release mirrors `run-due.ts` exactly:
+ * a failed unlock hands the connection back to `pg` as an error so the
+ * session is destroyed rather than pooled while still holding the lock.
+ */
+async function withJobClaim<T>(
+  scope: string,
+  body: () => Promise<T>,
+): Promise<{ claimed: true; value: T } | { claimed: false }> {
+  const client = await getPool().connect();
+  let holdsLock = false;
+  try {
+    const lock = await client.query<{ locked: boolean }>(
+      'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
+      [scope],
+    );
+    if (lock.rows[0]?.locked !== true) return { claimed: false };
+    holdsLock = true;
+    return { claimed: true, value: await body() };
+  } finally {
+    if (holdsLock) {
+      let unlockError: unknown;
+      try {
+        await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [scope]);
+      } catch (error) {
+        unlockError = error;
+      }
+      if (unlockError === undefined) {
+        client.release();
+      } else {
+        client.release(unlockError instanceof Error ? unlockError : new Error(String(unlockError)));
+      }
+    } else {
+      client.release();
+    }
+  }
 }
 
 /**
@@ -509,8 +580,51 @@ async function handleInstructAnswer(
   const instruction = await loadInstructionForJob(jobId, { businessId });
   if (instruction === null) return sendHtml(res, 404, renderNotFound());
 
-  // Scoped to a job that is actually waiting on this answer — see this
-  // function's own docblock for the two ways skipping this check broke.
+  // Everything from the phase guard to the transition runs under one claim
+  // on this job (I2). The guard is a read and `runInstruction` makes a live
+  // model call before anything writes, so without this two POSTs — a
+  // double-click, seconds apart — both passed the guard, both recorded an
+  // answer, and both opened, granted, bound and promoted a job. Then both
+  // closed the parked job out, and the second met a job already `failed`:
+  // `failed → failed` is illegal, so `transition` threw uncaught to the 500
+  // handler. Two authorised plans for one answer, and an error saying
+  // nothing happened.
+  const claim = await withJobClaim(`instruct-answer:${businessId}:${jobId}`, async () =>
+    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? ''),
+  );
+  if (!claim.claimed) {
+    sendHtml(
+      res,
+      409,
+      renderInstruct({
+        csrf: issueCsrfToken(session.sessionId),
+        error: 'התשובה הזו כבר בטיפול. רענן/י את הדף כדי לראות מה קרה.',
+      }),
+    );
+  }
+}
+
+/**
+ * The body of `handleInstructAnswer`, run while this request holds the job's
+ * claim — never called from anywhere else.
+ *
+ * Split out rather than inlined into the callback so the early returns below
+ * read the same way they did before the claim existed: each one is a refusal
+ * of this request, and every one of them releases the claim on the way out
+ * through `withJobClaim`'s `finally`.
+ */
+async function answerUnderClaim(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  jobId: string,
+  instruction: { instructionId: string; text: string },
+  answer: string,
+): Promise<void> {
+  // Scoped to a job that is actually waiting on this answer — see
+  // `handleInstructAnswer`'s docblock for the two ways skipping this check
+  // broke. Read under the claim, so a concurrent request cannot move the
+  // phase between this read and the transition at the end.
   const job = await loadJob(jobId, { businessId });
   if (job === null) return sendHtml(res, 404, renderNotFound());
   if (job.phase !== 'understand') {
@@ -524,7 +638,6 @@ async function handleInstructAnswer(
     );
   }
 
-  const answer = form.get('answer') ?? '';
   // The textarea's `required` is client-side only, and unlike `text` this
   // column carries no CHECK constraint bounding it — a hand-crafted POST can
   // send up to `MAX_BODY_BYTES` of it. An empty answer is worse than merely
