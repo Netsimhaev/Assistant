@@ -608,17 +608,20 @@ describe('GET /instruct, POST /instruct', () => {
   it('does not list a question that has already been answered', async () => {
     const baseUrl = await startServer(BUSINESS);
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
-    const job = await createJob({
+
+    const answeredJob = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
       businessId: BUSINESS,
     });
-    const instruction = await saveInstruction(
-      { jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
+    const answeredInstruction = await saveInstruction(
+      { jobId: answeredJob.jobId, text: 'תשלחי לדנה את ההצעה' },
       { businessId: BUSINESS },
     );
-    await recordQuestion(instruction.instructionId, 'לאיזו דנה?', { businessId: BUSINESS });
-    await transition(job.jobId, {
+    await recordQuestion(answeredInstruction.instructionId, 'לאיזו דנה?', {
+      businessId: BUSINESS,
+    });
+    await transition(answeredJob.jobId, {
       to: 'understand',
       actor: 'orchestrator',
       reason: 'test setup',
@@ -627,12 +630,36 @@ describe('GET /instruct, POST /instruct', () => {
     // The answer is recorded but the re-run refused, so the job is still
     // parked in `understand`. Phase alone would keep listing this as an open
     // question the owner has in fact already answered.
-    await recordAnswer(instruction.instructionId, 'דנה כהן', { businessId: BUSINESS });
+    await recordAnswer(answeredInstruction.instructionId, 'דנה כהן', { businessId: BUSINESS });
+
+    // A second, still-open question on a different parked job. Without it,
+    // an assertion that the answered question is absent would hold just as
+    // well if the whole listing were deleted — this proves the listing
+    // filters on the answer instead of proving nothing is listed at all.
+    const openJob = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    const openInstruction = await saveInstruction(
+      { jobId: openJob.jobId, text: 'תזמיני פגישה עם רואה החשבון' },
+      { businessId: BUSINESS },
+    );
+    await recordQuestion(openInstruction.instructionId, 'איזה יום מתאים?', {
+      businessId: BUSINESS,
+    });
+    await transition(openJob.jobId, {
+      to: 'understand',
+      actor: 'orchestrator',
+      reason: 'test setup',
+      businessId: BUSINESS,
+    });
 
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const body = await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text();
 
     expect(body).not.toContain('לאיזו דנה?');
+    expect(body).toContain('איזה יום מתאים?');
   });
 });
 
