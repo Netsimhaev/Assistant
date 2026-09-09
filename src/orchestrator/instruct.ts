@@ -219,7 +219,18 @@ export async function runInstruction(
     // existed only in that response: a reload orphaned the job in
     // `understand`, a phase nothing in the scheduler touches, with the owner
     // unable to see what they had been asked.
-    await recordQuestion(instruction.instructionId, plan.clarifyingQuestion, { businessId });
+    //
+    // Genuinely best-effort, matching `recordQuestion`'s own docblock: the
+    // job is already parked and the instruction row already written, so a
+    // failed UPDATE here must not reach the caller and turn a question into
+    // a failed instruction. The owner still sees the job — `pendingQuestions`
+    // lists it regardless — with `QUESTION_UNAVAILABLE` in place of the text
+    // that failed to save (`src/dashboard/views.ts`).
+    try {
+      await recordQuestion(instruction.instructionId, plan.clarifyingQuestion, { businessId });
+    } catch {
+      // Swallowed by design — see above.
+    }
     return {
       status: 'needs_answer',
       jobId: job.jobId,
