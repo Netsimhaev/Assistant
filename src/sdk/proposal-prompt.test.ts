@@ -3,7 +3,11 @@ import { Stance } from '../domain/proposal.js';
 import type { Reading } from '../domain/reading.js';
 import { buildCharter } from '../test/fixtures.js';
 import { compileCharter } from '../charter/compile.js';
-import { capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
+import {
+  READ_ONLY_CLASS_LABEL,
+  capabilityCatalogue,
+  renderCatalogue,
+} from '../orchestrator/catalogue.js';
 import {
   PROPOSAL_PROMPT_VERSION,
   buildProposalSystemPrompt,
@@ -65,6 +69,24 @@ describe('buildProposalSystemPrompt', () => {
     expect(prompt).toMatch(/קטלוג/);
     // 4. headline is in the owner's language, not a tool name
     expect(prompt).toMatch(/headline/);
+  });
+
+  /**
+   * L1 reaches this prompt too: `catalogue` above is the very same
+   * `renderCatalogue` output the planner is given, so a class-less tool's
+   * label appears here verbatim. `ProposedAction.expectedActionClass` is
+   * `ActionClass.nullable()` exactly as `PlanStep`'s is, so a copied label
+   * fails `Proposal.safeParse` the same way it failed `Plan.safeParse`.
+   *
+   * The first assertion pins the subject present: without a class-less tool
+   * in the rendered catalogue, "no bare `read-only`" would hold for a reason
+   * that has nothing to do with the rendering.
+   */
+  it('tells the proposer that a class-less tool takes null', () => {
+    expect(catalogue).toContain(READ_ONLY_CLASS_LABEL);
+    const prompt = buildProposalSystemPrompt(bundle, catalogue);
+    expect(prompt).toContain(READ_ONLY_CLASS_LABEL);
+    expect(prompt).not.toMatch(/ · read-only · /);
   });
 });
 

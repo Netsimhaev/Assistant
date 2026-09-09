@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { Plan, planProblems } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
-import { capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
+import { READ_ONLY_CLASS_LABEL, capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
 
 export interface PlanRequest {
   bundle: PolicyBundle;
@@ -70,6 +70,11 @@ export function buildPlannerPrompt(request: PlanRequest): string {
     'כללים: מזהי צעדים ייחודיים · dependsOn מפנה רק לצעדים בתוכנית הזו · בלי מעגלים ·',
     'שאלת הבהרה אחת לכל היותר · expectedActionClass הוא מה שאתה מאמין שהצעד ייחשב,',
     'ואי-התאמה לשער תפסול את התוכנית — עדיף null מאשר ניחוש.',
+    // Built from the constant, not retyped: a hand-copied label drifts the
+    // first time the rendering changes, and this rule exists precisely
+    // because the model copies the label it is shown (L1).
+    `כלי שהקטלוג מסמן «${READ_ONLY_CLASS_LABEL}» חייב לקבל \`null\` בשדה הזה. ` +
+      'הסימון הזה אינו מחלקת פעולה ואין להעתיק אותו כמחרוזת — תוכנית שתעשה זאת תיפסל.',
     '',
     // Last, and the only part that varies per job: everything above is the
     // cacheable prefix.

@@ -15,6 +15,7 @@ import { Stance } from '../domain/proposal.js';
 import { AgentId } from '../domain/audit.js';
 import { INTENT_MEANING, IntentName, type Reading } from '../domain/reading.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import { READ_ONLY_CLASS_LABEL } from '../orchestrator/catalogue.js';
 
 /**
  * Raised by hand when the *meaning* of the question changes.
@@ -126,6 +127,13 @@ export function buildProposalSystemPrompt(bundle: PolicyBundle, catalogue: strin
     'ההצעה כולה נפרד מ-`action.headline` על הפעולה עצמה · `clarifyingQuestion`',
     'אחד לכל היותר — שתי שאלות הן חקירה, לא הבהרה · `expectedActionClass` הוא',
     'ייעוץ בלבד, ועדיף `null` מאשר ניחוש.',
+    '',
+    // The same rule `buildPlannerPrompt` carries, and for the same reason:
+    // this prompt renders the very same catalogue, so the label the model
+    // might copy is identical (L1). Built from the constant rather than
+    // retyped, so the two cannot drift apart.
+    `כלי שהקטלוג מסמן «${READ_ONLY_CLASS_LABEL}» חייב לקבל \`null\` ב-\`expectedActionClass\`. ` +
+      'הסימון הזה אינו מחלקת פעולה ואין להעתיק אותו כמחרוזת — הצעה שתעשה זאת תיפסל.',
   ].join('\n');
 }
 
