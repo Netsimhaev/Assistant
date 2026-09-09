@@ -430,21 +430,40 @@ ${signErrorBlock}
  * One field and one button. The note under it is not decoration: an
  * instruction is its own approval, and the owner should know that before they
  * type, not discover it afterwards.
+ *
+ * `grantNote` is `runInstruction`'s explanation for exactly one situation: a
+ * plan spanning more than one action class, which authorises nothing at all
+ * (see `grantForPlan` in `instruct.ts`). Without showing it, the owner is
+ * bounced to the pending list and later meets an approval card for something
+ * they believed the instruction already covered, with no sentence anywhere
+ * saying why the shortcut did not apply — so it renders beside the error, not
+ * folded into it, since the two can never occur together (a `grantNote` only
+ * ever accompanies a `planned` outcome, an `error` only ever a `refused` one).
+ *
+ * The clarifying question goes through `escLabel`, not `esc`: it is
+ * model-composed text reaching an RTL page, the same category `escLabel` was
+ * written for (see its own docblock). Every instruction is owner-typed today,
+ * so the exposure is low, but it is the second model-authored string to reach
+ * a screen and the cheap decision is to treat it that way from the start.
  */
 export function renderInstruct(options: {
   csrf: string;
   error?: string;
   pending?: { jobId: string; question: string } | null;
+  grantNote?: string | null;
 }): string {
   const error =
     options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
+
+  const grantNote =
+    options.grantNote == null ? '' : `<p class="muted">${esc(options.grantNote)}</p>`;
 
   const pending =
     options.pending == null
       ? ''
       : `<article class="card">
            <h3>שאלה לפני שאמשיך</h3>
-           <p>${esc(options.pending.question)}</p>
+           <p>${escLabel(options.pending.question)}</p>
            <form method="POST" action="/instruct/${esc(options.pending.jobId)}/answer">
              <input type="hidden" name="csrf" value="${esc(options.csrf)}">
              <textarea name="answer" rows="2" required></textarea>
@@ -456,6 +475,7 @@ export function renderInstruct(options: {
     'מה לעשות',
     `<h1>מה לעשות</h1>
      ${error}
+     ${grantNote}
      ${pending}
      <form method="POST" action="/instruct">
        <input type="hidden" name="csrf" value="${esc(options.csrf)}">

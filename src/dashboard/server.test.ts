@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
+import { createJob, jobHistory, loadJob, transition } from '../orchestrator/jobs.js';
 import { enqueueApproval, getApproval } from '../governance/approvals.js';
 import type { ActionFacts } from '../domain/policy.js';
 import type { RiskAssessment } from '../domain/risk.js';
@@ -26,7 +26,8 @@ import { queryAudit } from '../audit/log.js';
 import { loadInstructionForJob, saveInstruction } from '../governance/instructions.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
-import { assertBindableHost, createServer } from './server.js';
+import { assertBindableHost, createServer, reasonForSupersededJob } from './server.js';
+import { renderInstruct } from './views.js';
 
 const BUSINESS = 'test-business';
 const OTHER_BUSINESS = 'test-business-other';
@@ -509,9 +510,26 @@ describe('GET /instruct, POST /instruct', () => {
   // `instruct.ts` interpolates `MAX_INSTRUCTION_CHARS` (a bare number) with
   // no locale formatting anywhere on this path — the refusal reads "...
   // מ-4000 תווים...", not "4,000". Asserting the comma form would fail
-  // against the actual (correct) refusal text, so this checks '4000'.
+  // against the actual (correct) refusal text.
+  //
+  // Bare '4000' is not enough, though — found while re-verifying this round's
+  // fixes: `renderInstruct`'s base form always renders
+  // `<textarea ... maxlength="4000" ...>`, on every refusal, regardless of
+  // which one fired. `toContain('4000')` alone would pass against ANY
+  // refusal — "no active charter", an empty instruction, anything — purely
+  // from that decorative markup. Asserting the fuller Hebrew phrase from the
+  // actual refusal sentence ("ארוכה מ-4000 תווים") is what ties this to the
+  // length check specifically, since that phrase appears nowhere else on the
+  // page.
+  //
+  // A charter is installed here (fix round 1, M1): without one, `runInstruction`
+  // refuses at `loadActiveCharter` before `createJob` for ANY input, so the
+  // empty `boss_instructions` table would hold whether or not the length cap
+  // ever fired. Installing a charter means the length check is what actually
+  // has to fire first for this to pass.
   it('shows the refusal when the instruction is too long, and opens no job', async () => {
     const baseUrl = await startServer(BUSINESS);
+    await installCharter(buildCharter(), { businessId: BUSINESS });
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
     const csrf = extractCsrf(await boxPage.text());
@@ -523,9 +541,65 @@ describe('GET /instruct, POST /instruct', () => {
     });
 
     expect(res.status).toBe(400);
-    expect(await res.text()).toContain('4000');
+    expect(await res.text()).toContain('ארוכה מ-4000 תווים');
     const { rows } = await getPool().query(`SELECT 1 FROM boss_instructions`);
     expect(rows).toHaveLength(0);
+  });
+});
+
+describe('renderInstruct — grantNote (fix round 1, C1)', () => {
+  // `runInstruction`'s `grantNote` is non-null exactly when a plan spanned
+  // more than one action class and so authorised nothing at all — before this
+  // fix it was computed and then thrown away, and the owner would later meet
+  // an approval card for something they believed the instruction had already
+  // covered. A pipeline-level test driving a real multi-class plan through an
+  // injected planner belongs in `instruct.test.ts` (this dashboard route has
+  // no way to inject a planner); at this layer, a view-level test on
+  // `renderInstruct` itself is what the fix brief calls "enough" — and it
+  // fails the moment the note's rendering branch is removed.
+  it('renders the grant note, HTML-escaped', () => {
+    const html = renderInstruct({
+      csrf: 'tok',
+      grantNote:
+        'ההוראה נגעה ביותר ממחלקת פעולה אחת <script>alert(1)</script>, ולכן לא ניתנה הרשאה אוטומטית.',
+    });
+    expect(html).toContain('ההוראה נגעה ביותר ממחלקת פעולה אחת');
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  it('renders no note block when grantNote is absent', () => {
+    const html = renderInstruct({ csrf: 'tok' });
+    expect(html).not.toContain('ולכן לא ניתנה הרשאה אוטומטית');
+  });
+});
+
+describe('reasonForSupersededJob (fix round 1, I2)', () => {
+  it('names the replacement job when the re-run produced one', () => {
+    expect(
+      reasonForSupersededJob({
+        status: 'planned',
+        jobId: 'J-REPLACEMENT',
+        instructionId: 'INS-1',
+        granted: [],
+        grantNote: null,
+      }),
+    ).toContain('J-REPLACEMENT');
+
+    expect(
+      reasonForSupersededJob({
+        status: 'needs_answer',
+        jobId: 'J-ASKS-AGAIN',
+        instructionId: 'INS-1',
+        question: 'איזו דנה?',
+      }),
+    ).toContain('J-ASKS-AGAIN');
+  });
+
+  it('says no replacement was created when the re-run refused, without inventing an id', () => {
+    const reason = reasonForSupersededJob({ status: 'refused', reason: 'ההוראה ריקה.' });
+    expect(reason).not.toContain('J-');
+    expect(reason.toLowerCase()).toContain('refused');
   });
 });
 
@@ -596,18 +670,15 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(stored?.answer).toBeNull();
   });
 
-  // The route must actually move a job stuck waiting on a question: this
-  // proves `recordAnswer` ran (the row now carries the owner's answer) and
-  // that the follow-up `runInstruction` call is reached and handled cleanly
-  // (400, not a throw or a hang) rather than skipped. No charter is active
-  // for this business at answer time, so the follow-up refuses with "no
-  // active charter" before it would ever reach the live planner.
-  it('records the answer and re-runs the pipeline instead of leaving the job stuck', async () => {
+  // Fix round 1, M2: the textarea's `required` is client-side only, and
+  // `answer` (unlike `text`) carries no CHECK constraint. An empty answer
+  // recorded as-is would overwrite any earlier answer and re-run the pipeline
+  // on text byte-identical to the original instruction, so the planner would
+  // ask the very same question again — forever. Refused before `recordAnswer`
+  // runs at all: the stored answer stays `null`.
+  it('refuses a whitespace-only answer without recording it', async () => {
     const baseUrl = await startServer(BUSINESS);
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
-    // Undoes the activation `anInstructionJob` needed only to satisfy the
-    // `jobs.charter_version` foreign key — leaving `charter_versions` intact.
-    await getPool().query(`DELETE FROM charter_active WHERE business_id = $1`, [BUSINESS]);
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
     const csrf = extractCsrf(await boxPage.text());
@@ -615,12 +686,116 @@ describe('POST /instruct/:jobId/answer', () => {
     const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
       method: 'POST',
       headers: { cookie },
-      body: new URLSearchParams({ csrf, answer: 'דנה כהן, dana@example.com' }),
+      body: new URLSearchParams({ csrf, answer: '   ' }),
+    });
+    expect(res.status).toBe(400);
+
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
+    // The parked job is untouched — refused before the close-out transition too.
+    const job = await loadJob(jobId, { businessId: BUSINESS });
+    expect(job?.phase).toBe('intake');
+  });
+
+  // Fix round 1, M2: `answer` has no CHECK constraint bounding it the way
+  // `text` does, so without this a hand-crafted POST could put up to
+  // `MAX_BODY_BYTES` of it in the column.
+  it('refuses an answer longer than the instruction cap without recording it', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'א'.repeat(4001) }),
+    });
+    expect(res.status).toBe(400);
+    // Not bare '4000' — see the note above the instruction-length test:
+    // `renderInstruct`'s base form always carries `maxlength="4000"`, on
+    // every refusal. The full sentence this route's own error text produces
+    // ("התשובה ארוכה מ-...") appears nowhere else on the page.
+    expect(await res.text()).toContain('התשובה ארוכה מ-4000 תווים');
+
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
+  });
+
+  // Fix round 1, I1: the reviewer's probe. `runInstruction` checks the length
+  // cap BEFORE `loadActiveCharter`, so a ~3,990-character original plus a
+  // 20-character answer crosses 4,000 only once both halves are joined.
+  // Dropping either half from the join (the original text, or the answer)
+  // would leave the joined length under the cap, so `instruct.ts`'s own
+  // length-refusal branch — the ONLY place "ההוראה ארוכה מ-4000 תווים" comes
+  // from — would never fire, and the response would carry different text
+  // instead (or, since nothing here would then refuse before `createJob`,
+  // would actually reach the live planner — see the mutation note in this
+  // block's own verification below). Not bare '4000': that also sits in
+  // `renderInstruct`'s decorative `maxlength="4000"`, present on every
+  // refusal regardless of cause, which is what let an earlier version of
+  // this exact test pass by coincidence when the join itself was broken —
+  // caught only by manually re-verifying the mutation.
+  it('joins the original instruction and the answer before re-running the pipeline', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const originalText = 'א'.repeat(3990);
+    const jobId = await anInstructionJob(BUSINESS, originalText);
+    const answer = 'ב'.repeat(20);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer }),
     });
 
     expect(res.status).toBe(400);
+    expect(await res.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+
     const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
-    expect(stored?.answer).toBe('דנה כהן, dana@example.com');
+    expect(stored?.answer).toBe(answer);
+  });
+
+  // Fix round 1, I2: the parked job must not be left in `understand` forever
+  // once its answer has been processed — `runInstruction` opens a new job
+  // rather than resuming this one, so the docblock's claim only holds if the
+  // route itself closes the parked job out. The re-run above refuses before
+  // ever creating a replacement (the join alone exceeds the length cap), so
+  // this checks the "no replacement" branch of `reasonForSupersededJob` end
+  // to end; the "names an actual replacement id" branch is exercised directly
+  // by the `reasonForSupersededJob` unit tests, since producing a real bound
+  // plan through this HTTP route would require a live model call.
+  it('closes the parked job out instead of leaving it stuck in understand', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    await transition(jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup', businessId: BUSINESS });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      // Exactly `MAX_INSTRUCTION_CHARS` on its own (passes the per-field
+      // check above, which only refuses STRICTLY more), but joined with the
+      // ~20-character original this crosses 4,000 — refusing inside
+      // `runInstruction`, before `createJob` and so before any live planner
+      // call, exactly like the join-probe test above. That keeps this test
+      // network-free while still landing on a real `transition` call this
+      // test can observe.
+      body: new URLSearchParams({ csrf, answer: 'ג'.repeat(4000) }),
+    });
+    expect(res.status).toBe(400);
+
+    const job = await loadJob(jobId, { businessId: BUSINESS });
+    expect(job?.phase).toBe('failed');
+    const history = await jobHistory(jobId);
+    const last = history[history.length - 1];
+    expect(last?.to).toBe('failed');
+    expect(last?.reason).toContain('re-run refused');
   });
 });
 

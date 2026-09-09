@@ -24,7 +24,8 @@ import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
 import { runInstruction } from '../orchestrator/instruct.js';
-import { loadInstructionForJob, recordAnswer } from '../governance/instructions.js';
+import { transition } from '../orchestrator/jobs.js';
+import { MAX_INSTRUCTION_CHARS, loadInstructionForJob, recordAnswer } from '../governance/instructions.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -367,6 +368,14 @@ async function handleReadings(res: ServerResponse, businessId: string, session: 
  * from a fresh submission or from an answer to a clarifying question — the
  * pipeline does not care which one produced the text it just planned (or
  * refused, or asked about again).
+ *
+ * A `planned` outcome carrying a `grantNote` renders the box instead of
+ * redirecting home. The note is non-null in exactly one case — a plan
+ * spanning more than one action class, which authorises nothing at all (see
+ * `grantForPlan` in `instruct.ts`) — and without showing it here the owner is
+ * bounced straight to the pending list and later meets an approval card for
+ * something they believed the instruction had already covered, with no
+ * sentence anywhere explaining why the shortcut did not apply.
  */
 function renderInstructionOutcome(
   res: ServerResponse,
@@ -385,6 +394,10 @@ function renderInstructionOutcome(
       200,
       renderInstruct({ csrf, pending: { jobId: outcome.jobId, question: outcome.question } }),
     );
+    return;
+  }
+  if (outcome.grantNote !== null) {
+    sendHtml(res, 200, renderInstruct({ csrf, grantNote: outcome.grantNote }));
     return;
   }
   redirect(res, '/');
@@ -410,14 +423,47 @@ async function handleInstructPost(
 }
 
 /**
+ * The `job_steps.reason` recorded when the job parked on a clarifying
+ * question is closed out after its answer is processed.
+ *
+ * `runInstruction` calls `createJob` unconditionally — the answer does not
+ * resume the parked job, it opens a brand-new one (see `handleInstructAnswer`
+ * below). This is what lets an operator reading the audit trail follow it
+ * from the parked job to whatever replaced it, when a replacement was
+ * actually created; a re-run that refuses before `createJob` (an over-length
+ * join, no active charter) never creates one, so that branch says so instead
+ * of inventing an id that does not exist. It also stays in English rather
+ * than folding in `outcome.reason`: that string is the owner-facing Hebrew
+ * refusal (CLAUDE.md: Hebrew for what the owner reads, English for internal
+ * records), and `job_steps.reason` is the latter — the instruction row this
+ * job already carries is where the detail lives.
+ *
+ * Exported and pure so both branches — including the one behind a bound plan,
+ * which needs a live model call this dashboard route has no way to inject
+ * around — can be tested without a network call or a database.
+ */
+export function reasonForSupersededJob(outcome: Awaited<ReturnType<typeof runInstruction>>): string {
+  return outcome.status === 'refused'
+    ? 'instruction door: answered; re-run refused before a replacement job was created'
+    : `instruction door: answered; superseded by ${outcome.jobId}`;
+}
+
+/**
  * The reply to a clarifying question `runInstruction` asked.
  *
  * A job waiting on a question sits in the `understand` phase, which nothing
  * else in the system reads — `runDueJobs` only ever picks up jobs in
  * `execute`, and the scheduler has no notion of "answer pending". This route
- * is the only thing that ever moves such a job forward: it re-runs the same
- * pipeline with the owner's answer appended to the original text, exactly as
- * if the owner had typed both in one go from the start.
+ * is the only thing that ever acts on such a job again: it records the
+ * answer, then re-runs the pipeline with the owner's answer appended to the
+ * original text, exactly as if the owner had typed both in one go from the
+ * start. That re-run is a **new** job, not a resumption of the parked one —
+ * `runInstruction` calls `createJob` unconditionally — so the parked job is
+ * closed out (`transition` to `failed`, reason from `reasonForSupersededJob`)
+ * rather than left sitting in `understand` forever, which is exactly the
+ * orphan-phase leak CLAUDE.md names ("פאזה בלי קורא אינה מקום מנוחה אלא
+ * דלף"). Resuming the parked job itself instead of superseding it would be a
+ * larger change than this route carries.
  *
  * `loadInstructionForJob` is scoped to `businessId` and returns `null` for a
  * job that belongs to another business — indistinguishable, on purpose, from
@@ -440,12 +486,44 @@ async function handleInstructAnswer(
   if (instruction === null) return sendHtml(res, 404, renderNotFound());
 
   const answer = form.get('answer') ?? '';
+  // The textarea's `required` is client-side only, and unlike `text` this
+  // column carries no CHECK constraint bounding it — a hand-crafted POST can
+  // send up to `MAX_BODY_BYTES` of it. An empty answer is worse than merely
+  // unbounded: recorded as-is it overwrites any earlier answer, and re-runs
+  // the pipeline on text byte-identical to the original instruction — so the
+  // planner asks the very same question again, forever.
+  if (answer.trim().length === 0) {
+    return sendHtml(
+      res,
+      400,
+      renderInstruct({ csrf: issueCsrfToken(session.sessionId), error: 'התשובה ריקה.' }),
+    );
+  }
+  if (answer.length > MAX_INSTRUCTION_CHARS) {
+    return sendHtml(
+      res,
+      400,
+      renderInstruct({
+        csrf: issueCsrfToken(session.sessionId),
+        error: `התשובה ארוכה מ-${MAX_INSTRUCTION_CHARS} תווים.`,
+      }),
+    );
+  }
+
   await recordAnswer(instruction.instructionId, answer, { businessId });
 
   const outcome = await runInstruction(
     { text: `${instruction.text}\n\n${answer}` },
     { businessId },
   );
+
+  await transition(jobId, {
+    to: 'failed',
+    actor: 'human',
+    reason: reasonForSupersededJob(outcome),
+    businessId,
+  });
+
   renderInstructionOutcome(res, session, outcome);
 }
 
