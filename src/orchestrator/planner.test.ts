@@ -7,7 +7,7 @@ import { Plan, planProblems, topologicalOrder } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
 import { createJob, jobHistory, loadJob, transition } from './jobs.js';
-import { capabilityCatalogue, renderCatalogue } from './catalogue.js';
+import { READ_ONLY_CLASS_LABEL, capabilityCatalogue, renderCatalogue } from './catalogue.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterCall, AdapterResult, ExternalAdapter } from './adapters/types.js';
 import { envCredentials } from './credentials.js';
@@ -202,6 +202,36 @@ describe('the capability catalogue makes a plan feasible by construction', () =>
     expect(once).toBe(twice);
     expect(once).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
     expect(once).toContain('## comms.email');
+  });
+
+  /**
+   * L1, found by running the door against the real model.
+   *
+   * The catalogue used to render a class-less tool as the bare token
+   * `read-only`, in the same column where every other tool shows a real
+   * `ActionClass` member — and the same prompt then asks the model to fill
+   * `expectedActionClass`. The model copied what it was shown, `ActionClass`
+   * has no such member, `Plan.safeParse` failed, and the owner was told their
+   * instruction could not be understood. Every control behaved correctly; the
+   * label next door was the whole defect.
+   *
+   * The first assertion pins the subject present before the negative one is
+   * allowed to mean anything: a rendered catalogue with no class-less tool in
+   * it would satisfy "contains no bare `read-only`" for the wrong reason.
+   */
+  it('renders a class-less tool as a null instruction, never as a bare token', async () => {
+    const bundle = await install();
+    const entries = capabilityCatalogue(bundle, 'boss');
+
+    const classless = entries.flatMap((e) => e.tools).filter((t) => t.actionClass === null);
+    expect(classless.length, 'no class-less tool in the catalogue to render').toBeGreaterThan(0);
+
+    const rendered = renderCatalogue(entries);
+    expect(rendered).toContain(READ_ONLY_CLASS_LABEL);
+    // The class column of every line is either a real ActionClass member or
+    // the label above. `read-only` standing alone between the separators is
+    // what the model copied.
+    expect(rendered).not.toMatch(/ · read-only · /);
   });
 
   it('never lists a tool the gate would refuse', async () => {

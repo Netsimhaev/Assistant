@@ -184,8 +184,12 @@ export function readEmails(input: Record<string, unknown>): string[] {
 /**
  * Digits only, so `+972-50-123-4567` and `0501234567` compare equal. The leading
  * country code is not normalised away — that needs a locale the charter owns.
+ *
+ * Exported for the same reason `readEmails` is: `coveredByAuthorization`
+ * (`src/governance/authorization.ts`) needs to see a WhatsApp step's
+ * recipient, which arrives here and not through `readEmails`.
  */
-function readPhones(input: Record<string, unknown>): string[] {
+export function readPhones(input: Record<string, unknown>): string[] {
   return collectStrings(input, ['phone', 'toNumber', 'msisdn'])
     .flatMap((value) => value.split(/[,;]/))
     .map((value) => value.replace(/\D/g, ''))

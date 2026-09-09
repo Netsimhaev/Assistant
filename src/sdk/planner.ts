@@ -1,8 +1,9 @@
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { config } from '../config.js';
 import { Plan, planProblems } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
-import { capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
+import { READ_ONLY_CLASS_LABEL, capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
 
 export interface PlanRequest {
   bundle: PolicyBundle;
@@ -10,6 +11,20 @@ export interface PlanRequest {
   intents: unknown;
   provenance: TrustLevel;
   rampLevel: AutonomyLevel;
+  /**
+   * The owner's own words, when the job came through the instruction door.
+   *
+   * Mutually exclusive with `intents` in practice: triage produces intents
+   * from content nobody vouches for, and this carries a sentence the owner
+   * typed behind a session. Both land in the same final section of the prompt
+   * so the cacheable prefix above it is untouched either way — see the
+   * assembly order in `buildPlannerPrompt`.
+   *
+   * The planner's own header says "never the raw message", and that rule was
+   * written about hostile input. Spec §4 of the instruction door records the
+   * deliberate exception and why it does not extend to any other caller.
+   */
+  instruction?: string;
 }
 
 export type PlanOutcome =
@@ -55,18 +70,55 @@ export function buildPlannerPrompt(request: PlanRequest): string {
     'כללים: מזהי צעדים ייחודיים · dependsOn מפנה רק לצעדים בתוכנית הזו · בלי מעגלים ·',
     'שאלת הבהרה אחת לכל היותר · expectedActionClass הוא מה שאתה מאמין שהצעד ייחשב,',
     'ואי-התאמה לשער תפסול את התוכנית — עדיף null מאשר ניחוש.',
+    // Built from the constant, not retyped: a hand-copied label drifts the
+    // first time the rendering changes, and this rule exists precisely
+    // because the model copies the label it is shown (L1).
+    `כלי שהקטלוג מסמן «${READ_ONLY_CLASS_LABEL}» חייב לקבל \`null\` בשדה הזה. ` +
+      'הסימון הזה אינו מחלקת פעולה ואין להעתיק אותו כמחרוזת — תוכנית שתעשה זאת תיפסל.',
     '',
-    '# ה-intents',
     // Last, and the only part that varies per job: everything above is the
     // cacheable prefix.
-    JSON.stringify(request.intents),
+    ...(request.instruction === undefined
+      ? ['# ה-intents', JSON.stringify(request.intents)]
+      : ['# ההוראה מבעל העסק', request.instruction]),
   ].join('\n');
 }
 
+/**
+ * The one guard standing between the test suite and a billed call.
+ *
+ * This machine carries a real `ANTHROPIC_API_KEY` (CLAUDE.md says so). No
+ * committed test calls `makePlan` on purpose — `runInstruction` takes an
+ * injectable `planner`, and every `instruct.test.ts` case supplies one — but
+ * `src/dashboard/server.ts`'s `/instruct` and `/instruct/:jobId/answer`
+ * routes call `runInstruction` with no `planner` option at all, because
+ * production must reach the real one. `server.test.ts` drives those routes
+ * over real HTTP and relies entirely on oversized input — three separate
+ * character counts (an instruction over 4,000 chars, an answer over 4,000,
+ * and an original-plus-answer pair that only exceeds the cap once joined) —
+ * refusing before `createJob` so the planner is never reached. A test that
+ * quietly gets one of those three counts wrong stops refusing early and
+ * falls through to this function instead, and nothing before this line would
+ * have stopped it: that is precisely what happened in two review rounds.
+ *
+ * `config.isTest` mirrors `vitest.config.ts`'s `env.NODE_ENV = 'test'`, so
+ * this fires for every test file without any of them opting in, and does not
+ * fire for the manual `npm run sdk:*` scripts or the dashboard in
+ * production, neither of which run under `NODE_ENV=test`.
+ */
+function refuseUnderTest(): void {
+  if (!config.isTest) return;
+  throw new Error(
+    'makePlan: refusing to run under NODE_ENV=test — this is a live, billed call to the Agent SDK. ' +
+      'Inject a planner (see RunInstructionOptions.planner) instead of relying on the default reaching this function.',
+  );
+}
+
 export async function makePlan(request: PlanRequest): Promise<PlanOutcome> {
+  refuseUnderTest();
   const options: Options = {
     systemPrompt:
-      'אתה המתכנן. אתה מקבל intents מובנים ומחזיר תוכנית JSON. ' +
+      'אתה המתכנן. אתה מקבל intents מובנים או הוראה ישירה מבעל העסק, ומחזיר תוכנית JSON. ' +
       'אינך מבצע דבר ואין לך כלים — התוכנית שלך היא הצעה שעוברת אימות.',
     // No tools at all. The planner reasons; it does not act, and a planner
     // that could act would be a second, ungated path to every capability.

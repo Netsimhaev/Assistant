@@ -178,6 +178,60 @@ describe('coveredByAuthorization', () => {
       actionClass: 'email.reply', input: { to: 'dana@example.com' }, ...NO_MONEY,
     })).toBe(false);
   });
+
+  const AUTH_PHONE: StandingAuthorization = {
+    jobId: 'J-x',
+    businessId: BUSINESS,
+    actionClass: 'whatsapp.initiate',
+    recipients: ['0501234567'],
+    grantedBy: 'boss',
+  };
+
+  it('covers a WhatsApp recipient named by number, not only an email address', () => {
+    // coveredByAuthorization used to compute `going` as readEmails(input)
+    // alone, so a WhatsApp step's phone was invisible to it and no phone
+    // recipient could ever be covered, however the grant was written.
+    expect(coveredByAuthorization(AUTH_PHONE, {
+      ...OWN_JOB, actionClass: 'whatsapp.initiate', input: { phone: '0501234567' }, ...NO_MONEY,
+    })).toBe(true);
+  });
+
+  it('does not cover a step that reaches an authorised address alongside an unnamed phone', () => {
+    // A phone-only grant can't expose this: pre-fix, readEmails(input) alone
+    // already finds nothing for a phone-only payload and returns false at
+    // the empty-`going` guard for the same reason with or without
+    // readPhones — that assertion would hold either way and prove nothing.
+    // Mixing an authorised email into the same grant makes `going`
+    // non-empty even pre-fix, so this is the version that actually
+    // distinguishes: pre-fix it wrongly returns true (the stranger phone is
+    // invisible to readEmails alone); only with readPhones wired in does the
+    // `every` see the second, ungranted number and refuse.
+    const mixed: StandingAuthorization = {
+      ...AUTH_PHONE,
+      recipients: ['dana@example.com', '0501234567'],
+    };
+    expect(coveredByAuthorization(mixed, {
+      ...OWN_JOB, actionClass: 'whatsapp.initiate',
+      input: { to: 'dana@example.com', phone: '0501234567,0509999999' }, ...NO_MONEY,
+    })).toBe(false);
+  });
+
+  it('covers memory.write_longterm as an entailed step, with no recipient required', () => {
+    // Joins crm.write in ENTAILED_INTERNAL_CLASSES: remembering a preference
+    // the owner stated reaches nobody, spends nothing, and can be corrected.
+    expect(coveredByAuthorization(AUTH, {
+      ...OWN_JOB, actionClass: 'memory.write_longterm', input: {}, ...NO_MONEY,
+    })).toBe(true);
+  });
+
+  it('still does not cover artifact.write now that memory.write_longterm is entailed', () => {
+    // artifact.write stays out on purpose: classify.ts maps both file.write
+    // and code_execution onto it, so entailing it would let any standing
+    // grant buy arbitrary code execution and filesystem writes.
+    expect(coveredByAuthorization(AUTH, {
+      ...OWN_JOB, actionClass: 'artifact.write', input: {}, ...NO_MONEY,
+    })).toBe(false);
+  });
 });
 
 describe('grantAuthorization', () => {

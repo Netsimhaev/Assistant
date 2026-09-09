@@ -23,9 +23,16 @@ import { saveReading } from '../documents/reading-store.js';
 import { saveProposal } from '../orchestrator/proposal-store.js';
 import { loadSignature } from '../governance/signatures.js';
 import { queryAudit } from '../audit/log.js';
+import {
+  loadInstructionForJob,
+  recordAnswer,
+  recordQuestion,
+  saveInstruction,
+} from '../governance/instructions.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
-import { assertBindableHost, createServer } from './server.js';
+import { assertBindableHost, createServer, reasonForSupersededJob } from './server.js';
+import { renderInstruct } from './views.js';
 
 const BUSINESS = 'test-business';
 const OTHER_BUSINESS = 'test-business-other';
@@ -471,6 +478,586 @@ describe('GET /readings', () => {
     // No approval behind this proposal (job_id is null): the screen must say
     // so, not silently omit the row or link to nothing.
     expect(body).toContain('אין כרטיס — אין פעולה לאשר');
+  });
+});
+
+describe('GET /instruct, POST /instruct', () => {
+  // M2: this asserted `toContain('מה לעשות')`, which is also the pending
+  // list's own link label to this page — and `fetch` follows redirects, so a
+  // handler replaced by `redirect(res, '/')` still returned 200 with that
+  // string in the body and the test still passed. `name="text"` is the box
+  // itself, and appears on no other page.
+  it('serves the instruction box behind a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('name="text"');
+  });
+
+  it('refuses the instruction box without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+
+    const res = await fetch(`${baseUrl}/instruct`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  it('refuses a submitted instruction without a CSRF token', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/instruct`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ text: 'תשלחי לדנה' }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  // The brief for this test named '4,000' as the expected substring, but
+  // `instruct.ts` interpolates `MAX_INSTRUCTION_CHARS` (a bare number) with
+  // no locale formatting anywhere on this path — the refusal reads "...
+  // מ-4000 תווים...", not "4,000". Asserting the comma form would fail
+  // against the actual (correct) refusal text.
+  //
+  // Bare '4000' is not enough, though — found while re-verifying this round's
+  // fixes: `renderInstruct`'s base form always renders
+  // `<textarea ... maxlength="4000" ...>`, on every refusal, regardless of
+  // which one fired. `toContain('4000')` alone would pass against ANY
+  // refusal — "no active charter", an empty instruction, anything — purely
+  // from that decorative markup. Asserting the fuller Hebrew phrase from the
+  // actual refusal sentence ("ארוכה מ-4000 תווים") is what ties this to the
+  // length check specifically, since that phrase appears nowhere else on the
+  // page.
+  //
+  // A charter is installed here (fix round 1, M1): without one, `runInstruction`
+  // refuses at `loadActiveCharter` before `createJob` for ANY input, so the
+  // empty `boss_instructions` table would hold whether or not the length cap
+  // ever fired. Installing a charter means the length check is what actually
+  // has to fire first for this to pass.
+  it('shows the refusal when the instruction is too long, and opens no job', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    await installCharter(buildCharter(), { businessId: BUSINESS });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, text: 'א'.repeat(4001) }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('ארוכה מ-4000 תווים');
+    const { rows } = await getPool().query(`SELECT 1 FROM boss_instructions`);
+    expect(rows).toHaveLength(0);
+    // M3: an empty `boss_instructions` is also true if the cap is deleted and
+    // `saveInstruction` throws instead — `runInstruction` catches that throw,
+    // fails the job it already opened, and returns a refusal that reads
+    // differently but still leaves this table empty. What the cap uniquely
+    // buys is that no job is opened at all, so that is what is asserted.
+    const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
+    expect(jobs.rows).toHaveLength(0);
+  });
+
+  /**
+   * I3: a clarifying question has to survive the page it was born on.
+   *
+   * `GET /instruct` rendered the empty box with no lookup at all, so the
+   * parked job's id and its question existed only in the HTML of the POST
+   * response that created them. Reload, navigate away or close the tab, and
+   * the job was orphaned in `understand` — a phase nothing in the scheduler
+   * touches — with the owner unable to ever see what they were asked.
+   *
+   * Set up the way `runInstruction` leaves it: an instruction row carrying
+   * the question, on a job parked in `understand`, with no answer yet.
+   */
+  it('shows a parked question and its answer form on a fresh GET', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    const instruction = await saveInstruction(
+      { jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
+      { businessId: BUSINESS },
+    );
+    await recordQuestion(instruction.instructionId, 'לאיזו דנה — כהן או לוי?', {
+      businessId: BUSINESS,
+    });
+    await transition(job.jobId, {
+      to: 'understand',
+      actor: 'orchestrator',
+      reason: 'test setup',
+      businessId: BUSINESS,
+    });
+
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const body = await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text();
+
+    expect(body).toContain('לאיזו דנה — כהן או לוי?');
+    // The question without a way to answer it is half the feature.
+    expect(body).toContain(`action="/instruct/${job.jobId}/answer"`);
+  });
+
+  it('does not list a question that has already been answered', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+
+    const answeredJob = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    const answeredInstruction = await saveInstruction(
+      { jobId: answeredJob.jobId, text: 'תשלחי לדנה את ההצעה' },
+      { businessId: BUSINESS },
+    );
+    await recordQuestion(answeredInstruction.instructionId, 'לאיזו דנה?', {
+      businessId: BUSINESS,
+    });
+    await transition(answeredJob.jobId, {
+      to: 'understand',
+      actor: 'orchestrator',
+      reason: 'test setup',
+      businessId: BUSINESS,
+    });
+    // The answer is recorded but the re-run refused, so the job is still
+    // parked in `understand`. Phase alone would keep listing this as an open
+    // question the owner has in fact already answered.
+    await recordAnswer(answeredInstruction.instructionId, 'דנה כהן', { businessId: BUSINESS });
+
+    // A second, still-open question on a different parked job. Without it,
+    // an assertion that the answered question is absent would hold just as
+    // well if the whole listing were deleted — this proves the listing
+    // filters on the answer instead of proving nothing is listed at all.
+    const openJob = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    const openInstruction = await saveInstruction(
+      { jobId: openJob.jobId, text: 'תזמיני פגישה עם רואה החשבון' },
+      { businessId: BUSINESS },
+    );
+    await recordQuestion(openInstruction.instructionId, 'איזה יום מתאים?', {
+      businessId: BUSINESS,
+    });
+    await transition(openJob.jobId, {
+      to: 'understand',
+      actor: 'orchestrator',
+      reason: 'test setup',
+      businessId: BUSINESS,
+    });
+
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const body = await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text();
+
+    expect(body).not.toContain('לאיזו דנה?');
+    expect(body).toContain('איזה יום מתאים?');
+  });
+});
+
+describe('renderInstruct — grantNote (fix round 1, C1)', () => {
+  // `runInstruction`'s `grantNote` is non-null exactly when a plan spanned
+  // more than one action class and so authorised nothing at all — before this
+  // fix it was computed and then thrown away, and the owner would later meet
+  // an approval card for something they believed the instruction had already
+  // covered. A pipeline-level test driving a real multi-class plan through an
+  // injected planner belongs in `instruct.test.ts` (this dashboard route has
+  // no way to inject a planner); at this layer, a view-level test on
+  // `renderInstruct` itself is what the fix brief calls "enough" — and it
+  // fails the moment the note's rendering branch is removed.
+  it('renders the grant note, HTML-escaped', () => {
+    const html = renderInstruct({
+      csrf: 'tok',
+      grantNote:
+        'ההוראה נגעה ביותר ממחלקת פעולה אחת <script>alert(1)</script>, ולכן לא ניתנה הרשאה אוטומטית.',
+    });
+    expect(html).toContain('ההוראה נגעה ביותר ממחלקת פעולה אחת');
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  it('renders no note block when grantNote is absent', () => {
+    const html = renderInstruct({ csrf: 'tok' });
+    expect(html).not.toContain('ולכן לא ניתנה הרשאה אוטומטית');
+  });
+});
+
+describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N2)', () => {
+  // Fix round 2: `reasonForSupersededJob` no longer accepts a `refused`
+  // outcome at all — its parameter type is `Extract<..., { jobId: string }>`,
+  // which `refused` (no `jobId` field) does not satisfy. That used to be a
+  // runtime branch ("says no replacement was created..."); the route now
+  // never calls this function on a `refused` outcome in the first place (see
+  // `handleInstructAnswer`), so the "no replacement" case is a compile-time
+  // impossibility rather than a string this function has to produce.
+  it('names the replacement job when the re-run produced one', () => {
+    expect(
+      reasonForSupersededJob({
+        status: 'planned',
+        jobId: 'J-REPLACEMENT',
+        instructionId: 'INS-1',
+        granted: [],
+        grantNote: null,
+      }),
+    ).toContain('J-REPLACEMENT');
+
+    expect(
+      reasonForSupersededJob({
+        status: 'needs_answer',
+        jobId: 'J-ASKS-AGAIN',
+        instructionId: 'INS-1',
+        question: 'איזו דנה?',
+        instructionText: 'תשלחי לדנה את ההצעה',
+      }),
+    ).toContain('J-ASKS-AGAIN');
+  });
+});
+
+describe('POST /instruct/:jobId/answer', () => {
+  /**
+   * A job parked in `understand` carrying a real instruction, wired up the
+   * same way `runInstruction` itself would leave it while waiting on an
+   * answer (a real `charter_versions` row, so `jobs.charter_version`'s FK is
+   * satisfied, and the `intake → understand` move `saveInstruction` is
+   * followed by in production).
+   *
+   * `installCharter` activates the charter it installs — there is no
+   * "installed but inactive" variant in this helper (an earlier version of
+   * this file deactivated it again with a `DELETE FROM charter_active` after
+   * calling this, to keep `loadActiveCharter` missing; that line is gone).
+   * So every test in this block that re-runs the pipeline for real DOES reach
+   * `loadActiveCharter` with a hit, and would proceed toward the live
+   * planner. What keeps these tests off the network instead is entirely the
+   * length cap: every answer POSTed here is sized so the joined instruction
+   * either exceeds `MAX_INSTRUCTION_CHARS` on its own or fails a guard before
+   * `runInstruction` is ever called — `runInstruction` checks that cap before
+   * `loadActiveCharter`, so a long-enough join refuses before the charter (or
+   * the planner) is ever consulted. There is no other guard here doing that
+   * job; a future test in this block that posts a short answer against a job
+   * with an active charter WILL reach the live planner.
+   *
+   * A test that needs the job somewhere OTHER than `understand` (fix round 2,
+   * N2's phase guard tests) transitions it further after calling this.
+   */
+  async function anInstructionJob(businessId: string, text: string): Promise<string> {
+    const bundle = await installCharter(buildCharter(), { businessId });
+    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
+    await saveInstruction({ jobId: job.jobId, text }, { businessId });
+    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup', businessId });
+    return job.jobId;
+  }
+
+  it('refuses without a CSRF token', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ answer: 'דנה כהן' }),
+    });
+    expect(res.status).toBe(403);
+
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
+  });
+
+  it('refuses without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      body: new URLSearchParams({ answer: 'דנה כהן' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  // The exact case the task calls out: `loadInstructionForJob` returns
+  // `null` for a job that belongs to another business — a value, not a
+  // throw — and the route has to turn that into a clean refusal itself.
+  it("refuses to answer another business's job instead of throwing", async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const otherJobId = await anInstructionJob(OTHER_BUSINESS, 'תשלחי לדנה את ההצעה');
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${otherJobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'דנה כהן' }),
+    });
+    expect(res.status).toBe(404);
+
+    const stored = await loadInstructionForJob(otherJobId, { businessId: OTHER_BUSINESS });
+    expect(stored?.answer).toBeNull();
+  });
+
+  // Fix round 1, M2: the textarea's `required` is client-side only, and
+  // `answer` (unlike `text`) carries no CHECK constraint. An empty answer
+  // recorded as-is would overwrite any earlier answer and re-run the pipeline
+  // on text byte-identical to the original instruction, so the planner would
+  // ask the very same question again — forever. Refused before `recordAnswer`
+  // runs at all: the stored answer stays `null`.
+  it('refuses a whitespace-only answer without recording it', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: '   ' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('התשובה ריקה');
+
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
+    // The parked job is untouched — refused before the close-out transition
+    // too, and still `understand` (fix round 2: `anInstructionJob` parks the
+    // job there directly, matching where a real answer-pending job sits).
+    const job = await loadJob(jobId, { businessId: BUSINESS });
+    expect(job?.phase).toBe('understand');
+  });
+
+  // Fix round 1, M2: `answer` has no CHECK constraint bounding it the way
+  // `text` does, so without this a hand-crafted POST could put up to
+  // `MAX_BODY_BYTES` of it in the column.
+  it('refuses an answer longer than the instruction cap without recording it', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'א'.repeat(4001) }),
+    });
+    expect(res.status).toBe(400);
+    // Not bare '4000' — see the note above the instruction-length test:
+    // `renderInstruct`'s base form always carries `maxlength="4000"`, on
+    // every refusal. The full sentence this route's own error text produces
+    // ("התשובה ארוכה מ-...") appears nowhere else on the page.
+    expect(await res.text()).toContain('התשובה ארוכה מ-4000 תווים');
+
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
+  });
+
+  // Fix round 1, I1: the reviewer's probe. `runInstruction` checks the length
+  // cap BEFORE `loadActiveCharter`, so a ~3,990-character original plus a
+  // 20-character answer crosses 4,000 only once both halves are joined.
+  // Dropping either half from the join (the original text, or the answer)
+  // would leave the joined length under the cap, so `instruct.ts`'s own
+  // length-refusal branch — the ONLY place "ההוראה ארוכה מ-4000 תווים" comes
+  // from — would never fire, and the response would carry different text
+  // instead (or, since nothing here would then refuse before `createJob`,
+  // would actually reach the live planner — see the mutation note in this
+  // block's own verification below). Not bare '4000': that also sits in
+  // `renderInstruct`'s decorative `maxlength="4000"`, present on every
+  // refusal regardless of cause, which is what let an earlier version of
+  // this exact test pass by coincidence when the join itself was broken —
+  // caught only by manually re-verifying the mutation.
+  it('joins the original instruction and the answer before re-running the pipeline', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const originalText = 'א'.repeat(3990);
+    const jobId = await anInstructionJob(BUSINESS, originalText);
+    const answer = 'ב'.repeat(20);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBe(answer);
+  });
+
+  // Fix round 2, N1: a refused re-run must leave the parked job exactly where
+  // it was, not close it out. Before this fix, `handleInstructAnswer`
+  // transitioned unconditionally: the first refused POST here would have
+  // moved the job to `failed`, and the second POST — the owner's obvious
+  // next move, resubmitting from the same page — would have hit
+  // `transition(jobId, { to: 'failed' })` again on a job already `failed`,
+  // which is an illegal transition that throws uncaught to the top-level 500
+  // handler. Both POSTs below stay under the length cap's live-planner
+  // avoidance strategy (see the note on `anInstructionJob`): each answer
+  // alone is well under `MAX_INSTRUCTION_CHARS`, but joined with the
+  // ~3,990-character original both cross it, so both refuse deterministically
+  // before `createJob` — never reaching the planner.
+  it('lets a second POST retry after a refused re-run instead of 500ing', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const originalText = 'א'.repeat(3990);
+    const jobId = await anInstructionJob(BUSINESS, originalText);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const firstRes = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'ב'.repeat(20) }),
+    });
+    expect(firstRes.status).toBe(400);
+    expect(await firstRes.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+
+    const afterFirst = await loadJob(jobId, { businessId: BUSINESS });
+    expect(afterFirst?.phase).toBe('understand');
+
+    // The retry — same job, a different (still over-cap-when-joined) answer.
+    // Pre-fix this 500s; post-fix it refuses the same clean way the first
+    // POST did, because the job is still `understand`, not `failed`.
+    const secondRes = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'ג'.repeat(20) }),
+    });
+    expect(secondRes.status).toBe(400);
+    expect(await secondRes.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+
+    const afterSecond = await loadJob(jobId, { businessId: BUSINESS });
+    expect(afterSecond?.phase).toBe('understand');
+  });
+
+  // Fix round 2, N1 (the other side): once a re-run DOES produce a
+  // replacement, the parked job is closed out — and a second POST against
+  // the now-closed job must meet the phase guard, not attempt (and illegally
+  // repeat) another close-out. Reaching a genuine `planned`/`needs_answer`
+  // outcome through this route needs a live model call (see the module
+  // docblock), so this simulates the post-success state directly: transition
+  // the parked job to `failed` the same way `handleInstructAnswer` itself
+  // would after a successful re-run, then POST again.
+  it('refuses a second POST after the parked job has already been closed out', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    await transition(jobId, {
+      to: 'failed',
+      actor: 'human',
+      reason: 'instruction door: answered; superseded by J-SIMULATED-REPLACEMENT',
+      businessId: BUSINESS,
+    });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'תשובה כלשהי' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('כבר אינה ממתינה לתשובה');
+
+    // The guard fires before `recordAnswer` — the row from the original
+    // answer (never set in this test) stays untouched, not overwritten.
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
+  });
+
+  /**
+   * I2: two POSTs of the same answer must produce one job, and the loser must
+   * refuse cleanly.
+   *
+   * The phase guard is a read, and `runInstruction` makes a live model call
+   * before anything writes — nothing held a lock across that window. Two
+   * POSTs (a double-click on the answer button, with a multi-second gap) both
+   * passed the guard, both recorded an answer, and both created a job, a
+   * grant, a binding and a promotion to `execute`. Then both transitioned the
+   * parked job to `failed`, and the second met a job already `failed` and
+   * threw uncaught to the 500 handler: two authorised, bound plans for one
+   * answer, and an error suggesting nothing happened.
+   *
+   * Unlike every other test in this block, this one deliberately posts a
+   * SHORT answer, so the pipeline runs past the length cap and reaches
+   * `createJob` — that is the write this test counts. It still never touches
+   * the network: `makePlan`'s `refuseUnderTest` throws under
+   * `NODE_ENV=test`, `runInstruction` catches it, fails the new job and
+   * returns `refused`. So a winning request creates exactly one job and a
+   * losing one creates none.
+   */
+  it('lets only one of two concurrent answers through, and the loser refuses without a 500', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const post = () =>
+      fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+        method: 'POST',
+        headers: { cookie },
+        body: new URLSearchParams({ csrf, answer: 'דנה כהן' }),
+      });
+
+    const [a, b] = await Promise.all([post(), post()]);
+    const bodies = [await a.text(), await b.text()];
+
+    // Nobody gets a 500 — the shape the owner actually met.
+    expect([a.status, b.status]).not.toContain(500);
+    // Exactly one of the two was turned away by the claim.
+    expect(bodies.filter((body) => body.includes('כבר בטיפול'))).toHaveLength(1);
+
+    // The count is the point: the parked job, plus the one job the winner
+    // opened. Without the claim both requests reach `createJob` and there are
+    // three.
+    const { rows } = await getPool().query<{ n: string }>(
+      'SELECT count(*)::text AS n FROM jobs WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(rows[0]?.n).toBe('2');
+  });
+
+  // Fix round 2, N2: the route must not be able to fail an unrelated,
+  // in-flight job just because it shares a business and carries an
+  // instruction row — which any successfully planned instruction does.
+  // `execute → failed` is a legal transition, so without the phase guard this
+  // would silently kill a running plan.
+  it("refuses to answer a job that isn't parked (e.g. already executing), and leaves it untouched", async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
+    for (const to of ['plan', 'execute'] as const) {
+      await transition(jobId, { to, actor: 'orchestrator', reason: 'test setup', businessId: BUSINESS });
+    }
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'תשובה כלשהי' }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('כבר אינה ממתינה לתשובה');
+
+    const job = await loadJob(jobId, { businessId: BUSINESS });
+    expect(job?.phase).toBe('execute');
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
   });
 });
 

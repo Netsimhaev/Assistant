@@ -198,7 +198,7 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/readings">מה קראתי</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/readings">מה קראתי</a></p>
 ${list}`,
   );
 }
@@ -421,6 +421,102 @@ ${signErrorBlock}
   </form>
   ${options.document && isDocumentDecisionIntent(options.documentIntent ?? null) ? signForm(approval.approvalId, options.csrf, options.document, noteValue) : ''}
 </div>`,
+  );
+}
+
+/**
+ * The instruction box.
+ *
+ * One field and one button. The note under it is not decoration: an
+ * instruction is its own approval, and the owner should know that before they
+ * type, not discover it afterwards.
+ *
+ * `grantNote` is `runInstruction`'s explanation for exactly one situation: a
+ * plan spanning more than one action class, which authorises nothing at all
+ * (see `grantForPlan` in `instruct.ts`). Without showing it, the owner is
+ * bounced to the pending list and later meets an approval card for something
+ * they believed the instruction already covered, with no sentence anywhere
+ * saying why the shortcut did not apply — so it renders beside the error, not
+ * folded into it, since the two can never occur together (a `grantNote` only
+ * ever accompanies a `planned` outcome, an `error` only ever a `refused` one).
+ *
+ * The clarifying question goes through `escLabel`, not `esc`: it is
+ * model-composed text reaching an RTL page, the same category `escLabel` was
+ * written for (see its own docblock). Every instruction is owner-typed today,
+ * so the exposure is low, but it is the second model-authored string to reach
+ * a screen and the cheap decision is to treat it that way from the start.
+ */
+/**
+ * One instruction still waiting on the owner's answer.
+ *
+ * `question` is nullable because migration 023 is what gave it a home: a job
+ * parked before that migration has no stored question and cannot be given
+ * one. Such a row is still listed — the owner can answer it, and an answer
+ * box with no question is far better than an orphaned job nothing shows.
+ */
+export interface PendingQuestion {
+  jobId: string;
+  question: string | null;
+  /** The owner's own words, so a question with no stored text still has context. */
+  text: string;
+}
+
+/** Shown in place of a question that predates migration 023. */
+const QUESTION_UNAVAILABLE = 'נשאלה שאלה שלא נשמרה. אפשר לענות כאן בכל זאת.';
+
+function pendingCard(item: PendingQuestion, csrf: string): string {
+  return `<article class="card">
+           <h3>שאלה לפני שאמשיך</h3>
+           <p class="muted">${escLabel(item.text)}</p>
+           <p>${item.question === null ? esc(QUESTION_UNAVAILABLE) : escLabel(item.question)}</p>
+           <form method="POST" action="/instruct/${esc(item.jobId)}/answer">
+             <input type="hidden" name="csrf" value="${esc(csrf)}">
+             <textarea name="answer" rows="2" required></textarea>
+             <button>לענות ולהמשיך</button>
+           </form>
+         </article>`;
+}
+
+export function renderInstruct(options: {
+  csrf: string;
+  error?: string;
+  pending?: PendingQuestion[] | null;
+  grantNote?: string | null;
+}): string {
+  const error =
+    options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
+
+  const grantNote =
+    options.grantNote == null ? '' : `<p class="muted">${esc(options.grantNote)}</p>`;
+
+  const pending =
+    options.pending == null
+      ? ''
+      : options.pending.map((item) => pendingCard(item, options.csrf)).join('\n');
+
+  return page(
+    'מה לעשות',
+    `<h1>מה לעשות</h1>
+     ${error}
+     ${grantNote}
+     ${pending}
+     <form method="POST" action="/instruct">
+       <input type="hidden" name="csrf" value="${esc(options.csrf)}">
+       <textarea name="text" rows="4" maxlength="4000" required
+                 placeholder="למשל: תשלחי לדנה dana@example.com את ההצעה"></textarea>
+       <button>שלח</button>
+     </form>
+     <p class="muted">
+       מה שתכתוב כאן נרשם כהוראה שלך, ואני נשענת עליה במקום לשאול שוב על אותו דבר.
+       בשלב הנוכחי זה עדיין לא משנה בפועל מה קורה: פעולה שיוצאת החוצה לא מתבצעת
+       היום בכלל — היא נעצרת עוד לפני שלב האישור, כי כל סוג פעולה יוצאת נמצא
+       בתחתית סולם האוטונומיה. זה ישתנה רק כששני התנאים יתקיימו יחד: הסולם יעלה
+       מעל "טעון אישור" עבור אותו סוג פעולה, והתקנון החתום שלך ייתן לו תקרה
+       גבוהה יותר.
+       פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
+     </p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a></p>
+     ${logoutForm(options.csrf)}`,
   );
 }
 

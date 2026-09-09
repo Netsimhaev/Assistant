@@ -256,6 +256,59 @@ describe('runDueJobs', () => {
     expect(rows[0]?.reason).toContain('no_plan_bound');
   });
 
+  /**
+   * I1, and the same starvation the `unbound` bucket above already fixed for
+   * its own case — reached by a different door.
+   *
+   * `instruct.ts` pre-checks everything that needs no database (allowlist,
+   * class mismatch) precisely so a bad plan fails once in `understand`. What
+   * it cannot pre-check is what needs bindings and the registry:
+   * `no_channel_for_tool`, `ambiguous_channel`, `no_adapter_for_system`.
+   * Those surface only here, and a `rejected` outcome used to be pushed into
+   * `ran` with the phase left exactly where it was — `updated_at` frozen,
+   * first in line under `ORDER BY updated_at ASC` on every pass forever.
+   *
+   * The scenario is the owner's, not a contrivance: no WhatsApp connection in
+   * the charter, "תשלחי לדנה וואטסאפ", the plan binds, `resolveChannel`
+   * returns `no_channel` on this pass and on every pass after it.
+   */
+  it('moves a rejected job out of execute so it cannot hold the window forever', async () => {
+    // A charter with no connection serving `mail.send` at all — so
+    // `resolveChannel` has nothing to match and `runPlan` rejects with
+    // `no_channel_for_tool`, the rejection `instruct.ts` cannot pre-check.
+    const bundle = await installCharter(
+      buildCharter({ version: '2026-08-15.no-channel', connections: [], autonomyBase: { 'email.initiate': 'auto' } }),
+      { businessId: BUSINESS },
+    );
+    const jobId = await jobInExecute(bundle.charterVersion, 'no-channel');
+    await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+
+    const sent: MailMessage[] = [];
+    const first = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+
+    // The positive half first: the job really did reach `runPlan` and really
+    // was rejected there. Without it the phase assertion below would hold for
+    // a job that was never picked up at all.
+    expect(first.ran).toEqual([{ jobId, status: 'rejected', detail: 'no_channel_for_tool' }]);
+    expect(sent).toHaveLength(0);
+
+    const job = await loadJob(jobId, { businessId: BUSINESS });
+    expect(job?.phase).toBe('failed');
+    expect(job?.closedAt).not.toBeNull();
+
+    // The disposition stated as behaviour: a second pass does not find it.
+    const second = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
+    expect(second.ran).toEqual([]);
+
+    // And the rejection code is on the record, not only in the bucket.
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'failed'`,
+      [jobId],
+    );
+    expect(rows[0]?.reason).toContain('no_channel_for_tool');
+  });
+
   it('honours the ramp: with no ramp row the send is capped and no mail goes out', async () => {
     const jobId = await seedExecutableJob();
     // No setRampLevel call at all — the floor is draft_only, which must be

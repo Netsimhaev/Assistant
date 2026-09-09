@@ -65,6 +65,26 @@ export function capabilityCatalogue(
 }
 
 /**
+ * How a tool with no action class is rendered in the class column.
+ *
+ * **Never a bare token.** The column beside it holds real `ActionClass`
+ * members — `email.reply`, `crm.write` — and the same prompt then asks the
+ * model to fill `expectedActionClass`, which is `ActionClass.nullable()`. The
+ * earlier label was the literal string `read-only`, which reads as one more
+ * member of that column's vocabulary; the model duly copied it, the plan
+ * failed `Plan.safeParse`, and the owner was told their instruction could not
+ * be understood. This was found by running the instruction door against the
+ * real model — no test could have caught it, because every test supplies its
+ * own plan.
+ *
+ * Written as the instruction it actually is, in Hebrew prose carrying the
+ * field name and the literal `null`, so it cannot be mistaken for a value:
+ * every `ActionClass` member is a bare ASCII dotted token, and nothing that
+ * looks like this one is.
+ */
+export const READ_ONLY_CLASS_LABEL = 'ללא מחלקה (expectedActionClass: null)';
+
+/**
  * The catalogue as the text a planner reads.
  *
  * Deterministic — sorted agents, sorted tools, no timestamps and no ids. The
@@ -79,7 +99,7 @@ export function renderCatalogue(entries: CatalogueEntry[]): string {
     if (entry.tools.length === 0) continue;
     lines.push(`## ${entry.agent}`);
     for (const tool of entry.tools) {
-      const cls = tool.actionClass ?? 'read-only';
+      const cls = tool.actionClass ?? READ_ONLY_CLASS_LABEL;
       lines.push(`- ${tool.toolName} · ${cls} · ${tool.effectiveAutonomy}`);
     }
     lines.push('');

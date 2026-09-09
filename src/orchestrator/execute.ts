@@ -210,6 +210,25 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     jobId: job.jobId,
     counterpartyTags: request.counterpartyTags,
     rampLevel: request.rampLevel,
+    // Ask the gate to consult an instruction the owner already gave for this
+    // job (C1). Before this, `instruct.ts` wrote a `job_authorizations` row on
+    // every instruction and no production caller ever set this flag, so the
+    // row was read by nothing and the owner was asked again about exactly
+    // what they had just asked for.
+    //
+    // Safe by construction, which is why it can be a flat `true` rather than
+    // something a caller steers. This is an opt-in to a LOOKUP, never an
+    // assertion of what was authorised: `evaluateToolCall` loads the row
+    // itself from `ctx.jobId` and the gate's own resolved business (see
+    // `GateContext.useStandingAuthorization`), `grantAuthorization` refuses
+    // to write one for any job whose `jobs.provenance` is not `boss`, and
+    // `coveredByAuthorization` re-checks job, business, money, action class
+    // and every recipient independently. A job the conductor opened is
+    // `unknown_external`, so there is never a row for it to find — and the
+    // three disjuncts of `needsApproval` mean this can only ever cancel the
+    // risk-band escalation, never the charter ceiling the owner signed and
+    // never `NEVER_FULLY_AUTONOMOUS`.
+    useStandingAuthorization: true,
     now,
     ...(request.approvalId !== undefined
       ? { approval: { approvalId: request.approvalId, stepId: request.stepId } }

@@ -1,6 +1,11 @@
 /**
- * Standing authorisation: the owner's instruction, on record, standing in for
- * an approval question (spec §6).
+ * Standing authorisation: the owner's instruction, on record, meant to stand
+ * in for an approval question (spec §6) — but doing so today requires two
+ * conditions neither of which is met in any production install: the action
+ * class's autonomy ramp above `approve_required`, and the signed charter
+ * granting that class a ceiling above `approve_required` too. Until both
+ * hold, `needsApproval` in `policy/engine.ts` is refused earlier, at the ramp
+ * floor, and this module's grant changes nothing the owner experiences.
  *
  * **It lives under `governance/` and not `orchestrator/` for a layering
  * reason, not a taxonomic one.** `policy/engine.ts` imports this module and
@@ -33,7 +38,7 @@ import { DatabaseError } from 'pg';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
-import { readEmails } from '../policy/facts.js';
+import { readEmails, readPhones } from '../policy/facts.js';
 
 /** Postgres' unique/primary-key-violation error code (see `src/cli/create-owner.ts`). */
 const UNIQUE_VIOLATION = '23505';
@@ -172,8 +177,37 @@ export async function loadAuthorization(
  * conditions never overlap, so the entry could never change an outcome — a
  * dead member of a security-critical positive list, reading as a live
  * control while being unreachable.
+ *
+ * `memory.write_longterm` joins it for the reason the owner asked: "record
+ * and remember" is a real instruction and this class is the mechanism that
+ * exists for it. That reason is narrower than the class it is attached to,
+ * and the gap is worth stating plainly rather than leaving it implicit.
+ * `classify.ts` maps FOUR tools onto `memory.write_longterm` —
+ * `memory.write_entity`, `memory.write_chunk`, `memory.upsert_preference`,
+ * and `memory.retire` — and the last of those is forgetting, not
+ * remembering a stated preference. `capabilities.ts` singles this class out
+ * for a hand-written denylist (`LONGTERM_MEMORY_WRITES`) precisely because
+ * its consequences are severe. The entailed shortcut here consults neither
+ * `auth.actionClass` nor `auth.recipients` — the same gap `artifact.write`
+ * was removed for above — so "reply to Dana" would also cover a
+ * `memory.retire` call during a job that had ingested a hostile attachment,
+ * if this check were the only thing standing between them.
+ *
+ * It is not. Exposure today is zero, and it is zero for a reason that has
+ * nothing to do with this list being safe on its own: stage 8 of the gate
+ * (`policy/engine.ts`) checks `effectiveAutonomy` before stage 10 is ever
+ * reached, `RAMP_FLOOR` (`orchestrator/ramp.ts`) holds every action class at
+ * `draft_only` until something raises it, and nothing in production does —
+ * see CLAUDE.md's account of the first-contact exemption for the identical
+ * argument made about a different control. Once a class's ramp does rise
+ * past `draft_only`, this entry stops being inert, and whether that memory
+ * write happened during a job that ingested untrusted content is a question
+ * this function still cannot answer. Narrowing to tool-level entailment
+ * would answer it properly; that is a larger change than this task carries,
+ * and this paragraph exists so the next reader does not have to rediscover
+ * the gap before deciding whether to make it.
  */
-const ENTAILED_INTERNAL_CLASSES: readonly ActionClass[] = ['crm.write'];
+const ENTAILED_INTERNAL_CLASSES: readonly ActionClass[] = ['crm.write', 'memory.write_longterm'];
 
 /**
  * Does the instruction already on record cover this call?
@@ -235,8 +269,18 @@ export function coveredByAuthorization(
   // dedicated test — any test written against this line alone would pass
   // with it deleted, and a test that cannot fail is not a test.
   if (named.size === 0) return false;
+  // `named` is only ever a set of exact strings, and `going` below is only
+  // ever `readPhones`' digits-only output alongside `readEmails`' lower-cased
+  // output — never what the owner literally typed. A caller that starts
+  // storing recipients as-typed (a phone with dashes, an address with mixed
+  // case) reopens the exact bug Task 3 fixed: a WhatsApp recipient that can
+  // never match because the two sides were normalised differently, silently.
 
-  const going = readEmails(facts.input);
+  // Emails and phones both, because a WhatsApp step's recipient is a number
+  // and an authorisation that cannot see it could never cover one. The
+  // `every` below still applies to the combined list: one authorised address
+  // does not vouch for a stranger's number standing beside it.
+  const going = [...readEmails(facts.input), ...readPhones(facts.input)];
   if (going.length === 0) return false;
 
   // `every`, not `some`: one authorised recipient does not vouch for the

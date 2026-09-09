@@ -144,4 +144,50 @@ describe('the planner prompt', () => {
     });
     expect(prompt).toContain(b.plainLanguage);
   });
+
+  it('puts the owner\'s instruction in the final section, not the intents array', async () => {
+    const b = await bundle();
+    const prompt = buildPlannerPrompt({
+      bundle: b,
+      intents: [],
+      instruction: 'תשלחי לדנה את ההצעה',
+      provenance: 'boss',
+      rampLevel: 'approve_required',
+    });
+
+    expect(prompt).toContain('תשלחי לדנה את ההצעה');
+    expect(prompt).toContain('# ההוראה מבעל העסק');
+    expect(prompt).not.toContain('# ה-intents');
+  });
+
+  it('keeps everything before the final section byte-identical either way', async () => {
+    // The cacheable prefix is the whole point of assembling the prompt in this
+    // order (see the function's docblock). If an instruction changed anything
+    // above the final heading, every instruction would miss the cache.
+    const b = await bundle();
+    const base = { bundle: b, intents: [], provenance: 'boss' as const, rampLevel: 'approve_required' as const };
+    const withIntents = buildPlannerPrompt(base);
+    const withInstruction = buildPlannerPrompt({ ...base, instruction: 'תשלחי לדנה' });
+
+    const prefixOf = (p: string): string => p.slice(0, p.lastIndexOf('# '));
+    expect(prefixOf(withInstruction)).toBe(prefixOf(withIntents));
+    // And they must actually differ below it — without this the assertion
+    // above holds trivially when the feature is absent, since the extra
+    // property is simply ignored and both prompts come out identical.
+    expect(withInstruction).toContain('תשלחי לדנה');
+    expect(withIntents).not.toContain('תשלחי לדנה');
+  });
+
+  it('still renders the intents array when no instruction is given', async () => {
+    const b = await bundle();
+    const prompt = buildPlannerPrompt({
+      bundle: b,
+      intents: [{ name: 'reply_to_sender' }],
+      provenance: 'boss',
+      rampLevel: 'approve_required',
+    });
+
+    expect(prompt).toContain('# ה-intents');
+    expect(prompt).toContain('reply_to_sender');
+  });
 });

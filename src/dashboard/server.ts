@@ -17,12 +17,21 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
+import { getPool } from '../db/pool.js';
 import { ApprovalNotDecidableError, getApproval, pendingApprovals } from '../governance/approvals.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
 import { DocumentAlreadySignedError, loadSignature } from '../governance/signatures.js';
 import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
+import { runInstruction } from '../orchestrator/instruct.js';
+import { loadJob, transition } from '../orchestrator/jobs.js';
+import {
+  MAX_INSTRUCTION_CHARS,
+  loadInstructionForJob,
+  pendingQuestions,
+  recordAnswer,
+} from '../governance/instructions.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -43,6 +52,7 @@ import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
 import {
   renderApprovalCard,
   renderForbidden,
+  renderInstruct,
   renderLogin,
   renderNotFound,
   renderPasswordChange,
@@ -357,6 +367,362 @@ const READINGS_LIST_LIMIT = 50;
 async function handleReadings(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   const rows = await recentReadings(READINGS_LIST_LIMIT, { businessId });
   sendHtml(res, 200, renderReadings(rows, issueCsrfToken(session.sessionId)));
+}
+
+/**
+ * Renders `runInstruction`'s outcome exactly the same way whether it came
+ * from a fresh submission or from an answer to a clarifying question — the
+ * pipeline does not care which one produced the text it just planned (or
+ * refused, or asked about again).
+ *
+ * A `planned` outcome carrying a `grantNote` renders the box instead of
+ * redirecting home. The note is non-null in exactly one case — a plan
+ * spanning more than one action class, which authorises nothing at all (see
+ * `grantForPlan` in `instruct.ts`) — and without showing it here the owner is
+ * bounced straight to the pending list and later meets an approval card for
+ * something they believed the instruction had already covered, with no
+ * sentence anywhere explaining why the shortcut did not apply.
+ */
+function renderInstructionOutcome(
+  res: ServerResponse,
+  session: Session,
+  outcome: Awaited<ReturnType<typeof runInstruction>>,
+): void {
+  const csrf = issueCsrfToken(session.sessionId);
+
+  if (outcome.status === 'refused') {
+    sendHtml(res, 400, renderInstruct({ csrf, error: outcome.reason }));
+    return;
+  }
+  if (outcome.status === 'needs_answer') {
+    sendHtml(
+      res,
+      200,
+      renderInstruct({
+        csrf,
+        pending: [{ jobId: outcome.jobId, question: outcome.question, text: outcome.instructionText }],
+      }),
+    );
+    return;
+  }
+  if (outcome.grantNote !== null) {
+    sendHtml(res, 200, renderInstruct({ csrf, grantNote: outcome.grantNote }));
+    return;
+  }
+  redirect(res, '/');
+}
+
+/**
+ * The instruction box, and every question still waiting on an answer (I3).
+ *
+ * This used to render the empty box with no lookup at all, which meant a
+ * parked job's id and its question existed only in the HTML of the POST
+ * response that created them: reload the page and the job was orphaned in
+ * `understand`, a phase nothing in the scheduler touches, with no way for the
+ * owner to see what they had been asked. Spec §8 says the question appears on
+ * the dashboard with an answer box; until now it appeared in one HTTP
+ * response and then ceased to exist.
+ */
+async function handleInstructGet(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const waiting = await pendingQuestions({ businessId });
+  sendHtml(
+    res,
+    200,
+    renderInstruct({
+      csrf: issueCsrfToken(session.sessionId),
+      pending: waiting.map((row) => ({
+        jobId: row.jobId,
+        question: row.question,
+        text: row.text,
+      })),
+    }),
+  );
+}
+
+/**
+ * A fresh instruction from the box.
+ *
+ * **Deliberately not claimed the way the answer route is (I2).** There is
+ * nothing here to claim: each POST is a distinct instruction with no
+ * pre-existing row to key a lock on, and two submissions genuinely are two
+ * instructions — the door's own rule, which `boss_instructions.job_id UNIQUE`
+ * states in the schema. A double-click therefore opens two jobs, each with
+ * its own instruction, grant and plan. That is a duplicate-work problem, not
+ * a correctness one: neither job authorises anything the owner did not type,
+ * and neither can fail the other, which was the whole of the answer route's
+ * defect. Deduplicating a fresh submission needs an idempotency key minted
+ * with the form, which is a larger change than this one.
+ */
+async function handleInstructPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const outcome = await runInstruction({ text: form.get('text') ?? '' }, { businessId });
+  renderInstructionOutcome(res, session, outcome);
+}
+
+/**
+ * The `job_steps.reason` recorded when the job parked on a clarifying
+ * question is closed out after its answer produced a replacement job.
+ *
+ * Only ever called when `runInstruction` actually created one — `planned`
+ * and `needs_answer` both carry a `jobId`, and the parameter type is
+ * restricted to exactly that (`Extract<..., { jobId: string }>` drops
+ * `refused`, which has no such field). A `refused` re-run never reaches
+ * `createJob` — checked before this is ever invoked, in the phase guard and
+ * the length/emptiness guards inside `handleInstructAnswer` — so there is
+ * never a case where this function needs to say "no replacement exists";
+ * that used to be a runtime branch here, and is now a compile-time
+ * impossibility instead.
+ *
+ * Exported and pure so it can be tested without a network call or a
+ * database — producing a genuine `planned` outcome through this HTTP route
+ * would need a live model call this route has no way to inject around.
+ */
+export function reasonForSupersededJob(
+  outcome: Extract<Awaited<ReturnType<typeof runInstruction>>, { jobId: string }>,
+): string {
+  return `instruction door: answered; superseded by ${outcome.jobId}`;
+}
+
+/**
+ * Holds an exclusive claim on one parked job for the duration of `body`, or
+ * returns `null` when someone else already holds it (I2).
+ *
+ * **Why a lock and not a transition.** Claiming by moving the job out of
+ * `understand` would work, but it would undo fix round 2's N1: a re-run that
+ * refuses — an over-cap join, no active charter — deliberately leaves the
+ * parked job exactly where it was, so the owner's obvious next move (shorten
+ * the answer, resubmit from the same page) lands on a job still waiting
+ * rather than one already `failed`. A lock claims the *work* without
+ * changing the job's story.
+ *
+ * **`pg_try_advisory_lock`, not the blocking form**, and for the reason
+ * `conduct.ts` and `run-due.ts` give for theirs: the second request must be
+ * turned away immediately with something the owner can read, never queued
+ * behind a multi-second model call and then allowed to repeat it.
+ *
+ * **Session-scoped, on a client of its own.** The window this covers is a
+ * live call to the Agent SDK. What that buys is narrower than it sounds:
+ * `pg_try_advisory_lock` is session-scoped, not transaction-scoped, so the
+ * connection itself is checked out of the pool for the whole call regardless
+ * — a concurrent answer POST on a different job occupies its own connection
+ * for as long as its model call runs, same as this one does. What is avoided
+ * is an open *transaction* held across that call: no row locks, no held MVCC
+ * snapshot, nothing blocking `VACUUM` for minutes while the network call
+ * runs. The release mirrors `run-due.ts` exactly: a failed unlock hands the
+ * connection back to `pg` as an error so the session is destroyed rather
+ * than pooled while still holding the lock.
+ */
+async function withJobClaim<T>(
+  scope: string,
+  body: () => Promise<T>,
+): Promise<{ claimed: true; value: T } | { claimed: false }> {
+  const client = await getPool().connect();
+  let holdsLock = false;
+  try {
+    const lock = await client.query<{ locked: boolean }>(
+      'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
+      [scope],
+    );
+    if (lock.rows[0]?.locked !== true) return { claimed: false };
+    holdsLock = true;
+    return { claimed: true, value: await body() };
+  } finally {
+    if (holdsLock) {
+      let unlockError: unknown;
+      try {
+        await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [scope]);
+      } catch (error) {
+        unlockError = error;
+      }
+      if (unlockError === undefined) {
+        client.release();
+      } else {
+        client.release(unlockError instanceof Error ? unlockError : new Error(String(unlockError)));
+      }
+    } else {
+      client.release();
+    }
+  }
+}
+
+/**
+ * The reply to a clarifying question `runInstruction` asked.
+ *
+ * A job waiting on a question sits in the `understand` phase, which nothing
+ * else in the system reads — `runDueJobs` only ever picks up jobs in
+ * `execute`, and the scheduler has no notion of "answer pending". This route
+ * is the only thing that ever acts on such a job again: it records the
+ * answer, then re-runs the pipeline with the owner's answer appended to the
+ * original text, exactly as if the owner had typed both in one go from the
+ * start.
+ *
+ * **Only a job actually parked in `understand` may be answered** — checked
+ * first, before `recordAnswer`, before `runInstruction`, before any
+ * transition. An earlier version of this route skipped that check and
+ * transitioned unconditionally, which broke two ways from the same line:
+ *
+ *   - A re-run that refuses (an over-length join, no active charter) used to
+ *     close the ORIGINAL job out anyway, even though nothing replaced it. The
+ *     owner's obvious next move — shorten the answer and resubmit from the
+ *     same page — then landed on a job already `failed`, and
+ *     `failed → failed` is illegal: `transition` throws, uncaught, straight
+ *     to the top-level 500 handler. A retry that used to work stopped
+ *     working.
+ *   - Nothing scoped this route to a job actually waiting for an answer —
+ *     only to "a job in this business with an instruction row", which any
+ *     successfully PLANNED instruction has too. A job sitting in `execute`
+ *     qualifies, and `execute → failed` is a legal transition, so a POST here
+ *     against the wrong job could overwrite its instruction's answer, open a
+ *     redundant job, and fail an in-flight, already-authorised plan.
+ *
+ * The phase guard fixes both at once: refused, the parked job is left
+ * exactly where it was (so the retry above lands on a job still in
+ * `understand`, not one already `failed`); already resolved into something
+ * else, the request is refused before touching anything.
+ *
+ * The re-run itself is always a **new** job, not a resumption of the parked
+ * one — `runInstruction` calls `createJob` unconditionally — so the parked
+ * job is closed out (`transition` to `failed`, reason from
+ * `reasonForSupersededJob`) only on `planned` or `needs_answer`, i.e. only
+ * when a replacement actually exists to name. Resuming the parked job itself
+ * instead of superseding it would be a larger change than this route
+ * carries.
+ *
+ * `loadInstructionForJob` is scoped to `businessId` and returns `null` for a
+ * job that belongs to another business — indistinguishable, on purpose, from
+ * a job id that never existed at all, the same reasoning `handleCard` already
+ * applies to an approval id (both come back 404, never 403).
+ */
+async function handleInstructAnswer(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  jobId: string,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const instruction = await loadInstructionForJob(jobId, { businessId });
+  if (instruction === null) return sendHtml(res, 404, renderNotFound());
+
+  // Everything from the phase guard to the transition runs under one claim
+  // on this job (I2). The guard is a read and `runInstruction` makes a live
+  // model call before anything writes, so without this two POSTs — a
+  // double-click, seconds apart — both passed the guard, both recorded an
+  // answer, and both opened, granted, bound and promoted a job. Then both
+  // closed the parked job out, and the second met a job already `failed`:
+  // `failed → failed` is illegal, so `transition` threw uncaught to the 500
+  // handler. Two authorised plans for one answer, and an error saying
+  // nothing happened.
+  const claim = await withJobClaim(`instruct-answer:${businessId}:${jobId}`, async () =>
+    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? ''),
+  );
+  if (!claim.claimed) {
+    sendHtml(
+      res,
+      409,
+      renderInstruct({
+        csrf: issueCsrfToken(session.sessionId),
+        error: 'התשובה הזו כבר בטיפול. רענן/י את הדף כדי לראות מה קרה.',
+      }),
+    );
+  }
+}
+
+/**
+ * The body of `handleInstructAnswer`, run while this request holds the job's
+ * claim — never called from anywhere else.
+ *
+ * Split out rather than inlined into the callback so the early returns below
+ * read the same way they did before the claim existed: each one is a refusal
+ * of this request, and every one of them releases the claim on the way out
+ * through `withJobClaim`'s `finally`.
+ */
+async function answerUnderClaim(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  jobId: string,
+  instruction: { instructionId: string; text: string },
+  answer: string,
+): Promise<void> {
+  // Scoped to a job that is actually waiting on this answer — see
+  // `handleInstructAnswer`'s docblock for the two ways skipping this check
+  // broke. Read under the claim, so a concurrent request cannot move the
+  // phase between this read and the transition at the end.
+  const job = await loadJob(jobId, { businessId });
+  if (job === null) return sendHtml(res, 404, renderNotFound());
+  if (job.phase !== 'understand') {
+    return sendHtml(
+      res,
+      400,
+      renderInstruct({
+        csrf: issueCsrfToken(session.sessionId),
+        error: 'הבקשה הזו כבר אינה ממתינה לתשובה.',
+      }),
+    );
+  }
+
+  // The textarea's `required` is client-side only, and unlike `text` this
+  // column carries no CHECK constraint bounding it — a hand-crafted POST can
+  // send up to `MAX_BODY_BYTES` of it. An empty answer is worse than merely
+  // unbounded: recorded as-is it overwrites any earlier answer, and re-runs
+  // the pipeline on text byte-identical to the original instruction — so the
+  // planner asks the very same question again, forever.
+  if (answer.trim().length === 0) {
+    return sendHtml(
+      res,
+      400,
+      renderInstruct({ csrf: issueCsrfToken(session.sessionId), error: 'התשובה ריקה.' }),
+    );
+  }
+  if (answer.length > MAX_INSTRUCTION_CHARS) {
+    return sendHtml(
+      res,
+      400,
+      renderInstruct({
+        csrf: issueCsrfToken(session.sessionId),
+        error: `התשובה ארוכה מ-${MAX_INSTRUCTION_CHARS} תווים.`,
+      }),
+    );
+  }
+
+  await recordAnswer(instruction.instructionId, answer, { businessId });
+
+  const outcome = await runInstruction(
+    { text: `${instruction.text}\n\n${answer}` },
+    { businessId },
+  );
+
+  // Only when a replacement actually exists — a `refused` re-run leaves the
+  // parked job exactly where it was, so a shortened retry finds it still
+  // waiting in `understand` instead of already `failed`.
+  if (outcome.status !== 'refused') {
+    await transition(jobId, {
+      to: 'failed',
+      actor: 'human',
+      reason: reasonForSupersededJob(outcome),
+      businessId,
+    });
+  }
+
+  renderInstructionOutcome(res, session, outcome);
 }
 
 async function handleCard(res: ServerResponse, businessId: string, session: Session, approvalId: string): Promise<void> {
@@ -812,6 +1178,7 @@ async function handleLogout(req: IncomingMessage, res: ServerResponse, businessI
 
 const CARD_PATH = /^\/a\/([^/]+)$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
+const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
 
 /** The outcome `handleDecision` records for each `DECISION_PATH` action. */
 const OUTCOME_FOR_ACTION = {
@@ -861,6 +1228,15 @@ async function route(
 
   if (method === 'GET' && pathname === '/') return handlePendingList(res, businessId, session);
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
+
+  if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
+  if (method === 'POST' && pathname === '/instruct') return handleInstructPost(req, res, businessId, session);
+
+  const instructAnswerMatch = INSTRUCT_ANSWER_PATH.exec(pathname);
+  if (method === 'POST' && instructAnswerMatch) {
+    const jobId = instructAnswerMatch[1];
+    if (jobId !== undefined) return handleInstructAnswer(req, res, businessId, session, jobId);
+  }
 
   const cardMatch = CARD_PATH.exec(pathname);
   if (method === 'GET' && cardMatch) {
