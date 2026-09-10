@@ -28,6 +28,18 @@ const MAIL_CONNECTION: CharterConnection = {
   subprocessor: null,
 };
 
+/**
+ * Every charter in this file declares `knownCounterpartyEmailDomain: 'b.com'`,
+ * matching the `a@b.com` these plans address.
+ *
+ * It is load-bearing. Since the first-contact exempt set was emptied (10/09),
+ * a `boss` chain no longer skips the escalation for a recipient the charter
+ * cannot resolve — such a send scores `one_unknown`, the band comes out
+ * `sensitive`, and the step queues an approval. This file is about what
+ * happens once a step actually reaches an adapter: the endpoint that travels
+ * with it, the redacted payload it carries, retryable versus final failures,
+ * the deadline. None of that is observable on a step that never dispatches.
+ */
 const LIVE: ConnectionBinding = {
   system: 'office-mail',
   status: 'live',
@@ -109,7 +121,7 @@ afterAll(async () => {
 
 describe('a plan reaches a real external system', () => {
   it('sends through the adapter the registry resolved', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }), {
       businessId: BUSINESS,
     });
     const job = await jobInExecute(bundle);
@@ -140,7 +152,7 @@ describe('a plan reaches a real external system', () => {
     // `endpoint` is validated on write and audited as a trust-relocating
     // change. Until it reached the transport, that audit entry described a
     // field nothing read.
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }), {
       businessId: BUSINESS,
     });
     const job = await jobInExecute(bundle);
@@ -162,7 +174,7 @@ describe('a plan reaches a real external system', () => {
   });
 
   it('hands the adapter the redacted payload, not the one the plan proposed', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }), {
       businessId: BUSINESS,
     });
     const job = await jobInExecute(bundle);
@@ -188,7 +200,7 @@ describe('a plan reaches a real external system', () => {
   });
 
   it('loads the bindings from the store when nobody injects them', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }), {
       businessId: BUSINESS,
     });
     await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
@@ -240,7 +252,7 @@ describe('a plan reaches a real external system', () => {
   it('rejects a whole multi-step plan on the LAST step lacking a channel', async () => {
     // The step without a channel is the second one. A plan validated lazily
     // would have sent the first mail before discovering it.
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }), {
       businessId: BUSINESS,
     });
     const job = await jobInExecute(bundle);
@@ -311,7 +323,7 @@ describe('a plan reaches a real external system', () => {
   });
 
   it('sleeps the job when the adapter says the failure is retryable', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }), {
       businessId: BUSINESS,
     });
     const job = await jobInExecute(bundle);
@@ -345,7 +357,7 @@ describe('a plan reaches a real external system', () => {
   });
 
   it('sleeps the step when the binding is not live, after the gate has run', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }), {
       businessId: BUSINESS,
     });
     const job = await jobInExecute(bundle);
@@ -380,7 +392,7 @@ describe('a plan reaches a real external system', () => {
   });
 
   it('refuses when the binding names a credential the source cannot resolve', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }), {
       businessId: BUSINESS,
     });
     const job = await jobInExecute(bundle);
@@ -483,7 +495,7 @@ describe('only a step that goes somewhere needs a channel', () => {
 
 describe('the adapter deadline is enforced, not merely announced', () => {
   it('sleeps the job when an adapter never answers', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }), {
       businessId: BUSINESS,
     });
     const job = await jobInExecute(bundle);

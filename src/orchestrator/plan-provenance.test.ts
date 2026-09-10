@@ -5,6 +5,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
 import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
+import { grantAuthorization } from '../governance/authorization.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import { envCredentials } from './credentials.js';
@@ -83,13 +84,61 @@ function permissiveCharter() {
   });
 }
 
-describe('the boss exemption, end to end through runPlan', () => {
+describe('a boss origin is no longer an exemption, and what replaced it', () => {
   beforeEach(async () => { await resetDatabase(); });
   afterAll(async () => { await closePool(); });
 
-  it('sends without an approval when the boss instructed it and nothing was read', async () => {
+  /**
+   * This test asserted the opposite until 10/09, and the reversal is the
+   * point of the change rather than a casualty of it.
+   *
+   * `FIRST_CONTACT_EXEMPT` held `boss`, so a chain the owner started that had
+   * read nothing did not escalate on a recipient the charter could not
+   * resolve. `stranger@example.com` is exactly that recipient, and this test
+   * watched a real message leave for it with no card. Nothing had ever
+   * exercised that in production — the ramp held every outbound class at
+   * `draft_only`, so the gate denied on autonomy before the band mattered —
+   * and the first time a raised ramp made it reachable, this is the shape it
+   * took.
+   *
+   * The set is empty now. What the owner wanted from it is asserted in the
+   * next test, by the mechanism that can actually express it.
+   */
+  it('asks even when the boss instructed it and nothing was read', async () => {
     const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
     const job = await jobInExecute(bundle);
+    const sent: MailMessage[] = [];
+
+    const result = await runPlan({
+      job, bundle, plan: SEND_ONLY, registry: registry(sent), bindings: [LIVE],
+      credentials: envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX),
+      counterpartyTags: [], rampLevel: 'auto', now: NOON,
+    });
+
+    expectHalted(result, 'awaiting_approval');
+    expect(sent).toEqual([]);
+  });
+
+  /**
+   * The replacement, end to end through the same call.
+   *
+   * The owner's rule is that a recipient counts as known once they have typed
+   * it, and the instruction door writes exactly that: a standing
+   * authorisation naming the recipients the instruction contained. It cancels
+   * the same risk-band term the exemption used to cancel, and reaches no
+   * further — a recipient nobody named stays behind a card, as the test above
+   * now shows.
+   *
+   * Same job, same plan, same unresolved address as above. The grant is the
+   * only difference.
+   */
+  it('sends when the owner’s own instruction named that recipient', async () => {
+    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const job = await jobInExecute(bundle);
+    await grantAuthorization(
+      { jobId: job.jobId, actionClass: 'email.initiate', recipients: ['stranger@example.com'] },
+      { businessId: BUSINESS },
+    );
     const sent: MailMessage[] = [];
 
     const result = await runPlan({
@@ -116,9 +165,13 @@ describe('the boss exemption, end to end through runPlan', () => {
       counterpartyTags: [], rampLevel: 'auto', now: NOON,
     });
 
-    // provenanceChainDerived is false (contentIngested), so the first-contact
-    // exemption never applies and the send to a stranger queues for approval
-    // rather than being refused outright.
+    // Kept after the exempt set was emptied, and still worth its place: it
+    // pins `runPlan`'s `!job.contentIngested` conjunct. The outcome no longer
+    // depends on the exemption — a stranger queues for approval either way —
+    // but if the set is ever re-populated, this is the test that says a job
+    // which has read a document does not get the relaxation back. Note it
+    // queues rather than being refused outright, which is the distinction the
+    // reason string carries.
     expectHalted(result, 'awaiting_approval');
     expect(sent).toEqual([]);
   });
@@ -161,16 +214,16 @@ describe('the boss exemption, end to end through runPlan', () => {
    * — combined with this test's permissive charter (`autonomyBase:
    * 'email.initiate': 'auto'`) and `rampLevel: 'auto'` — is not restrictive
    * enough to deny on its own. The step reaches `assessRisk`, the recipient
-   * is an unresolved stranger (`one_unknown`), and
-   * `FIRST_CONTACT_EXEMPT.has('staff')` is false (the set is `{'boss'}`
-   * only, `src/policy/risk.ts`), so `isUnvettedFirstContact` returns `true`
-   * and the band is `sensitive` — which is what actually queues the
-   * approval here, not an autonomy ceiling.
+   * is an unresolved stranger (`one_unknown`), so `isUnvettedFirstContact`
+   * returns `true` and the band is `sensitive` — which is what actually
+   * queues the approval here, not an autonomy ceiling.
    *
-   * This does NOT, on its own, prove `runPlan`'s `job.provenance === 'boss'`
-   * conjunct is load-bearing — see the fix-round report for why no test
-   * through `runPlan` can. It does correctly exercise the control this test
-   * is named for, which the previous `unknown_external` version did not.
+   * Since 10/09 the exempt set is empty, so `staff` and `boss` now reach the
+   * same outcome and this test no longer distinguishes them by itself. It is
+   * kept because the path it exercises — reaching `assessRisk` rather than
+   * being stopped at the autonomy ceiling — is what makes the assertion mean
+   * "the band escalated" instead of "some ceiling denied", and that is the
+   * property most easily lost by a later edit to the fixture's ceilings.
    */
   it('still asks when the job did not come from the boss', async () => {
     const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });

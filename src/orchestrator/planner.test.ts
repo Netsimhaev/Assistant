@@ -249,7 +249,15 @@ describe('the capability catalogue makes a plan feasible by construction', () =>
 
 describe('running a plan', () => {
   it('runs the steps in dependency order and records each one', async () => {
-    const bundle = await install({ autonomyBase: { 'crm.write': 'auto' } });
+    // `knownCounterpartyEmailDomain` is here for the mail step, not the CRM
+    // one: since the first-contact exempt set was emptied (10/09) a boss
+    // chain no longer skips the escalation, so an address the charter cannot
+    // resolve queues an approval and the run halts before the dependency
+    // order this test is about can be observed at all.
+    const bundle = await install({
+      autonomyBase: { 'crm.write': 'auto' },
+      knownCounterpartyEmailDomain: 'b.com',
+    });
     const job = await jobInExecute(bundle);
     const { calls, registry } = stubRegistry();
 

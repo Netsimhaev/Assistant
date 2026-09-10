@@ -80,6 +80,11 @@ describe('schedulerPass', () => {
     const bundle = await installCharter(
       buildCharter({
         connections: [MAIL_CONNECTION],
+        // The recipient must resolve by DOMAIN: since the first-contact exempt
+        // set was emptied (10/09), a boss chain no longer skips the
+        // escalation, and an unresolved address would queue an approval —
+        // which is not what this file is about.
+        knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'auto' },
       }),
       { businessId: BUSINESS },
@@ -135,6 +140,11 @@ describe('schedulerPass', () => {
     const bundle = await installCharter(
       buildCharter({
         connections: [MAIL_CONNECTION],
+        // The recipient must resolve by DOMAIN: since the first-contact exempt
+        // set was emptied (10/09), a boss chain no longer skips the
+        // escalation, and an unresolved address would queue an approval —
+        // which is not what this file is about.
+        knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'auto' },
       }),
       { businessId: BUSINESS },

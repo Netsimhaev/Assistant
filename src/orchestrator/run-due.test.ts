@@ -41,12 +41,14 @@ const PLAN: Plan = Plan.parse({
       intent: 'send the confirmation',
       toolName: 'mail.send',
       // `counterpartyId: 'c_812'` matches the known counterparty
-      // `buildCharter` (`test/fixtures.ts`) always includes. Without it the
-      // gate scores this as `one_unknown` (`scoreVisibility`,
-      // `policy/risk.ts`) and queues an approval regardless of autonomy or
-      // ramp — the first-contact exemption for `boss` provenance never fires
-      // in this codebase today, because nothing sets
-      // `ActionFacts.provenanceChainDerived` (see that field's docblock).
+      // `buildCharter` (`test/fixtures.ts`) always includes — and, as of
+      // 10/09, that is NOT what keeps this send out of the approval queue.
+      // `scoreVisibility` (`policy/risk.ts`) refuses to let identity evidence
+      // stand in for an address on a class that reaches a `person`, so the
+      // recipient has to resolve by DOMAIN; the charter below declares it.
+      // Until the first-contact exempt set was emptied this was invisible,
+      // because a `boss` chain came out `routine` no matter who it addressed,
+      // and this comment claimed the id was doing work it never did.
       input: { to: 'dana@example.com', counterpartyId: 'c_812', subject: 'נושא', body: 'גוף' },
       expectedActionClass: 'email.initiate',
     },
@@ -110,6 +112,7 @@ async function seedExecutableJob(businessId: string = BUSINESS): Promise<string>
       // test file makes within one test, not just within one business.
       version: `2026-08-15.${businessId}`,
       connections: [MAIL_CONNECTION],
+      knownCounterpartyEmailDomain: 'example.com',
       autonomyBase: { 'email.initiate': 'auto' },
     }),
     { businessId },
@@ -173,6 +176,7 @@ describe('runDueJobs', () => {
       buildCharter({
         version: `2026-08-15.notify-forward`,
         connections: [MAIL_CONNECTION],
+        knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'approve_required' },
       }),
       { businessId: BUSINESS },
@@ -212,7 +216,7 @@ describe('runDueJobs', () => {
   });
 
   it('reports a job in execute that is bound to no plan, and does not run it', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' }), {
       businessId: BUSINESS,
     });
     const jobId = await jobInExecute(bundle.charterVersion, 'unbound');
@@ -231,7 +235,7 @@ describe('runDueJobs', () => {
   // conductor card lands here — so this went from a documented hypothetical
   // to a certainty.
   it('moves an unbound job out of execute so it cannot hold the window forever', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' }), {
       businessId: BUSINESS,
     });
     const jobId = await jobInExecute(bundle.charterVersion, 'unbound-twice');
@@ -372,6 +376,7 @@ describe('runDueJobs', () => {
       buildCharter({
         version: '2026-08-15.poison',
         connections: [MAIL_CONNECTION],
+        knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'auto' },
       }),
       { businessId: BUSINESS },
