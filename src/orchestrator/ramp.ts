@@ -3,6 +3,7 @@ import { getPool, type Queryable } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
 import type { Plan } from '../domain/plan.js';
 import { AutonomyLevel, mostRestrictiveAutonomy } from '../domain/trust.js';
+import { READ_ONLY_TOOLS } from '../policy/classify.js';
 
 /**
  * The level an action class has when nothing says otherwise.
@@ -80,10 +81,32 @@ export async function setRampLevel(
  * several action classes. Taking the minimum is the only combination that
  * keeps a ceiling a ceiling.
  *
- * A step whose `expectedActionClass` is null contributes `RAMP_FLOOR`. That
- * field is advisory to the gate — the gate classifies the call itself — but
- * here it is the only thing available before the step runs, and "the planner
- * did not say" must not read as "no ceiling applies".
+ * A step whose `expectedActionClass` is null contributes `RAMP_FLOOR` — with
+ * one exception, and the distinction between them is the whole of this
+ * function's subtlety. "The planner did not say" must not read as "no ceiling
+ * applies", so a tool that HAS a class and was left unclassified still floors
+ * the plan. But a tool on `READ_ONLY_TOOLS` has no class **by construction**:
+ * `classifyAction` returns null for it, and the gate short-circuits it at
+ * stage 4, before the autonomy stage reads this value at all. It has no
+ * ceiling to contribute and never did.
+ *
+ * Conflating the two cost this project every autonomous action it ever had.
+ * The live run of 11/09: the ramp for `email.reply` stood at `auto_notify`,
+ * the charter allowed it, a standing authorisation covered the recipient —
+ * and the gate denied at `draft_only:persist_as_draft`, because the plan also
+ * contained `memory.recall` and `mail.draft`. Any plan that recalls or drafts
+ * before it sends was floored, which is every plan a competent planner
+ * writes, so the ramp was unreachable in practice and raising it changed
+ * nothing.
+ *
+ * `capabilityCatalogue` (`catalogue.ts`) already draws this line, reporting
+ * `auto` for a read-only tool because "a read-only tool has no class and no
+ * ceiling to combine; the gate short-circuits it, so reporting anything else
+ * would be a lie". This is the same statement, on the enforcement side.
+ *
+ * A tool that is neither classified nor on the read-only list is a tool
+ * nobody has reasoned about, and still floors the plan: the check is
+ * membership of a positive list, never the absence of a class.
  */
 export async function rampLevelForPlan(
   plan: Plan,
@@ -92,12 +115,17 @@ export async function rampLevelForPlan(
   const levels: AutonomyLevel[] = [];
   for (const step of plan.steps) {
     if (step.expectedActionClass === null) {
+      if (READ_ONLY_TOOLS.has(step.toolName)) continue;
       levels.push(RAMP_FLOOR);
       continue;
     }
     levels.push(await loadRampLevel(step.expectedActionClass, options));
   }
+  // A plan made entirely of read-only steps contributes no ceiling at all.
   // `mostRestrictiveAutonomy` throws on an empty list rather than defaulting
-  // to permissive; `Plan.steps` has `.min(1)`, so this is never empty.
+  // to permissive, and the floor is the right answer here anyway: there is
+  // nothing for the ramp to cap, and every step short-circuits before the
+  // autonomy stage reads it.
+  if (levels.length === 0) return RAMP_FLOOR;
   return mostRestrictiveAutonomy(levels);
 }
