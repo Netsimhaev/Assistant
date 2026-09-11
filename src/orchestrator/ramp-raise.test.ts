@@ -99,13 +99,18 @@ const REPLY_PLAN: Plan = Plan.parse({
 /**
  * The same reply, to an address nothing vouches for.
  *
- * This is the case the raise makes newly interesting. `scoreVisibility` rates
- * an unresolved recipient `one_unknown` (55, against 25 for a known one), and
- * `isUnvettedFirstContact` would normally escalate the band to `sensitive` —
- * except that `FIRST_CONTACT_EXEMPT` waives the escalation for a chain whose
- * provenance is `boss` and which has read no external content, which is
- * exactly what `runPlan` computes for this job. So the escalation does not
- * fire, and whether the owner is asked comes down to the weighted total alone.
+ * `scoreVisibility` rates an unresolved recipient `one_unknown` (55, against
+ * 25 for a known one), and `isUnvettedFirstContact` escalates the band to
+ * `sensitive` on that alone, so the owner is asked.
+ *
+ * It did not always. `FIRST_CONTACT_EXEMPT` held `boss`, which waived the
+ * escalation for a chain whose provenance is `boss` and which had read no
+ * external content — exactly what `runPlan` computes for this job — and this
+ * plan was the one that showed what that bought once a raised ramp made the
+ * waiver reachable: a real message, to an address nobody had confirmed, with
+ * no card. The set was emptied the same day. The plan is kept because it is
+ * still the sharpest statement of the boundary: nothing vouches for this
+ * recipient, and nothing in the owner's own provenance stands in for that.
  */
 const STRANGER_PLAN: Plan = Plan.parse({
   goal: 'reply to someone nothing vouches for',
@@ -267,13 +272,18 @@ describe('raising one action class off approve_required, under the charter a rea
    * discovered in production.
    *
    * Nothing vouches for this recipient, so `scoreVisibility` returns
-   * `one_unknown`. The escalation that would normally make that `sensitive`
-   * is waived here: `runPlan` computes `provenanceChainDerived = true` for a
-   * `boss` job whose plan reads no external content, and `boss` is the sole
-   * member of `FIRST_CONTACT_EXEMPT`. Before the raise this was harmless —
-   * stage 8 denied on the ramp long before the band was consulted. After it,
-   * the band is the whole of what is left, which is precisely the coupling
-   * `docs/05-approvals.md` flags as a knowingly accepted risk.
+   * `one_unknown` and the band is `sensitive`. That is the whole of why the
+   * owner is asked: stage 8 passes at `auto_notify`, and `needsApproval`'s
+   * third term is what stops it.
+   *
+   * Until 10/09 it did not stop it. `runPlan` computes
+   * `provenanceChainDerived = true` for a `boss` job whose plan reads no
+   * external content, and `boss` was then the sole member of
+   * `FIRST_CONTACT_EXEMPT`, so the escalation was waived. While the ramp held
+   * the class at `draft_only` that was harmless — stage 8 denied long before
+   * the band was consulted — and raising the ramp removed the only thing
+   * standing in front of it, which is precisely the coupling
+   * `docs/05-approvals.md` flagged as a knowingly accepted risk.
    *
    * Measured first, then closed. On the day the ramp was raised this sent —
    * `status: done`, a real message to an address nobody had confirmed, no
@@ -328,15 +338,24 @@ describe('raising one action class off approve_required, under the charter a rea
   });
 
   /**
-   * The control that survives the raise, and the one worth keeping.
+   * A tripwire, and honest about being one: today it proves nothing.
    *
-   * The exemption above is not granted to `boss` as such — `runPlan` requires
-   * that the job has never ingested external content. A job that has read a
-   * document is exactly the shape a prompt-injection attempt takes: the
-   * document names a recipient, the plan replies to it, and the owner's own
-   * provenance is what would carry it out. Flipping `content_ingested` is the
-   * only difference between this test and the one above, and it is enough to
-   * put the card back.
+   * This asserted, until the exempt set was emptied, that flipping
+   * `content_ingested` was what put the card back — `runPlan` grants
+   * `provenanceChainDerived` only to a job that has never ingested external
+   * content, and a job that has read a document is exactly the shape a
+   * prompt-injection attempt takes: the document names a recipient, the plan
+   * replies to it, and the owner's own provenance carries it out.
+   *
+   * With the set empty that conjunct can no longer decide anything, so this
+   * test now asserts the same outcome as the one two above it and would pass
+   * with `markContentIngested` and the whole `!job.contentIngested` term
+   * deleted. By this repository's own rule that is not a test, and saying so
+   * here is the only honest way to keep it. It is kept because it costs one
+   * database write and becomes load-bearing again the moment anyone puts a
+   * level back into `FIRST_CONTACT_EXEMPT` — which is the edit most likely to
+   * reopen this exact path. `plan-provenance.test.ts` carries the same
+   * tripwire against `runPlan` directly, with the same caveat.
    */
   it('goes back to asking as soon as the job has read external content', async () => {
     const { jobId } = await seedReplyJob(STRANGER_PLAN);
