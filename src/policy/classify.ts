@@ -307,11 +307,54 @@ function hasThreadRef(value: unknown): boolean {
 }
 
 /**
+ * The refinement rules, in the words a planner needs to hear them.
+ *
+ * Kept beside `refineActionClass` rather than in the prompt file, because a
+ * rule restated somewhere else is a rule that drifts — and this one drifting
+ * is what the live run of 11/09 cost. The catalogue renders the BASE class
+ * (`mail.send · email.reply`), the prompt asks the model for the class the
+ * step "will be considered", and the model, reasonably, copied the column. It
+ * wrote a `mail.send` with no `inReplyTo` — correct, there was no thread — and
+ * declared `email.reply`. `classMismatch` then refused the owner's entire
+ * instruction, because the gate reads the payload and says `email.initiate`.
+ *
+ * The model was not guessing and the prompt's existing advice ("better `null`
+ * than a guess") could not help: it had been told a fact that was only true
+ * half the time. So the rules are now stated, in a section of their own —
+ * never in the class column, which stays a vocabulary of bare `ActionClass`
+ * tokens for the reason `READ_ONLY_CLASS_LABEL` documents.
+ *
+ * `src/policy/ingest-table.test.ts` holds the invariant that this list covers
+ * exactly the bases `refineActionClass` actually refines, so a fifth rule
+ * added below without a line here fails loudly.
+ */
+export const REFINEMENT_RULES: readonly { base: ActionClass; rule: string }[] = [
+  {
+    base: 'email.reply',
+    rule: '`mail.send` נחשב `email.reply` רק אם המטען נושא `inReplyTo` עם מזהה שרשור אמיתי; בלעדיו הוא `email.initiate`.',
+  },
+  {
+    base: 'whatsapp.reply',
+    rule: '`wa.send_message` נחשב `whatsapp.reply` רק אם המטען נושא `conversationId` עם מזהה אמיתי; בלעדיו הוא `whatsapp.initiate`.',
+  },
+  {
+    base: 'calendar.create',
+    rule: '`calendar.write` נחשב `calendar.create` כשאין `operation` או כשהוא `create`; `move` הופך אותו ל-`calendar.move`, וכל ערך אחר ל-`calendar.cancel`.',
+  },
+  {
+    base: 'browser.interact',
+    rule: '`browser.click` ו-`browser.fill` נחשבים `browser.interact`, אבל מטען שנושא `amountMinor` גדול מאפס הופך אותם ל-`purchase.place`.',
+  },
+];
+
+/**
  * Refine a base class using the payload.
  *
  * `mail.send` is `email.reply` by default but `email.initiate` when there is no
  * thread to reply to — a materially different risk profile, since a first
  * contact with an unknown party is exactly what the sensitive band is for.
+ *
+ * Every branch below must have a line in `REFINEMENT_RULES` above.
  */
 export function refineActionClass(
   base: ActionClass,

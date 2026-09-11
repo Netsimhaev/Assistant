@@ -16,6 +16,7 @@ import { AgentId } from '../domain/audit.js';
 import { INTENT_MEANING, IntentName, type Reading } from '../domain/reading.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { READ_ONLY_CLASS_LABEL } from '../orchestrator/catalogue.js';
+import { REFINEMENT_RULES } from '../policy/classify.js';
 
 /**
  * Raised by hand when the *meaning* of the question changes.
@@ -29,7 +30,17 @@ import { READ_ONLY_CLASS_LABEL } from '../orchestrator/catalogue.js';
 // rejects") is a new hard constraint on a valid answer, not prose — a
 // proposal cached under v1 was generated without the model ever having been
 // told that rule.
-export const PROPOSAL_PROMPT_VERSION = 'v2';
+//
+// Raised to v3 (11/09): a read-only tool may no longer be an `action` at all,
+// and `proposalProblems` enforces it. Same test as v2 — this changes which
+// answers are valid, not merely how the question is worded, and a proposal
+// cached under v2 was produced by a model that had never been told it.
+//
+// Raised to v4 (11/09): `proposalProblems` now compares the declared class
+// against the REFINED one, matching the executor, so the payload-refinement
+// rules are stated here. A proposal cached under v3 was produced by a model
+// that would have been rejected by the check as it now stands.
+export const PROPOSAL_PROMPT_VERSION = 'v4';
 
 /**
  * What each stance means and what it does to `action` (spec §4).
@@ -139,6 +150,29 @@ export function buildProposalSystemPrompt(bundle: PolicyBundle, catalogue: strin
     // retyped, so the two cannot drift apart.
     `כלי שהקטלוג מסמן «${READ_ONLY_CLASS_LABEL}» חייב לקבל \`null\` ב-\`expectedActionClass\`. ` +
       'הסימון הזה אינו מחלקת פעולה ואין להעתיק אותו כמחרוזת — הצעה שתעשה זאת תיפסל.',
+    '',
+    // The live run of 11/09. The model judged, correctly, that a ₪11,988 quote
+    // exceeded its own authority, and proposed to act with
+    // `agent.request_help` — a tool the catalogue offers at `auto`. Nothing
+    // rejected it, `raiseProposalApproval` declined to card a classless tool,
+    // and the owner was told nothing at all. `proposalProblems` now refuses
+    // that shape; this says why, so the model proposes something useful
+    // instead of being refused.
+    'פעולה מוצעת חייבת להיות כלי שיש לו מחלקת פעולה — זה מה שמאפשר להעלות עליה',
+    'כרטיס שהבעלים יאשר. כלי שהקטלוג מסמן כקריאה-בלבד אינו יכול להיות `action`,',
+    'וגם לא כלי שמבקש עזרה או מסלים לאדם: **הבאת העניין לידיעת הבעלים היא מה',
+    'שקורה ממילא כשההצעה נרשמת** — אינה פעולה שאתה מציע. אם אין פעולה שהבעלים',
+    'יכול לאשר, אמור זאת בעמדה: `ask` עם שאלה, או `no_action` / `advise_against`',
+    'עם הנימוק. הצעה שתנקוב בכלי קריאה-בלבד כ-`action` תיפסל.',
+    '',
+    // The same block `buildPlannerPrompt` carries, and now load-bearing here
+    // too: `proposalProblems` compares the declared class against the REFINED
+    // one, so a proposal that trusts the catalogue's base column is rejected.
+    // Rendered from the same constant, beside the function that enforces it.
+    '# מחלקות שהמטען קובע',
+    'עמודת המחלקה בקטלוג מציגה את מחלקת הבסיס. לארבעה כלים המטען שכתבת הוא שקובע בפועל,',
+    'ולכן קבע את `expectedActionClass` לפי המטען שכתבת ולא לפי העמודה:',
+    ...REFINEMENT_RULES.map((r) => `- ${r.rule}`),
   ].join('\n');
 }
 

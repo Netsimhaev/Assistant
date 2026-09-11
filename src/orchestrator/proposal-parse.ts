@@ -14,7 +14,7 @@
 
 import { Proposal } from '../domain/proposal.js';
 import type { Reading } from '../domain/reading.js';
-import { classifiedToolNames, classifyAction } from '../policy/classify.js';
+import { classifiedToolNames, classifyAction, refineActionClass } from '../policy/classify.js';
 import type { CatalogueEntry } from './catalogue.js';
 
 export type ProposalProblem = {
@@ -25,6 +25,7 @@ export type ProposalProblem = {
     | 'reason_cites_unknown_finding'
     | 'tool_not_in_catalogue'
     | 'action_class_mismatch'
+    | 'action_tool_cannot_be_carded'
     | 'headline_is_tool_name';
   detail: string;
 };
@@ -85,22 +86,63 @@ export function proposalProblems(
       });
     }
 
-    // Advisory, but a mismatch means the planner intended something other than
-    // what will happen — the same rule `Plan` already holds for its steps.
+    // Advisory, but a mismatch means the proposer intended something other
+    // than what will happen — the same rule `Plan` already holds for its
+    // steps. §8 claims this check catches an infeasible plan before it runs,
+    // and a check that disagrees with the executor about what is feasible
+    // catches nothing: it just moves the rejection somewhere with no reason
+    // attached. That has now been true twice.
     //
-    // `actual === null` (a read-only tool) is a mismatch too, and used not to
-    // be: a `null !== undefined` guard stood here and let a proposal that
-    // named a read-only tool *and* declared a class through, only for
-    // `classMismatch` in `run-plan.ts` — which carries no such guard — to
-    // reject the whole compiled plan at execution. §8 claims this check
-    // catches an infeasible plan before it runs; a check that disagrees with
-    // the executor about what is feasible catches nothing, it just moves the
-    // rejection somewhere with no reason attached.
-    const actual = classifyAction(action.toolName);
+    // Once when `actual === null` was not treated as a mismatch, so a
+    // proposal naming a read-only tool *and* declaring a class passed here
+    // and `classMismatch` rejected the compiled plan at execution.
+    //
+    // And once over refinement, which is why `refineActionClass` is applied
+    // below rather than `classifyAction` alone: `actionClassOf` in
+    // `run-plan.ts` refines, and comparing against the base made the two
+    // disagree — a `mail.send` with no `inReplyTo` is `email.reply` to the
+    // base and `email.initiate` to the gate. Invisible until the conductor
+    // began binding a plan (11/09); before that the job failed earlier, on
+    // `no_plan_bound`. The proposal carries the real payload, so there was
+    // never a reason for this check to know less than the executor does.
+    const base = classifyAction(action.toolName);
+    const actual = base === null ? null : refineActionClass(base, action.input);
     if (action.expectedActionClass !== null && action.expectedActionClass !== actual) {
       problems.push({
         kind: 'action_class_mismatch',
         detail: `תוכנן ${action.expectedActionClass}, יסווג ${actual ?? 'קריאה-בלבד'}`,
+      });
+    }
+
+    // A proposed action is a thing the owner can be asked to approve, and a
+    // tool the gate cannot classify can never become a card:
+    // `raiseProposalApproval` returns `null` at exactly this condition, the
+    // job closes, and nothing reaches the owner.
+    //
+    // The mismatch check above does not cover it. That one fires only when a
+    // class WAS declared; the live run of 11/09 produced the other shape —
+    // `toolName: 'agent.request_help'` with `expectedActionClass: null`, which
+    // is the *correct* declaration for a read-only tool — and it passed every
+    // check here on the way to silence. A supplier's quote for ₪11,988 with
+    // three weeks to answer reached the owner not at all.
+    //
+    // Checked as a positive property of the tool rather than by naming the
+    // escalation tools: `agent.request_help` and `escalate_to_human` are
+    // today's members of `READ_ONLY_TOOLS`, and a list written here would stop
+    // covering the class the moment a third is added.
+    //
+    // This does not take escalation away from the assistant. Bringing a
+    // document to the owner is what raising the card already does, and a
+    // proposal that genuinely has nothing to act on says so with its stance —
+    // `ask` carries the question, `no_action` and `advise_against` carry the
+    // reasoning, and all three reach the owner through the readings screen.
+    if (actual === null) {
+      problems.push({
+        kind: 'action_tool_cannot_be_carded',
+        detail:
+          `${action.toolName} הוא כלי קריאה-בלבד ואין לו מחלקת פעולה, ולכן אי אפשר להעלות ` +
+          `עליו כרטיס לאישור. פעולה מוצעת חייבת להיות משהו שהבעלים יכול לאשר; ` +
+          `כדי להביא משהו לידיעתו השתמש בעמדה (ask / no_action / advise_against), לא בכלי.`,
       });
     }
 

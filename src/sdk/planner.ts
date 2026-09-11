@@ -4,6 +4,7 @@ import { Plan, planProblems } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import { READ_ONLY_CLASS_LABEL, capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
+import { REFINEMENT_RULES } from '../policy/classify.js';
 
 export interface PlanRequest {
   bundle: PolicyBundle;
@@ -75,6 +76,16 @@ export function buildPlannerPrompt(request: PlanRequest): string {
     // because the model copies the label it is shown (L1).
     `כלי שהקטלוג מסמן «${READ_ONLY_CLASS_LABEL}» חייב לקבל \`null\` בשדה הזה. ` +
       'הסימון הזה אינו מחלקת פעולה ואין להעתיק אותו כמחרוזת — תוכנית שתעשה זאת תיפסל.',
+    '',
+    // The class column shows the BASE class. For four tools the payload
+    // decides, so the column alone is true only half the time — and a planner
+    // that trusts it writes a step the gate reclassifies and the door
+    // refuses. Rendered from `REFINEMENT_RULES`, which lives beside the
+    // function that enforces them, so the two cannot drift.
+    '# מחלקות שהמטען קובע',
+    'עמודת המחלקה בקטלוג מציגה את מחלקת הבסיס. לארבעה כלים המטען שכתבת הוא שקובע בפועל,',
+    'ולכן קבע את `expectedActionClass` לפי המטען שכתבת ולא לפי העמודה:',
+    ...REFINEMENT_RULES.map((r) => `- ${r.rule}`),
     '',
     // Last, and the only part that varies per job: everything above is the
     // cacheable prefix.

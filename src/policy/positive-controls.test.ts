@@ -234,6 +234,46 @@ describe('read-only must mean no side effect, not merely no action class', () =>
 });
 
 describe('constants that must fail closed as the system grows', () => {
+  /**
+   * `TOOL_ACTION_CLASS` and `READ_ONLY_TOOLS` must stay disjoint, and since
+   * 11/09 that is load-bearing rather than merely tidy.
+   *
+   * `rampLevelForPlan` (`orchestrator/ramp.ts`) lets a step whose tool is on
+   * the read-only list contribute NO ceiling to the plan-wide minimum. Its
+   * entire safety argument is that such a tool has no class by construction
+   * and is short-circuited at stage 4, before stage 8 ever reads the ramp. A
+   * tool in both tables breaks that argument: it would carry a real,
+   * side-effecting class and still contribute nothing, so it would execute
+   * under whatever other class the plan happened to declare, bypassing its own
+   * ramp row entirely. `classMismatch` would not catch it either — that check
+   * stays silent when `expectedActionClass` is `null`.
+   *
+   * Nothing asserted this before, and this codebase has moved tools between
+   * these two tables three times: `file.write` and `code_execution` out of
+   * read-only into classified, and `browser.click`/`browser.fill` from
+   * read-only into `browser.interact`. The next such move is exactly where
+   * this would be forgotten.
+   *
+   * Written the way the test below it is written — by simulating the mistake
+   * rather than asserting today's tables, which are already disjoint and would
+   * pass with or without any guard.
+   */
+  it('keeps the classified and read-only tables disjoint, and would notice if they overlapped', () => {
+    const classified = classifiedToolNames();
+
+    const overlapOf = (readOnly: ReadonlySet<string>): string[] =>
+      classified.filter((tool) => readOnly.has(tool)).sort();
+
+    expect(overlapOf(READ_ONLY_TOOLS)).toEqual([]);
+
+    // The one line a future change would add. `mail.send` is classified; were
+    // it also read-only, `rampLevelForPlan` would skip it and the step would
+    // run under no ramp of its own.
+    const withMistake = new Set(READ_ONLY_TOOLS);
+    withMistake.add('mail.send');
+    expect(overlapOf(withMistake)).toEqual(['mail.send']);
+  });
+
   it('refuses an unowned tool even when an allowlist names it', () => {
     // Asserting the current tables is not enough: no allowlist contains these
     // today, so the allowlist path already refuses them and the assertion

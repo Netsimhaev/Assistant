@@ -178,6 +178,44 @@ describe('the planner prompt', () => {
     expect(withIntents).not.toContain('תשלחי לדנה');
   });
 
+  /**
+   * The live run of 11/09, and the reason this section exists.
+   *
+   * The owner typed "reply by email to Moti at moti@alfa-tech.example …".
+   * The planner wrote a `mail.send` step with no `inReplyTo` — correctly,
+   * since the quote arrived as a file in the inbox and there is no thread —
+   * and declared `expectedActionClass: 'email.reply'`. `classMismatch`
+   * refused the whole instruction: the gate classifies a `mail.send` without
+   * a thread reference as `email.initiate`.
+   *
+   * The model was not guessing. The catalogue renders `mail.send · email.reply`
+   * because `classifyAction` returns the BASE class, and the prompt then asks
+   * for the class the step "will be considered". It copied what it was shown —
+   * the same failure as the read-only label (L1), one column over.
+   *
+   * The column stays a bare token, because prose there is what L1 was about.
+   * The rule goes in a section of its own instead.
+   */
+  it('states the payload-refinement rules, so a reply without a thread is not planned as one', async () => {
+    const prompt = buildPlannerPrompt({
+      bundle: await bundle(),
+      intents: [],
+      provenance: 'boss',
+      rampLevel: 'approve_required',
+    });
+
+    // The deciding field and both outcomes, for the case that actually broke.
+    expect(prompt).toContain('inReplyTo');
+    expect(prompt).toContain('email.initiate');
+    // `email.initiate` is refinement-only — no tool maps to it — so the
+    // catalogue can never print it. Without the rules section this assertion
+    // has nothing to match, which is what makes it bite.
+    expect(prompt).toContain('conversationId');
+    expect(prompt).toContain('whatsapp.initiate');
+    // The money-bearing click, whose refinement is the one with a price tag.
+    expect(prompt).toContain('purchase.place');
+  });
+
   it('still renders the intents array when no instruction is given', async () => {
     const b = await bundle();
     const prompt = buildPlannerPrompt({
