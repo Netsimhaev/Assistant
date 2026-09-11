@@ -58,6 +58,67 @@ describe('parseProposal', () => {
     expect(outcome.status).toBe('unproposable');
   });
 
+  /**
+   * Found by the live run of 11/09, and by nothing else.
+   *
+   * The model read a supplier quote correctly, judged that the amount exceeded
+   * its own spending authority, and proposed to act — with
+   * `toolName: 'agent.request_help'` and `expectedActionClass: null`. That is
+   * an honest reading of the catalogue, which offers the tool at `auto`.
+   *
+   * Nothing rejected it. `raiseProposalApproval` then returned `null` at its
+   * read-only guard, the job closed, and a quote for ₪11,988 expiring in
+   * three weeks reached the owner not at all. The `action_class_mismatch`
+   * check above does not catch it, because it only fires when a class WAS
+   * declared; here the model correctly declared `null` for a read-only tool
+   * and was punished with silence.
+   *
+   * A proposal's action is a thing the owner can be asked to approve. A tool
+   * the gate cannot classify can never become a card, so proposing one is not
+   * a proposal to act — and "bring this to the owner" is not an action the
+   * assistant takes, it is what raising the card already does.
+   */
+  it('refuses an action naming a tool the gate cannot classify', () => {
+    const readOnlyAction = {
+      ...ACTION,
+      toolName: 'agent.request_help',
+      input: { subject: 'הצעת מחיר', summary: 'דורש החלטה' },
+      expectedActionClass: null,
+    };
+    const catalogue: CatalogueEntry[] = [
+      {
+        agent: 'comms.email',
+        tools: [
+          { toolName: 'agent.request_help', actionClass: null, effectiveAutonomy: 'auto' },
+        ],
+      },
+    ];
+
+    const outcome = parseProposal(
+      JSON.stringify({ ...VALID, action: readOnlyAction }),
+      READING,
+      catalogue,
+    );
+
+    expect(outcome.status).toBe('unproposable');
+    if (outcome.status !== 'unproposable') throw new Error('expected unproposable');
+    expect(outcome.reason).toContain('action_tool_cannot_be_carded');
+  });
+
+  /**
+   * The other half, so the rule above cannot be satisfied by refusing every
+   * action. A classifiable tool is still accepted, with the same catalogue
+   * shape and the same declared-`null` class.
+   */
+  it('still accepts an action whose tool the gate can classify', () => {
+    const outcome = parseProposal(
+      JSON.stringify({ ...VALID, action: { ...ACTION, expectedActionClass: null } }),
+      READING,
+      CATALOGUE,
+    );
+    expect(outcome.status).toBe('proposed');
+  });
+
   it('refuses no_action that carries an action', () => {
     const outcome = parseProposal(
       JSON.stringify({ ...VALID, stance: 'no_action' }), READING, CATALOGUE,

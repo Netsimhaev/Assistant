@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { ActionClass } from '../domain/action.js';
 import {
+  REFINEMENT_RULES,
   READ_ONLY_TOOLS,
+  refineActionClass,
   classifiedToolNames,
   ingestsExternalContent,
   toolsWithIngestDecision,
@@ -57,6 +60,55 @@ describe('the content-ingesting table', () => {
                      'wa.conversation_state', 'credential.request_session',
                      'calendar.write', 'crm.write', 'file.write']) {
       expect(ingestsExternalContent(t), t).toBe(false);
+    }
+  });
+});
+
+describe('the payload-refinement rules match the function that enforces them', () => {
+  /**
+   * The rules are prose the planner reads; `refineActionClass` is the code the
+   * gate runs. A rule stated in one place and enforced in another drifts, and
+   * the live run of 11/09 is what that drift costs: the planner declared
+   * `email.reply` for a `mail.send` with no thread, the gate said
+   * `email.initiate`, and the owner's whole instruction was refused.
+   *
+   * Both directions, mechanically, so neither list can grow without the other.
+   */
+  it('covers exactly the base classes the payload actually refines', () => {
+    // A battery of payloads spanning every field any branch reads. A base
+    // class that changes under ANY of these is refined and needs a rule.
+    const probes: Record<string, unknown>[] = [
+      {},
+      { inReplyTo: 'm-1' },
+      { conversationId: 'c-1' },
+      { amountMinor: 5_000 },
+      { operation: 'move' },
+      { operation: 'cancel' },
+      { operation: 'something-nobody-defined' },
+    ];
+
+    const refined = ActionClass.options
+      .filter((base) => probes.some((input) => refineActionClass(base, input) !== base))
+      .sort();
+    const documented = REFINEMENT_RULES.map((r) => r.base).sort();
+
+    expect(documented).toEqual(refined);
+  });
+
+  it('gives every rule a body that names the field the branch actually reads', () => {
+    // Without this the list could satisfy the test above while saying nothing
+    // a planner could act on — the defect being fixed was precisely a model
+    // that had no way to know which field decided.
+    const fieldOf: Record<string, string> = {
+      'email.reply': 'inReplyTo',
+      'whatsapp.reply': 'conversationId',
+      'calendar.create': 'operation',
+      'browser.interact': 'amountMinor',
+    };
+    for (const { base, rule } of REFINEMENT_RULES) {
+      const field = fieldOf[base];
+      expect(field, `no expected field recorded for ${base}`).toBeDefined();
+      expect(rule, `rule for ${base} does not name ${field}`).toContain(field as string);
     }
   });
 });

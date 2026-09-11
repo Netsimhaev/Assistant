@@ -29,7 +29,12 @@ import { READ_ONLY_CLASS_LABEL } from '../orchestrator/catalogue.js';
 // rejects") is a new hard constraint on a valid answer, not prose — a
 // proposal cached under v1 was generated without the model ever having been
 // told that rule.
-export const PROPOSAL_PROMPT_VERSION = 'v2';
+//
+// Raised to v3 (11/09): a read-only tool may no longer be an `action` at all,
+// and `proposalProblems` enforces it. Same test as v2 — this changes which
+// answers are valid, not merely how the question is worded, and a proposal
+// cached under v2 was produced by a model that had never been told it.
+export const PROPOSAL_PROMPT_VERSION = 'v3';
 
 /**
  * What each stance means and what it does to `action` (spec §4).
@@ -139,6 +144,20 @@ export function buildProposalSystemPrompt(bundle: PolicyBundle, catalogue: strin
     // retyped, so the two cannot drift apart.
     `כלי שהקטלוג מסמן «${READ_ONLY_CLASS_LABEL}» חייב לקבל \`null\` ב-\`expectedActionClass\`. ` +
       'הסימון הזה אינו מחלקת פעולה ואין להעתיק אותו כמחרוזת — הצעה שתעשה זאת תיפסל.',
+    '',
+    // The live run of 11/09. The model judged, correctly, that a ₪11,988 quote
+    // exceeded its own authority, and proposed to act with
+    // `agent.request_help` — a tool the catalogue offers at `auto`. Nothing
+    // rejected it, `raiseProposalApproval` declined to card a classless tool,
+    // and the owner was told nothing at all. `proposalProblems` now refuses
+    // that shape; this says why, so the model proposes something useful
+    // instead of being refused.
+    'פעולה מוצעת חייבת להיות כלי שיש לו מחלקת פעולה — זה מה שמאפשר להעלות עליה',
+    'כרטיס שהבעלים יאשר. כלי שהקטלוג מסמן כקריאה-בלבד אינו יכול להיות `action`,',
+    'וגם לא כלי שמבקש עזרה או מסלים לאדם: **הבאת העניין לידיעת הבעלים היא מה',
+    'שקורה ממילא כשההצעה נרשמת** — אינה פעולה שאתה מציע. אם אין פעולה שהבעלים',
+    'יכול לאשר, אמור זאת בעמדה: `ask` עם שאלה, או `no_action` / `advise_against`',
+    'עם הנימוק. הצעה שתנקוב בכלי קריאה-בלבד כ-`action` תיפסל.',
   ].join('\n');
 }
 

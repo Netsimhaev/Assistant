@@ -25,6 +25,7 @@ export type ProposalProblem = {
     | 'reason_cites_unknown_finding'
     | 'tool_not_in_catalogue'
     | 'action_class_mismatch'
+    | 'action_tool_cannot_be_carded'
     | 'headline_is_tool_name';
   detail: string;
 };
@@ -101,6 +102,38 @@ export function proposalProblems(
       problems.push({
         kind: 'action_class_mismatch',
         detail: `תוכנן ${action.expectedActionClass}, יסווג ${actual ?? 'קריאה-בלבד'}`,
+      });
+    }
+
+    // A proposed action is a thing the owner can be asked to approve, and a
+    // tool the gate cannot classify can never become a card:
+    // `raiseProposalApproval` returns `null` at exactly this condition, the
+    // job closes, and nothing reaches the owner.
+    //
+    // The mismatch check above does not cover it. That one fires only when a
+    // class WAS declared; the live run of 11/09 produced the other shape —
+    // `toolName: 'agent.request_help'` with `expectedActionClass: null`, which
+    // is the *correct* declaration for a read-only tool — and it passed every
+    // check here on the way to silence. A supplier's quote for ₪11,988 with
+    // three weeks to answer reached the owner not at all.
+    //
+    // Checked as a positive property of the tool rather than by naming the
+    // escalation tools: `agent.request_help` and `escalate_to_human` are
+    // today's members of `READ_ONLY_TOOLS`, and a list written here would stop
+    // covering the class the moment a third is added.
+    //
+    // This does not take escalation away from the assistant. Bringing a
+    // document to the owner is what raising the card already does, and a
+    // proposal that genuinely has nothing to act on says so with its stance —
+    // `ask` carries the question, `no_action` and `advise_against` carry the
+    // reasoning, and all three reach the owner through the readings screen.
+    if (actual === null) {
+      problems.push({
+        kind: 'action_tool_cannot_be_carded',
+        detail:
+          `${action.toolName} הוא כלי קריאה-בלבד ואין לו מחלקת פעולה, ולכן אי אפשר להעלות ` +
+          `עליו כרטיס לאישור. פעולה מוצעת חייבת להיות משהו שהבעלים יכול לאשר; ` +
+          `כדי להביא משהו לידיעתו השתמש בעמדה (ask / no_action / advise_against), לא בכלי.`,
       });
     }
 
