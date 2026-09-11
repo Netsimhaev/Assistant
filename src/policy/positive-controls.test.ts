@@ -427,27 +427,35 @@ function firstContactFacts(provenance: TrustLevel, chainDerived: boolean): Actio
   };
 }
 
-describe('the first-contact exemption stays exactly {boss}, and only when derived', () => {
-  it('scores boss as routine and every other TrustLevel as sensitive', async () => {
+describe('the first-contact exemption is empty: no TrustLevel escapes the escalation', () => {
+  it('scores EVERY TrustLevel as sensitive, boss included', async () => {
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
 
     // A widening of FIRST_CONTACT_EXEMPT in risk.ts is precisely how a
-    // security control loosens into a prompt-injection hole: add
-    // 'unknown_external' there and content-derived work stops escalating on
-    // first contact, silently, with every behaviour-agnostic test still
-    // green. This asserts the rule as it actually operates -- band by
-    // band, for every TrustLevel -- rather than the constant behind it, so
-    // there is no separate export to keep in sync with the implementation.
+    // security control loosens into a prompt-injection hole: add a level
+    // there and work that reached an unresolved recipient stops escalating
+    // on first contact, silently, with every behaviour-agnostic test still
+    // green. This asserts the rule as it actually operates -- band by band,
+    // for every TrustLevel -- rather than the constant behind it, so there
+    // is no separate export to keep in sync with the implementation.
+    //
+    // The set held `boss` until 10/09. It was emptied on the owner's
+    // instruction once raising the `email.reply` ramp made the exemption
+    // reachable, and the shape it took was a message leaving for an address
+    // nobody had confirmed. The owner's own rule -- a recipient counts as
+    // named when they typed it -- is served by the standing authorisation
+    // the instruction door writes, which cancels this same risk-band term
+    // for exactly those recipients. So nothing the owner asked for was lost
+    // by emptying it.
     //
     // Iterated from TrustLevel.options rather than listed by hand: a level
     // added to the enum later is exercised by this loop automatically and
-    // must fail closed (assert sensitive) until someone decides to exempt
-    // it deliberately in risk.ts. Listing today's non-exempt levels by hand
-    // would silently stop covering a level that does not exist yet.
+    // must fail closed until someone decides to exempt it deliberately in
+    // risk.ts. Re-populating the set is what turns this test red, and the
+    // failure names the level -- which is the point.
     for (const level of TrustLevel.options) {
       const risk = await assessRisk(firstContactFacts(level, true), bundle);
-      const expected = level === 'boss' ? 'routine' : 'sensitive';
-      expect(risk.band, `provenance=${level}`).toBe(expected);
+      expect(risk.band, `provenance=${level}`).toBe('sensitive');
     }
   });
 
@@ -455,13 +463,15 @@ describe('the first-contact exemption stays exactly {boss}, and only when derive
     const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
 
     // The other half of the same invariant, and the half that holds the
-    // safety argument up. Membership of FIRST_CONTACT_EXEMPT is a necessary
-    // condition, never a sufficient one: without `provenanceChainDerived`,
-    // the level on the fact object is whatever was stamped on the job, and
-    // a job the boss started can reach a recipient that injected content
-    // chose. Every level must escalate here, boss included -- so widening
-    // the set cannot on its own reopen the path, and dropping the
-    // precondition cannot pass unnoticed.
+    // safety argument up if the set is ever re-populated. Membership of
+    // FIRST_CONTACT_EXEMPT is a necessary condition, never a sufficient one:
+    // without `provenanceChainDerived`, the level on the fact object is
+    // whatever was stamped on the job, and a job the boss started can reach
+    // a recipient that injected content chose. Every level must escalate
+    // here -- so widening the set cannot on its own reopen the path, and
+    // dropping the precondition cannot pass unnoticed. While the set is
+    // empty this asserts the same outcome as the test above; the two differ
+    // in what they would catch, and both are cheap.
     for (const level of TrustLevel.options) {
       const risk = await assessRisk(firstContactFacts(level, false), bundle);
       expect(risk.band, `provenance=${level}, not chain-derived`).toBe('sensitive');

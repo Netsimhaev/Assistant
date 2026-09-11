@@ -295,8 +295,33 @@ function scoreSensitivity(facts: ActionFacts): RiskDimensions['dataSensitivity']
  * runs for them. The safety argument is held by the predicate, not by the
  * absence of a caller — which is exactly why it now has to hold under a real
  * one.
+ *
+ * **The set is empty as of 10/09, on the owner's instruction, and the whole
+ * argument above is now history rather than justification.** `boss` was its
+ * only member. What settled it was raising the `email.reply` ramp to
+ * `auto_notify`: until then the gate denied on autonomy at stage 8 long
+ * before the band was computed, so the exemption had never once decided
+ * anything. Made reachable, the first thing it did was let a real message
+ * leave for an address nothing in the charter resolved, with no card —
+ * measured in `src/orchestrator/ramp-raise.test.ts`, not predicted.
+ *
+ * The distinction the docblock above draws is real, and the owner's rule
+ * draws it in a place this constant cannot reach: a recipient counts as named
+ * when the owner **typed it**, and that case is already served by the
+ * standing authorisation the instruction door writes, which cancels this same
+ * risk-band term in `needsApproval` for exactly the recipients an instruction
+ * named. `provenanceChainDerived` can only say the chain came from the owner,
+ * never that the owner chose this address — and between those two, only the
+ * second is what was ever wanted. So emptying the set costs nothing the owner
+ * asked for and closes the case they did not.
+ *
+ * The mechanism is kept rather than deleted: the predicate below still reads
+ * the set and still requires `provenanceChainDerived`, so re-populating it is
+ * one line if the friction proves worse than the exposure. Two invariants in
+ * `src/policy/positive-controls.test.ts` iterate `TrustLevel.options` and
+ * fail — naming the level — the moment anything is put back.
  */
-const FIRST_CONTACT_EXEMPT: ReadonlySet<TrustLevel> = new Set<TrustLevel>(['boss']);
+const FIRST_CONTACT_EXEMPT: ReadonlySet<TrustLevel> = new Set<TrustLevel>();
 
 /**
  * Whether this first contact needs a human because nobody trustworthy vouched

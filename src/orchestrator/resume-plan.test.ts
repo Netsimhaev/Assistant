@@ -136,8 +136,20 @@ function twoStepPlan(body = 'שלום'): Plan {
   });
 }
 
+/**
+ * `knownCounterpartyEmailDomain: 'b.com'` covers the `a@b.com` recipient the
+ * plans here send to, and it is load-bearing rather than decorative: since the
+ * first-contact exempt set was emptied (10/09), a `boss` chain no longer skips
+ * the escalation, so an address the charter cannot resolve scores
+ * `one_unknown` and queues an approval. Every test in this file is about
+ * resumption — what re-runs, what is skipped, what the idempotency key
+ * protects — and a step that never sends observes none of it.
+ *
+ * Deliberately NOT extended to `example.com`: the plans that send to
+ * `new@example.com` are the ones whose second step is *supposed* to queue.
+ */
 async function install(connections: CharterConnection[]): Promise<PolicyBundle> {
-  return installCharter(buildCharter({ connections }), { businessId: BUSINESS });
+  return installCharter(buildCharter({ connections, knownCounterpartyEmailDomain: 'b.com' }), { businessId: BUSINESS });
 }
 
 async function jobInExecute(bundle: PolicyBundle): Promise<Job> {
