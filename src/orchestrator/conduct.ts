@@ -21,6 +21,8 @@ import {
   recordReadFailure,
 } from '../documents/store.js';
 import { createJob, transition, type Job } from './jobs.js';
+import { bindPlanToJob } from './plan-store.js';
+import { proposalToPlan } from './proposal-to-plan.js';
 import { proposeForReading, type ProposeForReadingOptions } from './propose.js';
 import { raiseProposalApproval, type NotifyTarget } from './proposal-approval.js';
 
@@ -257,6 +259,41 @@ export async function conductPendingDocuments(
           });
           result.failed += 1;
           continue;
+        }
+
+        // Compiled and bound BEFORE the card goes up, and that order is the
+        // fix rather than an incidental detail.
+        //
+        // Until 11/09 nothing was bound at all. The card was raised, the job
+        // moved to `await_approval`, the owner approved, `resumeAfterDecision`
+        // moved it to `execute` — and `runDueJobs` found a job with no plan
+        // and moved it to `failed` with `no_plan_bound`. Approving a
+        // conductor card did nothing whatsoever, and would have gone on doing
+        // nothing however high the ramp rose. `proposalToPlan` had been built
+        // and tested since the proposal planner shipped and had no production
+        // caller; this is it.
+        //
+        // A crash between the two writes must not be able to produce a card
+        // the owner can approve into that same failure. In this order the
+        // worst case is a `plan`-phase job carrying a plan nothing will run,
+        // which is inert: `runDueJobs` takes only jobs in `execute`. In the
+        // other order the worst case is the bug being fixed here.
+        //
+        // The step carries `action.input` verbatim (`proposalToPlan`), which
+        // is what makes the approval findable when the plan finally runs:
+        // `enqueueApproval` hashes the same payload, `unspentApprovalFor`
+        // looks the row up by that hash, and `consumeApproval` binds the tool
+        // name too. A compilation that reshaped either would leave the owner
+        // asked a second time for something they had already approved.
+        const compiled =
+          proposed.proposal.action === null
+            ? null
+            : proposalToPlan(proposed.proposal, {
+                goal: proposed.proposal.action.headline,
+              });
+        if (compiled !== null) {
+          stage = 'binding the compiled plan';
+          await bindPlanToJob(job.jobId, compiled, { businessId });
         }
 
         stage = 'raising the approval';

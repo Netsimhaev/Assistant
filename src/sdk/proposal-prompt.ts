@@ -16,6 +16,7 @@ import { AgentId } from '../domain/audit.js';
 import { INTENT_MEANING, IntentName, type Reading } from '../domain/reading.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { READ_ONLY_CLASS_LABEL } from '../orchestrator/catalogue.js';
+import { REFINEMENT_RULES } from '../policy/classify.js';
 
 /**
  * Raised by hand when the *meaning* of the question changes.
@@ -34,7 +35,12 @@ import { READ_ONLY_CLASS_LABEL } from '../orchestrator/catalogue.js';
 // and `proposalProblems` enforces it. Same test as v2 — this changes which
 // answers are valid, not merely how the question is worded, and a proposal
 // cached under v2 was produced by a model that had never been told it.
-export const PROPOSAL_PROMPT_VERSION = 'v3';
+//
+// Raised to v4 (11/09): `proposalProblems` now compares the declared class
+// against the REFINED one, matching the executor, so the payload-refinement
+// rules are stated here. A proposal cached under v3 was produced by a model
+// that would have been rejected by the check as it now stands.
+export const PROPOSAL_PROMPT_VERSION = 'v4';
 
 /**
  * What each stance means and what it does to `action` (spec §4).
@@ -158,6 +164,15 @@ export function buildProposalSystemPrompt(bundle: PolicyBundle, catalogue: strin
     'שקורה ממילא כשההצעה נרשמת** — אינה פעולה שאתה מציע. אם אין פעולה שהבעלים',
     'יכול לאשר, אמור זאת בעמדה: `ask` עם שאלה, או `no_action` / `advise_against`',
     'עם הנימוק. הצעה שתנקוב בכלי קריאה-בלבד כ-`action` תיפסל.',
+    '',
+    // The same block `buildPlannerPrompt` carries, and now load-bearing here
+    // too: `proposalProblems` compares the declared class against the REFINED
+    // one, so a proposal that trusts the catalogue's base column is rejected.
+    // Rendered from the same constant, beside the function that enforces it.
+    '# מחלקות שהמטען קובע',
+    'עמודת המחלקה בקטלוג מציגה את מחלקת הבסיס. לארבעה כלים המטען שכתבת הוא שקובע בפועל,',
+    'ולכן קבע את `expectedActionClass` לפי המטען שכתבת ולא לפי העמודה:',
+    ...REFINEMENT_RULES.map((r) => `- ${r.rule}`),
   ].join('\n');
 }
 

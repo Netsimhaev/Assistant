@@ -106,6 +106,40 @@ describe('parseProposal', () => {
   });
 
   /**
+   * The two class checks must agree, or the earlier one catches nothing.
+   *
+   * `proposalProblems` compared the declared class against `classifyAction` —
+   * the BASE class — while `classMismatch` in `run-plan.ts`, which decides
+   * whether the compiled plan may run, compares against the REFINED one. A
+   * `mail.send` with no `inReplyTo` is `email.reply` to the first and
+   * `email.initiate` to the second, so a proposal declaring `email.reply`
+   * passed here and was rejected at execution, with no reason the owner
+   * could read.
+   *
+   * Invisible until the conductor bound a plan (11/09): before that the job
+   * failed earlier, on `no_plan_bound`, and the disagreement never surfaced.
+   * The proposal carries the actual payload, so there is nothing stopping
+   * this check from computing exactly what the gate will.
+   */
+  it('refuses a reply class on a payload that carries no thread reference', () => {
+    const noThread = {
+      ...ACTION,
+      input: { to: 'dana@example.com' },
+      expectedActionClass: 'email.reply',
+    };
+
+    const outcome = parseProposal(
+      JSON.stringify({ ...VALID, action: noThread }),
+      READING,
+      CATALOGUE,
+    );
+
+    expect(outcome.status).toBe('unproposable');
+    if (outcome.status !== 'unproposable') throw new Error('expected unproposable');
+    expect(outcome.reason).toContain('action_class_mismatch');
+  });
+
+  /**
    * The other half, so the rule above cannot be satisfied by refusing every
    * action. A classifiable tool is still accepted, with the same catalogue
    * shape and the same declared-`null` class.

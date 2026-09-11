@@ -201,6 +201,55 @@ describe('conductPendingDocuments', () => {
     expect(documentId).toBeTruthy();
   });
 
+  /**
+   * Found by approving a card, on 11/09, and by nothing else.
+   *
+   * The conductor raised a card and moved the job to `await_approval` without
+   * ever binding a plan. `resumeAfterDecision` then moved the approved job to
+   * `execute`, `runDueJobs` found it with nothing to run, and moved it to
+   * `failed` with `no_plan_bound` — so approving a conductor card did
+   * nothing at all, and would have gone on doing nothing however high the
+   * ramp rose. `proposalToPlan` had been built and tested since the proposal
+   * planner shipped; no production caller ever used it.
+   *
+   * Bound BEFORE the card is raised, deliberately. A crash between the two
+   * leaves either a `plan`-phase job carrying a plan nothing will run — inert,
+   * because `runDueJobs` only takes jobs in `execute` — or, in the other
+   * order, a card the owner can approve into the very failure this fixes.
+   */
+  it('binds the compiled plan before it raises the card', async () => {
+    await aDocument('חוזה שיווק');
+    const d = deps();
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+    });
+    expect(result.carded).toBe(1);
+
+    const jobs = await getPool().query<{ job_id: string }>(
+      `SELECT job_id FROM jobs WHERE business_id = $1`, [BUSINESS]);
+    const jobId = jobs.rows[0]?.job_id;
+    expect(jobId).toBeTruthy();
+
+    const plans = await getPool().query<{ plan: unknown }>(
+      `SELECT plan FROM job_plans WHERE business_id = $1 AND job_id = $2`, [BUSINESS, jobId]);
+    expect(plans.rows).toHaveLength(1);
+
+    // The step must be the proposal's action verbatim, because the approval
+    // was enqueued against that exact payload: `unspentApprovalFor` finds the
+    // row by the hash of the step's input, and `consumeApproval` binds the
+    // tool name too. A compilation that reshaped either would leave the
+    // approval unfindable and the owner asked a second time.
+    const row = plans.rows[0]?.plan;
+    const plan = typeof row === 'string' ? JSON.parse(row) : (row as { steps: unknown[] });
+    const steps = (plan as { steps: { toolName: string; input: unknown }[] }).steps;
+    expect(steps).toHaveLength(1);
+    expect(steps[0]?.toolName).toBe(ACTING.action?.toolName);
+    expect(steps[0]?.input).toEqual(ACTING.action?.input);
+  });
+
   it('stores a passive proposal and raises no card', async () => {
     await aDocument('חוזה גרוע');
     const d = deps(PASSIVE);

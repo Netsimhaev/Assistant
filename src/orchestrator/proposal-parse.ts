@@ -14,7 +14,7 @@
 
 import { Proposal } from '../domain/proposal.js';
 import type { Reading } from '../domain/reading.js';
-import { classifiedToolNames, classifyAction } from '../policy/classify.js';
+import { classifiedToolNames, classifyAction, refineActionClass } from '../policy/classify.js';
 import type { CatalogueEntry } from './catalogue.js';
 
 export type ProposalProblem = {
@@ -86,18 +86,27 @@ export function proposalProblems(
       });
     }
 
-    // Advisory, but a mismatch means the planner intended something other than
-    // what will happen — the same rule `Plan` already holds for its steps.
+    // Advisory, but a mismatch means the proposer intended something other
+    // than what will happen — the same rule `Plan` already holds for its
+    // steps. §8 claims this check catches an infeasible plan before it runs,
+    // and a check that disagrees with the executor about what is feasible
+    // catches nothing: it just moves the rejection somewhere with no reason
+    // attached. That has now been true twice.
     //
-    // `actual === null` (a read-only tool) is a mismatch too, and used not to
-    // be: a `null !== undefined` guard stood here and let a proposal that
-    // named a read-only tool *and* declared a class through, only for
-    // `classMismatch` in `run-plan.ts` — which carries no such guard — to
-    // reject the whole compiled plan at execution. §8 claims this check
-    // catches an infeasible plan before it runs; a check that disagrees with
-    // the executor about what is feasible catches nothing, it just moves the
-    // rejection somewhere with no reason attached.
-    const actual = classifyAction(action.toolName);
+    // Once when `actual === null` was not treated as a mismatch, so a
+    // proposal naming a read-only tool *and* declaring a class passed here
+    // and `classMismatch` rejected the compiled plan at execution.
+    //
+    // And once over refinement, which is why `refineActionClass` is applied
+    // below rather than `classifyAction` alone: `actionClassOf` in
+    // `run-plan.ts` refines, and comparing against the base made the two
+    // disagree — a `mail.send` with no `inReplyTo` is `email.reply` to the
+    // base and `email.initiate` to the gate. Invisible until the conductor
+    // began binding a plan (11/09); before that the job failed earlier, on
+    // `no_plan_bound`. The proposal carries the real payload, so there was
+    // never a reason for this check to know less than the executor does.
+    const base = classifyAction(action.toolName);
+    const actual = base === null ? null : refineActionClass(base, action.input);
     if (action.expectedActionClass !== null && action.expectedActionClass !== actual) {
       problems.push({
         kind: 'action_class_mismatch',
