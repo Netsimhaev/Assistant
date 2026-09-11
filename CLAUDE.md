@@ -8,7 +8,7 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 1286 מבחנים
+npm test          # vitest run — 1287 מבחנים
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_URL
@@ -59,7 +59,9 @@ npm run ramp:set -- <מחלקה> <רמה>  # מעלה מחלקת פעולה מה
 
 **כלי כתיבה חדש דורש שתי עריכות.** להוסיף ל-`TOOL_ACTION_CLASS` ב-[src/policy/classify.ts](src/policy/classify.ts) **וגם** ל-allowlist של סוכן ב-[src/charter/capabilities.ts](src/charter/capabilities.ts). כלי שחסר בשתיהן מטופל כקריאה-בלבד ו**עובר את השער בשקט**. זה הבאג שהפיל תשעה מבחנים בסשן שבנה את השלד.
 
-**`READ_ONLY_TOOLS` עוקף את שלבים 5–9 לגמרי.** מי שנשאר שם עם תופעות לוואי אמיתיות: `file.write`, `media.generate_image`, `media.generate_video`. אם מוסיפים שם משהו, לוודא שהוא באמת לא צריך שער.
+**`READ_ONLY_TOOLS` עוקף את שלבים 5–9 לגמרי.** מי שנשאר שם עם תופעות לוואי אמיתיות: `media.generate_image`, `media.generate_video`, `browser.navigate` (שלושתם גם `OUTBOUND_TOOLS`), ולצידם `recipe.save`, `tasks.update_state`, `followup.schedule` ו-`mail.draft`. (`file.write` ו-`code_execution` כבר אינם שם — שניהם מסווגים מאז סקירת 28/08, והשורה הזו המשיכה לנקוב בהם עד 11/09.) אם מוסיפים שם משהו, לוודא שהוא באמת לא צריך שער.
+
+**ומאז 11/09 יש לרשימה הזו תפקיד שני:** `rampLevelForPlan` מדלג על צעד שהכלי שלו בה, ולכן **היא חייבת להישאר זרה ל-`TOOL_ACTION_CLASS`**. כלי ששוכן בשתיהן יישא מחלקה אמיתית עם תופעת לוואי ובכל זאת לא יתרום תקרה — כלומר ירוץ תחת כל מחלקה אחרת שהתוכנית מצהירה, בעקיפת שורת הרמפה שלו, ו-`classMismatch` שותק כש-`expectedActionClass` הוא `null`. שלוש פעמים כבר הועברו כלים בין שתי הטבלאות (`file.write`, `code_execution`, ו-`browser.click`/`browser.fill`), ולכן האינווריאנט נעול עכשיו ב-`positive-controls.test.ts` — בדימוי הטעות, לא בטענה על הטבלאות של היום.
 
 **`browser.click`/`browser.fill` מסווגים כ-`browser.interact`, לא קריאה-בלבד.** הבסיס הוא `auto` — הגידור לא בא מהמחלקה אלא מ**תקרת המקור** מעליה: שרשרת שקראה דף לא אמין היא `open_web` ולכן `draft_only`. קליק שנושא `amountMinor > 0` מתעדן ל-`purchase.place`. הטריגר הוא הסכום ולעולם לא תווית הכפתור — הדף נכתב על ידי מי ששולט באתר, והתאמה לטקסט שלו היא קריאת הקלט של התוקף כמדיניות.
 

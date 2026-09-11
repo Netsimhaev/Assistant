@@ -182,20 +182,24 @@ export async function runDueJobs(
         if (stored === null) {
           // Terminal, not merely reported — see `RunDueResult.unbound`.
           //
-          // **The open question this deliberately does not answer.** The
-          // other shape available here is to bind the one-step plan
-          // `proposeForReading` already returns and run it, which would make
-          // spec §6 literally true and produce an audit row for the work.
-          // It is not taken here because it routes a payload a document
-          // authored into `evaluateToolCall`, and that is a security decision
-          // for the owner to make deliberately rather than acquire as the
-          // side effect of a starvation fix.
+          // **The question this used to leave open was answered on 11/09,
+          // and by the owner.** The shape described here — bind the one-step
+          // plan `proposalToPlan` compiles and let it run — is now what
+          // `conduct.ts` does, before the card is ever raised. It was not
+          // acquired as the side effect of this starvation fix: the owner
+          // asked for it after a live run showed that approving a conductor
+          // card did nothing but land here.
           //
-          // The honest consequence, and the code reads this way on purpose:
-          // an approved conductor card records the owner's decision and does
-          // nothing else. That is exactly what `RAMP_HONESTY`
-          // (`proposal-approval.ts`) already tells the owner on the card, so
-          // the card and the runner agree.
+          // So an approved conductor card no longer reaches this branch at
+          // all. What routes a document-authored payload into
+          // `evaluateToolCall` is now exactly that, and the gate is what
+          // refuses it: `conduct.ts` stamps `unknown_external`, whose
+          // provenance ceiling the signed charter sets to `draft_only`, so
+          // stage 8 denies and writes an audit row saying so.
+          //
+          // This branch remains for what it was always really about — a job
+          // that reached `execute` with nothing bound for some other reason —
+          // and stays terminal so it cannot hold the scheduler's window.
           await transition(jobId, {
             to: 'failed',
             actor: 'system',

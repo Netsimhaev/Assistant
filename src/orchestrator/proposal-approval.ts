@@ -108,9 +108,20 @@ async function notifyOwner(
 /**
  * Said on every card the conductor raises.
  *
- * Approving does not execute: the ramp holds every outbound class in draft.
  * "I approved it and nothing happened" is indistinguishable from a broken
  * system unless it was said in advance, so it is said in advance.
+ *
+ * **What actually holds it, as of 11/09.** This used to say "the ramp holds
+ * every outbound class in draft", and that was only ever half the reason and
+ * is now the weaker half. Approving a conductor card does reach the gate now
+ * — `conduct.ts` binds the compiled plan before raising the card, so the job
+ * has something to run — and what refuses it is the **provenance ceiling**:
+ * every job the conductor opens is stamped `unknown_external`, which the
+ * signed charter caps at `draft_only`, so stage 8 denies whatever the ramp
+ * says. The owner can raise a ramp with a command; that ceiling moves only by
+ * signing a new charter, which is the control they asked for.
+ *
+ * The sentence below stays true either way, which is why it is unchanged.
  */
 export const RAMP_HONESTY =
   'אישור כאן מתעד את החלטתך ואינו מבצע את הפעולה — כל פעולה יוצאת מוחזקת כרגע במצב טיוטה.';
