@@ -37,6 +37,7 @@ export async function resetDatabase(): Promise<void> {
       -- the right call for production, and it means this list has to name the
       -- table by hand or one test's memories leak into the next.
       memories,
+      kept_items,
       proposals,
       document_readings,
       document_artifacts,
