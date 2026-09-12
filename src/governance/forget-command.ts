@@ -17,8 +17,9 @@
 const FORGET_VERBS: readonly string[] = ['תשכחי', 'שכחי', 'תמחקי', 'מחקי'];
 
 /**
- * Same shape as `typed-recipients.ts` uses: a whole-token test, not a scan
- * for something address-like inside a longer run of characters.
+ * Whole-token email address test, using the same anchoring approach as
+ * `typed-recipients.ts`: match only when the entire token is an email shape,
+ * never when email-like characters appear in the middle of a longer string.
  */
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
 
@@ -27,11 +28,24 @@ const DATE_SHAPE = /^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/;
 
 export type ForgetCommand =
   | { recognised: false }
-  | { recognised: true; identifier: string | null; onDate: string | null };
+  | {
+      recognised: true;
+      /** Email address extracted from the text, or null if none was present or readable. */
+      identifier: string | null;
+      /** Date extracted from the text (YYYY-MM-DD format), or null if none was present.
+       * The date's existence is verified; an impossible date like 31/02 returns null.
+       * Phone anchors come from the owner's choice in a picker, not from text parsing. */
+      onDate: string | null;
+    };
 
-/** Strips the Hebrew prefix particles and punctuation a token may carry. */
-function bareToken(token: string): string {
+/**
+ * Strips the Hebrew prefix particles and punctuation a token may carry.
+ * When checking the opening verb, this must NOT strip leading quotes — a
+ * command cannot open on someone else's quoted words.
+ */
+function bareToken(token: string, stripQuotes: boolean = true): string {
   const withoutPrefix = /^[לבמהוכש]-/.test(token) ? token.slice(2) : token;
+  if (!stripQuotes) return withoutPrefix;
   return withoutPrefix.replace(/^[('"«]+/, '').replace(/[)'"»,.;:!?]+$/, '');
 }
 
@@ -46,18 +60,26 @@ function readDate(token: string): string | null {
   const year = yearRaw.length === 2 ? 2000 + Number(yearRaw) : Number(yearRaw);
   if (day < 1 || day > 31 || month < 1 || month > 12) return null;
 
+  // Verify the date actually exists: construct it and check it round-trips.
+  const date = new Date(year, month - 1, day);
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
+    return null;
+  }
+
   return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
 export function readForgetCommand(text: string): ForgetCommand {
   const trimmed = text.trim();
-  const firstToken = bareToken(trimmed.split(/\s+/)[0] ?? '');
+  // Do not strip quotes from the first token when checking for the opening verb.
+  // A command cannot open with someone else's quoted words.
+  const firstToken = bareToken(trimmed.split(/\s+/)[0] ?? '', false);
   if (!FORGET_VERBS.includes(firstToken)) return { recognised: false };
 
   let identifier: string | null = null;
   let onDate: string | null = null;
 
-  for (const raw of trimmed.split(/[\s ]+/)) {
+  for (const raw of trimmed.split(/\s+/)) {
     const token = bareToken(raw);
     if (identifier === null && EMAIL_SHAPE.test(token)) {
       identifier = token.toLowerCase();

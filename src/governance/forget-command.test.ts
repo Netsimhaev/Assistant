@@ -47,4 +47,27 @@ describe('readForgetCommand', () => {
     expect(command.identifier).toBeNull();
     expect(command.onDate).toBeNull();
   });
+
+  it('refuses a command that opens directly on a quotation mark', () => {
+    // A quoted verb at position 0 is still a quote, not the owner's command.
+    // The opening quote must be part of the verb test, not stripped away first.
+    expect(readForgetCommand('"תשכחי מזה" - כך אמר הספק').recognised).toBe(false);
+    expect(readForgetCommand('«תמחקי מזה»').recognised).toBe(false);
+  });
+
+  it('rejects an impossible date (31/02)', () => {
+    const command = readForgetCommand('תשכחי מהתאריך 31/02/2026');
+    expect(command.recognised).toBe(true);
+    if (!command.recognised) throw new Error('unreachable');
+    // The date does not exist; it must not be normalised.
+    expect(command.onDate).toBeNull();
+  });
+
+  it('accepts a valid leap day (29/02/2028)', () => {
+    const command = readForgetCommand('תשכחי מ-29/02/2028');
+    expect(command.recognised).toBe(true);
+    if (!command.recognised) throw new Error('unreachable');
+    // 2028 is a leap year; the date exists and round-trips correctly.
+    expect(command.onDate).toBe('2028-02-29');
+  });
 });
