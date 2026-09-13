@@ -50,6 +50,12 @@ export const AuditKind = z.enum([
   'charter_change',
   'kill_switch',
   'connection_binding',
+  /**
+   * The owner erased something. Carries counts and never what was erased —
+   * a row naming the contact would make the audit log the one place the name
+   * survives, which is exactly what the command asked to prevent (spec §5.3).
+   */
+  'erasure',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 
