@@ -91,6 +91,13 @@ describe('what an erasure leaves behind', () => {
           AND c.data_type IN ('text', 'jsonb', 'json', 'ARRAY')`,
     );
 
+    // An empty result set would make the loop below vacuous — zero columns
+    // scanned passes with the same `[]` as zero matches found. The schema
+    // has 171 such columns today; this only has to stay comfortably above
+    // zero to catch the scan itself silently finding nothing, the same
+    // failure mode `reading-invariants.test.ts` locks for the policy sweep.
+    expect(columns.length).toBeGreaterThan(100);
+
     const found: string[] = [];
     for (const column of columns) {
       if (SURVIVES.includes(column.table_name)) continue;
@@ -149,13 +156,29 @@ describe('what an erasure leaves behind', () => {
   });
 
   /**
+   * The erasure module's own two files, and the property is about who may
+   * import them, not about what they do when called. Named as a positive
+   * allow list rather than a set of excluded root directories: a
+   * hand-maintained `roots` list here once covered
+   * orchestrator/sdk/policy/documents/charter and silently skipped
+   * src/cli, src/mail, src/memory, src/util, src/db, src/audit and
+   * src/config.ts — exactly the "control that covers a subset of what it
+   * claims" failure this project has been burned by before. Walking the
+   * whole tree and excluding by name means a directory added next year is
+   * scanned by default, not skipped by default.
+   */
+  const ERASURE_MODULE_FILES = new Set([
+    join('src', 'governance', 'erasure.ts'),
+    join('src', 'governance', 'erasure-plan.ts'),
+  ]);
+
+  /**
    * Erasure must never become something a plan can invoke: an injected
    * document would say "forget what you found out about me" and the evidence
    * would go (spec §3). Checked by reading the source, because the property
    * is about who may import it, not about what it does when called.
    */
-  it('is imported by nothing outside governance and the dashboard', async () => {
-    const roots = ['src/orchestrator', 'src/sdk', 'src/policy', 'src/documents', 'src/charter'];
+  it('is imported by nothing outside erasure.ts itself and the dashboard', async () => {
     const offenders: string[] = [];
 
     const walk = async (dir: string): Promise<void> => {
@@ -172,14 +195,20 @@ describe('what an erasure leaves behind', () => {
           continue;
         }
         if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) continue;
+        if (ERASURE_MODULE_FILES.has(path)) continue;
+        // The dashboard is the one production consumer spec §3 permits: a
+        // preview built for the owner to confirm, and the confirmed
+        // execution. Matched by path segment, not by root, so a file at any
+        // depth under it is exempt.
+        if (path.split(/[\\/]/).includes('dashboard')) continue;
         const source = await readFile(path, 'utf8');
-        if (source.includes('erasure.js') || source.includes('executeErasure')) {
+        if (/from\s+['"].*erasure(-plan)?\.js['"]/.test(source)) {
           offenders.push(path);
         }
       }
     };
 
-    for (const root of roots) await walk(root);
+    await walk('src');
     expect(offenders).toEqual([]);
   });
 
