@@ -154,8 +154,8 @@ export async function buildErasurePlan(
     for (const documentId of await idsFrom(
       db,
       `SELECT DISTINCT d.document_id FROM documents d
-         JOIN document_readings r ON r.document_id = d.document_id
-         JOIN proposals p ON p.reading_id = r.reading_id
+         JOIN document_readings r ON r.document_id = d.document_id AND r.business_id = $1
+         JOIN proposals p ON p.reading_id = r.reading_id AND p.business_id = $1
         WHERE d.business_id = $1 AND p.job_id = ANY ($2)`,
       [businessId, [...jobIds]],
       'document_id',
@@ -295,17 +295,89 @@ async function countItems(
   };
 
   return [
-    await one('memories', 'delete', 'SELECT count(*)::text AS n FROM memories WHERE business_id=$1 AND memory_id = ANY($2)', [businessId, memoryIds]),
-    await one('documents', 'delete', 'SELECT count(*)::text AS n FROM documents WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]),
-    await one('document_artifacts', 'delete', 'SELECT count(*)::text AS n FROM document_artifacts WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]),
-    await one('document_readings', 'delete', 'SELECT count(*)::text AS n FROM document_readings WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]),
-    await one('proposals', 'delete', 'SELECT count(*)::text AS n FROM proposals WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]),
-    await one('approval_requests', 'delete', 'SELECT count(*)::text AS n FROM approval_requests WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]),
-    await one('boss_instructions', 'delete', 'SELECT count(*)::text AS n FROM boss_instructions WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]),
-    await one('job_plans', 'delete', 'SELECT count(*)::text AS n FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]),
-    await one('job_authorizations', 'delete', 'SELECT count(*)::text AS n FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]),
-    await one('jobs', 'scrub', 'SELECT count(*)::text AS n FROM jobs WHERE business_id=$1 AND job_id = ANY($2) AND title IS NOT NULL', [businessId, jobIds]),
-    await one('job_steps', 'scrub', 'SELECT count(*)::text AS n FROM job_steps WHERE job_id = ANY($1)', [jobIds]),
-    await one('job_step_results', 'scrub', 'SELECT count(*)::text AS n FROM job_step_results WHERE business_id=$1 AND job_id = ANY($2) AND external_id IS NOT NULL', [businessId, jobIds]),
+    await one(
+      'memories',
+      'delete',
+      `SELECT count(*)::text AS n FROM memories
+        WHERE business_id = $1 AND memory_id = ANY ($2)`,
+      [businessId, memoryIds],
+    ),
+    await one(
+      'documents',
+      'delete',
+      `SELECT count(*)::text AS n FROM documents
+        WHERE business_id = $1 AND document_id = ANY ($2)`,
+      [businessId, documentIds],
+    ),
+    await one(
+      'document_artifacts',
+      'delete',
+      `SELECT count(*)::text AS n FROM document_artifacts
+        WHERE business_id = $1 AND document_id = ANY ($2)`,
+      [businessId, documentIds],
+    ),
+    await one(
+      'document_readings',
+      'delete',
+      `SELECT count(*)::text AS n FROM document_readings
+        WHERE business_id = $1 AND document_id = ANY ($2)`,
+      [businessId, documentIds],
+    ),
+    await one(
+      'proposals',
+      'delete',
+      `SELECT count(*)::text AS n FROM proposals
+        WHERE business_id = $1 AND job_id = ANY ($2)`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'approval_requests',
+      'delete',
+      `SELECT count(*)::text AS n FROM approval_requests
+        WHERE business_id = $1 AND job_id = ANY ($2)`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'boss_instructions',
+      'delete',
+      `SELECT count(*)::text AS n FROM boss_instructions
+        WHERE business_id = $1 AND job_id = ANY ($2)`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'job_plans',
+      'delete',
+      `SELECT count(*)::text AS n FROM job_plans
+        WHERE business_id = $1 AND job_id = ANY ($2)`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'job_authorizations',
+      'delete',
+      `SELECT count(*)::text AS n FROM job_authorizations
+        WHERE business_id = $1 AND job_id = ANY ($2)`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'jobs',
+      'scrub',
+      `SELECT count(*)::text AS n FROM jobs
+        WHERE business_id = $1 AND job_id = ANY ($2) AND title IS NOT NULL`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'job_steps',
+      'scrub',
+      `SELECT count(*)::text AS n FROM job_steps
+        WHERE job_id = ANY ($1)`,
+      [jobIds],
+    ),
+    await one(
+      'job_step_results',
+      'scrub',
+      `SELECT count(*)::text AS n FROM job_step_results
+        WHERE business_id = $1 AND job_id = ANY ($2) AND external_id IS NOT NULL`,
+      [businessId, jobIds],
+    ),
   ];
 }

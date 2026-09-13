@@ -1,18 +1,21 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { writeMemory } from '../memory/store.js';
+import { insertOrGetDocument } from '../documents/store.js';
+import { recordSignature } from './signatures.js';
 import { keepItem } from './kept-items.js';
 import { buildErasurePlan } from './erasure-plan.js';
 
 const BUSINESS = 'test-business';
 const RONIT = 'ronit@beta-log.example';
 
-/** A job that mentions the anchor in its authorisation and its plan. */
-async function jobAbout(identifier: string, title: string): Promise<string> {
+/** A job with a fresh charter, nothing else attached. */
+async function bareJob(title: string): Promise<string> {
   const bundle = await installCharter(buildCharter({ version: `er-${title}` }), {
     businessId: BUSINESS,
   });
@@ -22,17 +25,40 @@ async function jobAbout(identifier: string, title: string): Promise<string> {
     businessId: BUSINESS,
     title,
   });
+  return job.jobId;
+}
+
+/** A job that mentions the anchor in its authorisation and its plan. */
+async function jobAbout(identifier: string, title: string): Promise<string> {
+  const jobId = await bareJob(title);
   await getPool().query(
     `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
      VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
-    [BUSINESS, job.jobId, identifier],
+    [BUSINESS, jobId, identifier],
   );
   await getPool().query(
     `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
      VALUES ($1, $2, 'h1', $3::jsonb)`,
-    [BUSINESS, job.jobId, JSON.stringify({ goal: 'send', steps: [{ input: { to: [identifier] } }] })],
+    [BUSINESS, jobId, JSON.stringify({ goal: 'send', steps: [{ input: { to: [identifier] } }] })],
   );
-  return job.jobId;
+  return jobId;
+}
+
+async function aDocument(): Promise<string> {
+  const documentId = `DOC-${ulid()}`;
+  await insertOrGetDocument(
+    {
+      documentId,
+      source: 'manual',
+      originalName: 'חוזה.docx',
+      mediaType: 'text/plain',
+      sha256: `${documentId}-hash`.padEnd(64, '0').slice(0, 64),
+      byteSize: 10,
+      storedPath: `${BUSINESS}/${documentId}/original.txt`,
+    },
+    { businessId: BUSINESS },
+  );
+  return documentId;
 }
 
 describe('buildErasurePlan', () => {
@@ -44,8 +70,99 @@ describe('buildErasurePlan', () => {
     await closePool();
   });
 
-  it('finds a contact through every place the anchor can appear', async () => {
-    const jobId = await jobAbout(RONIT, 'about ronit');
+  describe('finds a contact through every place the anchor can appear', () => {
+    it('via job_authorizations.recipients', async () => {
+      const jobId = await bareJob('via-authorization');
+      await getPool().query(
+        `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
+         VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
+        [BUSINESS, jobId, RONIT],
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    it('via job_plans.plan', async () => {
+      const jobId = await bareJob('via-plan');
+      await getPool().query(
+        `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
+         VALUES ($1, $2, 'h1', $3::jsonb)`,
+        [BUSINESS, jobId, JSON.stringify({ goal: 'send', steps: [{ input: { to: [RONIT] } }] })],
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    it('via boss_instructions.text', async () => {
+      const jobId = await bareJob('via-instruction');
+      await getPool().query(
+        `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text)
+         VALUES ($1, $2, $3, $4)`,
+        [`INS-${ulid()}`, BUSINESS, jobId, `תשלחי תזכורת ל-${RONIT}`],
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    it('via approval_requests (proposed input, summary and detail)', async () => {
+      const jobId = await bareJob('via-approval');
+      await getPool().query(
+        `INSERT INTO approval_requests
+           (approval_id, business_id, job_id, action_class, summary, detail, risk,
+            proposed_tool, proposed_input, input_hash, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          `AP-${ulid()}`,
+          BUSINESS,
+          jobId,
+          'email.reply',
+          'שליחת מייל',
+          `אישור לשליחה אל ${RONIT}`,
+          '{}',
+          'mail.send',
+          JSON.stringify({ to: RONIT }),
+          'hash-1',
+          new Date(Date.now() + 3600_000).toISOString(),
+        ],
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    it('via jobs.title', async () => {
+      const jobId = await bareJob(`פנייה בנוגע ל-${RONIT}`);
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+  });
+
+  it('classifies items as delete or scrub correctly', async () => {
+    const jobId = await jobAbout(RONIT, 'action-classification');
     await writeMemory(
       { jobId, kind: 'entity', subjectKey: RONIT, body: { name: 'רונית' } },
       { businessId: BUSINESS },
@@ -56,8 +173,6 @@ describe('buildErasurePlan', () => {
       { businessId: BUSINESS },
     );
 
-    expect(plan.jobIds).toContain(jobId);
-    expect(plan.memoryIds).toHaveLength(1);
     const tables = new Map(plan.items.map((i) => [i.table, i]));
     expect(tables.get('memories')?.action).toBe('delete');
     expect(tables.get('job_plans')?.action).toBe('delete');
@@ -67,8 +182,8 @@ describe('buildErasurePlan', () => {
   });
 
   /**
-   * The other direction, and the one that makes the test above mean
-   * something: an erasure that swept everything would satisfy it perfectly.
+   * The other direction, and the one that makes the tests above mean
+   * something: an erasure that swept everything would satisfy them perfectly.
    */
   it('leaves a second contact completely untouched', async () => {
     const mine = await jobAbout(RONIT, 'ronit');
@@ -99,23 +214,58 @@ describe('buildErasurePlan', () => {
     expect(plan.memoryIds).toEqual([]);
   });
 
-  it('excludes a kept item and says why, rather than skipping it silently', async () => {
-    const jobId = await jobAbout(RONIT, 'ronit');
-    const memory = await writeMemory(
-      { jobId, kind: 'entity', subjectKey: RONIT, body: {} },
-      { businessId: BUSINESS },
-    );
-    await keepItem({ kind: 'memory', itemId: memory.memoryId, note: 'חשוב' }, { businessId: BUSINESS });
+  describe('kept items are excluded and explained, never skipped silently', () => {
+    it('excludes a kept memory and says why', async () => {
+      const jobId = await jobAbout(RONIT, 'ronit');
+      const memory = await writeMemory(
+        { jobId, kind: 'entity', subjectKey: RONIT, body: {} },
+        { businessId: BUSINESS },
+      );
+      await keepItem({ kind: 'memory', itemId: memory.memoryId, note: 'חשוב' }, { businessId: BUSINESS });
 
-    const plan = await buildErasurePlan(
-      { kind: 'contact', identifier: RONIT },
-      { businessId: BUSINESS },
-    );
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
 
-    expect(plan.memoryIds).not.toContain(memory.memoryId);
-    expect(plan.excluded).toHaveLength(1);
-    expect(plan.excluded[0]?.itemId).toBe(memory.memoryId);
-    expect(plan.excluded[0]?.note).toBe('חשוב');
+      expect(plan.memoryIds).not.toContain(memory.memoryId);
+      expect(plan.excluded).toHaveLength(1);
+      expect(plan.excluded[0]?.itemKind).toBe('memory');
+      expect(plan.excluded[0]?.itemId).toBe(memory.memoryId);
+      expect(plan.excluded[0]?.note).toBe('חשוב');
+      expect(typeof plan.excluded[0]?.keptAt).toBe('string');
+    });
+
+    it('excludes a kept document and says why', async () => {
+      const documentId = await aDocument();
+      await keepItem({ kind: 'document', itemId: documentId, note: 'לשימור' }, { businessId: BUSINESS });
+
+      const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+
+      expect(plan.documentIds).not.toContain(documentId);
+      expect(plan.excluded).toHaveLength(1);
+      expect(plan.excluded[0]?.itemKind).toBe('document');
+      expect(plan.excluded[0]?.itemId).toBe(documentId);
+      expect(plan.excluded[0]?.note).toBe('לשימור');
+      expect(typeof plan.excluded[0]?.keptAt).toBe('string');
+    });
+
+    it('excludes a kept job and says why', async () => {
+      const jobId = await jobAbout(RONIT, 'kept-job');
+      await keepItem({ kind: 'job', itemId: jobId, note: 'לשימור' }, { businessId: BUSINESS });
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).not.toContain(jobId);
+      expect(plan.excluded).toHaveLength(1);
+      expect(plan.excluded[0]?.itemKind).toBe('job');
+      expect(plan.excluded[0]?.itemId).toBe(jobId);
+      expect(plan.excluded[0]?.note).toBe('לשימור');
+      expect(typeof plan.excluded[0]?.keptAt).toBe('string');
+    });
   });
 
   it('refuses while a job it would touch is still waiting on the owner', async () => {
@@ -132,6 +282,26 @@ describe('buildErasurePlan', () => {
     expect(plan.refusals).toHaveLength(1);
     expect(plan.refusals[0]?.kind).toBe('live_job');
     expect(plan.refusals[0]?.detail).toContain(jobId);
+  });
+
+  it('refuses to erase a document that carries a signature', async () => {
+    const documentId = await aDocument();
+    await recordSignature(
+      {
+        signatureId: `SIG-${ulid()}`,
+        documentId,
+        signedSha256: 'c'.repeat(64),
+        approvalId: `AP-${ulid()}`,
+        signedBy: 'owner',
+      },
+      { businessId: BUSINESS },
+    );
+
+    const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+
+    expect(plan.refusals).toHaveLength(1);
+    expect(plan.refusals[0]?.kind).toBe('signed_document');
+    expect(plan.refusals[0]?.detail).toContain(documentId);
   });
 
   it('builds nothing at all for an anchor nothing matches', async () => {
