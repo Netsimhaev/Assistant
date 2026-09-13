@@ -79,6 +79,18 @@ describe('the authorisation boundary this sub-project drew', () => {
     const deleters = PRODUCTION_SOURCES.filter((path) => DELETE.test(readFileSync(path, 'utf8')));
     expect(deleters).toHaveLength(1);
     expect(deleters[0]?.replace(/\\/g, '/')).toMatch(/\/src\/governance\/erasure\.ts$/);
+
+    // The one-grant-per-job primary key (migration 015) was ALSO the control
+    // against silent widening — `AuthorizationAlreadyGrantedError` exists
+    // because an `INSERT ... ON CONFLICT DO UPDATE` would let a second grant
+    // widen the first without leaving a trace of what was originally asked
+    // for. A module that can both delete a row and call `grantAuthorization`
+    // turns that into a two-step widening the key no longer forbids: delete,
+    // then regrant with a wider `recipients` list. None of today's deleters
+    // may also grant.
+    for (const path of deleters) {
+      expect(readFileSync(path, 'utf8'), path).not.toMatch(/grantAuthorization\(/);
+    }
   });
 
   it('has no module under src/documents/ importing the authorisation module', () => {

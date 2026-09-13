@@ -53,8 +53,14 @@ export interface ErasurePlan {
  * A phase the owner is still involved in, or the engine is mid-way through.
  * Erasing under one of these leaves a job pointing at a plan that no longer
  * exists (spec §7.1).
+ *
+ * Exported so `executeErasure` can re-run the identical check, under a row
+ * lock, at the top of its transaction — the plan-time refusal below narrows
+ * the window a job can be woken into a live phase between the preview and
+ * the owner's confirmation, but does not close it. Two definitions of "live"
+ * drifting apart would be worse than one shared one (spec §7.1, I4).
  */
-const LIVE_PHASES: readonly string[] = ['execute', 'await_approval'];
+export const LIVE_PHASES: readonly string[] = ['execute', 'await_approval'];
 
 /**
  * Escapes what `LIKE` would otherwise read as a pattern.
@@ -160,6 +166,29 @@ export async function buildErasurePlan(
       [businessId, [...jobIds]],
       'document_id',
     )) documentIds.add(documentId);
+  }
+
+  // The reverse direction, for a `document` anchor specifically: `documents
+  // .document_id` cascades onto `document_readings`, which cascades onto
+  // `proposals`, so deleting the document row is going to destroy every
+  // proposal on every reading of it regardless of which job made that
+  // proposal. Without this, `jobIds` stays empty (a document anchor names no
+  // contact and no window), `countItems` reports zero proposals, and the
+  // owner approves a preview that undercounts exactly what the cascade is
+  // about to do — the defect C1 named. Scoped to `document` anchors only:
+  // a `contact` anchor already found its jobs directly, and pulling in every
+  // other job that happens to share a reading with a document it touched
+  // would sweep in jobs the owner never named.
+  if (anchor.kind === 'document' && documentIds.size > 0) {
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT p.job_id FROM proposals p
+         JOIN document_readings r ON r.reading_id = p.reading_id AND r.business_id = $1
+        WHERE r.business_id = $1 AND r.document_id = ANY ($2)
+          AND p.business_id = $1 AND p.job_id IS NOT NULL`,
+      [businessId, [...documentIds]],
+      'job_id',
+    )) jobIds.add(jobId);
   }
 
   // Memories: by subject, by body, by source — and by the jobs above.
