@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, writeFile, access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -12,7 +12,7 @@ import { writeMemory } from '../memory/store.js';
 import { recordSignature } from './signatures.js';
 import type { ErasurePlan } from './erasure-plan.js';
 import { buildErasurePlan } from './erasure-plan.js';
-import { ErasureRefusedError, executeErasure } from './erasure.js';
+import { ErasureAuditUnrecordedError, ErasureRefusedError, executeErasure } from './erasure.js';
 
 const BUSINESS = 'test-business';
 const RONIT = 'ronit@beta-log.example';
@@ -59,6 +59,56 @@ async function insertDocument(documentId: string, storedPath: string): Promise<v
      VALUES ($1, $2, 'manual', 'doc.txt', 'text/plain', repeat('a', 64), 12, $3, 'extracted')`,
     [documentId, BUSINESS, storedPath],
   );
+}
+
+async function insertReading(readingId: string, documentId: string, briefHash: string): Promise<void> {
+  await getPool().query(
+    `INSERT INTO document_readings
+       (reading_id, business_id, document_id, status, content, provenance, model, prompt_version, brief_hash)
+     VALUES ($1, $2, $3, 'read', '{}', 'boss', 'test-model', 'v1', $4)`,
+    [readingId, BUSINESS, documentId, briefHash],
+  );
+}
+
+async function insertProposal(proposalId: string, readingId: string, jobId: string | null): Promise<void> {
+  await getPool().query(
+    `INSERT INTO proposals (proposal_id, business_id, reading_id, status, content, model, prompt_version, raw, job_id)
+     VALUES ($1, $2, $3, 'proposed', '{}', 'test-model', 'v1', '', $4)`,
+    [proposalId, BUSINESS, readingId, jobId],
+  );
+}
+
+/**
+ * A sentinel that forces the audit insert to fail, without stubbing
+ * `appendAudit`. Same harness as `src/governance/killswitch.test.ts`
+ * (`test_force_audit_failure` / `force_audit_failure`), keyed on
+ * `NEW.kind = 'erasure'` instead of a reason substring — an erasure's reason
+ * never carries the identity being erased, so there is nothing safe to grep
+ * for in it, but `kind` is exactly this row's discriminator.
+ */
+async function installAuditFailureTrigger(): Promise<void> {
+  await getPool().query(`
+    CREATE OR REPLACE FUNCTION test_force_erasure_audit_failure() RETURNS trigger AS $$
+    BEGIN
+      IF NEW.kind = 'erasure' THEN
+        RAISE EXCEPTION 'forced erasure audit failure for test';
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    DROP TRIGGER IF EXISTS force_erasure_audit_failure ON audit_log;
+    CREATE TRIGGER force_erasure_audit_failure
+      BEFORE INSERT ON audit_log
+      FOR EACH ROW EXECUTE FUNCTION test_force_erasure_audit_failure();
+  `);
+}
+
+async function removeAuditFailureTrigger(): Promise<void> {
+  await getPool().query(`
+    DROP TRIGGER IF EXISTS force_erasure_audit_failure ON audit_log;
+    DROP FUNCTION IF EXISTS test_force_erasure_audit_failure();
+  `);
 }
 
 describe('executeErasure', () => {
@@ -402,5 +452,157 @@ describe('executeErasure', () => {
     expect(memories.rows).toHaveLength(1);
     const auth = await getPool().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [jobId]);
     expect(auth.rows).toHaveLength(1);
+  });
+
+  /**
+   * N1 / Residual 2 (fix round 2): C1's fix only closed the reverse direction
+   * for a `document` anchor. A `contact` anchor that closes *forward* to a
+   * shared document has the identical gap the other way around: the explicit
+   * `DELETE FROM proposals` was scoped to `job_id = ANY(jobIds)`, so a SECOND
+   * job's proposal on the SAME reading — one `document_readings` row cascades
+   * onto every proposal that cites it — was neither previewed nor credited to
+   * the statement that actually destroyed it via cascade. `job_id IS NULL`
+   * (a legacy proposal predating migration 018) fails that same `job_id =
+   * ANY(...)` test identically, so one fix (scoping `proposals` by
+   * `reading_id` through the erased documents as well as by `job_id`) closes
+   * both gaps at once.
+   *
+   * Two DIFFERENT jobs propose against the SAME reading — the documented
+   * expected state: readings dedupe by `(business_id, document_id,
+   * brief_hash, prompt_version, provenance)` and proposals deliberately do
+   * not, and `conductPendingDocuments` opens a fresh job per document per
+   * pass. Only `jobA` is reachable from the contact; `jobB` is not swept into
+   * `jobIds` (erasing a contact must not sweep in an unrelated job's whole
+   * record), but its proposal on the shared reading is still about to be
+   * destroyed the moment `document_readings` is deleted, and the preview and
+   * the executor must both say so.
+   */
+  it('a contact anchor that reaches a shared reading counts every proposal on it, not just its own job’s', async () => {
+    const jobA = await bareJob('shared-reading-a');
+    await getPool().query(
+      `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
+       VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
+      [BUSINESS, jobA, RONIT],
+    );
+    const jobB = await bareJob('shared-reading-b'); // unrelated to RONIT anywhere
+
+    const documentId = `DOC-${ulid()}`;
+    await insertDocument(documentId, `nowhere/${documentId}.txt`);
+    const readingId = `READ-${ulid()}`;
+    await insertReading(readingId, documentId, 'hash-n1-contact');
+    const proposalA = `PROP-${ulid()}`;
+    await insertProposal(proposalA, readingId, jobA);
+    const proposalB = `PROP-${ulid()}`;
+    await insertProposal(proposalB, readingId, jobB);
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    expect(plan.jobIds).toContain(jobA);
+    expect(plan.jobIds).not.toContain(jobB);
+    expect(plan.documentIds).toContain(documentId);
+
+    const proposalsItem = plan.items.find((item) => item.table === 'proposals');
+    expect(proposalsItem?.count).toBe(2);
+
+    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const deletedProposals = outcome.deleted.find((item) => item.table === 'proposals');
+    expect(deletedProposals?.count).toBe(2);
+
+    const remaining = await getPool().query('SELECT 1 FROM proposals WHERE reading_id=$1', [readingId]);
+    expect(remaining.rows).toHaveLength(0);
+  });
+
+  /**
+   * N1's "cover it too" for the `window` anchor: same shared-reading shape,
+   * reached via a job found by creation time instead of by contact.
+   */
+  it('a window anchor that reaches a shared reading counts every proposal on it, not just its own job’s', async () => {
+    const jobA = await bareJob('window-shared-reading-a');
+    const jobB = await bareJob('window-shared-reading-b');
+
+    const documentId = `DOC-${ulid()}`;
+    await insertDocument(documentId, `nowhere/${documentId}.txt`);
+    const readingId = `READ-${ulid()}`;
+    await insertReading(readingId, documentId, 'hash-n1-window');
+    const proposalA = `PROP-${ulid()}`;
+    await insertProposal(proposalA, readingId, jobA);
+    const proposalB = `PROP-${ulid()}`;
+    await insertProposal(proposalB, readingId, jobB);
+
+    // Real-clock creation times land within milliseconds of each other, so a
+    // window couldn't otherwise separate them deterministically. Stamped
+    // apart by an hour so the window below can be built to include jobA and
+    // exclude jobB unambiguously — the point of this test is the shared
+    // reading, not the window boundary arithmetic.
+    const jobATime = new Date('2026-01-01T00:00:00.000Z');
+    const jobBTime = new Date('2026-01-01T01:00:00.000Z');
+    await getPool().query('UPDATE jobs SET created_at=$2 WHERE job_id=$1', [jobA, jobATime.toISOString()]);
+    await getPool().query('UPDATE jobs SET created_at=$2 WHERE job_id=$1', [jobB, jobBTime.toISOString()]);
+
+    const fromIso = new Date(jobATime.getTime() - 1000).toISOString();
+    const toIso = new Date(jobATime.getTime() + 1000).toISOString();
+
+    const plan = await buildErasurePlan({ kind: 'window', fromIso, toIso }, { businessId: BUSINESS });
+    expect(plan.jobIds).toContain(jobA);
+    expect(plan.jobIds).not.toContain(jobB);
+    expect(plan.documentIds).toContain(documentId);
+
+    const proposalsItem = plan.items.find((item) => item.table === 'proposals');
+    expect(proposalsItem?.count).toBe(2);
+
+    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    const deletedProposals = outcome.deleted.find((item) => item.table === 'proposals');
+    expect(deletedProposals?.count).toBe(2);
+
+    const remaining = await getPool().query('SELECT 1 FROM proposals WHERE reading_id=$1', [readingId]);
+    expect(remaining.rows).toHaveLength(0);
+  });
+
+  /**
+   * I3 (round 1 residual, now closed): an `appendAudit` failure after the
+   * database transaction and file deletions have already committed must not
+   * be reported as though nothing happened. Same forced-failure harness as
+   * `src/governance/killswitch.test.ts` (a real BEFORE INSERT trigger on
+   * `audit_log`, self-installed and self-removed) — CLAUDE.md explicitly
+   * sanctions disabling/restoring `audit_log` triggers from a test, and this
+   * one only ever fires on `kind = 'erasure'`, so it cannot affect any other
+   * audit write in the same run.
+   */
+  describe('appendAudit failure after the erasure has already committed', () => {
+    afterEach(async () => {
+      await removeAuditFailureTrigger();
+    });
+
+    it('throws ErasureAuditUnrecordedError carrying the real, completed outcome', async () => {
+      await installAuditFailureTrigger();
+      const { jobId } = await seed();
+      const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+      let caught: unknown;
+      try {
+        await executeErasure(plan, { businessId: BUSINESS });
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(ErasureAuditUnrecordedError);
+      const typedError = caught as ErasureAuditUnrecordedError;
+      expect(typedError.erased).toBe(true);
+      expect(typedError.cause).toBeInstanceOf(Error);
+      expect((typedError.cause as Error).message).toContain('forced erasure audit failure');
+
+      // The erasure itself is unconditionally done: real counts on the error,
+      // and the rows are actually gone — the failure is only in the log.
+      const total = typedError.outcome.deleted.reduce((sum, item) => sum + item.count, 0);
+      expect(total).toBeGreaterThan(0);
+      const memories = await getPool().query('SELECT 1 FROM memories WHERE business_id=$1', [BUSINESS]);
+      expect(memories.rows).toHaveLength(0);
+      const auth = await getPool().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [jobId]);
+      expect(auth.rows).toHaveLength(0);
+
+      // And genuinely no audit row: the append failed for real, not a retry
+      // swallowing the error.
+      const rows = await getPool().query(`SELECT 1 FROM audit_log WHERE business_id=$1 AND kind='erasure'`, [BUSINESS]);
+      expect(rows.rows).toHaveLength(0);
+    });
   });
 });

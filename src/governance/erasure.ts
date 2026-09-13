@@ -137,9 +137,24 @@ export async function executeErasure(
     // Deleted: rows whose whole existence is the content. `proposals` runs
     // before `document_readings` — see the docblock above — so the explicit
     // delete, not the reading's cascade, is what removes it and what gets
-    // credited with removing it.
+    // credited with removing it. Scoped by `reading_id` through the erased
+    // documents as well as by `job_id` — identical to `countItems` in
+    // `erasure-plan.ts` and for the same reason (fix round 2, N1/Residual 2):
+    // a proposal on a reading of a document being erased is destroyed by the
+    // cascade regardless of whose job it belongs to, including a job outside
+    // `jobIds` and a legacy proposal whose `job_id` is NULL.
     await del('memories', 'DELETE FROM memories WHERE business_id=$1 AND memory_id = ANY($2)', [businessId, memoryIds]);
-    await del('proposals', 'DELETE FROM proposals WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
+    await del(
+      'proposals',
+      `DELETE FROM proposals
+        WHERE business_id=$1
+          AND (job_id = ANY($2)
+            OR reading_id IN (
+                 SELECT reading_id FROM document_readings
+                  WHERE business_id=$1 AND document_id = ANY($3)
+               ))`,
+      [businessId, jobIds, documentIds],
+    );
     await del('document_readings', 'DELETE FROM document_readings WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]);
     await del('document_artifacts', 'DELETE FROM document_artifacts WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]);
     await del('approval_requests', 'DELETE FROM approval_requests WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);

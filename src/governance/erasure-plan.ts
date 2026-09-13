@@ -355,9 +355,25 @@ async function countItems(
     await one(
       'proposals',
       'delete',
+      // Scoped by `reading_id` through the erased documents as well as by
+      // `job_id` (fix round 2, N1/Residual 2): `document_readings` cascades
+      // onto `proposals`, so ANY proposal on a reading of a document being
+      // erased is about to be destroyed regardless of which job made it —
+      // including a job outside `jobIds` (a second job proposing against a
+      // reading two documents legitimately share) and a proposal whose
+      // `job_id` is NULL (migration 018 made the column nullable by design,
+      // and `ON DELETE SET NULL` still produces one). `job_id = ANY($2)`
+      // alone undercounts both identically; this is the same query the
+      // executor runs to delete, so the preview and the deletion agree by
+      // construction.
       `SELECT count(*)::text AS n FROM proposals
-        WHERE business_id = $1 AND job_id = ANY ($2)`,
-      [businessId, jobIds],
+        WHERE business_id = $1
+          AND (job_id = ANY ($2)
+            OR reading_id IN (
+                 SELECT reading_id FROM document_readings
+                  WHERE business_id = $1 AND document_id = ANY ($3)
+               ))`,
+      [businessId, jobIds, documentIds],
     ),
     await one(
       'approval_requests',
