@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, writeFile, access } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ulid } from 'ulid';
@@ -141,20 +141,56 @@ describe('executeErasure', () => {
     expect(job.rows[0]?.title).toBeNull();
   });
 
-  it('deletes the file the document pointed at', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'erase-'));
-    const path = join(dir, 'doc.txt');
-    await writeFile(path, 'תוכן', 'utf8');
-    // `byte_size` is NOT NULL with no default — verified against the live
-    // schema during preflight, and omitting it fails the insert.
-    await insertDocument('DOC-1', path);
+  /**
+   * The path is relative in the column, as `ingest.ts` writes it, and the
+   * plan is what turns it into something `unlink` can act on. Written against
+   * a temp root injected into the plan builder, exactly as `verify.ts`'s tests
+   * inject theirs.
+   *
+   * **`filesRemoved === 1` is the load-bearing half.** An already-absent file
+   * is tolerated, so a run that resolved the path wrongly and deleted nothing
+   * still leaves `access()` rejecting and `filesFailed` empty. Only the count
+   * separates "we deleted it" from "we never found it" — which is precisely
+   * how the relative-path defect stayed invisible.
+   */
+  it('deletes the file a relative stored_path points at, under the document root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'erase-root-'));
+    const relative = `${BUSINESS}/DOC-REL/original.txt`;
+    await mkdir(join(root, BUSINESS, 'DOC-REL'), { recursive: true });
+    await writeFile(join(root, relative), 'תוכן', 'utf8');
+    await insertDocument('DOC-REL', relative);
 
-    const plan = await buildErasurePlan({ kind: 'document', documentId: 'DOC-1' }, { businessId: BUSINESS });
+    const plan = await buildErasurePlan(
+      { kind: 'document', documentId: 'DOC-REL' },
+      { businessId: BUSINESS, documentRoot: root },
+    );
     const outcome = await executeErasure(plan, { businessId: BUSINESS });
 
     expect(outcome.filesRemoved).toBe(1);
+    expect(outcome.filesAlreadyGone).toEqual([]);
     expect(outcome.filesFailed).toEqual([]);
-    await expect(access(path)).rejects.toThrow();
+    await expect(access(join(root, relative))).rejects.toThrow();
+  });
+
+  /**
+   * Tolerating an already-absent file is right — the goal was that it not be
+   * there, and it is not. Being indistinguishable from a deletion we performed
+   * is what let a total failure to delete anything read as a clean run.
+   */
+  it('counts an already-absent file apart from one it actually deleted', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'erase-gone-'));
+    const relative = `${BUSINESS}/DOC-GONE/original.txt`;
+    await insertDocument('DOC-GONE', relative);
+
+    const plan = await buildErasurePlan(
+      { kind: 'document', documentId: 'DOC-GONE' },
+      { businessId: BUSINESS, documentRoot: root },
+    );
+    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+
+    expect(outcome.filesRemoved).toBe(0);
+    expect(outcome.filesAlreadyGone).toEqual([join(root, relative)]);
+    expect(outcome.filesFailed).toEqual([]);
   });
 
   it('refuses to run a plan that carries a refusal', async () => {

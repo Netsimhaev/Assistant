@@ -1,5 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { isAbsolute, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { ulid } from 'ulid';
+import { config } from '../config.js';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -311,5 +314,37 @@ describe('buildErasurePlan', () => {
     );
     expect(plan.jobIds).toEqual([]);
     expect(plan.items.every((i) => i.count === 0)).toBe(true);
+  });
+  /**
+   * `documents.stored_path` is relative — `ingest.ts` writes
+   * `<businessId>/<documentId>/original.<ext>` and joins `config.documentRoot`
+   * separately. The executor `unlink`s what this plan lists and resolves
+   * nothing of its own (spec §8), so the join has to happen here: a relative
+   * path handed to `unlink` resolves against whatever the process's working
+   * directory happens to be, misses, and is tolerated as "already gone".
+   * Every row destroyed, every byte retained, and the screen says done.
+   *
+   * `verify.ts` is the house convention for this exact column.
+   */
+  it('resolves every file path against the document root, never leaving it relative', async () => {
+    const documentId = await aDocument();
+
+    const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+
+    expect(plan.filePaths).toHaveLength(1);
+    expect(plan.filePaths.every((path) => isAbsolute(path))).toBe(true);
+    expect(plan.filePaths[0]).toBe(join(config.documentRoot, `${BUSINESS}/${documentId}/original.txt`));
+  });
+
+  it('joins against an injected document root when one is given', async () => {
+    const documentId = await aDocument();
+    const root = join(tmpdir(), 'erase-plan-root');
+
+    const plan = await buildErasurePlan(
+      { kind: 'document', documentId },
+      { businessId: BUSINESS, documentRoot: root },
+    );
+
+    expect(plan.filePaths[0]).toBe(join(root, `${BUSINESS}/${documentId}/original.txt`));
   });
 });

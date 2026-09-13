@@ -4,9 +4,11 @@
  *
  * Two things are proved here that nothing else on this branch can prove.
  * First, **the preview is the truth**: what the page lists is what the
- * executor removes, refusals included. Second, **the confirm rebuilds the
- * plan** — a plan that travelled through a browser is a plan the browser
- * could have edited, and the executor deletes exactly what its plan says.
+ * executor removes, refusals included. Second, **the confirm destroys the
+ * plan the owner read, and nothing wider** — it rebuilds server-side (a plan
+ * that travelled through a browser is a plan the browser could have edited)
+ * and then refuses unless the rebuilt plan fingerprints identically to the
+ * one the preview showed.
  *
  * Every POST here is guarded by the session's CSRF token. An erasure cannot
  * be undone, so a cross-site form that reached `/erase/confirm` would be the
@@ -28,7 +30,8 @@ import { readForgetCommand } from '../governance/forget-command.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
 import { createOwner } from './auth.js';
 import { createServer } from './server.js';
-import { renderErasure } from './views.js';
+import { renderErasure, renderErasureDone } from './views.js';
+import type { ErasureOutcome } from '../governance/erasure.js';
 
 const BUSINESS = 'test-business';
 const USERNAME = 'owner';
@@ -83,6 +86,13 @@ function extractCsrf(html: string): string {
   return match[1];
 }
 
+/** The hash of the plan the page is showing — what the confirm is authorising. */
+function extractPlanHash(html: string): string {
+  const match = /name="planHash" value="([0-9a-f]+)"/.exec(html);
+  if (!match?.[1]) throw new Error(`no plan hash found in body: ${html.slice(0, 200)}`);
+  return match[1];
+}
+
 /** A job whose title names Ronit, plus one memory about her. */
 async function seedRonit(): Promise<{ jobId: string }> {
   const bundle = await installCharter(buildCharter({ version: 'screen' }), { businessId: BUSINESS });
@@ -129,6 +139,13 @@ describe('the erasure screen', () => {
 
     expect(html).toContain(RONIT);
     expect(html).toContain('זיכרונות');
+    expect(html).toContain('כותרות משימה');
+    // "every" as a count, not as a spot check: one row rendered for each item
+    // the plan says it will touch, so a label this file forgot to name still
+    // fails the assertion instead of slipping through.
+    const touched = plan.items.filter((item) => item.count > 0);
+    expect(touched.length).toBeGreaterThan(1);
+    expect(html.match(/<tr><td>/g) ?? []).toHaveLength(touched.length);
     // The confirm control has to say what it does, in a word nobody clicks by
     // accident.
     expect(html).toContain('מחק לצמיתות');
@@ -218,63 +235,6 @@ describe('the erasure routes', () => {
     expect(await memoryCount()).toBe(1);
   });
 
-  it('destroys what the preview listed when the owner confirms', async () => {
-    const baseUrl = await startServer();
-    await seedRonit();
-    const cookie = await signIn(baseUrl);
-    const preview = await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, {
-      headers: { cookie },
-    });
-    const html = await preview.text();
-    const csrf = extractCsrf(html);
-
-    const res = await fetch(`${baseUrl}/erase/confirm`, {
-      method: 'POST',
-      headers: { cookie },
-      body: new URLSearchParams({
-        csrf,
-        anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
-      }),
-    });
-
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain('נמחק');
-    expect(await memoryCount()).toBe(0);
-  });
-
-  /**
-   * The plan is rebuilt on confirm, never reconstructed from the form. A row
-   * that came into scope after the preview was drawn is therefore erased
-   * too — which is only visible because the browser never carried a row list
-   * to begin with.
-   */
-  it('rebuilds the plan on confirm rather than trusting the round trip', async () => {
-    const baseUrl = await startServer();
-    const { jobId } = await seedRonit();
-    const cookie = await signIn(baseUrl);
-    const csrf = extractCsrf(
-      await (await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })).text(),
-    );
-
-    // After the preview, and before the confirm.
-    await writeMemory(
-      { jobId, kind: 'chunk', subjectKey: 'הערה', body: { note: RONIT } },
-      { businessId: BUSINESS },
-    );
-    expect(await memoryCount()).toBe(2);
-
-    await fetch(`${baseUrl}/erase/confirm`, {
-      method: 'POST',
-      headers: { cookie },
-      body: new URLSearchParams({
-        csrf,
-        anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
-      }),
-    });
-
-    expect(await memoryCount()).toBe(0);
-  });
-
   /**
    * A job woken into a live phase between the preview and the confirm is the
    * case the rebuild exists for: the screen must refuse, and must say so
@@ -284,9 +244,9 @@ describe('the erasure routes', () => {
     const baseUrl = await startServer();
     const { jobId } = await seedRonit();
     const cookie = await signIn(baseUrl);
-    const csrf = extractCsrf(
-      await (await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })).text(),
-    );
+    const previewHtml = await (
+      await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
+    ).text();
 
     for (const to of ['understand', 'plan', 'await_approval'] as const) {
       await transition(jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
@@ -296,7 +256,8 @@ describe('the erasure routes', () => {
       method: 'POST',
       headers: { cookie },
       body: new URLSearchParams({
-        csrf,
+        csrf: extractCsrf(previewHtml),
+        planHash: extractPlanHash(previewHtml),
         anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
       }),
     });
@@ -304,6 +265,9 @@ describe('the erasure routes', () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain(jobId);
+    // The plan-time refusal, not the hash handshake: a refusal is the more
+    // useful thing to say, so it is checked first and its wording proves it.
+    expect(html).toContain('ותלויה בפריטים האלה');
     expect(html).not.toContain('מחק לצמיתות');
     expect(await memoryCount()).toBe(1);
   });
@@ -336,6 +300,11 @@ describe('the erasure routes', () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).not.toContain('בטל שמירה');
+    // Back in the plan, not merely absent from the kept block — without this
+    // the assertion above also holds for a handler that fell through to the
+    // empty entry form.
+    expect(html).toContain(jobId);
+    expect(html).toContain('שמור את זה');
     const rows = await getPool().query('SELECT 1 FROM kept_items WHERE business_id = $1', [BUSINESS]);
     expect(rows.rows).toHaveLength(0);
   });
@@ -459,5 +428,347 @@ describe('the erasure routes', () => {
     const res = await fetch(`${baseUrl}/erase`, { redirect: 'manual' });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
+  });
+});
+
+describe('the done screen', () => {
+  const outcome = (over: Partial<ErasureOutcome> = {}): ErasureOutcome => ({
+    deleted: [{ table: 'memories', action: 'delete', count: 2 }],
+    filesRemoved: 0,
+    filesAlreadyGone: [],
+    filesFailed: [],
+    ...over,
+  });
+
+  /**
+   * §7's own obligation on this screen. `filesRemoved` alone cannot tell the
+   * owner apart a run with no files to delete from a run that failed to
+   * delete every file it named — which is exactly the shape the relative-path
+   * defect took.
+   */
+  it('says how many files the plan named, not only how many it deleted', () => {
+    const html = renderErasureDone({
+      anchorLabel: RONIT,
+      plannedFiles: 3,
+      outcome: outcome({ filesRemoved: 1, filesAlreadyGone: ['/root/a', '/root/b'] }),
+      auditUnrecorded: false,
+    });
+
+    expect(html).toContain('3');
+    expect(html).toContain('כבר לא היו');
+    expect(html).toContain('/root/a');
+  });
+
+  it('calls out a run that named files and deleted none of them', () => {
+    const html = renderErasureDone({
+      anchorLabel: RONIT,
+      plannedFiles: 2,
+      outcome: outcome({ filesRemoved: 0, filesAlreadyGone: ['/root/a', '/root/b'] }),
+      auditUnrecorded: false,
+    });
+
+    expect(html).toContain('אף קובץ לא נמחק בפועל');
+  });
+
+  it('lists every path that failed, so it can be cleaned by hand', () => {
+    const html = renderErasureDone({
+      anchorLabel: RONIT,
+      plannedFiles: 1,
+      outcome: outcome({ filesFailed: ['/root/left-behind.txt'] }),
+      auditUnrecorded: false,
+    });
+
+    expect(html).toContain('/root/left-behind.txt');
+    expect(html).toContain('נשארו על הדיסק');
+  });
+
+  /**
+   * The defining rule of this screen: an erasure that already happened is
+   * never reported as one that did not.
+   */
+  it('reports a missing audit row as a completed erasure, never as a failure', () => {
+    const html = renderErasureDone({
+      anchorLabel: RONIT,
+      plannedFiles: 0,
+      outcome: outcome(),
+      auditUnrecorded: true,
+    });
+
+    expect(html).toContain('המחיקה בוצעה במלואה');
+    expect(html).not.toContain('המחיקה נכשלה');
+    expect(html).not.toContain('לא נמחק דבר');
+  });
+});
+
+describe('what the owner authorised', () => {
+  /**
+   * Spec §4.4 makes the PLAN the unit of authorisation: the executor removes
+   * exactly what the plan lists, and that is what makes the preview the truth
+   * rather than a decoration. Rebuilding from a round-tripped anchor is right
+   * — a plan the browser carried is a plan the browser could have edited —
+   * but rebuilding *and then acting* means the destroyed set can be wider than
+   * the counts the owner read.
+   *
+   * The handshake is the one this codebase already owns for approvals: the
+   * preview renders a hash of the plan, the confirm rebuilds and hashes again,
+   * and a difference re-shows rather than destroys. The anchor still travels;
+   * it is simply no longer what is trusted.
+   */
+  it('refuses to destroy a plan that grew between the preview and the confirm', async () => {
+    const baseUrl = await startServer();
+    const { jobId } = await seedRonit();
+    const cookie = await signIn(baseUrl);
+    const previewHtml = await (
+      await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
+    ).text();
+    const csrf = extractCsrf(previewHtml);
+    const planHash = extractPlanHash(previewHtml);
+
+    // The world moves. A second memory comes into scope after the owner read
+    // the counts and before they clicked.
+    await writeMemory(
+      { jobId, kind: 'chunk', subjectKey: 'הערה', body: { note: RONIT } },
+      { businessId: BUSINESS },
+    );
+    expect(await memoryCount()).toBe(2);
+
+    const res = await fetch(`${baseUrl}/erase/confirm`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf,
+        planHash,
+        anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('השתנה מאז');
+    // Nothing destroyed, and the owner is looking at the new preview.
+    expect(await memoryCount()).toBe(2);
+    expect(html).toContain('מחק לצמיתות');
+    expect(extractPlanHash(html)).not.toBe(planHash);
+  });
+
+  it('destroys when the rebuilt plan is the one the owner read', async () => {
+    const baseUrl = await startServer();
+    await seedRonit();
+    const cookie = await signIn(baseUrl);
+    const previewHtml = await (
+      await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
+    ).text();
+
+    const res = await fetch(`${baseUrl}/erase/confirm`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf: extractCsrf(previewHtml),
+        planHash: extractPlanHash(previewHtml),
+        anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('נמחק');
+    expect(await memoryCount()).toBe(0);
+  });
+
+  /** Fail closed: no hash is not "no objection", it is "nothing was authorised". */
+  it('refuses a confirm that carries no plan hash at all', async () => {
+    const baseUrl = await startServer();
+    await seedRonit();
+    const cookie = await signIn(baseUrl);
+    const csrf = extractCsrf(
+      await (await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })).text(),
+    );
+
+    const res = await fetch(`${baseUrl}/erase/confirm`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf,
+        anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('השתנה מאז');
+    expect(await memoryCount()).toBe(1);
+  });
+});
+
+describe('the two ways a confirm ends other than cleanly', () => {
+  /**
+   * The window neither the plan-time refusal nor the hash handshake can
+   * close: a job woken into a live phase *after* the confirm rebuilt and
+   * hashed, and before the executor's locked re-read. Forced deterministically
+   * — the test holds `FOR UPDATE` on the job row and flips its phase inside an
+   * uncommitted transaction, so the confirm's rebuild reads the old snapshot
+   * and the executor blocks on the lock until the test commits.
+   *
+   * Asserted on the executor's own wording (`מאז שהתצוגה המקדימה הוכנה`),
+   * which `buildErasurePlan`'s refusal does not use: if the timing slipped and
+   * the plan-time branch handled it instead, this fails rather than passing
+   * from the wrong branch.
+   */
+  it('renders the executor’s own refusal when a job goes live mid-transaction', async () => {
+    const baseUrl = await startServer();
+    const { jobId } = await seedRonit();
+    const cookie = await signIn(baseUrl);
+    const previewHtml = await (
+      await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
+    ).text();
+
+    const blocker = await getPool().connect();
+    let pending: Promise<Response>;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query('SELECT job_id FROM jobs WHERE job_id = $1 FOR UPDATE', [jobId]);
+      await blocker.query(`UPDATE jobs SET phase = 'await_approval' WHERE job_id = $1`, [jobId]);
+
+      pending = fetch(`${baseUrl}/erase/confirm`, {
+        method: 'POST',
+        headers: { cookie },
+        body: new URLSearchParams({
+          csrf: extractCsrf(previewHtml),
+          planHash: extractPlanHash(previewHtml),
+          anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
+        }),
+      });
+
+      // Long enough for the request to rebuild, hash, and reach the executor's
+      // `FOR UPDATE`, where it parks on the lock this transaction holds.
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      await blocker.query('COMMIT');
+    } finally {
+      blocker.release();
+    }
+
+    const res = await pending;
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('מאז שהתצוגה המקדימה הוכנה');
+    expect(html).not.toContain('מחק לצמיתות');
+    expect(await memoryCount()).toBe(1);
+  });
+
+  /**
+   * The erasure committed; the record of it did not. The owner must never be
+   * told their data survived when it has not — so this asserts the rows are
+   * really gone *and* that the page says the erasure completed.
+   *
+   * Forced by a trigger that makes the `audit_log` insert raise. Dropped in
+   * `finally`; `fileParallelism: false` means no other file is running.
+   */
+  it('reports an erasure whose audit row failed as done, and it really is done', async () => {
+    const baseUrl = await startServer();
+    await seedRonit();
+    const cookie = await signIn(baseUrl);
+    const previewHtml = await (
+      await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
+    ).text();
+
+    let res: Response;
+    try {
+      await getPool().query(
+        `CREATE OR REPLACE FUNCTION erasure_audit_boom() RETURNS trigger AS $fn$
+           BEGIN RAISE EXCEPTION 'audit unavailable'; END;
+         $fn$ LANGUAGE plpgsql`,
+      );
+      await getPool().query(
+        `CREATE TRIGGER erasure_audit_boom BEFORE INSERT ON audit_log
+           FOR EACH ROW EXECUTE FUNCTION erasure_audit_boom()`,
+      );
+
+      res = await fetch(`${baseUrl}/erase/confirm`, {
+        method: 'POST',
+        headers: { cookie },
+        body: new URLSearchParams({
+          csrf: extractCsrf(previewHtml),
+          planHash: extractPlanHash(previewHtml),
+          anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
+        }),
+      });
+    } finally {
+      await getPool().query('DROP TRIGGER IF EXISTS erasure_audit_boom ON audit_log');
+      await getPool().query('DROP FUNCTION IF EXISTS erasure_audit_boom()');
+    }
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('המחיקה בוצעה במלואה');
+    expect(html).not.toContain('המחיקה נכשלה');
+    // It really happened.
+    expect(await memoryCount()).toBe(0);
+  });
+});
+
+describe('the smaller things the screen owes the owner', () => {
+  /**
+   * The prefill reaches a visible input from the query string — a link, not
+   * necessarily something the owner typed. A right-to-left override there
+   * re-orders the address they are about to authorise a destruction against.
+   */
+  it('strips bidirectional overrides from the values it puts back in the form', () => {
+    const html = renderErasure({
+      csrf: 'token',
+      anchorLabel: '',
+      plan: null,
+      prefill: { identifier: 'dana‮exe.gpj@example.com' },
+    });
+
+    expect(html).not.toContain('‮');
+    expect(html).toContain('exe.gpj@example.com');
+  });
+
+  it('gives the irreversible button a style of its own', () => {
+    const html = renderErasure({
+      csrf: 'token',
+      anchorLabel: RONIT,
+      plan: {
+        anchor: { kind: 'contact', identifier: RONIT },
+        jobIds: [],
+        documentIds: [],
+        memoryIds: [],
+        filePaths: [],
+        items: [],
+        excluded: [],
+        refusals: [],
+      },
+    });
+
+    expect(html).toContain('class="danger"');
+    expect(html).toMatch(/\.danger\s*\{/);
+  });
+
+  /** Spec §6's free-text note, reachable from the screen and not only from the DB. */
+  it('carries the owner’s note into the keep, and shows it back', async () => {
+    const baseUrl = await startServer();
+    const { jobId } = await seedRonit();
+    const cookie = await signIn(baseUrl);
+    const previewHtml = await (
+      await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
+    ).text();
+    expect(previewHtml).toContain('name="note"');
+
+    const res = await fetch(`${baseUrl}/erase/keep`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf: extractCsrf(previewHtml),
+        kind: 'job',
+        itemId: jobId,
+        note: 'צריך את זה לביקורת המס',
+        anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
+      }),
+    });
+
+    expect(await res.text()).toContain('צריך את זה לביקורת המס');
+    const rows = await getPool().query<{ note: string | null }>(
+      'SELECT note FROM kept_items WHERE business_id = $1 AND item_id = $2',
+      [BUSINESS, jobId],
+    );
+    expect(rows.rows[0]?.note).toBe('צריך את זה לביקורת המס');
   });
 });

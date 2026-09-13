@@ -11,6 +11,7 @@
  * over to the job or document that carries it, so dependent rows — readings,
  * proposals, extracted parts, step records — come along.
  */
+import { join } from 'node:path';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import { keptIds, type KeptItemKind } from './kept-items.js';
@@ -85,10 +86,11 @@ async function idsFrom(
 
 export async function buildErasurePlan(
   anchor: ErasureAnchor,
-  options: { businessId?: string; db?: Queryable } = {},
+  options: { businessId?: string; db?: Queryable; documentRoot?: string } = {},
 ): Promise<ErasurePlan> {
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
+  const documentRoot = options.documentRoot ?? config.documentRoot;
 
   const jobIds = new Set<string>();
   const documentIds = new Set<string>();
@@ -271,7 +273,20 @@ export async function buildErasurePlan(
       'SELECT document_id, stored_path FROM documents WHERE business_id = $1 AND document_id = ANY ($2)',
       [businessId, documentList],
     );
-    for (const row of rows) filePaths.push(row.stored_path);
+    // Absolute, always. `documents.stored_path` is relative by design —
+    // `ingest.ts` writes `<businessId>/<documentId>/original.<ext>` and joins
+    // `config.documentRoot` separately — and the executor `unlink`s exactly
+    // what this list holds while resolving nothing of its own (spec §8). A
+    // relative path arriving there resolves against whatever the process's
+    // working directory happens to be, misses, and is tolerated as "already
+    // gone": every row destroyed, every byte kept, and the screen reporting
+    // a clean run. The join belongs to whoever owns the plan, and
+    // `verify.ts` is the house convention for this exact column.
+    //
+    // It also matters for what the owner reads: the done screen lists the
+    // paths that failed so they can be cleaned by hand, and a relative path
+    // is not something anyone can act on.
+    for (const row of rows) filePaths.push(join(documentRoot, row.stored_path));
 
     const signed = await db.query<{ document_id: string; signed_by: string }>(
       'SELECT document_id, signed_by FROM signatures WHERE business_id = $1 AND document_id = ANY ($2)',

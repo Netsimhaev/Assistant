@@ -44,7 +44,19 @@ export interface ErasureOutcome {
    * counts — never copied from the plan's preview, which can only say what
    * was true when the preview was built. */
   deleted: ErasureItem[];
+  /** Files this run actually unlinked — never a file that was already absent. */
   filesRemoved: number;
+  /**
+   * Files the plan named that were not on disk when the unlink ran.
+   *
+   * Tolerated, not failed: the goal was that they not be there, and they are
+   * not. Counted separately because being *indistinguishable* from a file we
+   * deleted is what let a run that resolved every path wrongly — and therefore
+   * deleted nothing at all — report itself as clean. A run where every file is
+   * "already gone" is an anomaly, and the screen can only say so if this
+   * number exists.
+   */
+  filesAlreadyGone: string[];
   /** Paths the database no longer references and the disk still holds. */
   filesFailed: string[];
 }
@@ -194,6 +206,7 @@ export async function executeErasure(
 
   // Only now the disk.
   let filesRemoved = 0;
+  const filesAlreadyGone: string[] = [];
   const filesFailed: string[] = [];
   for (const path of plan.filePaths) {
     try {
@@ -201,13 +214,17 @@ export async function executeErasure(
       filesRemoved += 1;
     } catch (err) {
       // A file that was already gone is not a failure: the goal was that it
-      // not be there, and it is not.
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      // not be there, and it is not. It is not a deletion either, and it is
+      // recorded as its own third outcome rather than folded into silence.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        filesAlreadyGone.push(path);
+        continue;
+      }
       filesFailed.push(path);
     }
   }
 
-  const outcome: ErasureOutcome = { deleted: results, filesRemoved, filesFailed };
+  const outcome: ErasureOutcome = { deleted: results, filesRemoved, filesAlreadyGone, filesFailed };
 
   // Real counts, not the preview's: the whole point of this row is to
   // survive as the one record of what happened, and what happened is what
@@ -232,6 +249,9 @@ export async function executeErasure(
           `מחיקה בהוראת הבעלים · עוגן מסוג ${plan.anchor.kind} · ` +
           `${total} פריטים · ${plan.filePaths.length} קבצים · ` +
           `${plan.excluded.length} נשמרו לפי הוראה קודמת` +
+          (filesAlreadyGone.length > 0
+            ? ` · ${filesAlreadyGone.length} קבצים כבר לא היו על הדיסק`
+            : '') +
           (filesFailed.length > 0 ? ` · ${filesFailed.length} קבצים לא נמחקו מהדיסק` : ''),
       },
       { businessId },

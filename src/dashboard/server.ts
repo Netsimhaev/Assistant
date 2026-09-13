@@ -855,6 +855,43 @@ function anchorFromJson(raw: string | null): ErasureAnchor | null {
   return parsed.success ? parsed.data : null;
 }
 
+/**
+ * A fingerprint of the plan the owner is looking at.
+ *
+ * Spec §4.4 makes the plan — not the anchor — the unit of authorisation. The
+ * anchor may keep round-tripping through the browser (it is re-parsed and
+ * re-resolved, so it can only ask for a different preview), but a confirm
+ * must act on the plan whose counts the owner actually read: rebuilding and
+ * then deleting means the destroyed set can be wider than the previewed one.
+ *
+ * The idiom is the one approvals already use — `input_hash` finds the row,
+ * `input_hash_at_decision` proves it is the same thing that was decided, both
+ * over `canonicalJson`. No table is added: the hash is the handle.
+ *
+ * **Normalised before hashing, deliberately.** The plan's id arrays come out
+ * of `SELECT`s with no `ORDER BY` and out of `Set` iteration, so two builds
+ * of an unchanged world may order them differently. Hashing the raw object
+ * would make an identical world refuse at random — a control that fires when
+ * nothing happened teaches the owner to click past it. Sorting first means a
+ * difference in the hash is a difference in *what the plan covers*.
+ */
+function planFingerprint(plan: ErasurePlan): string {
+  return canonicalHash({
+    anchor: plan.anchor,
+    jobIds: [...plan.jobIds].sort(),
+    documentIds: [...plan.documentIds].sort(),
+    memoryIds: [...plan.memoryIds].sort(),
+    filePaths: [...plan.filePaths].sort(),
+    items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
+    excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
+    refusals: plan.refusals.map((r) => `${r.kind}:${r.detail}`).sort(),
+  });
+}
+
+const PLAN_MOVED =
+  'מה שנמצא למחיקה השתנה מאז שהצגתי לך את הרשימה, ולכן לא מחקתי כלום. ' +
+  'זו הרשימה המעודכנת — עבור/י עליה ואשר/י שוב.';
+
 function anchorLabelFor(anchor: ErasureAnchor): string {
   switch (anchor.kind) {
     case 'contact':
@@ -907,9 +944,10 @@ async function sendErasurePreview(
   businessId: string,
   session: Session,
   anchor: ErasureAnchor,
-  overrides: { plan?: ErasurePlan } = {},
+  documentRoot: string | undefined,
+  overrides: { plan?: ErasurePlan; error?: string } = {},
 ): Promise<void> {
-  const plan = overrides.plan ?? (await buildErasurePlan(anchor, { businessId }));
+  const plan = overrides.plan ?? (await resolvePlan(anchor, businessId, documentRoot));
   sendHtml(
     res,
     200,
@@ -917,9 +955,28 @@ async function sendErasurePreview(
       csrf: issueCsrfToken(session.sessionId),
       anchorLabel: anchorLabelFor(anchor),
       plan,
+      planHash: planFingerprint(plan),
       prefill: prefillFor(anchor),
+      ...(overrides.error === undefined ? {} : { error: overrides.error }),
     }),
   );
+}
+
+/**
+ * One place the plan is built, so the preview and the confirm cannot drift on
+ * which document root they resolved file paths against — the paths are what
+ * the executor `unlink`s, and a fingerprint over a different root is a
+ * fingerprint of a different plan.
+ */
+async function resolvePlan(
+  anchor: ErasureAnchor,
+  businessId: string,
+  documentRoot: string | undefined,
+): Promise<ErasurePlan> {
+  return buildErasurePlan(anchor, {
+    businessId,
+    ...(documentRoot === undefined ? {} : { documentRoot }),
+  });
 }
 
 /**
@@ -933,11 +990,12 @@ async function handleEraseGet(
   res: ServerResponse,
   businessId: string,
   session: Session,
+  documentRoot: string | undefined,
 ): Promise<void> {
   const params = new URL(req.url ?? '/erase', 'http://dashboard.local').searchParams;
   const identifier = (params.get('identifier') ?? '').trim();
   if (identifier !== '') {
-    return sendErasurePreview(res, businessId, session, { kind: 'contact', identifier });
+    return sendErasurePreview(res, businessId, session, { kind: 'contact', identifier }, documentRoot);
   }
 
   const onDate = params.get('onDate') ?? '';
@@ -961,6 +1019,7 @@ async function handleErasePreview(
   res: ServerResponse,
   businessId: string,
   session: Session,
+  documentRoot: string | undefined,
 ): Promise<void> {
   const form = await readFormBody(req);
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
@@ -969,7 +1028,7 @@ async function handleErasePreview(
 
   const anchor = anchorFromForm(form);
   if (anchor === null) return sendErasureEntry(res, session, 400, ANCHOR_UNREADABLE);
-  await sendErasurePreview(res, businessId, session, anchor);
+  await sendErasurePreview(res, businessId, session, anchor, documentRoot);
 }
 
 /**
@@ -987,6 +1046,7 @@ async function handleEraseConfirm(
   res: ServerResponse,
   businessId: string,
   session: Session,
+  documentRoot: string | undefined,
 ): Promise<void> {
   const form = await readFormBody(req);
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
@@ -996,9 +1056,22 @@ async function handleEraseConfirm(
   const anchor = anchorFromJson(form.get('anchor'));
   if (anchor === null) return sendErasureEntry(res, session, 400, ANCHOR_UNREADABLE);
 
-  const plan = await buildErasurePlan(anchor, { businessId });
+  const plan = await resolvePlan(anchor, businessId, documentRoot);
+  // A refusal first: it is the more useful thing to say, and it is true
+  // whether or not the plan also moved.
   if (plan.refusals.length > 0) {
-    return sendErasurePreview(res, businessId, session, anchor, { plan });
+    return sendErasurePreview(res, businessId, session, anchor, documentRoot, { plan });
+  }
+
+  // Then the handshake. The owner authorised a set of counts, not an anchor;
+  // if the rebuilt plan is not the one they read, re-show it instead of
+  // destroying a wider set than the preview named (spec §4.4). A missing
+  // hash lands here too — nothing was authorised.
+  if (form.get('planHash') !== planFingerprint(plan)) {
+    return sendErasurePreview(res, businessId, session, anchor, documentRoot, {
+      plan,
+      error: PLAN_MOVED,
+    });
   }
 
   let outcome: ErasureOutcome;
@@ -1016,8 +1089,8 @@ async function handleEraseConfirm(
       // The window the plan-time check cannot close: a job went live between
       // the rebuild above and the executor's locked re-read. Nothing was
       // deleted — show why, with the confirm control gone.
-      const refreshed = await buildErasurePlan(anchor, { businessId });
-      return sendErasurePreview(res, businessId, session, anchor, {
+      const refreshed = await resolvePlan(anchor, businessId, documentRoot);
+      return sendErasurePreview(res, businessId, session, anchor, documentRoot, {
         plan: {
           ...refreshed,
           refusals: [{ kind: 'live_job', detail: error.message }, ...refreshed.refusals],
@@ -1031,7 +1104,14 @@ async function handleEraseConfirm(
   sendHtml(
     res,
     200,
-    renderErasureDone({ anchorLabel: anchorLabelFor(anchor), outcome, auditUnrecorded }),
+    renderErasureDone({
+      anchorLabel: anchorLabelFor(anchor),
+      // The plan's own count, not the outcome's: it is the denominator the
+      // screen needs to notice that it deleted none of what it named.
+      plannedFiles: plan.filePaths.length,
+      outcome,
+      auditUnrecorded,
+    }),
   );
 }
 
@@ -1048,6 +1128,7 @@ async function handleEraseKeep(
   res: ServerResponse,
   businessId: string,
   session: Session,
+  documentRoot: string | undefined,
 ): Promise<void> {
   const form = await readFormBody(req);
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
@@ -1067,7 +1148,7 @@ async function handleEraseKeep(
 
   const anchor = anchorFromJson(form.get('anchor'));
   if (anchor === null) return sendErasureEntry(res, session, 200);
-  await sendErasurePreview(res, businessId, session, anchor);
+  await sendErasurePreview(res, businessId, session, anchor, documentRoot);
 }
 
 
@@ -1578,10 +1659,10 @@ async function route(
   if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
   if (method === 'POST' && pathname === '/instruct') return handleInstructPost(req, res, businessId, session);
 
-  if (method === 'GET' && pathname === '/erase') return handleEraseGet(req, res, businessId, session);
-  if (method === 'POST' && pathname === '/erase/preview') return handleErasePreview(req, res, businessId, session);
-  if (method === 'POST' && pathname === '/erase/confirm') return handleEraseConfirm(req, res, businessId, session);
-  if (method === 'POST' && pathname === '/erase/keep') return handleEraseKeep(req, res, businessId, session);
+  if (method === 'GET' && pathname === '/erase') return handleEraseGet(req, res, businessId, session, documentRoot);
+  if (method === 'POST' && pathname === '/erase/preview') return handleErasePreview(req, res, businessId, session, documentRoot);
+  if (method === 'POST' && pathname === '/erase/confirm') return handleEraseConfirm(req, res, businessId, session, documentRoot);
+  if (method === 'POST' && pathname === '/erase/keep') return handleEraseKeep(req, res, businessId, session, documentRoot);
 
   const instructAnswerMatch = INSTRUCT_ANSWER_PATH.exec(pathname);
   if (method === 'POST' && instructAnswerMatch) {

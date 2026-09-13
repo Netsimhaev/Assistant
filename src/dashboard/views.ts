@@ -50,7 +50,10 @@ const esc = escapeHtml;
  *
  * `esc` itself is deliberately left alone: many call sites depend on it, and
  * a display field is the only place where dropping characters is the right
- * trade.
+ * trade. The erasure screen's prefilled inputs count as display fields for
+ * the same reason: they are filled from the query string — a link, not
+ * necessarily something the owner typed — and they show the identifier the
+ * owner is about to authorise a destruction against.
  *
  * The set: U+061C ALM, U+200E/U+200F LRM/RLM, U+202A-U+202E (the embedding
  * and override family), U+2066-U+2069 (the isolate family).
@@ -78,6 +81,9 @@ const STYLE = `
   .band-routine { color: #2e7d32; }
   .band-sensitive { color: #ef6c00; }
   .band-anomalous, .band-blocked { color: #c0392b; }
+  /* The one control on any screen here that cannot be undone. It sits beside
+     three buttons that only ask for a preview, and it must not look like them. */
+  button.danger { background: #c0392b; color: #fff; border: 1px solid #8e2a20; font-weight: bold; }
 `;
 
 function page(title: string, body: string): string {
@@ -590,6 +596,21 @@ export interface ErasureViewModel {
   anchorLabel: string;
   /** `null` before an anchor has been chosen: the entry form, and nothing else. */
   plan: ErasurePlan | null;
+  /**
+   * A fingerprint of the plan shown below, carried into the confirm form.
+   *
+   * Spec §4.4 makes the plan — not the anchor — the unit of authorisation:
+   * the executor removes exactly what the plan lists, and that is what makes
+   * the preview the truth rather than a decoration. The confirm route
+   * rebuilds the plan server-side and compares fingerprints, so a world that
+   * moved between the preview and the click is re-shown rather than
+   * destroyed. Computed by the caller, because deciding what counts as "the
+   * same plan" is logic, not presentation.
+   *
+   * Absent means no confirm is authorised: the form still renders with an
+   * empty hash and the route refuses it, which is the fail-closed direction.
+   */
+  planHash?: string;
   error?: string;
   prefill?: ErasurePrefill;
 }
@@ -619,6 +640,7 @@ function keepControl(
              ${anchorField(anchor)}
              <input type="hidden" name="kind" value="${esc(kind)}">
              <input type="hidden" name="itemId" value="${esc(itemId)}">
+             <input type="text" name="note" size="20" placeholder="למה לשמור? (לא חובה)">
              <button type="submit">שמור את זה</button>
            </form></li>`;
 }
@@ -658,23 +680,23 @@ function erasureEntry(model: ErasureViewModel): string {
       ${token}
       <input type="hidden" name="kind" value="contact">
       <label>כתובת מייל או מספר טלפון
-        <input type="text" name="identifier" value="${esc(prefill.identifier ?? '')}" required></label>
+        <input type="text" name="identifier" value="${escLabel(prefill.identifier ?? '')}" required></label>
       <button type="submit">הצג מה יימחק</button>
     </form>
     <form method="post" action="/erase/preview">
       ${token}
       <input type="hidden" name="kind" value="window">
       <label>משימות שרצו מ־
-        <input type="text" name="fromIso" value="${esc(prefill.fromIso ?? '')}" placeholder="2026-09-03T00:00" required></label>
+        <input type="text" name="fromIso" value="${escLabel(prefill.fromIso ?? '')}" placeholder="2026-09-03T00:00" required></label>
       <label>ועד
-        <input type="text" name="toIso" value="${esc(prefill.toIso ?? '')}" placeholder="2026-09-03T23:59" required></label>
+        <input type="text" name="toIso" value="${escLabel(prefill.toIso ?? '')}" placeholder="2026-09-03T23:59" required></label>
       <button type="submit">הצג מה יימחק</button>
     </form>
     <form method="post" action="/erase/preview">
       ${token}
       <input type="hidden" name="kind" value="document">
       <label>מזהה מסמך
-        <input type="text" name="documentId" value="${esc(prefill.documentId ?? '')}" required></label>
+        <input type="text" name="documentId" value="${escLabel(prefill.documentId ?? '')}" required></label>
       <button type="submit">הצג מה יימחק</button>
     </form>
   </div>`;
@@ -729,6 +751,7 @@ export function renderErasure(model: ErasureViewModel): string {
       : `<form method="post" action="/erase/confirm">
            <input type="hidden" name="csrf" value="${esc(model.csrf)}">
            ${anchorField(plan.anchor)}
+           <input type="hidden" name="planHash" value="${esc(model.planHash ?? '')}">
            <button type="submit" class="danger">מחק לצמיתות</button>
          </form>`;
 
@@ -759,6 +782,16 @@ export function renderErasure(model: ErasureViewModel): string {
 
 export interface ErasureDoneViewModel {
   anchorLabel: string;
+  /**
+   * How many files the plan named — the denominator.
+   *
+   * Without it the page can show `filesRemoved` and nothing else, and "there
+   * were no files to delete" reads exactly like "we failed to delete every
+   * file we named". That second state is the one spec §7 says must be loud,
+   * and it is the shape the relative-path defect took: rows destroyed, bytes
+   * retained, screen clean.
+   */
+  plannedFiles: number;
   outcome: ErasureOutcome;
   /**
    * The erasure committed and the audit row recording it did not. True here
@@ -786,6 +819,28 @@ export function renderErasureDone(model: ErasureDoneViewModel): string {
     )
     .join('');
 
+  const gone = model.outcome.filesAlreadyGone;
+
+  // The accounting, always, even when it is all zeros: a number the owner can
+  // check against the preview they just read.
+  const files =
+    `<p>מתוך ${model.plannedFiles} קבצים שהתוכנית מנתה: ` +
+    `${model.outcome.filesRemoved} נמחקו מהדיסק, ` +
+    `${gone.length} כבר לא היו שם, ` +
+    `${model.outcome.filesFailed.length} נכשלו.</p>` +
+    (gone.length === 0
+      ? ''
+      : `<ul class="muted">${gone.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`);
+
+  // Every file the plan named was already missing. Tolerated one at a time;
+  // as a whole run it means the paths were resolved against something other
+  // than where the bytes live, and nothing was actually destroyed on disk.
+  const nothingDeleted =
+    model.plannedFiles > 0 && model.outcome.filesRemoved === 0 && model.outcome.filesFailed.length === 0
+      ? `<p class="error">אף קובץ לא נמחק בפועל — כולם כבר לא היו במקום שהתוכנית ציינה.
+         זה חריג: שורות בסיס הנתונים נמחקו, וכדאי לוודא שהקבצים באמת אינם.</p>`
+      : '';
+
   const failed =
     model.outcome.filesFailed.length === 0
       ? ''
@@ -803,7 +858,8 @@ export function renderErasureDone(model: ErasureDoneViewModel): string {
     `<h1>נמחק — ${escLabel(model.anchorLabel)}</h1>
      ${audit}
      <table><tr><th>מה</th><th>כמה</th><th>מה קרה</th></tr>${rows}</table>
-     <p>${model.outcome.filesRemoved} קבצים נמחקו מהדיסק.</p>
+     ${files}
+     ${nothingDeleted}
      ${failed}
      <p class="muted">מה שכבר יצא החוצה — מייל שנשלח, הודעה שהתקבלה — נמחק מכאן ועדיין קיים
      אצל הספק ואצל הנמען. המערכת אינה יכולה למחוק אותו שם.</p>
