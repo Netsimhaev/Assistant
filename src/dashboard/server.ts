@@ -32,6 +32,17 @@ import {
   pendingQuestions,
   recordAnswer,
 } from '../governance/instructions.js';
+import { readForgetCommand } from '../governance/forget-command.js';
+import { buildErasurePlan } from '../governance/erasure-plan.js';
+import type { ErasureAnchor, ErasurePlan } from '../governance/erasure-plan.js';
+import {
+  ErasureAuditUnrecordedError,
+  ErasureRefusedError,
+  executeErasure,
+} from '../governance/erasure.js';
+import type { ErasureOutcome } from '../governance/erasure.js';
+import { keepItem, revokeKeep } from '../governance/kept-items.js';
+import type { KeptItemKind } from '../governance/kept-items.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -51,6 +62,8 @@ import { redeemRecoveryCode, remainingCodes } from './recovery.js';
 import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
 import {
   renderApprovalCard,
+  renderErasure,
+  renderErasureDone,
   renderForbidden,
   renderInstruct,
   renderLogin,
@@ -60,6 +73,7 @@ import {
   renderReadings,
   renderServerError,
 } from './views.js';
+import type { ErasurePrefill } from './views.js';
 
 const SESSION_COOKIE = 'sid';
 const SESSION_MAX_AGE_SECONDS = SESSION_HOURS * 3600;
@@ -216,6 +230,20 @@ function sendHtml(res: ServerResponse, status: number, body: string, headers: Re
 
 function redirect(res: ServerResponse, location: string, headers: Record<string, string> = {}): void {
   res.writeHead(302, { Location: location, ...SECURITY_HEADERS, ...headers });
+  res.end();
+}
+
+/**
+ * The answer to a POST that is finished with the posted data and wants the
+ * browser to GET somewhere else.
+ *
+ * 303 and not the 302 above: a 302 leaves the method up to the client, and
+ * the one place this is used sends a *forget command* to a screen whose job
+ * is to destroy things. A re-POST on reload, or a client that re-sends the
+ * body to the new location, is not a risk worth carrying for one saved line.
+ */
+function redirectSeeOther(res: ServerResponse, location: string): void {
+  res.writeHead(303, { Location: location, ...SECURITY_HEADERS });
   res.end();
 }
 
@@ -468,7 +496,24 @@ async function handleInstructPost(
     return sendHtml(res, 403, renderForbidden());
   }
 
-  const outcome = await runInstruction({ text: form.get('text') ?? '' }, { businessId });
+  const text = form.get('text') ?? '';
+
+  // A forget command never reaches the planner. Erasure is not a tool and
+  // must not become one by the back door of a plan step (spec §3), so the
+  // branch is here — before `runInstruction`, which opens a job, grants a
+  // standing authorisation and calls the model. Recognition is the
+  // deterministic verb list in `forget-command.js`; it decides which screen
+  // the text goes to and nothing about what will be deleted.
+  const forget = readForgetCommand(text);
+  if (forget.recognised) {
+    const query = new URLSearchParams();
+    if (forget.identifier !== null) query.set('identifier', forget.identifier);
+    if (forget.onDate !== null) query.set('onDate', forget.onDate);
+    const suffix = query.toString() === '' ? '' : `?${query.toString()}`;
+    return redirectSeeOther(res, `/erase${suffix}`);
+  }
+
+  const outcome = await runInstruction({ text }, { businessId });
   renderInstructionOutcome(res, session, outcome);
 }
 
@@ -724,6 +769,307 @@ async function answerUnderClaim(
 
   renderInstructionOutcome(res, session, outcome);
 }
+
+// --- The erasure screen (spec §4, §6, §7). --------------------------------
+//
+// Four routes, and one rule that outranks the rest: **the anchor travels,
+// the plan never does.** `POST /erase/confirm` receives the same anchor the
+// preview was drawn from and calls `buildErasurePlan` again, because a plan
+// that went through a browser is a plan the browser could have edited, and
+// `executeErasure` deletes exactly what its plan lists. Reconstructing an
+// `ErasurePlan` from form fields here would hand the row list to whoever
+// submitted the form.
+//
+// Erasure is reachable from nowhere else. It is not a tool, no agent
+// allowlist names it, and no plan step can call it (spec §3) — the owner,
+// on this screen, is the only path.
+
+/**
+ * A moment the owner typed, normalised to an ISO instant.
+ *
+ * Validated before it reaches SQL: `buildErasurePlan` puts the window
+ * straight into a comparison against `jobs.created_at`, and an unparseable
+ * string there is a database error surfacing as a 500 rather than a sentence
+ * the owner can act on.
+ */
+const ErasureMoment = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((value) => !Number.isNaN(Date.parse(value)))
+  .transform((value) => new Date(value).toISOString());
+
+/**
+ * The three anchor shapes, parsed the same way whether they arrive from the
+ * entry form or from the hidden field the preview page round-trips. Anything
+ * else is refused with a readable sentence — never defaulted, and never
+ * widened into "everything".
+ */
+const ErasureAnchorInput = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('contact'), identifier: z.string().trim().min(1) }),
+  z.object({ kind: z.literal('window'), fromIso: ErasureMoment, toIso: ErasureMoment }),
+  z.object({ kind: z.literal('document'), documentId: z.string().trim().min(1) }),
+]);
+
+const ANCHOR_UNREADABLE = 'לא הצלחתי לקרוא מה בדיוק למחוק. בחר/י שוב מהטופס.';
+const KEEP_UNREADABLE = 'לא הצלחתי לקרוא איזה פריט לשמור.';
+
+/** The kinds `kept_items` accepts, as a positive list this file can test against. */
+const KEPT_KINDS: readonly KeptItemKind[] = ['document', 'memory', 'job'];
+
+function keptKindFrom(raw: string | null): KeptItemKind | null {
+  return KEPT_KINDS.find((kind) => kind === raw) ?? null;
+}
+
+function anchorFromForm(form: URLSearchParams): ErasureAnchor | null {
+  const kind = form.get('kind');
+  const candidate =
+    kind === 'contact'
+      ? { kind, identifier: form.get('identifier') ?? '' }
+      : kind === 'window'
+        ? { kind, fromIso: form.get('fromIso') ?? '', toIso: form.get('toIso') ?? '' }
+        : kind === 'document'
+          ? { kind, documentId: form.get('documentId') ?? '' }
+          : null;
+  if (candidate === null) return null;
+  const parsed = ErasureAnchorInput.safeParse(candidate);
+  return parsed.success ? parsed.data : null;
+}
+
+/**
+ * The anchor carried in a hidden field, parsed through the identical schema.
+ *
+ * A hand-edited field can therefore only ask for a *different preview* — the
+ * screen answers it by resolving that anchor from scratch and showing the
+ * counts again. It can never name rows of its own.
+ */
+function anchorFromJson(raw: string | null): ErasureAnchor | null {
+  if (raw === null) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const parsed = ErasureAnchorInput.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+function anchorLabelFor(anchor: ErasureAnchor): string {
+  switch (anchor.kind) {
+    case 'contact':
+      return anchor.identifier;
+    case 'document':
+      return anchor.documentId;
+    case 'window':
+      return `${anchor.fromIso} — ${anchor.toIso}`;
+  }
+}
+
+/** Keeps the entry form showing the anchor the preview was built from. */
+function prefillFor(anchor: ErasureAnchor): ErasurePrefill {
+  switch (anchor.kind) {
+    case 'contact':
+      return { identifier: anchor.identifier };
+    case 'document':
+      return { documentId: anchor.documentId };
+    case 'window':
+      return { fromIso: anchor.fromIso, toIso: anchor.toIso };
+  }
+}
+
+/** The entry form on its own, with an optional sentence saying what went wrong. */
+function sendErasureEntry(
+  res: ServerResponse,
+  session: Session,
+  status: number,
+  error?: string,
+): void {
+  sendHtml(
+    res,
+    status,
+    renderErasure({
+      csrf: issueCsrfToken(session.sessionId),
+      anchorLabel: '',
+      plan: null,
+      ...(error === undefined ? {} : { error }),
+    }),
+  );
+}
+
+/**
+ * Resolve the anchor and show what would be destroyed. Read-only, always:
+ * `buildErasurePlan` runs nothing but SELECTs, so a preview — including one
+ * reached by a hand-written URL — cannot change a row.
+ */
+async function sendErasurePreview(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  anchor: ErasureAnchor,
+  overrides: { plan?: ErasurePlan } = {},
+): Promise<void> {
+  const plan = overrides.plan ?? (await buildErasurePlan(anchor, { businessId }));
+  sendHtml(
+    res,
+    200,
+    renderErasure({
+      csrf: issueCsrfToken(session.sessionId),
+      anchorLabel: anchorLabelFor(anchor),
+      plan,
+      prefill: prefillFor(anchor),
+    }),
+  );
+}
+
+/**
+ * The screen itself. `?identifier=` arrives from a forget command and goes
+ * straight to a preview; `?onDate=` only fills the window fields in, because
+ * "which of the three tasks that ran that day" is a choice the owner makes
+ * from a list, not one this route guesses (spec §4.2).
+ */
+async function handleEraseGet(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const params = new URL(req.url ?? '/erase', 'http://dashboard.local').searchParams;
+  const identifier = (params.get('identifier') ?? '').trim();
+  if (identifier !== '') {
+    return sendErasurePreview(res, businessId, session, { kind: 'contact', identifier });
+  }
+
+  const onDate = params.get('onDate') ?? '';
+  const prefill: ErasurePrefill = /^\d{4}-\d{2}-\d{2}$/.test(onDate)
+    ? { fromIso: `${onDate}T00:00`, toIso: `${onDate}T23:59` }
+    : {};
+  sendHtml(
+    res,
+    200,
+    renderErasure({
+      csrf: issueCsrfToken(session.sessionId),
+      anchorLabel: '',
+      plan: null,
+      prefill,
+    }),
+  );
+}
+
+async function handleErasePreview(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const anchor = anchorFromForm(form);
+  if (anchor === null) return sendErasureEntry(res, session, 400, ANCHOR_UNREADABLE);
+  await sendErasurePreview(res, businessId, session, anchor);
+}
+
+/**
+ * The irreversible one.
+ *
+ * The plan is **rebuilt from the anchor** and never reconstructed from the
+ * form — see the block comment above. The rebuild also re-runs the refusals,
+ * which is what catches a job the scheduler woke into a live phase while the
+ * owner was reading the preview; `executeErasure` checks the same thing again
+ * under a row lock, and that second refusal is caught here rather than
+ * becoming a 500.
+ */
+async function handleEraseConfirm(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const anchor = anchorFromJson(form.get('anchor'));
+  if (anchor === null) return sendErasureEntry(res, session, 400, ANCHOR_UNREADABLE);
+
+  const plan = await buildErasurePlan(anchor, { businessId });
+  if (plan.refusals.length > 0) {
+    return sendErasurePreview(res, businessId, session, anchor, { plan });
+  }
+
+  let outcome: ErasureOutcome;
+  let auditUnrecorded = false;
+  try {
+    outcome = await executeErasure(plan, { businessId });
+  } catch (error) {
+    // It happened. The transaction committed and every unlink was attempted;
+    // only the record of it is missing, and reporting that as a failure
+    // would tell the owner their data is still there when it is not.
+    if (error instanceof ErasureAuditUnrecordedError) {
+      outcome = error.outcome;
+      auditUnrecorded = true;
+    } else if (error instanceof ErasureRefusedError) {
+      // The window the plan-time check cannot close: a job went live between
+      // the rebuild above and the executor's locked re-read. Nothing was
+      // deleted — show why, with the confirm control gone.
+      const refreshed = await buildErasurePlan(anchor, { businessId });
+      return sendErasurePreview(res, businessId, session, anchor, {
+        plan: {
+          ...refreshed,
+          refusals: [{ kind: 'live_job', detail: error.message }, ...refreshed.refusals],
+        },
+      });
+    } else {
+      throw error;
+    }
+  }
+
+  sendHtml(
+    res,
+    200,
+    renderErasureDone({ anchorLabel: anchorLabelFor(anchor), outcome, auditUnrecorded }),
+  );
+}
+
+/**
+ * "Keep this" and "stop keeping this" — the one list an erasure does not
+ * touch (spec §6).
+ *
+ * Both directions answer with the preview rebuilt from the same anchor, so
+ * the owner sees the item leave the plan, or come back into it, in the same
+ * response as the click.
+ */
+async function handleEraseKeep(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const kind = keptKindFrom(form.get('kind'));
+  const itemId = (form.get('itemId') ?? '').trim();
+  if (kind === null || itemId === '') return sendErasureEntry(res, session, 400, KEEP_UNREADABLE);
+
+  if (form.get('revoke') === '1') {
+    await revokeKeep(kind, itemId, { businessId });
+  } else {
+    const note = noteFrom(form);
+    await keepItem({ kind, itemId, ...(note === undefined ? {} : { note }) }, { businessId });
+  }
+
+  const anchor = anchorFromJson(form.get('anchor'));
+  if (anchor === null) return sendErasureEntry(res, session, 200);
+  await sendErasurePreview(res, businessId, session, anchor);
+}
+
 
 async function handleCard(res: ServerResponse, businessId: string, session: Session, approvalId: string): Promise<void> {
   // Scoped by businessId in the same query that loads the row — an approval
@@ -1231,6 +1577,11 @@ async function route(
 
   if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
   if (method === 'POST' && pathname === '/instruct') return handleInstructPost(req, res, businessId, session);
+
+  if (method === 'GET' && pathname === '/erase') return handleEraseGet(req, res, businessId, session);
+  if (method === 'POST' && pathname === '/erase/preview') return handleErasePreview(req, res, businessId, session);
+  if (method === 'POST' && pathname === '/erase/confirm') return handleEraseConfirm(req, res, businessId, session);
+  if (method === 'POST' && pathname === '/erase/keep') return handleEraseKeep(req, res, businessId, session);
 
   const instructAnswerMatch = INSTRUCT_ANSWER_PATH.exec(pathname);
   if (method === 'POST' && instructAnswerMatch) {
