@@ -40,13 +40,19 @@ export type ForgetCommand =
 
 /**
  * Strips the Hebrew prefix particles and punctuation a token may carry.
- * When checking the opening verb, this must NOT strip leading quotes — a
- * command cannot open on someone else's quoted words.
+ *
+ * The two strips are separate on purpose, and only the leading one is
+ * conditional. The security property is about an opening quote: a supplier's
+ * sentence reaches the instruction box by paste and opens with one, so the
+ * verb test must see it. Trailing punctuation carries no such meaning —
+ * `תשכחי,` is an ordinary Hebrew opening — and a single `stripQuotes`
+ * flag that suppressed both made it unrecognised, sending a sentence that
+ * says "forget" to the planner instead of to this screen.
  */
 function bareToken(token: string, stripQuotes: boolean = true): string {
   const withoutPrefix = /^[לבמהוכש]-/.test(token) ? token.slice(2) : token;
-  if (!stripQuotes) return withoutPrefix;
-  return withoutPrefix.replace(/^[('"«]+/, '').replace(/[)'"»,.;:!?]+$/, '');
+  const withoutLeading = stripQuotes ? withoutPrefix.replace(/^[('"«]+/, '') : withoutPrefix;
+  return withoutLeading.replace(/[)'"»,.;:!?]+$/, '');
 }
 
 function readDate(token: string): string | null {

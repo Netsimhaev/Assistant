@@ -55,6 +55,25 @@ describe('readForgetCommand', () => {
     expect(readForgetCommand('«תמחקי מזה»').recognised).toBe(false);
   });
 
+  /**
+   * The asymmetry the flag exists for, named in both directions.
+   *
+   * The security property is about a LEADING quote: a pasted supplier
+   * sentence opens with one, so the opening-verb test must see it. A TRAILING
+   * comma carries no such meaning — `תשכחי,` is an entirely ordinary Hebrew
+   * opening, and refusing it sent the text to `runInstruction`, which opens a
+   * job, grants a standing authorisation and calls the planner on a sentence
+   * that says "forget".
+   */
+  it('recognises a verb that carries trailing punctuation, quoted or not', () => {
+    expect(readForgetCommand('תשכחי, מרונית כהן').recognised).toBe(true);
+    expect(readForgetCommand('תשכחי. הכול').recognised).toBe(true);
+    expect(readForgetCommand('מחקי; את זה').recognised).toBe(true);
+    // And the leading quote is still refused, with the same trailing comma
+    // present — so a green here cannot come from the strip being dropped.
+    expect(readForgetCommand('"תשכחי," כך אמר הספק').recognised).toBe(false);
+  });
+
   it('rejects an impossible date (31/02)', () => {
     const command = readForgetCommand('תשכחי מהתאריך 31/02/2026');
     expect(command.recognised).toBe(true);
