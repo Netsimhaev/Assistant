@@ -720,6 +720,46 @@ describe('executeErasure', () => {
       expect(survivors.rows.map((r) => r.approval_id)).not.toContain(mine);
     });
 
+    /**
+     * The identifier the fix round itself got wrong (fix round 2, F1).
+     *
+     * `_` is an ordinary character in an email local part and a WILDCARD to
+     * `LIKE`. `likeLiteral` prefixes it with a backslash, which only means
+     * anything if the statement declares an escape character — and the new
+     * predicate's `ESCAPE '\\'` was written with a single backslash inside a
+     * template literal, where `\\'` collapses to `'`. Postgres therefore
+     * received `ESCAPE ''`, which disables escape processing entirely, so the
+     * escaped pattern matched nothing and the orphan card survived exactly as
+     * it had before the fix.
+     *
+     * Written as the identifier-shaped case rather than as an assertion about
+     * the SQL text, so what is locked in is that an ordinary address is found
+     * — not a backslash count somebody can get right by accident again.
+     */
+    it('finds an orphan card for an identifier carrying a LIKE wildcard', async () => {
+      const underscored = 'dana_cohen@beta-log.example';
+      const mine = await orphanApproval(underscored);
+      // Differs from the anchor only where the wildcard sits, so a predicate
+      // that stopped escaping would sweep this one in too and fail here.
+      const theirs = await orphanApproval('danaXcohen@beta-log.example');
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: underscored },
+        { businessId: BUSINESS },
+      );
+
+      expect(countOf(plan, 'approval_requests', 'delete')).toBe(1);
+
+      await executeErasure(plan, { businessId: BUSINESS });
+
+      const survivors = await getPool().query<{ approval_id: string }>(
+        'SELECT approval_id FROM approval_requests WHERE business_id=$1',
+        [BUSINESS],
+      );
+      expect(survivors.rows.map((r) => r.approval_id)).toEqual([theirs]);
+      expect(survivors.rows.map((r) => r.approval_id)).not.toContain(mine);
+    });
+
     it('an orphan approval_requests row created inside a window is listed and deleted', async () => {
       const inside = await orphanApproval(RONIT);
       const outside = await orphanApproval('avi@gamma-lift.example');
@@ -747,6 +787,52 @@ describe('executeErasure', () => {
       );
       expect(survivors.rows.map((r) => r.approval_id)).toEqual([outside]);
       expect(survivors.rows.map((r) => r.approval_id)).not.toContain(inside);
+    });
+
+    /**
+     * What holds the window arm inside the `job_id IS NULL` guard (fix round
+     * 2, review (b)).
+     *
+     * A card that HAS a job is reached through that job or not at all — and
+     * if the owner kept that job, it is kept with it. The window arm is
+     * nested inside the orphan guard for exactly that reason, and nothing
+     * would have caught it being lifted out: this is a card whose own
+     * `created_at` falls inside the window while the job it belongs to was
+     * created a month earlier, so only an unguarded window arm reaches it.
+     */
+    it('leaves a card whose job is outside the window, even though the card is inside it', async () => {
+      const jobId = await bareJob('older-than-the-window');
+      await getPool().query(
+        `UPDATE jobs SET created_at = now() - interval '30 days' WHERE job_id = $1`,
+        [jobId],
+      );
+      const approvalId = `AP-${ulid()}`;
+      await getPool().query(
+        `INSERT INTO approval_requests
+           (approval_id, business_id, job_id, action_class, summary, detail, risk,
+            proposed_tool, proposed_input, input_hash, expires_at)
+         VALUES ($1, $2, $3, 'email.reply', 'x', 'x', '{}', 'mail.send', '{}', 'hw', $4)`,
+        [approvalId, BUSINESS, jobId, new Date(Date.now() + 3600_000).toISOString()],
+      );
+
+      const plan = await buildErasurePlan(
+        {
+          kind: 'window',
+          fromIso: new Date(Date.now() - 3600_000).toISOString(),
+          toIso: new Date(Date.now() + 3600_000).toISOString(),
+        },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).not.toContain(jobId);
+      expect(countOf(plan, 'approval_requests', 'delete')).toBe(0);
+
+      await executeErasure(plan, { businessId: BUSINESS });
+
+      const survivors = await getPool().query('SELECT 1 FROM approval_requests WHERE approval_id=$1', [
+        approvalId,
+      ]);
+      expect(survivors.rows).toHaveLength(1);
     });
 
     it('an orphan proposals row on an erased reading is listed and deleted', async () => {

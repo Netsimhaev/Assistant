@@ -103,10 +103,10 @@ const APPROVAL_REQUESTS_MATCHED = `business_id = $1
   AND (job_id = ANY ($2)
     OR (job_id IS NULL
         AND (($3::text IS NOT NULL
-              AND (coalesce(proposed_input::text, '') ILIKE $3 ESCAPE '\'
-                OR coalesce(edited_input::text, '')  ILIKE $3 ESCAPE '\'
-                OR summary ILIKE $3 ESCAPE '\'
-                OR detail  ILIKE $3 ESCAPE '\'))
+              AND (coalesce(proposed_input::text, '') ILIKE $3 ESCAPE '\\'
+                OR coalesce(edited_input::text, '')  ILIKE $3 ESCAPE '\\'
+                OR summary ILIKE $3 ESCAPE '\\'
+                OR detail  ILIKE $3 ESCAPE '\\'))
           OR ($4::timestamptz IS NOT NULL
               AND created_at >= $4::timestamptz
               AND created_at <  $5::timestamptz))))`;

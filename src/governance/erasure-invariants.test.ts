@@ -16,8 +16,19 @@ const BUSINESS = 'test-business';
  * Distinctive enough that a match anywhere is this test's doing and not a
  * coincidence, and shaped like an address so every place that stores one
  * accepts it.
+ *
+ * **The underscore is load-bearing** (fix round 2, F1). `_` is an ordinary
+ * character in an email local part and a WILDCARD to `LIKE`, so an anchor
+ * carrying one is only found if the escaping actually works end to end —
+ * `likeLiteral` prefixing it AND the statement declaring an escape character.
+ * The orphan-approval predicate declared `ESCAPE ''` (a single backslash
+ * inside a template literal collapses), escape processing was off, and the
+ * escaped pattern matched nothing. This sweep stayed green through all of it
+ * for one reason only: the probe had no wildcard in it. One character makes
+ * the control able to catch that class by itself, which is the whole point of
+ * seeding all twelve stores.
  */
-const PROBE = 'zz-erase-probe-7f3a@nowhere.example';
+const PROBE = 'zz_erase-probe-7f3a@nowhere.example';
 
 /**
  * The three tables an erasure deliberately leaves alone (spec §5.2). Named,
