@@ -64,6 +64,43 @@ export interface ErasurePlan {
 export const LIVE_PHASES: readonly string[] = ['execute', 'await_approval'];
 
 /**
+ * Escapes what `LIKE` would otherwise read as a pattern.
+ *
+ * The anchor is owner-supplied text. A bare `%` would match every row in
+ * every table searched — the same reason `recallMemories` escapes its
+ * keyword.
+ */
+function likeLiteral(value: string): string {
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+/**
+ * The `ESCAPE` clause every `LIKE`/`ILIKE` in this module carries, written
+ * once.
+ *
+ * `likeLiteral` above prefixes a backslash, and that prefix means nothing
+ * unless the statement also DECLARES backslash as the escape character. The
+ * two halves only work as a pair, so they live as a pair.
+ *
+ * **Why a constant and not fourteen typed clauses** (fix round 3, and the
+ * class behind F1). Written inline, the clause is spelled with two
+ * backslashes inside a template literal. One instead of two is not a syntax
+ * error, not a type error and not visibly wrong: the literal quietly
+ * collapses to `ESCAPE ''`, which disables escape processing altogether, and
+ * the statement then fails *only* for an anchor containing `_`, `%` or a
+ * backslash — an ordinary email local part. That is exactly how it reached
+ * the last gate of this branch, in the one clause that had just been added.
+ * A property held right fourteen times by hand is a property waiting to
+ * break — the same argument that put the `proposals` predicate in one place.
+ *
+ * Spelled with `String.raw` deliberately: it is the one spelling the
+ * collapsing rule cannot touch, so the fix cannot be undone by the mechanism
+ * that caused the defect. It is the same ten characters as the two-backslash
+ * template spelling — verified by running both, not assumed.
+ */
+export const LIKE_ESCAPE = String.raw`ESCAPE '\'`;
+
+/**
  * The `approval_requests` rows an erasure destroys, as ONE predicate.
  *
  * **Why the second arm exists (final review, N1).** `approval_requests.job_id`
@@ -103,10 +140,10 @@ const APPROVAL_REQUESTS_MATCHED = `business_id = $1
   AND (job_id = ANY ($2)
     OR (job_id IS NULL
         AND (($3::text IS NOT NULL
-              AND (coalesce(proposed_input::text, '') ILIKE $3 ESCAPE '\\'
-                OR coalesce(edited_input::text, '')  ILIKE $3 ESCAPE '\\'
-                OR summary ILIKE $3 ESCAPE '\\'
-                OR detail  ILIKE $3 ESCAPE '\\'))
+              AND (coalesce(proposed_input::text, '') ILIKE $3 ${LIKE_ESCAPE}
+                OR coalesce(edited_input::text, '')  ILIKE $3 ${LIKE_ESCAPE}
+                OR summary ILIKE $3 ${LIKE_ESCAPE}
+                OR detail  ILIKE $3 ${LIKE_ESCAPE}))
           OR ($4::timestamptz IS NOT NULL
               AND created_at >= $4::timestamptz
               AND created_at <  $5::timestamptz))))`;
@@ -201,17 +238,6 @@ export const PROPOSALS_ERASED_PREDICATE = `business_id = $1
           WHERE business_id = $1 AND document_id = ANY ($3)
        ))`;
 
-/**
- * Escapes what `LIKE` would otherwise read as a pattern.
- *
- * The anchor is owner-supplied text. A bare `%` would match every row in
- * every table searched — the same reason `recallMemories` escapes its
- * keyword.
- */
-function likeLiteral(value: string): string {
-  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-}
-
 async function idsFrom(
   db: Queryable,
   sql: string,
@@ -248,7 +274,7 @@ export async function buildErasurePlan(
     for (const jobId of await idsFrom(
       db,
       `SELECT DISTINCT job_id FROM job_plans
-        WHERE business_id = $1 AND plan::text ILIKE $2 ESCAPE '\\'`,
+        WHERE business_id = $1 AND plan::text ILIKE $2 ${LIKE_ESCAPE}`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
@@ -257,7 +283,7 @@ export async function buildErasurePlan(
       db,
       `SELECT DISTINCT job_id FROM boss_instructions
         WHERE business_id = $1
-          AND (text ILIKE $2 ESCAPE '\\' OR coalesce(answer, '') ILIKE $2 ESCAPE '\\')`,
+          AND (text ILIKE $2 ${LIKE_ESCAPE} OR coalesce(answer, '') ILIKE $2 ${LIKE_ESCAPE})`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
@@ -269,17 +295,17 @@ export async function buildErasurePlan(
       db,
       `SELECT DISTINCT job_id FROM approval_requests
         WHERE business_id = $1 AND job_id IS NOT NULL
-          AND (coalesce(proposed_input::text, '') ILIKE $2 ESCAPE '\\'
-            OR coalesce(edited_input::text, '')  ILIKE $2 ESCAPE '\\'
-            OR summary ILIKE $2 ESCAPE '\\'
-            OR detail  ILIKE $2 ESCAPE '\\')`,
+          AND (coalesce(proposed_input::text, '') ILIKE $2 ${LIKE_ESCAPE}
+            OR coalesce(edited_input::text, '')  ILIKE $2 ${LIKE_ESCAPE}
+            OR summary ILIKE $2 ${LIKE_ESCAPE}
+            OR detail  ILIKE $2 ${LIKE_ESCAPE})`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
 
     for (const jobId of await idsFrom(
       db,
-      `SELECT job_id FROM jobs WHERE business_id = $1 AND coalesce(title, '') ILIKE $2 ESCAPE '\\'`,
+      `SELECT job_id FROM jobs WHERE business_id = $1 AND coalesce(title, '') ILIKE $2 ${LIKE_ESCAPE}`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
@@ -354,8 +380,8 @@ export async function buildErasurePlan(
           `SELECT memory_id FROM memories
             WHERE business_id = $1
               AND (subject_key = $2
-                OR body::text ILIKE $3 ESCAPE '\\'
-                OR coalesce(source_ref, '') ILIKE $3 ESCAPE '\\'
+                OR body::text ILIKE $3 ${LIKE_ESCAPE}
+                OR coalesce(source_ref, '') ILIKE $3 ${LIKE_ESCAPE}
                 OR written_by_job = ANY ($4))`,
           [businessId, anchor.identifier, `%${likeLiteral(anchor.identifier)}%`, [...jobIds]],
         )
