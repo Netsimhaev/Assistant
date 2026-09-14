@@ -233,20 +233,6 @@ function redirect(res: ServerResponse, location: string, headers: Record<string,
   res.end();
 }
 
-/**
- * The answer to a POST that is finished with the posted data and wants the
- * browser to GET somewhere else.
- *
- * 303 and not the 302 above: a 302 leaves the method up to the client, and
- * the one place this is used sends a *forget command* to a screen whose job
- * is to destroy things. A re-POST on reload, or a client that re-sends the
- * body to the new location, is not a risk worth carrying for one saved line.
- */
-function redirectSeeOther(res: ServerResponse, location: string): void {
-  res.writeHead(303, { Location: location, ...SECURITY_HEADERS });
-  res.end();
-}
-
 type Session = { sessionId: string; username: string; mustChangePassword: boolean };
 
 /** `null` when there is no valid session at all — distinct from a valid one that just needs a password change. */
@@ -490,6 +476,7 @@ async function handleInstructPost(
   res: ServerResponse,
   businessId: string,
   session: Session,
+  documentRoot: string | undefined,
 ): Promise<void> {
   const form = await readFormBody(req);
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
@@ -506,11 +493,29 @@ async function handleInstructPost(
   // the text goes to and nothing about what will be deleted.
   const forget = readForgetCommand(text);
   if (forget.recognised) {
-    const query = new URLSearchParams();
-    if (forget.identifier !== null) query.set('identifier', forget.identifier);
-    if (forget.onDate !== null) query.set('onDate', forget.onDate);
-    const suffix = query.toString() === '' ? '' : `?${query.toString()}`;
-    return redirectSeeOther(res, `/erase${suffix}`);
+    // **Rendered here, never redirected to** (security review, MEDIUM). This
+    // used to answer `303 /erase?identifier=<address>`, which wrote the
+    // contact's address into the reverse proxy's access log — the deployment
+    // mandates a proxy — and into the browser's history. Both outlive the
+    // erasure, in two places it cannot reach, for a feature whose whole
+    // promise is that the identity is gone and only counts remain. `onDate`
+    // is less sensitive and travelled the same way.
+    //
+    // Answering in place is safe HERE specifically: a recognised forget
+    // command creates no job, grants no authorisation and calls no model —
+    // this branch returns before `runInstruction` — so there is no side
+    // effect for Post/Redirect/Get to protect against on refresh. That
+    // argument does NOT hold one line below, where the instruction path does
+    // all three.
+    //
+    // The screen is built by the same function `GET /erase` uses, so the two
+    // entrances cannot drift, and every form it emits posts to an absolute
+    // path (`/erase/preview`, `/erase/confirm`, `/erase/keep`) so they work
+    // unchanged from a page served at `/instruct`.
+    return sendErasureScreenFor(res, businessId, session, documentRoot, {
+      identifier: forget.identifier,
+      onDate: forget.onDate,
+    });
   }
 
   const outcome = await runInstruction({ text }, { businessId });
@@ -1011,16 +1016,38 @@ async function handleEraseGet(
   documentRoot: string | undefined,
 ): Promise<void> {
   const params = new URL(req.url ?? '/erase', 'http://dashboard.local').searchParams;
-  const identifier = (params.get('identifier') ?? '').trim();
+  await sendErasureScreenFor(res, businessId, session, documentRoot, {
+    identifier: params.get('identifier'),
+    onDate: params.get('onDate'),
+  });
+}
+
+/**
+ * The erasure screen for what a forget command could read out of the text.
+ *
+ * One path, so `GET /erase?identifier=` and the inline render from
+ * `POST /instruct` cannot answer the same prefill with two different screens.
+ * An identifier goes straight to a preview; a date only fills the window
+ * fields in, because "which of the three tasks that ran that day" is a choice
+ * the owner makes from a list, not one this route guesses (spec §4.2).
+ */
+async function sendErasureScreenFor(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  documentRoot: string | undefined,
+  prefill: { identifier: string | null; onDate: string | null },
+): Promise<void> {
+  const identifier = (prefill.identifier ?? '').trim();
   if (identifier !== '') {
     return sendErasurePreview(res, businessId, session, { kind: 'contact', identifier }, documentRoot);
   }
 
-  const onDate = params.get('onDate') ?? '';
-  const prefill: ErasurePrefill = /^\d{4}-\d{2}-\d{2}$/.test(onDate)
+  const onDate = prefill.onDate ?? '';
+  const window: ErasurePrefill = /^\d{4}-\d{2}-\d{2}$/.test(onDate)
     ? { fromIso: `${onDate}T00:00`, toIso: `${onDate}T23:59` }
     : {};
-  await sendErasureEntry(res, businessId, session, 200, { prefill });
+  await sendErasureEntry(res, businessId, session, 200, { prefill: window });
 }
 
 async function handleErasePreview(
@@ -1673,7 +1700,8 @@ async function route(
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
 
   if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
-  if (method === 'POST' && pathname === '/instruct') return handleInstructPost(req, res, businessId, session);
+  if (method === 'POST' && pathname === '/instruct')
+    return handleInstructPost(req, res, businessId, session, documentRoot);
 
   if (method === 'GET' && pathname === '/erase') return handleEraseGet(req, res, businessId, session, documentRoot);
   if (method === 'POST' && pathname === '/erase/preview') return handleErasePreview(req, res, businessId, session, documentRoot);

@@ -196,9 +196,27 @@ describe('the erasure screen', () => {
 });
 
 describe('the erasure routes', () => {
-  it('sends a forget command to the screen instead of the planner', async () => {
+  /**
+   * Two properties, and the second is why this is not a redirect.
+   *
+   * **The screen, not the planner.** A recognised forget command must not
+   * reach `runInstruction`, which opens a job, grants a standing
+   * authorisation and calls the model on a sentence that says "forget".
+   *
+   * **And the identity must not end up in a URL** (security review, MEDIUM).
+   * This route used to answer `303 /erase?identifier=<address>`. The
+   * deployment mandates a reverse proxy — `docs/dashboard-deployment.md` and
+   * `DASHBOARD_TRUST_PROXY` both assume one — so that address was written
+   * into the proxy's access log and into the browser's history, and it stayed
+   * there after the erasure, in two places the erasure cannot reach. For a
+   * feature whose whole promise is that the identity is gone and only counts
+   * remain, that is the one leak that matters. The screen is rendered inline
+   * from the POST instead, so nothing about the contact travels in a URL.
+   */
+  it('renders the erasure screen inline, with the identity in no URL', async () => {
     const baseUrl = await startServer();
     await installCharter(buildCharter(), { businessId: BUSINESS });
+    await seedRonit();
     const cookie = await signIn(baseUrl);
     const csrf = extractCsrf(await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text());
 
@@ -208,14 +226,79 @@ describe('the erasure routes', () => {
       body: new URLSearchParams({ csrf, text: `תשכחי מ-${RONIT}` }),
       redirect: 'manual',
     });
+    const html = await res.text();
 
-    expect(res.status).toBe(303);
-    expect(res.headers.get('location')).toBe(`/erase?identifier=${encodeURIComponent(RONIT)}`);
+    // Answered in place: no redirect at all, so no URL to carry anything.
+    expect(res.status).toBe(200);
+    expect(res.headers.get('location')).toBeNull();
+
+    // The assertion that matters: the address appears in NO response header,
+    // whatever the header is called. A `Location`-shaped leak under another
+    // name fails here too.
+    for (const [name, value] of res.headers.entries()) {
+      expect(value, `header ${name}`).not.toContain(RONIT);
+      expect(value, `header ${name}`).not.toContain(encodeURIComponent(RONIT));
+    }
+
+    // Nor in any URL the page itself emits — a form action or a link that
+    // carried the prefill would put it back in the history on the next click.
+    for (const url of html.match(/(?:action|href)="([^"]*)"/g) ?? []) {
+      expect(url).not.toContain(RONIT);
+      expect(url).not.toContain(encodeURIComponent(RONIT));
+    }
+
+    // It is genuinely the erasure screen, prefilled and already previewing —
+    // the same thing `GET /erase?identifier=` produced.
+    expect(html).toContain(RONIT);
+    expect(html).toContain('זיכרונות');
+    expect(html).toContain('name="planHash"');
+
+    // The forms it emits post to absolute paths, so they still work when the
+    // page was served from `/instruct` rather than from `/erase`.
+    expect(html).toContain('action="/erase/preview"');
+    expect(html).toContain('action="/erase/confirm"');
+
     // Never to the planner: no job, and no instruction row.
-    const jobs = await getPool().query('SELECT 1 FROM jobs WHERE business_id = $1', [BUSINESS]);
+    const jobs = await getPool().query(
+      'SELECT 1 FROM jobs WHERE business_id = $1 AND title IS NULL',
+      [BUSINESS],
+    );
     expect(jobs.rows).toHaveLength(0);
     const instructions = await getPool().query('SELECT 1 FROM boss_instructions');
     expect(instructions.rows).toHaveLength(0);
+
+    // And read-only: a preview destroys nothing.
+    expect(await memoryCount()).toBe(1);
+  });
+
+  /**
+   * The date-only shape, which takes the other branch: no anchor is resolved,
+   * so the entry form is rendered with the window prefilled — and the date,
+   * like the address, never reaches a URL.
+   */
+  it('renders the entry form inline for a date-only forget command', async () => {
+    const baseUrl = await startServer();
+    await installCharter(buildCharter(), { businessId: BUSINESS });
+    const cookie = await signIn(baseUrl);
+    const csrf = extractCsrf(await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text());
+
+    const res = await fetch(`${baseUrl}/instruct`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, text: 'תשכחי מהשיחה של 3/9/2026' }),
+      redirect: 'manual',
+    });
+    const html = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('location')).toBeNull();
+    for (const [name, value] of res.headers.entries()) {
+      expect(value, `header ${name}`).not.toContain('2026-09-03');
+    }
+    expect(html).toContain('2026-09-03T00:00');
+    expect(html).toContain('2026-09-03T23:59');
+    // No anchor was resolved, so there is nothing to confirm yet.
+    expect(html).not.toContain('name="planHash"');
   });
 
   it('previews from the identifier in the query string', async () => {
