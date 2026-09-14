@@ -31,7 +31,7 @@ import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
-import type { ErasureItem, ErasurePlan } from './erasure-plan.js';
+import type { ErasureItem, ErasurePlan, ErasureRefusal } from './erasure-plan.js';
 import {
   APPROVAL_REQUESTS_ERASED_PREDICATE,
   APPROVAL_REQUESTS_SCRUBBED_PREDICATE,
@@ -43,8 +43,38 @@ import {
 
 /** Thrown when a plan carrying a refusal is handed to the executor, or when a
  * job the plan touches turns out to be live by the time the transaction
- * actually starts (see the liveness re-check below). */
-export class ErasureRefusedError extends Error {}
+ * actually starts (see the liveness re-check below), or when a document the
+ * plan names was signed between the preview and the confirm.
+ *
+ * `kind` carries which of spec §7.1's two refusals this is, so the screen
+ * re-shows it as the refusal it actually is rather than labelling every
+ * execution-time refusal a live job. */
+export class ErasureRefusedError extends Error {
+  readonly kind: ErasureRefusal['kind'];
+
+  constructor(message: string, kind: ErasureRefusal['kind'] = 'live_job') {
+    super(message);
+    this.name = 'ErasureRefusedError';
+    this.kind = kind;
+  }
+}
+
+/**
+ * Postgres' foreign-key violation. `signatures.document_id` is `ON DELETE
+ * RESTRICT` since migration 020, and that constraint — not the plan-time
+ * read, which happens before the owner clicks — is the authoritative answer
+ * to "is this document signed". A signature inserted in between therefore
+ * surfaces here and nowhere else.
+ */
+const FOREIGN_KEY_VIOLATION = '23503';
+const SIGNATURE_DOCUMENT_FK = 'signatures_document_id_fkey';
+
+function isSignatureRestriction(err: unknown): boolean {
+  const candidate = err as { code?: unknown; constraint?: unknown };
+  return (
+    candidate.code === FOREIGN_KEY_VIOLATION && candidate.constraint === SIGNATURE_DOCUMENT_FK
+  );
+}
 
 export interface ErasureOutcome {
   /** What was actually deleted or scrubbed, from the statements' own row
@@ -109,7 +139,12 @@ export async function executeErasure(
   const businessId = options.businessId ?? config.businessId;
 
   if (plan.refusals.length > 0) {
-    throw new ErasureRefusedError(plan.refusals.map((r) => r.detail).join(' · '));
+    // The kind travels with the message so the screen re-shows the refusal it
+    // actually is; the first one is the one the sentence leads with.
+    throw new ErasureRefusedError(
+      plan.refusals.map((r) => r.detail).join(' · '),
+      plan.refusals[0]?.kind ?? 'live_job',
+    );
   }
 
   const { jobIds, documentIds, memoryIds } = plan;
@@ -181,7 +216,21 @@ export async function executeErasure(
     await del('boss_instructions', 'DELETE FROM boss_instructions WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
-    await del('documents', 'DELETE FROM documents WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]);
+    // The only statement that can be refused by the schema itself. A
+    // signature added after the preview was built makes migration 020's
+    // RESTRICT reject this delete; the transaction rolls back and nothing is
+    // destroyed, which is right — but re-thrown raw it reached the owner as a
+    // 500 instead of the sentence spec §7.1 wrote for this case. Translated,
+    // not swallowed: it still aborts the erasure.
+    try {
+      await del('documents', 'DELETE FROM documents WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]);
+    } catch (err) {
+      if (!isSignatureRestriction(err)) throw err;
+      throw new ErasureRefusedError(
+        'מסמך שהתוכנית מנתה נחתם מאז שהתצוגה המקדימה הוכנה; המחיקה בוטלה ולא נמחק דבר.',
+        'signed_document',
+      );
+    }
 
     // Scrubbed: rows that carry a content field and must keep existing, so
     // audit rows go on pointing at jobs that are really there. The `WHERE`

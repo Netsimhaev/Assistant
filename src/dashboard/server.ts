@@ -1092,11 +1092,15 @@ async function handleEraseConfirm(
       // The window the plan-time check cannot close: a job went live between
       // the rebuild above and the executor's locked re-read. Nothing was
       // deleted — show why, with the confirm control gone.
+      // `error.kind` and not a hardcoded `live_job`: the executor refuses for
+      // two reasons (a job woken live, and a document signed since the
+      // preview), and the rebuilt plan below already names the specific
+      // document or job underneath this sentence.
       const refreshed = await resolvePlan(anchor, businessId, documentRoot);
       return sendErasurePreview(res, businessId, session, anchor, documentRoot, {
         plan: {
           ...refreshed,
-          refusals: [{ kind: 'live_job', detail: error.message }, ...refreshed.refusals],
+          refusals: [{ kind: error.kind, detail: error.message }, ...refreshed.refusals],
         },
       });
     } else {

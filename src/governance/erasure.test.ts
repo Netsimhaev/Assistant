@@ -895,6 +895,76 @@ describe('executeErasure', () => {
   });
 
   /**
+   * A signature that appears AFTER the preview was built (final review, N8).
+   *
+   * `signatures.document_id` is `ON DELETE RESTRICT` since migration 020, so
+   * the executor's `DELETE FROM documents` raises a foreign-key error and the
+   * transaction rolls back — which is correct, and nothing is destroyed. What
+   * was wrong is what the owner saw: the error travelled up as an unknown
+   * failure and `handleEraseConfirm` re-threw it to `renderServerError`, so a
+   * 500 stood in for the sentence spec §7.1 wrote for exactly this case.
+   *
+   * The plan-time refusal cannot close this window: it reads `signatures`
+   * before the owner clicks. Only the constraint itself is authoritative, so
+   * the constraint's own error is what gets translated.
+   */
+  it('refuses, rather than failing, when a document is signed after the preview', async () => {
+    const jobId = await bareJob('signed-mid-flight');
+    const documentId = `DOC-${ulid()}`;
+    await insertDocument(documentId, `nowhere/${documentId}.txt`);
+    await getPool().query(
+      `INSERT INTO document_artifacts (business_id, document_id, ordinal, kind, content)
+       VALUES ($1, $2, 0, 'text', '{}')`,
+      [BUSINESS, documentId],
+    );
+
+    const plan: ErasurePlan = {
+      anchor: { kind: 'document', documentId },
+      jobIds: [jobId],
+      documentIds: [documentId],
+      memoryIds: [],
+      filePaths: [],
+      items: [],
+      excluded: [],
+      refusals: [],
+    };
+
+    // Between the preview and the confirm.
+    await recordSignature(
+      {
+        signatureId: `SIG-${ulid()}`,
+        documentId,
+        signedSha256: 'f'.repeat(64),
+        approvalId: `AP-${ulid()}`,
+        signedBy: 'owner',
+      },
+      { businessId: BUSINESS },
+    );
+
+    let caught: unknown;
+    try {
+      await executeErasure(plan, { businessId: BUSINESS });
+    } catch (error) {
+      caught = error;
+    }
+
+    // A refusal the screen knows how to render, not an unknown failure.
+    expect(caught).toBeInstanceOf(ErasureRefusedError);
+    expect((caught as ErasureRefusedError).kind).toBe('signed_document');
+
+    // And nothing was destroyed: the rollback held, on a row the statement
+    // order had already deleted before reaching `documents`.
+    const artifacts = await getPool().query('SELECT 1 FROM document_artifacts WHERE document_id=$1', [
+      documentId,
+    ]);
+    expect(artifacts.rows).toHaveLength(1);
+    const documents = await getPool().query('SELECT 1 FROM documents WHERE document_id=$1', [
+      documentId,
+    ]);
+    expect(documents.rows).toHaveLength(1);
+  });
+
+  /**
    * I3 (round 1 residual, now closed): an `appendAudit` failure after the
    * database transaction and file deletions have already committed must not
    * be reported as though nothing happened. Same forced-failure harness as
