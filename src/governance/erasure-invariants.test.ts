@@ -5,7 +5,7 @@ import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
-import { createJob } from '../orchestrator/jobs.js';
+import { createJob, transition } from '../orchestrator/jobs.js';
 import { writeMemory } from '../memory/store.js';
 import { buildErasurePlan } from './erasure-plan.js';
 import { executeErasure } from './erasure.js';
@@ -49,6 +49,17 @@ describe('what an erasure leaves behind', () => {
    * matches. A table added a year from now is scanned automatically, and
    * somebody who adds a store and forgets to wire erasure into it turns this
    * red without having to remember this file exists.
+   *
+   * **"Everywhere" means all twelve content stores of spec §5.1, and it did
+   * not used to** (final review, N2). The seed covered five — `jobs.title`,
+   * `job_authorizations.recipients`, `job_plans.plan`,
+   * `boss_instructions.text` and `memories` — so the sweep could only detect
+   * a missed store that would have received a copy of one of those five
+   * values. N1 was the live demonstration: an orphan `approval_requests` card
+   * carrying the probe survived a contact erasure entirely, and this scan
+   * stayed green because no such row was ever seeded. The seven added below
+   * are the rest of the table, and the orphan card is among them, so this
+   * control now detects N1 by itself.
    */
   it('leaves the probe in no text or JSON column of any table, anywhere', async () => {
     const bundle = await installCharter(buildCharter({ version: 'probe' }), { businessId: BUSINESS });
@@ -78,6 +89,99 @@ describe('what an erasure leaves behind', () => {
     await writeMemory(
       { jobId: job.jobId, kind: 'entity', subjectKey: PROBE, body: { email: PROBE } },
       { businessId: BUSINESS },
+    );
+
+    // --- The other seven stores of spec §5.1. ----------------------------
+    //
+    // The document chain first. It is reached from the job the way production
+    // reaches it — document → reading → proposal → job — so the probe lands
+    // in `documents`, `document_artifacts`, `document_readings` and
+    // `proposals` through the plan's real closure and not through a shortcut
+    // this test invented.
+    const documentId = `DOC-probe-${Date.now()}`;
+    await db.query(
+      `INSERT INTO documents
+         (document_id, business_id, source, original_name, media_type, sha256,
+          byte_size, stored_path, status, reason)
+       VALUES ($1, $2, 'manual', $3, 'text/plain', repeat('c', 64), 12, $4, 'extracted', $5)`,
+      [
+        documentId,
+        BUSINESS,
+        `הצעת מחיר ל-${PROBE}.txt`,
+        `${BUSINESS}/${documentId}/original.txt`,
+        `נקלט מ-${PROBE}`,
+      ],
+    );
+    await db.query(
+      `INSERT INTO document_artifacts (business_id, document_id, ordinal, kind, content, part_name)
+       VALUES ($1, $2, 0, 'text', $3::jsonb, $4)`,
+      [BUSINESS, documentId, JSON.stringify({ text: `צור קשר עם ${PROBE}` }), `גיליון ${PROBE}`],
+    );
+    const readingId = `READ-probe-${Date.now()}`;
+    await db.query(
+      `INSERT INTO document_readings
+         (reading_id, business_id, document_id, status, content, provenance, model,
+          prompt_version, brief_hash)
+       VALUES ($1, $2, $3, 'read', $4::jsonb, 'boss', 'test-model', 'v1', 'hash-probe')`,
+      [readingId, BUSINESS, documentId, JSON.stringify({ summary: `פנייה של ${PROBE}` })],
+    );
+    await db.query(
+      `INSERT INTO proposals
+         (proposal_id, business_id, reading_id, status, content, model, prompt_version, raw, job_id)
+       VALUES ($1, $2, $3, 'proposed', $4::jsonb, 'test-model', 'v1', $5, $6)`,
+      [
+        `PROP-probe-${Date.now()}`,
+        BUSINESS,
+        readingId,
+        JSON.stringify({ stance: 'act', to: PROBE }),
+        `הצעה גולמית אל ${PROBE}`,
+        job.jobId,
+      ],
+    );
+
+    // Two approval cards: one behind the job, and one ORPHAN — `job_id` NULL,
+    // the shape N1 found surviving. Both hold the address and the body.
+    for (const [approvalId, jobIdOrNull] of [
+      [`AP-probe-job-${Date.now()}`, job.jobId],
+      [`AP-probe-orphan-${Date.now()}`, null],
+    ] as Array<[string, string | null]>) {
+      await db.query(
+        `INSERT INTO approval_requests
+           (approval_id, business_id, job_id, action_class, summary, detail, risk,
+            proposed_tool, proposed_input, input_hash, expires_at, edited_input,
+            decision_note, diff_vs_norm, artifacts)
+         VALUES ($1, $2, $3, 'email.reply', $4, $5, $6::jsonb, 'mail.send', $7::jsonb, $8, $9,
+                 $10::jsonb, $11, $12, $13::jsonb)`,
+        [
+          approvalId,
+          BUSINESS,
+          jobIdOrNull,
+          `שליחת מייל אל ${PROBE}`,
+          `הגוף המלא של ההודעה אל ${PROBE}`,
+          JSON.stringify({ band: 'sensitive', note: PROBE }),
+          JSON.stringify({ to: PROBE, body: `שלום ${PROBE}` }),
+          `hash-${approvalId}`,
+          new Date(Date.now() + 3600_000).toISOString(),
+          JSON.stringify({ to: PROBE }),
+          `הבעלים כתב על ${PROBE}`,
+          `חריגה לעומת ${PROBE}`,
+          JSON.stringify([{ name: PROBE }]),
+        ],
+      );
+    }
+
+    // The two scrubbed stores. Both survive the erasure as rows and must come
+    // back holding nothing to read.
+    await transition(job.jobId, {
+      to: 'understand',
+      actor: 'orchestrator',
+      reason: `פתיחת משימה בעקבות ${PROBE}`,
+      businessId: BUSINESS,
+    });
+    await db.query(
+      `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id)
+       VALUES ($1, $2, 'hp', 's1', $3)`,
+      [BUSINESS, job.jobId, `msg-${PROBE}`],
     );
 
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
