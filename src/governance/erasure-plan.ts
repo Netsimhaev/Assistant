@@ -111,8 +111,44 @@ const APPROVAL_REQUESTS_MATCHED = `business_id = $1
               AND created_at >= $4::timestamptz
               AND created_at <  $5::timestamptz))))`;
 
-/** Every `approval_requests` row this anchor reaches. Used by both sites. */
-export const APPROVAL_REQUESTS_ERASED_PREDICATE = APPROVAL_REQUESTS_MATCHED;
+/**
+ * The one conditional in spec §5.1.1's delete-versus-scrub table.
+ *
+ * `approval_requests` is deleted **unless a signature points at it, and then
+ * it is scrubbed**. A signature says "this person, at this time, THROUGH THIS
+ * APPROVAL, accepted the document" — deleting the approval out from under it
+ * leaves the one row recording a human act pointing at nothing. It is the
+ * same ethic migration 020 already encodes by making the signature survive
+ * its document's deletion with `ON DELETE RESTRICT`: the record of what a
+ * person did outlives the content it was about.
+ *
+ * Two predicates over the same matched set, so a matched row lands in exactly
+ * one of them and neither can silently claim a row the other should have had.
+ * Both are interpolated verbatim by `countItems` and by the executor.
+ */
+export const APPROVAL_REQUESTS_ERASED_PREDICATE = `${APPROVAL_REQUESTS_MATCHED}
+  AND NOT EXISTS (SELECT 1 FROM signatures s
+                   WHERE s.business_id = $1 AND s.approval_id = approval_requests.approval_id)`;
+
+/** The matched rows a signature attests to: emptied, and kept. */
+export const APPROVAL_REQUESTS_SCRUBBED_PREDICATE = `${APPROVAL_REQUESTS_MATCHED}
+  AND EXISTS (SELECT 1 FROM signatures s
+               WHERE s.business_id = $1 AND s.approval_id = approval_requests.approval_id)`;
+
+/**
+ * Every content column spec §5.1 names for this table, emptied in one place
+ * so the executor's `SET` list cannot drift from what the preview counted.
+ * `summary`, `detail`, `proposed_input`, `risk` and `artifacts` are NOT NULL,
+ * so they take a neutral value rather than NULL.
+ */
+export const APPROVAL_REQUESTS_SCRUB_SET = `summary = 'נמחק בהוראת הבעלים',
+        detail = 'נמחק בהוראת הבעלים',
+        proposed_input = '{}'::jsonb,
+        edited_input = NULL,
+        decision_note = NULL,
+        diff_vs_norm = NULL,
+        artifacts = '[]'::jsonb,
+        risk = '{}'::jsonb`;
 
 /**
  * The five parameters `APPROVAL_REQUESTS_ERASED_PREDICATE` takes, derived
@@ -483,6 +519,12 @@ async function countItems(
       'approval_requests',
       'delete',
       `SELECT count(*)::text AS n FROM approval_requests WHERE ${APPROVAL_REQUESTS_ERASED_PREDICATE}`,
+      approvalRequestParams(businessId, jobIds, anchor),
+    ),
+    await one(
+      'approval_requests',
+      'scrub',
+      `SELECT count(*)::text AS n FROM approval_requests WHERE ${APPROVAL_REQUESTS_SCRUBBED_PREDICATE}`,
       approvalRequestParams(businessId, jobIds, anchor),
     ),
     await one(

@@ -34,6 +34,8 @@ import { canonicalHash } from '../util/canonical.js';
 import type { ErasureItem, ErasurePlan } from './erasure-plan.js';
 import {
   APPROVAL_REQUESTS_ERASED_PREDICATE,
+  APPROVAL_REQUESTS_SCRUBBED_PREDICATE,
+  APPROVAL_REQUESTS_SCRUB_SET,
   LIVE_PHASES,
   PROPOSALS_ERASED_PREDICATE,
   approvalRequestParams,
@@ -185,6 +187,17 @@ export async function executeErasure(
     // audit rows go on pointing at jobs that are really there. The `WHERE`
     // clauses mirror `countItems` in `erasure-plan.ts` exactly, so a
     // statement's real row count agrees with what the preview counted.
+    //
+    // `approval_requests` is the one conditional row in spec §5.1.1: deleted
+    // above unless a signature points at it, emptied and kept here when one
+    // does. A signature attests to a human act performed THROUGH this
+    // approval; destroying the approval leaves it pointing at nothing, the
+    // same thing migration 020's RESTRICT already refuses one table over.
+    await scrub(
+      'approval_requests',
+      `UPDATE approval_requests SET ${APPROVAL_REQUESTS_SCRUB_SET} WHERE ${APPROVAL_REQUESTS_SCRUBBED_PREDICATE}`,
+      approvalRequestParams(businessId, jobIds, plan.anchor),
+    );
     await scrub('jobs', 'UPDATE jobs SET title = NULL WHERE business_id=$1 AND job_id = ANY($2) AND title IS NOT NULL', [businessId, jobIds]);
     await scrub('job_steps', `UPDATE job_steps SET reason = 'נמחק בהוראת הבעלים' WHERE job_id = ANY($1)`, [jobIds]);
     await scrub('job_step_results', 'UPDATE job_step_results SET external_id = NULL WHERE business_id=$1 AND job_id = ANY($2) AND external_id IS NOT NULL', [businessId, jobIds]);

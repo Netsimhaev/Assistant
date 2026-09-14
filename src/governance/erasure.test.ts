@@ -17,6 +17,9 @@ import { ErasureAuditUnrecordedError, ErasureRefusedError, executeErasure } from
 const BUSINESS = 'test-business';
 const RONIT = 'ronit@beta-log.example';
 
+/** Content that must not survive a scrub, distinctive enough to assert on. */
+const SIGNED_SECRET = 'zz-signed-approval-content';
+
 async function seed(): Promise<{ jobId: string }> {
   const bundle = await installCharter(buildCharter({ version: 'erase-exec' }), {
     businessId: BUSINESS,
@@ -53,11 +56,15 @@ async function bareJob(title: string): Promise<string> {
   return job.jobId;
 }
 
-async function insertDocument(documentId: string, storedPath: string): Promise<void> {
+async function insertDocument(
+  documentId: string,
+  storedPath: string,
+  sha: string = 'a'.repeat(64),
+): Promise<void> {
   await getPool().query(
     `INSERT INTO documents (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status)
-     VALUES ($1, $2, 'manual', 'doc.txt', 'text/plain', repeat('a', 64), 12, $3, 'extracted')`,
-    [documentId, BUSINESS, storedPath],
+     VALUES ($1, $2, 'manual', 'doc.txt', 'text/plain', $4, 12, $3, 'extracted')`,
+    [documentId, BUSINESS, storedPath, sha],
   );
 }
 
@@ -337,12 +344,13 @@ describe('executeErasure', () => {
   });
 
   /**
-   * I2: only three of the twelve statements had any coverage before this
-   * test — deleting any of the other nine lines left the whole suite green.
-   * One row seeded for every statement; removing any single line from
-   * `executeErasure` must make this fail.
+   * I2: only three of the statements had any coverage before this test —
+   * deleting any of the other lines left the whole suite green. One row
+   * seeded for every statement; removing any single line from
+   * `executeErasure` must make this fail. Thirteen since the signed-approval
+   * scrub of spec §5.1.1 was implemented (final review, N3).
    */
-  it('touches every one of the twelve statements — deletes vanish, scrubs stay and empty', async () => {
+  it('touches every one of the thirteen statements — deletes vanish, scrubs stay and empty', async () => {
     const jobId = await bareJob('twelve-statements');
 
     const documentId = `DOC-${ulid()}`;
@@ -365,12 +373,43 @@ describe('executeErasure', () => {
        VALUES ($1, $2, $3, 'proposed', '{}', 'test-model', 'v1', '', $4)`,
       [proposalId, BUSINESS, readingId, jobId],
     );
+    const unsignedApproval = `AP-${ulid()}`;
     await getPool().query(
       `INSERT INTO approval_requests
          (approval_id, business_id, job_id, action_class, summary, detail, risk,
           proposed_tool, proposed_input, input_hash, expires_at)
        VALUES ($1, $2, $3, 'email.reply', 'x', 'x', '{}', 'mail.send', '{}', 'h', $4)`,
-      [`AP-${ulid()}`, BUSINESS, jobId, new Date(Date.now() + 3600_000).toISOString()],
+      [unsignedApproval, BUSINESS, jobId, new Date(Date.now() + 3600_000).toISOString()],
+    );
+    // The thirteenth statement: an approval a signature points at is emptied
+    // and kept, not deleted (spec §5.1.1). The signature hangs off a SECOND
+    // document, one this plan does not name, so the signed-document refusal
+    // is not what is being exercised here.
+    const signedApproval = `AP-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO approval_requests
+         (approval_id, business_id, job_id, action_class, summary, detail, risk,
+          proposed_tool, proposed_input, input_hash, expires_at)
+       VALUES ($1, $2, $3, 'email.reply', $5, $5, '{}', 'mail.send', '{}', 'h2', $4)`,
+      [
+        signedApproval,
+        BUSINESS,
+        jobId,
+        new Date(Date.now() + 3600_000).toISOString(),
+        SIGNED_SECRET,
+      ],
+    );
+    const otherDocument = `DOC-${ulid()}`;
+    await insertDocument(otherDocument, `nowhere/${otherDocument}.txt`, 'b'.repeat(64));
+    await recordSignature(
+      {
+        signatureId: `SIG-${ulid()}`,
+        documentId: otherDocument,
+        signedSha256: 'e'.repeat(64),
+        approvalId: signedApproval,
+        signedBy: 'owner',
+      },
+      { businessId: BUSINESS },
     );
     await getPool().query(
       `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text)
@@ -410,21 +449,27 @@ describe('executeErasure', () => {
     };
 
     const outcome = await executeErasure(plan, { businessId: BUSINESS });
-    const byTable = new Map(outcome.deleted.map((item) => [item.table, item]));
+    // Keyed by table AND action: `approval_requests` now reports both a
+    // delete and a scrub, and a map keyed by table alone would silently let
+    // one stand in for the other.
+    const byStatement = new Map(
+      outcome.deleted.map((item) => [`${item.table}:${item.action}`, item]),
+    );
 
-    expect(byTable.get('memories')).toEqual({ table: 'memories', action: 'delete', count: 1 });
-    expect(byTable.get('document_artifacts')).toEqual({ table: 'document_artifacts', action: 'delete', count: 1 });
-    expect(byTable.get('document_readings')).toEqual({ table: 'document_readings', action: 'delete', count: 1 });
-    expect(byTable.get('proposals')).toEqual({ table: 'proposals', action: 'delete', count: 1 });
-    expect(byTable.get('approval_requests')).toEqual({ table: 'approval_requests', action: 'delete', count: 1 });
-    expect(byTable.get('boss_instructions')).toEqual({ table: 'boss_instructions', action: 'delete', count: 1 });
-    expect(byTable.get('job_plans')).toEqual({ table: 'job_plans', action: 'delete', count: 1 });
-    expect(byTable.get('job_authorizations')).toEqual({ table: 'job_authorizations', action: 'delete', count: 1 });
-    expect(byTable.get('documents')).toEqual({ table: 'documents', action: 'delete', count: 1 });
-    expect(byTable.get('jobs')).toEqual({ table: 'jobs', action: 'scrub', count: 1 });
-    expect(byTable.get('job_steps')?.action).toBe('scrub');
-    expect(byTable.get('job_steps')?.count ?? 0).toBeGreaterThan(0);
-    expect(byTable.get('job_step_results')).toEqual({ table: 'job_step_results', action: 'scrub', count: 1 });
+    expect(byStatement.get('memories:delete')).toEqual({ table: 'memories', action: 'delete', count: 1 });
+    expect(byStatement.get('document_artifacts:delete')).toEqual({ table: 'document_artifacts', action: 'delete', count: 1 });
+    expect(byStatement.get('document_readings:delete')).toEqual({ table: 'document_readings', action: 'delete', count: 1 });
+    expect(byStatement.get('proposals:delete')).toEqual({ table: 'proposals', action: 'delete', count: 1 });
+    expect(byStatement.get('approval_requests:delete')).toEqual({ table: 'approval_requests', action: 'delete', count: 1 });
+    expect(byStatement.get('approval_requests:scrub')).toEqual({ table: 'approval_requests', action: 'scrub', count: 1 });
+    expect(byStatement.get('boss_instructions:delete')).toEqual({ table: 'boss_instructions', action: 'delete', count: 1 });
+    expect(byStatement.get('job_plans:delete')).toEqual({ table: 'job_plans', action: 'delete', count: 1 });
+    expect(byStatement.get('job_authorizations:delete')).toEqual({ table: 'job_authorizations', action: 'delete', count: 1 });
+    expect(byStatement.get('documents:delete')).toEqual({ table: 'documents', action: 'delete', count: 1 });
+    expect(byStatement.get('jobs:scrub')).toEqual({ table: 'jobs', action: 'scrub', count: 1 });
+    expect(byStatement.get('job_steps:scrub')?.action).toBe('scrub');
+    expect(byStatement.get('job_steps:scrub')?.count ?? 0).toBeGreaterThan(0);
+    expect(byStatement.get('job_step_results:scrub')).toEqual({ table: 'job_step_results', action: 'scrub', count: 1 });
 
     // Deleted rows are gone.
     const deletedChecks: Array<[table: string, column: string, value: string]> = [
@@ -440,8 +485,14 @@ describe('executeErasure', () => {
       const { rows } = await getPool().query(`SELECT 1 FROM ${table} WHERE ${column} = $1`, [value]);
       expect(rows, table).toHaveLength(0);
     }
-    const approvals = await getPool().query('SELECT 1 FROM approval_requests WHERE job_id=$1', [jobId]);
-    expect(approvals.rows).toHaveLength(0);
+    const approvals = await getPool().query<{ approval_id: string; summary: string }>(
+      'SELECT approval_id, summary FROM approval_requests WHERE job_id=$1',
+      [jobId],
+    );
+    // The unsigned card is gone; the signed one is still there and emptied.
+    expect(approvals.rows.map((r) => r.approval_id)).toEqual([signedApproval]);
+    expect(approvals.rows.map((r) => r.approval_id)).not.toContain(unsignedApproval);
+    expect(approvals.rows[0]?.summary).not.toContain(SIGNED_SECRET);
     const instructions = await getPool().query('SELECT 1 FROM boss_instructions WHERE job_id=$1', [jobId]);
     expect(instructions.rows).toHaveLength(0);
 
@@ -719,6 +770,127 @@ describe('executeErasure', () => {
         orphanProposal,
       ]);
       expect(rows.rows).toHaveLength(0);
+    });
+  });
+
+  /**
+   * Spec §5.1.1's one conditional: `approval_requests` is deleted **unless a
+   * signature points at it, and then it is scrubbed**.
+   *
+   * A signature says "this person, at this time, THROUGH THIS APPROVAL,
+   * accepted the document". Deleting the approval out from under it leaves
+   * the one row recording a human act pointing at nothing — the same ethic
+   * migration 020 already encodes by making the signature survive its
+   * document's deletion with `ON DELETE RESTRICT`. The content still goes;
+   * the row stays.
+   *
+   * The document behind the signature is deliberately one the anchor does NOT
+   * reach, so the signed-document refusal is not what this measures.
+   */
+  describe('an approval a signature points at', () => {
+    async function approvalFor(jobId: string | null, identifier: string): Promise<string> {
+      const approvalId = `AP-${ulid()}`;
+      await getPool().query(
+        `INSERT INTO approval_requests
+           (approval_id, business_id, job_id, action_class, summary, detail, risk,
+            proposed_tool, proposed_input, input_hash, expires_at, edited_input,
+            decision_note, diff_vs_norm, artifacts)
+         VALUES ($1, $2, $3, 'email.reply', $4, $5, $6, 'mail.send', $7, $8, $9, $10, $11, $12, $13)`,
+        [
+          approvalId,
+          BUSINESS,
+          jobId,
+          `שליחת מייל אל ${identifier}`,
+          `הגוף המלא אל ${identifier}`,
+          JSON.stringify({ band: 'sensitive', note: identifier }),
+          JSON.stringify({ to: identifier }),
+          `hash-${approvalId}`,
+          new Date(Date.now() + 3600_000).toISOString(),
+          JSON.stringify({ to: identifier, body: identifier }),
+          `הבעלים כתב: ${identifier}`,
+          `חריגה לעומת ${identifier}`,
+          JSON.stringify([{ name: identifier }]),
+        ],
+      );
+      return approvalId;
+    }
+
+    it('is scrubbed and kept, while an unsigned one beside it is deleted', async () => {
+      const jobId = await bareJob(`מייל אל ${RONIT}`);
+      const signedApproval = await approvalFor(jobId, RONIT);
+      const unsignedApproval = await approvalFor(jobId, RONIT);
+
+      // A document the contact anchor cannot reach, so the signed-DOCUMENT
+      // refusal never fires and what is measured here is the approval branch.
+      const elsewhere = `DOC-${ulid()}`;
+      await insertDocument(elsewhere, `nowhere/${elsewhere}.txt`);
+      await recordSignature(
+        {
+          signatureId: `SIG-${ulid()}`,
+          documentId: elsewhere,
+          signedSha256: 'd'.repeat(64),
+          approvalId: signedApproval,
+          signedBy: 'owner',
+        },
+        { businessId: BUSINESS },
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+      expect(plan.refusals).toEqual([]);
+
+      // The preview says both things, separately: one row goes, one is emptied.
+      const item = (action: 'delete' | 'scrub'): number =>
+        plan.items.find((i) => i.table === 'approval_requests' && i.action === action)?.count ?? 0;
+      expect(item('delete')).toBe(1);
+      expect(item('scrub')).toBe(1);
+
+      await executeErasure(plan, { businessId: BUSINESS });
+
+      const rows = await getPool().query<{
+        approval_id: string;
+        summary: string;
+        detail: string;
+        proposed_input: unknown;
+        edited_input: unknown;
+        decision_note: string | null;
+        diff_vs_norm: string | null;
+        artifacts: unknown;
+        risk: unknown;
+      }>(
+        `SELECT approval_id, summary, detail, proposed_input, edited_input,
+                decision_note, diff_vs_norm, artifacts, risk
+           FROM approval_requests WHERE business_id = $1`,
+        [BUSINESS],
+      );
+
+      // The unsigned one is gone; the signed one is still there.
+      expect(rows.rows.map((r) => r.approval_id)).toEqual([signedApproval]);
+      expect(rows.rows.map((r) => r.approval_id)).not.toContain(unsignedApproval);
+
+      // And it holds nothing to read. Every content column spec §5.1 names.
+      const kept = rows.rows[0];
+      if (kept === undefined) throw new Error('unreachable');
+      for (const value of [
+        kept.summary,
+        kept.detail,
+        JSON.stringify(kept.proposed_input),
+        JSON.stringify(kept.edited_input),
+        kept.decision_note ?? '',
+        kept.diff_vs_norm ?? '',
+        JSON.stringify(kept.artifacts),
+        JSON.stringify(kept.risk),
+      ]) {
+        expect(value).not.toContain(RONIT);
+      }
+
+      // The signature itself survives, still pointing at a row that exists.
+      const signature = await getPool().query('SELECT 1 FROM signatures WHERE approval_id = $1', [
+        signedApproval,
+      ]);
+      expect(signature.rows).toHaveLength(1);
     });
   });
 
