@@ -64,6 +64,80 @@ export interface ErasurePlan {
 export const LIVE_PHASES: readonly string[] = ['execute', 'await_approval'];
 
 /**
+ * The `approval_requests` rows an erasure destroys, as ONE predicate.
+ *
+ * **Why the second arm exists (final review, N1).** `approval_requests.job_id`
+ * is TEXT with no NOT NULL and no foreign key (001_spine.sql), and the
+ * production path that produces a NULL is real: `GateContext.jobId` is
+ * `string | null`, `evaluateToolCall` writes `jobId: ctx.jobId ?? null` into
+ * `enqueueApproval`, and `gate-hook.ts` carries the same nullable id for the
+ * SDK path that has no job row. Such a card holds the recipient address and
+ * the whole message body in `summary`, `detail`, `proposed_input` and
+ * `edited_input` — and it closes over to no job, so `job_id = ANY($2)` can
+ * never reach it. The contact search above found it and the `job_id IS NOT
+ * NULL` filter discarded it: the plan listed nothing and the row survived.
+ *
+ * **Restricted to `job_id IS NULL`, and that is a positive condition, not a
+ * leftover.** A card that HAS a job is already reached through that job — the
+ * contact search adds its `job_id` to `jobIds`, and if the owner chose to keep
+ * that job the card is kept with it. Widening the content arm past the orphan
+ * shape would destroy the cards of a job the owner explicitly kept, which is
+ * the opposite failure. The orphan is the only row with no other way in.
+ *
+ * **Two anchor shapes close it; the third cannot.** A contact anchor matches
+ * the four content columns, exactly as the contact search does. A window
+ * anchor matches `approval_requests.created_at` inside the window, exactly as
+ * the `jobs` search does — an orphan card raised in that window is content
+ * from that window, and the window anchor already takes every job created in
+ * it regardless of content. A DOCUMENT anchor has no closure available and is
+ * deliberately given none: `approval_requests` carries no document reference
+ * of any kind, and an orphan card is by definition not reachable through the
+ * proposals/readings chain either, so there is no honest predicate to write.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds, `$3` the contact
+ * LIKE pattern or NULL, `$4`/`$5` the window bounds or NULL. Built by
+ * `approvalRequestParams` so the preview and the destruction cannot differ in
+ * values any more than they can differ in text.
+ */
+const APPROVAL_REQUESTS_MATCHED = `business_id = $1
+  AND (job_id = ANY ($2)
+    OR (job_id IS NULL
+        AND (($3::text IS NOT NULL
+              AND (coalesce(proposed_input::text, '') ILIKE $3 ESCAPE '\'
+                OR coalesce(edited_input::text, '')  ILIKE $3 ESCAPE '\'
+                OR summary ILIKE $3 ESCAPE '\'
+                OR detail  ILIKE $3 ESCAPE '\'))
+          OR ($4::timestamptz IS NOT NULL
+              AND created_at >= $4::timestamptz
+              AND created_at <  $5::timestamptz))))`;
+
+/** Every `approval_requests` row this anchor reaches. Used by both sites. */
+export const APPROVAL_REQUESTS_ERASED_PREDICATE = APPROVAL_REQUESTS_MATCHED;
+
+/**
+ * The five parameters `APPROVAL_REQUESTS_ERASED_PREDICATE` takes, derived
+ * from the anchor the plan already carries.
+ *
+ * Exported so the executor derives them from `plan.anchor` with this same
+ * function rather than rebuilding the pattern by hand — the `proposals` pair
+ * agrees in text, parameters AND values, and this one has to agree the same
+ * way or the fix reintroduces the defect it closes one layer up.
+ */
+export function approvalRequestParams(
+  businessId: string,
+  jobIds: readonly string[],
+  anchor: ErasureAnchor,
+): unknown[] {
+  return [
+    businessId,
+    jobIds,
+    anchor.kind === 'contact' ? `%${likeLiteral(anchor.identifier)}%` : null,
+    anchor.kind === 'window' ? anchor.fromIso : null,
+    anchor.kind === 'window' ? anchor.toIso : null,
+  ];
+}
+
+/**
  * The `proposals` rows an erasure destroys, as ONE predicate.
  *
  * Scoped by `reading_id` through the erased documents as well as by `job_id`
@@ -152,6 +226,9 @@ export async function buildErasurePlan(
       'job_id',
     )) jobIds.add(jobId);
 
+    // `job_id IS NOT NULL` because this query derives JOB ids and a NULL is
+    // not one. The orphan card it skips is not lost: it is matched directly,
+    // by its own content, in `APPROVAL_REQUESTS_ERASED_PREDICATE` below.
     for (const jobId of await idsFrom(
       db,
       `SELECT DISTINCT job_id FROM approval_requests
@@ -328,7 +405,7 @@ export async function buildErasurePlan(
     }
   }
 
-  const items = await countItems(db, businessId, jobList, documentList, memoryIds);
+  const items = await countItems(db, businessId, anchor, jobList, documentList, memoryIds);
 
   return {
     anchor,
@@ -352,6 +429,7 @@ export async function buildErasurePlan(
 async function countItems(
   db: Queryable,
   businessId: string,
+  anchor: ErasureAnchor,
   jobIds: string[],
   documentIds: string[],
   memoryIds: string[],
@@ -404,9 +482,8 @@ async function countItems(
     await one(
       'approval_requests',
       'delete',
-      `SELECT count(*)::text AS n FROM approval_requests
-        WHERE business_id = $1 AND job_id = ANY ($2)`,
-      [businessId, jobIds],
+      `SELECT count(*)::text AS n FROM approval_requests WHERE ${APPROVAL_REQUESTS_ERASED_PREDICATE}`,
+      approvalRequestParams(businessId, jobIds, anchor),
     ),
     await one(
       'boss_instructions',

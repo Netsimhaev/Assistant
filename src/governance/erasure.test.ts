@@ -594,6 +594,135 @@ describe('executeErasure', () => {
   });
 
   /**
+   * The orphan shapes — a row whose `job_id` is NULL, in the two tables that
+   * allow one.
+   *
+   * `approval_requests.job_id` is TEXT with no NOT NULL and no foreign key
+   * (001_spine.sql), and the production path that produces the shape is real:
+   * `GateContext.jobId` is `string | null`, `evaluateToolCall` writes
+   * `jobId: ctx.jobId ?? null` into `enqueueApproval`, and `gate-hook.ts`
+   * carries the same nullable id for the SDK path that has no job row. Such a
+   * card holds the recipient address and the whole message body in `summary`,
+   * `detail` and `proposed_input`, and it closes over to no job at all — so
+   * nothing scoped by `job_id = ANY(...)` can ever reach it. Before this, the
+   * plan did not even LIST it: the search found it and the `job_id IS NOT
+   * NULL` filter discarded it. Silence plus survival, which is the worst
+   * shape of this branch's recurring family.
+   *
+   * `proposals.job_id` became nullable in migration 018 and `ON DELETE SET
+   * NULL` still produces one. That side is already correct — it is reached
+   * through `reading_id` — but nothing named it, which is exactly the reason
+   * to name it: a test that says "a row with a NULL job id still gets erased"
+   * makes the next reader ask the same question about the next table.
+   *
+   * Both halves assert the same thing twice, deliberately: the plan LISTS the
+   * row (count > 0) and the executor DELETES it. Listing without deleting is
+   * the failure this is here for.
+   */
+  describe('a row whose job_id is NULL', () => {
+    /** An approval card with no job behind it, carrying the anchor verbatim. */
+    async function orphanApproval(identifier: string): Promise<string> {
+      const approvalId = `AP-${ulid()}`;
+      await getPool().query(
+        `INSERT INTO approval_requests
+           (approval_id, business_id, job_id, action_class, summary, detail, risk,
+            proposed_tool, proposed_input, input_hash, expires_at)
+         VALUES ($1, $2, NULL, 'email.reply', $3, $4, '{}', 'mail.send', $5, $6, $7)`,
+        [
+          approvalId,
+          BUSINESS,
+          `שליחת מייל אל ${identifier}`,
+          `הגוף המלא של ההודעה אל ${identifier}`,
+          JSON.stringify({ to: identifier, body: `שלום ${identifier}` }),
+          `hash-${approvalId}`,
+          new Date(Date.now() + 3600_000).toISOString(),
+        ],
+      );
+      return approvalId;
+    }
+
+    const countOf = (plan: ErasurePlan, table: string, action: 'delete' | 'scrub'): number =>
+      plan.items.find((item) => item.table === table && item.action === action)?.count ?? 0;
+
+    it('an orphan approval_requests row is listed by a contact plan and deleted by the executor', async () => {
+      const mine = await orphanApproval(RONIT);
+      const theirs = await orphanApproval('avi@gamma-lift.example');
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      // Listed. Without this the owner confirms a preview that never
+      // mentioned the row holding the address and the message body.
+      expect(countOf(plan, 'approval_requests', 'delete')).toBe(1);
+
+      await executeErasure(plan, { businessId: BUSINESS });
+
+      const survivors = await getPool().query<{ approval_id: string }>(
+        'SELECT approval_id FROM approval_requests WHERE business_id=$1',
+        [BUSINESS],
+      );
+      // The other direction in the same assertion: a predicate that swept
+      // every orphan card would fail here, not pass.
+      expect(survivors.rows.map((r) => r.approval_id)).toEqual([theirs]);
+      expect(survivors.rows.map((r) => r.approval_id)).not.toContain(mine);
+    });
+
+    it('an orphan approval_requests row created inside a window is listed and deleted', async () => {
+      const inside = await orphanApproval(RONIT);
+      const outside = await orphanApproval('avi@gamma-lift.example');
+      await getPool().query(
+        `UPDATE approval_requests SET created_at = now() - interval '30 days' WHERE approval_id = $1`,
+        [outside],
+      );
+
+      const plan = await buildErasurePlan(
+        {
+          kind: 'window',
+          fromIso: new Date(Date.now() - 3600_000).toISOString(),
+          toIso: new Date(Date.now() + 3600_000).toISOString(),
+        },
+        { businessId: BUSINESS },
+      );
+
+      expect(countOf(plan, 'approval_requests', 'delete')).toBe(1);
+
+      await executeErasure(plan, { businessId: BUSINESS });
+
+      const survivors = await getPool().query<{ approval_id: string }>(
+        'SELECT approval_id FROM approval_requests WHERE business_id=$1',
+        [BUSINESS],
+      );
+      expect(survivors.rows.map((r) => r.approval_id)).toEqual([outside]);
+      expect(survivors.rows.map((r) => r.approval_id)).not.toContain(inside);
+    });
+
+    it('an orphan proposals row on an erased reading is listed and deleted', async () => {
+      const documentId = `DOC-${ulid()}`;
+      await insertDocument(documentId, `nowhere/${documentId}.txt`);
+      const readingId = `READ-${ulid()}`;
+      await insertReading(readingId, documentId, `brief-${ulid()}`);
+      const orphanProposal = `PROP-${ulid()}`;
+      await insertProposal(orphanProposal, readingId, null);
+
+      const plan = await buildErasurePlan(
+        { kind: 'document', documentId },
+        { businessId: BUSINESS },
+      );
+
+      expect(countOf(plan, 'proposals', 'delete')).toBe(1);
+
+      await executeErasure(plan, { businessId: BUSINESS });
+
+      const rows = await getPool().query('SELECT 1 FROM proposals WHERE proposal_id=$1', [
+        orphanProposal,
+      ]);
+      expect(rows.rows).toHaveLength(0);
+    });
+  });
+
+  /**
    * I3 (round 1 residual, now closed): an `appendAudit` failure after the
    * database transaction and file deletions have already committed must not
    * be reported as though nothing happened. Same forced-failure harness as

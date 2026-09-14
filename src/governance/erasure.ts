@@ -32,7 +32,12 @@ import { getPool } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { ErasureItem, ErasurePlan } from './erasure-plan.js';
-import { LIVE_PHASES, PROPOSALS_ERASED_PREDICATE } from './erasure-plan.js';
+import {
+  APPROVAL_REQUESTS_ERASED_PREDICATE,
+  LIVE_PHASES,
+  PROPOSALS_ERASED_PREDICATE,
+  approvalRequestParams,
+} from './erasure-plan.js';
 
 /** Thrown when a plan carrying a refusal is handed to the executor, or when a
  * job the plan touches turns out to be live by the time the transaction
@@ -161,7 +166,16 @@ export async function executeErasure(
     );
     await del('document_readings', 'DELETE FROM document_readings WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]);
     await del('document_artifacts', 'DELETE FROM document_artifacts WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]);
-    await del('approval_requests', 'DELETE FROM approval_requests WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
+    // The same constant and the same five parameter VALUES the preview
+    // counted — derived from `plan.anchor` by the plan builder's own
+    // function, never rebuilt here. An orphan card (`job_id IS NULL`) holds
+    // the address and the message body and closes over to no job, so
+    // `job_id = ANY($2)` alone left it listed nowhere and deleted nowhere.
+    await del(
+      'approval_requests',
+      `DELETE FROM approval_requests WHERE ${APPROVAL_REQUESTS_ERASED_PREDICATE}`,
+      approvalRequestParams(businessId, jobIds, plan.anchor),
+    );
     await del('boss_instructions', 'DELETE FROM boss_instructions WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
