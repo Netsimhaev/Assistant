@@ -32,7 +32,7 @@ import { getPool } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { ErasureItem, ErasurePlan } from './erasure-plan.js';
-import { LIVE_PHASES } from './erasure-plan.js';
+import { LIVE_PHASES, PROPOSALS_ERASED_PREDICATE } from './erasure-plan.js';
 
 /** Thrown when a plan carrying a refusal is handed to the executor, or when a
  * job the plan touches turns out to be live by the time the transaction
@@ -149,22 +149,14 @@ export async function executeErasure(
     // Deleted: rows whose whole existence is the content. `proposals` runs
     // before `document_readings` — see the docblock above — so the explicit
     // delete, not the reading's cascade, is what removes it and what gets
-    // credited with removing it. Scoped by `reading_id` through the erased
-    // documents as well as by `job_id` — identical to `countItems` in
-    // `erasure-plan.ts` and for the same reason (fix round 2, N1/Residual 2):
-    // a proposal on a reading of a document being erased is destroyed by the
-    // cascade regardless of whose job it belongs to, including a job outside
-    // `jobIds` and a legacy proposal whose `job_id` is NULL.
+    // credited with removing it. The predicate is `PROPOSALS_ERASED_PREDICATE`
+    // itself, the same constant `countItems` interpolates, with the same
+    // three parameters in the same order: the preview and the destruction
+    // cannot drift here because there is only one of them.
     await del('memories', 'DELETE FROM memories WHERE business_id=$1 AND memory_id = ANY($2)', [businessId, memoryIds]);
     await del(
       'proposals',
-      `DELETE FROM proposals
-        WHERE business_id=$1
-          AND (job_id = ANY($2)
-            OR reading_id IN (
-                 SELECT reading_id FROM document_readings
-                  WHERE business_id=$1 AND document_id = ANY($3)
-               ))`,
+      `DELETE FROM proposals WHERE ${PROPOSALS_ERASED_PREDICATE}`,
       [businessId, jobIds, documentIds],
     );
     await del('document_readings', 'DELETE FROM document_readings WHERE business_id=$1 AND document_id = ANY($2)', [businessId, documentIds]);
