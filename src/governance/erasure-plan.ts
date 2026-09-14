@@ -299,6 +299,16 @@ export async function buildErasurePlan(
   }
 
   // Documents reached through the jobs that read them.
+  //
+  // **Discovered from the PRE-exclusion `jobIds`, and the kept jobs are
+  // subtracted afterwards** (final review, N5). So "keep job J" preserves J's
+  // plans, authorizations, instructions and title, while J's document and J's
+  // memories are still destroyed. That is deliberate — a keep is a keep on
+  // the item named, not a transitive shield over everything that item touched
+  // — and the preview is honest about it: both are counted and listed before
+  // the owner confirms. It is written down because a reader of the keep
+  // button will not assume it, and spec §6 is a promise about not being
+  // surprised. The same note applies to the memory query below.
   if (jobIds.size > 0) {
     for (const documentId of await idsFrom(
       db,
@@ -335,6 +345,9 @@ export async function buildErasurePlan(
   }
 
   // Memories: by subject, by body, by source — and by the jobs above.
+  // `jobIds` here is still the pre-exclusion set; see the note at the
+  // document discovery above for why keeping a job does not keep its
+  // memories.
   const memoryRows =
     anchor.kind === 'contact'
       ? await db.query<{ memory_id: string }>(

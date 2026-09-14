@@ -874,6 +874,14 @@ function anchorFromJson(raw: string | null): ErasureAnchor | null {
  * would make an identical world refuse at random — a control that fires when
  * nothing happened teaches the owner to click past it. Sorting first means a
  * difference in the hash is a difference in *what the plan covers*.
+ *
+ * For the same reason `excluded` is reduced to `itemKind:itemId` and its
+ * `keptAt` and `note` are **display-only, deliberately outside the hash**: a
+ * kept item's id is already subtracted from `jobIds`/`documentIds`/
+ * `memoryIds` before the plan is returned, so a change to *when* or *why*
+ * something was kept cannot move a single row the executor touches. Editing a
+ * note between the preview and the confirm re-renders identically, which is
+ * the right outcome.
  */
 function planFingerprint(plan: ErasurePlan): string {
   return canonicalHash({

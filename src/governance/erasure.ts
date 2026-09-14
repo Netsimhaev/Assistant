@@ -297,6 +297,16 @@ export async function executeErasure(
   // Real counts, not the preview's: the whole point of this row is to
   // survive as the one record of what happened, and what happened is what
   // the statements above actually reported.
+  //
+  // **One row per erasure, deliberately — and a documented deviation from the
+  // spec** (final review, N9). Spec §7 says a file-deletion failure is
+  // recorded as a SEPARATE audit row; it is folded into this one's `reason`
+  // instead (`N קבצים לא נמחקו מהדיסק`), with the paths shown on screen. One
+  // row per erasure is the better shape — a reader counting erasures should
+  // not have to know which of two rows is the erasure and which is a footnote
+  // on it — but the deviation was never written down anywhere, and a spec
+  // claiming a row the code does not write is the same defect as a control
+  // that overstates itself.
   const total = results.reduce((sum, item) => sum + item.count, 0);
 
   try {
