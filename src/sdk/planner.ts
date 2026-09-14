@@ -5,6 +5,7 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import { READ_ONLY_CLASS_LABEL, capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
 import { REFINEMENT_RULES } from '../policy/classify.js';
+import { renderLocalToolContracts } from '../orchestrator/local-tools.js';
 
 export interface PlanRequest {
   bundle: PolicyBundle;
@@ -82,6 +83,14 @@ export function buildPlannerPrompt(request: PlanRequest): string {
     // that trusts it writes a step the gate reclassifies and the door
     // refuses. Rendered from `REFINEMENT_RULES`, which lives beside the
     // function that enforces them, so the two cannot drift.
+    // Third instance of the same failure: the catalogue names a tool and says
+    // nothing about how to call it, and the model fills the gap plausibly and
+    // wrongly. Rendered from the constant beside the handlers that enforce it.
+    '# איך לקרוא לכלים המקומיים שממומשים',
+    'לכלים האלה יש מימוש אמיתי, והמטען חייב להיות בדיוק בצורה הזו — צורה אחרת תיפסל:',
+    renderLocalToolContracts(),
+    'כל כלי מקומי אחר עדיין אינו ממומש: אפשר לתכנן אותו, אך הוא לא יבצע דבר.',
+    '',
     '# מחלקות שהמטען קובע',
     'עמודת המחלקה בקטלוג מציגה את מחלקת הבסיס. לארבעה כלים המטען שכתבת הוא שקובע בפועל,',
     'ולכן קבע את `expectedActionClass` לפי המטען שכתבת ולא לפי העמודה:',

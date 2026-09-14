@@ -48,22 +48,49 @@ describe('the authorisation boundary this sub-project drew', () => {
     expect(PRODUCTION_SOURCES.length).toBeGreaterThan(50);
   });
 
-  it('has exactly one writer of job_authorizations', () => {
+  it('has exactly one writer that can grant job_authorizations', () => {
     // The security core: standing authorisation stands in for a human
     // approval, and a second writer is how an instruction gets forged —
     // written anywhere other than the one place that first checks the job's
     // own stamped provenance (`grantAuthorization` in
     // `src/governance/authorization.ts`).
-    // Every write, not only the literal `INSERT INTO`. An
+    // Every granting write, not only the literal `INSERT INTO`. An
     // `UPDATE job_authorizations SET recipients = ...` — precisely the silent
     // widening the migration's primary key was chosen to forbid — passed a
     // substring match on the insert, and so did `INSERT  INTO` with two
     // spaces. `TRUNCATE` stays permitted on purpose: `src/test/db.ts` empties
     // the table between tests, and emptying a table grants nobody anything.
-    const WRITE = /(INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+job_authorizations/i;
-    const writers = PRODUCTION_SOURCES.filter((path) => WRITE.test(readFileSync(path, 'utf8')));
-    expect(writers).toHaveLength(1);
-    expect(writers[0]?.replace(/\\/g, '/')).toMatch(/\/src\/governance\/authorization\.ts$/);
+    // `DELETE FROM` is checked separately below: it can only take an
+    // authorization away, never forge one, so it does not belong in this
+    // count.
+    const GRANT = /(INSERT\s+INTO|UPDATE)\s+job_authorizations/i;
+    const grantors = PRODUCTION_SOURCES.filter((path) => GRANT.test(readFileSync(path, 'utf8')));
+    expect(grantors).toHaveLength(1);
+    expect(grantors[0]?.replace(/\\/g, '/')).toMatch(/\/src\/governance\/authorization\.ts$/);
+  });
+
+  it('has exactly one writer that can delete job_authorizations', () => {
+    // A `DELETE FROM job_authorizations` cannot forge an authorization the
+    // way `INSERT`/`UPDATE` can — it only removes one that already stands —
+    // but a row disappearing from under a job in flight is still worth being
+    // able to name a single source for. Today: the erasure executor, which
+    // deletes exactly what an `ErasurePlan` lists and nothing it does not.
+    const DELETE = /DELETE\s+FROM\s+job_authorizations/i;
+    const deleters = PRODUCTION_SOURCES.filter((path) => DELETE.test(readFileSync(path, 'utf8')));
+    expect(deleters).toHaveLength(1);
+    expect(deleters[0]?.replace(/\\/g, '/')).toMatch(/\/src\/governance\/erasure\.ts$/);
+
+    // The one-grant-per-job primary key (migration 015) was ALSO the control
+    // against silent widening — `AuthorizationAlreadyGrantedError` exists
+    // because an `INSERT ... ON CONFLICT DO UPDATE` would let a second grant
+    // widen the first without leaving a trace of what was originally asked
+    // for. A module that can both delete a row and call `grantAuthorization`
+    // turns that into a two-step widening the key no longer forbids: delete,
+    // then regrant with a wider `recipients` list. None of today's deleters
+    // may also grant.
+    for (const path of deleters) {
+      expect(readFileSync(path, 'utf8'), path).not.toMatch(/grantAuthorization\(/);
+    }
   });
 
   it('has no module under src/documents/ importing the authorisation module', () => {

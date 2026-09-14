@@ -22,6 +22,7 @@ import { loadJob, transition } from './jobs.js';
 import { bindPlanToJob, completedSteps } from './plan-store.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { StepChannelError } from './step-error.js';
+import { runLocalTool } from './local-tools.js';
 import type { Job } from './jobs.js';
 
 /**
@@ -435,12 +436,25 @@ async function performStep(
 ): Promise<StepEffect> {
   if (!needsChannel(step.toolName)) {
     // A local step: nothing leaves the instance, so there is nothing to
-    // connect to. There is no local tool executor either — this returns no
-    // result rather than pretending to have read something — which is why
-    // `crm.read` in a plan yields `null` today. Building that executor is
-    // separate work; what matters here is that a local step is not refused
-    // for lacking a connection it could never need.
-    return { output: null, externalId: null };
+    // connect to — and since 12/09 there is somewhere to send it. `runLocalTool`
+    // performs the tools that have a handler (the memory family) and returns an
+    // explicit `not_implemented` for the rest, which is the honest version of
+    // what this branch used to do silently: return `null` and let the step be
+    // recorded as completed, so a plan that "recalled what we know" proceeded
+    // on nothing and reported success for it.
+    //
+    // `effectiveInput` and not `redactedInput`. Redaction exists to keep the
+    // charter's patterns off the wire, and nothing here reaches a wire; a
+    // memory written from the redacted payload would record the mask instead
+    // of the fact. The gate has already permitted this exact payload, which is
+    // the same reason `performStep` routes the outbound case by it.
+    const output = await runLocalTool(step.toolName, effectiveInput, {
+      jobId: request.job.jobId,
+      businessId: request.job.businessId,
+    });
+    // No `externalId`: nothing outside the instance issued a handle, and
+    // inventing one would tell `verify` it had a far end to ask.
+    return { output, externalId: null };
   }
 
   // Routed by the payload the gate actually judged, not by the one the plan

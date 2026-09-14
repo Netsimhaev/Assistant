@@ -224,14 +224,24 @@ export async function closeVerifiedJobs(
 }
 
 /**
- * The last hop. Its reason is the honest one: the curator was passed through,
- * and there is nothing for it to do until the memory layers exist.
+ * The last hop, and its reason has to stay true as the system grows.
+ *
+ * It used to read "nothing to remember — the memory layers are not built",
+ * which was honest until 12/09 and then was not: the memory store exists, and
+ * a job that ran a `memory.write_*` step has already written what it learned.
+ * The live run of that day closed two jobs with a line saying the opposite of
+ * what they had just done.
+ *
+ * What remains true is narrower and worth saying precisely. There is no
+ * *curator*: nothing reads a finished job and decides, on its own, what about
+ * it is worth keeping. Remembering happens only where a plan asked for it
+ * explicitly, step by step. That is the gap this hop still marks.
  */
 async function closeJob(jobId: string, businessId: string): Promise<void> {
   await transition(jobId, {
     to: 'closed',
     actor: 'orchestrator',
-    reason: 'nothing to remember — the memory layers are not built',
+    reason: 'no curator — a job remembers only what its own steps recorded',
     businessId,
   });
 }

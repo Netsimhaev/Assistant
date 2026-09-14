@@ -13,6 +13,9 @@
  */
 import type { ApprovalRequest } from '../governance/approvals.js';
 import type { DocumentRecord } from '../documents/types.js';
+import type { ErasureAnchor, ErasurePlan } from '../governance/erasure-plan.js';
+import type { ErasureOutcome } from '../governance/erasure.js';
+import type { KeptItem } from '../governance/kept-items.js';
 import type { IntentName } from '../domain/reading.js';
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
@@ -48,7 +51,10 @@ const esc = escapeHtml;
  *
  * `esc` itself is deliberately left alone: many call sites depend on it, and
  * a display field is the only place where dropping characters is the right
- * trade.
+ * trade. The erasure screen's prefilled inputs count as display fields for
+ * the same reason: they are filled from the query string — a link, not
+ * necessarily something the owner typed — and they show the identifier the
+ * owner is about to authorise a destruction against.
  *
  * The set: U+061C ALM, U+200E/U+200F LRM/RLM, U+202A-U+202E (the embedding
  * and override family), U+2066-U+2069 (the isolate family).
@@ -76,6 +82,9 @@ const STYLE = `
   .band-routine { color: #2e7d32; }
   .band-sensitive { color: #ef6c00; }
   .band-anomalous, .band-blocked { color: #c0392b; }
+  /* The one control on any screen here that cannot be undone. It sits beside
+     three buttons that only ask for a preview, and it must not look like them. */
+  button.danger { background: #c0392b; color: #fff; border: 1px solid #8e2a20; font-weight: bold; }
 `;
 
 function page(title: string, body: string): string {
@@ -515,7 +524,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }
@@ -530,4 +539,393 @@ export function renderForbidden(): string {
 
 export function renderServerError(): string {
   return page('שגיאה', '<h1>500</h1><p>אירעה שגיאה. נסה שוב.</p>');
+}
+
+// --- The erasure screen (spec §6, §7). ------------------------------------
+//
+// The one place in the system where a human authorises an irreversible
+// destruction. Two rules shape every line below.
+//
+// **The preview is the truth.** `executeErasure` deletes exactly what its
+// plan lists, so this page must name every table that will be touched and
+// how many rows, before the confirm control is offered at all. A screen that
+// summarised ("a few things about Ronit") would make the owner approve a
+// number they never saw.
+//
+// **Nothing is skipped silently.** A kept item is rendered as kept, with the
+// date it was kept and a one-click revoke, and a refusal replaces the confirm
+// control rather than sitting beside it. An erasure that quietly passed over
+// something would be exactly the silence this codebase keeps stamping out.
+
+/** Hebrew names for the tables, so the owner reads what they are losing. */
+const TABLE_LABELS: Record<string, string> = {
+  memories: 'זיכרונות',
+  documents: 'מסמכים',
+  document_artifacts: 'טקסט שחולץ ממסמכים',
+  document_readings: 'סיכומים',
+  proposals: 'הצעות',
+  approval_requests: 'כרטיסי אישור',
+  boss_instructions: 'לשון הוראות',
+  job_plans: 'תוכניות',
+  job_authorizations: 'הרשאות',
+  jobs: 'כותרות משימה',
+  job_steps: 'שורות מעבר',
+  job_step_results: 'מזהי הודעה מהספק',
+};
+
+/** Hebrew names for what a kept item or a plan entry actually is. */
+const ITEM_KIND_LABELS: Record<string, string> = {
+  document: 'מסמך',
+  memory: 'זיכרון',
+  job: 'משימה',
+};
+
+/**
+ * What the owner typed but has not previewed yet — the entry form's starting
+ * values. A forget command carries an address or a date into this screen
+ * (spec §4.1); nothing else on the page depends on it.
+ */
+export interface ErasurePrefill {
+  identifier?: string;
+  fromIso?: string;
+  toIso?: string;
+  documentId?: string;
+}
+
+export interface ErasureViewModel {
+  csrf: string;
+  anchorLabel: string;
+  /** `null` before an anchor has been chosen: the entry form, and nothing else. */
+  plan: ErasurePlan | null;
+  /**
+   * A fingerprint of the plan shown below, carried into the confirm form.
+   *
+   * Spec §4.4 makes the plan — not the anchor — the unit of authorisation:
+   * the executor removes exactly what the plan lists, and that is what makes
+   * the preview the truth rather than a decoration. The confirm route
+   * rebuilds the plan server-side and compares fingerprints, so a world that
+   * moved between the preview and the click is re-shown rather than
+   * destroyed. Computed by the caller, because deciding what counts as "the
+   * same plan" is logic, not presentation.
+   *
+   * Absent means no confirm is authorised: the form still renders with an
+   * empty hash and the route refuses it, which is the fail-closed direction.
+   */
+  planHash?: string;
+  error?: string;
+  prefill?: ErasurePrefill;
+  /**
+   * Everything the owner has ever said to keep — for the screen that has no
+   * plan and therefore no `plan.excluded` to render.
+   *
+   * Spec §6 says every erasure screen shows what is kept. `plan.excluded`
+   * only holds the kept items THIS anchor happened to reach, so on the entry
+   * screen it says nothing at all, and a keep set last month stayed invisible
+   * until the owner happened to build a preview that reached it. Supplied by
+   * the route from `listKept`, which until now was computed nowhere and read
+   * by nothing outside its own test.
+   */
+  kept?: readonly KeptItem[];
+}
+
+/**
+ * The anchor, carried through every form on the page as one JSON field.
+ *
+ * It is deliberately the *anchor* that travels and never the plan: the
+ * confirm route rebuilds the plan from this, so a browser that edited the
+ * field can only ask for a different preview — never for a deletion of rows
+ * the resolver never selected.
+ */
+function anchorField(anchor: ErasureAnchor): string {
+  return `<input type="hidden" name="anchor" value="${esc(JSON.stringify(anchor))}">`;
+}
+
+/** One "keep this out of the erasure" button for a single item in the plan. */
+function keepControl(
+  model: ErasureViewModel,
+  anchor: ErasureAnchor,
+  kind: string,
+  itemId: string,
+): string {
+  return `<li>${esc(ITEM_KIND_LABELS[kind] ?? kind)} ${escLabel(itemId)}
+           <form method="post" action="/erase/keep" style="display:inline">
+             <input type="hidden" name="csrf" value="${esc(model.csrf)}">
+             ${anchorField(anchor)}
+             <input type="hidden" name="kind" value="${esc(kind)}">
+             <input type="hidden" name="itemId" value="${esc(itemId)}">
+             <input type="text" name="note" size="20" placeholder="למה לשמור? (לא חובה)">
+             <button type="submit">שמור את זה</button>
+           </form></li>`;
+}
+
+/** At most this many ids per kind get their own control; the rest are counted. */
+const MAX_LISTED_ITEMS = 25;
+
+function keepSection(
+  model: ErasureViewModel,
+  anchor: ErasureAnchor,
+  kind: string,
+  ids: readonly string[],
+): string {
+  if (ids.length === 0) return '';
+  const shown = ids.slice(0, MAX_LISTED_ITEMS);
+  const rest =
+    ids.length > shown.length
+      ? `<li class="muted">ועוד ${ids.length - shown.length} פריטים מאותו סוג.</li>`
+      : '';
+  return `<ul>${shown.map((id) => keepControl(model, anchor, kind, id)).join('')}${rest}</ul>`;
+}
+
+/**
+ * The entry form — three shapes, three forms, one per anchor kind (spec §4.2).
+ *
+ * Rendered on the preview page too, so changing the anchor never means going
+ * back to an empty screen. Its submit buttons say "show me", never "delete":
+ * the only control on this page that destroys anything is the one below the
+ * counts the owner has actually read.
+ */
+function erasureEntry(model: ErasureViewModel): string {
+  const prefill = model.prefill ?? {};
+  const token = `<input type="hidden" name="csrf" value="${esc(model.csrf)}">`;
+  return `<div class="card">
+    <h2>מה לשכוח</h2>
+    <form method="post" action="/erase/preview">
+      ${token}
+      <input type="hidden" name="kind" value="contact">
+      <label>כתובת מייל או מספר טלפון
+        <input type="text" name="identifier" value="${escLabel(prefill.identifier ?? '')}" required></label>
+      <button type="submit">הצג מה יימחק</button>
+    </form>
+    <form method="post" action="/erase/preview">
+      ${token}
+      <input type="hidden" name="kind" value="window">
+      <label>משימות שרצו מ־
+        <input type="text" name="fromIso" value="${escLabel(prefill.fromIso ?? '')}" placeholder="2026-09-03T00:00" required></label>
+      <label>ועד
+        <input type="text" name="toIso" value="${escLabel(prefill.toIso ?? '')}" placeholder="2026-09-03T23:59" required></label>
+      <button type="submit">הצג מה יימחק</button>
+    </form>
+    <form method="post" action="/erase/preview">
+      ${token}
+      <input type="hidden" name="kind" value="document">
+      <label>מזהה מסמך
+        <input type="text" name="documentId" value="${escLabel(prefill.documentId ?? '')}" required></label>
+      <button type="submit">הצג מה יימחק</button>
+    </form>
+  </div>`;
+}
+
+/** One kept item, however the screen came by it. */
+interface KeptRowView {
+  itemKind: string;
+  itemId: string;
+  /** `YYYY-MM-DD`; the screen never shows a time. */
+  keptOn: string;
+  note: string | null;
+}
+
+/**
+ * The kept list, with its revoke control, for both erasure screens.
+ *
+ * `anchor` is `null` on the entry screen, and the revoke form then simply
+ * carries no anchor field — `handleEraseKeep` already treats a missing anchor
+ * as "revoke and show the entry screen again", so the control works in both
+ * places without a second route. Written once so the two screens cannot drift
+ * on what "kept" looks like or on whether it can be undone.
+ */
+function keptList(
+  model: ErasureViewModel,
+  anchor: ErasureAnchor | null,
+  rows: readonly KeptRowView[],
+): string {
+  return rows
+    .map(
+      (k) =>
+        `<li>${esc(ITEM_KIND_LABELS[k.itemKind] ?? k.itemKind)} ${escLabel(k.itemId)} — נשמר ב-${esc(k.keptOn)}` +
+        (k.note === null ? '' : ` (${escLabel(k.note)})`) +
+        ` <form method="post" action="/erase/keep" style="display:inline">` +
+        `<input type="hidden" name="csrf" value="${esc(model.csrf)}">` +
+        (anchor === null ? '' : anchorField(anchor)) +
+        `<input type="hidden" name="revoke" value="1">` +
+        `<input type="hidden" name="kind" value="${esc(k.itemKind)}">` +
+        `<input type="hidden" name="itemId" value="${esc(k.itemId)}">` +
+        `<button type="submit">בטל שמירה</button></form></li>`,
+    )
+    .join('');
+}
+
+export function renderErasure(model: ErasureViewModel): string {
+  const { plan } = model;
+  const error = model.error === undefined ? '' : `<p class="error">${esc(model.error)}</p>`;
+
+  if (plan === null) {
+    // Spec §6: what is kept is shown on EVERY erasure screen, not only on the
+    // one whose anchor happened to reach it.
+    const keptHere = keptList(
+      model,
+      null,
+      (model.kept ?? []).map((k) => ({
+        itemKind: k.kind,
+        itemId: k.itemId,
+        keptOn: k.keptAt.toISOString().slice(0, 10),
+        note: k.note,
+      })),
+    );
+    return page(
+      'מחיקה',
+      `<h1>מחיקה</h1>${error}${erasureEntry(model)}` +
+        (keptHere === '' ? '' : `<h2>יישמרו לפי הוראתך</h2><ul>${keptHere}</ul>`) +
+        `<p><a href="/">לכרטיסי האישור</a></p>`,
+    );
+  }
+
+  const rows = plan.items
+    .filter((item) => item.count > 0)
+    .map(
+      (item) =>
+        `<tr><td>${esc(TABLE_LABELS[item.table] ?? item.table)}</td>` +
+        `<td>${item.count}</td>` +
+        `<td>${item.action === 'delete' ? 'יימחק' : 'ינוקה מתוכן'}</td></tr>`,
+    )
+    .join('');
+
+  const nothing = rows === '' ? '<p class="muted">לא נמצא שום דבר שמתאים לעוגן הזה.</p>' : '';
+
+  const refusals = plan.refusals.map((r) => `<p class="error">${escLabel(r.detail)}</p>`).join('');
+
+  const kept = keptList(
+    model,
+    plan.anchor,
+    plan.excluded.map((k) => ({
+      itemKind: k.itemKind,
+      itemId: k.itemId,
+      keptOn: k.keptAt.slice(0, 10),
+      note: k.note,
+    })),
+  );
+
+  // The confirm control exists only when nothing refuses. Offering it beside
+  // a refusal would invite the click the refusal is there to prevent — and
+  // `executeErasure` would throw on it anyway.
+  const confirm =
+    plan.refusals.length > 0
+      ? '<p class="error">המחיקה חסומה עד שהסיבות שלמעלה ייפתרו.</p>'
+      : `<form method="post" action="/erase/confirm">
+           <input type="hidden" name="csrf" value="${esc(model.csrf)}">
+           ${anchorField(plan.anchor)}
+           <input type="hidden" name="planHash" value="${esc(model.planHash ?? '')}">
+           <button type="submit" class="danger">מחק לצמיתות</button>
+         </form>`;
+
+  const excludable =
+    plan.memoryIds.length + plan.documentIds.length + plan.jobIds.length === 0
+      ? ''
+      : `<h2>להוציא פריט מהמחיקה</h2>
+         ${keepSection(model, plan.anchor, 'memory', plan.memoryIds)}
+         ${keepSection(model, plan.anchor, 'document', plan.documentIds)}
+         ${keepSection(model, plan.anchor, 'job', plan.jobIds)}`;
+
+  return page(
+    'מחיקה',
+    `<h1>מחיקה — ${escLabel(model.anchorLabel)}</h1>
+     ${error}
+     ${refusals}
+     <table><tr><th>מה</th><th>כמה</th><th>מה יקרה</th></tr>${rows}</table>
+     ${nothing}
+     ${plan.filePaths.length > 0 ? `<p>${plan.filePaths.length} קבצים יימחקו מהדיסק.</p>` : ''}
+     ${kept === '' ? '' : `<h2>יישמרו לפי הוראתך</h2><ul>${kept}</ul>`}
+     ${excludable}
+     <p class="muted">מסלול הביקורת יישמר — הוא אינו מחזיק שמות, כתובות או תוכן.</p>
+     ${confirm}
+     ${erasureEntry(model)}
+     <p><a href="/">ביטול — חזרה לכרטיסי האישור</a></p>`,
+  );
+}
+
+export interface ErasureDoneViewModel {
+  anchorLabel: string;
+  /**
+   * How many files the plan named — the denominator.
+   *
+   * Without it the page can show `filesRemoved` and nothing else, and "there
+   * were no files to delete" reads exactly like "we failed to delete every
+   * file we named". That second state is the one spec §7 says must be loud,
+   * and it is the shape the relative-path defect took: rows destroyed, bytes
+   * retained, screen clean.
+   */
+  plannedFiles: number;
+  outcome: ErasureOutcome;
+  /**
+   * The erasure committed and the audit row recording it did not. True here
+   * means it HAPPENED — reported as loudly as a failure, and never as one.
+   */
+  auditUnrecorded: boolean;
+}
+
+/**
+ * What was actually destroyed, from the statements' own row counts.
+ *
+ * `filesFailed` is shown in full and in red: those rows are gone and those
+ * files are still on disk, which is the one repairable half of the two
+ * failure modes spec §7 weighs — and it is only repairable if the owner is
+ * told the paths.
+ */
+export function renderErasureDone(model: ErasureDoneViewModel): string {
+  const rows = model.outcome.deleted
+    .filter((item) => item.count > 0)
+    .map(
+      (item) =>
+        `<tr><td>${esc(TABLE_LABELS[item.table] ?? item.table)}</td>` +
+        `<td>${item.count}</td>` +
+        `<td>${item.action === 'delete' ? 'נמחק' : 'נוקה מתוכן'}</td></tr>`,
+    )
+    .join('');
+
+  const gone = model.outcome.filesAlreadyGone;
+
+  // The accounting, always, even when it is all zeros: a number the owner can
+  // check against the preview they just read.
+  const files =
+    `<p>מתוך ${model.plannedFiles} קבצים שהתוכנית מנתה: ` +
+    `${model.outcome.filesRemoved} נמחקו מהדיסק, ` +
+    `${gone.length} כבר לא היו שם, ` +
+    `${model.outcome.filesFailed.length} נכשלו.</p>` +
+    (gone.length === 0
+      ? ''
+      : `<ul class="muted">${gone.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`);
+
+  // Every file the plan named was already missing. Tolerated one at a time;
+  // as a whole run it means the paths were resolved against something other
+  // than where the bytes live, and nothing was actually destroyed on disk.
+  const nothingDeleted =
+    model.plannedFiles > 0 && model.outcome.filesRemoved === 0 && model.outcome.filesFailed.length === 0
+      ? `<p class="error">אף קובץ לא נמחק בפועל — כולם כבר לא היו במקום שהתוכנית ציינה.
+         זה חריג: שורות בסיס הנתונים נמחקו, וכדאי לוודא שהקבצים באמת אינם.</p>`
+      : '';
+
+  const failed =
+    model.outcome.filesFailed.length === 0
+      ? ''
+      : `<p class="error">${model.outcome.filesFailed.length} קבצים נשארו על הדיסק ואיש כבר אינו מצביע עליהם.
+         המחיקה מבסיס הנתונים הושלמה; את הקבצים האלה צריך למחוק ידנית:</p>
+         <ul>${model.outcome.filesFailed.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`;
+
+  const audit = model.auditUnrecorded
+    ? `<p class="error">המחיקה בוצעה במלואה, אבל שורת הביקורת שמתעדת אותה לא נכתבה.
+       המחיקה אינה הפיכה ואינה "לא קרתה" — צריך לשחזר את הרישום ידנית.</p>`
+    : '';
+
+  return page(
+    'נמחק',
+    `<h1>נמחק — ${escLabel(model.anchorLabel)}</h1>
+     ${audit}
+     <table><tr><th>מה</th><th>כמה</th><th>מה קרה</th></tr>${rows}</table>
+     ${files}
+     ${nothingDeleted}
+     ${failed}
+     <p class="muted">מה שכבר יצא החוצה — מייל שנשלח, הודעה שהתקבלה — נמחק מכאן ועדיין קיים
+     אצל הספק ואצל הנמען. המערכת אינה יכולה למחוק אותו שם.</p>
+     <p class="muted">מסלול הביקורת נשמר, עם מספרים בלבד: בלי שמות, בלי כתובות ובלי תוכן.</p>
+     <p><a href="/erase">מחיקה נוספת</a> · <a href="/">לכרטיסי האישור</a></p>`,
+  );
 }

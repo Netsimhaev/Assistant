@@ -32,6 +32,12 @@ export async function resetDatabase(): Promise<void> {
       job_steps,
       job_authorizations,
       jobs,
+      -- Not reached by CASCADE: memories.written_by_job is deliberately not a
+      -- foreign key, because a memory outlives the job that wrote it. That is
+      -- the right call for production, and it means this list has to name the
+      -- table by hand or one test's memories leak into the next.
+      memories,
+      kept_items,
       proposals,
       document_readings,
       document_artifacts,

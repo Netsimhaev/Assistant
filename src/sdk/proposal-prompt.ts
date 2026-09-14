@@ -17,6 +17,7 @@ import { INTENT_MEANING, IntentName, type Reading } from '../domain/reading.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { READ_ONLY_CLASS_LABEL } from '../orchestrator/catalogue.js';
 import { REFINEMENT_RULES } from '../policy/classify.js';
+import { renderLocalToolContracts } from '../orchestrator/local-tools.js';
 
 /**
  * Raised by hand when the *meaning* of the question changes.
@@ -40,7 +41,12 @@ import { REFINEMENT_RULES } from '../policy/classify.js';
 // against the REFINED one, matching the executor, so the payload-refinement
 // rules are stated here. A proposal cached under v3 was produced by a model
 // that would have been rejected by the check as it now stands.
-export const PROPOSAL_PROMPT_VERSION = 'v4';
+//
+// Raised to v5 (12/09): the local tools have a real executor now, and the
+// payload each one requires is stated. A proposal cached under v4 was produced
+// by a model that had to guess the shape -- and the live run showed it guessed
+// plausibly and wrongly.
+export const PROPOSAL_PROMPT_VERSION = 'v5';
 
 /**
  * What each stance means and what it does to `action` (spec §4).
@@ -169,6 +175,10 @@ export function buildProposalSystemPrompt(bundle: PolicyBundle, catalogue: strin
     // too: `proposalProblems` compares the declared class against the REFINED
     // one, so a proposal that trusts the catalogue's base column is rejected.
     // Rendered from the same constant, beside the function that enforces it.
+    '# איך לקרוא לכלים המקומיים שממומשים',
+    'לכלים האלה יש מימוש אמיתי, והמטען חייב להיות בדיוק בצורה הזו — צורה אחרת תיפסל:',
+    renderLocalToolContracts(),
+    '',
     '# מחלקות שהמטען קובע',
     'עמודת המחלקה בקטלוג מציגה את מחלקת הבסיס. לארבעה כלים המטען שכתבת הוא שקובע בפועל,',
     'ולכן קבע את `expectedActionClass` לפי המטען שכתבת ולא לפי העמודה:',
