@@ -240,6 +240,54 @@ describe('the erasure routes', () => {
    * case the rebuild exists for: the screen must refuse, and must say so
    * rather than 500.
    */
+  /**
+   * Spec §6: *"every erasure screen shows what is kept"*.
+   *
+   * The preview screen renders `plan.excluded`, which holds only the kept
+   * items the anchor happened to reach. The ENTRY screen has no anchor and
+   * no plan, and before this it showed nothing kept at all — so a keep the
+   * owner set last month was invisible until they happened to build a preview
+   * that reached it. `listKept` existed for exactly this and had no reader
+   * outside its own test, which is the shape this codebase has a documented
+   * allergy to (`compiled policy has a reader`).
+   *
+   * The kept item here is deliberately one NO anchor on this screen reaches,
+   * so the assertion cannot pass through the preview path by accident.
+   */
+  it('shows what is kept on the entry screen, where there is no plan at all', async () => {
+    const baseUrl = await startServer();
+    const cookie = await signIn(baseUrl);
+    await keepItem(
+      { kind: 'memory', itemId: 'MEM-unreachable-by-any-anchor', note: 'הסיכום מהישיבה' },
+      { businessId: BUSINESS },
+    );
+
+    const res = await fetch(`${baseUrl}/erase`, { headers: { cookie } });
+    const html = await res.text();
+
+    expect(res.status).toBe(200);
+    // No preview on this page at all — this is the entry screen.
+    expect(html).not.toContain('name="planHash"');
+    expect(html).toContain('MEM-unreachable-by-any-anchor');
+    expect(html).toContain('הסיכום מהישיבה');
+    // And the revoke control, so the list is actionable and not decorative.
+    expect(html).toContain('name="revoke" value="1"');
+  });
+
+  /**
+   * The other direction, without which the test above is satisfied by a page
+   * that prints a kept heading unconditionally.
+   */
+  it('says nothing about kept items on the entry screen when nothing is kept', async () => {
+    const baseUrl = await startServer();
+    const cookie = await signIn(baseUrl);
+
+    const html = await (await fetch(`${baseUrl}/erase`, { headers: { cookie } })).text();
+
+    expect(html).not.toContain('name="revoke" value="1"');
+    expect(html).not.toContain('יישמרו לפי הוראתך');
+  });
+
   it('refuses on confirm when a job went live after the preview', async () => {
     const baseUrl = await startServer();
     const { jobId } = await seedRonit();

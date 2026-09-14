@@ -15,6 +15,7 @@ import type { ApprovalRequest } from '../governance/approvals.js';
 import type { DocumentRecord } from '../documents/types.js';
 import type { ErasureAnchor, ErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
+import type { KeptItem } from '../governance/kept-items.js';
 import type { IntentName } from '../domain/reading.js';
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
@@ -613,6 +614,18 @@ export interface ErasureViewModel {
   planHash?: string;
   error?: string;
   prefill?: ErasurePrefill;
+  /**
+   * Everything the owner has ever said to keep — for the screen that has no
+   * plan and therefore no `plan.excluded` to render.
+   *
+   * Spec §6 says every erasure screen shows what is kept. `plan.excluded`
+   * only holds the kept items THIS anchor happened to reach, so on the entry
+   * screen it says nothing at all, and a keep set last month stayed invisible
+   * until the owner happened to build a preview that reached it. Supplied by
+   * the route from `listKept`, which until now was computed nowhere and read
+   * by nothing outside its own test.
+   */
+  kept?: readonly KeptItem[];
 }
 
 /**
@@ -702,14 +715,67 @@ function erasureEntry(model: ErasureViewModel): string {
   </div>`;
 }
 
+/** One kept item, however the screen came by it. */
+interface KeptRowView {
+  itemKind: string;
+  itemId: string;
+  /** `YYYY-MM-DD`; the screen never shows a time. */
+  keptOn: string;
+  note: string | null;
+}
+
+/**
+ * The kept list, with its revoke control, for both erasure screens.
+ *
+ * `anchor` is `null` on the entry screen, and the revoke form then simply
+ * carries no anchor field — `handleEraseKeep` already treats a missing anchor
+ * as "revoke and show the entry screen again", so the control works in both
+ * places without a second route. Written once so the two screens cannot drift
+ * on what "kept" looks like or on whether it can be undone.
+ */
+function keptList(
+  model: ErasureViewModel,
+  anchor: ErasureAnchor | null,
+  rows: readonly KeptRowView[],
+): string {
+  return rows
+    .map(
+      (k) =>
+        `<li>${esc(ITEM_KIND_LABELS[k.itemKind] ?? k.itemKind)} ${escLabel(k.itemId)} — נשמר ב-${esc(k.keptOn)}` +
+        (k.note === null ? '' : ` (${escLabel(k.note)})`) +
+        ` <form method="post" action="/erase/keep" style="display:inline">` +
+        `<input type="hidden" name="csrf" value="${esc(model.csrf)}">` +
+        (anchor === null ? '' : anchorField(anchor)) +
+        `<input type="hidden" name="revoke" value="1">` +
+        `<input type="hidden" name="kind" value="${esc(k.itemKind)}">` +
+        `<input type="hidden" name="itemId" value="${esc(k.itemId)}">` +
+        `<button type="submit">בטל שמירה</button></form></li>`,
+    )
+    .join('');
+}
+
 export function renderErasure(model: ErasureViewModel): string {
   const { plan } = model;
   const error = model.error === undefined ? '' : `<p class="error">${esc(model.error)}</p>`;
 
   if (plan === null) {
+    // Spec §6: what is kept is shown on EVERY erasure screen, not only on the
+    // one whose anchor happened to reach it.
+    const keptHere = keptList(
+      model,
+      null,
+      (model.kept ?? []).map((k) => ({
+        itemKind: k.kind,
+        itemId: k.itemId,
+        keptOn: k.keptAt.toISOString().slice(0, 10),
+        note: k.note,
+      })),
+    );
     return page(
       'מחיקה',
-      `<h1>מחיקה</h1>${error}${erasureEntry(model)}<p><a href="/">לכרטיסי האישור</a></p>`,
+      `<h1>מחיקה</h1>${error}${erasureEntry(model)}` +
+        (keptHere === '' ? '' : `<h2>יישמרו לפי הוראתך</h2><ul>${keptHere}</ul>`) +
+        `<p><a href="/">לכרטיסי האישור</a></p>`,
     );
   }
 
@@ -727,20 +793,16 @@ export function renderErasure(model: ErasureViewModel): string {
 
   const refusals = plan.refusals.map((r) => `<p class="error">${escLabel(r.detail)}</p>`).join('');
 
-  const kept = plan.excluded
-    .map(
-      (k) =>
-        `<li>${esc(ITEM_KIND_LABELS[k.itemKind] ?? k.itemKind)} ${escLabel(k.itemId)} — נשמר ב-${esc(k.keptAt.slice(0, 10))}` +
-        (k.note === null ? '' : ` (${escLabel(k.note)})`) +
-        ` <form method="post" action="/erase/keep" style="display:inline">` +
-        `<input type="hidden" name="csrf" value="${esc(model.csrf)}">` +
-        anchorField(plan.anchor) +
-        `<input type="hidden" name="revoke" value="1">` +
-        `<input type="hidden" name="kind" value="${esc(k.itemKind)}">` +
-        `<input type="hidden" name="itemId" value="${esc(k.itemId)}">` +
-        `<button type="submit">בטל שמירה</button></form></li>`,
-    )
-    .join('');
+  const kept = keptList(
+    model,
+    plan.anchor,
+    plan.excluded.map((k) => ({
+      itemKind: k.itemKind,
+      itemId: k.itemId,
+      keptOn: k.keptAt.slice(0, 10),
+      note: k.note,
+    })),
+  );
 
   // The confirm control exists only when nothing refuses. Offering it beside
   // a refusal would invite the click the refusal is there to prevent — and

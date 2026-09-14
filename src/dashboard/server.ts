@@ -41,7 +41,7 @@ import {
   executeErasure,
 } from '../governance/erasure.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
-import { keepItem, revokeKeep } from '../governance/kept-items.js';
+import { keepItem, listKept, revokeKeep } from '../governance/kept-items.js';
 import type { KeptItemKind } from '../governance/kept-items.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
@@ -915,13 +915,21 @@ function prefillFor(anchor: ErasureAnchor): ErasurePrefill {
   }
 }
 
-/** The entry form on its own, with an optional sentence saying what went wrong. */
-function sendErasureEntry(
+/**
+ * The entry form on its own, with an optional sentence saying what went wrong.
+ *
+ * It also carries the kept list. Spec §6 says every erasure screen shows what
+ * is kept, and this screen has no plan and so no `plan.excluded` to render —
+ * a keep the owner set last month was invisible here until they happened to
+ * build a preview that reached it.
+ */
+async function sendErasureEntry(
   res: ServerResponse,
+  businessId: string,
   session: Session,
   status: number,
-  error?: string,
-): void {
+  overrides: { error?: string; prefill?: ErasurePrefill } = {},
+): Promise<void> {
   sendHtml(
     res,
     status,
@@ -929,7 +937,9 @@ function sendErasureEntry(
       csrf: issueCsrfToken(session.sessionId),
       anchorLabel: '',
       plan: null,
-      ...(error === undefined ? {} : { error }),
+      kept: await listKept({ businessId }),
+      ...(overrides.error === undefined ? {} : { error: overrides.error }),
+      ...(overrides.prefill === undefined ? {} : { prefill: overrides.prefill }),
     }),
   );
 }
@@ -1002,16 +1012,7 @@ async function handleEraseGet(
   const prefill: ErasurePrefill = /^\d{4}-\d{2}-\d{2}$/.test(onDate)
     ? { fromIso: `${onDate}T00:00`, toIso: `${onDate}T23:59` }
     : {};
-  sendHtml(
-    res,
-    200,
-    renderErasure({
-      csrf: issueCsrfToken(session.sessionId),
-      anchorLabel: '',
-      plan: null,
-      prefill,
-    }),
-  );
+  await sendErasureEntry(res, businessId, session, 200, { prefill });
 }
 
 async function handleErasePreview(
@@ -1027,7 +1028,8 @@ async function handleErasePreview(
   }
 
   const anchor = anchorFromForm(form);
-  if (anchor === null) return sendErasureEntry(res, session, 400, ANCHOR_UNREADABLE);
+  if (anchor === null)
+    return sendErasureEntry(res, businessId, session, 400, { error: ANCHOR_UNREADABLE });
   await sendErasurePreview(res, businessId, session, anchor, documentRoot);
 }
 
@@ -1054,7 +1056,8 @@ async function handleEraseConfirm(
   }
 
   const anchor = anchorFromJson(form.get('anchor'));
-  if (anchor === null) return sendErasureEntry(res, session, 400, ANCHOR_UNREADABLE);
+  if (anchor === null)
+    return sendErasureEntry(res, businessId, session, 400, { error: ANCHOR_UNREADABLE });
 
   const plan = await resolvePlan(anchor, businessId, documentRoot);
   // A refusal first: it is the more useful thing to say, and it is true
@@ -1137,7 +1140,8 @@ async function handleEraseKeep(
 
   const kind = keptKindFrom(form.get('kind'));
   const itemId = (form.get('itemId') ?? '').trim();
-  if (kind === null || itemId === '') return sendErasureEntry(res, session, 400, KEEP_UNREADABLE);
+  if (kind === null || itemId === '')
+    return sendErasureEntry(res, businessId, session, 400, { error: KEEP_UNREADABLE });
 
   if (form.get('revoke') === '1') {
     await revokeKeep(kind, itemId, { businessId });
@@ -1147,7 +1151,7 @@ async function handleEraseKeep(
   }
 
   const anchor = anchorFromJson(form.get('anchor'));
-  if (anchor === null) return sendErasureEntry(res, session, 200);
+  if (anchor === null) return sendErasureEntry(res, businessId, session, 200);
   await sendErasurePreview(res, businessId, session, anchor, documentRoot);
 }
 
