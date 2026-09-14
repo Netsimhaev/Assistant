@@ -202,7 +202,13 @@ describe('what an erasure leaves behind', () => {
         // depth under it is exempt.
         if (path.split(/[\\/]/).includes('dashboard')) continue;
         const source = await readFile(path, 'utf8');
-        if (/from\s+['"].*erasure(-plan)?\.js['"]/.test(source)) {
+        // Both import forms. Requiring the `from` keyword missed
+        // `await import('../governance/erasure.js')` — and a dynamic import
+        // is precisely how a future caller would reach a module it is not
+        // supposed to name statically. No offender exists today; the
+        // alternation was proved to bite by planting one in `src/util/
+        // money.ts`, watching this test name the file, and restoring it.
+        if (/(?:from|import\s*\()\s*['"].*erasure(-plan)?\.js['"]/.test(source)) {
           offenders.push(path);
         }
       }
