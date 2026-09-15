@@ -56,6 +56,15 @@ export const AuditKind = z.enum([
    * survives, which is exactly what the command asked to prevent (spec §5.3).
    */
   'erasure',
+  /**
+   * The assistant decided on her own what a finished job was worth
+   * remembering. Carries counts only — how many candidates came back, how
+   * many were written, how many were refused — never the subject or the
+   * claim. This row is also what the daily cap counts, because it is the
+   * only record that a billed call happened at all, including a call that
+   * produced nothing.
+   */
+  'curation',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 
