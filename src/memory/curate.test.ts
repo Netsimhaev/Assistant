@@ -6,8 +6,8 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { bindPlanToJob } from '../orchestrator/plan-store.js';
-import { recallMemories, writeMemory } from './store.js';
-import { curateJob } from './curate.js';
+import { recallMemories, writeMemory, type MemoryKind } from './store.js';
+import { curateJob, curationRunsToday } from './curate.js';
 import type { CurationResult } from './curation-parse.js';
 
 const BUSINESS = 'test-business';
@@ -51,6 +51,38 @@ async function seedJob(provenance: 'boss' | 'unknown_external', toolName = 'mail
 
 function curatorReturning(candidates: CurationResult['candidates']) {
   return async (): Promise<CurationResult> => ({ candidates });
+}
+
+interface LiveRow {
+  provenance: string;
+  body: unknown;
+}
+
+/**
+ * The live row at an exact `(kind, subjectKey, attribute)` key, read
+ * directly with SQL rather than through `recallMemories`.
+ *
+ * `recallMemories` pages (default limit 5, newest first) and is exactly the
+ * lens that hid the fix-round-1 C1 bug: a target row sitting behind enough
+ * newer rows on the same subject fell outside the page and read as absent.
+ * The conflict-branch tests below assert against this instead, so they
+ * cannot be fooled by the same blind spot they exist to catch.
+ */
+async function liveRows(
+  kind: MemoryKind,
+  subjectKey: string,
+  attribute: string | null = null,
+): Promise<LiveRow[]> {
+  const { rows } = await getPool().query<{ provenance: string; body: unknown }>(
+    `SELECT provenance, body FROM memories
+       WHERE business_id = $1 AND kind = $2 AND subject_key = $3
+         AND attribute IS NOT DISTINCT FROM $4 AND retired_at IS NULL`,
+    [BUSINESS, kind, subjectKey, attribute],
+  );
+  return rows.map((row) => ({
+    provenance: row.provenance,
+    body: typeof row.body === 'string' ? JSON.parse(row.body) : row.body,
+  }));
 }
 
 describe('the curator', () => {
@@ -149,14 +181,71 @@ describe('the curator', () => {
       ]),
     });
 
-    const live = await recallMemories({ subjectKey: RONIT }, { businessId: BUSINESS });
-    const preference = live.find((m) => m.kind === 'preference');
-    const chunk = live.find((m) => m.kind === 'chunk');
+    const preferenceRows = await liveRows('preference', RONIT, 'ערוץ מועדף');
+    expect(preferenceRows).toHaveLength(1);
+    expect(preferenceRows[0]?.body).toEqual({ value: 'מייל' });
+    expect(preferenceRows[0]?.provenance).toBe('boss');
 
-    expect(preference?.body).toEqual({ value: 'מייל' });
-    expect(preference?.provenance).toBe('boss');
-    expect(chunk?.provenance).toBe('unknown_external');
-    expect(JSON.stringify(chunk?.body)).toContain('טלפון');
+    const chunkRows = await liveRows('chunk', RONIT);
+    expect(chunkRows).toHaveLength(1);
+    expect(chunkRows[0]?.provenance).toBe('unknown_external');
+    expect(JSON.stringify(chunkRows[0]?.body)).toContain('טלפון');
+  });
+
+  /**
+   * Fix round 1, C1. A `boss` preference is protected only if the guard can
+   * actually SEE it. `recallMemories` returns at most 5 rows, newest first,
+   * with no `attribute` filter — so six newer preferences on other
+   * attributes of the same subject used to push the target row off the
+   * page entirely, and the guard fell through as if the row did not exist.
+   * `resolveConflict` now asks the database for the exact key directly.
+   */
+  it('protects the owner’s preference even behind many newer rows on the same subject', async () => {
+    const bossJob = await seedJob('boss');
+    await writeMemory(
+      {
+        jobId: bossJob,
+        kind: 'preference',
+        subjectKey: RONIT,
+        attribute: 'ערוץ מועדף',
+        body: { value: 'מייל' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    // Six newer, unrelated preferences on the same subject — enough to push
+    // the row above past `recallMemories`' default limit of 5.
+    for (let i = 0; i < 6; i += 1) {
+      await writeMemory(
+        {
+          jobId: bossJob,
+          kind: 'preference',
+          subjectKey: RONIT,
+          attribute: `תכונה-${i}`,
+          body: { value: `x${i}` },
+        },
+        { businessId: BUSINESS },
+      );
+    }
+
+    const strangerJob = await seedJob('unknown_external');
+    await curateJob(strangerJob, {
+      businessId: BUSINESS,
+      curator: curatorReturning([
+        {
+          kind: 'preference',
+          subjectKey: RONIT,
+          attribute: 'ערוץ מועדף',
+          body: { value: 'טלפון' },
+          sourceRef: 'מסמך של הספק',
+        },
+      ]),
+    });
+
+    const preferenceRows = await liveRows('preference', RONIT, 'ערוץ מועדף');
+    expect(preferenceRows).toHaveLength(1);
+    expect(preferenceRows[0]?.provenance).toBe('boss');
+    expect(preferenceRows[0]?.body).toEqual({ value: 'מייל' });
   });
 
   it('replaces the old row when both came from the same trust level', async () => {
@@ -186,9 +275,52 @@ describe('the curator', () => {
       ]),
     });
 
-    const live = await recallMemories({ subjectKey: RONIT }, { businessId: BUSINESS });
-    expect(live.filter((m) => m.kind === 'preference')).toHaveLength(1);
-    expect(live.find((m) => m.kind === 'preference')?.body).toEqual({ value: 'טלפון' });
+    const preferenceRows = await liveRows('preference', RONIT, 'ערוץ מועדף');
+    expect(preferenceRows).toHaveLength(1);
+    expect(preferenceRows[0]?.body).toEqual({ value: 'טלפון' });
+  });
+
+  /**
+   * Fix round 1, I5. The third branch §10 names: an existing claim from
+   * BELOW `boss` trust is not protected — a later `boss` job simply
+   * replaces it, same as two same-trust writes do.
+   */
+  it('lets a boss claim replace an external one at the same key', async () => {
+    const externalJob = await seedJob('unknown_external');
+    await writeMemory(
+      {
+        jobId: externalJob,
+        kind: 'preference',
+        subjectKey: RONIT,
+        attribute: 'ערוץ מועדף',
+        body: { value: 'וואטסאפ' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    const bossJob = await seedJob('boss');
+    await curateJob(bossJob, {
+      businessId: BUSINESS,
+      curator: curatorReturning([
+        {
+          kind: 'preference',
+          subjectKey: RONIT,
+          attribute: 'ערוץ מועדף',
+          body: { value: 'מייל' },
+          sourceRef: 'x',
+        },
+      ]),
+    });
+
+    const preferenceRows = await liveRows('preference', RONIT, 'ערוץ מועדף');
+    expect(preferenceRows).toHaveLength(1);
+    expect(preferenceRows[0]?.provenance).toBe('boss');
+    expect(preferenceRows[0]?.body).toEqual({ value: 'מייל' });
+
+    // No chunk: an external claim losing to a later boss claim is an
+    // ordinary replace, not a recorded disagreement.
+    const chunkRows = await liveRows('chunk', RONIT);
+    expect(chunkRows).toHaveLength(0);
   });
 
   it('records a curation audit row carrying counts and no subject', async () => {
@@ -210,7 +342,13 @@ describe('the curator', () => {
     expect(rows[0]?.reason).not.toContain(RONIT);
   });
 
-  it('closes the job’s curation without throwing when the model fails', async () => {
+  /**
+   * Fix round 1, I2 + I3. A billed call that throws must still leave a
+   * trace — otherwise the daily cap never advances for a call that was
+   * paid for — and the outcome must say plainly that the run failed rather
+   * than reading like a quiet no-op.
+   */
+  it('records a curation audit row and reports failed when the model throws', async () => {
     const jobId = await seedJob('boss');
 
     const outcome = await curateJob(jobId, {
@@ -220,6 +358,60 @@ describe('the curator', () => {
       },
     });
 
-    expect(outcome).toMatchObject({ ran: false, written: 0 });
+    expect(outcome).toMatchObject({ ran: false, written: 0, failed: true });
+
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'curation'`,
+      [BUSINESS],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.reason).not.toContain(RONIT);
+  });
+
+  /**
+   * Fix round 1, I6. The cost-control path had no coverage at all.
+   */
+  it('refuses to run once the daily cap is reached, without calling the model', async () => {
+    const jobId = await seedJob('boss');
+    let called = false;
+
+    const outcome = await curateJob(jobId, {
+      businessId: BUSINESS,
+      runsPerDay: 0,
+      curator: async () => {
+        called = true;
+        return { candidates: [] };
+      },
+    });
+
+    expect(outcome).toMatchObject({ ran: false, skipped: 'over_cap', written: 0, failed: false });
+    expect(called).toBe(false);
+  });
+
+  it('refuses to run without ANTHROPIC_API_KEY when no curator is injected', async () => {
+    const jobId = await seedJob('boss');
+    const original = process.env['ANTHROPIC_API_KEY'];
+    delete process.env['ANTHROPIC_API_KEY'];
+
+    try {
+      const outcome = await curateJob(jobId, { businessId: BUSINESS });
+      expect(outcome).toMatchObject({ ran: false, skipped: 'no_key', written: 0, failed: false });
+    } finally {
+      if (original !== undefined) process.env['ANTHROPIC_API_KEY'] = original;
+    }
+  });
+
+  it('curationRunsToday counts curation audit rows written today', async () => {
+    expect(await curationRunsToday({ businessId: BUSINESS })).toBe(0);
+
+    const jobId = await seedJob('boss');
+    await curateJob(jobId, {
+      businessId: BUSINESS,
+      curator: curatorReturning([
+        { kind: 'chunk', subjectKey: RONIT, body: { text: 'x' }, sourceRef: 'x' },
+      ]),
+    });
+
+    expect(await curationRunsToday({ businessId: BUSINESS })).toBe(1);
   });
 });
