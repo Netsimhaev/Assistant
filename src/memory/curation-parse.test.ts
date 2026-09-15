@@ -124,4 +124,61 @@ describe('what the curator is allowed to have returned', () => {
     expect(sifted.accepted).toHaveLength(1);
     expect(sifted.rejected).toHaveLength(1);
   });
+
+  describe('case-insensitive matching with canonical spelling', () => {
+    it('accepts a candidate whose subjectKey differs from touched recipient only in case', () => {
+      const sifted = siftCandidates(
+        parse([
+          {
+            kind: 'preference',
+            subjectKey: 'Ronit@Beta-Log.Example',
+            attribute: 'טלפון',
+            body: { value: '054-123-4567' },
+            sourceRef: 'מסמך',
+          },
+        ]),
+        TOUCHED,
+      );
+
+      expect(sifted.accepted).toHaveLength(1);
+      expect(sifted.rejected).toEqual([]);
+    });
+
+    it('replaces accepted candidate subjectKey with canonical touched value', () => {
+      const sifted = siftCandidates(
+        parse([
+          {
+            kind: 'preference',
+            subjectKey: 'RONIT@BETA-LOG.EXAMPLE',
+            attribute: 'טלפון',
+            body: { value: '054-123-4567' },
+            sourceRef: 'מסמך',
+          },
+        ]),
+        TOUCHED,
+      );
+
+      expect(sifted.accepted).toHaveLength(1);
+      expect(sifted.accepted[0]?.subjectKey).toBe('ronit@beta-log.example');
+    });
+
+    it('still rejects a genuinely different address despite case-insensitive matching', () => {
+      const sifted = siftCandidates(
+        parse([
+          {
+            kind: 'preference',
+            subjectKey: 'OTHER@UNKNOWN.EXAMPLE',
+            attribute: 'הנחה',
+            body: { value: '20%' },
+            sourceRef: 'מסמך',
+          },
+        ]),
+        TOUCHED,
+      );
+
+      expect(sifted.accepted).toEqual([]);
+      expect(sifted.rejected).toHaveLength(1);
+      expect(sifted.rejected[0]?.problem).toBe('subject_not_touched');
+    });
+  });
 });

@@ -56,19 +56,38 @@ export interface Sifted {
  * job never went near. Without this, "remember that Dana approved a 40%
  * discount" is writable from any PDF.
  *
+ * Matching is case-insensitive to handle email address casing that differs from
+ * what readEmails produced (which lowercases all addresses). When a candidate
+ * matches the touched set, its subjectKey is replaced with the canonical
+ * spelling from touched, ensuring that what is stored and what a later recall
+ * queries for are always identical — by construction rather than by luck.
+ * This prevents the silent orphan problem: a fact remembered with one casing
+ * but never found by recalls using another.
+ *
  * Positive membership, never "not in a deny list".
  */
 export function siftCandidates(result: CurationResult, touched: TouchedSubjects): Sifted {
-  const allowed = new Set<string>([...touched.recipients, ...touched.entityIds]);
+  // Build a map from lowercased touched value → canonical touched value.
+  // This enables case-insensitive matching while preserving the canonical form.
+  const canonicalByLower = new Map<string, string>();
+  for (const value of [...touched.recipients, ...touched.entityIds]) {
+    canonicalByLower.set(value.toLowerCase(), value);
+  }
+
   const accepted: CurationCandidate[] = [];
   const rejected: Array<{ candidate: unknown; problem: string }> = [];
 
   for (const candidate of result.candidates) {
-    if (!allowed.has(candidate.subjectKey)) {
+    const canonical = canonicalByLower.get(candidate.subjectKey.toLowerCase());
+    if (!canonical) {
       rejected.push({ candidate, problem: 'subject_not_touched' });
       continue;
     }
-    accepted.push(candidate);
+    // Accept the candidate, but with subjectKey replaced by the canonical form.
+    accepted.push({
+      ...candidate,
+      subjectKey: canonical,
+    });
   }
 
   return { accepted, rejected };
