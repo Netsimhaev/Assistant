@@ -230,6 +230,38 @@ export function addresseeOf(actionClass: ActionClass): Addressee {
 }
 
 /**
+ * Does this action class deliver to a person, as opposed to merely carrying
+ * an address in its payload?
+ *
+ * `null` answers `false`: an unclassified action is one nobody vouched for
+ * as reaching a person. Accepting `ActionClass | null` rather than making
+ * every caller narrow first is deliberate — both call sites derive their
+ * class from a payload that may fail to classify at all, and forcing a
+ * null check at each one is exactly the kind of restatement that drifts.
+ *
+ * The reason this predicate exists, not just what it returns: `crm.write`
+ * carries an `email` field too, but that field is the new lead's address —
+ * the record's *content* — not somewhere a message goes. Treating it as a
+ * destination would put an approval in front of every new lead ever filed,
+ * demanding an address resolve when there was never anywhere for it to
+ * resolve *to*. `addresseeOf` is the fact this reads: `email.*` and
+ * `whatsapp.*` (among others) address a `person`; `crm.write`,
+ * `accounting.write` and the rest address `internal`.
+ *
+ * Single definition for both of this predicate's consumers — `scoreVisibility`
+ * (`src/policy/risk.ts`), which decides whether an unresolved address should
+ * escalate the first-contact risk band, and `stepAddressesPerson`
+ * (`src/memory/curation-brief.ts`), which decides whether a plan step's
+ * payload email is a subject the curator may cite. Two copies of "does this
+ * address a person" is the shape of control this codebase has paid for
+ * before — see `BROWSER_ADDRESSED_CLASSES`'s own docblock for the same
+ * lesson learned the same way.
+ */
+export function messagesAPerson(actionClass: ActionClass | null): boolean {
+  return actionClass !== null && addresseeOf(actionClass) === 'person';
+}
+
+/**
  * Classes that address a browser session rather than a person, derived from
  * the total mapping above so the `one_unknown` risk exemption
  * (`policy/risk.ts`) cannot drift from it.

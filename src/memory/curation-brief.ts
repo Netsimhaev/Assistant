@@ -16,7 +16,7 @@
 import type { Queryable } from '../db/pool.js';
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
-import { addresseeOf } from '../domain/action.js';
+import { messagesAPerson } from '../domain/action.js';
 import type { Reading } from '../domain/reading.js';
 import { loadJob } from '../orchestrator/jobs.js';
 import { loadPlanBody } from '../orchestrator/plan-store.js';
@@ -48,18 +48,30 @@ export const MAX_BRIEF_CHARS = 12_000;
  *
  * `isOutbound` (`src/policy/classify.ts`) answers a different question —
  * "does this leave the instance" — and answers it `true` for `crm.write`,
- * which does reach a third-party CRM. But `crm.write`'s `email` field is the
- * new lead's address, i.e. the record's *content*, never a destination: see
- * the `messagesAPerson` comment in `src/policy/risk.ts` and the crm.write
- * note in CLAUDE.md ("§28/08 review"). `addresseeOf` is what the rest of the
- * codebase already asks this exact question with — `scoreVisibility` reads
- * it for the identical reason. An unclassified tool answers `false`: a name
- * nobody classified is a name nobody vouched for as reaching a person.
+ * which does reach a third-party CRM. `messagesAPerson`
+ * (`src/domain/action.ts`) is what the rest of the codebase already asks
+ * this exact question with — `scoreVisibility` (`src/policy/risk.ts`) reads
+ * it for the identical reason, and its own docblock carries the `crm.write`
+ * case in full: that tool's `email` field is a lead's address, i.e. the
+ * record's content, never a destination. An unclassified tool answers
+ * `false`: a name nobody classified is a name nobody vouched for as
+ * reaching a person.
+ *
+ * Refined through `refineActionClass` before the check, the same as the
+ * gate itself does (`buildFacts`, `src/policy/facts.ts`), rather than
+ * reading `classifyAction`'s base class directly. No current
+ * `REFINEMENT_RULES` entry actually flips a class between addressing a
+ * person and not — `email.reply`/`email.initiate`,
+ * `whatsapp.reply`/`whatsapp.initiate` and the `calendar.*` family are all
+ * `person` either way, so refining changes nothing today. It stays
+ * future-proof against the day a refinement rule does flip that answer:
+ * reading the base class here while the gate reads the refined one would
+ * then silently disagree about whether the same step addressed a person.
  */
 function stepAddressesPerson(toolName: string, input: Record<string, unknown>): boolean {
   const base = classifyAction(toolName);
   if (base === null) return false;
-  return addresseeOf(refineActionClass(base, input)) === 'person';
+  return messagesAPerson(refineActionClass(base, input));
 }
 
 /**
