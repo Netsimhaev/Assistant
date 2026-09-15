@@ -181,4 +181,96 @@ describe('what the curator is allowed to have returned', () => {
       expect(sifted.rejected[0]?.problem).toBe('subject_not_touched');
     });
   });
+
+  describe('adversarial cases that expose substring/prefix matching vulnerabilities', () => {
+    /**
+     * A superstring of a touched address — the attack an attacker would
+     * actually reach for: a domain that *contains* a trusted one.
+     * Must be rejected as subject_not_touched.
+     */
+    it('rejects a superstring of a touched email address', () => {
+      const sifted = siftCandidates(
+        parse([
+          {
+            kind: 'chunk',
+            subjectKey: 'ronit@beta-log.example.evil.test',
+            body: { text: 'attack' },
+            sourceRef: 'hostile',
+          },
+        ]),
+        TOUCHED,
+      );
+
+      expect(sifted.accepted).toEqual([]);
+      expect(sifted.rejected).toHaveLength(1);
+      expect(sifted.rejected[0]?.problem).toBe('subject_not_touched');
+    });
+
+    /**
+     * A substring of a touched address. If the implementation used
+     * substring matching instead of exact matching, this would be accepted.
+     * Must be rejected as subject_not_touched.
+     */
+    it('rejects a substring of a touched email address', () => {
+      const sifted = siftCandidates(
+        parse([
+          {
+            kind: 'chunk',
+            subjectKey: 'beta-log.example',
+            body: { text: 'attack' },
+            sourceRef: 'hostile',
+          },
+        ]),
+        TOUCHED,
+      );
+
+      expect(sifted.accepted).toEqual([]);
+      expect(sifted.rejected).toHaveLength(1);
+      expect(sifted.rejected[0]?.problem).toBe('subject_not_touched');
+    });
+
+    /**
+     * A prefix-padded variant of a touched address.
+     * Must be rejected as subject_not_touched.
+     */
+    it('rejects a prefix-padded variant of a touched email address', () => {
+      const sifted = siftCandidates(
+        parse([
+          {
+            kind: 'chunk',
+            subjectKey: 'xronit@beta-log.example',
+            body: { text: 'attack' },
+            sourceRef: 'hostile',
+          },
+        ]),
+        TOUCHED,
+      );
+
+      expect(sifted.accepted).toEqual([]);
+      expect(sifted.rejected).toHaveLength(1);
+      expect(sifted.rejected[0]?.problem).toBe('subject_not_touched');
+    });
+
+    /**
+     * A superstring of a touched entity id.
+     * Must be rejected as subject_not_touched.
+     */
+    it('rejects a superstring of a touched entity id', () => {
+      const sifted = siftCandidates(
+        parse([
+          {
+            kind: 'entity',
+            subjectKey: 'ronit-cohen-beta-log-extra',
+            body: { name: 'attack' },
+            sourceRef: 'hostile',
+          },
+        ]),
+        TOUCHED,
+      );
+
+      expect(sifted.accepted).toEqual([]);
+      expect(sifted.rejected).toHaveLength(1);
+      expect(sifted.rejected[0]?.problem).toBe('subject_not_touched');
+    });
+  });
 });
