@@ -203,7 +203,7 @@ export function parsePlan(raw: string): PlanOutcome {
  * first lets the caller decide which one is the plan — being parseable and
  * being a plan are different questions.
  */
-function extractJsonObjects(raw: string): unknown[] {
+export function extractJsonObjects(raw: string): unknown[] {
   const text = raw.replace(/```(?:json)?/g, '');
   const found: unknown[] = [];
 
