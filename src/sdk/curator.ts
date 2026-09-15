@@ -55,8 +55,8 @@ export const curateWithModel: Curator = async (brief) => {
     // definition. Handing that process a full copy of every credential the
     // installation owns would be the opposite of quarantine.
     env: process.env['PATH'] === undefined ? {} : { PATH: process.env['PATH'] },
-    // Same as the planner: multiple turns allow the model to self-correct if
-    // the first attempt does not produce valid JSON.
+    // These options mirror the planner's for consistency across SDK callers.
+    // maxTurns is a ceiling that this call never approaches because it holds no tools.
     permissionMode: 'default',
     maxTurns: 3,
   };
