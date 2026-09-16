@@ -27,6 +27,7 @@
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
 import { curateJob } from '../memory/curate.js';
+import type { Curator } from '../sdk/curator.js';
 import { loadJob, transition } from './jobs.js';
 import { loadPlanBody, stepResults } from './plan-store.js';
 
@@ -94,9 +95,16 @@ interface DueJobRow {
  * Per-job isolation, the session-scoped advisory lock, the re-read under that
  * lock, and destroying the connection on a failed unlock are all the same as
  * `runDueJobs`, and that function's docblock argues each one.
+ *
+ * `options.curator` exists so a test can inject a stub and observe that the
+ * call actually happened, the same reason `runPlan` takes `bindings` as a
+ * parameter instead of calling `loadBindings` itself: without a seam here, a
+ * test asserting `curated` could pass with the `curateJob` call deleted,
+ * because nothing would force the real, billed path to run. Production
+ * callers pass nothing and get `curateWithModel`, `curateJob`'s own default.
  */
 export async function closeVerifiedJobs(
-  options: { businessId?: string; limit?: number } = {},
+  options: { businessId?: string; limit?: number; curator?: Curator } = {},
 ): Promise<CloseVerifiedResult> {
   const businessId = options.businessId ?? config.businessId;
   const limit = options.limit ?? 20;
@@ -196,7 +204,10 @@ export async function closeVerifiedJobs(
         // It cannot fail the job: `curateJob` swallows its own errors and
         // reports them, because a job that did its work must not be
         // stranded by a model that did not answer.
-        const curation = await curateJob(jobId, { businessId });
+        const curation = await curateJob(jobId, {
+          businessId,
+          ...(options.curator ? { curator: options.curator } : {}),
+        });
         if (curation.ran) result.curated.push(jobId);
 
         await closeJob(jobId, businessId);
