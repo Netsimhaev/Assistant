@@ -62,10 +62,26 @@ export interface CloseVerifiedResult {
   /** Per-job failures, isolated so one bad row cannot end the pass. */
   errored: ErroredVerifyJob[];
   /**
-   * Jobs this pass actually sent to the curator. A job that closed without
-   * being curated is normal — the feature is behind a key and a daily cap.
+   * Jobs whose curation actually ran this pass — `curateJob`'s `ran` flag.
+   * True for a clean pass, but also true when the attempt wrote some
+   * candidates and then failed partway through (`written > 0` inside its
+   * `catch` still counts as `ran`), so membership here is not by itself
+   * proof of a clean run. A job that closed without appearing in either
+   * this list or `curationSkipped` below simply had no plan qualified for
+   * curation in the first place (`not_qualified`, `no_plan`, `no_brief`) —
+   * the ordinary case, since most jobs never ask the curator anything.
    */
   curated: string[];
+  /**
+   * Jobs closed this pass whose curation did not run, and why —
+   * `curateJob`'s `skipped` reason, surfaced rather than discarded (spec
+   * §4.2). `not_qualified` and `no_brief` are routine. `no_key` and
+   * `over_cap` are the ones an operator needs to see: without this list, an
+   * installation with curation switched off (no key) or budgeted out for
+   * today is indistinguishable from one where every job simply had nothing
+   * worth remembering.
+   */
+  curationSkipped: Array<{ jobId: string; reason: string }>;
 }
 
 interface DueJobRow {
@@ -127,6 +143,7 @@ export async function closeVerifiedJobs(
     phaseMoved: [],
     errored: [],
     curated: [],
+    curationSkipped: [],
   };
 
   for (const row of rows) {
@@ -152,8 +169,14 @@ export async function closeVerifiedJobs(
           continue;
         }
 
-        // Already past the curator; only the last hop is left. The docblock
-        // above says why this phase is scanned at all.
+        // Found here on a pass that picks up after a crash between the two
+        // commits below: `transition(..., 'remember')` lands before
+        // `curateJob` is even called, so a job already sitting in
+        // `remember` may have had curation run to completion, or may have
+        // been stranded mid-attempt (or before any attempt) by the very
+        // crash that left it here. Either way this pass does not retry
+        // curation for it — only the last hop, closing, is left. The
+        // docblock above says why this phase is scanned at all.
         if (job.phase === 'remember') {
           await closeJob(jobId, businessId);
           result.closed.push(jobId);
@@ -208,7 +231,11 @@ export async function closeVerifiedJobs(
           businessId,
           ...(options.curator ? { curator: options.curator } : {}),
         });
-        if (curation.ran) result.curated.push(jobId);
+        if (curation.ran) {
+          result.curated.push(jobId);
+        } else if (curation.skipped !== null) {
+          result.curationSkipped.push({ jobId, reason: curation.skipped });
+        }
 
         await closeJob(jobId, businessId);
         result.closed.push(jobId);

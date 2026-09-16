@@ -202,6 +202,9 @@ describe('closeVerifiedJobs', () => {
       // The property under test: a job that did its work still closes when
       // curation does not run.
       expect(result.curated).not.toContain(jobId);
+      // And the skip is visible rather than discarded (N2): "curation is
+      // off" must not look identical to "nothing was worth remembering".
+      expect(result.curationSkipped).toContainEqual({ jobId, reason: 'no_key' });
     } finally {
       if (original !== undefined) process.env['ANTHROPIC_API_KEY'] = original;
     }

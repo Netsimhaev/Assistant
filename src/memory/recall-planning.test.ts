@@ -133,6 +133,32 @@ describe('the memory block handed to the planner', () => {
     expect(block).not.toContain(secondEmail);
   });
 
+  // N3 from the final review: `recallForPlanning` passes `limit: MAX_RECALL`
+  // (20) to widen recall past `recallMemories`' own default of 5. Every
+  // other test in this file writes at most three rows per subject, so that
+  // argument could be deleted and all of them would stay green — nothing
+  // exercised the widening it exists for. This one seeds eight rows on a
+  // single subject, past the default, and the budget here (the library
+  // default, 3,000 chars) is far larger than eight short rows need, so a
+  // failure here is about which rows were fetched, not about which fetched
+  // rows fit.
+  it('reaches all memories on a subject with more than five, not just the default page', async () => {
+    const bossJob = await jobWith('boss');
+    const total = 8;
+    for (let i = 1; i <= total; i++) {
+      await writeMemory(
+        { jobId: bossJob, kind: 'chunk', subjectKey: RONIT, body: { text: `FACT_${i}` } },
+        { businessId: BUSINESS },
+      );
+    }
+
+    const block = await recallForPlanning([RONIT], { businessId: BUSINESS });
+
+    for (let i = 1; i <= total; i++) {
+      expect(block).toContain(`FACT_${i}`);
+    }
+  });
+
   it('stops at first row that does not fit, not skipping to a later shorter row', async () => {
     const bossJob = await jobWith('boss');
     const subject = 'test@example.com';

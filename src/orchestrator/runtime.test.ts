@@ -11,6 +11,7 @@ const FULL = {
   SMTP_PASS: 'pw',
   APPROVAL_NOTIFY_TO: 'boss@example.com',
   DASHBOARD_BASE_URL: 'http://127.0.0.1:8787',
+  ANTHROPIC_API_KEY: 'sk-test-key',
 };
 
 describe('buildRuntime', () => {
@@ -38,6 +39,15 @@ describe('buildRuntime', () => {
     const runtime = buildRuntime(withoutTo);
     expect(runtime.notify).toBeUndefined();
     expect(runtime.warnings.join(' ')).toMatch(/APPROVAL_NOTIFY_TO/);
+  });
+
+  it('warns when ANTHROPIC_API_KEY is absent, so curation-off does not look like nothing-to-remember', () => {
+    const { ANTHROPIC_API_KEY: _key, ...withoutKey } = FULL;
+    const runtime = buildRuntime(withoutKey);
+    expect(runtime.warnings.join(' ')).toMatch(/ANTHROPIC_API_KEY/);
+    // Unrelated to the mail adapter — a missing model key must not also
+    // suppress the mail warning path or vice versa.
+    expect(runtime.registry.get('office-mail')).not.toBeNull();
   });
 
   it('always supplies a credential source', () => {
