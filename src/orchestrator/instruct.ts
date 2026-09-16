@@ -170,9 +170,24 @@ export async function runInstruction(
   });
 
   // Positive scope: only who this instruction actually names. Same extractor
-  // the standing-authorisation path uses, never a second one.
+  // the standing-authorisation path uses, never a second one. This finds
+  // literal address tokens only — "תשיבי לרונית" with no address spelled out
+  // names nobody, yields no subjects, and gets no memory block at all.
+  // Resolving a name to a subject key is a separate, unbuilt capability.
   const subjects = emailAddressesIn(input.text);
-  const memoryBlock = await recallForPlanning(subjects, { businessId });
+
+  // A failed recall degrades to no memory block rather than failing the
+  // instruction — planning without the past is worse than planning with it,
+  // but not planning at all because a read failed is worse than both. Unlike
+  // the planner call below, which throws for the ordinary failure mode of a
+  // real call and must fail the job because there is no plan without it,
+  // this one has a safe fallback and takes it instead.
+  let memoryBlock = '';
+  try {
+    memoryBlock = await recallForPlanning(subjects, { businessId });
+  } catch {
+    memoryBlock = '';
+  }
 
   let outcome: PlanOutcome;
   try {
