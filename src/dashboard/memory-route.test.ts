@@ -123,15 +123,19 @@ describe('GET /memory', () => {
     expect(res.headers.get('location')).toBe('/login');
   });
 
-  it('strips bidirectional overrides from a remembered subject and its source', async () => {
+  it('strips bidirectional overrides from a remembered subject, its source, and its value', async () => {
     const boss = await jobWithProvenance('boss');
+    const external = await jobWithProvenance('unknown_external');
     // U+202E RIGHT-TO-LEFT OVERRIDE, the same payload
     // `document-for-approval`'s and `server.test.ts`'s own bidi tests use.
-    // Seeded on BOTH fields `renderMemory` runs through `escLabel`
-    // (`subjectKey` and `sourceRef`) — one field alone would leave the other
-    // unproven.
+    // Seeded on subjectKey, sourceRef, AND the memory's own body text —
+    // `renderMemory` runs all three through `escLabel`, and a body a
+    // stranger's document wrote is exactly where an external claim, override
+    // included, lands verbatim (see `memoryValue`'s docblock). One field
+    // alone would leave the others unproven.
     const hostileSubject = 'ronit‮gpj.exe';
     const hostileSource = 'DOC-‮gpj.exe';
+    const hostileBody = 'invoice‮gpj.exe';
     await writeMemory(
       {
         jobId: boss.jobId,
@@ -140,6 +144,10 @@ describe('GET /memory', () => {
         body: {},
         sourceRef: hostileSource,
       },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      { jobId: external.jobId, kind: 'chunk', subjectKey: 'attachment', body: { text: hostileBody } },
       { businessId: BUSINESS },
     );
 
@@ -155,5 +163,6 @@ describe('GET /memory', () => {
     expect(body).toContain('ronit');
     expect(body).toContain('gpj.exe');
     expect(body).toContain('DOC-');
+    expect(body).toContain('invoice');
   });
 });

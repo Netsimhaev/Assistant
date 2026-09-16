@@ -496,6 +496,21 @@ describe('GET /instruct, POST /instruct', () => {
     expect(await res.text()).toContain('name="text"');
   });
 
+  // The memory screen (`GET /memory`) was reachable only by typing the URL —
+  // no page linked to it, the same way `/erase` is one hop from here. This
+  // locks the link in place so a future edit to this nav row cannot drop it
+  // silently: without this assertion, removing the link leaves every other
+  // test on this file green.
+  it('links to the memory screen, the same way it links to erasure', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const body = await res.text();
+    expect(body).toContain('<a href="/memory">מה נזכר</a>');
+    expect(body).toContain('<a href="/erase">מה לשכוח</a>');
+  });
+
   it('refuses the instruction box without a session', async () => {
     const baseUrl = await startServer(BUSINESS);
 

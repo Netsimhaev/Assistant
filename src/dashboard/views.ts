@@ -287,11 +287,21 @@ const PROVENANCE_LABEL: Record<string, string> = {
 };
 
 /** What one memory's value column shows — the preference's key beside its value, or the raw body otherwise. */
+/**
+ * `escLabel`, not `esc` — this screen exists so the owner can audit what the
+ * assistant believes, and much of what it shows here is text a stranger
+ * wrote: a `chunk`'s body is exactly where an external claim lands verbatim
+ * (`memory/store.ts`'s own reason for stamping every row with `provenance`).
+ * A bidirectional override inside that text would make a line render as
+ * something other than what is actually stored, on the one screen whose
+ * whole job is to show that faithfully. `esc` neutralises markup; it leaves
+ * the override family untouched (see `escLabel`'s docblock).
+ */
 function memoryValue(memory: MemoryRecord): string {
   if (memory.attribute !== null) {
-    return `${esc(memory.attribute)}: ${esc(JSON.stringify(memory.body))}`;
+    return `${escLabel(memory.attribute)}: ${escLabel(JSON.stringify(memory.body))}`;
   }
-  return esc(JSON.stringify(memory.body));
+  return escLabel(JSON.stringify(memory.body));
 }
 
 /**
@@ -606,7 +616,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }
