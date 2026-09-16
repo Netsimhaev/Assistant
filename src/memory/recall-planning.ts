@@ -11,9 +11,15 @@
  * attributed claim, in the renderer and not as an instruction in the prompt,
  * because that is the difference between influence and an injection that
  * worked.
+ *
+ * Rows are pooled from all subjects, then sorted by provenance (owner facts
+ * first, external claims last). Within each tier, rows keep the order their
+ * subjects were named. If the first subject's facts fill the budget, later
+ * subjects may not appear at all — the block is filled in subject order, and
+ * the character budget is the hard stop.
  */
 import { config } from '../config.js';
-import { recallMemories, type MemoryRecord } from './store.js';
+import { recallMemories, MAX_RECALL, type MemoryRecord } from './store.js';
 
 export const MEMORY_BLOCK_BUDGET_CHARS = 3_000;
 
@@ -35,7 +41,7 @@ export async function recallForPlanning(
 
   const found: MemoryRecord[] = [];
   for (const subject of subjects) {
-    found.push(...(await recallMemories({ subjectKey: subject }, { businessId })));
+    found.push(...(await recallMemories({ subjectKey: subject, limit: MAX_RECALL }, { businessId })));
   }
   if (found.length === 0) return '';
 
@@ -50,7 +56,7 @@ export async function recallForPlanning(
   let used = header.length;
   for (const memory of ordered) {
     const line = renderRow(memory);
-    if (used + line.length + 1 > budget) continue;
+    if (used + line.length + 1 > budget) break;
     lines.push(line);
     used += line.length + 1;
   }

@@ -112,4 +112,24 @@ describe('the memory block handed to the planner', () => {
     expect(block).toContain('עובדה של הבעלים');
     expect(block).not.toContain('טענה של זר');
   });
+
+  it('stops at first subject when a later subject does not fit', async () => {
+    const bossJob = await jobWith('boss');
+    const firstEmail = 'alice@first.example';
+    const secondEmail = 'bob@second.example';
+
+    await writeMemory(
+      { jobId: bossJob, kind: 'chunk', subjectKey: firstEmail, body: { text: 'אליס: עובדה ארוכה כדי למלא את התקציב ולא להשאיר מקום לבוב' } },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      { jobId: bossJob, kind: 'chunk', subjectKey: secondEmail, body: { text: 'בוב: עובדה' } },
+      { businessId: BUSINESS },
+    );
+
+    const block = await recallForPlanning([firstEmail, secondEmail], { businessId: BUSINESS, budget: 150 });
+
+    expect(block).toContain(firstEmail);
+    expect(block).not.toContain(secondEmail);
+  });
 });
