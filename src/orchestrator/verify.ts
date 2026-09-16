@@ -26,6 +26,7 @@
  */
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
+import { curateJob } from '../memory/curate.js';
 import { loadJob, transition } from './jobs.js';
 import { loadPlanBody, stepResults } from './plan-store.js';
 
@@ -59,6 +60,11 @@ export interface CloseVerifiedResult {
   phaseMoved: string[];
   /** Per-job failures, isolated so one bad row cannot end the pass. */
   errored: ErroredVerifyJob[];
+  /**
+   * Jobs this pass actually sent to the curator. A job that closed without
+   * being curated is normal — the feature is behind a key and a daily cap.
+   */
+  curated: string[];
 }
 
 interface DueJobRow {
@@ -81,9 +87,9 @@ interface DueJobRow {
  * **Why through `remember` at all**, rather than adding `verify → closed` to
  * `LEGAL_TRANSITIONS`: that table is the state machine's contract, and
  * widening it to save one write would erase the difference between a job that
- * passed the curator and one that never did. The transition is made, and its
- * reason says plainly that nothing was remembered, because the memory layers
- * are not built.
+ * passed the curator and one that never did. `curateJob` now runs in that
+ * phase, right before the job is closed — see `closeJob`'s own docblock for
+ * what it does and does not guarantee.
  *
  * Per-job isolation, the session-scoped advisory lock, the re-read under that
  * lock, and destroying the connection on a failed unlock are all the same as
@@ -112,6 +118,7 @@ export async function closeVerifiedJobs(
     lockedOut: [],
     phaseMoved: [],
     errored: [],
+    curated: [],
   };
 
   for (const row of rows) {
@@ -184,6 +191,14 @@ export async function closeVerifiedJobs(
           reason: 'all steps completed — no acceptance criteria were evaluated',
           businessId,
         });
+
+        // The curator runs in the `remember` hop it was always meant for.
+        // It cannot fail the job: `curateJob` swallows its own errors and
+        // reports them, because a job that did its work must not be
+        // stranded by a model that did not answer.
+        const curation = await curateJob(jobId, { businessId });
+        if (curation.ran) result.curated.push(jobId);
+
         await closeJob(jobId, businessId);
         result.closed.push(jobId);
       } catch (error) {
@@ -230,18 +245,22 @@ export async function closeVerifiedJobs(
  * which was honest until 12/09 and then was not: the memory store exists, and
  * a job that ran a `memory.write_*` step has already written what it learned.
  * The live run of that day closed two jobs with a line saying the opposite of
- * what they had just done.
+ * what they had just done. It then read "no curator — a job remembers only
+ * what its own steps recorded", which was honest until this hop started
+ * calling `curateJob` and then was not.
  *
- * What remains true is narrower and worth saying precisely. There is no
- * *curator*: nothing reads a finished job and decides, on its own, what about
- * it is worth keeping. Remembering happens only where a plan asked for it
- * explicitly, step by step. That is the gap this hop still marks.
+ * The curator now runs immediately before this function is called, in the
+ * `remember` hop. A job still closes here whether or not curation actually
+ * ran: the feature is switched off entirely with no API key or over its
+ * daily cap, and `curateJob` never fails a job for a model that did not
+ * answer. This function only ever records that the job reached `closed`,
+ * not that anything in particular was remembered along the way.
  */
 async function closeJob(jobId: string, businessId: string): Promise<void> {
   await transition(jobId, {
     to: 'closed',
     actor: 'orchestrator',
-    reason: 'no curator — a job remembers only what its own steps recorded',
+    reason: 'closed after the curator pass',
     businessId,
   });
 }

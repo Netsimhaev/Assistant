@@ -170,6 +170,23 @@ describe('closeVerifiedJobs', () => {
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
   });
 
+  it('curates a finished job before closing it, and closes it anyway when curation is off', async () => {
+    const { jobId, planHash } = await jobInVerify();
+    await recordStep(jobId, planHash, 'completed');
+
+    const result = await closeVerifiedJobs({ businessId: BUSINESS });
+
+    expect(result.closed).toContain(jobId);
+    // No `curator` is injected here, so `curateJob` never reaches a real
+    // model call that this test could observe: either `ANTHROPIC_API_KEY` is
+    // absent and it skips before trying, or the key is present and
+    // `curateWithModel`'s `refuseUnderTest` guard trips because
+    // `NODE_ENV=test` \u2014 caught inside `curateJob`, never rethrown. Either
+    // way `ran` comes back `false`, and that is the property under test: a
+    // job that did its work still closes when curation does not run.
+    expect(result.curated).not.toContain(jobId);
+  });
+
   it('leaves another business\u2019s job alone', async () => {
     const mine = await jobInVerify();
     await recordStep(mine.jobId, mine.planHash, 'completed');
