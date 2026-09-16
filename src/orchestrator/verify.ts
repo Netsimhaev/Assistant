@@ -67,9 +67,14 @@ export interface CloseVerifiedResult {
    * candidates and then failed partway through (`written > 0` inside its
    * `catch` still counts as `ran`), so membership here is not by itself
    * proof of a clean run. A job that closed without appearing in either
-   * this list or `curationSkipped` below simply had no plan qualified for
-   * curation in the first place (`not_qualified`, `no_plan`, `no_brief`) —
-   * the ordinary case, since most jobs never ask the curator anything.
+   * this list or `curationSkipped` below is the one `CurationOutcome`
+   * shape neither list carries: `ran: false, skipped: null, failed: true`
+   * — an attempt that threw before writing a single candidate (a model
+   * error, a failed query, `refuseUnderTest` firing under
+   * `NODE_ENV=test`). `curateJob` still records that failure as its own
+   * `curation` audit row, but this pass result does not surface it —
+   * exactly the gap N2 exists to close, and the one this fix wave left
+   * open.
    */
   curated: string[];
   /**
