@@ -132,4 +132,43 @@ describe('the memory block handed to the planner', () => {
     expect(block).toContain(firstEmail);
     expect(block).not.toContain(secondEmail);
   });
+
+  it('stops at first row that does not fit, not skipping to a later shorter row', async () => {
+    const bossJob = await jobWith('boss');
+    const subject = 'test@example.com';
+
+    // Three rows in the same provenance tier (all boss).
+    // Stored in this order, but retrieved in reverse (newest first).
+    // Row 1 (oldest): a short row
+    const oldest = 'X'.repeat(50);
+    await writeMemory(
+      { jobId: bossJob, kind: 'chunk', subjectKey: subject, body: { text: oldest } },
+      { businessId: BUSINESS },
+    );
+    // Row 2 (middle): a huge row that will not fit in the budget
+    const huge = 'Y'.repeat(500);
+    await writeMemory(
+      { jobId: bossJob, kind: 'chunk', subjectKey: subject, body: { text: huge } },
+      { businessId: BUSINESS },
+    );
+    // Row 3 (newest): another short row
+    const newest = 'Z'.repeat(50);
+    await writeMemory(
+      { jobId: bossJob, kind: 'chunk', subjectKey: subject, body: { text: newest } },
+      { businessId: BUSINESS },
+    );
+
+    // Retrieval order: newest (Z), huge (Y), oldest (X)
+    // Budget: enough for newest row, not enough for huge row.
+    // With break: newest fits, huge doesn't fit so stop. Result: newest only.
+    // With continue: newest fits, skip huge, oldest also fits. Result: newest + oldest (wrong).
+    const block = await recallForPlanning([subject], { businessId: BUSINESS, budget: 250 });
+
+    expect(block).toContain(newest);
+    expect(block).not.toContain(huge);
+    // This assertion catches the break vs continue difference:
+    // With break: stops at the row that does not fit (huge).
+    // With continue: skips huge and includes oldest as well.
+    expect(block).not.toContain(oldest);
+  });
 });
