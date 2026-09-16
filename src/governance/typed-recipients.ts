@@ -273,6 +273,12 @@ const LEADING_HEBREW_PARTICLE = /^[לבמהוכש][-\u05BE]/;
  * token with no brackets at all passes through it unchanged; the branch that
  * actually unwraps a display name is reached only when a token has one.
  *
+ * Exported for the curator's recall scope too (`src/orchestrator/instruct.ts`):
+ * the memory block handed to the planner is scoped to only the addresses an
+ * instruction actually names, and this is the function that already decides
+ * that question correctly for standing authorisation — a second extractor
+ * would drift from it.
+ *
  * Note on `EMAIL_SHAPE` itself: it is loose enough that a token like
  * `dana@example.co.il2` (once any leading particle is stripped) still
  * matches it as a whole — `EMAIL_SHAPE`'s domain half accepts any non-space,
@@ -285,7 +291,7 @@ const LEADING_HEBREW_PARTICLE = /^[לבמהוכש][-\u05BE]/;
  * ends up doing the rejecting, nothing is authorised that the owner did not
  * type in full.
  */
-function emailAddressesIn(instruction: string): string[] {
+export function emailAddressesIn(instruction: string): string[] {
   return instruction
     .split(/\s+/)
     .map((token) => token.replace(LEADING_HEBREW_PARTICLE, ''))

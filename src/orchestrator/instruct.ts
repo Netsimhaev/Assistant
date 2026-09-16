@@ -63,7 +63,8 @@ import {
   saveInstruction,
   type InstructionRecord,
 } from '../governance/instructions.js';
-import { authorisedRecipients } from '../governance/typed-recipients.js';
+import { authorisedRecipients, emailAddressesIn } from '../governance/typed-recipients.js';
+import { recallForPlanning } from '../memory/recall-planning.js';
 import { readEmails, readPhones } from '../policy/facts.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
@@ -168,6 +169,11 @@ export async function runInstruction(
     businessId,
   });
 
+  // Positive scope: only who this instruction actually names. Same extractor
+  // the standing-authorisation path uses, never a second one.
+  const subjects = emailAddressesIn(input.text);
+  const memoryBlock = await recallForPlanning(subjects, { businessId });
+
   let outcome: PlanOutcome;
   try {
     outcome = await planner({
@@ -181,6 +187,7 @@ export async function runInstruction(
       // gate would refuse. `rampLevelForPlan` is applied to the real plan by
       // `runDueJobs` when it runs.
       rampLevel: 'draft_only',
+      ...(memoryBlock === '' ? {} : { memoryBlock }),
     });
   } catch (err) {
     // `makePlan` returns `{status:'unparseable'}` for bad model OUTPUT, but it
