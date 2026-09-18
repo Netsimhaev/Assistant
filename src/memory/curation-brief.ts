@@ -160,6 +160,28 @@ export async function buildCurationBrief(
     }
   }
 
+  // The set of subjects `siftCandidates` will accept is per-job — it cannot
+  // live in `SYSTEM_PROMPT` (the cached prefix) without invalidating the
+  // cache on every call, the same reasoning `PlanRequest.instruction`'s
+  // docblock (`src/sdk/planner.ts`) gives for keeping a per-call value out of
+  // the system prompt. So it is rendered here, into the brief, verbatim —
+  // the exact strings `siftCandidates` compares against, not a paraphrase.
+  const permittedSubjects = [...recipients, ...entityIds];
+  const permittedSection =
+    permittedSubjects.length > 0
+      ? `# נושאים מותרים\n` +
+        `מותר לך לכתוב עובדה רק על מי שמזהה אותו מופיע ברשימה הזו, ` +
+        `ו-subjectKey חייב להיות זהה למזהה כאן אות באות — לא שם, לא ניחוש:\n` +
+        permittedSubjects.map((subject) => `- ${subject}`).join('\n')
+      : `# נושאים מותרים\n` +
+        `המשימה הזו לא פנתה אל אף אחד ולא נקבה בשם ישות — אין אף נושא שמותר ` +
+        `לכתוב עליו עובדה, ולכן התשובה התקנית היחידה היא {"candidates":[]}.`;
+  // Inserted right after the title, not appended at the end: `text` below is
+  // truncated by dropping whole trailing sections when it exceeds
+  // MAX_BRIEF_CHARS, and a section this small and this load-bearing must
+  // never be among the ones a long reading pushes out.
+  sections.splice(1, 0, permittedSection);
+
   let text = sections.join('\n\n');
   if (text.length > MAX_BRIEF_CHARS) {
     const marker = '\n\n[קוצץ]';
