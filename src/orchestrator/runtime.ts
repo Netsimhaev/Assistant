@@ -106,6 +106,19 @@ export function buildRuntime(
     }
   }
 
+  // Same switch discipline as the SMTP set above, for the same reason
+  // (spec §4.2): a missing key turns curation off entirely, and a job that
+  // closes without learning anything from it must not look identical to a
+  // job that simply had nothing worth remembering. `curateJob` itself
+  // reports this per-job as `skipped: 'no_key'`; this is the one place that
+  // reports it for the installation as a whole, before any job has run.
+  if ((env['ANTHROPIC_API_KEY'] ?? '').length === 0) {
+    warnings.push(
+      `no curation: ANTHROPIC_API_KEY not set — jobs will close normally, ` +
+        `but the assistant will not learn anything from them`,
+    );
+  }
+
   return {
     registry: new AdapterRegistry(systemAdapters, [browserAdapter]),
     credentials: envCredentials(env),

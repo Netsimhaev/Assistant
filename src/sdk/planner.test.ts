@@ -228,4 +228,37 @@ describe('the planner prompt', () => {
     expect(prompt).toContain('# ה-intents');
     expect(prompt).toContain('reply_to_sender');
   });
+
+  /**
+   * The capability catalogue is the most heavily cached text in the system and
+   * one byte changed in the prefix invalidates all of it. Memory changes on
+   * every job by definition, so it must sit AFTER everything that does not —
+   * the same position the intents and the instruction already occupy.
+   */
+  it('puts the memory block last, leaving the cached prefix identical', async () => {
+    const b = await bundle();
+    const withMemory = buildPlannerPrompt({
+      bundle: b,
+      intents: [],
+      instruction: 'תשיבי לרונית',
+      memoryBlock: '# מה ידוע מהעבר\n- ronit@beta-log.example: {"value":"טלפון"}',
+      provenance: 'boss',
+      rampLevel: 'auto',
+    });
+    const without = buildPlannerPrompt({
+      bundle: b,
+      intents: [],
+      instruction: 'תשיבי לרונית',
+      provenance: 'boss',
+      rampLevel: 'auto',
+    });
+
+    // Everything up to the instruction must be byte-identical: one varying
+    // byte invalidates the whole cached prefix, and memory varies on every job.
+    const prefixOf = (text: string) => text.slice(0, text.indexOf('# ההוראה'));
+    expect(prefixOf(withMemory)).toBe(prefixOf(without));
+    expect(withMemory.indexOf('# מה ידוע מהעבר')).toBeGreaterThan(
+      withMemory.indexOf('# ההוראה'),
+    );
+  });
 });

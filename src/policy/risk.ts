@@ -1,7 +1,7 @@
 import {
   BASELINE_REVERSIBILITY,
   BROWSER_ADDRESSED_CLASSES,
-  addresseeOf,
+  messagesAPerson,
 } from '../domain/action.js';
 import type { ActionFacts, CompiledCeilings, PolicyBundle } from '../domain/policy.js';
 import type { RiskAssessment, RiskBand, RiskDimensions } from '../domain/risk.js';
@@ -211,13 +211,10 @@ function scoreVisibility(
     facts.counterpartyTags.some((tag) => known.tags.includes(tag));
 
   // The every-address rule applies only where an address is a DESTINATION.
-  // `addresseeOf` is the existing answer to that question: `email.*` and
-  // `whatsapp.*` address a `person`, while `crm.write`, `accounting.write` and
-  // the rest address `internal` — for those the email in the payload is the
-  // record's content, not somewhere a message goes. Demanding that it resolve
-  // would put an approval in front of every new lead ever filed, which is the
-  // same failure in the opposite direction.
-  const messagesAPerson = facts.actionClass !== null && addresseeOf(facts.actionClass) === 'person';
+  // `messagesAPerson` (`src/domain/action.ts`) is the existing answer to that
+  // question — see its own docblock for why `crm.write`'s email must not
+  // count as one.
+  const addressedToPerson = messagesAPerson(facts.actionClass);
 
   // `every`, not `some`, and the distinction is the whole control. This is the
   // one place in the risk engine where a match makes the outcome LESS
@@ -234,7 +231,7 @@ function scoreVisibility(
   // resolve: the id is a claim about who this concerns, not about where the
   // message goes, and the two are exactly what an injected payload separates.
   const resolved =
-    messagesAPerson && addressesResolved.length > 0
+    addressedToPerson && addressesResolved.length > 0
       ? addressesResolved.every((isKnown) => isKnown)
       : identityResolved || addressesResolved.some((isKnown) => isKnown);
   return resolved

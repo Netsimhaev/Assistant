@@ -82,4 +82,8 @@ export const config = {
   documentRoot: resolve(required('DOCUMENT_ROOT')),
   documentInbox: optional('DOCUMENT_INBOX'),
   documentReadsPerDay: positiveInt('DOCUMENT_READS_PER_DAY', 20),
+  // A billed model call per finished job. A feature that spends money with no
+  // switch starts charging an existing installation on the day it upgrades —
+  // which is exactly what `DOCUMENT_INBOX` did before it became a switch.
+  curationRunsPerDay: positiveInt('CURATION_RUNS_PER_DAY', 20),
 } as const;

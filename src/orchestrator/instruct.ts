@@ -63,7 +63,8 @@ import {
   saveInstruction,
   type InstructionRecord,
 } from '../governance/instructions.js';
-import { authorisedRecipients } from '../governance/typed-recipients.js';
+import { authorisedRecipients, emailAddressesIn } from '../governance/typed-recipients.js';
+import { recallForPlanning } from '../memory/recall-planning.js';
 import { readEmails, readPhones } from '../policy/facts.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
@@ -168,6 +169,26 @@ export async function runInstruction(
     businessId,
   });
 
+  // Positive scope: only who this instruction actually names. Same extractor
+  // the standing-authorisation path uses, never a second one. This finds
+  // literal address tokens only — "תשיבי לרונית" with no address spelled out
+  // names nobody, yields no subjects, and gets no memory block at all.
+  // Resolving a name to a subject key is a separate, unbuilt capability.
+  const subjects = emailAddressesIn(input.text);
+
+  // A failed recall degrades to no memory block rather than failing the
+  // instruction — planning without the past is worse than planning with it,
+  // but not planning at all because a read failed is worse than both. Unlike
+  // the planner call below, which throws for the ordinary failure mode of a
+  // real call and must fail the job because there is no plan without it,
+  // this one has a safe fallback and takes it instead.
+  let memoryBlock = '';
+  try {
+    memoryBlock = await recallForPlanning(subjects, { businessId });
+  } catch {
+    memoryBlock = '';
+  }
+
   let outcome: PlanOutcome;
   try {
     outcome = await planner({
@@ -181,6 +202,7 @@ export async function runInstruction(
       // gate would refuse. `rampLevelForPlan` is applied to the real plan by
       // `runDueJobs` when it runs.
       rampLevel: 'draft_only',
+      ...(memoryBlock === '' ? {} : { memoryBlock }),
     });
   } catch (err) {
     // `makePlan` returns `{status:'unparseable'}` for bad model OUTPUT, but it

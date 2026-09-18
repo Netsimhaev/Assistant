@@ -4,6 +4,9 @@ import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
+import { recallMemories } from '../memory/store.js';
+import type { CurationResult } from '../memory/curation-parse.js';
+import type { Curator } from '../sdk/curator.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { bindPlanToJob, planHashOf, recordStepCompletion } from './plan-store.js';
 import { closeVerifiedJobs } from './verify.js';
@@ -168,6 +171,80 @@ describe('closeVerifiedJobs', () => {
     expect(result.unbound).toEqual([jobId]);
     expect(result.closed).toEqual([]);
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+  });
+
+  // Made deterministic on purpose. Without deleting the key, this test's
+  // actual behaviour depends on whether the machine running it has a real
+  // `ANTHROPIC_API_KEY` in `.env` (this repo's own does, per CLAUDE.md's
+  // note that the development machine "carries a real ANTHROPIC_API_KEY").
+  // With the key present and no `curator` injected, `curateJob` does NOT
+  // take the `no_key` skip \u2014 it reaches `curateWithModel`, whose
+  // `refuseUnderTest` guard throws because `NODE_ENV=test`, and that throw is
+  // caught inside `curateJob`'s own `try/catch` (`ran: false, failed: true`).
+  // That is a different `CurationOutcome` than the `no_key` skip (`failed:
+  // false`), even though both leave `ran: false`, which is all this test
+  // checks. Deleting the key here removes that ambiguity: this test now
+  // names, and guarantees, the `no_key` skip specifically. The refusal path
+  // is exercised implicitly by the sibling test below, which injects a
+  // `curator` and so never reaches `curateWithModel` at all \u2014 there is no
+  // test in this file that deliberately drives the `refuseUnderTest` throw;
+  // that path is `curate.test.ts`'s to cover, not this file's.
+  it('closes a job anyway when ANTHROPIC_API_KEY is absent, so curation is skipped rather than run', async () => {
+    const { jobId, planHash } = await jobInVerify();
+    await recordStep(jobId, planHash, 'completed');
+    const original = process.env['ANTHROPIC_API_KEY'];
+    delete process.env['ANTHROPIC_API_KEY'];
+
+    try {
+      const result = await closeVerifiedJobs({ businessId: BUSINESS });
+
+      expect(result.closed).toContain(jobId);
+      // The property under test: a job that did its work still closes when
+      // curation does not run.
+      expect(result.curated).not.toContain(jobId);
+      // And the skip is visible rather than discarded (N2): "curation is
+      // off" must not look identical to "nothing was worth remembering".
+      expect(result.curationSkipped).toContainEqual({ jobId, reason: 'no_key' });
+    } finally {
+      if (original !== undefined) process.env['ANTHROPIC_API_KEY'] = original;
+    }
+  });
+
+  // The test above proves a real property (curation off must not strand a
+  // job), but on its own it cannot tell "the call is wired in" from "the
+  // call was deleted": `curated: []` is initialised whether or not
+  // `curateJob` ever runs, so a purely negative assertion against it holds
+  // either way. This test closes that gap with an injected curator \u2014 the
+  // same seam `runPlan`'s `bindings` parameter provides \u2014 and asserts on a
+  // side effect (a `memories` row) that only a real call can produce.
+  it('runs an injected curator and writes what it returns, before closing', async () => {
+    const { jobId, planHash } = await jobInVerify();
+    await recordStep(jobId, planHash, 'completed');
+
+    // PLAN's one step sends to dana@example.com, so that address is in
+    // `touched.recipients` and `siftCandidates` will accept a candidate
+    // naming it.
+    const curator: Curator = async (): Promise<CurationResult> => ({
+      candidates: [
+        {
+          kind: 'chunk',
+          subjectKey: 'dana@example.com',
+          body: { value: '\u05de\u05e2\u05d3\u05d9\u05e4\u05d4 \u05ea\u05d9\u05d0\u05d5\u05dd \u05d1\u05d1\u05d5\u05e7\u05e8' },
+          sourceRef: '\u05d2\u05d5\u05e3 \u05d4\u05d4\u05d5\u05d3\u05e2\u05d4',
+        },
+      ],
+    });
+
+    const result = await closeVerifiedJobs({ businessId: BUSINESS, curator });
+
+    expect(result.closed).toContain(jobId);
+    expect(result.curated).toContain(jobId);
+    const rows = await recallMemories(
+      { subjectKey: 'dana@example.com', kind: 'chunk' },
+      { businessId: BUSINESS },
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.body).toEqual({ value: '\u05de\u05e2\u05d3\u05d9\u05e4\u05d4 \u05ea\u05d9\u05d0\u05d5\u05dd \u05d1\u05d1\u05d5\u05e7\u05e8' });
   });
 
   it('leaves another business\u2019s job alone', async () => {

@@ -46,6 +46,7 @@ import type { KeptItemKind } from '../governance/kept-items.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
+import { MAX_RECALL, recallMemories } from '../memory/store.js';
 import { verifyDocumentUnchanged } from '../documents/verify.js';
 import type { VerifyOutcome } from '../documents/verify.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -67,6 +68,7 @@ import {
   renderForbidden,
   renderInstruct,
   renderLogin,
+  renderMemory,
   renderNotFound,
   renderPasswordChange,
   renderPendingList,
@@ -381,6 +383,19 @@ const READINGS_LIST_LIMIT = 50;
 async function handleReadings(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   const rows = await recentReadings(READINGS_LIST_LIMIT, { businessId });
   sendHtml(res, 200, renderReadings(rows, issueCsrfToken(session.sessionId)));
+}
+
+/**
+ * "מה נזכר" — read-only, on purpose. `recallMemories({})` with no
+ * `subjectKey`/`keyword` returns the most recent rows rather than everything
+ * (see that function's own docblock: "recall everything" is not a question
+ * the store answers), so this asks for `MAX_RECALL` — the same cap the store
+ * itself enforces on any caller — rather than a smaller default meant for a
+ * single recall during planning.
+ */
+async function handleMemory(res: ServerResponse, businessId: string, session: Session): Promise<void> {
+  const memories = await recallMemories({ limit: MAX_RECALL }, { businessId });
+  sendHtml(res, 200, renderMemory(memories, issueCsrfToken(session.sessionId)));
 }
 
 /**
@@ -1698,6 +1713,7 @@ async function route(
 
   if (method === 'GET' && pathname === '/') return handlePendingList(res, businessId, session);
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
+  if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
 
   if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
   if (method === 'POST' && pathname === '/instruct')

@@ -17,6 +17,7 @@ import type { ErasureAnchor, ErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
 import type { KeptItem } from '../governance/kept-items.js';
 import type { IntentName } from '../domain/reading.js';
+import type { MemoryRecord } from '../memory/store.js';
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { formatMinor } from '../util/money.js';
@@ -267,6 +268,97 @@ export function renderReadings(rows: ReadingSummary[], csrf: string): string {
 <p><a href="/">&rarr; חזרה לרשימה</a></p>
 <p class="muted">כל מסמך שנקלט ונקרא, ומה שהוסק ממנו. המסך הזה מציג בלבד — הכרעה נעשית בכרטיס האישור.</p>
 ${rows.length === 0 ? '<p>עדיין לא נקרא אף מסמך.</p>' : items}`,
+  );
+}
+
+const MEMORY_KIND_LABEL: Record<string, string> = {
+  entity: 'ישות',
+  preference: 'העדפה',
+  chunk: 'קטע',
+};
+
+/** Hebrew label for a memory's provenance — the trust level of the job that wrote it. */
+const PROVENANCE_LABEL: Record<string, string> = {
+  boss: 'הבעלים',
+  staff: 'צוות',
+  known_counterparty: 'צד ידוע',
+  unknown_external: 'גורם חיצוני לא מזוהה',
+  open_web: 'אינטרנט פתוח',
+};
+
+/** What one memory's value column shows — the preference's key beside its value, or the raw body otherwise. */
+/**
+ * `escLabel`, not `esc` — this screen exists so the owner can audit what the
+ * assistant believes, and much of what it shows here is text a stranger
+ * wrote: a `chunk`'s body is exactly where an external claim lands verbatim
+ * (`memory/store.ts`'s own reason for stamping every row with `provenance`).
+ * A bidirectional override inside that text would make a line render as
+ * something other than what is actually stored, on the one screen whose
+ * whole job is to show that faithfully. `esc` neutralises markup; it leaves
+ * the override family untouched (see `escLabel`'s docblock).
+ */
+function memoryValue(memory: MemoryRecord): string {
+  if (memory.attribute !== null) {
+    return `${escLabel(memory.attribute)}: ${escLabel(JSON.stringify(memory.body))}`;
+  }
+  return escLabel(JSON.stringify(memory.body));
+}
+
+/**
+ * What the assistant has recorded on its own initiative (`memory/store.ts`),
+ * one row per memory, sorted by subject.
+ *
+ * **Read-only, deliberately.** No form, no delete button: the erasure screen
+ * already deletes, with a counted preview and a confirmation step, and a
+ * second, casual path next to a plain list would be the dangerous kind of
+ * convenience.
+ *
+ * **`escLabel`, not `esc`, on `subjectKey` and `sourceRef`.** Both are text
+ * somebody else chose — a memory's subject can be an address that arrived
+ * inside a document a stranger wrote, and `esc` alone leaves a
+ * bidirectional-override character intact (see `escLabel`'s docblock).
+ *
+ * **A row whose `provenance` is not `boss` reads as a loaded claim, never as
+ * a fact.** That is the whole reason `memory/store.ts` stamps every row with
+ * the trust level of the job that wrote it and never strips it on recall: a
+ * supplier's document that says "our new bank account is X" is a claim that
+ * supplier made, and showing it here the same way a preference the owner
+ * typed is shown would be exactly the laundering that module's docblock warns
+ * about.
+ */
+export function renderMemory(memories: MemoryRecord[], csrf: string): string {
+  const sorted = [...memories].sort((a, b) => a.subjectKey.localeCompare(b.subjectKey));
+  const rows = sorted
+    .map((m) => {
+      const kind = MEMORY_KIND_LABEL[m.kind] ?? m.kind;
+      const source = m.sourceRef === null ? '—' : escLabel(m.sourceRef);
+      const label =
+        m.provenance === 'boss'
+          ? esc(PROVENANCE_LABEL['boss'] ?? 'boss')
+          : `<strong>נטען</strong> — ${esc(PROVENANCE_LABEL[m.provenance] ?? m.provenance)}`;
+      return `<tr>
+        <td>${escLabel(m.subjectKey)}</td>
+        <td>${esc(kind)}</td>
+        <td>${memoryValue(m)}</td>
+        <td>${source}</td>
+        <td>${label}</td>
+      </tr>`;
+    })
+    .join('');
+
+  return page(
+    'מה נזכר',
+    `<header>
+  <h1>מה נזכר</h1>
+  ${logoutForm(csrf)}
+</header>
+<p><a href="/">&rarr; חזרה לרשימה</a></p>
+<p class="muted">מה שהעוזרת רשמה מיוזמתה. המסך הזה מציג בלבד — אין כאן מחיקה; מחיקה נעשית במסך המחיקה.</p>
+${
+  memories.length === 0
+    ? '<p>עדיין לא נרשם דבר.</p>'
+    : `<table><tr><th>נושא</th><th>סוג</th><th>ערך</th><th>מקור</th><th>סטטוס</th></tr>${rows}</table>`
+}`,
   );
 }
 
@@ -524,7 +616,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }

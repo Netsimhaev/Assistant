@@ -1,13 +1,16 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { installCharter } from '../charter/store.js';
+import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { loadPlanBody } from './plan-store.js';
 import { loadInstructionForJob } from '../governance/instructions.js';
+import { createJob } from './jobs.js';
+import { writeMemory } from '../memory/store.js';
 import { runInstruction } from './instruct.js';
 import type { Plan } from '../domain/plan.js';
+import type { PlanRequest } from '../sdk/planner.js';
 
 const BUSINESS = 'test-business';
 
@@ -407,5 +410,48 @@ describe('runInstruction', () => {
     expect(plans.rows).toHaveLength(0);
     const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs`);
     expect(jobs.rows[0]?.phase).toBe('failed');
+  });
+
+  /**
+   * The chain instruction -> subjects -> recall -> prompt, proven end to end
+   * rather than in pieces: `planner.test.ts` proves `buildPlannerPrompt`
+   * places an already-built string correctly, which says nothing about
+   * whether `instruct.ts` ever builds one. Capturing the real `PlanRequest`
+   * the injected planner receives is what makes deleting the recall call
+   * fail this test rather than leaving the suite green.
+   */
+  it('passes the planner a memory block for an address the instruction names', async () => {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'preference',
+        subjectKey: 'ronit@beta-log.example',
+        attribute: 'ערוץ מועדף',
+        body: { value: 'טלפון' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    const captured: { request: PlanRequest | null } = { request: null };
+    const result = await runInstruction(
+      { text: 'תשיבי לרונית בכתובת ronit@beta-log.example' },
+      {
+        businessId: BUSINESS,
+        planner: async (request) => {
+          captured.request = request;
+          return { status: 'planned', plan: mailPlan('ronit@beta-log.example') };
+        },
+      },
+    );
+
+    expect(result.status).toBe('planned');
+    expect(captured.request?.memoryBlock).toContain('טלפון');
   });
 });

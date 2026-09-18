@@ -27,6 +27,11 @@ export interface PlanRequest {
    * deliberate exception and why it does not extend to any other caller.
    */
   instruction?: string;
+  /**
+   * The past, already assembled and labelled by `recallForPlanning`. Rendered
+   * LAST for the cache's sake, and never re-ordered above the catalogue.
+   */
+  memoryBlock?: string;
 }
 
 export type PlanOutcome =
@@ -101,6 +106,9 @@ export function buildPlannerPrompt(request: PlanRequest): string {
     ...(request.instruction === undefined
       ? ['# ה-intents', JSON.stringify(request.intents)]
       : ['# ההוראה מבעל העסק', request.instruction]),
+    ...(request.memoryBlock !== undefined && request.memoryBlock !== ''
+      ? ['', request.memoryBlock]
+      : []),
   ].join('\n');
 }
 
@@ -203,7 +211,7 @@ export function parsePlan(raw: string): PlanOutcome {
  * first lets the caller decide which one is the plan — being parseable and
  * being a plan are different questions.
  */
-function extractJsonObjects(raw: string): unknown[] {
+export function extractJsonObjects(raw: string): unknown[] {
   const text = raw.replace(/```(?:json)?/g, '');
   const found: unknown[] = [];
 
