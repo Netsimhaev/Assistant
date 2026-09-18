@@ -236,4 +236,60 @@ describe('the brief the curator is asked about', () => {
 
     expect(brief?.touched.entityIds).toEqual(['supplier-beta-log']);
   });
+
+  /**
+   * Defect 2 from the first live run: the model answered with a name
+   * ("רונית") while `touched.recipients` held an address
+   * (`ronit@beta-log.example`), so every candidate would have been refused as
+   * `subject_not_touched` even after Defect 1's envelope fix. The brief must
+   * spell out the exact strings `siftCandidates` will accept, verbatim, so
+   * the model has something to copy rather than something to guess from.
+   */
+  it('lists the touched recipients and entity ids verbatim as permitted subjects', async () => {
+    const jobId = await seedJobWithPlan('mail.send', {
+      to: 'ronit@beta-log.example',
+      subject: 'עדכון',
+      body: 'טקסט',
+    });
+
+    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+
+    expect(brief?.text).toContain('נושאים מותרים');
+    expect(brief?.text).toContain('ronit@beta-log.example');
+  });
+
+  it('says plainly that there is no permitted subject when the job touched nobody', async () => {
+    const jobId = await seedJob('משימה פנימית בלבד');
+    await bindSteps(jobId, 'משימה פנימית בלבד', [
+      { id: 's1', agent: 'ops.systems', toolName: 'artifact.write', input: { path: 'x.txt' } },
+    ]);
+
+    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+
+    expect(brief?.touched.recipients).toEqual([]);
+    expect(brief?.touched.entityIds).toEqual([]);
+    expect(brief?.text).toContain('נושאים מותרים');
+    expect(brief?.text).toContain('לא פנתה אל אף אחד');
+    expect(brief?.text).toContain('candidates');
+  });
+
+  /**
+   * The permitted-subjects section is small and load-bearing, so it must
+   * survive the same truncation that drops whole trailing sections when the
+   * brief exceeds MAX_BRIEF_CHARS — it is spliced in right after the title,
+   * not appended at the end, for exactly this reason.
+   */
+  it('keeps the permitted-subjects section even when the brief is truncated', async () => {
+    const jobId = await seedJobWithPlan('mail.send', {
+      to: 'ronit@beta-log.example',
+      subject: 'עדכון',
+      body: 'א'.repeat(MAX_BRIEF_CHARS + 5_000),
+    });
+
+    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+
+    expect(brief!.text).toContain('[קוצץ]');
+    expect(brief!.text).toContain('נושאים מותרים');
+    expect(brief!.text).toContain('ronit@beta-log.example');
+  });
 });
