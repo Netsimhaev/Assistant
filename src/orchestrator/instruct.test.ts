@@ -516,6 +516,55 @@ describe('runInstruction', () => {
   });
 
   /**
+   * Spec §6: when neither candidate has a company or an address to tell them
+   * apart, offering their bare names twice is a question with no answer. The
+   * owner must be told what actually works instead — typing the address,
+   * which both identifies the person and authorises writing to them.
+   */
+  it('tells the owner to type the address when neither candidate has a distinguishing detail', async () => {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-cohen-nodetail',
+        body: { name: 'רונית כהן' },
+      },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-levi-nodetail',
+        body: { name: 'רונית לוי' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    const outcome = await runInstruction(
+      { text: 'תשיבי לרונית' },
+      {
+        businessId: BUSINESS,
+        planner: async () => {
+          throw new Error('the planner must not be called when the identity is unresolved');
+        },
+      },
+    );
+
+    expect(outcome.status).toBe('needs_answer');
+    if (outcome.status !== 'needs_answer') return;
+    expect(outcome.question).toContain('רונית');
+    expect(outcome.question).toContain('כתובת');
+  });
+
+  /**
    * A name that resolves to exactly one contact must feed that contact's
    * memory to the planner — proven end to end, as the neighbouring test above
    * proves the typed-address path, so deleting the resolver call fails this

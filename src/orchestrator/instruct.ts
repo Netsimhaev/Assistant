@@ -497,6 +497,21 @@ async function grantForPlan(
  */
 function renderIdentityQuestion(ambiguities: readonly Ambiguity[]): string {
   const lines = ambiguities.map((ambiguity) => {
+    // Positive check: does ANY candidate carry something that tells it apart
+    // from the others? When none does, offering their bare names is a
+    // question with no possible answer, so the owner is pointed at the one
+    // path that both identifies the person and authorises writing to them —
+    // typing the address — rather than being asked to guess.
+    const hasDistinguishingDetail = ambiguity.candidates.some(
+      (candidate) => candidate.company !== null || candidate.email !== null,
+    );
+    if (!hasDistinguishingDetail) {
+      return (
+        `יש לי כמה אנשי קשר בשם "${ambiguity.token}" ואין לי דרך להבחין ביניהם. ` +
+        `כדי שאדע בדיוק למי לפנות, אפשר לכתוב את כתובת המייל או מספר הטלפון שלה/שלו.`
+      );
+    }
+
     const options = ambiguity.candidates
       .map((candidate) => {
         const details = [candidate.company, candidate.email].filter(
