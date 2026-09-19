@@ -23,6 +23,20 @@ const DANI: Contact = {
   email: 'dani@delta.example',
 };
 
+const RONIT_ONLY: Contact = {
+  subjectKeys: ['ronit-solo'],
+  name: 'רונית',
+  company: null,
+  email: 'ronit@solo.example',
+};
+
+const RONIT_ONLY_TWO: Contact = {
+  subjectKeys: ['ronit-solo-two'],
+  name: 'רונית',
+  company: null,
+  email: 'ronit2@solo.example',
+};
+
 describe('resolving a name to an identity', () => {
   it('resolves a first name to every key that person has', () => {
     const result = resolveContacts('תשיבי לרונית על ההצעה', [RONIT]);
@@ -133,5 +147,31 @@ describe('resolving a name to an identity', () => {
 
   it('returns nothing when there are no contacts at all', () => {
     expect(resolveContacts('תשיבי לרונית', [])).toEqual({ subjects: [], ambiguities: [] });
+  });
+
+  /**
+   * A one-word name must not collide with itself: `namePartsOf` used to
+   * return the full name twice (once as `full`, once as its only "part"),
+   * so a single contact was pushed into the same bucket twice and reported
+   * as an ambiguity between herself and herself.
+   */
+  it('resolves a single one-word name silently, with no self-ambiguity', () => {
+    const result = resolveContacts('תשיבי לרונית', [RONIT_ONLY]);
+
+    expect(result.ambiguities).toEqual([]);
+    expect(result.subjects).toEqual(expect.arrayContaining(['ronit-solo']));
+  });
+
+  /**
+   * Two different people who both happen to be named with the same single
+   * word must still raise a real ambiguity with exactly two candidates —
+   * de-duplicating a contact's own name parts must never merge two people.
+   */
+  it('still asks when two different people share one one-word name', () => {
+    const result = resolveContacts('תשיבי לרונית', [RONIT_ONLY, RONIT_ONLY_TWO]);
+
+    expect(result.subjects).toEqual([]);
+    expect(result.ambiguities).toHaveLength(1);
+    expect(result.ambiguities[0]?.candidates).toHaveLength(2);
   });
 });

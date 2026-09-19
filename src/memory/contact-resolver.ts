@@ -81,11 +81,22 @@ function tokensOf(text: string): Set<string> {
   return out;
 }
 
-/** Every way this contact's name may be written: the whole name and each part. */
+/**
+ * Every distinct way this contact's name may be written: the whole name and
+ * each part, de-duplicated.
+ *
+ * A one-word name makes `full` and its only part the same string. Without
+ * de-duplication that contact was pushed into its own bucket in
+ * `resolveContacts` twice, `matched.length === 1` came out false, and a
+ * single contact was reported as an ambiguity against herself. The dedupe
+ * only removes repeats of the *same* contact's own spellings — it never
+ * merges two different contacts, so two people who share a one-word name
+ * still land in the same bucket as two separate entries and still ask.
+ */
 function namePartsOf(contact: Contact): string[] {
   const full = contact.name.trim().toLowerCase();
   const parts = full.split(/\s+/).filter((part) => part !== '');
-  return [full, ...parts];
+  return [...new Set([full, ...parts])];
 }
 
 /**
