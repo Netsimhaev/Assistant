@@ -239,8 +239,15 @@ const TRAILING_PUNCTUATION = /[.,;:!?)"']+$/;
  * one. There is no sub-token scanning anywhere in this pipeline and nothing
  * for a backtracking engine to settle for, regardless of what precedes or
  * follows the particle.
+ *
+ * Exported because `src/memory/contact-resolver.ts` reads it too, so there is
+ * one definition of "a Hebrew particle glued to a word", never two. That
+ * reader only needs the hyphenated form from here — the particle followed by
+ * `-` or the Hebrew maqaf — and handles the glued form (`לרונית`, no
+ * separator at all) with its own rule, because this pattern does not match
+ * that spelling.
  */
-const LEADING_HEBREW_PARTICLE = /^[לבמהוכש][-\u05BE]/;
+export const LEADING_HEBREW_PARTICLE = /^[לבמהוכש][-\u05BE]/;
 
 /**
  * Email-shaped tokens in free text, found the way `readEmails`
