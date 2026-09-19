@@ -108,6 +108,18 @@ export type InstructionOutcome =
        * already authorised, and this is the sentence that tells them why.
        */
       grantNote: string | null;
+      /**
+       * Set only when a name was still ambiguous on the second pass, so the
+       * instruction went ahead with none of that person's memory (spec
+       * §7.2's "ומציינת זאת").
+       *
+       * Carried out on the outcome rather than written anywhere, exactly as
+       * `grantNote` above is, because it is the same kind of fact: the owner
+       * has already been asked once, their answer did not settle it, and
+       * without this sentence they would assume the memory was used. Silence
+       * here is not neutral — it is a claim that nothing went unused.
+       */
+      identityNote: string | null;
     }
   | {
       status: 'needs_answer';
@@ -192,7 +204,10 @@ export async function runInstruction(
     resolution = resolveContacts(input.text, await listContacts({ businessId }));
   } catch {
     // A failed contact read degrades to no memory, never to a failed
-    // instruction — the same trade the recall below already makes.
+    // instruction — the same trade the recall below already makes. Spec §10
+    // row 1: the instruction proceeds with no memory AND no question, since
+    // a read that never returned recognised nobody — which is a different
+    // thing from recognising somebody ambiguously.
   }
 
   // Spec §6: more than one person fits the name, so nothing is planned and
@@ -214,6 +229,14 @@ export async function runInstruction(
       instructionText: instruction.text,
     };
   }
+
+  // Reached only when either nothing was ambiguous or the owner has already
+  // been asked once, so a remaining ambiguity here is exactly spec §7.2's
+  // case: proceed without that person's memory, and say so.
+  const identityNote =
+    resolution.ambiguities.length > 0
+      ? renderIdentityNote(resolution.ambiguities.map((ambiguity) => ambiguity.token))
+      : null;
 
   const subjects = [...typed, ...resolution.subjects];
 
@@ -391,7 +414,28 @@ export async function runInstruction(
     instructionId: instruction.instructionId,
     granted,
     grantNote,
+    identityNote,
   };
+}
+
+/**
+ * The sentence the owner reads when their answer did not settle who was
+ * meant and the instruction went ahead anyway (spec §7.2).
+ *
+ * It says three things, in the order the owner needs them: which name went
+ * unresolved, that the instruction ran WITHOUT what is remembered about that
+ * person, and the one thing that fixes it — writing the address. Pointing at
+ * the address is not incidental: it is the same path the identity question's
+ * own no-detail branch offers, and the only one that both identifies the
+ * person and (separately, through the charter) authorises writing to them.
+ */
+function renderIdentityNote(tokens: readonly string[]): string {
+  const names = tokens.map((token) => `"${token}"`).join(', ');
+  return tokens.length === 1
+    ? `עדיין לא ידעתי לזהות בוודאות למי התכוונת ב-${names}, ולכן המשכתי בלי מה שאני ` +
+        'זוכרת על אותו אדם. אם תכתוב לי את כתובת המייל שלו, אדע בפעם הבאה בדיוק במי מדובר.'
+    : `עדיין לא ידעתי לזהות בוודאות למי התכוונת ב-${names}, ולכן המשכתי בלי מה שאני ` +
+        'זוכרת על אותם אנשים. אם תכתוב לי את כתובות המייל שלהם, אדע בפעם הבאה בדיוק במי מדובר.';
 }
 
 interface GrantForPlanResult {

@@ -404,13 +404,20 @@ async function handleMemory(res: ServerResponse, businessId: string, session: Se
  * pipeline does not care which one produced the text it just planned (or
  * refused, or asked about again).
  *
- * A `planned` outcome carrying a `grantNote` renders the box instead of
- * redirecting home. The note is non-null in exactly one case — a plan
+ * A `planned` outcome carrying either note renders the box instead of
+ * redirecting home. `grantNote` is non-null in exactly one case — a plan
  * spanning more than one action class, which authorises nothing at all (see
  * `grantForPlan` in `instruct.ts`) — and without showing it here the owner is
  * bounced straight to the pending list and later meets an approval card for
  * something they believed the instruction had already covered, with no
  * sentence anywhere explaining why the shortcut did not apply.
+ *
+ * `identityNote` is non-null when a name stayed ambiguous after the owner had
+ * already answered once, so the instruction ran with none of that person's
+ * memory (spec §7.2's "ומציינת זאת"). Redirecting home on that outcome is
+ * what made the silence: an ordinary success page, and an owner who believes
+ * their answer worked. Both notes are passed together — they answer
+ * different questions and one instruction can raise both.
  */
 function renderInstructionOutcome(
   res: ServerResponse,
@@ -434,8 +441,16 @@ function renderInstructionOutcome(
     );
     return;
   }
-  if (outcome.grantNote !== null) {
-    sendHtml(res, 200, renderInstruct({ csrf, grantNote: outcome.grantNote }));
+  if (outcome.grantNote !== null || outcome.identityNote !== null) {
+    sendHtml(
+      res,
+      200,
+      renderInstruct({
+        csrf,
+        grantNote: outcome.grantNote,
+        identityNote: outcome.identityNote,
+      }),
+    );
     return;
   }
   redirect(res, '/');

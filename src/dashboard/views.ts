@@ -541,6 +541,12 @@ ${signErrorBlock}
  * folded into it, since the two can never occur together (a `grantNote` only
  * ever accompanies a `planned` outcome, an `error` only ever a `refused` one).
  *
+ * `identityNote` is the second of the two notes and answers a different
+ * question: a name in the instruction still fitted more than one contact
+ * after the owner had already been asked once, so the instruction went ahead
+ * with none of that person's memory (spec §7.2). Both can be true of one
+ * instruction, so both render.
+ *
  * The clarifying question goes through `escLabel`, not `esc`: it is
  * model-composed text reaching an RTL page, the same category `escLabel` was
  * written for (see its own docblock). Every instruction is owner-typed today,
@@ -583,12 +589,21 @@ export function renderInstruct(options: {
   error?: string;
   pending?: PendingQuestion[] | null;
   grantNote?: string | null;
+  identityNote?: string | null;
 }): string {
   const error =
     options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
 
   const grantNote =
     options.grantNote == null ? '' : `<p class="muted">${esc(options.grantNote)}</p>`;
+
+  // Through `escLabel`, not `esc`: this note quotes the owner's own words
+  // back at them — the name token exactly as it was typed — and a quoted
+  // fragment reaching an RTL page is the category `escLabel` was written
+  // for. It renders beside `grantNote` rather than replacing it, because the
+  // two answer different questions and one instruction can raise both.
+  const identityNote =
+    options.identityNote == null ? '' : `<p class="muted">${escLabel(options.identityNote)}</p>`;
 
   const pending =
     options.pending == null
@@ -600,6 +615,7 @@ export function renderInstruct(options: {
     `<h1>מה לעשות</h1>
      ${error}
      ${grantNote}
+     ${identityNote}
      ${pending}
      <form method="POST" action="/instruct">
        <input type="hidden" name="csrf" value="${esc(options.csrf)}">

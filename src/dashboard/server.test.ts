@@ -10,6 +10,7 @@ import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
+import { writeMemory } from '../memory/store.js';
 import { enqueueApproval, getApproval } from '../governance/approvals.js';
 import type { ActionFacts } from '../domain/policy.js';
 import type { RiskAssessment } from '../domain/risk.js';
@@ -705,6 +706,45 @@ describe('renderInstruct — grantNote (fix round 1, C1)', () => {
   });
 });
 
+/**
+ * F2 / spec §7.2. `identityNote` is the second half of "proceeds without
+ * memory ומציינת זאת": without it the owner reads an ordinary success and
+ * assumes what is remembered about that person was taken into account. It is
+ * rendered the same way `grantNote` above is, at the same layer and for the
+ * same reason — this route cannot inject a planner, so the pipeline half of
+ * this lives in `instruct.test.ts`.
+ */
+describe('renderInstruct - identityNote (spec 7.2)', () => {
+  it('renders the identity note, escaped', () => {
+    const html = renderInstruct({
+      csrf: 'tok',
+      identityNote: 'המשכתי בלי מה שאני זוכרת <script>alert(1)</script> על אותו אדם.',
+    });
+    expect(html).toContain('המשכתי בלי מה שאני זוכרת');
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  it('renders no identity note block when there is none', () => {
+    const html = renderInstruct({ csrf: 'tok' });
+    expect(html).not.toContain('המשכתי בלי מה שאני זוכרת');
+  });
+
+  /**
+   * The two notes answer different questions and can both be true of one
+   * instruction, so one must not displace the other.
+   */
+  it('renders both notes together', () => {
+    const html = renderInstruct({
+      csrf: 'tok',
+      grantNote: 'לא ניתנה הרשאה אוטומטית.',
+      identityNote: 'המשכתי בלי מה שאני זוכרת על אותו אדם.',
+    });
+    expect(html).toContain('לא ניתנה הרשאה אוטומטית');
+    expect(html).toContain('המשכתי בלי מה שאני זוכרת');
+  });
+});
+
 describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N2)', () => {
   // Fix round 2: `reasonForSupersededJob` no longer accepts a `refused`
   // outcome at all — its parameter type is `Extract<..., { jobId: string }>`,
@@ -721,6 +761,7 @@ describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N
         instructionId: 'INS-1',
         granted: [],
         grantNote: null,
+        identityNote: null,
       }),
     ).toContain('J-REPLACEMENT');
 
@@ -1073,6 +1114,77 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(job?.phase).toBe('execute');
     const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
     expect(stored?.answer).toBeNull();
+  });
+
+  /**
+   * F3 / spec §7.2's loop bound, tested at the wire.
+   *
+   * `identityAsked: true` in `answerUnderClaim` is the single argument that
+   * stops the identity question being asked again on every pass, forever.
+   * The existing §7.2 test injects that option straight into
+   * `runInstruction`, so it proves the OPTION works and nothing proves this
+   * ROUTE passes it: reverting the argument to `{ businessId }` left
+   * `server.test.ts` and `instruct.test.ts` entirely green.
+   *
+   * This test posts an answer that genuinely fails to narrow a real
+   * ambiguity — two contacts named רונית, an answer naming neither — so the
+   * second pass reaches the identity check with `ambiguities` non-empty. The
+   * negative assertion alone would be worthless (the request could refuse
+   * earlier for any reason and still not contain the question), so the
+   * positive one is what makes it bite: the response must carry the
+   * planner-failure refusal, which is only reachable by running PAST the
+   * identity check. Without the argument the route returns the identity
+   * question instead and both assertions flip.
+   *
+   * Like the concurrency test above, this posts a SHORT answer and so runs
+   * past the length cap — and stays off the network the same way, through
+   * `makePlan`'s `refuseUnderTest`.
+   */
+  it('does not ask the identity question again when answering through the route', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const jobId = await anInstructionJob(BUSINESS, 'תשיבי לרונית');
+
+    // Two people one name — the ambiguity the answer below will not settle.
+    const seedJob = await createJob({
+      charterVersion: (await loadJob(jobId, { businessId: BUSINESS }))?.charterVersion ?? '',
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-cohen-beta-log',
+        body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
+      },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-levi-gamma',
+        body: { name: 'רונית לוי', company: 'גמא הרמה' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    const csrf = extractCsrf(await boxPage.text());
+
+    const res = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, answer: 'אני לא זוכר' }),
+    });
+    const body = await res.text();
+
+    // It ran the pipeline through to the planner, which is only possible
+    // past the identity check.
+    expect(body).toContain('קריאת המתכנן נכשלה');
+    // And it did not ask a second time.
+    expect(body).not.toContain('למי התכוונת');
   });
 });
 

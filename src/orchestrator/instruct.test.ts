@@ -660,4 +660,134 @@ describe('runInstruction', () => {
 
     expect(outcome.status).not.toBe('needs_answer');
   });
+
+  /**
+   * Spec §7.2 has two halves — she proceeds without memory **and states
+   * that** ("ומציינת זאת") — and only the first was implemented. An owner
+   * who has already been asked once, and whose answer did not settle it,
+   * otherwise believes their memory was taken into account when it was not.
+   * The sentence must also say what actually works: giving the address.
+   */
+  it('says so when it proceeds without memory after an answer', async () => {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-cohen-beta-log',
+        body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
+      },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-levi-gamma',
+        body: { name: 'רונית לוי', company: 'גמא הרמה' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    const outcome = await runInstruction(
+      { text: 'תשיבי לרונית\n\nאני לא זוכר' },
+      {
+        businessId: BUSINESS,
+        identityAsked: true,
+        planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
+      },
+    );
+
+    expect(outcome.status).toBe('planned');
+    if (outcome.status !== 'planned') throw new Error('unreachable');
+    expect(outcome.identityNote).not.toBeNull();
+    expect(outcome.identityNote ?? '').toContain('רונית');
+    // The one thing the owner can do about it.
+    expect(outcome.identityNote ?? '').toContain('כתובת');
+  });
+
+  /**
+   * The negative half: a note that is present on every planned instruction
+   * tells the owner nothing. An instruction naming nobody ambiguous carries
+   * no note at all.
+   */
+  it('carries no identity note when nothing was ambiguous', async () => {
+    const outcome = await runInstruction(
+      { text: 'תשלחי ל-dana@example.com את ההצעה' },
+      {
+        businessId: BUSINESS,
+        planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
+      },
+    );
+
+    expect(outcome.status).toBe('planned');
+    if (outcome.status !== 'planned') throw new Error('unreachable');
+    expect(outcome.identityNote).toBeNull();
+  });
+
+  /**
+   * Spec §10, row 1: "קריאת הזיכרון נכשלת → ההוראה ממשיכה בלי זיכרון ובלי
+   * שאלה". Deleting the `try/catch` around `listContacts` left the whole
+   * suite green, so the degrade path was documented and unproven.
+   *
+   * The failure is made real rather than injected: the table the read needs
+   * is renamed out from under it for the duration, so `listContacts` throws
+   * the way it would if the read genuinely failed, and it is put back in
+   * `finally` so a failing assertion cannot leak into the next test. With
+   * the catch removed, the throw escapes `runInstruction` and this test
+   * fails on the rejection instead of the assertions.
+   */
+  it('plans anyway when the contact read fails, and asks nothing', async () => {
+    await getPool().query('ALTER TABLE memories RENAME TO memories_hidden');
+    try {
+      const outcome = await runInstruction(
+        { text: 'תשיבי לרונית' },
+        {
+          businessId: BUSINESS,
+          planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
+        },
+      );
+
+      expect(outcome.status).toBe('planned');
+      if (outcome.status !== 'planned') throw new Error('unreachable');
+      // No question, and nothing claiming a name went unresolved: a failed
+      // read means nothing was recognised, which is not the same as
+      // recognising something ambiguous.
+      expect(outcome.identityNote).toBeNull();
+    } finally {
+      await getPool().query('ALTER TABLE memories_hidden RENAME TO memories');
+    }
+  });
+
+  /**
+   * The other half of the same row: the planner really is handed no memory
+   * block when the read fails, rather than a stale or partial one.
+   */
+  it('hands the planner no memory block when the contact read fails', async () => {
+    await getPool().query('ALTER TABLE memories RENAME TO memories_hidden');
+    try {
+      let seen: PlanRequest | undefined;
+      const outcome = await runInstruction(
+        { text: 'תשיבי לרונית' },
+        {
+          businessId: BUSINESS,
+          planner: async (request) => {
+            seen = request;
+            return { status: 'planned', plan: mailPlan('dana@example.com') };
+          },
+        },
+      );
+
+      expect(outcome.status).toBe('planned');
+      expect(seen?.memoryBlock).toBeUndefined();
+    } finally {
+      await getPool().query('ALTER TABLE memories_hidden RENAME TO memories');
+    }
+  });
 });
