@@ -64,6 +64,8 @@ import {
   type InstructionRecord,
 } from '../governance/instructions.js';
 import { authorisedRecipients, emailAddressesIn } from '../governance/typed-recipients.js';
+import { listContacts } from '../memory/contacts.js';
+import { resolveContacts, type Ambiguity, type Resolution } from '../memory/contact-resolver.js';
 import { recallForPlanning } from '../memory/recall-planning.js';
 import { readEmails, readPhones } from '../policy/facts.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
@@ -76,6 +78,16 @@ export interface RunInstructionOptions {
   businessId?: string;
   /** The one step that costs money, injectable so the pipeline can be tested without an API key. */
   planner?: (request: PlanRequest) => Promise<PlanOutcome>;
+  /**
+   * Set by the dashboard's answer route (spec §7.2) when it re-runs an
+   * instruction the owner has already been asked to clarify once. Deliberately
+   * coarse: it does not track which name was ambiguous, only that a second
+   * pass is underway, so any second pass — not just one that resolves the
+   * same name — suppresses the identity question. That coarseness is what
+   * bounds the loop: without it, a name that stays ambiguous after an answer
+   * would be asked about again, forever.
+   */
+  identityAsked?: boolean;
 }
 
 export interface GrantedAuthorization {
@@ -169,12 +181,41 @@ export async function runInstruction(
     businessId,
   });
 
-  // Positive scope: only who this instruction actually names. Same extractor
-  // the standing-authorisation path uses, never a second one. This finds
-  // literal address tokens only — "תשיבי לרונית" with no address spelled out
-  // names nobody, yields no subjects, and gets no memory block at all.
-  // Resolving a name to a subject key is a separate, unbuilt capability.
-  const subjects = emailAddressesIn(input.text);
+  // Two positive sources, never a guess: addresses the owner typed, and
+  // contacts whose name appears in the instruction. `emailAddressesIn` is the
+  // same extractor the standing-authorisation path uses — resolving a NAME is
+  // new, and deliberately feeds memory only (spec §9): it does not widen who
+  // may be written to.
+  const typed = emailAddressesIn(input.text);
+  let resolution: Resolution = { subjects: [], ambiguities: [] };
+  try {
+    resolution = resolveContacts(input.text, await listContacts({ businessId }));
+  } catch {
+    // A failed contact read degrades to no memory, never to a failed
+    // instruction — the same trade the recall below already makes.
+  }
+
+  // Spec §6: more than one person fits the name, so nothing is planned and
+  // nothing is sent until the owner says which. Asked once per chain (§7.2):
+  // after an answer has come back, an unresolved name proceeds without memory
+  // rather than asking again.
+  if (resolution.ambiguities.length > 0 && options.identityAsked !== true) {
+    const question = renderIdentityQuestion(resolution.ambiguities);
+    try {
+      await recordQuestion(instruction.instructionId, question, { businessId });
+    } catch {
+      // Swallowed by design, exactly as the planner's own question is.
+    }
+    return {
+      status: 'needs_answer',
+      jobId: job.jobId,
+      instructionId: instruction.instructionId,
+      question,
+      instructionText: instruction.text,
+    };
+  }
+
+  const subjects = [...typed, ...resolution.subjects];
 
   // A failed recall degrades to no memory block rather than failing the
   // instruction — planning without the past is worse than planning with it,
@@ -444,4 +485,29 @@ async function grantForPlan(
     granted.push({ actionClass, recipients });
   }
   return { granted, grantNote: null };
+}
+
+/**
+ * The question the owner is asked, carrying what distinguishes the candidates.
+ *
+ * It offers the distinguishing details rather than asking the owner to guess
+ * which detail would help — that is what the owner's decision calls "another
+ * identifying detail", and the answer comes back as more text on the same
+ * instruction, which the same matcher then narrows on.
+ */
+function renderIdentityQuestion(ambiguities: readonly Ambiguity[]): string {
+  const lines = ambiguities.map((ambiguity) => {
+    const options = ambiguity.candidates
+      .map((candidate) => {
+        const details = [candidate.company, candidate.email].filter(
+          (detail): detail is string => detail !== null,
+        );
+        return details.length === 0
+          ? candidate.name
+          : `${candidate.name} (${details.join(' · ')})`;
+      })
+      .join(' · ');
+    return `למי התכוונת ב"${ambiguity.token}"? ${options}`;
+  });
+  return lines.join('\n');
 }

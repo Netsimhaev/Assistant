@@ -772,7 +772,9 @@ async function answerUnderClaim(
 
   const outcome = await runInstruction(
     { text: `${instruction.text}\n\n${answer}` },
-    { businessId },
+    // Spec §7.2: asked once per chain — this is the second pass, so the
+    // identity question is suppressed even if a name is still ambiguous.
+    { businessId, identityAsked: true },
   );
 
   // Only when a replacement actually exists — a `refused` re-run leaves the

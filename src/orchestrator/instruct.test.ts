@@ -454,4 +454,161 @@ describe('runInstruction', () => {
     expect(result.status).toBe('planned');
     expect(captured.request?.memoryBlock).toContain('טלפון');
   });
+
+  /**
+   * Spec §6: a name that fits more than one contact must stop the job before
+   * anything is planned or sent, not narrow to a guess.
+   */
+  it('stops and asks when a name fits two contacts, and plans nothing', async () => {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    // Two-word names, matching the fixtures `contact-resolver.test.ts` already
+    // uses for this exact pair — a single-word name would collide with itself
+    // in `namePartsOf` (full name === its only part) and is not this test's
+    // concern.
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-cohen-beta-log',
+        body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
+      },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-levi-gamma',
+        body: { name: 'רונית לוי', company: 'גמא הרמה' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    const outcome = await runInstruction(
+      { text: 'תשיבי לרונית' },
+      {
+        businessId: BUSINESS,
+        planner: async () => {
+          throw new Error('the planner must not be called when the identity is unresolved');
+        },
+      },
+    );
+
+    expect(outcome.status).toBe('needs_answer');
+    if (outcome.status !== 'needs_answer') return;
+    expect(outcome.question).toContain('רונית');
+    // Both distinguishing details are offered, so the owner can answer in a word.
+    expect(outcome.question).toContain('בטא לוגיסטיקה');
+    expect(outcome.question).toContain('גמא הרמה');
+
+    // Nothing bound — the same resting place the planner's own question uses.
+    expect(await loadPlanBody(outcome.jobId, { businessId: BUSINESS })).toBeNull();
+    const jobs = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs WHERE job_id = $1`, [
+      outcome.jobId,
+    ]);
+    expect(jobs.rows[0]?.phase).toBe('understand');
+  });
+
+  /**
+   * A name that resolves to exactly one contact must feed that contact's
+   * memory to the planner — proven end to end, as the neighbouring test above
+   * proves the typed-address path, so deleting the resolver call fails this
+   * test rather than leaving the suite green.
+   */
+  it('resolves a name to memory and hands it to the planner', async () => {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-cohen-beta-log',
+        body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה', email: 'ronit@beta-log.example' },
+      },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'preference',
+        subjectKey: 'ronit@beta-log.example',
+        attribute: 'ערוץ מועדף',
+        body: { value: 'טלפון' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    let seen: PlanRequest | undefined;
+    const result = await runInstruction(
+      { text: 'תשיבי לרונית' },
+      {
+        businessId: BUSINESS,
+        planner: async (request) => {
+          seen = request;
+          return { status: 'planned', plan: mailPlan('ronit@beta-log.example') };
+        },
+      },
+    );
+
+    expect(result.status).toBe('planned');
+    // The value can only have reached the planner via the preference row
+    // seeded above, keyed under the contact's own address — no other path in
+    // this test produces the word "טלפון".
+    expect(seen?.memoryBlock ?? '').toContain('טלפון');
+  });
+
+  /**
+   * Spec §7.2: the identity question is asked once per chain. Once the
+   * dashboard's answer route has re-run the instruction, an unresolved name
+   * must not stop the job a second time — it proceeds with no memory instead.
+   */
+  it('does not ask a second time once an answer has come back', async () => {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-cohen-beta-log',
+        body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
+      },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-levi-gamma',
+        body: { name: 'רונית לוי', company: 'גמא הרמה' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    const outcome = await runInstruction(
+      { text: 'תשיבי לרונית\n\nאני לא זוכר' },
+      {
+        businessId: BUSINESS,
+        identityAsked: true,
+        planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
+      },
+    );
+
+    expect(outcome.status).not.toBe('needs_answer');
+  });
 });
