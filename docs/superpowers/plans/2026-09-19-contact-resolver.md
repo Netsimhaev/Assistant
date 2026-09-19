@@ -403,6 +403,10 @@ describe('resolving a name to an identity', () => {
     expect(result.ambiguities).toHaveLength(1);
   });
 
+  /**
+   * `ולדני` is two stacked particles — ו and ל — on `דני`. Peeling one layer
+   * reaches `לדני` and never the name, which is why the strip loops.
+   */
   it('resolves two different people named in one instruction', () => {
     const result = resolveContacts('תשיבי לרונית ולדני', [RONIT, DANI]);
 
@@ -468,6 +472,9 @@ export interface Resolution {
 /** The particle letters that glue onto a Hebrew word: ל, ב, מ, ה, ו, כ, ש. */
 const GLUED_PARTICLE = /^[לבמהוכש]/u;
 
+/** How many stacked particles are peeled. `ולדני` needs two; three does not occur in practice. */
+const MAX_PARTICLE_LAYERS = 2;
+
 /**
  * Split on anything that is not a letter or a digit, so punctuation cannot
  * hide a token, and emit BOTH spellings of a Hebrew word that may carry a
@@ -491,7 +498,17 @@ function tokensOf(text: string): Set<string> {
     const token = raw.replace(LEADING_HEBREW_PARTICLE, '').trim().toLowerCase();
     if (token === '') continue;
     out.add(token);
-    if (GLUED_PARTICLE.test(token) && token.length >= 3) out.add(token.slice(1));
+
+    // Hebrew stacks particles: `ולדני` is ו + ל + דני, and stripping one layer
+    // reaches `לדני` but never `דני`. Two layers cover the constructions that
+    // actually occur; the cap is deliberate, because every extra layer adds
+    // candidate tokens that can only ever match a name equal to one of them.
+    let rest = token;
+    for (let layer = 0; layer < MAX_PARTICLE_LAYERS; layer += 1) {
+      if (!GLUED_PARTICLE.test(rest) || rest.length < 4) break;
+      rest = rest.slice(1);
+      out.add(rest);
+    }
   }
   return out;
 }
@@ -784,6 +801,8 @@ git commit -m "Document the contact resolver: what it decides, and what it must 
 **Placeholders.** Task 3's test bodies reference the file's existing charter-seeding and planner-injection helpers rather than repeating them, because `instruct.test.ts` already has them and duplicating a fixture is how two fixtures drift apart. Every other step carries its code. Called out here so the reviewer checks it deliberately.
 
 **Type consistency.** `Contact` is defined once in Task 1 and consumed unchanged in Tasks 2 and 3. `Resolution` and `Ambiguity` are defined in Task 2 and consumed in Task 3. `listContacts` and `resolveContacts` keep the same names and signatures everywhere.
+
+**A third defect, found by Task 2's implementer rather than by me.** Hebrew stacks prefix particles: `ולדני` is ו + ל + דני, and a single strip reaches `לדני` but never the name — so the plan's own "two people in one instruction" test could not pass. The strip now loops, capped at two layers, because two covers the constructions that occur and each extra layer adds candidate tokens for nothing.
 
 **A second defect, caught by the preflight scan before Task 1 was dispatched.** The plan claimed the shared `LEADING_HEBREW_PARTICLE` strips the particle from `לרונית`. It does not — it requires a hyphen or maqaf after the letter, so the glued form every owner actually writes passed through untouched and the central test would have failed. `tokensOf` now emits both spellings, and the reuse of the shared expression stands for the hyphenated form it really does cover.
 
