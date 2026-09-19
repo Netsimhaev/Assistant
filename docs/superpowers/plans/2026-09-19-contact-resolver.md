@@ -336,8 +336,14 @@ describe('resolving a name to an identity', () => {
     expect(result.ambiguities).toEqual([]);
   });
 
-  it('strips a leading Hebrew particle', () => {
+  /**
+   * Both spellings. Preflight found the shared expression handles only the
+   * hyphenated form, so the glued form — the one people actually write — is
+   * the case that must be proven.
+   */
+  it('strips a leading Hebrew particle, glued or hyphenated', () => {
     expect(resolveContacts('תשיבי לרונית', [RONIT]).subjects).toContain('ronit-cohen-beta-log');
+    expect(resolveContacts('תשיבי ל-רונית', [RONIT]).subjects).toContain('ronit-cohen-beta-log');
     expect(resolveContacts('מרונית הגיע עדכון', [RONIT]).subjects).toContain(
       'ronit-cohen-beta-log',
     );
@@ -459,12 +465,33 @@ export interface Resolution {
   ambiguities: Ambiguity[];
 }
 
-/** Split on anything that is not a letter or a digit, so punctuation cannot hide a token. */
+/** The particle letters that glue onto a Hebrew word: ל, ב, מ, ה, ו, כ, ש. */
+const GLUED_PARTICLE = /^[לבמהוכש]/u;
+
+/**
+ * Split on anything that is not a letter or a digit, so punctuation cannot
+ * hide a token, and emit BOTH spellings of a Hebrew word that may carry a
+ * prefix particle.
+ *
+ * The shared `LEADING_HEBREW_PARTICLE` handles the hyphenated form only
+ * (`ל-רונית`) — preflight checked it against the glued form and found
+ * `לרונית` passes through untouched, which is the way every owner actually
+ * writes it. So the raw token is kept AND, when it begins with a particle
+ * letter and at least two characters remain, the remainder is added beside it.
+ *
+ * Adding a candidate token can only ever create a match against a contact
+ * whose name part equals it exactly, so the residual risk is narrow: a contact
+ * named `רמה` would match the word `הרמה`. That feeds memory scope only and
+ * never authorisation (spec §9), so the cost of the rare false match is
+ * recalling the wrong person's preferences, not writing to the wrong person.
+ */
 function tokensOf(text: string): Set<string> {
   const out = new Set<string>();
   for (const raw of text.split(/[^\p{L}\p{N}@._-]+/u)) {
     const token = raw.replace(LEADING_HEBREW_PARTICLE, '').trim().toLowerCase();
-    if (token !== '') out.add(token);
+    if (token === '') continue;
+    out.add(token);
+    if (GLUED_PARTICLE.test(token) && token.length >= 3) out.add(token.slice(1));
   }
   return out;
 }
@@ -757,6 +784,8 @@ git commit -m "Document the contact resolver: what it decides, and what it must 
 **Placeholders.** Task 3's test bodies reference the file's existing charter-seeding and planner-injection helpers rather than repeating them, because `instruct.test.ts` already has them and duplicating a fixture is how two fixtures drift apart. Every other step carries its code. Called out here so the reviewer checks it deliberately.
 
 **Type consistency.** `Contact` is defined once in Task 1 and consumed unchanged in Tasks 2 and 3. `Resolution` and `Ambiguity` are defined in Task 2 and consumed in Task 3. `listContacts` and `resolveContacts` keep the same names and signatures everywhere.
+
+**A second defect, caught by the preflight scan before Task 1 was dispatched.** The plan claimed the shared `LEADING_HEBREW_PARTICLE` strips the particle from `לרונית`. It does not — it requires a hyphen or maqaf after the letter, so the glued form every owner actually writes passed through untouched and the central test would have failed. `tokensOf` now emits both spellings, and the reuse of the shared expression stands for the hyphenated form it really does cover.
 
 **One defect the self-review caught in my own text.** Task 1's test called `retireMemories` without its required `kind` field and would not have compiled. Corrected in place.
 
