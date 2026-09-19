@@ -207,8 +207,17 @@ function phoneNumbersIn(instruction: string): string[] {
  */
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** Sentence punctuation a token can trail without it being part of an address. */
-const TRAILING_PUNCTUATION = /[.,;:!?)"']+$/;
+/**
+ * Sentence punctuation a token can trail without it being part of an address.
+ *
+ * Exported for the same one-definition reason `LEADING_HEBREW_PARTICLE` is:
+ * `src/memory/contact-resolver.ts` splits on a character class that keeps `.`
+ * inside a token so an address survives whole, which leaves the full stop
+ * ending an ordinary Hebrew sentence glued to the name before it. Both
+ * readers strip the same trailing characters after the same particle strip,
+ * so "punctuation the owner typed to end a sentence" means one thing here.
+ */
+export const TRAILING_PUNCTUATION = /[.,;:!?)"']+$/;
 
 /**
  * A leading Hebrew prefix particle glued directly onto the next word with no

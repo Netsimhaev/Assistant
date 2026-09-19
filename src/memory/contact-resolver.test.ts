@@ -175,3 +175,135 @@ describe('resolving a name to an identity', () => {
     expect(result.ambiguities[0]?.candidates).toHaveLength(2);
   });
 });
+
+/**
+ * F1. `tokensOf` keeps `.` inside a token so an address survives whole, and
+ * the cost was that ordinary sentence punctuation became part of the name:
+ * `תשיבי לרונית.` produced the token `רונית.`, which equals no contact's
+ * name. The failure returned empty subjects AND empty ambiguities — the
+ * same shape as "nobody by that name" — so it looked exactly like correct
+ * behaviour while the feature was inert for the commonest way a Hebrew
+ * sentence ends.
+ */
+describe('a name ending a sentence', () => {
+  it('resolves a name followed by a full stop', () => {
+    const result = resolveContacts('תשיבי לרונית.', [RONIT]);
+
+    expect(result.ambiguities).toEqual([]);
+    expect(result.subjects).toContain('ronit-cohen-beta-log');
+  });
+
+  it('resolves a name followed by a comma', () => {
+    const result = resolveContacts('תשיבי לרונית, ותודה', [RONIT]);
+
+    expect(result.ambiguities).toEqual([]);
+    expect(result.subjects).toContain('ronit-cohen-beta-log');
+  });
+
+  it('resolves a name followed by a question mark', () => {
+    const result = resolveContacts('ענית לרונית?', [RONIT]);
+
+    expect(result.ambiguities).toEqual([]);
+    expect(result.subjects).toContain('ronit-cohen-beta-log');
+  });
+
+  /**
+   * The address form is what the `.`-keeping split existed to protect, so
+   * the strip must not cost it: an address is still one whole token, and an
+   * address ending the sentence still narrows a real ambiguity — the second
+   * is the case the review measured, where an answer typed with a full stop
+   * left the owner with no memory and (before F2) no explanation.
+   */
+  it('keeps an address whole, with or without a trailing full stop', () => {
+    const plain = resolveContacts('תשיבי לרונית\n\nronit@gamma-lift.example', [RONIT, RONIT_TWO]);
+    expect(plain.ambiguities).toEqual([]);
+    expect(plain.subjects).toContain('ronit-levi-gamma');
+
+    const stopped = resolveContacts('תשיבי לרונית\n\nronit@gamma-lift.example.', [
+      RONIT,
+      RONIT_TWO,
+    ]);
+    expect(stopped.ambiguities).toEqual([]);
+    expect(stopped.subjects).toContain('ronit-levi-gamma');
+  });
+});
+
+/**
+ * F5. Names match whole-token because "a looser comparison is how the
+ * resolver starts naming the wrong person", and the company tie-break used
+ * `text.includes(company)` — reintroducing exactly that, one field over.
+ * Both cases below were measured against the module: each resolved ONE
+ * candidate silently, which is a confident wrong identity rather than a
+ * question. A company is usually several words, so the answer is a match on
+ * a sequence of whole tokens, not a raw substring.
+ */
+describe('narrowing by company', () => {
+  const RONIT_LIFT: Contact = {
+    subjectKeys: ['ronit-cohen-lift'],
+    name: 'רונית כהן',
+    company: 'הרמה',
+    email: null,
+  };
+
+  const RONIT_BETA: Contact = {
+    subjectKeys: ['ronit-levi-beta'],
+    name: 'רונית לוי',
+    company: 'בטא לוגיסטיקה',
+    email: null,
+  };
+
+  const DANA_DELTA: Contact = {
+    subjectKeys: ['dana-delta'],
+    name: 'דנה',
+    company: 'דלתא',
+    email: null,
+  };
+
+  const DANA_OMEGA: Contact = {
+    subjectKeys: ['dana-omega'],
+    name: 'דנה',
+    company: 'אומגה',
+    email: null,
+  };
+
+  it('does not narrow on a company that only appears inside another word', () => {
+    const result = resolveContacts('תשיבי לדנה שנמצאת בדלתאות', [DANA_DELTA, DANA_OMEGA]);
+
+    expect(result.subjects).toEqual([]);
+    expect(result.ambiguities).toHaveLength(1);
+    expect(result.ambiguities[0]?.candidates).toHaveLength(2);
+  });
+
+  /**
+   * `הרמה` is a whole word of the company's name and `להרמה` is an ordinary
+   * Hebrew word that merely contains it. The particle peel is not applied on
+   * this side on purpose — it would turn `להרמה` back into `הרמה` and
+   * restore the very match this test refuses.
+   */
+  it('does not narrow on a company carrying a glued particle in the text', () => {
+    const result = resolveContacts('תשיבי לרונית בקשר להרמה של המשטח', [RONIT_LIFT, RONIT_BETA]);
+
+    expect(result.subjects).toEqual([]);
+    expect(result.ambiguities).toHaveLength(1);
+    expect(result.ambiguities[0]?.candidates).toHaveLength(2);
+  });
+
+  /**
+   * The legitimate case the tie-break exists for, and the reason it cannot
+   * simply reuse the single-token name rule: a real company name is several
+   * words, so it is matched as a contiguous run of whole tokens.
+   */
+  it('narrows to one when the text names a real multi-word company', () => {
+    const result = resolveContacts('תשיבי לרונית\n\nבטא לוגיסטיקה', [RONIT_LIFT, RONIT_BETA]);
+
+    expect(result.ambiguities).toEqual([]);
+    expect(result.subjects).toEqual(['ronit-levi-beta']);
+  });
+
+  it('narrows on a multi-word company that ends the sentence', () => {
+    const result = resolveContacts('תשיבי לרונית מחברת בטא לוגיסטיקה.', [RONIT_LIFT, RONIT_BETA]);
+
+    expect(result.ambiguities).toEqual([]);
+    expect(result.subjects).toEqual(['ronit-levi-beta']);
+  });
+});
