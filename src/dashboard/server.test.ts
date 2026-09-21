@@ -1,6 +1,6 @@
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
-import type { Server } from 'node:http';
+import type { Server, ServerResponse } from 'node:http';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -32,7 +32,12 @@ import {
 } from '../governance/instructions.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
-import { assertBindableHost, createServer, reasonForSupersededJob } from './server.js';
+import {
+  assertBindableHost,
+  createServer,
+  reasonForSupersededJob,
+  renderInstructionOutcome,
+} from './server.js';
 import { renderInstruct } from './views.js';
 
 const BUSINESS = 'test-business';
@@ -745,6 +750,65 @@ describe('renderInstruct - identityNote (spec 7.2)', () => {
   });
 });
 
+/**
+ * F-live-2, the wiring half. The note itself is `instruct.ts`'s (proved
+ * there, through an injected planner); what this proves is that the
+ * `needs_answer` branch of `renderInstructionOutcome` actually passes it on.
+ * The two halves have to be separate: this route calls `runInstruction`
+ * without a planner on purpose, so it can never produce a planner-authored
+ * clarifying question under test, and a view-level test on `renderInstruct`
+ * alone would stay green with the wiring deleted.
+ *
+ * `renderInstructionOutcome` only ever writes a status line and a body, so a
+ * response that captures both is the whole environment it needs.
+ */
+describe('renderInstructionOutcome - the note on a needs_answer outcome', () => {
+  function capture(outcome: Parameters<typeof renderInstructionOutcome>[2]): string {
+    let body = '';
+    const res = {
+      writeHead: () => undefined,
+      end: (chunk?: unknown) => {
+        body = typeof chunk === 'string' ? chunk : '';
+      },
+    } as unknown as ServerResponse;
+
+    renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome);
+    return body;
+  }
+
+  it('renders the identity note beside the question card', () => {
+    const html = capture({
+      status: 'needs_answer',
+      jobId: 'J-1',
+      instructionId: 'INS-1',
+      question: 'על איזו הצעה מדובר?',
+      instructionText: 'תשיבי לרונית',
+      identityNote: 'לא ידעתי לזהות את "רונית", ולכן המשכתי בלי מה שאני זוכרת עליה.',
+    });
+
+    expect(html).toContain('על איזו הצעה מדובר?');
+    expect(html).toContain('המשכתי בלי מה שאני זוכרת עליה');
+  });
+
+  /**
+   * The identity question's own return carries `null`, because that question
+   * already is the notice. Nothing extra must appear beside it.
+   */
+  it('renders no note when the outcome carries none', () => {
+    const html = capture({
+      status: 'needs_answer',
+      jobId: 'J-1',
+      instructionId: 'INS-1',
+      question: 'למי התכוונת ב"רונית"?',
+      instructionText: 'תשיבי לרונית',
+      identityNote: null,
+    });
+
+    expect(html).toContain('למי התכוונת');
+    expect(html).not.toContain('המשכתי בלי מה שאני זוכרת');
+  });
+});
+
 describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N2)', () => {
   // Fix round 2: `reasonForSupersededJob` no longer accepts a `refused`
   // outcome at all — its parameter type is `Extract<..., { jobId: string }>`,
@@ -772,6 +836,7 @@ describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N
         instructionId: 'INS-1',
         question: 'איזו דנה?',
         instructionText: 'תשלחי לדנה את ההצעה',
+        identityNote: null,
       }),
     ).toContain('J-ASKS-AGAIN');
   });

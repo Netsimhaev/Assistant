@@ -134,6 +134,22 @@ export type InstructionOutcome =
        * list on `GET /instruct` shows, from one source.
        */
       instructionText: string;
+      /**
+       * The same fact as `identityNote` on `planned`, on the outcome where it
+       * is most likely to be true — which is why it is here at all.
+       *
+       * A measured live run: the name stayed unresolved, so the memory block
+       * came back empty, so the planner had no context and returned its own
+       * clarifying question, so the instruction ended `needs_answer` and the
+       * note — which rode `planned` alone — was never rendered. The owner was
+       * shown a generic question about "רונית" and told nothing about the name
+       * not having been recognised. The two are not merely co-occurring: the
+       * missing memory is what produced the question.
+       *
+       * The two returns that produce this status set it differently on
+       * purpose, and each says why at its own site.
+       */
+      identityNote: string | null;
     }
   | { status: 'refused'; reason: string };
 
@@ -227,6 +243,13 @@ export async function runInstruction(
       instructionId: instruction.instructionId,
       question,
       instructionText: instruction.text,
+      // Null on purpose, and this is the one return where it must be: the
+      // question above IS the notice that the name was not recognised, and
+      // nothing has gone ahead without the memory yet — nothing has gone
+      // ahead at all. A note repeating the question beside the question is
+      // noise, and noise beside a real notice is how a real notice stops
+      // being read.
+      identityNote: null,
     };
   }
 
@@ -323,6 +346,13 @@ export async function runInstruction(
       instructionId: instruction.instructionId,
       question: plan.clarifyingQuestion,
       instructionText: instruction.text,
+      // Carried, unlike the identity question's own return above: this
+      // question is the PLANNER's, about something else entirely, and it is
+      // the likeliest place the note is true — an unresolved name empties the
+      // memory block, and a planner with no context asks. Without it the
+      // owner reads a question about the work and concludes the name was
+      // understood.
+      identityNote,
     };
   }
 

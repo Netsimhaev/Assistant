@@ -791,3 +791,101 @@ describe('runInstruction', () => {
     }
   });
 });
+
+/**
+ * F-live-2. `identityNote` rode only the `planned` outcome, and the case that
+ * actually happens is the other one: when a name stays unresolved the memory
+ * block is empty, and a planner handed no context is MORE likely to come back
+ * with a clarifying question of its own — so the instruction ends as
+ * `needs_answer` and the note is never rendered. Measured live: the owner was
+ * asked a generic question about רונית and told nothing about the name not
+ * having been recognised. The two co-occur precisely because the missing
+ * memory is what produced the question.
+ */
+describe('saying she went ahead without the memory when the planner asks too', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    await withCharter();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  /** Two people called רונית, so the name cannot be settled from contacts alone. */
+  async function seedTwoRonits(): Promise<void> {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-cohen-beta-log',
+        body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
+      },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-levi-gamma',
+        body: { name: 'רונית לוי', company: 'גמא הרמה' },
+      },
+      { businessId: BUSINESS },
+    );
+  }
+
+  it('carries the identity note on the planner s own clarifying question', async () => {
+    await seedTwoRonits();
+
+    const outcome = await runInstruction(
+      { text: 'תשיבי לרונית\n\nאני לא זוכר' },
+      {
+        businessId: BUSINESS,
+        identityAsked: true,
+        planner: async () => ({
+          status: 'planned',
+          plan: { ...mailPlan('dana@example.com'), clarifyingQuestion: 'על איזו הצעה מדובר?' },
+        }),
+      },
+    );
+
+    expect(outcome.status).toBe('needs_answer');
+    if (outcome.status !== 'needs_answer') throw new Error('unreachable');
+    expect(outcome.question).toBe('על איזו הצעה מדובר?');
+    // `?? ''` rather than `.not.toBeNull()`: an absent field is `undefined`,
+    // which is not null, so the looser assertion would have passed against
+    // the very defect this test exists for.
+    expect(outcome.identityNote ?? '').toContain('רונית');
+    expect(outcome.identityNote ?? '').toContain('כתובת');
+  });
+
+  /**
+   * The identity question's own early return is the opposite case: that
+   * question IS the notice, so a note repeating it would be noise.
+   */
+  it('carries no identity note on the identity question itself', async () => {
+    await seedTwoRonits();
+
+    const outcome = await runInstruction(
+      { text: 'תשיבי לרונית' },
+      {
+        businessId: BUSINESS,
+        planner: async () => {
+          throw new Error('the planner must not be reached on the identity question');
+        },
+      },
+    );
+
+    expect(outcome.status).toBe('needs_answer');
+    if (outcome.status !== 'needs_answer') throw new Error('unreachable');
+    expect(outcome.question).toContain('רונית');
+    expect(outcome.identityNote).toBeNull();
+  });
+});

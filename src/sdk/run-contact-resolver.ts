@@ -164,6 +164,11 @@ function reportOutcome(outcome: Awaited<ReturnType<typeof runInstruction>>): voi
     console.log('');
     console.log('--- השאלה שהבוס יראה ---');
     console.log(outcome.question);
+    // Printed here too, not only on `planned`: this script is what measured
+    // the note never reaching the owner, and it measured it by showing only
+    // the question. A live run that cannot see the note cannot catch its
+    // absence a second time.
+    console.log(`identityNote: ${outcome.identityNote ?? '—'}`);
   } else if (outcome.status === 'planned') {
     console.log(`job:    ${outcome.jobId}`);
     console.log(`granted: ${JSON.stringify(outcome.granted)}`);

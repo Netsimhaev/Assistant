@@ -418,8 +418,21 @@ async function handleMemory(res: ServerResponse, businessId: string, session: Se
  * what made the silence: an ordinary success page, and an owner who believes
  * their answer worked. Both notes are passed together — they answer
  * different questions and one instruction can raise both.
+ *
+ * A `needs_answer` outcome carries the same note and renders it beside the
+ * question card, which is the case a live run measured: an unresolved name
+ * empties the memory block, a planner with no context returns its own
+ * clarifying question, and the outcome the owner sees is this one — so a note
+ * that rode `planned` alone reached them exactly never, in the situation it
+ * was written for. The identity question's own return sets the note to `null`
+ * because that question already is the notice (see `instruct.ts`), so this
+ * branch needs no condition of its own: it renders whatever was carried.
+ *
+ * Exported for `server.test.ts`, the same reason `reasonForSupersededJob`
+ * below is: this route cannot inject a planner, so the only way to prove the
+ * `needs_answer` branch really passes the note on is to call it directly.
  */
-function renderInstructionOutcome(
+export function renderInstructionOutcome(
   res: ServerResponse,
   session: Session,
   outcome: Awaited<ReturnType<typeof runInstruction>>,
@@ -436,6 +449,7 @@ function renderInstructionOutcome(
       200,
       renderInstruct({
         csrf,
+        identityNote: outcome.identityNote,
         pending: [{ jobId: outcome.jobId, question: outcome.question, text: outcome.instructionText }],
       }),
     );
