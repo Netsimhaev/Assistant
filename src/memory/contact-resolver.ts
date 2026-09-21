@@ -137,6 +137,29 @@ function namePartsOf(contact: Contact): string[] {
 }
 
 /**
+ * Does `sequence` sit in `words` starting exactly at `start`, compared whole
+ * word to whole word?
+ *
+ * An empty sequence sits anywhere, which is why the one caller that can be
+ * handed an empty one — `containsSequence` — refuses it before asking.
+ */
+function sequenceAt(
+  words: readonly string[],
+  sequence: readonly string[],
+  start: number,
+): boolean {
+  for (let offset = 0; offset < sequence.length; offset += 1) {
+    const wanted = sequence[offset];
+    const actual = words[start + offset];
+    // A positive comparison: both positions must hold the same string. Two
+    // `undefined`s cannot be read as equal, even though every caller's loop
+    // bound already means neither can occur.
+    if (wanted === undefined || actual === undefined || wanted !== actual) return false;
+  }
+  return true;
+}
+
+/**
  * Is `sequence` a contiguous run of `words`, compared whole word to whole
  * word?
  *
@@ -147,19 +170,63 @@ function containsSequence(words: readonly string[], sequence: readonly string[])
   if (sequence.length === 0) return false;
 
   for (let start = 0; start + sequence.length <= words.length; start += 1) {
-    let matched = true;
-    for (let offset = 0; offset < sequence.length; offset += 1) {
-      const wanted = sequence[offset];
-      const actual = words[start + offset];
-      // A positive comparison: both positions must hold the same string. Two
-      // `undefined`s cannot be read as equal, even though the loop bound
-      // already means neither can occur.
-      if (wanted === undefined || actual === undefined || wanted !== actual) {
-        matched = false;
-        break;
-      }
-    }
-    if (matched) return true;
+    if (sequenceAt(words, sequence, start)) return true;
+  }
+  return false;
+}
+
+/**
+ * Is the company a contiguous run of `words`, allowing ONE Hebrew particle
+ * glued onto the first word of that run — and only when the company has two
+ * or more words?
+ *
+ * The exact match comes first and needs no explanation. The peel is what the
+ * live run forced: asked "which רונית?", the owner answers
+ * `רונית מבטא לוגיסטיקה`, and Hebrew glues the particle onto the FIRST word
+ * of a noun phrase, so `מבטא` is simply how `בטא לוגיסטיקה` is written after
+ * "from". Three of five measured phrasings failed this way
+ * (`רונית מבטא לוגיסטיקה`, `הכוונה לבטא לוגיסטיקה`, `מדלתא דפוס`) — every
+ * failure a particle on the first word, and every one of them the ordinary
+ * way a person writes the answer.
+ *
+ * **The two-word floor is the whole safety argument, not a detail.** The
+ * words AFTER the peeled one are the anchor: `לוגיסטיקה` and `דפוס` must
+ * still match exactly, so the peel can only ever confirm a company the text
+ * already almost spells out. A ONE-word company has no anchor at all, and
+ * matching it through a peel is precisely the accident an earlier review
+ * measured and removed — the company `הרמה` claimed by the ordinary Hebrew
+ * word `להרמה` in "צריך להרמה של המשטח", naming the wrong person with no
+ * question asked.
+ *
+ * **The residual cost, stated rather than hidden:** a one-word company that
+ * the owner writes with a particle (`מגמא` for the company `גמא`) still does
+ * not narrow, and she asks again instead. That is the chosen direction: this
+ * module asks when it is unsure everywhere else, and an extra question costs
+ * the owner one line of typing, while a confident wrong identity costs them
+ * the wrong person's memory with nothing on screen saying so.
+ *
+ * Exactly one particle letter is peeled, never a stack. `tokensOf` peels up
+ * to `MAX_PARTICLE_LAYERS` for names because `ולדני` genuinely occurs; a
+ * company name is preceded by one preposition, not two, and each extra layer
+ * only widens what can match.
+ */
+function containsCompany(words: readonly string[], company: readonly string[]): boolean {
+  if (containsSequence(words, company)) return true;
+
+  // Positive condition: two or more words, so the words after the peeled one
+  // anchor the match. See this function's docblock.
+  if (company.length < 2) return false;
+
+  const head = company[0];
+  if (head === undefined) return false;
+  const tail = company.slice(1);
+
+  for (let start = 0; start + company.length <= words.length; start += 1) {
+    const first = words[start];
+    if (first === undefined) continue;
+    if (!GLUED_PARTICLE.test(first)) continue;
+    if (first.slice(1) !== head) continue;
+    if (sequenceAt(words, tail, start + 1)) return true;
   }
   return false;
 }
@@ -182,18 +249,18 @@ function containsSequence(words: readonly string[], sequence: readonly string[])
  * keeps the multi-word case the substring match was there for and drops the
  * "inside a longer word" class outright.
  *
- * The particle peel that `tokensOf` applies to names is deliberately NOT
- * applied here: it would turn `להרמה` back into `הרמה` and restore the
- * second measured case above. The cost is stated rather than hidden — a
- * company written with a particle glued to its first word (`מבטא
- * לוגיסטיקה`) no longer narrows, because `מבטא` is not `בטא`. The owner is
- * then asked rather than guessed at, which is the direction this module
- * takes everywhere else.
+ * The particle peel that `tokensOf` applies to names is still NOT applied
+ * wholesale here — `containsCompany` peels one particle off the FIRST word
+ * of the run and only when the company has two or more words, so the words
+ * after it anchor the match. That is what lets the owner's natural answer
+ * (`רונית מבטא לוגיסטיקה`) narrow while `להרמה` still cannot claim the
+ * one-word company `הרמה`. The full argument, and the residual cost that
+ * remains, are in `containsCompany`'s own docblock.
  */
 function distinguished(contact: Contact, tokens: Set<string>, words: readonly string[]): boolean {
   if (contact.email !== null && tokens.has(contact.email)) return true;
   if (contact.company === null) return false;
-  return containsSequence(words, wordsOf(contact.company));
+  return containsCompany(words, wordsOf(contact.company));
 }
 
 export function resolveContacts(text: string, contacts: readonly Contact[]): Resolution {

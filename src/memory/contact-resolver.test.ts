@@ -307,3 +307,94 @@ describe('narrowing by company', () => {
     expect(result.subjects).toEqual(['ronit-levi-beta']);
   });
 });
+
+/**
+ * The live run's finding, and the most valuable thing it produced. When the
+ * assistant asks "which רונית?", the owner's most natural answer is
+ * `רונית מבטא לוגיסטיקה` — Hebrew glues the particle onto the FIRST word of
+ * the company's name — and three of the five phrasings measured did not
+ * narrow at all. A question whose natural answer does not work is worse than
+ * no question.
+ *
+ * The rule under test: peel a leading particle off the first word of the
+ * company run ONLY, require every remaining word to match exactly, and allow
+ * it only for a company of two or more words — the remaining words are the
+ * anchor, and a one-word company matched through a peel has none. The two
+ * cases at the bottom are the ones that anchor buys: they must still ask.
+ */
+describe('narrowing by a company the owner wrote with a particle', () => {
+  const RONIT_BETA: Contact = {
+    subjectKeys: ['ronit-levi-beta'],
+    name: 'רונית לוי',
+    company: 'בטא לוגיסטיקה',
+    email: null,
+  };
+
+  const RONIT_DELTA: Contact = {
+    subjectKeys: ['ronit-barak-delta'],
+    name: 'רונית ברק',
+    company: 'דלתא דפוס',
+    email: null,
+  };
+
+  const NARROWS: ReadonlyArray<readonly [string, string]> = [
+    ['רונית מבטא לוגיסטיקה', 'ronit-levi-beta'],
+    ['רונית בטא לוגיסטיקה', 'ronit-levi-beta'],
+    ['רונית של בטא לוגיסטיקה', 'ronit-levi-beta'],
+    ['הכוונה לבטא לוגיסטיקה', 'ronit-levi-beta'],
+    ['מדלתא דפוס', 'ronit-barak-delta'],
+  ];
+
+  for (const [answer, expected] of NARROWS) {
+    it(`narrows on the answer "${answer}"`, () => {
+      const result = resolveContacts(`תשיבי לרונית\n\n${answer}`, [RONIT_BETA, RONIT_DELTA]);
+
+      expect(result.ambiguities).toEqual([]);
+      expect(result.subjects).toEqual([expected]);
+    });
+  }
+
+  /**
+   * The anchor, stated as a test. `הרמה` is one word, so a peel would let
+   * the ordinary Hebrew word `להרמה` name a person — the exact accident an
+   * earlier review measured and fixed. A one-word company keeps asking.
+   */
+  it('still asks for a one-word company carrying a particle in the text', () => {
+    const RONIT_LIFT: Contact = {
+      subjectKeys: ['ronit-cohen-lift'],
+      name: 'רונית כהן',
+      company: 'הרמה',
+      email: null,
+    };
+
+    const result = resolveContacts('תשיבי לרונית, צריך להרמה של המשטח', [
+      RONIT_LIFT,
+      RONIT_BETA,
+    ]);
+
+    expect(result.subjects).toEqual([]);
+    expect(result.ambiguities).toHaveLength(1);
+    expect(result.ambiguities[0]?.candidates).toHaveLength(2);
+  });
+
+  /** The substring class stays dead: `דלתא` inside `בדלתאות` is not a match. */
+  it('still asks when the company only appears inside a longer word', () => {
+    const DANA_DELTA: Contact = {
+      subjectKeys: ['dana-delta'],
+      name: 'דנה',
+      company: 'דלתא',
+      email: null,
+    };
+    const DANA_OMEGA: Contact = {
+      subjectKeys: ['dana-omega'],
+      name: 'דנה',
+      company: 'אומגה',
+      email: null,
+    };
+
+    const result = resolveContacts('תשיבי לדנה שנמצאת בדלתאות', [DANA_DELTA, DANA_OMEGA]);
+
+    expect(result.subjects).toEqual([]);
+    expect(result.ambiguities).toHaveLength(1);
+  });
+});
