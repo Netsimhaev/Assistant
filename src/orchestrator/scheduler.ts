@@ -6,6 +6,8 @@ import type { ConductOptions, ConductResult } from './conduct.js';
 import { scanInbox } from './inbox-scan.js';
 import type { ScanResult } from './inbox-scan.js';
 import { loadJob, transition } from './jobs.js';
+import { evaluateAutonomy } from './promote.js';
+import type { AutonomyPassResult } from './promote.js';
 import { runDueJobs } from './run-due.js';
 import type { RunDueResult } from './run-due.js';
 import { buildRuntime } from './runtime.js';
@@ -148,6 +150,8 @@ export interface SchedulerPassResult {
   conduct: ConductResult | null;
   due: RunDueResult;
   verified: CloseVerifiedResult;
+  /** Which action classes this round moved up, and which moved down. */
+  autonomy: AutonomyPassResult;
 }
 
 /**
@@ -253,7 +257,12 @@ export async function schedulerPass(
   // instead and every close would trail a pass behind the work that earned
   // it.
   const verified = await closeVerifiedJobs(options);
-  return { tick: tickResult, scan, scanError, conduct, due, verified };
+  // Last, and for the same reason `closeVerifiedJobs` runs after the plans:
+  // this pass reads what this very round produced — an approval just decided,
+  // a job just failed. Run it earlier and every evaluation trails a pass
+  // behind the evidence that justifies it (spec §10).
+  const autonomy = await evaluateAutonomy(options);
+  return { tick: tickResult, scan, scanError, conduct, due, verified, autonomy };
 }
 
 export interface SchedulerHandle {
