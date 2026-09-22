@@ -33,6 +33,9 @@ import {
   recordAnswer,
 } from '../governance/instructions.js';
 import { readForgetCommand } from '../governance/forget-command.js';
+import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
+import { recordCorrection } from '../governance/corrections.js';
+import { listAutonomousActions } from './autonomous-actions.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureAnchor, ErasurePlan } from '../governance/erasure-plan.js';
 import {
@@ -63,6 +66,8 @@ import { redeemRecoveryCode, remainingCodes } from './recovery.js';
 import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
 import {
   renderApprovalCard,
+  renderAutonomousActions,
+  renderAutonomy,
   renderErasure,
   renderErasureDone,
   renderForbidden,
@@ -1692,9 +1697,96 @@ async function handleLogout(req: IncomingMessage, res: ServerResponse, businessI
   redirect(res, '/login', { 'Set-Cookie': clearedCookie() });
 }
 
+/**
+ * The owner's dial (spec §8.4). GET shows the three positions and which one
+ * is current; POST changes it.
+ */
+async function handleAutonomyGet(res: ServerResponse, businessId: string, session: Session): Promise<void> {
+  const mode = await loadAutonomyMode({ businessId });
+  sendHtml(res, 200, renderAutonomy(mode, issueCsrfToken(session.sessionId)));
+}
+
+async function handleAutonomyModePost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const parsed = AutonomyMode.safeParse(form.get('mode'));
+  if (!parsed.success) {
+    const mode = await loadAutonomyMode({ businessId });
+    return sendHtml(res, 400, renderAutonomy(mode, issueCsrfToken(session.sessionId), 'יש לבחור אחת משלוש האפשרויות.'));
+  }
+
+  await setAutonomyMode(parsed.data, session.username, { businessId });
+  redirect(res, '/autonomy');
+}
+
+/**
+ * What the assistant did on its own (spec §8.5). GET lists it; POST records
+ * that one step was wrong.
+ */
+async function handleAutonomousActionsGet(res: ServerResponse, businessId: string, session: Session): Promise<void> {
+  const actions = await listAutonomousActions({ businessId });
+  sendHtml(res, 200, renderAutonomousActions(actions, issueCsrfToken(session.sessionId)));
+}
+
+/**
+ * Records a correction — never an undo. `recordCorrection` (T5) both writes
+ * the `autonomy_marks` row the promotion pass demotes on and files the memory
+ * the planner will see next time, in one call.
+ *
+ * The action class is never trusted from the form: it is re-derived by
+ * looking `jobId`/`stepId` up in `listAutonomousActions`'s own output, the
+ * same criteria that decided this pair may be marked at all. A hidden field
+ * a browser could carry unmodified would still be a value this route chose
+ * to believe rather than to check — and a job/step that already went through
+ * a card (or does not exist) must be refused here for the same reason the
+ * list never shows it: marking it would misattribute a human's own decision
+ * to the assistant, and would demote a class for a step nobody let it run
+ * alone.
+ */
+async function handleAutonomousActionMark(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  jobId: string,
+  stepId: string,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const note = (form.get('note') ?? '').trim();
+  const actions = await listAutonomousActions({ businessId });
+  const action = actions.find((candidate) => candidate.jobId === jobId && candidate.stepId === stepId);
+
+  if (action === undefined || note === '') {
+    const message =
+      action === undefined
+        ? 'הפעולה הזאת אינה ברשימת הפעולות העצמאיות — ייתכן שכבר טופלה.'
+        : 'יש להזין נימוק.';
+    return sendHtml(res, 400, renderAutonomousActions(actions, issueCsrfToken(session.sessionId), message));
+  }
+
+  await recordCorrection(
+    { jobId, stepId, actionClass: action.actionClass, note, by: session.username },
+    { businessId },
+  );
+  redirect(res, '/autonomy/actions');
+}
+
 const CARD_PATH = /^\/a\/([^/]+)$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
 const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
+const AUTONOMOUS_ACTION_MARK_PATH = /^\/autonomy\/actions\/([^/]+)\/([^/]+)\/mark$/;
 
 /** The outcome `handleDecision` records for each `DECISION_PATH` action. */
 const OUTCOME_FOR_ACTION = {
@@ -1746,6 +1838,12 @@ async function route(
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
 
+  if (method === 'GET' && pathname === '/autonomy') return handleAutonomyGet(res, businessId, session);
+  if (method === 'POST' && pathname === '/autonomy/mode')
+    return handleAutonomyModePost(req, res, businessId, session);
+  if (method === 'GET' && pathname === '/autonomy/actions')
+    return handleAutonomousActionsGet(res, businessId, session);
+
   if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
   if (method === 'POST' && pathname === '/instruct')
     return handleInstructPost(req, res, businessId, session, documentRoot);
@@ -1759,6 +1857,15 @@ async function route(
   if (method === 'POST' && instructAnswerMatch) {
     const jobId = instructAnswerMatch[1];
     if (jobId !== undefined) return handleInstructAnswer(req, res, businessId, session, jobId);
+  }
+
+  const markMatch = AUTONOMOUS_ACTION_MARK_PATH.exec(pathname);
+  if (method === 'POST' && markMatch) {
+    const jobId = markMatch[1];
+    const stepId = markMatch[2];
+    if (jobId !== undefined && stepId !== undefined) {
+      return handleAutonomousActionMark(req, res, businessId, session, jobId, stepId);
+    }
   }
 
   const cardMatch = CARD_PATH.exec(pathname);

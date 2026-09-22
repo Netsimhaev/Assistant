@@ -18,6 +18,8 @@ import type { ErasureOutcome } from '../governance/erasure.js';
 import type { KeptItem } from '../governance/kept-items.js';
 import type { IntentName } from '../domain/reading.js';
 import type { MemoryRecord } from '../memory/store.js';
+import { AutonomyMode } from '../governance/autonomy-mode.js';
+import type { AutonomousAction } from './autonomous-actions.js';
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { formatMinor } from '../util/money.js';
@@ -208,7 +210,7 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/instruct">מה לעשות</a> · <a href="/readings">מה קראתי</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/readings">מה קראתי</a> · <a href="/autonomy">כמה חופש לתת</a></p>
 ${list}`,
   );
 }
@@ -358,6 +360,141 @@ ${
   memories.length === 0
     ? '<p>עדיין לא נרשם דבר.</p>'
     : `<table><tr><th>נושא</th><th>סוג</th><th>ערך</th><th>מקור</th><th>סטטוס</th></tr>${rows}</table>`
+}
+<p><a href="/autonomy">כמה חופש לתת</a> · <a href="/autonomy/actions">מה נעשה בלעדיך</a></p>`,
+  );
+}
+
+// --- The owner's dial, and what she did on her own (spec §8.4, §8.5). ------
+//
+// Two screens, and the reason they exist together. The dial (`renderAutonomy`)
+// sets how much freedom a class of action may earn; the list
+// (`renderAutonomousActions`) is what makes that freedom accountable — the
+// owner does not get a notification for every autonomous step (his own
+// choice, `docs/05-approvals.md`), so this screen is the only place he can
+// ever see what ran without him and say "that one was wrong."
+
+/**
+ * One plain-Hebrew sentence per position of the dial, said as what that
+ * position DOES rather than left for the owner to infer from a single word.
+ * `rampBoundsForMode` (`governance/autonomy-mode.ts`) is the mechanism these
+ * describe; the sentences exist so a screen with three unexplained words does
+ * not become a screen that gets clicked wrongly.
+ */
+const AUTONOMY_MODE_LABEL: Record<AutonomyMode, string> = {
+  off: 'כבוי — כל פעולה יוצאת נשמרת כטיוטה בלבד; שום דבר לא נשלח מבלי שתאשר.',
+  ask: 'שאלי תמיד — כל פעולה יוצאת מגיעה אליך לאישור, גם כזו שכבר אושרה כמה פעמים בעבר.',
+  learn: 'למידה — פעולה שהוכיחה את עצמה שוב ושוב יכולה לעבור לביצוע עצמאי; טעות אחת מורידה אותה בחזרה מיד.',
+};
+
+const AUTONOMY_MODE_NAME: Record<AutonomyMode, string> = {
+  off: 'כבוי',
+  ask: 'שאלי תמיד',
+  learn: 'למידה',
+};
+
+/**
+ * The owner's dial. A form with the three positions `AutonomyMode` allows,
+ * each with its own sentence, and the current one both checked AND named in
+ * plain text — a radio button alone is easy to glance past.
+ */
+export function renderAutonomy(mode: AutonomyMode, csrf: string, error?: string): string {
+  const errorBlock = error === undefined ? '' : `<p class="error">${esc(error)}</p>`;
+
+  const options = AutonomyMode.options
+    .map((option) => {
+      const checked = option === mode ? ' checked' : '';
+      return `<label>
+        <input type="radio" name="mode" value="${esc(option)}"${checked}>
+        ${esc(AUTONOMY_MODE_LABEL[option])}
+      </label>`;
+    })
+    .join('\n');
+
+  return page(
+    'כמה חופש לתת',
+    `<header>
+  <h1>כמה חופש לתת</h1>
+  ${logoutForm(csrf)}
+</header>
+<p><a href="/">&rarr; חזרה לרשימה</a></p>
+${errorBlock}
+<p class="muted">המצב הנוכחי: <strong>${esc(AUTONOMY_MODE_NAME[mode])}</strong>.</p>
+<form method="post" action="/autonomy/mode">
+  <input type="hidden" name="csrf" value="${esc(csrf)}">
+  ${options}
+  <button type="submit">שמירה</button>
+</form>
+<p><a href="/autonomy/actions">מה נעשה בלעדיך</a></p>`,
+  );
+}
+
+/**
+ * What the assistant did entirely on its own — `listAutonomousActions`'s own
+ * docblock explains why a step that went through a card never reaches here.
+ *
+ * **Every value that came from a message reaches this table through
+ * `escLabel`, never `esc`.** `jobTitle`, `recipient` and `subject` can each
+ * originate in content a stranger wrote (a document a stranger sent, an
+ * address a supplier's own reply carried) reaching the assistant's own
+ * outbound step, and `esc` alone leaves a bidirectional-override character
+ * intact — see `escLabel`'s docblock for the exact incident that taught this
+ * codebase to check content fields against it. `actionClass` and `toolName`
+ * are read through `esc` instead: both are values drawn from the closed
+ * `ActionClass`/tool-name vocabulary the gate itself classified the step
+ * under, not text anyone outside the system chose.
+ *
+ * **The button does not undo anything.** The action already left the
+ * building — a mail already sent, a memory already written — and marking it
+ * only records that it was wrong; the sentence saying so sits once at the
+ * top of the page rather than being skipped because the button's own label
+ * ("זו הייתה טעות") might be read as an undo control.
+ */
+export function renderAutonomousActions(actions: readonly AutonomousAction[], csrf: string, error?: string): string {
+  const errorBlock = error === undefined ? '' : `<p class="error">${esc(error)}</p>`;
+
+  const rows = actions
+    .map((action) => {
+      const title = action.jobTitle === null ? '—' : escLabel(action.jobTitle);
+      const recipient = action.recipient === null ? '—' : escLabel(action.recipient);
+      const subject = action.subject === null ? '—' : escLabel(action.subject);
+      const markPath = `/autonomy/actions/${esc(action.jobId)}/${esc(action.stepId)}/mark`;
+
+      return `<tr>
+        <td>${esc(action.completedAt.toISOString())}</td>
+        <td>${title}</td>
+        <td>${esc(action.actionClass)}</td>
+        <td>${esc(action.toolName)}</td>
+        <td>${recipient}</td>
+        <td>${subject}</td>
+        <td>
+          <form method="post" action="${markPath}">
+            <input type="hidden" name="csrf" value="${esc(csrf)}">
+            <textarea name="note" rows="2" required placeholder="מה היה לא בסדר?"></textarea>
+            <button type="submit">זו הייתה טעות</button>
+          </form>
+        </td>
+      </tr>`;
+    })
+    .join('');
+
+  return page(
+    'מה נעשה בלעדיך',
+    `<header>
+  <h1>מה נעשה בלעדיך</h1>
+  ${logoutForm(csrf)}
+</header>
+<p><a href="/">&rarr; חזרה לרשימה</a> · <a href="/autonomy">כמה חופש לתת</a></p>
+${errorBlock}
+<p class="muted">
+  כל פעולה שהעוזרת ביצעה מיוזמתה, בלי כרטיס אישור. סימון "זו הייתה טעות"
+  אינו מבטל ואינו מתקן את הפעולה עצמה — היא כבר יצאה — הוא רק רושם
+  שהיא הייתה שגויה, וזה עשוי להוריד את רמת החופש של סוג הפעולה הזה.
+</p>
+${
+  actions.length === 0
+    ? '<p>עדיין לא בוצעה אף פעולה מיוזמת העוזרת.</p>'
+    : `<table><tr><th>מתי</th><th>משימה</th><th>סוג פעולה</th><th>כלי</th><th>נמען</th><th>נושא</th><th></th></tr>${rows}</table>`
 }`,
   );
 }
@@ -632,7 +769,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }

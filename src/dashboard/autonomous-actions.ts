@@ -1,0 +1,144 @@
+/**
+ * What the assistant did entirely on its own — spec §8.4/§8.5.
+ *
+ * The owner deliberately does not get a notification for every autonomous
+ * step (`docs/05-approvals.md`'s "he wants to look when he wants to look").
+ * Without a screen that lists exactly what ran unattended, there is nothing
+ * for him to look AT, and the demotion half of the promotion mechanism
+ * (`orchestrator/promote.ts`'s `markCount`) has no way to ever receive a
+ * mark: a mark can only follow from a step the owner can actually see.
+ *
+ * **The filter is the whole point.** A step this list shows is one the
+ * assistant did without anyone's sign-off, which is exactly the fact that
+ * makes marking it "a mistake" meaningful. A step that went out because the
+ * owner clicked "approve" on a card is a decision HE made — showing it here
+ * would invite him to mark his own approval as the assistant's error, and
+ * would let a mark demote a class whose real cause was a person, not the
+ * autonomy the dial governs.
+ *
+ * Read at job granularity, matching the brief exactly: a completed
+ * (`job_step_results.status = 'completed'`) row is excluded the moment its
+ * OWN job has any `approval_requests` row that was spent
+ * (`consumed_at IS NOT NULL`) — not only an approval naming this particular
+ * step. `consumed_by_step` exists and could narrow this to the single step a
+ * card actually paid for, but a job that needed a human's yes anywhere in it
+ * is a job the owner already had a hand in, and the safe reading of "was a
+ * person involved here" is the broader one.
+ *
+ * The action class shown is not the plan's advisory `expectedActionClass`
+ * (`domain/plan.ts` states plainly that field is never authoritative) but the
+ * SAME computation the gate itself used to decide the step could run
+ * autonomously — `classifyAction` then `refineActionClass`, exactly as
+ * `run-plan.ts`'s own `actionClassOf` derives it. Anything else would let
+ * this screen, and the mark it produces, describe a class the gate never
+ * actually acted under.
+ */
+import { config } from '../config.js';
+import { getPool, type Queryable } from '../db/pool.js';
+import { Plan } from '../domain/plan.js';
+import type { ActionClass } from '../domain/action.js';
+import { classifyAction, refineActionClass } from '../policy/classify.js';
+import { readEmails, readPhones } from '../policy/facts.js';
+
+/** One completed step the assistant ran with nobody's card behind it. */
+export interface AutonomousAction {
+  jobId: string;
+  stepId: string;
+  actionClass: ActionClass;
+  toolName: string;
+  /** `jobs.title` is nullable and, for several origins, content someone else wrote. */
+  jobTitle: string | null;
+  /** The email or phone number `readEmails`/`readPhones` found in the step's own payload. */
+  recipient: string | null;
+  /** The step payload's `subject` field, when it carries one and it is a string. */
+  subject: string | null;
+  /** The provider's handle on what the step created, or `null` when it created nothing. */
+  externalId: string | null;
+  completedAt: Date;
+}
+
+interface ActionRow {
+  job_id: string;
+  step_id: string;
+  external_id: string | null;
+  completed_at: Date;
+  job_title: string | null;
+  plan: unknown;
+}
+
+/**
+ * Every completed step that ran without a card, newest first.
+ *
+ * The join to `job_plans` carries `AND jp.plan_hash = r.plan_hash` — not just
+ * the job id — because a job's bound plan is the one row `job_plans` will
+ * ever hold for it (`bindPlanToJob`'s first-plan-wins rule), and a completion
+ * recorded under any other hash belongs to a plan this job is no longer
+ * running (`resume-plan.test.ts` seeds exactly that shape). Matching only on
+ * `job_id` would resolve such a stale row against the CURRENT plan and read a
+ * step that never actually ran under it.
+ *
+ * A step whose tool is not classified (`classifyAction` returns `null` — a
+ * `READ_ONLY_TOOLS` member, by construction never anything else) is not an
+ * "action" in the sense this screen means: it never needed a card, ramp or
+ * mark to run, autonomously or otherwise, so it is left out rather than
+ * listed with a fabricated class.
+ */
+export async function listAutonomousActions(
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<AutonomousAction[]> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+
+  const { rows } = await db.query<ActionRow>(
+    `SELECT r.job_id, r.step_id, r.external_id, r.completed_at,
+            j.title AS job_title, jp.plan AS plan
+       FROM job_step_results r
+       JOIN jobs j       ON j.job_id = r.job_id  AND j.business_id = r.business_id
+       JOIN job_plans jp ON jp.job_id = r.job_id AND jp.business_id = r.business_id
+                        AND jp.plan_hash = r.plan_hash
+      WHERE r.business_id = $1
+        AND r.status = 'completed'
+        AND NOT EXISTS (
+          SELECT 1 FROM approval_requests a
+           WHERE a.business_id = r.business_id
+             AND a.job_id = r.job_id
+             AND a.consumed_at IS NOT NULL
+        )
+      ORDER BY r.completed_at DESC`,
+    [businessId],
+  );
+
+  const actions: AutonomousAction[] = [];
+  for (const row of rows) {
+    const parsed = Plan.safeParse(row.plan);
+    if (!parsed.success) {
+      throw new Error(
+        `listAutonomousActions: stored plan for job ${row.job_id} does not parse as a Plan`,
+      );
+    }
+    const step = parsed.data.steps.find((candidate) => candidate.id === row.step_id);
+    if (step === undefined) continue;
+
+    const base = classifyAction(step.toolName);
+    if (base === null) continue;
+    const actionClass = refineActionClass(base, step.input);
+
+    const [email] = readEmails(step.input);
+    const [phone] = readPhones(step.input);
+    const subjectRaw = step.input['subject'];
+
+    actions.push({
+      jobId: row.job_id,
+      stepId: row.step_id,
+      actionClass,
+      toolName: step.toolName,
+      jobTitle: row.job_title,
+      recipient: email ?? phone ?? null,
+      subject: typeof subjectRaw === 'string' ? subjectRaw : null,
+      externalId: row.external_id,
+      completedAt: row.completed_at,
+    });
+  }
+
+  return actions;
+}

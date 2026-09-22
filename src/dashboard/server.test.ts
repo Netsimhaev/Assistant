@@ -10,7 +10,10 @@ import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
+import { bindPlanToJob } from '../orchestrator/plan-store.js';
+import { Plan } from '../domain/plan.js';
 import { writeMemory } from '../memory/store.js';
+import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { enqueueApproval, getApproval } from '../governance/approvals.js';
 import type { ActionFacts } from '../domain/policy.js';
 import type { RiskAssessment } from '../domain/risk.js';
@@ -142,6 +145,45 @@ async function jobAwaitingApproval(businessId: string) {
     await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId });
   }
   return job;
+}
+
+/**
+ * A completed step with no card behind it — exactly what
+ * `listAutonomousActions` (`autonomous-actions.ts`) is built to find, seeded
+ * directly rather than by running a plan through the scheduler: this file is
+ * testing the ROUTE (session, CSRF, the row `recordCorrection` writes), which
+ * `autonomous-actions.test.ts` already proves end to end through the real
+ * gate. `job_step_results` is written directly, mirroring
+ * `resume-plan.test.ts`'s own use of a raw insert for the same table.
+ */
+async function seedAutonomousAction(
+  businessId: string,
+  input: Record<string, unknown> = { to: 'dana@example.com', inReplyTo: 'thread-1', subject: 'תשובה', body: 'גוף' },
+): Promise<{ jobId: string; stepId: string }> {
+  const bundle = await installCharter(buildCharter({ version: `autonomy-actions-${ulid()}` }), { businessId });
+  const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
+  const plan = Plan.parse({
+    goal: 'reply to a known customer',
+    steps: [
+      {
+        id: 's1',
+        agent: 'comms.email',
+        intent: 'reply to the customer',
+        toolName: 'mail.send',
+        input,
+      },
+    ],
+  });
+  const binding = await bindPlanToJob(job.jobId, plan, { businessId });
+  if (binding.status !== 'stored') throw new Error(`unexpected plan binding status ${binding.status}`);
+
+  await getPool().query(
+    `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status)
+     VALUES ($1, $2, $3, $4, 'MSG-1', 'completed')`,
+    [businessId, job.jobId, binding.planHash, 's1'],
+  );
+
+  return { jobId: job.jobId, stepId: 's1' };
 }
 
 // --- Fixtures for the document -> reading -> proposal -> job -> approval
@@ -2294,5 +2336,187 @@ describe('editing before approval', () => {
 
     const approval = await getApproval(approvalId, { businessId: BUSINESS });
     expect(approval?.state).toBe('pending');
+  });
+});
+
+describe('GET /autonomy — the owner’s dial', () => {
+  it('redirects to login without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const res = await fetch(`${baseUrl}/autonomy`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  it('shows the current mode and all three positions', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/autonomy`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    // The floor a fresh business has (`governance/autonomy-mode.ts`'s
+    // `MODE_FLOOR`) before anyone has ever touched the dial.
+    expect(body).toContain('כבוי');
+    expect(body).toContain('value="off" checked');
+    expect(body).toContain('value="ask"');
+    expect(body).toContain('value="learn"');
+  });
+
+  it('changes the mode and writes an audit row', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const getRes = await fetch(`${baseUrl}/autonomy`, { headers: { cookie } });
+    const csrf = extractCsrf(await getRes.text());
+
+    const postRes = await fetch(`${baseUrl}/autonomy/mode`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, mode: 'learn' }),
+      redirect: 'manual',
+    });
+    expect(postRes.status).toBe(302);
+    expect(postRes.headers.get('location')).toBe('/autonomy');
+
+    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('learn');
+  });
+
+  it('refuses a mode change without a CSRF token', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/autonomy/mode`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ mode: 'learn' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(403);
+    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+  });
+});
+
+describe('GET /autonomy/actions — what she did on her own', () => {
+  it('redirects to login without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const res = await fetch(`${baseUrl}/autonomy/actions`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  it('lists a step that ran without a card', async () => {
+    const { jobId } = await seedAutonomousAction(BUSINESS);
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain(jobId);
+    expect(body).toContain('dana@example.com');
+    expect(body).toContain('זו הייתה טעות');
+  });
+});
+
+/**
+ * `POST /autonomy/actions/:jobId/:stepId/mark` — the three route tests the
+ * brief requires, plus the CSRF mutation (Step 5): removing the CSRF check
+ * from this route must turn the second test below red.
+ */
+describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
+  it('redirects to login without a session', async () => {
+    const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
+    const baseUrl = await startServer(BUSINESS);
+
+    const res = await fetch(`${baseUrl}/autonomy/actions/${jobId}/${stepId}/mark`, {
+      method: 'POST',
+      body: new URLSearchParams({ note: 'לא היה צריך לצאת' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+
+    const { rows } = await getPool().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toHaveLength(0);
+  });
+
+  it('refuses a mark without a valid CSRF token', async () => {
+    const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/autonomy/actions/${jobId}/${stepId}/mark`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ note: 'לא היה צריך לצאת' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(403);
+
+    const { rows } = await getPool().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toHaveLength(0);
+  });
+
+  it('records a mark with a valid token, and does not touch the step it marks', async () => {
+    const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const listRes = await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } });
+    const csrf = extractCsrf(await listRes.text());
+
+    const res = await fetch(`${baseUrl}/autonomy/actions/${jobId}/${stepId}/mark`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, note: 'לא היה צריך לצאת בלי לבדוק את הסכום' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/autonomy/actions');
+
+    const { rows } = await getPool().query<{
+      job_id: string;
+      step_id: string;
+      action_class: string;
+      note: string;
+      marked_by: string;
+    }>('SELECT job_id, step_id, action_class, note, marked_by FROM autonomy_marks WHERE business_id = $1', [
+      BUSINESS,
+    ]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      job_id: jobId,
+      step_id: stepId,
+      action_class: 'email.reply',
+      note: 'לא היה צריך לצאת בלי לבדוק את הסכום',
+      marked_by: USERNAME,
+    });
+
+    // The mark does not undo or touch the step it describes (spec §8.4) —
+    // the underlying completion row is untouched.
+    const { rows: stepRows } = await getPool().query(
+      'SELECT status, external_id FROM job_step_results WHERE business_id = $1 AND job_id = $2',
+      [BUSINESS, jobId],
+    );
+    expect(stepRows).toEqual([{ status: 'completed', external_id: 'MSG-1' }]);
+  });
+
+  it('refuses to mark a job/step pair that is not in the autonomous list', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const listRes = await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } });
+    const csrf = extractCsrf(await listRes.text());
+
+    const res = await fetch(`${baseUrl}/autonomy/actions/J-nonexistent/s1/mark`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, note: 'טעות' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(400);
+
+    const { rows } = await getPool().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toHaveLength(0);
   });
 });
