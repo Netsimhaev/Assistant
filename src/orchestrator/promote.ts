@@ -338,16 +338,25 @@ export async function evaluateAutonomy(
       }
 
       // Spec §5.1.4 — no mark and no failed job inside the window of ten —
-      // has no separate check here, on purpose, not by omission. A mark or
-      // an objective failure on THIS class inside that window would already
-      // have taken the `continue` above: either it demoted the class this
-      // very pass (the branch above, which `continue`s before reaching
-      // here), or the class was already below `auto_notify` and could not
-      // have produced one — §6.1 counts a failure only for a job that ran
-      // under a level ABOVE `approve_required`, and marks only exist for
-      // steps `listAutonomousActions` shows, i.e. ones that ran without a
-      // card. A class waiting at `approve_required` has neither. §5.1.4 is
-      // therefore vacuous by construction, not dropped.
+      // has no separate check here, on purpose, not by omission. The two
+      // halves are satisfied for DIFFERENT reasons, and an earlier draft of
+      // this comment collapsed them into one claim that was not true of the
+      // code.
+      //
+      // The mark half is structural: a mark can only exist for a step
+      // `listAutonomousActions` shows, which is a step that ran without an
+      // approval card. A class sitting at `approve_required` produces no
+      // such step, so `markCount` cannot fire for a class that is a
+      // candidate for promotion.
+      //
+      // The failure half is satisfied by not being asked: this branch never
+      // calls `failureCount`. Note what that does NOT mean — `failureCount`
+      // itself carries no level filter, so §6.1's wording ("a job that ran
+      // above `approve_required`") is stricter than the query, which counts
+      // any failed job whose plan declares the class. That gap is narrow and
+      // predates this branch, and it is named here rather than papered over:
+      // it would matter the day something asks `failureCount` on the
+      // promotion path.
       const storedFrom = (await loadStoredRampLevel(actionClass, { businessId, db })) ?? level;
       await move(
         'promote',
