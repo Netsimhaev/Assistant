@@ -309,6 +309,34 @@ describe('the evaluation pass', () => {
   });
 
   /**
+   * Finding 6, final review: `from_level` must name what the row actually
+   * held, not the level the dial's ceiling made visible to this pass.
+   * `learn`'s ceiling is `auto_notify`, so a class hand-raised to `auto`
+   * (above it) is clamped down to `auto_notify` for every read `evaluateAutonomy`
+   * makes — but the event demoting it off that class must still say `auto`,
+   * because that is the level the class was actually stored at.
+   */
+  it('logs the row it actually held as from_level, not the level the dial clamped to', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'auto', { businessId: BUSINESS });
+    // The clamp is doing real work here: the gate never sees 'auto' under
+    // `learn`, only the ceiling.
+    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('auto_notify');
+
+    await getPool().query(
+      `INSERT INTO autonomy_marks (mark_id, business_id, job_id, step_id, action_class, note, marked_by)
+       VALUES ('AM-test-raw-from', $1, 'J-test', 'S-test', 'email.reply', 'טעות', 'owner@example.com')`,
+      [BUSINESS],
+    );
+
+    const result = await evaluateAutonomy({ businessId: BUSINESS });
+    expect(result.demoted).toContain('email.reply');
+    expect(await events('email.reply')).toEqual([
+      { direction: 'demote', from_level: 'auto', to_level: 'approve_required' },
+    ]);
+  });
+
+  /**
    * Spec §6.1, §6.3, §12.5. Two claims, and the second is the one an earlier
    * draft of this pass got wrong: after a demotion the class must earn ten
    * NEW clean approvals, not inherit the ten it already had. The final third

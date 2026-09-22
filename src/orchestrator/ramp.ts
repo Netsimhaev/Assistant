@@ -20,6 +20,54 @@ interface RampRow {
 }
 
 /**
+ * The raw `autonomy_ramp.level` for one action class — a row this build can
+ * parse, or `null` for a missing row or a string outside `AutonomyLevel`.
+ *
+ * Unclamped by the owner's dial on purpose: it is what `loadRampLevel` reads
+ * before applying `rampBoundsForMode`, factored out so a caller that needs
+ * the stored fact itself — not what the gate currently sees — has one place
+ * to read it rather than a second copy of this query.
+ */
+async function fetchStoredLevel(
+  actionClass: ActionClass,
+  options: { businessId?: string; db?: Queryable },
+): Promise<AutonomyLevel | null> {
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<RampRow>(
+    `SELECT level FROM autonomy_ramp
+      WHERE business_id = $1 AND action_class = $2`,
+    [options.businessId ?? config.businessId, actionClass],
+  );
+  const stored = rows[0]?.level;
+  if (stored === undefined) return null;
+
+  // Parsed rather than cast. The column is TEXT, so a level this build does
+  // not know about — a rollback, a hand-edited row — is representable, and
+  // treating it as an AutonomyLevel would hand a caller a value it cannot
+  // rank.
+  const parsed = AutonomyLevel.safeParse(stored);
+  return parsed.success ? parsed.data : null;
+}
+
+/**
+ * The row exactly as stored, with no dial applied.
+ *
+ * Exists for `autonomy_events.from_level` (`orchestrator/promote.ts`): that
+ * row is the history the owner's screen shows, and it must name the level
+ * the class's own row actually held, not the level the dial made visible to
+ * the gate. A class stored at `draft_only` and promoted under `learn` (whose
+ * floor raises what the gate sees to `approve_required`) must log `from:
+ * 'draft_only'` — a `from` it was never really at is a lie in the one place
+ * this system promises not to tell one.
+ */
+export async function loadStoredRampLevel(
+  actionClass: ActionClass,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<AutonomyLevel | null> {
+  return fetchStoredLevel(actionClass, options);
+}
+
+/**
  * The earned autonomy for one action class.
  *
  * The first reader this table has ever had. `RunPlanRequest.rampLevel` has
@@ -33,11 +81,7 @@ export async function loadRampLevel(
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<AutonomyLevel> {
   const db = options.db ?? getPool();
-  const { rows } = await db.query<RampRow>(
-    `SELECT level FROM autonomy_ramp
-      WHERE business_id = $1 AND action_class = $2`,
-    [options.businessId ?? config.businessId, actionClass],
-  );
+  const stored = await fetchStoredLevel(actionClass, { ...options, db });
 
   // The owner's dial decides the window this may sit in (spec §3.1), and the
   // stored level is CLAMPED into it — raised to the floor, and lowered to the
@@ -50,22 +94,26 @@ export async function loadRampLevel(
   // two of them — the signed charter's cap for the class, and the provenance
   // ceiling — are ALWAYS present. `ramp-floor.test.ts` proves it through a
   // real gate decision, because a comment claiming it would not be a control.
-  const { floor, ceiling } = rampBoundsForMode(await loadAutonomyMode({ ...options, db }));
+  const bounds = rampBoundsForMode(await loadAutonomyMode({ ...options, db }));
+  return clampToDial(stored, bounds);
+}
 
-  const stored = rows[0]?.level;
-  if (stored === undefined) return floor;
-
-  // Parsed rather than cast. The column is TEXT, so a level this build does
-  // not know about — a rollback, a hand-edited row — is representable, and
-  // treating it as an AutonomyLevel would hand the gate a ceiling it cannot
-  // rank.
-  const parsed = AutonomyLevel.safeParse(stored);
-  if (!parsed.success) return floor;
-
-  // Clamp, written as two positive comparisons rather than as "not outside".
-  if (!permits(parsed.data, floor)) return floor;
-  if (permits(parsed.data, ceiling)) return ceiling;
-  return parsed.data;
+/**
+ * Clamp a stored level (or its absence) into the dial's window.
+ *
+ * Written as two positive comparisons rather than as "not outside", and
+ * shared between `loadRampLevel` (the gate's view) and `runSetRampCli` (the
+ * operator's view) so the two can never compute the clamp two different
+ * ways.
+ */
+export function clampToDial(
+  stored: AutonomyLevel | null,
+  bounds: { floor: AutonomyLevel; ceiling: AutonomyLevel },
+): AutonomyLevel {
+  if (stored === null) return bounds.floor;
+  if (!permits(stored, bounds.floor)) return bounds.floor;
+  if (permits(stored, bounds.ceiling)) return bounds.ceiling;
+  return stored;
 }
 
 /**

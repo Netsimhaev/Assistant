@@ -19,7 +19,7 @@ import { ActionClass } from '../domain/action.js';
 import type { AutonomyLevel } from '../domain/trust.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { STREAK_REQUIRED, approvalStreak } from '../governance/agreement.js';
-import { loadRampLevel, setRampLevel } from './ramp.js';
+import { loadRampLevel, loadStoredRampLevel, setRampLevel } from './ramp.js';
 
 export interface AutonomyPassResult {
   promoted: ActionClass[];
@@ -221,6 +221,11 @@ function demotionReason(marks: number, failures: number): string {
  * caller today leaves it unset. A caller that passed a live transaction there
  * would have its reads and this write on two different connections — recorded
  * because it is a real limit, not because anything relies on it.
+ *
+ * `from` is whatever the caller passed — `evaluateAutonomy` passes the raw
+ * `autonomy_ramp` row (`loadStoredRampLevel`), not the level the dial made
+ * visible to this pass, so `autonomy_events.from_level` names what the class
+ * was actually stored at rather than what the gate saw.
  */
 async function move(
   direction: 'promote' | 'demote',
@@ -301,10 +306,16 @@ export async function evaluateAutonomy(
         const marks = await markCount(actionClass, businessId, signalSince, db);
         const failures = await failureCount(actionClass, businessId, signalSince, db);
         if (marks + failures > 0) {
+          // `from` is the row's own stored level, not the clamped `level`
+          // this pass evaluated — see `loadStoredRampLevel`. The two agree
+          // whenever the dial's ceiling did no work; they can differ when it
+          // did (a hand-raised `auto` clamped down to `auto_notify` under
+          // `learn`), and the event row must name what was actually there.
+          const storedFrom = (await loadStoredRampLevel(actionClass, { businessId, db })) ?? level;
           await move(
             'demote',
             actionClass,
-            EARNED_STEP.to,
+            storedFrom,
             EARNED_STEP.from,
             demotionReason(marks, failures),
             businessId,
@@ -326,10 +337,22 @@ export async function evaluateAutonomy(
         continue;
       }
 
+      // Spec §5.1.4 — no mark and no failed job inside the window of ten —
+      // has no separate check here, on purpose, not by omission. A mark or
+      // an objective failure on THIS class inside that window would already
+      // have taken the `continue` above: either it demoted the class this
+      // very pass (the branch above, which `continue`s before reaching
+      // here), or the class was already below `auto_notify` and could not
+      // have produced one — §6.1 counts a failure only for a job that ran
+      // under a level ABOVE `approve_required`, and marks only exist for
+      // steps `listAutonomousActions` shows, i.e. ones that ran without a
+      // card. A class waiting at `approve_required` has neither. §5.1.4 is
+      // therefore vacuous by construction, not dropped.
+      const storedFrom = (await loadStoredRampLevel(actionClass, { businessId, db })) ?? level;
       await move(
         'promote',
         actionClass,
-        EARNED_STEP.from,
+        storedFrom,
         EARNED_STEP.to,
         `${STREAK_REQUIRED} אישורים רצופים ללא שינוי`,
         businessId,
