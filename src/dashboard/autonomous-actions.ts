@@ -16,14 +16,18 @@
  * would let a mark demote a class whose real cause was a person, not the
  * autonomy the dial governs.
  *
- * Read at job granularity, matching the brief exactly: a completed
- * (`job_step_results.status = 'completed'`) row is excluded the moment its
- * OWN job has any `approval_requests` row that was spent
- * (`consumed_at IS NOT NULL`) — not only an approval naming this particular
- * step. `consumed_by_step` exists and could narrow this to the single step a
- * card actually paid for, but a job that needed a human's yes anywhere in it
- * is a job the owner already had a hand in, and the safe reading of "was a
- * person involved here" is the broader one.
+ * Read at STEP granularity, via `approval_requests.consumed_by_step`
+ * (`governance/consume.ts`) — the exact step id a spent approval recorded as
+ * the one that spent it. An earlier version of this query excluded by job id
+ * alone (any spent card anywhere in the job hid every completed step in it),
+ * which a live two-step-plan reproduction proved wrong: `run-plan.ts`'s own
+ * docblock describes a halted multi-step plan resuming — one step already
+ * earned autonomy, a sibling step still needs a card — as the designed
+ * operating mode this promotion feature exists to reach. Under the job-level
+ * filter, the moment the gated sibling's card was spent, the OTHER step —
+ * which never touched a card — vanished from the list: invisible, therefore
+ * unmarkable, therefore undemotable. Filtering on `consumed_by_step = r.step_id`
+ * excludes exactly the step a card paid for and nothing else.
  *
  * The action class shown is not the plan's advisory `expectedActionClass`
  * (`domain/plan.ts` states plainly that field is never authoritative) but the
@@ -102,7 +106,7 @@ export async function listAutonomousActions(
           SELECT 1 FROM approval_requests a
            WHERE a.business_id = r.business_id
              AND a.job_id = r.job_id
-             AND a.consumed_at IS NOT NULL
+             AND a.consumed_by_step = r.step_id
         )
       ORDER BY r.completed_at DESC`,
     [businessId],

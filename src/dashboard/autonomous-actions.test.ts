@@ -229,6 +229,77 @@ describe('listAutonomousActions', () => {
     expect(actions.some((a) => a.jobId === cardJobId)).toBe(false);
   });
 
+  /**
+   * The hole review found: excluding by JOB, not by step. A single job whose
+   * plan mixes an already-autonomous step with one still needing a card is
+   * not a corner case — `run-plan.ts`'s own docblock describes exactly this
+   * shape (a halted multi-step plan resuming, part already earned, part
+   * still gated) as the designed mode, and it is exactly what more classes
+   * climbing off `draft_only` produces more of. `s1` never touches a card;
+   * `s2` does. `s1` must stay listed and markable no matter what happens to
+   * its sibling.
+   */
+  it('keeps listing an autonomous step after a SIBLING step in the same job spends a card', async () => {
+    const bundle = await installFixture();
+    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+
+    const twoStepPlan = Plan.parse({
+      goal: 'reply to a known customer, and separately to a stranger',
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'reply to the known customer',
+          toolName: 'mail.send',
+          input: { to: 'dana@example.com', inReplyTo: 'thread-1', subject: 'תשובה', body: 'גוף' },
+          // Required: an undeclared class contributes the RAMP FLOOR
+          // (`draft_only`), not "no ceiling" — omitting it here rejected the
+          // whole job at stage 8 before either step ever ran.
+          expectedActionClass: 'email.reply',
+        },
+        {
+          id: 's2',
+          agent: 'comms.email',
+          intent: 'reply to the stranger',
+          toolName: 'mail.send',
+          input: { to: 'stranger@nowhere.example', inReplyTo: 'thread-2', subject: 'הצעה', body: 'גוף' },
+          expectedActionClass: 'email.reply',
+        },
+      ],
+    });
+    const jobId = await seedReplyJob(bundle, twoStepPlan);
+
+    const sent: MailMessage[] = [];
+    const runtime = runtimeWith(sent);
+
+    // First pass: s1 sends autonomously; s2 parks the whole job on a card.
+    const firstPass = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+    expect(firstPass.ran).toEqual([{ jobId, status: 'halted', detail: 'awaiting_approval' }]);
+    expect(sent).toHaveLength(1);
+
+    const beforeApproval = await listAutonomousActions({ businessId: BUSINESS });
+    expect(beforeApproval.map((a) => a.stepId)).toEqual(['s1']);
+
+    const [pending] = await pendingApprovals({ businessId: BUSINESS });
+    if (pending === undefined) throw new Error('expected one pending approval for s2');
+    await applyDecision(
+      pending.approvalId,
+      'approved',
+      { by: 'owner@example.com', channel: 'dashboard' },
+      { businessId: BUSINESS },
+    );
+
+    // Second pass: s1 is skipped as already-completed; s2 resumes, consumes
+    // its own card, and sends.
+    const secondPass = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+    expect(secondPass.ran).toEqual([{ jobId, status: 'done', detail: null }]);
+    expect(sent).toHaveLength(2);
+
+    // s1 never touched a card. It must still be here, on its own.
+    const afterApproval = await listAutonomousActions({ businessId: BUSINESS });
+    expect(afterApproval.map((a) => a.stepId)).toEqual(['s1']);
+  });
+
   it('returns an empty list for a business with no completed steps', async () => {
     await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), { businessId: BUSINESS });
     expect(await listAutonomousActions({ businessId: BUSINESS })).toEqual([]);
