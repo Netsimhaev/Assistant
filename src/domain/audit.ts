@@ -65,6 +65,13 @@ export const AuditKind = z.enum([
    * produced nothing.
    */
   'curation',
+  /**
+   * The owner moved the dial, or the measurement moved a class up or down.
+   * Carries the class, both levels and the reason — never a recipient and
+   * never message content: an autonomy change is a fact about the system's
+   * own permissions, not about whoever the action was aimed at.
+   */
+  'autonomy_change',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 
