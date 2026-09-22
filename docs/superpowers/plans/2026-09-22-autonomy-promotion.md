@@ -47,10 +47,11 @@
 - Create: `src/db/migrations/026_autonomy_promotion.sql`
 - Create: `src/governance/autonomy-mode.ts`
 - Modify: `src/domain/audit.ts` — להוסיף `'autonomy_change'` ל-`AuditKind`
+- Modify: `src/test/db.ts` — שלוש הטבלאות החדשות לרשימת ה-TRUNCATE
 - Test: `src/governance/autonomy-mode.test.ts`
 
 **Interfaces:**
-- Produces: `AutonomyMode` (zod enum + type), `loadAutonomyMode(options): Promise<AutonomyMode>`, `setAutonomyMode(mode: AutonomyMode, by: string, options): Promise<void>`, `rampFloorForMode(mode: AutonomyMode): AutonomyLevel`.
+- Produces: `AutonomyMode` (zod enum + type), `loadAutonomyMode(options): Promise<AutonomyMode>`, `setAutonomyMode(mode: AutonomyMode, by: string, options): Promise<void>`, `rampBoundsForMode(mode: AutonomyMode): { floor: AutonomyLevel; ceiling: AutonomyLevel }`.
 
 - [ ] **Step 1: המיגרציה**
 
@@ -113,6 +114,17 @@ CREATE INDEX autonomy_events_class_idx ON autonomy_events (business_id, action_c
 
 ל-`audit_log.kind` אין אילוץ `CHECK` ב-SQL — נבדק — ולכן אין מיגרציה נוספת.
 
+- [ ] **Step 2.5: שלוש הטבלאות לרשימת האיפוס**
+
+`src/test/db.ts` מונה את הטבלאות **ביד**, וההערה בקובץ עצמו מזהירה שטבלה שנשמטת ממנה מדליפה מצב ממבחן למבחן. הוסף את שלוש החדשות לרשימת ה-`TRUNCATE`, ליד `autonomy_ramp`:
+
+```
+      autonomy_ramp,
+      autonomy_mode,
+      autonomy_marks,
+      autonomy_events,
+```
+
 - [ ] **Step 3: כתוב את המבחן הנופל**
 
 צור `src/governance/autonomy-mode.test.ts`:
@@ -121,7 +133,7 @@ CREATE INDEX autonomy_events_class_idx ON autonomy_events (business_id, action_c
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { loadAutonomyMode, rampFloorForMode, setAutonomyMode } from './autonomy-mode.js';
+import { loadAutonomyMode, rampBoundsForMode, setAutonomyMode } from './autonomy-mode.js';
 
 const BUSINESS = 'test-business';
 
@@ -138,13 +150,22 @@ describe('the owner dial', () => {
   });
 
   /**
-   * The floor is the whole mechanism (spec 3.1): the dial does not enter the
-   * gate, it only decides how low the ramp may sit.
+   * The bounds are the whole mechanism (spec 3.1): the dial does not enter the
+   * gate, it decides only the window the ramp may sit in.
+   *
+   * BOTH ends matter, and the ceiling is the half an earlier draft of this
+   * plan left out. With a floor alone, `off` could not pull a class that had
+   * already been promoted back down — a switch labelled "off" that does not
+   * stop her.
    */
-  it('maps each mode to the ramp floor it implies', () => {
-    expect(rampFloorForMode('off')).toBe('draft_only');
-    expect(rampFloorForMode('ask')).toBe('approve_required');
-    expect(rampFloorForMode('learn')).toBe('approve_required');
+  it('maps each mode to the window the ramp may sit in', () => {
+    expect(rampBoundsForMode('off')).toEqual({ floor: 'draft_only', ceiling: 'draft_only' });
+    expect(rampBoundsForMode('ask')).toEqual({
+      floor: 'approve_required', ceiling: 'approve_required',
+    });
+    expect(rampBoundsForMode('learn')).toEqual({
+      floor: 'approve_required', ceiling: 'auto_notify',
+    });
   });
 
   it('stores what the owner chose and reads it back', async () => {
@@ -227,15 +248,27 @@ export type AutonomyMode = z.infer<typeof AutonomyMode>;
 const MODE_FLOOR: AutonomyMode = 'off';
 
 /**
- * The ramp floor each mode implies.
+ * The window the ramp may sit in, for each mode.
  *
- * `ask` and `learn` share a floor and differ only in whether the measurement
- * may climb above it (`promote.ts`). Keeping them the same here is the point:
- * turning learning off must not silently take away the level the owner
- * already decided the assistant should work at.
+ * BOTH ends, and the ceiling is the half that makes the switch honest. With a
+ * floor alone, `off` could not pull back a class that had already been
+ * promoted: the stored level would simply win, and a switch the owner reads
+ * as "stop" would leave her acting. `off` therefore pins everything at
+ * `draft_only`, `ask` pins everything at `approve_required` — she asks every
+ * time, which is what that label says — and only `learn` opens a range for
+ * the measurement to move inside.
+ *
+ * This is a clamp and not a grant. The ramp remains one of five ceilings
+ * `effectiveAutonomy` combines by minimum, so nothing here can exceed the
+ * signed charter; `ramp-floor.test.ts` proves that through a real gate
+ * decision rather than asserting it.
  */
-export function rampFloorForMode(mode: AutonomyMode): AutonomyLevel {
-  return mode === 'off' ? 'draft_only' : 'approve_required';
+export function rampBoundsForMode(
+  mode: AutonomyMode,
+): { floor: AutonomyLevel; ceiling: AutonomyLevel } {
+  if (mode === 'off') return { floor: 'draft_only', ceiling: 'draft_only' };
+  if (mode === 'ask') return { floor: 'approve_required', ceiling: 'approve_required' };
+  return { floor: 'approve_required', ceiling: 'auto_notify' };
 }
 
 export async function loadAutonomyMode(
@@ -318,7 +351,7 @@ git commit -m "The owner's dial, and the ramp floor it implies"
 - Test: `src/orchestrator/ramp-floor.test.ts`
 
 **Interfaces:**
-- Consumes: `loadAutonomyMode`, `rampFloorForMode` (Task 1).
+- Consumes: `loadAutonomyMode`, `rampBoundsForMode` (Task 1).
 - Produces: התנהגות חדשה ל-`loadRampLevel` — החתימה אינה משתנה.
 
 - [ ] **Step 1: כתוב את המבחן הנופל — התקנון גובר**
@@ -345,13 +378,21 @@ describe('the dial raises the ramp floor, and the charter still wins', () => {
     await closePool();
   });
 
-  it('floors at draft_only while the dial is off, whatever the row says', async () => {
-    await setRampLevel('email.reply', 'auto', { businessId: BUSINESS });
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('auto');
-    // Nothing was written to the ramp that the mode can lower — the mode only
-    // ever RAISES a floor. `off` means the floor is `draft_only`, which a
-    // stored `auto` already clears, so the stored value stands.
-    expect(await loadRampLevel('calendar.create', { businessId: BUSINESS })).toBe('draft_only');
+  /**
+   * The test an earlier draft of this plan did not have, and the defect it
+   * would have shipped: a class already promoted must come back DOWN when the
+   * owner turns the dial off. A switch labelled "off" that leaves her acting
+   * is the worst thing this feature could do.
+   */
+  it('pulls a promoted class back to draft_only when the dial is off', async () => {
+    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('draft_only');
+  });
+
+  it('pins everything at approve_required on ask — she asks every time', async () => {
+    await setAutonomyMode('ask', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
   });
 
   it('lifts a class with no row to approve_required once the dial is on', async () => {
@@ -359,8 +400,8 @@ describe('the dial raises the ramp floor, and the charter still wins', () => {
     expect(await loadRampLevel('calendar.create', { businessId: BUSINESS })).toBe('approve_required');
   });
 
-  it('never lowers a stored level that already sits above the floor', async () => {
-    await setAutonomyMode('ask', 'owner@example.com', { businessId: BUSINESS });
+  it('keeps an earned level while the dial is on learn', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
     expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('auto_notify');
   });
@@ -413,7 +454,7 @@ npx vitest run src/orchestrator/ramp-floor.test.ts
 ב-`src/orchestrator/ramp.ts`, הוסף את הייבוא ושנה את `loadRampLevel`:
 
 ```ts
-import { loadAutonomyMode, rampFloorForMode } from '../governance/autonomy-mode.js';
+import { loadAutonomyMode, rampBoundsForMode } from '../governance/autonomy-mode.js';
 import { AutonomyLevel, mostRestrictiveAutonomy, permits } from '../domain/trust.js';
 ```
 
@@ -429,24 +470,29 @@ export async function loadRampLevel(
     [options.businessId ?? config.businessId, actionClass],
   );
 
-  // The owner's dial decides how low this may sit (spec §3.1). It RAISES a
-  // floor and never lowers a stored level: a class that already earned more
-  // than the floor keeps what it earned.
+  // The owner's dial decides the window this may sit in (spec §3.1), and the
+  // stored level is CLAMPED into it — raised to the floor, and lowered to the
+  // ceiling. Both ends do work: the floor is what lets a class start being
+  // used at all, and the ceiling is what makes `off` actually stop her.
   //
-  // This is the only place in the system where a ceiling is relaxed, and it
-  // is safe for one reason, stated rather than assumed: the ramp is one of
-  // five ceilings `effectiveAutonomy` combines by minimum, and two of them —
-  // the signed charter's own cap for the class, and the provenance ceiling —
-  // are ALWAYS present. `ramp-floor.test.ts` proves it through a real gate
-  // decision, because a comment claiming it would not be a control.
-  const floor = rampFloorForMode(await loadAutonomyMode({ ...options, db }));
+  // The relaxing half is the only place in the system where a ceiling is
+  // loosened, and it is safe for one reason, stated rather than assumed: the
+  // ramp is one of five ceilings `effectiveAutonomy` combines by minimum, and
+  // two of them — the signed charter's cap for the class, and the provenance
+  // ceiling — are ALWAYS present. `ramp-floor.test.ts` proves it through a
+  // real gate decision, because a comment claiming it would not be a control.
+  const { floor, ceiling } = rampBoundsForMode(await loadAutonomyMode({ ...options, db }));
 
   const stored = rows[0]?.level;
   if (stored === undefined) return floor;
 
   const parsed = AutonomyLevel.safeParse(stored);
   if (!parsed.success) return floor;
-  return permits(parsed.data, floor) ? parsed.data : floor;
+
+  // Clamp, written as two positive comparisons rather than as "not outside".
+  if (!permits(parsed.data, floor)) return floor;
+  if (permits(parsed.data, ceiling)) return ceiling;
+  return parsed.data;
 }
 ```
 
@@ -460,9 +506,10 @@ npx vitest run src/orchestrator/ramp-floor.test.ts src/orchestrator/ramp.test.ts
 
 - [ ] **Step 5: הוכח ששני המבחנים נושכים — לא אחד**
 
-א. החלף `permits(parsed.data, floor) ? parsed.data : floor` ב-`parsed.data`. צפוי: **"lifts a class with no row"** נשאר ירוק אבל מבחן אחר נופל? אם **שום** מבחן לא נופל, כתוב מבחן שכן — ערך שמור `draft_only` תחת מתג `ask` חייב לעלות ל-`approve_required`.
-ב. החלף את `return floor` (במקרה של שורה חסרה) ב-`return RAMP_FLOOR`. צפוי: **"lifts a class with no row"** נופל.
-דווח מה ראית בשני המקרים. החזר, וודא זהות בייט-בבייט.
+א. הסר את שורת ה-`ceiling` (`if (permits(parsed.data, ceiling)) return ceiling;`). צפוי: **"pulls a promoted class back to draft_only when the dial is off"** ו-**"pins everything at approve_required on ask"** — שניהם נופלים. זו המוטציה החשובה בתוכנית כולה.
+ב. הסר את שורת ה-`floor` (`if (!permits(parsed.data, floor)) return floor;`). צפוי: **"lifts a class with no row to approve_required"** נופל.
+ג. החלף את `return floor` (שורה חסרה) ב-`return RAMP_FLOOR`. צפוי: **"lifts a class with no row"** נופל.
+דווח מה ראית בשלושתם. החזר אחרי כל אחד, וודא זהות בייט-בבייט.
 
 - [ ] **Step 6: Commit**
 
@@ -1182,7 +1229,7 @@ git commit -m "Document earned autonomy: what moves it, and what it cannot move"
 
 **מצייני מקום.** שתי משימות — 6 ו-7 — נכתבו בצעדים מתארים ולא בקוד מלא, במכוון ומוצהר: הן עורכות קבצים גדולים וקיימים (`views.ts`, `server.ts`, `CLAUDE.md`) שבהם הדפוס הנכון הוא של הקובץ ולא שלי, ולהכתיב להן קוד היה מייצר סתירה עם השכנים. לכל צעד בהן יש בכל זאת בדיקה ספציפית שחייבת לעבור. **ב-T3 וב-T5 השארתי גופי מבחן להשלמה מול החתימות האמיתיות** — גם זה מוצהר בגוף המשימה, עם הוראה מפורשת לקרוא את הקובץ לפני.
 
-**עקביות טיפוסים.** `AutonomyMode` מוגדר ב-T1 ונצרך ב-T2 ו-T4. `rampFloorForMode` מוגדר ב-T1, נצרך ב-T2 בלבד. `approvalStreak`/`STREAK_REQUIRED` מ-T3 נצרכים ב-T4. `evaluateAutonomy` ו-`AutonomyPassResult` מ-T4 נצרכים ב-scheduler. `recordCorrection` מ-T5 נצרך ב-T6. שלוש הטבלאות של T1 נקראות ב-T4 (`autonomy_events`, `autonomy_marks`) וב-T6.
+**עקביות טיפוסים.** `AutonomyMode` מוגדר ב-T1 ונצרך ב-T2 ו-T4. `rampBoundsForMode` מוגדר ב-T1, נצרך ב-T2 בלבד. `approvalStreak`/`STREAK_REQUIRED` מ-T3 נצרכים ב-T4. `evaluateAutonomy` ו-`AutonomyPassResult` מ-T4 נצרכים ב-scheduler. `recordCorrection` מ-T5 נצרך ב-T6. שלוש הטבלאות של T1 נקראות ב-T4 (`autonomy_events`, `autonomy_marks`) וב-T6.
 
 **סריקת קדם שהרצתי על התוכנית הזו, ושני פגמים שהיא תפסה בטקסט שלי.** שניהם היו חוסמים מבצע, ושניהם תוקנו לפני השיגור:
 
