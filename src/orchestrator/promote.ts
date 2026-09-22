@@ -12,7 +12,7 @@
  */
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withTransaction, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import { ActionClass } from '../domain/action.js';
@@ -24,6 +24,15 @@ import { loadRampLevel, setRampLevel } from './ramp.js';
 export interface AutonomyPassResult {
   promoted: ActionClass[];
   demoted: ActionClass[];
+  /**
+   * Classes whose own evaluation threw and was isolated (spec §10).
+   *
+   * Without this field the isolation is indistinguishable from "nothing was
+   * due": a class that fails to evaluate every pass would never promote and
+   * never say why. It exists for the same reason `RunDueResult` splits its
+   * buckets — an outcome nobody prints is an outcome that does not exist.
+   */
+  errored: ActionClass[];
 }
 
 /**
@@ -53,6 +62,31 @@ async function lastEventAt(
     [businessId, actionClass],
   );
   return rows[0]?.at ?? null;
+}
+
+/**
+ * When the ramp row for this class was last written.
+ *
+ * The fallback window for the demotion signals when the class has never moved
+ * through this pass. §6.1 counts a failure only under a level ABOVE
+ * `approve_required`, and with no window at all `failureCount(null)` reached
+ * back over all history — so a class raised by hand (`npm run ramp:set`, the
+ * path CLAUDE.md documents as in use on `dev-business`) fell again on the very
+ * next pass because of a job that failed long before the raise, quietly
+ * undoing the raise. `updated_at` is when the level this pass is judging came
+ * into being, which is exactly the start of the period it may judge.
+ */
+async function rampUpdatedAt(
+  actionClass: ActionClass,
+  businessId: string,
+  db: Queryable,
+): Promise<Date | null> {
+  const { rows } = await db.query<{ updated_at: Date }>(
+    `SELECT updated_at FROM autonomy_ramp
+      WHERE business_id = $1 AND action_class = $2`,
+    [businessId, actionClass],
+  );
+  return rows[0]?.updated_at ?? null;
 }
 
 async function demotionCount(
@@ -148,39 +182,81 @@ async function failureCount(
   return Number(rows[0]?.n ?? '0');
 }
 
-async function record(
+/**
+ * Which signal fired, named rather than implied.
+ *
+ * Spec §9.1 makes the event row the history §8 shows the owner — "this class
+ * was demoted on Tuesday, and here is why". A fixed disjunction ("a mark or a
+ * failed job") answers neither half of that, and both counts are already in
+ * hand at the call site. Written as two positive clauses that each name what
+ * they found, so a demotion driven by both says both.
+ */
+function demotionReason(marks: number, failures: number): string {
+  const parts: string[] = [];
+  if (marks > 0) parts.push(`סימון טעות של הבוס (${marks})`);
+  if (failures > 0) parts.push(`משימה שנכשלה (${failures})`);
+  return parts.join(' ו-');
+}
+
+/**
+ * Move one class, as one transaction.
+ *
+ * The level, the event row, `promoted_at`/`demoted_at` and the audit entry
+ * are one fact about the business and must commit or roll back together.
+ * Written as four statements on the pool, a failure in the last of them — and
+ * `appendAudit` takes a per-business advisory lock, which contends exactly
+ * when the system is busy — left the class ALREADY at `auto_notify` with no
+ * audit row and nothing in `promoted`: autonomy raised, silently. The same
+ * hazard `trip()` in `killswitch.ts` documents, except that one is
+ * deliberately non-atomic because stopping without a record beats not
+ * stopping; here there is no such asymmetry, so the transaction is simply
+ * right.
+ *
+ * `appendAudit` receives the transaction as `tx` and therefore joins it,
+ * rather than opening one of its own and taking the advisory lock inside a
+ * single statement.
+ *
+ * The transaction is opened here rather than threaded from `evaluateAutonomy`'s
+ * `options.db`: that parameter points the READS at a connection, and every
+ * caller today leaves it unset. A caller that passed a live transaction there
+ * would have its reads and this write on two different connections — recorded
+ * because it is a real limit, not because anything relies on it.
+ */
+async function move(
   direction: 'promote' | 'demote',
   actionClass: ActionClass,
   from: AutonomyLevel,
   to: AutonomyLevel,
   reason: string,
   businessId: string,
-  db: Queryable,
 ): Promise<void> {
-  await db.query(
-    `INSERT INTO autonomy_events
-       (event_id, business_id, action_class, direction, from_level, to_level, reason)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-    [`AE-${ulid()}`, businessId, actionClass, direction, from, to, reason],
-  );
-  await db.query(
-    `UPDATE autonomy_ramp
-        SET ${direction === 'promote' ? 'promoted_at' : 'demoted_at'} = now(), updated_at = now()
-      WHERE business_id = $1 AND action_class = $2`,
-    [businessId, actionClass],
-  );
-  await appendAudit(
-    {
-      actor: 'orchestrator',
-      kind: 'autonomy_change',
-      actionClass,
-      charterVersion: 'unknown',
-      provenance: 'boss',
-      inputHash: canonicalHash({ actionClass, direction, from, to }),
-      reason: `${actionClass}: ${from} → ${to} (${reason})`,
-    },
-    { businessId },
-  );
+  await withTransaction(async (tx) => {
+    await setRampLevel(actionClass, to, { businessId, db: tx });
+    await tx.query(
+      `INSERT INTO autonomy_events
+         (event_id, business_id, action_class, direction, from_level, to_level, reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [`AE-${ulid()}`, businessId, actionClass, direction, from, to, reason],
+    );
+    await tx.query(
+      `UPDATE autonomy_ramp
+          SET ${direction === 'promote' ? 'promoted_at' : 'demoted_at'} = now(), updated_at = now()
+        WHERE business_id = $1 AND action_class = $2`,
+      [businessId, actionClass],
+    );
+    await appendAudit(
+      {
+        actor: 'orchestrator',
+        kind: 'autonomy_change',
+        actionClass,
+        charterVersion: 'unknown',
+        provenance: 'boss',
+        inputHash: canonicalHash({ actionClass, direction, from, to }),
+        reason: `${actionClass}: ${from} → ${to} (${reason})`,
+      },
+      { businessId, tx },
+    );
+  });
 }
 
 /**
@@ -198,6 +274,7 @@ export async function evaluateAutonomy(
 
   const promoted: ActionClass[] = [];
   const demoted: ActionClass[] = [];
+  const errored: ActionClass[] = [];
 
   for (const actionClass of ActionClass.options) {
     // One class failing to evaluate must not stop the rest (spec §10). A
@@ -216,19 +293,21 @@ export async function evaluateAutonomy(
       // lost, because the window below is "since the last move", not "since
       // the last pass".
       if (level === EARNED_STEP.to) {
-        const bad =
-          (await markCount(actionClass, businessId, since, db)) +
-          (await failureCount(actionClass, businessId, since, db));
-        if (bad > 0) {
-          await setRampLevel(actionClass, EARNED_STEP.from, { businessId, db });
-          await record(
+        // The period this pass may judge: since the last move if there was
+        // one, and otherwise since the level itself was written — see
+        // `rampUpdatedAt`. Never the beginning of time, which would let
+        // evidence from before the class was ever released count against it.
+        const signalSince = since ?? (await rampUpdatedAt(actionClass, businessId, db));
+        const marks = await markCount(actionClass, businessId, signalSince, db);
+        const failures = await failureCount(actionClass, businessId, signalSince, db);
+        if (marks + failures > 0) {
+          await move(
             'demote',
             actionClass,
             EARNED_STEP.to,
             EARNED_STEP.from,
-            'סימון של הבוס או משימה שנכשלה',
+            demotionReason(marks, failures),
             businessId,
-            db,
           );
           demoted.push(actionClass);
           continue;
@@ -247,21 +326,22 @@ export async function evaluateAutonomy(
         continue;
       }
 
-      await setRampLevel(actionClass, EARNED_STEP.to, { businessId, db });
-      await record(
+      await move(
         'promote',
         actionClass,
         EARNED_STEP.from,
         EARNED_STEP.to,
         `${STREAK_REQUIRED} אישורים רצופים ללא שינוי`,
         businessId,
-        db,
       );
       promoted.push(actionClass);
     } catch {
-      // Swallowed per class, by design — see above.
+      // Isolated per class, by design — see above — but reported, never
+      // swallowed: the whole point of `errored` is that "it threw" and
+      // "nothing was due" must not look the same to whoever reads the pass.
+      errored.push(actionClass);
     }
   }
 
-  return { promoted, demoted };
+  return { promoted, demoted, errored };
 }

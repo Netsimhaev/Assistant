@@ -80,6 +80,23 @@ function logErrored(result: SchedulerPassResult): void {
   for (const job of result.verified.errored) {
     console.error(`job ${job.jobId} errored while closing: ${job.error}`);
   }
+  // Same rule one pass further along. A class whose evaluation threw would
+  // otherwise look exactly like a class with nothing due — it would simply
+  // never promote, every pass, and say nothing. A move itself is not an
+  // error, but it is a change to what the assistant may do unasked, so it is
+  // worth a line an operator sees.
+  if (result.autonomyError !== null) {
+    console.error(`autonomy evaluation failed: ${result.autonomyError}`);
+  }
+  for (const actionClass of result.autonomy.errored) {
+    console.error(`autonomy evaluation failed for ${actionClass}`);
+  }
+  for (const actionClass of result.autonomy.promoted) {
+    console.log(`autonomy raised for ${actionClass}`);
+  }
+  for (const actionClass of result.autonomy.demoted) {
+    console.log(`autonomy lowered for ${actionClass}`);
+  }
 }
 
 // One pass before the loop, so a misconfiguration surfaces immediately rather

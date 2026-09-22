@@ -33,8 +33,10 @@ import { Plan } from '../domain/plan.js';
 import { createJob, transition } from './jobs.js';
 import { bindPlanToJob } from './plan-store.js';
 import { loadRampLevel, setRampLevel } from './ramp.js';
+import { schedulerPass } from './scheduler.js';
 import { evaluateAutonomy } from './promote.js';
 
+import type { Queryable } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
 import type { PolicyBundle, ActionFacts } from '../domain/policy.js';
 
@@ -158,6 +160,17 @@ async function events(
     [BUSINESS, actionClass],
   );
   return rows;
+}
+
+/** The `reason` on the newest event for a class — what spec §8 shows the owner. */
+async function newestReason(actionClass: ActionClass): Promise<string | undefined> {
+  const { rows } = await getPool().query<{ reason: string }>(
+    `SELECT reason FROM autonomy_events
+      WHERE business_id = $1 AND action_class = $2
+      ORDER BY at DESC, event_id DESC LIMIT 1`,
+    [BUSINESS, actionClass],
+  );
+  return rows[0]?.reason;
 }
 
 /** A plan whose only step declares `actionClass` — what a failure is attributed by. */
@@ -403,5 +416,154 @@ describe('the evaluation pass', () => {
     expect(await storedLevel('email.reply')).toBe('auto_notify');
     expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('auto_notify');
     expect(await events('email.reply')).toEqual([]);
+  });
+
+  /**
+   * Spec §10 — the pass has a production caller.
+   *
+   * `evaluateAutonomy` being right is worth nothing if `schedulerPass` does
+   * not call it, and this repository records the "function with no production
+   * caller" defect four separate times. Replacing the call with a literal
+   * left all three scheduler test files green; this is the test that goes red
+   * for it. The companion in `scheduler-runs-plans.test.ts` locks the other
+   * half — that it runs LAST — with evidence that pass itself produces.
+   */
+  it('is wired into schedulerPass, not merely exported', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await cleanRun('email.reply', STREAK_REQUIRED);
+
+    // `inbox: null` keeps both document-conductor loops off: this test is
+    // about the autonomy pass, and the conductor's half costs money.
+    const pass = await schedulerPass({ businessId: BUSINESS, inbox: null });
+
+    expect(pass.autonomy.promoted).toContain('email.reply');
+    expect(pass.autonomy.errored).toEqual([]);
+    expect(pass.autonomyError).toBeNull();
+    expect(await storedLevel('email.reply')).toBe('auto_notify');
+  });
+
+  /**
+   * Spec §9.1 — the event row is the history the owner's screen reads, so it
+   * has to say WHICH signal fired. A fixed disjunction ("a mark or a failed
+   * job") answers neither half of "why was this class demoted on Tuesday".
+   */
+  it('records which signal demoted the class, not a disjunction of both', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await failedJobDeclaring('email.reply');
+
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).demoted).toContain('email.reply');
+    const reason = await newestReason('email.reply');
+    expect(reason).toContain('משימה שנכשלה');
+    expect(reason).not.toContain('סימון');
+  });
+
+  /**
+   * Spec §6.1 — a failure counts only under a level ABOVE `approve_required`.
+   *
+   * The owner raises a class by hand (`npm run ramp:set`, the path CLAUDE.md
+   * documents as in use on `dev-business`). With no window, `failureCount`
+   * reached over all history and the very next pass demoted it on a job that
+   * failed BEFORE the raise — the documented raise quietly undoing itself.
+   * The second half is the positive control: a failure after the raise does
+   * demote, so the window is what moved and not the signal.
+   */
+  it('ignores a failure that predates a hand-raised level, and heeds one after it', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await failedJobDeclaring('email.reply');
+    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+
+    const first = await evaluateAutonomy({ businessId: BUSINESS });
+    expect(first.demoted).toEqual([]);
+    expect(await storedLevel('email.reply')).toBe('auto_notify');
+    expect(await events('email.reply')).toEqual([]);
+
+    await failedJobDeclaring('email.reply');
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).demoted).toContain('email.reply');
+    expect(await storedLevel('email.reply')).toBe('approve_required');
+  });
+
+  /**
+   * The level, the event row and the audit entry are one fact and commit
+   * together.
+   *
+   * Written as four statements on the pool, a failure in the last of them left
+   * the class ALREADY at `auto_notify` with no audit row and nothing in
+   * `promoted` — autonomy raised, silently. `appendAudit` takes a per-business
+   * advisory lock and so fails exactly when the system is busy, which is the
+   * scenario `killswitch.ts` documents.
+   *
+   * The failure is injected with a trigger that refuses this audit kind, and
+   * removed in `finally`. The removal cannot itself throw — `DROP TRIGGER IF
+   * EXISTS` on a trigger this test created — which is the lesson Task 1 paid
+   * for: a cleanup that can fail is not a cleanup.
+   */
+  it('rolls the level back when the audit entry cannot be written', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await cleanRun('email.reply', STREAK_REQUIRED);
+
+    await getPool().query(`
+      CREATE OR REPLACE FUNCTION refuse_autonomy_audit() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.kind = 'autonomy_change' THEN
+          RAISE EXCEPTION 'audit refused by test';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    try {
+      await getPool().query(`
+        CREATE TRIGGER refuse_autonomy_audit_trigger
+        BEFORE INSERT ON audit_log
+        FOR EACH ROW EXECUTE FUNCTION refuse_autonomy_audit()
+      `);
+
+      const blocked = await evaluateAutonomy({ businessId: BUSINESS });
+      expect(blocked.promoted).toEqual([]);
+      // Nothing half-happened: the level is untouched and no event row exists.
+      expect(await storedLevel('email.reply')).toBe('approve_required');
+      expect(await events('email.reply')).toEqual([]);
+      // And it is reported rather than swallowed.
+      expect(blocked.errored).toContain('email.reply');
+    } finally {
+      await getPool().query('DROP TRIGGER IF EXISTS refuse_autonomy_audit_trigger ON audit_log');
+      await getPool().query('DROP FUNCTION IF EXISTS refuse_autonomy_audit()');
+    }
+
+    // Positive control: with the obstacle gone, the same evidence promotes.
+    const after = await evaluateAutonomy({ businessId: BUSINESS });
+    expect(after.promoted).toContain('email.reply');
+    expect(after.errored).toEqual([]);
+    expect(await storedLevel('email.reply')).toBe('auto_notify');
+  });
+
+  /**
+   * Spec §10 — one class failing must not stop the rest, and must not look
+   * like nothing being due either.
+   */
+  it('isolates a class whose evaluation throws, and names it in errored', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await cleanRun('email.reply', STREAK_REQUIRED);
+    await cleanRun('calendar.create', STREAK_REQUIRED);
+
+    // A connection that refuses every statement carrying this one class. The
+    // cast is for `pg`'s overloaded `query` signature only — the body does no
+    // narrowing of its own.
+    const refusing: Queryable = {
+      query: ((text: string, params?: unknown[]) => {
+        if (Array.isArray(params) && params.includes('email.reply')) {
+          return Promise.reject(new Error('injected read failure'));
+        }
+        return getPool().query(text, params as unknown[]);
+      }) as Queryable['query'],
+    };
+
+    const result = await evaluateAutonomy({ businessId: BUSINESS, db: refusing });
+    expect(result.errored).toEqual(['email.reply']);
+    expect(result.promoted).toEqual(['calendar.create']);
+    expect(await storedLevel('email.reply')).toBeUndefined();
   });
 });

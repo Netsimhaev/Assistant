@@ -12,7 +12,7 @@ import { envCredentials } from './credentials.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { bindPlanToJob } from './plan-store.js';
-import { setRampLevel } from './ramp.js';
+import { loadRampLevel, setRampLevel } from './ramp.js';
 import { schedulerPass } from './scheduler.js';
 import type { Runtime } from './runtime.js';
 
@@ -187,5 +187,90 @@ describe('schedulerPass', () => {
     expect(sent).toHaveLength(1);
     expect(pass.verified.closed).toContain(job.jobId);
     expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+  });
+
+  /**
+   * Spec §10 — the autonomy pass runs LAST, and the ordering is asserted with
+   * evidence this very pass produces rather than with a claim about call
+   * order.
+   *
+   * The job fails inside `runDueJobs` (a credential ref that resolves to
+   * nothing — final, not retryable, `run-plan.ts`), and §6.1 makes a job that
+   * ended in `failed` a demotion signal. So the class can only come down if
+   * the evaluation looks after the plans have run. Move `evaluateAutonomy`
+   * above `runDueJobs` — or replace it with a literal — and `demoted` is
+   * empty and the stored row stays `auto_notify`.
+   */
+  it('demotes a class on a job that failed in this same pass', async () => {
+    const bundle = await installCharter(
+      buildCharter({
+        connections: [MAIL_CONNECTION],
+        knownCounterpartyEmailDomain: 'example.com',
+        autonomyBase: { 'email.initiate': 'auto' },
+      }),
+      { businessId: BUSINESS },
+    );
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'run and fail',
+    });
+    for (const to of ['understand', 'plan', 'execute'] as const) {
+      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    }
+    await upsertBinding(
+      {
+        system: 'office-mail',
+        status: 'live',
+        endpoint: null,
+        // A ref the credential source below cannot resolve. `run-plan.ts`
+        // treats that as a misconfiguration and therefore NOT retryable, so
+        // the job lands in `failed` rather than sleeping in `followup`.
+        credentialRef: 'OFFICE_MAIL',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { businessId: BUSINESS, by: 'test' },
+    );
+    await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    // The rung a class can actually fall from. `auto` would be clamped to
+    // `auto_notify` on read anyway; writing the level the demotion expects
+    // makes what is being tested explicit.
+    await setRampLevel('email.initiate', 'auto_notify', { businessId: BUSINESS });
+
+    const sent: MailMessage[] = [];
+    const pass = await schedulerPass({
+      businessId: BUSINESS,
+      runtime: {
+        registry: new AdapterRegistry([
+          createMailAdapter({
+            system: 'office-mail',
+            transport: {
+              async send(message) {
+                sent.push(message);
+                return { messageId: 'MSG-1' };
+              },
+            },
+          }),
+        ]),
+        // Nothing provisioned: the ref above resolves to null.
+        credentials: envCredentials({}, PREFIX),
+        warnings: [],
+      },
+      now: NOON,
+      inbox: null,
+    });
+
+    // The failure really happened in this pass, and nothing was sent.
+    expect(sent).toHaveLength(0);
+    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    // And the evaluation that ran after it saw the failure.
+    expect(pass.autonomyError).toBeNull();
+    expect(pass.autonomy.demoted).toContain('email.initiate');
+    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe(
+      'approve_required',
+    );
   });
 });

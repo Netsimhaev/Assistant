@@ -152,6 +152,18 @@ export interface SchedulerPassResult {
   verified: CloseVerifiedResult;
   /** Which action classes this round moved up, and which moved down. */
   autonomy: AutonomyPassResult;
+  /**
+   * `evaluateAutonomy`'s thrown message, if it threw. Null on a clean pass.
+   *
+   * The same treatment `scanError` gets, and for the same reason. The pass's
+   * own `try/catch` isolates ONE class (spec §10); a throw outside that loop
+   * — `loadAutonomyMode` on a transient database error — would reject
+   * `schedulerPass` itself, and `startScheduler` routes a rejected pass to
+   * `onError` INSTEAD of `onResult`. That would suppress the tick, the scan,
+   * the plans and the closes that had all already succeeded, because the
+   * bookkeeping that runs last after them failed.
+   */
+  autonomyError: string | null;
 }
 
 /**
@@ -261,8 +273,27 @@ export async function schedulerPass(
   // this pass reads what this very round produced — an approval just decided,
   // a job just failed. Run it earlier and every evaluation trails a pass
   // behind the evidence that justifies it (spec §10).
-  const autonomy = await evaluateAutonomy(options);
-  return { tick: tickResult, scan, scanError, conduct, due, verified, autonomy };
+  //
+  // Guarded rather than awaited bare: see `autonomyError`. Everything above
+  // has already happened by the time this runs, and a bookkeeping pass that
+  // failed must not hide the work that succeeded.
+  let autonomy: AutonomyPassResult = { promoted: [], demoted: [], errored: [] };
+  let autonomyError: string | null = null;
+  try {
+    autonomy = await evaluateAutonomy(options);
+  } catch (err) {
+    autonomyError = err instanceof Error ? err.message : String(err);
+  }
+  return {
+    tick: tickResult,
+    scan,
+    scanError,
+    conduct,
+    due,
+    verified,
+    autonomy,
+    autonomyError,
+  };
 }
 
 export interface SchedulerHandle {
