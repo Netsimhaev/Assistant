@@ -54,6 +54,54 @@ describe('the owner dial', () => {
   });
 
   /**
+   * The row and its audit entry are one fact and must commit together —
+   * the same asymmetry `move()` (`orchestrator/promote.ts`) avoids for the
+   * ramp. Two separate commits would let the dial move, possibly to
+   * `learn` (which opens every action class to earned promotion), while
+   * `appendAudit`'s per-business advisory lock fails silently underneath
+   * with no row to show who moved it or from where.
+   *
+   * The failure is injected with a trigger that refuses this audit kind,
+   * removed in `finally` with `DROP ... IF EXISTS` so the cleanup itself
+   * cannot throw — the same pattern `promote.test.ts` uses for `move()`.
+   */
+  it('does not move the dial when the audit entry cannot be written', async () => {
+    await getPool().query(`
+      CREATE OR REPLACE FUNCTION refuse_autonomy_mode_audit() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.kind = 'autonomy_change' THEN
+          RAISE EXCEPTION 'audit refused by test';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    try {
+      await getPool().query(`
+        CREATE TRIGGER refuse_autonomy_mode_audit_trigger
+        BEFORE INSERT ON audit_log
+        FOR EACH ROW EXECUTE FUNCTION refuse_autonomy_mode_audit()
+      `);
+
+      await expect(
+        setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS }),
+      ).rejects.toThrow(/audit refused by test/);
+
+      // Nothing half-happened: the dial is still at its default.
+      expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+    } finally {
+      await getPool().query(
+        'DROP TRIGGER IF EXISTS refuse_autonomy_mode_audit_trigger ON audit_log',
+      );
+      await getPool().query('DROP FUNCTION IF EXISTS refuse_autonomy_mode_audit()');
+    }
+
+    // Positive control: with the obstacle gone, the identical call moves it.
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('learn');
+  });
+
+  /**
    * A value this build cannot rank must never be treated as a permission.
    * The CHECK constraint stops it at the database, so this writes past the
    * constraint deliberately to prove the reader is defended on its own.

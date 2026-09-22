@@ -14,7 +14,7 @@
  */
 import { z } from 'zod';
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withTransaction, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { AutonomyLevel } from '../domain/trust.js';
@@ -68,33 +68,50 @@ export async function loadAutonomyMode(
   return parsed.success ? parsed.data : MODE_FLOOR;
 }
 
+/**
+ * Writes the row and its audit entry as one transaction — the same shape
+ * `move()` in `orchestrator/promote.ts` uses, and for the identical reason.
+ * `appendAudit` takes a per-business advisory lock that contends exactly
+ * when the system is busy; two separate commits would let the dial move —
+ * possibly to `learn`, opening every class to earned promotion — while the
+ * audit row describing who moved it and from where simply never lands. A
+ * failed audit here must roll the mode back, not leave it changed and mute.
+ *
+ * The transaction is opened here, on the pool, exactly as `move()` in
+ * `orchestrator/promote.ts` opens its own rather than threading
+ * `options.db`: that parameter points the read in `loadAutonomyMode` at a
+ * connection, and the one production caller (`dashboard/server.ts`) never
+ * sets it.
+ */
 export async function setAutonomyMode(
   mode: AutonomyMode,
   by: string,
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
   const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
-  const previous = await loadAutonomyMode({ businessId, db });
 
-  await db.query(
-    `INSERT INTO autonomy_mode (business_id, mode, updated_at, updated_by)
-     VALUES ($1, $2, now(), $3)
-     ON CONFLICT (business_id)
-     DO UPDATE SET mode = EXCLUDED.mode, updated_at = now(), updated_by = EXCLUDED.updated_by`,
-    [businessId, mode, by],
-  );
+  await withTransaction(async (tx) => {
+    const previous = await loadAutonomyMode({ businessId, db: tx });
 
-  await appendAudit(
-    {
-      actor: 'human',
-      onBehalfOf: by,
-      kind: 'autonomy_change',
-      charterVersion: 'unknown',
-      provenance: 'boss',
-      inputHash: canonicalHash({ from: previous, to: mode }),
-      reason: `רמת החופש שונתה מ-${previous} ל-${mode} על ידי ${by}`,
-    },
-    { businessId },
-  );
+    await tx.query(
+      `INSERT INTO autonomy_mode (business_id, mode, updated_at, updated_by)
+       VALUES ($1, $2, now(), $3)
+       ON CONFLICT (business_id)
+       DO UPDATE SET mode = EXCLUDED.mode, updated_at = now(), updated_by = EXCLUDED.updated_by`,
+      [businessId, mode, by],
+    );
+
+    await appendAudit(
+      {
+        actor: 'human',
+        onBehalfOf: by,
+        kind: 'autonomy_change',
+        charterVersion: 'unknown',
+        provenance: 'boss',
+        inputHash: canonicalHash({ from: previous, to: mode }),
+        reason: `רמת החופש שונתה מ-${previous} ל-${mode} על ידי ${by}`,
+      },
+      { businessId, tx },
+    );
+  });
 }
