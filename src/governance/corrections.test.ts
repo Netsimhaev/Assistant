@@ -28,6 +28,25 @@ function planTo(recipient: string): Plan {
   });
 }
 
+/** Same recipient as `planTo`, but classified `calendar.create` — a
+ * different action class addressing the same person, for the per-class
+ * supersede test below. */
+function calendarPlanTo(recipient: string): Plan {
+  return Plan.parse({
+    goal: 'book a meeting',
+    steps: [
+      {
+        id: 's1',
+        agent: 'sched.meetings',
+        intent: 'book a meeting with the customer',
+        toolName: 'calendar.create',
+        input: { to: recipient, title: 'פגישה' },
+        expectedActionClass: 'calendar.create',
+      },
+    ],
+  });
+}
+
 /** A step whose payload names no recipient at all — `calendar.create` still
  * addresses a `person` (per `messagesAPerson`), but this input carries
  * neither `to`, `recipient`, `email`, `phone`, `toNumber` nor `msisdn`. */
@@ -168,6 +187,49 @@ describe('recordCorrection', () => {
     const live = await recallMemories({ subjectKey: 'dana@example.com' }, { businessId: BUSINESS });
     expect(live).toHaveLength(1);
     expect(JSON.stringify(live[0]?.body)).toContain('השני');
+  });
+
+  /**
+   * Review finding 6: the docblock claims the attribute key includes the
+   * action class specifically so a correction about drafting a reply does
+   * not supersede one about scheduling — but the "supersedes" test above
+   * uses `email.reply` throughout, so it cannot tell class-scoping apart from
+   * plain recipient-scoping. This proves the class half of the key directly:
+   * two corrections for the SAME person under DIFFERENT action classes must
+   * leave TWO live rows, not one.
+   */
+  it('keeps corrections for different action classes on the same person separate', async () => {
+    const charterVersion = await ensureCharter();
+
+    const replyJob = await seedJob(charterVersion, 'boss', planTo('dana@example.com'));
+    await recordCorrection(
+      {
+        jobId: replyJob,
+        stepId: 's1',
+        actionClass: 'email.reply',
+        note: 'הנוסח היה רשמי מדי',
+        by: 'owner@example.com',
+      },
+      { businessId: BUSINESS },
+    );
+
+    const calendarJob = await seedJob(charterVersion, 'boss', calendarPlanTo('dana@example.com'));
+    await recordCorrection(
+      {
+        jobId: calendarJob,
+        stepId: 's1',
+        actionClass: 'calendar.create',
+        note: 'השעה הייתה שגויה',
+        by: 'owner@example.com',
+      },
+      { businessId: BUSINESS },
+    );
+
+    const live = await recallMemories({ subjectKey: 'dana@example.com' }, { businessId: BUSINESS });
+    expect(live).toHaveLength(2);
+    expect(live.map((row) => row.attribute).sort()).toEqual(
+      ['תיקון — calendar.create', 'תיקון — email.reply'].sort(),
+    );
   });
 
   /**

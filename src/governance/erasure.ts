@@ -215,10 +215,12 @@ export async function executeErasure(
     );
     await del('boss_instructions', 'DELETE FROM boss_instructions WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     // `autonomy_marks.note` is owner-written content about a corrected step
-    // and can name the counterparty it was addressed to — see
-    // `erasure-plan.ts`'s header for why this is the one migration-026 table
-    // wired in here and its two siblings (`autonomy_mode`, `autonomy_events`)
-    // are not. Same predicate, same parameters, as `countItems` there.
+    // and is not restricted to naming the counterparty the step happened to
+    // be addressed to — see `erasure-plan.ts`'s header for why this is the
+    // one migration-026 table wired in here (its two siblings are not) and
+    // why `buildErasurePlan` also searches `note` itself to discover a job
+    // that has no other tie to the contact. Same predicate, same parameters,
+    // as `countItems` there.
     await del('autonomy_marks', 'DELETE FROM autonomy_marks WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);

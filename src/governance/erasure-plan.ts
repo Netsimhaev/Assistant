@@ -12,13 +12,19 @@
  * proposals, extracted parts, step records — come along.
  *
  * **Migration 026 added three tables, and only one of them belongs here.**
- * `autonomy_marks.note` is owner-written free text about one corrected step —
+ * `autonomy_marks.note` is owner-typed free text about one corrected step —
  * `src/governance/corrections.ts` files it against the job whose step was
- * wrong, and that note can name the counterparty the step was addressed to
- * ("should not have offered Dana a discount"). It is content about a person
- * in exactly the sense `boss_instructions.text` already is, keyed the same
- * way — by `job_id` — and it is wired in below for that reason alone.
- * `autonomy_mode` (one row per business: the owner's dial position) and
+ * wrong — and that text is not restricted to naming the counterparty the
+ * step happened to be addressed to; a note about who was wrongly cc'd, or
+ * who should have been contacted instead, can name someone the job's own
+ * plan, title, instructions and authorizations never mention. It is content
+ * about a person in exactly the sense `boss_instructions.text` already is,
+ * and it is wired in below the same way `boss_instructions` is: BOTH as a
+ * `job_id`-scoped deletion target below AND as a contact-anchor discovery
+ * source of its own (the `autonomy_marks` query beside the `boss_instructions`
+ * one), because a note is exactly the kind of free text that can be the only
+ * place in a job that names the person being erased. `autonomy_mode` (one
+ * row per business: the owner's dial position) and
  * `autonomy_events` (a promotion/demotion ledger whose `reason` column holds
  * only counts, e.g. "10 אישורים רצופים ללא שינוי") are facts about the
  * SYSTEM's own permissions, not about any counterparty — neither carries a
@@ -300,6 +306,26 @@ export async function buildErasurePlan(
       `SELECT DISTINCT job_id FROM boss_instructions
         WHERE business_id = $1
           AND (text ILIKE $2 ${LIKE_ESCAPE} OR coalesce(answer, '') ILIKE $2 ${LIKE_ESCAPE})`,
+      [businessId, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // `autonomy_marks.note` is owner-typed free text and is not restricted to
+    // naming only the counterparty the corrected step was addressed to — a
+    // note about who was wrongly cc'd, or who should have been contacted
+    // instead, can name someone the job's plan/title/instructions/
+    // authorizations never mention at all. Without this query such a job is
+    // never placed in `jobIds`, the `job_id = ANY($2)` deletion below never
+    // reaches it, and the name survives an erasure permanently — the same
+    // defect class already fixed twice in this module (`job_plans`, the
+    // orphan `approval_requests` card). `boss_instructions` just above is the
+    // template: a table reached BOTH as a discovery source (by its own
+    // content) and as a closure target (by `job_id` membership), and
+    // `autonomy_marks` needs the same pairing, not just the second half.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM autonomy_marks
+        WHERE business_id = $1 AND note ILIKE $2 ${LIKE_ESCAPE}`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
@@ -590,10 +616,10 @@ async function countItems(
       [businessId, jobIds],
     ),
     // See this module's header for why `autonomy_marks` and not its two
-    // migration-026 siblings. Keyed by `job_id` exactly like
-    // `boss_instructions` above: a mark belongs to the job whose step it
-    // corrects, and that job is already in `jobIds` once anything about it —
-    // its plan, its instruction, its title — matched the anchor.
+    // migration-026 siblings. Deleted by `job_id` membership exactly like
+    // `boss_instructions` above — and, like it, `jobIds` for a contact anchor
+    // already includes every job whose OWN note names the contact, via the
+    // discovery query beside `boss_instructions`'s above.
     await one(
       'autonomy_marks',
       'delete',

@@ -251,6 +251,50 @@ describe('what an erasure leaves behind', () => {
   });
 
   /**
+   * The sweep above cannot catch a discovery-only gap: its seeded job is
+   * independently findable through `job_plans`, `boss_instructions`,
+   * `job_authorizations` AND `jobs.title`, so a mark riding along on any ONE
+   * of those four says nothing about whether the mark's own `note` is ever
+   * searched for its own sake. This test isolates exactly that: a job with
+   * NOTHING else tying it to the contact — no plan, no instruction, no
+   * authorization, a title that never mentions it — carrying only a
+   * correction note that names the contact. `autonomy_marks.note` is
+   * owner-typed free text and is not restricted to describing the
+   * counterparty a step was addressed to (review finding 5): a note about
+   * who was wrongly cc'd can name someone the job never otherwise mentions.
+   * Without the `autonomy_marks` discovery query in `buildErasurePlan`
+   * (beside `boss_instructions`'s), this job is never placed in `jobIds`, the
+   * `job_id = ANY($2)` deletion never reaches it, and the name survives an
+   * erasure of that very contact permanently.
+   */
+  it('reaches a correction note that names a counterparty the job otherwise never mentions', async () => {
+    const bundle = await installCharter(buildCharter({ version: 'note-only' }), { businessId: BUSINESS });
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      // Deliberately silent on the contact: no plan, no instruction, no
+      // authorization and a title that never names it either.
+      title: 'משימה רגילה שלא קשורה לאיש',
+    });
+
+    await getPool().query(
+      `INSERT INTO autonomy_marks (mark_id, business_id, job_id, step_id, action_class, note, marked_by)
+       VALUES ('AM-note-only', $1, $2, 's1', 'email.reply', $3, 'owner@example.com')`,
+      [BUSINESS, job.jobId, `לא היה צריך להעתיק את ${PROBE} בטעות`],
+    );
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
+    await executeErasure(plan, { businessId: BUSINESS });
+
+    const { rows } = await getPool().query(
+      'SELECT 1 FROM autonomy_marks WHERE business_id = $1 AND mark_id = $2',
+      [BUSINESS, 'AM-note-only'],
+    );
+    expect(rows).toHaveLength(0);
+  });
+
+  /**
    * And the other direction, without which the scan above is satisfied
    * perfectly by an erasure that deletes the whole database.
    */
