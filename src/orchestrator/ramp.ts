@@ -2,17 +2,16 @@ import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
 import type { Plan } from '../domain/plan.js';
-import { AutonomyLevel, mostRestrictiveAutonomy } from '../domain/trust.js';
+import { AutonomyLevel, mostRestrictiveAutonomy, permits } from '../domain/trust.js';
+import { loadAutonomyMode, rampBoundsForMode } from '../governance/autonomy-mode.js';
 import { READ_ONLY_TOOLS } from '../policy/classify.js';
 
 /**
- * The level an action class has when nothing says otherwise.
- *
- * Matches the column default in migration 001, and matters far more than that
- * suggests: this is the value a missing row, an unknown business, or a level
- * string this code does not recognise all resolve to. A value nobody could
- * read is never a permissive value — and `draft_only` is the level at which
- * work is produced and nothing leaves the building.
+ * The default floor `rampLevelForPlan` uses for a step that has a class but no
+ * stored row (see the docblock there). `loadRampLevel`'s own floor is no
+ * longer this constant — it is derived from the owner's dial via
+ * `rampBoundsForMode`, so that turning the dial to `off` can pull an already
+ * promoted class back down, not just hold new ones at the bottom.
  */
 const RAMP_FLOOR: AutonomyLevel = 'draft_only';
 
@@ -40,15 +39,33 @@ export async function loadRampLevel(
     [options.businessId ?? config.businessId, actionClass],
   );
 
+  // The owner's dial decides the window this may sit in (spec §3.1), and the
+  // stored level is CLAMPED into it — raised to the floor, and lowered to the
+  // ceiling. Both ends do work: the floor is what lets a class start being
+  // used at all, and the ceiling is what makes `off` actually stop her.
+  //
+  // The relaxing half is the only place in the system where a ceiling is
+  // loosened, and it is safe for one reason, stated rather than assumed: the
+  // ramp is one of five ceilings `effectiveAutonomy` combines by minimum, and
+  // two of them — the signed charter's cap for the class, and the provenance
+  // ceiling — are ALWAYS present. `ramp-floor.test.ts` proves it through a
+  // real gate decision, because a comment claiming it would not be a control.
+  const { floor, ceiling } = rampBoundsForMode(await loadAutonomyMode({ ...options, db }));
+
   const stored = rows[0]?.level;
-  if (stored === undefined) return RAMP_FLOOR;
+  if (stored === undefined) return floor;
 
   // Parsed rather than cast. The column is TEXT, so a level this build does
   // not know about — a rollback, a hand-edited row — is representable, and
   // treating it as an AutonomyLevel would hand the gate a ceiling it cannot
   // rank.
   const parsed = AutonomyLevel.safeParse(stored);
-  return parsed.success ? parsed.data : RAMP_FLOOR;
+  if (!parsed.success) return floor;
+
+  // Clamp, written as two positive comparisons rather than as "not outside".
+  if (!permits(parsed.data, floor)) return floor;
+  if (permits(parsed.data, ceiling)) return ceiling;
+  return parsed.data;
 }
 
 /**

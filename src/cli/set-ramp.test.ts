@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -7,6 +7,23 @@ import { loadRampLevel } from '../orchestrator/ramp.js';
 import { runSetRampCli } from './set-ramp.js';
 
 const BUSINESS = 'test-business';
+
+/**
+ * The raw `autonomy_ramp` row, bypassing `loadRampLevel`.
+ *
+ * `loadRampLevel` now clamps its answer to the owner's dial (Task 2), which
+ * defaults to `off` and would flatten a stored `approve_required` down to
+ * `draft_only` — hiding exactly the thing the test below checks: that this
+ * command writes ONE row for ONE class. The dial's clamp is
+ * `ramp-floor.test.ts`'s job; this reads what was actually written.
+ */
+async function storedLevel(actionClass: string, businessId: string): Promise<string | undefined> {
+  const { rows } = await getPool().query<{ level: string }>(
+    'SELECT level FROM autonomy_ramp WHERE business_id = $1 AND action_class = $2',
+    [businessId, actionClass],
+  );
+  return rows[0]?.level;
+}
 
 function collector(): { log: (line: string) => void; lines: string[] } {
   const lines: string[] = [];
@@ -28,10 +45,10 @@ describe('runSetRampCli', () => {
 
     await runSetRampCli(['email.reply', 'approve_required'], { log, businessId: BUSINESS });
 
-    expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
-    // The floor is what an unset class falls to, so this proves the write was
-    // scoped to the one class named rather than applied broadly.
-    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await storedLevel('email.reply', BUSINESS)).toBe('approve_required');
+    // An unset class has no row at all, so this proves the write was scoped
+    // to the one class named rather than applied broadly.
+    expect(await storedLevel('email.initiate', BUSINESS)).toBeUndefined();
   });
 
   it('refuses an unknown action class, names the valid ones, and writes nothing', async () => {

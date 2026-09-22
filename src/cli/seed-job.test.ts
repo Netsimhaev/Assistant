@@ -1,15 +1,31 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { loadJob } from '../orchestrator/jobs.js';
 import { loadPlanBody } from '../orchestrator/plan-store.js';
-import { loadRampLevel } from '../orchestrator/ramp.js';
 import { seedMailJob } from './seed-job.js';
 
 const BUSINESS = 'test-business';
+
+/**
+ * The raw `autonomy_ramp` row, bypassing `loadRampLevel`.
+ *
+ * `loadRampLevel` now clamps its answer to the owner's dial (Task 2), which
+ * defaults to `off` and would flatten every value below to `draft_only` —
+ * hiding exactly the thing this file tests: that `seedMailJob` writes ONE row
+ * for ONE class, not a business-wide grant. The dial's clamp is
+ * `ramp-floor.test.ts`'s job; this reads what was actually written.
+ */
+async function storedLevel(actionClass: string, businessId: string): Promise<string | undefined> {
+  const { rows } = await getPool().query<{ level: string }>(
+    'SELECT level FROM autonomy_ramp WHERE business_id = $1 AND action_class = $2',
+    [businessId, actionClass],
+  );
+  return rows[0]?.level;
+}
 
 const MAIL_CONNECTION: CharterConnection = {
   system: 'office-mail',
@@ -57,11 +73,11 @@ describe('seedMailJob', () => {
       businessId: BUSINESS,
     });
 
-    expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('approve_required');
-    // Every other class stays on the floor. A seed command that raised the
+    expect(await storedLevel('email.initiate', BUSINESS)).toBe('approve_required');
+    // Every other class has no row at all. A seed command that raised the
     // whole business would be a far larger grant than it appears to make.
-    expect(await loadRampLevel('purchase.place', { businessId: BUSINESS })).toBe('draft_only');
-    expect(await loadRampLevel('crm.write', { businessId: BUSINESS })).toBe('draft_only');
+    expect(await storedLevel('purchase.place', BUSINESS)).toBeUndefined();
+    expect(await storedLevel('crm.write', BUSINESS)).toBeUndefined();
   });
 
   it('refuses when no charter is installed', async () => {

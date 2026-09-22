@@ -10,6 +10,7 @@ import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import { upsertBinding } from './bindings.js';
 import { envCredentials } from './credentials.js';
 import { createJob, loadJob, transition } from './jobs.js';
+import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { bindPlanToJob } from './plan-store.js';
 import { setRampLevel } from './ramp.js';
 import { schedulerPass } from './scheduler.js';
@@ -110,6 +111,10 @@ describe('schedulerPass', () => {
       { businessId: BUSINESS, by: 'test' },
     );
     await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+    // The owner's dial (Task 2) defaults to `off`, which clamps
+    // `loadRampLevel` to `draft_only` regardless of what is stored — open it
+    // first so the promotion below is actually honoured.
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     // Park it asleep, due as of NOON — the same fixed clock passed to
@@ -170,6 +175,10 @@ describe('schedulerPass', () => {
       { businessId: BUSINESS, by: 'test' },
     );
     await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+    // The owner's dial (Task 2) defaults to `off`, which clamps
+    // `loadRampLevel` to `draft_only` regardless of what is stored — open it
+    // first so the promotion below is actually honoured.
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     const sent: MailMessage[] = [];

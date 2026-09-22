@@ -34,6 +34,7 @@ import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { grantAuthorization } from '../governance/authorization.js';
+import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { Plan } from '../domain/plan.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { AdapterRegistry } from './adapters/registry.js';
@@ -180,6 +181,14 @@ async function seedReplyJob(plan: Plan = REPLY_PLAN): Promise<{
     }),
     { businessId: BUSINESS },
   );
+
+  // The owner's dial (Task 2) clamps `loadRampLevel` around a window that
+  // defaults to `off` — everything pinned at `draft_only` — for a business
+  // with no row in `autonomy_mode`. This file's whole premise is "does a
+  // raised ramp row change anything", so it needs the dial open to its widest
+  // setting first; the clamp itself is `ramp-floor.test.ts`'s job, not this
+  // file's.
+  await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
 
   const job = await createJob({
     charterVersion: bundle.charterVersion,

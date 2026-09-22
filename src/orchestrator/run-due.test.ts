@@ -6,6 +6,7 @@ import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
 import type { CharterConnection } from '../domain/connection.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
+import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import { upsertBinding } from './bindings.js';
@@ -149,6 +150,10 @@ describe('runDueJobs', () => {
 
   it('runs a job that is in execute with a stored plan', async () => {
     const jobId = await seedExecutableJob();
+    // The owner's dial (Task 2) defaults to `off`, which clamps
+    // `loadRampLevel` to `draft_only` regardless of what is stored — open it
+    // first so the promotion below is actually honoured.
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     const sent: MailMessage[] = [];
@@ -194,6 +199,7 @@ describe('runDueJobs', () => {
       { businessId: BUSINESS, by: 'test' },
     );
     await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
 
     const notified: string[] = [];
@@ -346,8 +352,10 @@ describe('runDueJobs', () => {
     // section for the exact failure this produced when verified.
     const OTHER_BUSINESS = 'other-business';
     const jobIdHome = await seedExecutableJob(BUSINESS);
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
     const jobIdOther = await seedExecutableJob(OTHER_BUSINESS);
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: OTHER_BUSINESS });
     await setRampLevel('email.initiate', 'auto', { businessId: OTHER_BUSINESS });
 
     const sent: MailMessage[] = [];
@@ -395,6 +403,7 @@ describe('runDueJobs', () => {
     ]);
 
     const healthyJobId = await seedExecutableJob();
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     const sent: MailMessage[] = [];
