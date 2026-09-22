@@ -14,13 +14,25 @@
  * session lost an hour to exactly that: a ramp raise proposed for documents
  * arriving from outside, where the charter caps `unknown_external` at
  * `draft_only` and the raise could never have been felt.
+ *
+ * **Why it folds in the owner's dial (finding 4, final review).** The row
+ * this command writes is not what `loadRampLevel` hands the gate — that
+ * function clamps the stored value into `rampBoundsForMode` of the owner's
+ * "freedom" dial (`autonomy-mode.ts`) first, and the dial defaults to `off`,
+ * whose ceiling is `draft_only`. Printing the raw level against only the
+ * charter's ceilings — as this command once did — reported `auto_notify` as
+ * effective while the dial pinned the class at `draft_only`: a hand raise
+ * that reads as felt when the gate has not moved at all. `clampToDial` is
+ * the same function `loadRampLevel` clamps through, so the two can never
+ * disagree about what "effective" means.
  */
 import { closePool } from '../db/pool.js';
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { ActionClass } from '../domain/action.js';
 import { AutonomyLevel, TrustLevel, mostRestrictiveAutonomy } from '../domain/trust.js';
-import { setRampLevel } from '../orchestrator/ramp.js';
+import { loadAutonomyMode, rampBoundsForMode } from '../governance/autonomy-mode.js';
+import { clampToDial, setRampLevel } from '../orchestrator/ramp.js';
 
 export interface SetRampCliDeps {
   log: (line: string) => void;
@@ -79,15 +91,28 @@ export async function runSetRampCli(argv: string[], deps: SetRampCliDeps): Promi
 
   await setRampLevel(actionClass, level, { businessId });
 
+  // The dial that clamps everything `loadRampLevel` returns to the gate.
+  // Read AFTER the write, same as the charter above, so what gets printed
+  // matches what a gate decision made right now would actually see.
+  const mode = await loadAutonomyMode({ businessId });
+  const dialBounds = rampBoundsForMode(mode);
+  const dialClamped = clampToDial(level, dialBounds);
+
   const classCeiling = active.bundle.autonomyBase[actionClass];
   log(`הרמפה של ${actionClass} הועלתה ל-${level} עבור ${businessId}.`);
   log(`תקרת התקנון למחלקה הזו: ${classCeiling}.`);
+  log(
+    `מתג "רמת החופש" של העסק: ${mode} (רצפה ${dialBounds.floor}, תקרה ${dialBounds.ceiling}).`,
+  );
+  if (dialClamped !== level) {
+    log(`המתג מהדק את ${level} ל-${dialClamped} — ההעלאה הזו אינה מורגשת עד שהמתג ישונה.`);
+  }
   log('');
-  log('הרמה שתיאכף בפועל היא המחמירה מבין הרמפה, תקרת המחלקה, ותקרת מקור התוכן:');
+  log('הרמה שתיאכף בפועל היא המחמירה מבין הרמפה (אחרי הידוק המתג), תקרת המחלקה, ותקרת מקור התוכן:');
 
   for (const provenance of TrustLevel.options) {
     const provenanceCeiling = active.bundle.provenanceCeiling[provenance];
-    const effective = mostRestrictiveAutonomy([level, classCeiling, provenanceCeiling]);
+    const effective = mostRestrictiveAutonomy([dialClamped, classCeiling, provenanceCeiling]);
     const note = effective === level ? '' : `  ← התקרה גוברת, ההעלאה לא מורגשת כאן`;
     log(`  ${provenance.padEnd(20)} ${effective}${note}`);
   }

@@ -3,6 +3,7 @@ import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
+import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { loadRampLevel } from '../orchestrator/ramp.js';
 import { runSetRampCli } from './set-ramp.js';
 
@@ -86,6 +87,44 @@ describe('runSetRampCli', () => {
     expect(output).toContain('approve_required');
     expect(output).toContain('unknown_external');
     expect(output).toContain('draft_only');
+  });
+
+  /**
+   * Finding 4, final review: the printed "effective" level used to come from
+   * three ceilings only (ramp, class, provenance) and never asked the
+   * owner's dial — so at the default `off`, raising the ramp to
+   * `auto_notify` printed `auto_notify` as effective while `loadRampLevel`
+   * (and therefore the real gate) still clamps every class to `draft_only`.
+   * This is the failure that fix must remove: without folding the dial in,
+   * the boss row below reads `auto_notify` instead of `draft_only`.
+   */
+  it('does not report a raise as felt when the dial pins the class down', async () => {
+    const { log, lines } = collector();
+
+    await runSetRampCli(['email.reply', 'auto_notify'], { log, businessId: BUSINESS });
+    const output = lines.join('\n');
+
+    expect(output).toContain('off');
+    expect(await storedLevel('email.reply', BUSINESS)).toBe('auto_notify');
+
+    const bossLine = lines.find((line) => line.trim().startsWith('boss'));
+    expect(bossLine).toBeDefined();
+    expect(bossLine).toContain('draft_only');
+    expect(bossLine).not.toContain('auto_notify');
+  });
+
+  /** The same raise, with the dial opened, is now genuinely felt. */
+  it('reports a raise as felt once the dial is opened to learn', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    const { log, lines } = collector();
+
+    await runSetRampCli(['email.reply', 'auto_notify'], { log, businessId: BUSINESS });
+    const output = lines.join('\n');
+
+    expect(output).toContain('learn');
+    const bossLine = lines.find((line) => line.trim().startsWith('boss'));
+    expect(bossLine).toBeDefined();
+    expect(bossLine).toContain('auto_notify');
   });
 
   it('refuses when no charter is installed rather than reporting a ceiling it cannot read', async () => {
