@@ -10,6 +10,22 @@
  * The anchor is searched in seven places (spec §4.3), and every match closes
  * over to the job or document that carries it, so dependent rows — readings,
  * proposals, extracted parts, step records — come along.
+ *
+ * **Migration 026 added three tables, and only one of them belongs here.**
+ * `autonomy_marks.note` is owner-written free text about one corrected step —
+ * `src/governance/corrections.ts` files it against the job whose step was
+ * wrong, and that note can name the counterparty the step was addressed to
+ * ("should not have offered Dana a discount"). It is content about a person
+ * in exactly the sense `boss_instructions.text` already is, keyed the same
+ * way — by `job_id` — and it is wired in below for that reason alone.
+ * `autonomy_mode` (one row per business: the owner's dial position) and
+ * `autonomy_events` (a promotion/demotion ledger whose `reason` column holds
+ * only counts, e.g. "10 אישורים רצופים ללא שינוי") are facts about the
+ * SYSTEM's own permissions, not about any counterparty — neither carries a
+ * job id, a contact identifier, or any column a person's name could land in
+ * during ordinary use. They are left unwired for the same reason
+ * `autonomy_ramp` (migration 001) already is: there is nothing counterparty-
+ * shaped in them to erase.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -570,6 +586,18 @@ async function countItems(
       'boss_instructions',
       'delete',
       `SELECT count(*)::text AS n FROM boss_instructions
+        WHERE business_id = $1 AND job_id = ANY ($2)`,
+      [businessId, jobIds],
+    ),
+    // See this module's header for why `autonomy_marks` and not its two
+    // migration-026 siblings. Keyed by `job_id` exactly like
+    // `boss_instructions` above: a mark belongs to the job whose step it
+    // corrects, and that job is already in `jobIds` once anything about it —
+    // its plan, its instruction, its title — matched the anchor.
+    await one(
+      'autonomy_marks',
+      'delete',
+      `SELECT count(*)::text AS n FROM autonomy_marks
         WHERE business_id = $1 AND job_id = ANY ($2)`,
       [businessId, jobIds],
     ),

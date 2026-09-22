@@ -71,6 +71,12 @@ describe('what an erasure leaves behind', () => {
    * stayed green because no such row was ever seeded. The seven added below
    * are the rest of the table, and the orphan card is among them, so this
    * control now detects N1 by itself.
+   *
+   * **A thirteenth store, added later and outside spec §5.1: `autonomy_marks`
+   * (migration 026).** Not part of the original table because it did not
+   * exist yet, seeded below for the same reason as the other twelve — see
+   * `erasure-plan.ts`'s header for why it is the one migration-026 table that
+   * needed wiring at all.
    */
   it('leaves the probe in no text or JSON column of any table, anywhere', async () => {
     const bundle = await installCharter(buildCharter({ version: 'probe' }), { businessId: BUSINESS });
@@ -193,6 +199,21 @@ describe('what an erasure leaves behind', () => {
       `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id)
        VALUES ($1, $2, 'hp', 's1', $3)`,
       [BUSINESS, job.jobId, `msg-${PROBE}`],
+    );
+
+    // --- Migration 026's one erasable table. -----------------------------
+    //
+    // `autonomy_marks.note` is owner-written content about a corrected step
+    // and can name the person it was addressed to; see `erasure-plan.ts`'s
+    // header for why this is the only one of the three migration-026 tables
+    // wired into erasure. Keyed by `job_id`, exactly like `boss_instructions`
+    // above, so it is reached the same way: through the job the mark belongs
+    // to, which the `job_plans` seed above already put in this sweep's
+    // `jobIds`.
+    await db.query(
+      `INSERT INTO autonomy_marks (mark_id, business_id, job_id, step_id, action_class, note, marked_by)
+       VALUES ('AM-probe', $1, $2, 's1', 'email.reply', $3, 'owner@example.com')`,
+      [BUSINESS, job.jobId, `התיקון היה בעקבות פנייה של ${PROBE}`],
     );
 
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
