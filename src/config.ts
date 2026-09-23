@@ -86,4 +86,9 @@ export const config = {
   // switch starts charging an existing installation on the day it upgrades —
   // which is exactly what `DOCUMENT_INBOX` did before it became a switch.
   curationRunsPerDay: positiveInt('CURATION_RUNS_PER_DAY', 20),
+  // A delegation costs at least one model call in the child. Same shape as
+  // `curationRunsPerDay` and for the same reason: this project caps model cost
+  // with a daily count off `audit_log`, not with a token budget — and a second,
+  // unproven cost mechanism beside the one that works is how two readers drift.
+  delegationsPerDay: positiveInt('DELEGATIONS_PER_DAY', 50),
 } as const;

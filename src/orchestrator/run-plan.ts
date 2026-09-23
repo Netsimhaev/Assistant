@@ -467,6 +467,9 @@ async function performStep(
     const output = await runLocalTool(step.toolName, effectiveInput, {
       jobId: request.job.jobId,
       businessId: request.job.businessId,
+      // Only `doc.fetch` reads this today (readDocument needs the active
+      // charter to build its prompt); every other local handler ignores it.
+      bundle: request.bundle,
     });
     // No `externalId`: nothing outside the instance issued a handle, and
     // inventing one would tell `verify` it had a far end to ask.

@@ -23,14 +23,21 @@
  * a stated failure, never a silent write of something malformed. `zod` does
  * the parsing, and the error carries the field that was wrong.
  *
- * Only the memory family is implemented. That is the whole of what the owner
- * authorised the assistant to do on its own initiative — record and remember —
- * and the rest of the local tools remain honestly unimplemented rather than
- * stubbed into something that looks like it worked.
+ * The memory family was the whole of what the owner authorised the assistant
+ * to do on its own initiative — record and remember. `doc.fetch` joined it for
+ * a different reason: it is the tool the intent registry's one delegation
+ * target (`know.reader`) calls, and a child job whose single step completes
+ * with `not_implemented` would run a delegation end to end and teach the
+ * parent nothing — see `intent-registry.ts`'s reachability check. Every other
+ * local tool remains honestly unimplemented rather than stubbed into something
+ * that looks like it worked.
  */
 import { z } from 'zod';
 import type { Queryable } from '../db/pool.js';
 import { SafeLookupKey } from '../domain/charter.js';
+import type { PolicyBundle } from '../domain/policy.js';
+import { readDocument } from '../documents/read.js';
+import type { ReadOutcome, ReadRequest } from '../sdk/know-reader.js';
 import {
   recallMemories,
   retireMemories,
@@ -38,12 +45,28 @@ import {
   type MemoryKind,
   type MemoryRecord,
 } from '../memory/store.js';
+import { loadJob } from './jobs.js';
 import { StepChannelError } from './step-error.js';
 
 export interface LocalToolContext {
   jobId: string;
   businessId: string;
   db?: Queryable;
+  /**
+   * The active charter — required by `doc.fetch` (`readDocument` needs it to
+   * build the reading prompt) and by nothing else today. Optional here so the
+   * memory-family tests that predate this field do not have to supply one;
+   * `doc.fetch`'s own handler throws a clear internal error if it is missing,
+   * because that is a wiring bug, not a malformed payload.
+   */
+  bundle?: PolicyBundle;
+  /**
+   * The one step that costs money, injectable so a test can drive `doc.fetch`
+   * without an API key — the same seam `ReadDocumentOptions.reader` already
+   * is. Defaults to the real `runKnowReader` inside `readDocument` itself when
+   * omitted.
+   */
+  reader?: (request: ReadRequest) => Promise<ReadOutcome>;
 }
 
 /** What a local handler returns — the value that lands in the step's record. */
@@ -106,6 +129,20 @@ const RecallInput = z.object({
   query: z.string().max(200).optional(),
   kind: z.enum(['entity', 'preference', 'chunk']).optional(),
   limit: z.number().int().positive().optional(),
+});
+
+/**
+ * `documentId` is the one field this handler actually needs; it arrives here
+ * because `requestHelp` (`orchestrator/delegate.ts`) merges the resolved
+ * context ref into the step's input before binding the child's plan — a
+ * `ContextRef` carries a pointer, never text, and this is where the pointer is
+ * followed. `question` rides along from the registry's payload and is not
+ * read yet: `readDocument` always produces the same structured `Reading`
+ * regardless of phrasing, so there is nothing for it to steer today.
+ */
+const DocFetchInput = z.object({
+  documentId: SafeLookupKey,
+  question: z.string().min(1).max(500).optional(),
 });
 
 /** Fails the step with the field that was wrong, never a bare "invalid". */
@@ -250,6 +287,53 @@ const HANDLERS: Record<string, LocalHandler> = {
     );
     return renderRecalled(found);
   },
+
+  /**
+   * `know.reader`'s half of a delegation. Resolves the document context ref
+   * `requestHelp` merged into the step's input, reads it, and hands back a
+   * result shape that says which of the three real outcomes happened —
+   * `readDocument` itself never throws for a document, only for a genuine
+   * fault (see its own docblock).
+   *
+   * The job's own `provenance` is loaded rather than trusted from the input,
+   * for the same reason `writeMemory` reads it off the job record and not off
+   * its caller: a handler that could accept a trust level as a parameter is a
+   * handler a hostile payload could use to launder one.
+   */
+  'doc.fetch': async (input, ctx) => {
+    const parsed = parseOrFail(DocFetchInput, input, 'doc.fetch');
+    if (ctx.bundle === undefined) {
+      throw new Error('runLocalTool: doc.fetch requires ctx.bundle (the active charter)');
+    }
+    const job = await loadJob(ctx.jobId, {
+      businessId: ctx.businessId,
+      ...(ctx.db !== undefined ? { db: ctx.db } : {}),
+    });
+    if (job === null) {
+      throw new Error(`runLocalTool: doc.fetch could not load job ${ctx.jobId}`);
+    }
+    const outcome = await readDocument(
+      {
+        documentId: parsed.documentId,
+        bundle: ctx.bundle,
+        provenance: job.provenance,
+        jobId: ctx.jobId,
+      },
+      {
+        businessId: ctx.businessId,
+        ...(ctx.db !== undefined ? { db: ctx.db } : {}),
+        ...(ctx.reader !== undefined ? { reader: ctx.reader } : {}),
+      },
+    );
+    switch (outcome.status) {
+      case 'no_artifacts':
+        return { performed: false, reason: 'no_artifacts' };
+      case 'unreadable':
+        return { performed: true, status: 'unreadable', reason: outcome.reason };
+      case 'read':
+        return { performed: true, status: 'read', reading: outcome.reading, cached: outcome.cached };
+    }
+  },
 };
 
 /** The tools this executor actually performs. Exported for the invariant test. */
@@ -311,6 +395,12 @@ export const LOCAL_TOOL_CONTRACTS: readonly { toolName: string; payload: string 
   {
     toolName: 'memory.recall_shallow',
     payload: 'כמו `memory.recall`, ומחזיר לכל היותר שלוש תוצאות.',
+  },
+  {
+    toolName: 'doc.fetch',
+    payload:
+      '`{"documentId": מזהה המסמך, "question": טקסט (רשות, עדיין לא נקרא)}` — ' +
+      'לא נקרא ישירות על ידי תוכנית; זה הכלי שהצעד היחיד של משימת-בת בהאצלה קורא לו.',
   },
 ];
 

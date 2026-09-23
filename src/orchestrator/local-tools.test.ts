@@ -1,14 +1,20 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { ulid } from 'ulid';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
+import { compileCharter } from '../charter/compile.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { Plan } from '../domain/plan.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { envCredentials } from './credentials.js';
 import { runPlan } from './run-plan.js';
 import { recallMemories } from '../memory/store.js';
+import { insertOrGetDocument, markExtracted } from '../documents/store.js';
+import { renderReadingBrief } from '../documents/brief.js';
+import { interpretReaderResponse, type ReadOutcome } from '../sdk/know-reader.js';
+import type { DocumentArtifact } from '../documents/types.js';
 import {
   LOCAL_TOOL_CONTRACTS,
   implementedLocalTools,
@@ -363,5 +369,118 @@ describe('the local tool executor', () => {
       expect(known.has(tool), `${tool} is not a tool the policy knows`).toBe(true);
       expect(isOutbound(tool), `${tool} is outbound and must not run locally`).toBe(false);
     }
+  });
+
+  /**
+   * `doc.fetch` — know.reader's half of a delegation. Until this task it had
+   * no implementation at all, so a child job created by `requestHelp` would
+   * have completed with `not_implemented` and taught the parent nothing.
+   */
+  describe('doc.fetch', () => {
+    async function anExtractedDocument(text: string): Promise<string> {
+      const documentId = `DOC-${ulid()}`;
+      await insertOrGetDocument(
+        {
+          documentId,
+          source: 'manual',
+          originalName: 'מסמך.txt',
+          mediaType: 'text/plain',
+          sha256: ulid().padEnd(64, '0'),
+          byteSize: text.length,
+          storedPath: `${BUSINESS}/${documentId}/original.txt`,
+        },
+        { businessId: BUSINESS },
+      );
+      await markExtracted(
+        documentId,
+        [{ ordinal: 0, kind: 'text', partName: 'גוף', content: { blocks: [{ kind: 'paragraph', text }] }, flags: [] }],
+        { businessId: BUSINESS },
+      );
+      return documentId;
+    }
+
+    function stubReader(raw: string) {
+      let calls = 0;
+      const reader = async (request: { artifacts: readonly DocumentArtifact[] }): Promise<ReadOutcome> => {
+        calls += 1;
+        const { includedOrdinals } = renderReadingBrief(request.artifacts);
+        return interpretReaderResponse(raw, includedOrdinals, [], 1);
+      };
+      return { reader, callCount: () => calls };
+    }
+
+    it('reads an extracted document and hands back the reading', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch1');
+      const documentId = await anExtractedDocument('מה המחיר לאספקה?');
+      const { reader, callCount } = stubReader(
+        JSON.stringify({
+          summary: 'שאלה על מחיר אספקה.',
+          findings: [],
+          intents: [
+            {
+              intent: 'file_document',
+              subject: { kind: 'sender' },
+              sourceRef: { ordinal: 0, locator: null },
+              note: '',
+            },
+          ],
+          unreadable: [],
+        }),
+      );
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v1' }));
+
+      const out = await runLocalTool(
+        'doc.fetch',
+        { documentId, question: 'מה המסמך מבקש?' },
+        { jobId, businessId: BUSINESS, bundle, reader },
+      );
+
+      expect(out['performed']).toBe(true);
+      expect(out['status']).toBe('read');
+      expect((out['reading'] as { summary: string }).summary).toBe('שאלה על מחיר אספקה.');
+      expect(callCount()).toBe(1);
+    });
+
+    it('reports no_artifacts without calling the reader, for a document with nothing extracted', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch2');
+      const documentId = `DOC-${ulid()}`;
+      await insertOrGetDocument(
+        {
+          documentId,
+          source: 'manual',
+          originalName: 'ריק.txt',
+          mediaType: 'text/plain',
+          sha256: ulid().padEnd(64, '0'),
+          byteSize: 0,
+          storedPath: `${BUSINESS}/${documentId}/original.txt`,
+        },
+        { businessId: BUSINESS },
+      );
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v2' }));
+      let called = false;
+      const reader = async (): Promise<ReadOutcome> => {
+        called = true;
+        throw new Error('must not be called for a document with no artifacts');
+      };
+
+      const out = await runLocalTool('doc.fetch', { documentId }, { jobId, businessId: BUSINESS, bundle, reader });
+      expect(out).toEqual({ performed: false, reason: 'no_artifacts' });
+      expect(called).toBe(false);
+    });
+
+    it('throws a clear internal error when the caller forgot to supply a bundle', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch3');
+      await expect(
+        runLocalTool('doc.fetch', { documentId: 'doc-x' }, { jobId, businessId: BUSINESS }),
+      ).rejects.toThrow(/bundle/);
+    });
+
+    it('fails the step on a payload missing documentId', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch4');
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v4' }));
+      await expect(
+        runLocalTool('doc.fetch', { question: 'מה זה?' }, { jobId, businessId: BUSINESS, bundle }),
+      ).rejects.toBeInstanceOf(StepChannelError);
+    });
   });
 });
