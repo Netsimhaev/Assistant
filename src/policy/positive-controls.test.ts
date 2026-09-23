@@ -8,6 +8,7 @@ import { BusinessCharter } from '../domain/charter.js';
 import { addresseeOf, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
 import { AGENT_ALLOWLISTS, isToolPermitted } from '../charter/capabilities.js';
 import {
+  CEILING_EXEMPT_TOOLS,
   classifyAction,
   classifiedToolNames,
   isOutbound,
@@ -437,6 +438,37 @@ describe('outbound is a positive list, and it is complete', () => {
     if (decision.outcome !== 'allow') throw new Error('unreachable');
     const redacted = decision.redactedInput as { description: string };
     expect(redacted.description).not.toContain('123456789');
+  });
+});
+
+/**
+ * Delegation is classified so it is gated and audited, and exempt from the
+ * plan ceiling so it can actually run. Both halves are load-bearing and both
+ * are easy to undo by accident, so both are asserted here.
+ */
+describe('delegation is classified but contributes no plan ceiling', () => {
+  it('classifies agent.request_help and keeps it off the read-only list', () => {
+    expect(classifyAction('agent.request_help')).toBe('agent.delegate');
+    expect(READ_ONLY_TOOLS.has('agent.request_help')).toBe(false);
+  });
+
+  /**
+   * The list that lets a plan containing a delegation still run. Kept to one
+   * member: a tool that carries a real side effect and contributes no ceiling
+   * runs under whatever other class the plan declares, which is the documented
+   * hazard. Delegation is admissible only because it carries no outbound
+   * authority of its own — the child job's own steps face the full ten stages.
+   */
+  it('exempts exactly one tool from the plan ceiling, and it addresses internally', () => {
+    expect([...CEILING_EXEMPT_TOOLS]).toEqual(['agent.request_help']);
+    for (const tool of CEILING_EXEMPT_TOOLS) {
+      const cls = classifyAction(tool);
+      expect(cls, tool).not.toBeNull();
+      expect(addresseeOf(cls!), tool).toBe('internal');
+      // Disjoint from READ_ONLY_TOOLS: that list already means "no ceiling",
+      // and a tool in both would be two mechanisms for one property.
+      expect(READ_ONLY_TOOLS.has(tool), tool).toBe(false);
+    }
   });
 });
 

@@ -122,14 +122,18 @@ export function proposalProblems(
     // The mismatch check above does not cover it. That one fires only when a
     // class WAS declared; the live run of 11/09 produced the other shape —
     // `toolName: 'agent.request_help'` with `expectedActionClass: null`, which
-    // is the *correct* declaration for a read-only tool — and it passed every
-    // check here on the way to silence. A supplier's quote for ₪11,988 with
-    // three weeks to answer reached the owner not at all.
+    // was, at the time, the *correct* declaration for a read-only tool — and
+    // it passed every check here on the way to silence. A supplier's quote
+    // for ₪11,988 with three weeks to answer reached the owner not at all.
+    // (`agent.request_help` is no longer read-only — the envelope work
+    // classified it as `agent.delegate` — but the check below still applies
+    // to every tool that carries no class today, and to whatever future tool
+    // repeats the same shape.)
     //
     // Checked as a positive property of the tool rather than by naming the
-    // escalation tools: `agent.request_help` and `escalate_to_human` are
-    // today's members of `READ_ONLY_TOOLS`, and a list written here would stop
-    // covering the class the moment a third is added.
+    // escalation tools: `escalate_to_human` is today's sole member of
+    // `READ_ONLY_TOOLS` with this shape, and a list written here would stop
+    // covering the class the moment another one is added.
     //
     // This does not take escalation away from the assistant. Bringing a
     // document to the owner is what raising the card already does, and a

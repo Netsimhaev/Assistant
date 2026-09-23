@@ -4,7 +4,7 @@ import type { ActionClass } from '../domain/action.js';
 import type { Plan } from '../domain/plan.js';
 import { AutonomyLevel, mostRestrictiveAutonomy, permits } from '../domain/trust.js';
 import { loadAutonomyMode, rampBoundsForMode } from '../governance/autonomy-mode.js';
-import { READ_ONLY_TOOLS } from '../policy/classify.js';
+import { CEILING_EXEMPT_TOOLS, READ_ONLY_TOOLS } from '../policy/classify.js';
 
 /**
  * The default floor `rampLevelForPlan` uses for a step that has a class but no
@@ -179,6 +179,11 @@ export async function rampLevelForPlan(
 ): Promise<AutonomyLevel> {
   const levels: AutonomyLevel[] = [];
   for (const step of plan.steps) {
+    // Classified but exempt from the ceiling by design (see the docblock on
+    // `CEILING_EXEMPT_TOOLS`) — checked before the `null`-class branch below,
+    // because this step does have a real class and would otherwise floor the
+    // whole plan at its ramp.
+    if (CEILING_EXEMPT_TOOLS.has(step.toolName)) continue;
     if (step.expectedActionClass === null) {
       if (READ_ONLY_TOOLS.has(step.toolName)) continue;
       levels.push(RAMP_FLOOR);

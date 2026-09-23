@@ -100,6 +100,23 @@ describe('capability table invariants', () => {
     expect(COLLABORATION_GRAPH['ops.web']).toEqual([]);
   });
 
+  /**
+   * The capability layer denies before the charter, so an agent with graph
+   * neighbours but without the delegation tool holds a signed edge it can never
+   * use — the dead-rule class this file already guards against for
+   * `UNOWNED_TOOLS`. And the other direction is the dangerous one: `ops.web`
+   * must not hold the tool at all, not merely be refused at the gate. A hijacked
+   * browser session should not reach even a call that would be denied.
+   */
+  it('holds the delegation tool if and only if its graph entry is non-empty', () => {
+    for (const agent of AgentId.options) {
+      const hasNeighbours = (COLLABORATION_GRAPH[agent] ?? []).length > 0;
+      const holdsTool = isToolPermitted(agent, 'agent.request_help');
+      expect(holdsTool, `${agent}: neighbours=${hasNeighbours}`).toBe(hasNeighbours);
+    }
+    expect(isToolPermitted('ops.web', 'agent.request_help')).toBe(false);
+  });
+
   it('every agent appears in the denylist and collaboration tables', () => {
     for (const agent of AGENTS) {
       expect(AGENT_DENYLISTS[agent], agent).toBeDefined();
@@ -217,6 +234,7 @@ describe('addresseeOf is pinned class by class', () => {
     'data.export': 'internal',
     'memory.write_longterm': 'internal',
     'charter.amend': 'internal',
+    'agent.delegate': 'internal',
   };
 
   it('has an entry for every action class', () => {
