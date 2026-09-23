@@ -26,8 +26,20 @@ export class MasterKeyError extends Error {}
  * it never touches the `credentials` table — but the cipher requires an AAD
  * for every call, and this is a fixed, known one so the check value proves
  * exactly one thing: the key in the file is the key that sealed this row.
+ *
+ * Lowercase and hyphenated on purpose, not merely as a naming convention.
+ * `CREDENTIAL_REF_PATTERN` (`src/orchestrator/credentials.ts`) is
+ * `/^[A-Z0-9_]+$/` — uppercase letters, digits, underscores only — so a real
+ * credential ref can never equal this string. That makes the two AAD domains
+ * disjoint by construction: no credential a customer stores can ever share
+ * this row's authenticated data, which is exactly the property the cipher's
+ * AAD binding exists to give every row. A blocklist ("refuse the ref
+ * `KEY_CHECK`") would have been a negative control instead, and this
+ * codebase has already been bitten three times by "everything that is not
+ * X". Do not "tidy" this back to uppercase — that would put it back inside
+ * the credential ref's own alphabet.
  */
-const KEY_CHECK_REF = 'KEY_CHECK';
+const KEY_CHECK_REF = 'key-check';
 const KEY_CHECK_PLAINTEXT = 'credential-broker-key-check';
 
 interface KeyStateRow {
@@ -51,9 +63,20 @@ async function readKeyBytes(path: string): Promise<Buffer> {
 }
 
 /**
- * Spec §4.2 — a key file readable by group or other is not protected, and the
- * install must refuse rather than run with it.
- *
+ * Spec §4.2 — a key file readable by group or other is not protected. Pure
+ * function of the mode bits, deliberately separated from `fs.stat` so the
+ * decision itself ("is this mode too open?") is fully unit-testable on every
+ * platform, including the one (Windows) where a real file's `mode` cannot be
+ * trusted to carry these bits at all. What is NOT tested here — and cannot
+ * be, on this platform — is whether `fs.stat().mode` actually reports them;
+ * that is Node's contract with POSIX, not this project's, and is covered
+ * instead by the filesystem test in `master-key.test.ts`.
+ */
+export function isModeTooOpen(mode: number): boolean {
+  return (mode & 0o077) !== 0;
+}
+
+/**
  * Windows does not expose POSIX group/other permission bits through
  * `fs.stat`: `mode` there reflects only a read-only attribute, not who else
  * can read the file. A check written against POSIX bits would either always
@@ -64,8 +87,7 @@ async function readKeyBytes(path: string): Promise<Buffer> {
 async function assertKeyFilePermissions(path: string): Promise<void> {
   if (process.platform === 'win32') return;
   const info = await stat(path);
-  const groupOrOtherReadable = (info.mode & 0o077) !== 0;
-  if (groupOrOtherReadable) {
+  if (isModeTooOpen(info.mode)) {
     throw new MasterKeyError(
       `קובץ המפתח פתוח לקריאה למשתמשים או לקבוצה נוספים (${path}) — יש להריץ chmod 600`,
     );

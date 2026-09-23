@@ -5,7 +5,14 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { KEY_BYTES, MasterKeyError, loadMasterKey, verifyKeyState, writeKeyState } from './master-key.js';
+import {
+  KEY_BYTES,
+  MasterKeyError,
+  isModeTooOpen,
+  loadMasterKey,
+  verifyKeyState,
+  writeKeyState,
+} from './master-key.js';
 
 const BUSINESS = 'test-business';
 
@@ -70,6 +77,27 @@ describe('loadMasterKey', () => {
       await expect(loadMasterKey(path)).rejects.toThrow(MasterKeyError);
     },
   );
+});
+
+/**
+ * The decision itself — "is this mode too open?" — is a pure function of an
+ * integer, so it gets full coverage here on every platform, independent of
+ * whether the current OS's `fs.stat().mode` actually carries POSIX bits.
+ * That leaves the filesystem test above (skipped on win32) to cover only the
+ * wiring: does `assertKeyFilePermissions` call this with the real mode.
+ */
+describe('isModeTooOpen', () => {
+  it.each([
+    [0o600, false],
+    [0o400, false],
+    [0o640, true],
+    [0o644, true],
+    [0o660, true],
+    [0o700, false],
+    [0o777, true],
+  ])('mode %o -> %s', (mode, expected) => {
+    expect(isModeTooOpen(mode)).toBe(expected);
+  });
 });
 
 describe('verifyKeyState / writeKeyState', () => {
