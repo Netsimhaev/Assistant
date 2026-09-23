@@ -32,6 +32,27 @@
  * during ordinary use. They are left unwired for the same reason
  * `autonomy_ramp` (migration 001) already is: there is nothing counterparty-
  * shaped in them to erase.
+ *
+ * **Migration 027 added two more, and both are deliberately out of scope.**
+ * `credentials` holds a business's own connection secrets — the ciphertext
+ * and nonce as `bytea`, plus a ref (`OFFICE_MAIL`), a key id and the platform
+ * operator who wrote the row — and `credential_key_state` holds one row
+ * saying which master key is live. Not a column in either can hold a
+ * counterparty's name, address or phone: there is no free text, no job id and
+ * no contact identifier anywhere in them, and the secret itself is sealed
+ * bytes rather than content about anyone. They are the business's own
+ * configuration, so an erasure of a contact or a window has nothing to take
+ * from them, and erasing them under a `business` anchor is not a thing this
+ * planner offers — no anchor is business-wide. Recorded here rather than
+ * assumed, because the standing rule is that a new table holding content must
+ * be wired to the executor, and silence about a table is indistinguishable
+ * from having forgotten it. Their TEXT columns do fall inside
+ * `erasure-invariants.test.ts`'s schema-derived sweep like every other
+ * table's — but that sweep can only notice a value it seeded, and nothing
+ * seeds one here, so it is a backstop for a future column that received a
+ * copy of a probed value, not a proof that these two are empty of content
+ * today. The reasoning above is what carries that, and it has to be rechecked
+ * if either table ever gains a free-text column.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
