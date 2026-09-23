@@ -11,6 +11,7 @@ import {
 } from '../policy/classify.js';
 import { canonicalHash } from '../util/canonical.js';
 import { unspentApprovalFor } from '../governance/approvals.js';
+import { delegationProblems } from '../governance/delegation.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import type { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
@@ -207,6 +208,21 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
   const problems = planProblems(plan);
   if (problems.length > 0) {
     return { status: 'rejected', code: 'malformed_plan', reason: describe(problems[0]!) };
+  }
+
+  // Layer one of two. The gate answers "is it permitted right now" per call;
+  // this answers "can the charter ever serve this plan" for the plan as a
+  // whole — the same split the channel already has (feasibility at validation,
+  // availability at execution), and for the same reason: a step that fails
+  // alone leaves the steps before it already done.
+  const delegationIssues = delegationProblems(plan, bundle.collaborationGraph);
+  if (delegationIssues.length > 0) {
+    const first = delegationIssues[0]!;
+    return {
+      status: 'rejected',
+      code: 'malformed_plan',
+      reason: `צעד ${first.stepId}: ${first.from} אינו רשאי לבקש עזרה מ-${first.to}`,
+    };
   }
 
   for (const step of plan.steps) {
