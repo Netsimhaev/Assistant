@@ -331,10 +331,25 @@ const HANDLERS: Record<string, LocalHandler> = {
       ...(ctx.db !== undefined ? { db: ctx.db } : {}),
     });
     if (readsSoFar >= config.documentReadsPerDay) {
+      // `DOCUMENT_READS_PER_DAY=0` is a legitimate ceiling (CLAUDE.md: an
+      // operator turning document reads off entirely), and `positiveInt`
+      // accepts it. At that value `readsSoFar >= 0` is true before anything
+      // has been read, so `retryable: true` would be a lie — "come back
+      // later" never becomes true at a cap of zero, and the child would be
+      // parked and retried forever. A genuine cap (reached, but nonzero)
+      // resets at midnight and stays retryable; the conductor's own answer to
+      // an exhausted-but-nonzero cap is also to stop for the day, not to spin.
+      //
+      // NOT fixed here: an exhausted nonzero cap still retries on a flat
+      // five-minute delay (`executeStep`'s default), which is ~288 wake
+      // cycles a day until the envelope deadline frees the parent. The
+      // honest fix — wake at the next day boundary — needs `StepChannelError`
+      // to carry its own `wakeAt`, which is Task 7's territory (it already
+      // owns the deadline path this depends on).
       throw new StepChannelError(
         'document_reads_exhausted',
         `${readsSoFar}/${config.documentReadsPerDay} document reads already used today`,
-        true,
+        config.documentReadsPerDay > 0,
       );
     }
     const outcome = await readDocument(

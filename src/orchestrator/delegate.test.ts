@@ -107,7 +107,7 @@ function anAncestorEnvelope(overrides: Partial<AgentEnvelope> = {}): AgentEnvelo
   };
 }
 
-/** Persist an ancestor envelope and mark it as having opened `childJobId` — what `envelopeOpenedChild` checks. */
+/** Persist an ancestor envelope and mark it as having opened `childJobId` — what `loadEnvelopeWithChild` checks. */
 async function seedAncestor(envelope: AgentEnvelope, childJobId: string): Promise<void> {
   await writeEnvelope(envelope, { parentJobId: `JOB-ancestor-of-${childJobId}`, businessId: BUSINESS });
   await attachChildJob(envelope.id, childJobId, { businessId: BUSINESS });

@@ -1,4 +1,5 @@
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { config } from '../config.js';
 import type { Proposal } from '../domain/proposal.js';
 import type { Reading } from '../domain/reading.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -67,6 +68,23 @@ export function interpretProposerResponse(
 }
 
 /**
+ * Same guard as `curateWithModel`'s (`src/sdk/curator.ts`) and `runKnowReader`'s
+ * (`src/sdk/know-reader.ts`), and for the same reason: the protection against
+ * a live, billed call under test must not rest on test discipline alone
+ * (CLAUDE.md, "ההגנה מפני קריאה חיה לא תישען רק על משמעת מבחנים").
+ * `ProposeForReadingOptions.proposer` (`orchestrator/propose.ts`) is the seam
+ * a test injects instead — injecting bypasses this guard entirely, because
+ * the guard lives in the DEFAULT this function is, not in the seam itself.
+ */
+function refuseUnderTest(): void {
+  if (!config.isTest) return;
+  throw new Error(
+    'makeProposal: refusing to run under NODE_ENV=test — this is a live, billed call to the Agent SDK. ' +
+      'Inject a proposer (see ProposeForReadingOptions.proposer) instead of relying on the default reaching this function.',
+  );
+}
+
+/**
  * Run the proposer: one model call, no tools, over a reading already on file.
  *
  * `catalogue` is computed once and threaded through both the prompt
@@ -75,6 +93,7 @@ export function interpretProposerResponse(
  * never be two different catalogues.
  */
 export async function makeProposal(request: ProposeRequest): Promise<ProposeOutcome> {
+  refuseUnderTest();
   const catalogue = capabilityCatalogue(request.bundle, request.provenance, {
     rampLevel: request.rampLevel,
   });
