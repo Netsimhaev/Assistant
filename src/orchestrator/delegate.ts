@@ -22,11 +22,11 @@
  * anything sitting in `execute` with a bound plan; it does not check whether
  * an envelope points at it. Attaching after would leave a window where the
  * child is runnable and unattached — the scheduler could run it and it would
- * answer into a void no envelope names, and `resumeDelegatedJobs` (which
- * finds a parent through the envelope's `child_job_id`) could never wake the
- * parent, not even on the deadline path. Attaching first means the only
- * reachable crash window leaves a child that is attached but not yet
- * runnable, which the deadline path can still recover.
+ * answer into a void no envelope names, and whatever reads the envelope back
+ * to find the parent to wake (Task 7's `resumeDelegatedJobs`, not built yet)
+ * would have nothing pointing the other way. Attaching first at least means
+ * the only reachable crash window leaves a child that is attached but not yet
+ * runnable, which a future deadline check has something to find.
  *
  * A crash after `writeEnvelope` commits but before the child is created still
  * leaves a durable, idempotent trace: a retry with the same inputs hits the
@@ -63,7 +63,7 @@ import {
   attachChildJob,
   countPairExchanges,
   delegationsToday,
-  envelopeOpenedChild,
+  loadEnvelopeWithChild,
   priorQuadruples,
   writeEnvelope,
 } from '../governance/envelope-store.js';
@@ -291,17 +291,24 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
   const matchingRef = matchingRefs[0] ?? null;
 
   // The caller's claim about its own ancestry is verified against the row,
-  // not trusted — `parentEnvelope: null` is the easiest legal value to pass by
-  // accident (it resets hops to 0, opens a fresh correlation, and hands back
-  // the maximally permissive root ceiling), so a fabricated or stale envelope
-  // here is a real way to widen a child's authority. `envelopeOpenedChild`
-  // answers from `agent_envelopes` itself: does this envelope exist, and does
-  // ITS `child_job_id` really name the job that is asking. The same
-  // correction `grantAuthorization` already applies to a job's claimed
-  // provenance and `GateContext.standing` applies to a claimed authorisation.
+  // not trusted — and every value used below comes from the LOADED row, never
+  // from `input.parentEnvelope` itself. `input.parentEnvelope` supplies only
+  // an id to look up; a caller holding a legitimately-attached envelope id
+  // could otherwise still pass `hops: 0` to slip `hopGuard`, a different
+  // `correlationId` to escape both anti-ping-pong guards' scope (they are
+  // scoped by it), or a loosened `constraints` object to widen the child's
+  // ceiling — the object itself proves nothing, and re-reading its fields
+  // after the check would defeat the check. `parentEnvelope: null` is the
+  // easiest legal value to pass by accident (it resets hops to 0, opens a
+  // fresh correlation, and hands back the maximally permissive root ceiling),
+  // so a fabricated or stale envelope here is a real way to widen a child's
+  // authority. The same correction `grantAuthorization` already applies to a
+  // job's claimed provenance and `GateContext.standing` applies to a claimed
+  // authorisation.
+  let verifiedAncestor: AgentEnvelope | null = null;
   if (input.parentEnvelope !== null) {
-    const verified = await envelopeOpenedChild(input.parentEnvelope.id, parent.jobId, { businessId });
-    if (!verified) {
+    const stored = await loadEnvelopeWithChild(input.parentEnvelope.id, { businessId });
+    if (stored === null || stored.childJobId !== parent.jobId) {
       return {
         status: 'refused',
         code: 'parent_envelope_mismatch',
@@ -310,18 +317,18 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
           `על המשימה ${parent.jobId} כבת שלה`,
       };
     }
+    verifiedAncestor = stored.envelope;
   }
 
-  // Ancestry: inherited from the parent's own incoming envelope when it has
-  // one (now verified against the row), otherwise this is the root of a new
-  // tree.
-  const parentHops = input.parentEnvelope?.hops ?? 0;
-  const correlationId = input.parentEnvelope?.correlationId ?? parent.jobId;
-  const causalChain = input.parentEnvelope
-    ? [...input.parentEnvelope.causalChain, input.parentEnvelope.id]
+  // Ancestry: inherited from the VERIFIED ancestor when there is one,
+  // otherwise this is the root of a new tree.
+  const parentHops = verifiedAncestor?.hops ?? 0;
+  const correlationId = verifiedAncestor?.correlationId ?? parent.jobId;
+  const causalChain = verifiedAncestor
+    ? [...verifiedAncestor.causalChain, verifiedAncestor.id]
     : [];
   const ancestorConstraints: EnvelopeConstraints =
-    input.parentEnvelope?.constraints ?? {
+    verifiedAncestor?.constraints ?? {
       charterVersion: input.bundle.charterVersion,
       ...ROOT_ANCESTOR_CONSTRAINTS,
     };
@@ -453,12 +460,13 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
   // bound plan — it does not check whether an envelope points at it. A crash
   // in the old order (execute, then attach) left a window where the child was
   // already runnable and unattached: the scheduler could run it and it would
-  // answer into a void no envelope named, and `resumeDelegatedJobs` — which
-  // finds parents by `awaiting_envelope_id`, reached from the envelope via
-  // `child_job_id` — could never find its way back to wake the parent, not
-  // even on the deadline path. Attaching first means the only reachable crash
-  // window leaves a child that is attached but not yet runnable, which
-  // `resumeDelegatedJobs`'s own deadline check can still recover from.
+  // answer into a void no envelope named, and whatever eventually wakes the
+  // parent (Task 7's `resumeDelegatedJobs`, which will find it via the
+  // envelope's `child_job_id` and the parent's `awaiting_envelope_id` — not
+  // built yet) would have no envelope pointing at this child to find. Attaching
+  // first at least means the only reachable crash window leaves a child that
+  // is attached but not yet runnable, which a future deadline check has
+  // something to find.
   await transition(child.jobId, {
     to: 'understand',
     actor: 'orchestrator',

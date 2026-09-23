@@ -284,6 +284,61 @@ describe('requestHelp', () => {
     expect(await countJobs()).toBe(before);
   });
 
+  /**
+   * Verifying the envelope id is not enough on its own — a caller holding a
+   * REAL, correctly-attached envelope could still hand `requestHelp` an
+   * object claiming `hops: 0`, a fresh `correlationId` and a fully permissive
+   * `constraints`, and every one of those fields would slip past its own
+   * guard or ceiling if read from the argument. This pins that every value
+   * used comes from the verified ROW, never from the caller's object.
+   */
+  it('derives hops, correlationId, causalChain and constraints from the verified row, not from the caller\'s claim', async () => {
+    const { job, bundle } = await openParentJob({ provenance: 'boss' });
+    const real = anAncestorEnvelope({
+      hops: 3,
+      correlationId: 'JOB-real-root',
+      causalChain: ['ENV-real-0', 'ENV-real-1'],
+      constraints: {
+        charterVersion: bundle.charterVersion,
+        provenanceCeiling: 'unknown_external',
+        autonomyCeiling: 'draft_only',
+        moneyCeilingMinor: 100,
+        deadlineAt: '2026-09-24T11:00:00.000Z',
+      },
+    });
+    await seedAncestor(real, job.jobId);
+
+    // Same envelope id (the only thing the check verifies) — every other
+    // field lies in the permissive direction.
+    const lied: AgentEnvelope = {
+      ...real,
+      hops: 0,
+      correlationId: 'JOB-fabricated',
+      causalChain: [],
+      constraints: {
+        charterVersion: bundle.charterVersion,
+        provenanceCeiling: 'boss',
+        autonomyCeiling: 'auto',
+        moneyCeilingMinor: null,
+        deadlineAt: '9999-12-31T00:00:00.000Z',
+      },
+    };
+
+    const now = new Date('2026-09-24T10:00:00.000Z');
+    const result = await requestHelp(baseRequest(job, bundle, { parentEnvelope: lied, now }));
+    if (result.status !== 'opened') throw new Error('expected opened');
+
+    const envelope = await loadEnvelope(result.envelopeId, { businessId: BUSINESS });
+    // The row's values win, not the lied-about ones.
+    expect(envelope?.hops).toBe(4); // real.hops (3) + 1, not the claimed 0 + 1
+    expect(envelope?.correlationId).toBe('JOB-real-root');
+    expect(envelope?.causalChain).toEqual(['ENV-real-0', 'ENV-real-1', real.id]);
+    expect(envelope?.constraints.provenanceCeiling).toBe('unknown_external');
+    expect(envelope?.constraints.autonomyCeiling).toBe('draft_only');
+    expect(envelope?.constraints.moneyCeilingMinor).toBe(100);
+    expect(envelope?.constraints.deadlineAt).toBe('2026-09-24T11:00:00.000Z');
+  });
+
   it('refuses when the delegating agent is not permitted to reach the receiver', async () => {
     const { job, bundle } = await openParentJob();
     // `ops.web` delegates to nobody (`COLLABORATION_GRAPH`) — the one rule
@@ -367,6 +422,45 @@ describe('requestHelp', () => {
     if (result.status !== 'duplicate') throw new Error('expected duplicate');
     expect(result.envelopeId).toBe(fabricated.id);
     expect(await countJobs()).toBe(before);
+  });
+
+  /**
+   * The `duplicate` branch's other test deliberately uses a never-attached
+   * envelope, so `childJobId` comes back `null` there whether or not the
+   * plumbing actually reads the column — a hardcoded `null` would survive it.
+   * This one attaches a KNOWN child id under the exact idempotency key the
+   * call will compute, so the only way to pass is to actually read it back.
+   */
+  it('returns the stored child_job_id on a duplicate result', async () => {
+    const { job, bundle } = await openParentJob();
+    const request = baseRequest(job, bundle);
+    const refsHash = contextRefsHash(request.contextRefs);
+    const idempotencyKey = canonicalHash({
+      correlationId: job.jobId,
+      from: request.from,
+      to: request.to,
+      intent: request.intent,
+      contextRefsHash: refsHash,
+      payload: request.payload,
+    });
+    const fabricated = anAncestorEnvelope({
+      correlationId: 'JOB-unrelated-3',
+      from: request.from,
+      to: request.to,
+      intent: request.intent,
+      payload: request.payload,
+      contextRefs: request.contextRefs,
+      hops: 0,
+      idempotencyKey,
+    });
+    await writeEnvelope(fabricated, { parentJobId: 'JOB-unrelated-3', businessId: BUSINESS });
+    const knownChildJobId = `J-${ulid()}`;
+    await attachChildJob(fabricated.id, knownChildJobId, { businessId: BUSINESS });
+
+    const result = await requestHelp(request);
+    expect(result.status).toBe('duplicate');
+    if (result.status !== 'duplicate') throw new Error('expected duplicate');
+    expect(result.childJobId).toBe(knownChildJobId);
   });
 
   it('refuses a repeat of the same quadruple with no new context', async () => {

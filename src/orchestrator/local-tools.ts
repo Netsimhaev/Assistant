@@ -33,10 +33,12 @@
  * that looks like it worked.
  */
 import { z } from 'zod';
+import { config } from '../config.js';
 import type { Queryable } from '../db/pool.js';
 import { SafeLookupKey } from '../domain/charter.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { readDocument } from '../documents/read.js';
+import { readingsToday } from '../documents/store.js';
 import type { ReadOutcome, ReadRequest } from '../sdk/know-reader.js';
 import {
   recallMemories,
@@ -311,6 +313,29 @@ const HANDLERS: Record<string, LocalHandler> = {
     });
     if (job === null) {
       throw new Error(`runLocalTool: doc.fetch could not load job ${ctx.jobId}`);
+    }
+    // `DOCUMENT_READS_PER_DAY` bounds document reads for the instance —
+    // `conductPendingDocuments`'s inbox loop enforces it for the inbox path,
+    // but a delegation's `doc.fetch` step reaches `readDocument` without ever
+    // passing through that loop, and without this it would be billed and
+    // counted only against `delegationsPerDay`, which bounds a different
+    // thing. Checked here directly, never behind `DOCUMENT_INBOX` — that
+    // switch is about the inbox scan, not about every read this instance
+    // makes. Counts `document_readings` rows the same way the conductor does,
+    // which means a cache hit that would cost nothing can still be refused
+    // here if the count is already at the ceiling — the same conservative
+    // trade the conductor's own docblock names (M1): it can only under-run
+    // the budget, never exceed it.
+    const readsSoFar = await readingsToday({
+      businessId: ctx.businessId,
+      ...(ctx.db !== undefined ? { db: ctx.db } : {}),
+    });
+    if (readsSoFar >= config.documentReadsPerDay) {
+      throw new StepChannelError(
+        'document_reads_exhausted',
+        `${readsSoFar}/${config.documentReadsPerDay} document reads already used today`,
+        true,
+      );
     }
     const outcome = await readDocument(
       {

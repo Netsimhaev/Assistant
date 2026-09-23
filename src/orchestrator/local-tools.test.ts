@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
+import { config } from '../config.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -481,6 +482,44 @@ describe('the local tool executor', () => {
       await expect(
         runLocalTool('doc.fetch', { question: 'מה זה?' }, { jobId, businessId: BUSINESS, bundle }),
       ).rejects.toBeInstanceOf(StepChannelError);
+    });
+
+    /**
+     * `DOCUMENT_READS_PER_DAY` bounds document reads for the instance.
+     * `conductPendingDocuments` enforces it for the inbox path; a delegation's
+     * `doc.fetch` step reaches `readDocument` without ever going through that
+     * loop, and without a check here it would be billed and counted only
+     * against `delegationsPerDay`, which bounds a different thing entirely.
+     */
+    it('refuses once the daily document-reads cap is used up, retryably', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch5');
+      const documentId = await anExtractedDocument('כמה זה עולה?');
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v5' }));
+
+      for (let i = 0; i < config.documentReadsPerDay; i++) {
+        await getPool().query(
+          `INSERT INTO document_readings (
+             reading_id, business_id, document_id, status, reason, content,
+             provenance, model, prompt_version, brief_hash
+           ) VALUES ($1, $2, $3, 'unreadable', 'seed', NULL, 'boss', 'test', 'v1', $4)`,
+          [`RDG-${ulid()}`, BUSINESS, documentId, `seed-${i}`],
+        );
+      }
+
+      const { reader, callCount } = stubReader(JSON.stringify({ summary: 'x', findings: [], intents: [], unreadable: [] }));
+      let caught: unknown;
+      try {
+        await runLocalTool('doc.fetch', { documentId }, { jobId, businessId: BUSINESS, bundle, reader });
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(StepChannelError);
+      const typed = caught as StepChannelError;
+      expect(typed.code).toBe('document_reads_exhausted');
+      expect(typed.retryable).toBe(true);
+      // Refused before the model was ever called.
+      expect(callCount()).toBe(0);
     });
   });
 });

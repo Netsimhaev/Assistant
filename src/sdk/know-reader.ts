@@ -1,4 +1,5 @@
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
+import { config } from '../config.js';
 import { renderReadingBrief } from '../documents/brief.js';
 import { parseReading } from '../documents/reading-parse.js';
 import type { DocumentArtifact } from '../documents/types.js';
@@ -97,10 +98,29 @@ export function interpretReaderResponse(
 }
 
 /**
+ * Same guard as `curateWithModel`'s (`src/sdk/curator.ts`), and for the same
+ * reason: the protection against a live, billed call under test must not rest
+ * on test discipline alone (CLAUDE.md, "ההגנה מפני קריאה חיה לא תישען רק על
+ * משמעת מבחנים"). `readDocument`'s `reader` option (and, above it,
+ * `LocalToolContext.reader` and `RunPlanRequest.reader`) is the seam a test
+ * injects instead — injecting bypasses this guard entirely, because the guard
+ * lives in the DEFAULT this function is, not in the seam itself. A test that
+ * forgets to inject one is exactly what this is for.
+ */
+function refuseUnderTest(): void {
+  if (!config.isTest) return;
+  throw new Error(
+    'runKnowReader: refusing to run under NODE_ENV=test — this is a live, billed call to the Agent SDK. ' +
+      'Inject a reader (see ReadDocumentOptions.reader) instead of relying on the default reaching this function.',
+  );
+}
+
+/**
  * Run `know.reader` end to end: SDK harness, charter-derived prompt, and every
  * tool call passing through `evaluateToolCall` before it executes.
  */
 export async function runKnowReader(request: ReadRequest): Promise<ReadOutcome> {
+  refuseUnderTest();
   const denials: string[] = [];
   // Both halves are used: the text goes to the model, and the ordinals it
   // survived with are what a citation is checked against. Checking against

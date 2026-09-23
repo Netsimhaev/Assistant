@@ -142,11 +142,32 @@ export async function writeEnvelope(
   return { status: 'duplicate', envelope: toEnvelope(existing), childJobId: existing.child_job_id };
 }
 
-/** One envelope by id, or null if this business has never stored one under it. */
-export async function loadEnvelope(
+export interface StoredEnvelope {
+  envelope: AgentEnvelope;
+  /** `null` when this envelope has not (yet) had a child attached to it. */
+  childJobId: string | null;
+}
+
+/**
+ * One envelope by id, together with the `child_job_id` column — or null if
+ * this business has never stored one under it.
+ *
+ * This is the read `requestHelp` uses to verify a caller-supplied
+ * `parentEnvelope` against the database rather than trusting the object's own
+ * fields: `envelope.id` says which row to load, and everything else this
+ * function returns — `hops`, `correlationId`, `causalChain`, `constraints`,
+ * and now `childJobId` — comes from the row, never from the caller's claim.
+ * A caller holding a legitimate envelope id whose `child_job_id` really is
+ * its own job could otherwise still supply `hops: 0` to slip `hopGuard`, a
+ * different `correlationId` to escape both anti-ping-pong guards' scope, or a
+ * loosened `constraints` to widen the child's ceiling — the exact laundering
+ * `grantAuthorization` already refuses for a job's claimed provenance, and
+ * `GateContext.standing` for a claimed authorisation.
+ */
+export async function loadEnvelopeWithChild(
   envelopeId: string,
   options: { businessId?: string; db?: Queryable } = {},
-): Promise<AgentEnvelope | null> {
+): Promise<StoredEnvelope | null> {
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
   const { rows } = await db.query<EnvelopeRow>(
@@ -158,32 +179,16 @@ export async function loadEnvelope(
     [businessId, envelopeId],
   );
   const row = rows[0];
-  return row ? toEnvelope(row) : null;
+  return row ? { envelope: toEnvelope(row), childJobId: row.child_job_id } : null;
 }
 
-/**
- * Whether `envelopeId` exists for this business and its stored `child_job_id`
- * equals `childJobId` — the check `requestHelp` runs against a
- * caller-supplied `parentEnvelope` before trusting anything derived from it
- * (`hops`, `correlationId`, the ancestor ceiling). `parentEnvelope` is a
- * claim the caller makes about its own history; this is the row agreeing with
- * it, the same correction `grantAuthorization` already applies to a job's
- * claimed provenance and `GateContext.standing` applies to a claimed
- * authorisation. A nonexistent envelope and a mismatched one are refused
- * identically — both mean the claim cannot be trusted.
- */
-export async function envelopeOpenedChild(
+/** One envelope by id, or null if this business has never stored one under it. */
+export async function loadEnvelope(
   envelopeId: string,
-  childJobId: string,
   options: { businessId?: string; db?: Queryable } = {},
-): Promise<boolean> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
-  const { rows } = await db.query<{ child_job_id: string | null }>(
-    `SELECT child_job_id FROM agent_envelopes WHERE business_id = $1 AND envelope_id = $2`,
-    [businessId, envelopeId],
-  );
-  return rows[0]?.child_job_id === childJobId;
+): Promise<AgentEnvelope | null> {
+  const stored = await loadEnvelopeWithChild(envelopeId, options);
+  return stored ? stored.envelope : null;
 }
 
 export interface EnvelopeQuadruple {
@@ -283,9 +288,10 @@ export async function delegationsToday(
 
 /**
  * Fill in the child job a `help_request` envelope spawned, once the
- * orchestrator has actually created it. This is the column
- * `resumeDelegatedJobs` reads (via `agent_envelopes_child_idx`) to find the
- * envelope waiting on a child job that just finished.
+ * orchestrator has actually created it. This is the column Task 7's
+ * `resumeDelegatedJobs` will read (via `agent_envelopes_child_idx`) to find
+ * the envelope waiting on a child job that just finished — not built yet, so
+ * this states what the column is for, not what already reads it.
  */
 export async function attachChildJob(
   envelopeId: string,
