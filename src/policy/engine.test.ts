@@ -1107,6 +1107,13 @@ describe('delegation graph', () => {
   it('refuses a delegation whose payload has no readable "to"', async () => {
     const bundle = await install();
 
+    // Both cases fall through `mayDelegate` too — `(graph[from] ?? []).
+    // includes(to)` is `false` for `undefined` and for `123` alike — and land
+    // on the *second* deny, which carries the same code as the first. `code`
+    // alone cannot tell "unreadable to" apart from "readable but not
+    // permitted"; only `reason` differs, so that is what proves this guard
+    // (engine.ts's unreadable-`to` check) actually ran rather than the graph
+    // check underneath it catching both by coincidence.
     const missing = await evaluateToolCall(
       'agent.request_help',
       { intent: 'x' },
@@ -1115,6 +1122,7 @@ describe('delegation graph', () => {
     expect(missing.outcome).toBe('deny');
     if (missing.outcome !== 'deny') throw new Error('unreachable');
     expect(missing.code).toBe('delegation_not_permitted');
+    expect(missing.reason).toContain('בלי נמען קריא');
 
     // A value that isn't even a string is not a value we failed to read as a
     // string — it's read fine and it isn't one. Same code either way: a value
@@ -1127,5 +1135,6 @@ describe('delegation graph', () => {
     expect(wrongType.outcome).toBe('deny');
     if (wrongType.outcome !== 'deny') throw new Error('unreachable');
     expect(wrongType.code).toBe('delegation_not_permitted');
+    expect(wrongType.reason).toContain('בלי נמען קריא');
   });
 });

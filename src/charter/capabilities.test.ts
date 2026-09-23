@@ -143,16 +143,39 @@ describe('capability table invariants', () => {
  * what "compiled but unenforced" actually looks like.
  */
 describe('compiled policy has a reader', () => {
-  // `redact.ts` joined this list here: it is `engine.ts`'s sibling for two of
-  // the gate's own stages (redaction and quiet hours), exactly the same
+  // Keyed by name, not array position: `GATE_SOURCES[1]` used to be "the
+  // engine" only because it was the second entry written down, and the very
+  // next edit to this list (`channels.ts`, below) would have silently
+  // repointed it at a different file. A named lookup can't drift that way.
+  //
+  // `redact.ts` joined this list because it is `engine.ts`'s sibling for two
+  // of the gate's own stages (redaction and quiet hours), exactly the same
   // relationship `budget.ts` and `risk.ts` already have, and it was simply
   // missing — `bundle.redactPatterns` is read there, not in `engine.ts` itself.
-  const GATE_SOURCES = [
-    '../policy/budget.ts',
-    '../policy/engine.ts',
-    '../policy/risk.ts',
-    '../policy/redact.ts',
-  ].map((rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'));
+  //
+  // `channels.ts` joined for the same reason, one review round later:
+  // `resolveChannel` is where `bundle.connections` is actually filtered
+  // (`bundle.connections.filter(...)`, `orchestrator/channels.ts`) — the
+  // string `connections` had been passing the check below only because it
+  // also appears, coincidentally, in an English comment inside `engine.ts`
+  // ("citing it on two different connections"). A reader on a coincidence is
+  // no reader at all; confirmed by grep that no `CompiledCeilings` key and no
+  // `doNotContact` bucket name appears anywhere in `channels.ts`, so adding
+  // it here does not silently pass either of the two tests above it.
+  const GATE_SOURCE_FILES = {
+    budget: '../policy/budget.ts',
+    engine: '../policy/engine.ts',
+    risk: '../policy/risk.ts',
+    redact: '../policy/redact.ts',
+    channels: '../orchestrator/channels.ts',
+  } as const;
+  const GATE_SOURCE_TEXT = Object.fromEntries(
+    Object.entries(GATE_SOURCE_FILES).map(([name, rel]) => [
+      name,
+      readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'),
+    ]),
+  ) as Record<keyof typeof GATE_SOURCE_FILES, string>;
+  const GATE_SOURCES = Object.values(GATE_SOURCE_TEXT);
 
   it('every compiled ceiling is named somewhere in the gate', () => {
     const ceilings = compileCharter(buildCharter()).ceilings;
@@ -168,7 +191,7 @@ describe('compiled policy has a reader', () => {
 
   it('every do-not-contact match key is read by the gate', () => {
     const buckets = Object.keys(compileCharter(buildCharter()).doNotContact);
-    const engine = GATE_SOURCES[1] ?? '';
+    const engine = GATE_SOURCE_TEXT.engine;
     const unread = buckets.filter((bucket) => !engine.includes(bucket));
 
     // Three of these four used to compile into a flat list compared against
@@ -190,10 +213,6 @@ describe('compiled policy has a reader', () => {
    */
   it('every compiled top-level field is named somewhere in the gate', () => {
     const NOT_READ_BY_GATE = new Set<string>([
-      // Identity of the bundle itself, compared in stage 2 by value rather than
-      // by name lookup.
-      'charterVersion',
-
       // Signature/integrity metadata: verified when the charter is installed
       // (`charter/sign.ts`, `charter/store.ts`), not consulted for any
       // per-call permission decision. A gate that read `contentHash` would be
@@ -218,27 +237,53 @@ describe('compiled policy has a reader', () => {
       // a fact to produce allow/deny.
       'plainLanguage',
 
-      // KNOWN GAP, not a design choice — flagged here rather than fixed,
-      // because fixing it means changing `isToolPermitted`'s signature at all
-      // three call sites (`policy/engine.ts`, `orchestrator/catalogue.ts` x2),
-      // which is out of scope for the collaboration-graph work this test
-      // was written for. `compileCharter` copies `AGENT_ALLOWLISTS` /
-      // `AGENT_DENYLISTS` (`charter/capabilities.ts`) into these two fields
-      // verbatim, but `isToolPermitted(agent, toolName)` takes no bundle and
-      // reads those same static constants directly — never `ctx.bundle.
-      // allowlists` / `.denylists`. Identical today only because compile time
-      // copies the live constant; a process running an older `bundle` against
-      // a newer `capabilities.ts` would enforce the *new* allowlist under the
-      // *old* signed charter's name, exactly the staleness `connections` was
-      // carried into the bundle to avoid. Left for a follow-up task.
+      // NOT a gap, on review: neither field is signed-charter data at all.
+      // `compileCharter` (`charter/compile.ts:51-53`) injects `allowlists` and
+      // `denylists` straight from the module constants `AGENT_ALLOWLISTS` /
+      // `AGENT_DENYLISTS` (`charter/capabilities.ts`) — nothing in the signed
+      // document produced them, so there is nothing signed that goes unread.
+      // `isToolPermitted(agent, toolName)` reads those same constants
+      // directly rather than `ctx.bundle.allowlists` / `.denylists`, and that
+      // is the *fresher* source, not a staler one: a tightened allowlist
+      // deployed to `capabilities.ts` takes effect on the next call, where
+      // reading it off an old signed bundle would keep permitting a tool the
+      // new code just withdrew — the opposite failure direction from
+      // `connections`, which is signed-charter data and does need the pinned
+      // bundle. The test below asserts the property this comment claims
+      // (`b.allowlists` / `b.denylists` equal the live constants verbatim),
+      // so the claim doesn't rest on prose alone.
       'allowlists',
       'denylists',
     ]);
+    // `charterVersion` was excluded here originally on the theory that stage
+    // 2 compares it "by value rather than by name lookup" — true, but stage 2
+    // (`engine.ts:142`, `currentVersion !== ctx.bundle.charterVersion`) also
+    // contains the literal substring `charterVersion`, so the field passes
+    // the check on its own merits. Excluding it bought nothing but a blind
+    // spot: deleting the stage-2 staleness comparison entirely left this test
+    // green. Not excluded any more.
+    //
+    // The exclusion set is the one place this invariant can be defeated, so
+    // its size is asserted directly rather than as a loose lower bound on
+    // survivors — growing it should be a deliberate, reviewed edit, not
+    // something that quietly fits under a stale slack number.
+    expect(NOT_READ_BY_GATE.size).toBe(6);
     const compiled = compileCharter(buildCharter()) as Record<string, unknown>;
     const fields = Object.keys(compiled).filter((f) => !NOT_READ_BY_GATE.has(f));
-    expect(fields.length).toBeGreaterThan(3);
     const unread = fields.filter((field) => !GATE_SOURCES.some((src) => src.includes(field)));
     expect(unread).toEqual([]);
+  });
+
+  it('the compiled bundle carries the live capability tables verbatim', () => {
+    // Proves what the exclusion comment above claims: `allowlists` and
+    // `denylists` are not signed-charter data with a missing reader — they
+    // are the live `capabilities.ts` constants, copied into the bundle
+    // unchanged. If a future edit to `compileCharter` ever derived these from
+    // the charter document instead, this fails and the exclusion above stops
+    // being true.
+    const compiled = compileCharter(buildCharter());
+    expect(compiled.allowlists).toEqual(AGENT_ALLOWLISTS);
+    expect(compiled.denylists).toEqual(AGENT_DENYLISTS);
   });
 });
 

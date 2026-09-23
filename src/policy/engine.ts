@@ -175,6 +175,14 @@ export async function evaluateToolCall(
   // `collaborationGraph` was compiled into the signed bundle from the first
   // migration and read by nobody until this line, which made the rule that
   // `ops.web` delegates to nobody signed and unenforced.
+  //
+  // This is still before stage 5, so a refusal here writes no audit row (see
+  // the module docblock: "Intent is written to the audit log *before* the
+  // call is permitted" — stage 5 onward). A refused delegation therefore
+  // leaves no trace in the audit chain; the caller's own failure handling
+  // (the `PolicyDecision` returned here) is the only record of it. Do not
+  // move this check later to buy a row — its position, right after the
+  // allowlist check and before any state is touched, is correct.
   if (toolName === 'agent.request_help') {
     const to = isRecord(toolInput) && Object.hasOwn(toolInput, 'to') ? toolInput['to'] : undefined;
     if (typeof to !== 'string' || !AgentId.safeParse(to).success) {

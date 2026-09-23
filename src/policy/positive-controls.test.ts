@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { readFile } from 'node:fs/promises';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -556,6 +557,27 @@ describe('the first-contact exemption is empty: no TrustLevel escapes the escala
     for (const level of TrustLevel.options) {
       const risk = await assessRisk(firstContactFacts(level, false), bundle);
       expect(risk.band, `provenance=${level}, not chain-derived`).toBe('sensitive');
+    }
+  });
+});
+
+describe('the graph check in the gate is keyed on every agent.delegate tool, not one name', () => {
+  it("names every 'agent.delegate' tool in engine.ts's collaboration-graph branch", async () => {
+    // `engine.ts` gates the graph check on `toolName === 'agent.request_help'`
+    // — one literal string. A second tool ever classified as `agent.delegate`
+    // (there is only one today) would be classified, ceiling-exempt via
+    // `CEILING_EXEMPT_TOOLS`, and allowlisted, and still sail through stage 3
+    // ungraphed, because nothing ties the branch's condition to the action
+    // class rather than to this one tool name. Read as text, the way the
+    // erasure invariants scan for a forbidden name: a type-level check can't
+    // see a string literal compared with `===`.
+    const engineSource = await readFile('src/policy/engine.ts', 'utf8');
+    const delegateTools = classifiedToolNames().filter(
+      (tool) => classifyAction(tool) === 'agent.delegate',
+    );
+    expect(delegateTools.length).toBeGreaterThan(0);
+    for (const tool of delegateTools) {
+      expect(engineSource.includes(`'${tool}'`), `engine.ts names ${tool}`).toBe(true);
     }
   });
 });
