@@ -22,6 +22,16 @@ function collector(): { log: (line: string) => void; lines: string[] } {
   return { log: (line: string) => lines.push(line), lines };
 }
 
+/** Whether a path is there at all — the check both survivability tests make. */
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** A `readPassphrase` that never touches argv or a terminal. */
 function reads(value: string): () => Promise<string> {
   return async () => value;
@@ -126,6 +136,96 @@ describe('runSecretKeyCli create', () => {
 
     await expect(runSecretKeyCli(['create', OPERATOR], deps())).rejects.toThrow();
     await expect(stat(KEY_PATH)).rejects.toThrow();
+  });
+});
+
+/**
+ * Spec §5.2 and §5.3 — the recovery copy and the one-time printout are two
+ * of the three things standing between a lost key file and lost secrets.
+ * Both used to be collected AFTER the key file was written and the
+ * transaction had committed, so anything that threw at the passphrase prompt
+ * — an empty line, an EOF, a Ctrl-D, all reachable from
+ * `nodePromptIo.readSecret` — landed between the live key and its backup.
+ *
+ * These two tests are the behaviour, not the ordering: what they assert is
+ * that a refused passphrase leaves the world exactly as it found it. Written
+ * this way on purpose — an assertion on "the prompt is called first" would
+ * pass again the moment someone reintroduced a write before it under a
+ * different name.
+ */
+describe('a refused passphrase changes nothing', () => {
+  it('leaves no key file, no key state and no recovery copy when create is given an empty passphrase', async () => {
+    await expect(
+      runSecretKeyCli(['create', OPERATOR], deps({ readPassphrase: reads('') })),
+    ).rejects.toThrow(/סיסמה ריקה/);
+
+    expect(await exists(KEY_PATH)).toBe(false);
+    expect(await exists(`${KEY_PATH}.recovery`)).toBe(false);
+    const { rows } = await getPool().query('SELECT 1 FROM credential_key_state');
+    expect(rows).toHaveLength(0);
+
+    // And the operator is not stuck: with a real passphrase the very next
+    // `create` succeeds, rather than being refused by a guard that a
+    // half-finished run had already tripped.
+    await runSecretKeyCli(['create', OPERATOR], deps());
+    expect(await exists(KEY_PATH)).toBe(true);
+    expect(await exists(`${KEY_PATH}.recovery`)).toBe(true);
+  });
+
+  it('leaves the key, the rows and the recovery copy untouched when rotate is given an empty passphrase', async () => {
+    await runSecretKeyCli(['create', OPERATOR], deps());
+    const key = await loadMasterKey(KEY_PATH);
+    await putSecret(
+      { businessId: config.businessId, ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR },
+      key,
+    );
+    const recoveryBefore = await readFile(`${KEY_PATH}.recovery`, 'utf8');
+
+    await expect(
+      runSecretKeyCli(['rotate', OPERATOR], deps({ readPassphrase: reads('') })),
+    ).rejects.toThrow(/סיסמה ריקה/);
+
+    // Nothing rotated: the file on disk is still the key the rows are sealed
+    // under, and the recovery copy is still a copy of THAT key — not of a
+    // retired one, which is the state this ordering used to leave behind.
+    const after = await loadMasterKey(KEY_PATH);
+    expect(after.equals(key)).toBe(true);
+    expect(await readFile(`${KEY_PATH}.recovery`, 'utf8')).toBe(recoveryBefore);
+    await expect(verifyKeyState(key, { businessId: config.businessId })).resolves.toBeUndefined();
+    expect((await storedCredentials(key).resolve('ONE', config.businessId))?.value).toBe(
+      'first-secret',
+    );
+
+    // The recovery copy is not merely byte-identical, it still opens the
+    // live key — the stale-copy failure was silent precisely because the
+    // file looked fine.
+    await rm(KEY_PATH);
+    await runSecretKeyCli(['restore', OPERATOR], deps());
+    expect((await loadMasterKey(KEY_PATH)).equals(key)).toBe(true);
+  });
+});
+
+/**
+ * Spec §6.4 — every action this tool takes is audited, always. The `create`
+ * audit row used to be written last, after the key file, the key state and
+ * the recovery file, so any throw in between left a key that exists with
+ * nothing recording that it was ever made.
+ */
+describe('a key that exists is a key that was recorded', () => {
+  it('writes the create audit row in the same transaction as the key state', async () => {
+    await runSecretKeyCli(['create', OPERATOR], deps());
+
+    const { rows } = await getPool().query<{ reason: string; on_behalf_of: string }>(
+      "SELECT reason, on_behalf_of FROM audit_log WHERE kind = 'credential_change'",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.on_behalf_of).toBe(OPERATOR);
+    expect(rows[0]?.reason).toContain(OPERATOR);
+
+    // The pairing, which is the actual claim: key state and audit row either
+    // both exist or neither does.
+    const { rows: state } = await getPool().query('SELECT 1 FROM credential_key_state');
+    expect(state).toHaveLength(1);
   });
 });
 

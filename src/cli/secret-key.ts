@@ -34,7 +34,7 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { appendAudit } from '../audit/log.js';
 import { config } from '../config.js';
-import { acquireAdvisoryLock, closePool, getPool, withTransaction } from '../db/pool.js';
+import { acquireAdvisoryLock, closePool, withTransaction } from '../db/pool.js';
 import type { Queryable } from '../db/pool.js';
 import { ROTATION_LOCK_SCOPE } from '../governance/credential-store.js';
 import {
@@ -120,8 +120,8 @@ async function pathExists(path: string): Promise<boolean> {
  * whether the file at `keyPath` happens to exist. A file can be moved or
  * deleted without the database forgetting it ever sealed anything — `create`
  * must refuse on either signal, not just the one a mistyped path would hide. */
-async function keyStateExists(businessId: string): Promise<boolean> {
-  const { rows } = await getPool().query(
+async function keyStateExists(businessId: string, db: Queryable): Promise<boolean> {
+  const { rows } = await db.query(
     'SELECT 1 FROM credential_key_state WHERE business_id = $1',
     [businessId],
   );
@@ -180,6 +180,10 @@ async function auditKeyAction(params: {
   operator: string;
   action: Command;
   reason: string;
+  /** Joins the caller's transaction when given, so "the key exists" and "the
+   * key was recorded" commit together. Omitted, the audit row is written on
+   * its own connection — see `rotate` for the one place that is deliberate. */
+  tx?: Queryable;
 }): Promise<void> {
   await appendAudit(
     {
@@ -197,7 +201,7 @@ async function auditKeyAction(params: {
       }),
       reason: params.reason,
     },
-    { businessId: params.businessId },
+    { businessId: params.businessId, ...(params.tx !== undefined ? { tx: params.tx } : {}) },
   );
 }
 
@@ -218,43 +222,85 @@ async function readNonEmptyPassphrase(deps: SecretKeyCliDeps): Promise<string> {
 async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   const businessId = deps.businessId ?? config.businessId;
 
-  // Refuse, do not prompt (task requirement). Checked BEFORE any write:
-  // overwriting a key file orphans every stored secret irreversibly, and a
-  // tool that does it on a mistyped path is a tool that will eventually do
-  // it. Two independent signals, because either alone can be missing while
-  // the other is real: the file can be deleted without the database
-  // forgetting it sealed something, and a fresh machine can be pointed at
-  // an existing database before any file has ever been written to it.
-  if (await pathExists(deps.keyPath)) {
-    throw new Error(
-      `כבר קיים קובץ מפתח בנתיב "${deps.keyPath}" — יצירה הייתה דורסת אותו ומייתמת ` +
-        `לצמיתות כל סוד שכבר נשמר תחתיו. אם התכוונת להחליף מפתח, הרץ rotate. אם התכוונת ` +
-        `לשחזר קובץ שאבד, הרץ restore.`,
-    );
-  }
-  if (await keyStateExists(businessId)) {
-    throw new Error(
-      `להתקנה של "${businessId}" כבר יש מפתח פעיל רשום בבסיס הנתונים, גם אם הקובץ ` +
-        `בנתיב "${deps.keyPath}" חסר — יצירת מפתח חדש הייתה מייתמת כל סוד שכבר נשמר. ` +
-        `הרץ restore אם הכוונה היא לשחזר קובץ שאבד.`,
-    );
-  }
+  // **Input first, before anything is written anywhere.** The passphrase is
+  // pure input and costs nothing to collect early — and collecting it late
+  // cost two of the three survivability layers. Read after the key file and
+  // the key state were already written, an empty line, an EOF or a Ctrl-D
+  // (all reachable from `nodePromptIo.readSecret`) threw *between* the live
+  // key and its backup: the installation kept a key file and a key-state row
+  // with no recovery copy, no one-time printout and no audit row, and a
+  // second `create` was then refused by both guards below — leaving the
+  // operator holding a key that exists in exactly one place, pointed at a
+  // `restore` that cannot work because there is nothing to restore from.
+  // Measured on this branch, not reasoned about. Sealing the copy is done
+  // here too, for the same reason: `scrypt` can fail, and a failure here
+  // must land before the first write, not between two of them.
+  const passphrase = await readNonEmptyPassphrase(deps);
 
   const key = randomBytes(KEY_BYTES);
   const keyId = `KEY-${randomUUID()}`;
-
-  await writeFile(deps.keyPath, key, { mode: 0o600 });
-  await writeKeyState(key, keyId, { businessId });
-
-  const passphrase = await readNonEmptyPassphrase(deps);
   const recovery = await sealRecoveryCopy(key, passphrase, businessId);
-  await writeFile(recoveryPathFor(deps.keyPath), JSON.stringify(recovery), { mode: 0o600 });
 
-  await auditKeyAction({
-    businessId,
-    operator,
-    action: 'create',
-    reason: `מפתח חדש (${keyId}) נוצר עבור ${businessId} על ידי ${operator}`,
+  // One transaction, holding `ROTATION_LOCK_SCOPE` — the identical lock
+  // `putSecret` and `rotate` take. `pathExists`/`keyStateExists` are
+  // check-then-write, so without it two simultaneous creates could each pass
+  // both guards and leave the key file from one beside the key state of the
+  // other: an installation that refuses to start, with the file and the row
+  // naming different keys. One operator runs this tool, which is why this was
+  // a low finding and not a high one, but check-then-write under a lock that
+  // already exists costs nothing.
+  await withTransaction(async (tx: Queryable) => {
+    await acquireAdvisoryLock(tx, ROTATION_LOCK_SCOPE);
+
+    // Refuse, do not prompt (task requirement). Checked BEFORE any write:
+    // overwriting a key file orphans every stored secret irreversibly, and a
+    // tool that does it on a mistyped path is a tool that will eventually do
+    // it. Two independent signals, because either alone can be missing while
+    // the other is real: the file can be deleted without the database
+    // forgetting it sealed something, and a fresh machine can be pointed at
+    // an existing database before any file has ever been written to it.
+    if (await pathExists(deps.keyPath)) {
+      throw new Error(
+        `כבר קיים קובץ מפתח בנתיב "${deps.keyPath}" — יצירה הייתה דורסת אותו ומייתמת ` +
+          `לצמיתות כל סוד שכבר נשמר תחתיו. אם התכוונת להחליף מפתח, הרץ rotate. אם התכוונת ` +
+          `לשחזר קובץ שאבד, הרץ restore.`,
+      );
+    }
+    if (await keyStateExists(businessId, tx)) {
+      throw new Error(
+        `להתקנה של "${businessId}" כבר יש מפתח פעיל רשום בבסיס הנתונים, גם אם הקובץ ` +
+          `בנתיב "${deps.keyPath}" חסר — יצירת מפתח חדש הייתה מייתמת כל סוד שכבר נשמר. ` +
+          `הרץ restore אם הכוונה היא לשחזר קובץ שאבד.`,
+      );
+    }
+
+    await writeKeyState(key, keyId, { businessId, db: tx });
+
+    // Inside the transaction, so "a key exists" and "a key was recorded"
+    // commit together — spec §6.4 says every tool action is audited ALWAYS,
+    // and an audit row written last is a row any throw above it skips. Cheap
+    // here: `create` holds the audit lock for two statements, not for a whole
+    // re-encryption pass (contrast `rotate` below).
+    await auditKeyAction({
+      businessId,
+      operator,
+      action: 'create',
+      reason: `מפתח חדש (${keyId}) נוצר עבור ${businessId} על ידי ${operator}`,
+      tx,
+    });
+
+    // The two file writes come last, still inside the lock. They are not
+    // transactional with the database — the same physical boundary
+    // `erasure.ts` documents — so the ordering picks which failure is
+    // survivable: a throw here rolls the database back, leaving NO key state,
+    // so the operator deletes whatever landed on disk and runs `create`
+    // again. Nothing was sealed under this key yet, so nothing is lost. The
+    // reverse (key state committed, files missing) would be the stuck state
+    // above, with neither `create` nor `restore` able to proceed. The
+    // recovery copy is written before the live key for the same reason: of
+    // the two, the backup is the one whose absence is silent.
+    await writeFile(recoveryPathFor(deps.keyPath), JSON.stringify(recovery), { mode: 0o600 });
+    await writeFile(deps.keyPath, key, { mode: 0o600 });
   });
 
   deps.log('המפתח נוצר בהצלחה. השורה הבאה מציגה אותו פעם אחת בלבד — הוא לא יוצג שוב לעולם:');
@@ -338,6 +384,21 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   const newKey = randomBytes(KEY_BYTES);
   const newKeyId = `KEY-${randomUUID()}`;
 
+  // **Read and seal before the transaction opens, for the same reason
+  // `create` does.** Collected after the commit, an empty passphrase left a
+  // rotation that had already succeeded — every row re-encrypted under
+  // `newKey`, the key file replaced — beside a recovery copy still holding
+  // the RETIRED key. Nothing is corrupted (a `restore` from that copy is
+  // correctly refused by `verifyKeyState`), which is exactly what makes it
+  // dangerous: the recovery layer is dead while the operator believes it is
+  // live, and `rotate` prints nothing, so the new key exists in one place
+  // only. Measured on this branch. Both reads above are read-only, so the
+  // prompt still comes after the command has established there is a key to
+  // rotate at all — this is before the first WRITE, which is the property
+  // that matters.
+  const passphrase = await readNonEmptyPassphrase(deps);
+  const recovery = await sealRecoveryCopy(newKey, passphrase, businessId);
+
   const rotated = await withTransaction(async (tx: Queryable) => {
     await acquireAdvisoryLock(tx, ROTATION_LOCK_SCOPE);
 
@@ -377,18 +438,25 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // the database but not yet durable on disk anywhere, discoverable at the
   // next startup as `verifyKeyState`'s refusal rather than as silent
   // corruption of a customer's send.
-  await writeFile(deps.keyPath, newKey, { mode: 0o600 });
-
-  const passphrase = await readNonEmptyPassphrase(deps);
-  const recovery = await sealRecoveryCopy(newKey, passphrase, businessId);
-  await writeFile(recoveryPathFor(deps.keyPath), JSON.stringify(recovery), { mode: 0o600 });
-
+  //
+  // The audit row goes first of the three, before either file: a rotation
+  // that committed is a rotation that is recorded, whatever happens to the
+  // disk afterwards (spec §6.4, "always"). It is NOT folded into the
+  // transaction above the way `create`'s is — `appendAudit` takes the
+  // `audit:<business>` advisory lock, and holding that for the length of a
+  // whole re-encryption pass would block every other audit writer in the
+  // installation for as long as rotation runs.
   await auditKeyAction({
     businessId,
     operator,
     action: 'rotate',
     reason: `המפתח הוחלף (${newKeyId}) עבור ${businessId} על ידי ${operator} — ${rotated} סודות הוצפנו מחדש`,
   });
+
+  // Recovery copy before the live key file, so the window in which the
+  // backup on disk is the retired key is as short as the code can make it.
+  await writeFile(recoveryPathFor(deps.keyPath), JSON.stringify(recovery), { mode: 0o600 });
+  await writeFile(deps.keyPath, newKey, { mode: 0o600 });
 
   deps.log(`המפתח הוחלף בהצלחה. ${rotated} סודות הוצפנו מחדש תחת המפתח החדש.`);
 }
