@@ -2,7 +2,12 @@ import { config } from '../config.js';
 import { domainMatches, extractDomain } from '../util/address.js';
 import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
 import { coveredByAuthorization, loadAuthorization } from '../governance/authorization.js';
-import type { AgentId } from '../domain/audit.js';
+// `AgentId` is both a value (the zod enum, used below for `.safeParse`) and a
+// type (`GateContext.agent`'s type) exported from the same declaration in
+// `domain/audit.ts`. A single non-type-only import brings in both bindings —
+// unlike the type-only import this replaces, which erased the value and left
+// `AgentId.safeParse` uncallable under `verbatimModuleSyntax`.
+import { AgentId } from '../domain/audit.js';
 import type { ActionFacts, PolicyBundle, PolicyDecision } from '../domain/policy.js';
 import { DENY_CODES } from '../domain/policy.js';
 import type { AutonomyLevel } from '../domain/trust.js';
@@ -21,6 +26,7 @@ import { buildFacts, type FactsContext } from './facts.js';
 import { isOutbound, isKnownTool } from './classify.js';
 import { assessRisk, type NormsLookup } from './risk.js';
 import { inQuietHours, redactPayload } from './redact.js';
+import { mayDelegate } from '../governance/delegation.js';
 
 export interface GateContext extends FactsContext {
   agent: AgentId;
@@ -158,6 +164,31 @@ export async function evaluateToolCall(
       DENY_CODES.notAllowlisted,
       `הכלי "${toolName}" אינו ברשימת ההרשאות של ${ctx.agent}`,
     );
+  }
+
+  // Still stage 3, and deliberately here rather than in a stage of its own:
+  // "whom may you ask" is a permission question, and this is the one place
+  // that answers permission questions. The gate already reads payloads for
+  // exactly this — stage 6 reads the recipient list to answer "whom may you
+  // write to". Same question, different addressee space.
+  //
+  // `collaborationGraph` was compiled into the signed bundle from the first
+  // migration and read by nobody until this line, which made the rule that
+  // `ops.web` delegates to nobody signed and unenforced.
+  if (toolName === 'agent.request_help') {
+    const to = isRecord(toolInput) && Object.hasOwn(toolInput, 'to') ? toolInput['to'] : undefined;
+    if (typeof to !== 'string' || !AgentId.safeParse(to).success) {
+      return deny(
+        DENY_CODES.delegationNotPermitted,
+        'בקשת עזרה בלי נמען קריא — סוכן יעד שלא נפתר אינו נמען מותר',
+      );
+    }
+    if (!mayDelegate(ctx.bundle.collaborationGraph, ctx.agent, to)) {
+      return deny(
+        DENY_CODES.delegationNotPermitted,
+        `${ctx.agent} אינו רשאי לבקש עזרה מ-${to}`,
+      );
+    }
   }
 
   // 4. Read-only short-circuit --------------------------------------------

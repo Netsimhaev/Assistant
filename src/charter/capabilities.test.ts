@@ -143,9 +143,16 @@ describe('capability table invariants', () => {
  * what "compiled but unenforced" actually looks like.
  */
 describe('compiled policy has a reader', () => {
-  const GATE_SOURCES = ['../policy/budget.ts', '../policy/engine.ts', '../policy/risk.ts'].map(
-    (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'),
-  );
+  // `redact.ts` joined this list here: it is `engine.ts`'s sibling for two of
+  // the gate's own stages (redaction and quiet hours), exactly the same
+  // relationship `budget.ts` and `risk.ts` already have, and it was simply
+  // missing — `bundle.redactPatterns` is read there, not in `engine.ts` itself.
+  const GATE_SOURCES = [
+    '../policy/budget.ts',
+    '../policy/engine.ts',
+    '../policy/risk.ts',
+    '../policy/redact.ts',
+  ].map((rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'));
 
   it('every compiled ceiling is named somewhere in the gate', () => {
     const ceilings = compileCharter(buildCharter()).ceilings;
@@ -167,6 +174,70 @@ describe('compiled policy has a reader', () => {
     // Three of these four used to compile into a flat list compared against
     // `counterpartyId` alone, so a block by domain, phone or tag matched
     // nothing at all while appearing in the signed document.
+    expect(unread).toEqual([]);
+  });
+
+  /**
+   * The two tests above cover `ceilings` and `doNotContact`. `collaborationGraph`
+   * sat outside both, compiled into the signed charter and read by nobody — the
+   * fifth instance of this defect class in this project, and the first that the
+   * mechanical check was supposed to catch and did not.
+   *
+   * This asserts over EVERY top-level field of the compiled bundle, so the sixth
+   * instance cannot exist. A field genuinely not meant for the gate is added to
+   * `NOT_READ_BY_GATE` by name, with a reason — which is a decision someone
+   * writes down, not a gap nobody noticed.
+   */
+  it('every compiled top-level field is named somewhere in the gate', () => {
+    const NOT_READ_BY_GATE = new Set<string>([
+      // Identity of the bundle itself, compared in stage 2 by value rather than
+      // by name lookup.
+      'charterVersion',
+
+      // Signature/integrity metadata: verified when the charter is installed
+      // (`charter/sign.ts`, `charter/store.ts`), not consulted for any
+      // per-call permission decision. A gate that read `contentHash` would be
+      // reading a fingerprint of itself, not a rule.
+      'contentHash',
+
+      // A compilation timestamp with zero readers anywhere in `src/` — not
+      // just outside the gate. It names no rule and carries no permission, so
+      // there is nothing here for the gate to enforce. Worth a cleanup pass
+      // on its own; not a policy gap.
+      'compiledAt',
+
+      // Deliberately model-facing, not code-enforced: `domain/policy.ts`'s own
+      // docblock calls this "prose injected into agent prompts ... the model
+      // could in principle be talked out of" — the opposite of the data the
+      // gate evaluates. Read by `sdk/reading-prompt.ts`.
+      'promptFragments',
+
+      // "What the owner actually signed" (same docblock) — the human-legible
+      // text fed into planner/proposal prompts (`sdk/planner.ts`,
+      // `sdk/proposal-prompt.ts`) and shown to people. Never compared against
+      // a fact to produce allow/deny.
+      'plainLanguage',
+
+      // KNOWN GAP, not a design choice — flagged here rather than fixed,
+      // because fixing it means changing `isToolPermitted`'s signature at all
+      // three call sites (`policy/engine.ts`, `orchestrator/catalogue.ts` x2),
+      // which is out of scope for the collaboration-graph work this test
+      // was written for. `compileCharter` copies `AGENT_ALLOWLISTS` /
+      // `AGENT_DENYLISTS` (`charter/capabilities.ts`) into these two fields
+      // verbatim, but `isToolPermitted(agent, toolName)` takes no bundle and
+      // reads those same static constants directly — never `ctx.bundle.
+      // allowlists` / `.denylists`. Identical today only because compile time
+      // copies the live constant; a process running an older `bundle` against
+      // a newer `capabilities.ts` would enforce the *new* allowlist under the
+      // *old* signed charter's name, exactly the staleness `connections` was
+      // carried into the bundle to avoid. Left for a follow-up task.
+      'allowlists',
+      'denylists',
+    ]);
+    const compiled = compileCharter(buildCharter()) as Record<string, unknown>;
+    const fields = Object.keys(compiled).filter((f) => !NOT_READ_BY_GATE.has(f));
+    expect(fields.length).toBeGreaterThan(3);
+    const unread = fields.filter((field) => !GATE_SOURCES.some((src) => src.includes(field)));
     expect(unread).toEqual([]);
   });
 });

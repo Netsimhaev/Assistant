@@ -269,4 +269,5 @@ export const DENY_CODES = {
   amountUnreadable: 'amount_unreadable',
   recipientUnreadable: 'recipient_unreadable',
   notAllowlisted: 'tool_not_allowlisted',
+  delegationNotPermitted: 'delegation_not_permitted',
 } as const;
