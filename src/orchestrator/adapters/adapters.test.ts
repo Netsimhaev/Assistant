@@ -305,27 +305,31 @@ describe('credentials', () => {
   // ASSISTANT_CREDENTIAL_ default — envCredentials takes prefix as an
   // explicit override precisely so tests are not tied to the production one.
   const P = 'TEST_CRED_';
+  // businessId is a required argument to resolve() now, but this source
+  // ignores it (see envCredentials' docblock) — any non-empty string
+  // exercises the call site without implying a per-business mechanism here.
+  const BIZ = 'biz-1';
 
   it('resolves a ref to a value from the environment, under the prefix', async () => {
     const source = envCredentials({ [`${P}OFFICE_MAIL`]: 'secret-value' }, P);
-    const handle = await source.resolve('OFFICE_MAIL');
+    const handle = await source.resolve('OFFICE_MAIL', BIZ);
     expect(handle?.value).toBe('secret-value');
   });
 
   it('returns null for a ref nothing defines, rather than an empty secret', async () => {
     // An empty credential would be attempted and fail at the far end; null
     // stops the step before it reaches an external system at all.
-    expect(await envCredentials({}, P).resolve('MISSING')).toBeNull();
+    expect(await envCredentials({}, P).resolve('MISSING', BIZ)).toBeNull();
   });
 
   it('returns null for a ref that resolves to an empty string', async () => {
     // Distinct from "nothing defines it": an env var can be present but set
     // to '', and that must be refused exactly like an absent one.
-    expect(await envCredentials({ [`${P}EMPTY`]: '' }, P).resolve('EMPTY')).toBeNull();
+    expect(await envCredentials({ [`${P}EMPTY`]: '' }, P).resolve('EMPTY', BIZ)).toBeNull();
   });
 
   it('does not serialise the value when the handle is stringified', async () => {
-    const handle = await envCredentials({ [`${P}K`]: 'secret-value' }, P).resolve('K');
+    const handle = await envCredentials({ [`${P}K`]: 'secret-value' }, P).resolve('K', BIZ);
     expect(JSON.stringify(handle)).not.toContain('secret-value');
   });
 
@@ -334,7 +338,7 @@ describe('credentials', () => {
     // directly and never calls it, so this is a separate guard against a
     // separate path. envCredentials must go through createCredentialHandle
     // rather than a plain object literal for this to hold.
-    const handle = await envCredentials({ [`${P}K`]: 'super-secret-value' }, P).resolve('K');
+    const handle = await envCredentials({ [`${P}K`]: 'super-secret-value' }, P).resolve('K', BIZ);
     const serialised = canonicalJson({ credential: handle });
     expect(serialised).toContain('K');
     expect(serialised).not.toContain('super-secret-value');
@@ -352,13 +356,13 @@ describe('credentials', () => {
         ANTHROPIC_API_KEY: 'sk-real-infra-secret',
       };
       const source = envCredentials(env); // default prefix, not the test prefix
-      expect(await source.resolve('DATABASE_URL')).toBeNull();
-      expect(await source.resolve('ANTHROPIC_API_KEY')).toBeNull();
+      expect(await source.resolve('DATABASE_URL', BIZ)).toBeNull();
+      expect(await source.resolve('ANTHROPIC_API_KEY', BIZ)).toBeNull();
     });
 
     it('reaches only the prefixed form of the same name', async () => {
       const env = { ASSISTANT_CREDENTIAL_DATABASE_URL: 'not-actually-infra' };
-      const handle = await envCredentials(env).resolve('DATABASE_URL');
+      const handle = await envCredentials(env).resolve('DATABASE_URL', BIZ);
       expect(handle?.value).toBe('not-actually-infra');
     });
   });
@@ -374,14 +378,14 @@ describe('credentials', () => {
     it.each(['constructor', 'hasOwnProperty', 'isPrototypeOf', '__proto__', 'toString'])(
       'returns null for ref %s against an injected {}',
       async (ref) => {
-        expect(await envCredentials({}, P).resolve(ref)).toBeNull();
+        expect(await envCredentials({}, P).resolve(ref, BIZ)).toBeNull();
       },
     );
 
     it.each(['constructor', 'hasOwnProperty', 'isPrototypeOf', '__proto__', 'toString'])(
       'returns null for ref %s against the real process.env',
       async (ref) => {
-        expect(await envCredentials(undefined, P).resolve(ref)).toBeNull();
+        expect(await envCredentials(undefined, P).resolve(ref, BIZ)).toBeNull();
       },
     );
 
@@ -393,14 +397,14 @@ describe('credentials', () => {
         string,
         string | undefined
       >;
-      expect(await envCredentials(env, P).resolve('SECRET')).toBeNull();
+      expect(await envCredentials(env, P).resolve('SECRET', BIZ)).toBeNull();
     });
 
     it('rejects a prefixed own key whose value is not a string', async () => {
       // Also a legal ref, so this isolates the typeof guard from the
       // hasOwn guard: the key genuinely is an own property here.
       const env = { [`${P}WEIRD`]: 12345 } as unknown as Record<string, string | undefined>;
-      expect(await envCredentials(env, P).resolve('WEIRD')).toBeNull();
+      expect(await envCredentials(env, P).resolve('WEIRD', BIZ)).toBeNull();
     });
   });
 
@@ -413,15 +417,15 @@ describe('credentials', () => {
       // only shows up against the real process.env (see the describe block
       // below).
       const source = envCredentials({ [`${P}OFFICE_MAIL`]: 'secret-value' }, P);
-      expect(await source.resolve('office_mail')).toBeNull();
-      expect(await source.resolve('OFFICE_MAIL')).not.toBeNull();
+      expect(await source.resolve('office_mail', BIZ)).toBeNull();
+      expect(await source.resolve('OFFICE_MAIL', BIZ)).not.toBeNull();
     });
 
     it('rejects a ref containing characters outside [A-Z0-9_]', async () => {
       const source = envCredentials({ [`${P}OFFICE-MAIL`]: 'secret-value' }, P);
-      expect(await source.resolve('OFFICE-MAIL')).toBeNull();
-      expect(await source.resolve('OFFICE.MAIL')).toBeNull();
-      expect(await source.resolve('')).toBeNull();
+      expect(await source.resolve('OFFICE-MAIL', BIZ)).toBeNull();
+      expect(await source.resolve('OFFICE.MAIL', BIZ)).toBeNull();
+      expect(await source.resolve('', BIZ)).toBeNull();
     });
   });
 
@@ -444,7 +448,7 @@ describe('credentials', () => {
       const differentCaseKey = key.toLowerCase();
       process.env[differentCaseKey] = 'leaked-cross-case-value';
       try {
-        expect(await envCredentials(undefined, P).resolve(suffix)).toBeNull();
+        expect(await envCredentials(undefined, P).resolve(suffix, BIZ)).toBeNull();
       } finally {
         delete process.env[differentCaseKey];
       }

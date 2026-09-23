@@ -10,7 +10,17 @@ import type { CredentialHandle } from './adapters/types.js';
  * only the ref does.
  */
 export interface CredentialSource {
-  resolve(ref: string): Promise<CredentialHandle | null>;
+  /**
+   * `businessId` is REQUIRED and has no default anywhere in this path.
+   *
+   * Everywhere else in this codebase the business is
+   * `options.businessId ?? config.businessId`. Here that pattern is
+   * forbidden: an omitted business would read silently as "the one in the
+   * configuration", which is precisely the mechanism by which one customer
+   * reads another's secret. Required means an omission is a compile error
+   * rather than a wrong lookup at run time.
+   */
+  resolve(ref: string, businessId: string): Promise<CredentialHandle | null>;
 }
 
 /**
@@ -99,7 +109,11 @@ export function envCredentials(
   }
 
   return {
-    async resolve(ref: string): Promise<CredentialHandle | null> {
+    // `businessId` is accepted to satisfy `CredentialSource` but ignored:
+    // this source exists for tests only, and reads from a single shared
+    // process environment with no per-business partition. The real store
+    // (a later task) is what actually keys a lookup by business.
+    async resolve(ref: string, _businessId: string): Promise<CredentialHandle | null> {
       if (!CREDENTIAL_REF_PATTERN.test(ref)) return null;
       const key = prefix + ref;
       // Exact-string membership, not Object.hasOwn: see the docblock above

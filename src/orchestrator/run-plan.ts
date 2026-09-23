@@ -482,7 +482,10 @@ async function performStep(
 
   const binding = request.bindings.find((b) => b.system === resolution.system);
   const credentialRef = binding?.credentialRef ?? null;
-  const credential = credentialRef === null ? null : await request.credentials.resolve(credentialRef);
+  const credential =
+    credentialRef === null
+      ? null
+      : await request.credentials.resolve(credentialRef, request.job.businessId);
   if (credentialRef !== null && credential === null) {
     // NOT retryable, unlike `channel_unavailable` above. A ref that does not
     // resolve is a misconfiguration — a misspelling, or a secret that was
