@@ -480,4 +480,5 @@ npm run ramp:set -- <מחלקה> <רמה>  # מעלה מחלקת פעולה מה
 | [docs/08-risks.md](docs/08-risks.md) | prompt injection, דפדפן, עלויות, אחריות |
 | [docs/08b-whatsapp-bridge.md](docs/08b-whatsapp-bridge.md) | `WhatsAppGateway` ושלושת מימושיו |
 | [docs/09-roadmap.md](docs/09-roadmap.md) | חמשת השלבים ושאלות פתוחות |
+| [docs/10-user-settings.md](docs/10-user-settings.md) | **קובץ מתעדכן** — כל מה שבעל עסק בוחר בעצמו במסך ההגדרות, והגבול שאף בחירה אינה חוצה |
 | [docs/dashboard-deployment.md](docs/dashboard-deployment.md) | פריסת דשבורד האישורים — loopback בלבד, ולמה פריסה שגויה נכשלת בשקט |
