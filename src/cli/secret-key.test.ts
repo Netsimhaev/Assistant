@@ -1,12 +1,14 @@
-import { randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { randomBytes, scrypt as scryptCb } from 'node:crypto';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
 import { closePool, getPool } from '../db/pool.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
-import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
+import { KEY_BYTES, MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
+import { encryptSecret } from '../governance/secret-cipher.js';
 import { resetDatabase } from '../test/db.js';
 import { RotationAuditUnrecordedError, runSecretKeyCli } from './secret-key.js';
 import type { SecretKeyCliDeps } from './secret-key.js';
@@ -32,9 +34,26 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-/** A `readPassphrase` that never touches argv or a terminal. */
+/** A `readPassphrase` that never touches argv or a terminal. Returns the
+ * same value on every call, which is what an operator who types the
+ * passphrase correctly twice produces. */
 function reads(value: string): () => Promise<string> {
   return async () => value;
+}
+
+/** A `readPassphrase` that answers differently on successive calls — an
+ * operator who mistypes the confirmation. Runs out rather than repeating:
+ * a third call would mean the code asked more times than the test described. */
+function readsInTurn(...values: string[]): () => Promise<string> {
+  let next = 0;
+  return async () => {
+    const value = values[next];
+    if (value === undefined) {
+      throw new Error(`readPassphrase called ${next + 1} times; only ${values.length} given`);
+    }
+    next += 1;
+    return value;
+  };
 }
 
 function deps(overrides: Partial<SecretKeyCliDeps> = {}): SecretKeyCliDeps {
@@ -117,8 +136,14 @@ describe('runSecretKeyCli create', () => {
     const original = await readFile(KEY_PATH);
 
     await expect(
-      runSecretKeyCli(['create', OPERATOR], deps({ readPassphrase: reads('a different one') })),
-    ).rejects.toThrow();
+      runSecretKeyCli(
+        ['create', OPERATOR],
+        // Long enough to clear MIN_PASSPHRASE_CHARS on purpose: a shorter one
+        // would be refused by the passphrase floor, and this test would go
+        // green while never reaching the guard it names.
+        deps({ readPassphrase: reads('a different passphrase entirely') }),
+      ),
+    ).rejects.toThrow(/כבר קיים קובץ מפתח/);
 
     const after = await readFile(KEY_PATH);
     expect(after.equals(original)).toBe(true);
@@ -440,5 +465,139 @@ describe('runSecretKeyCli argument handling', () => {
 
   it('rejects a missing operator', async () => {
     await expect(runSecretKeyCli(['create'], deps())).rejects.toThrow();
+  });
+});
+
+
+const scrypt = promisify(scryptCb) as (
+  password: string,
+  salt: string,
+  keylen: number,
+) => Promise<Buffer>;
+
+/**
+ * The passphrase policy on the recovery copy.
+ *
+ * `.env.example` and `create`'s own output permit this copy to be stored
+ * outside the server, beside a database backup, and both rest that permission
+ * on one claim: without the passphrase the copy is worth nothing. Nothing in
+ * the code used to hold that claim up. The passphrase was checked for being
+ * non-empty and for nothing else — no length, no confirmation — while the
+ * dashboard login, which is rate-limited and locks after five failures,
+ * already required ten characters. The weaker secret carried the floor and
+ * the stronger one carried none.
+ *
+ * These tests are the floor and the retype. They assert on the messages
+ * because the operator's next move depends on which refusal they got.
+ */
+describe('a new recovery passphrase must be long enough, and typed twice', () => {
+  it('refuses a passphrase under the floor and writes nothing at all', async () => {
+    await expect(
+      runSecretKeyCli(['create', OPERATOR], deps({ readPassphrase: reads('short-one-15x') })),
+    ).rejects.toThrow(/קצרה מדי/);
+
+    expect(await exists(KEY_PATH)).toBe(false);
+    expect(await exists(`${KEY_PATH}.recovery`)).toBe(false);
+    const { rows } = await getPool().query('SELECT 1 FROM credential_key_state');
+    expect(rows).toHaveLength(0);
+  });
+
+  it('refuses when the confirmation does not match, and writes nothing at all', async () => {
+    await expect(
+      runSecretKeyCli(
+        ['create', OPERATOR],
+        deps({
+          readPassphrase: readsInTurn(
+            'correct horse battery staple',
+            'correct horse battery stapel',
+          ),
+        }),
+      ),
+    ).rejects.toThrow(/אינן זהות/);
+
+    expect(await exists(KEY_PATH)).toBe(false);
+    expect(await exists(`${KEY_PATH}.recovery`)).toBe(false);
+    const { rows } = await getPool().query('SELECT 1 FROM credential_key_state');
+    expect(rows).toHaveLength(0);
+  });
+
+  /**
+   * Rotation is where a mistyped passphrase costs the most: it succeeds, so
+   * the operator has no reason to look again, and the recovery layer is dead
+   * from that moment while appearing to be alive. Nothing may rotate.
+   */
+  it('refuses a mistyped confirmation on rotate, leaving the key and the rows untouched', async () => {
+    await runSecretKeyCli(['create', OPERATOR], deps());
+    const key = await loadMasterKey(KEY_PATH);
+    await putSecret(
+      { businessId: config.businessId, ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR },
+      key,
+    );
+    const recoveryBefore = await readFile(`${KEY_PATH}.recovery`, 'utf8');
+
+    await expect(
+      runSecretKeyCli(
+        ['rotate', OPERATOR],
+        deps({ readPassphrase: readsInTurn('a brand new passphrase', 'a brand new passphrasx') }),
+      ),
+    ).rejects.toThrow(/אינן זהות/);
+
+    expect((await loadMasterKey(KEY_PATH)).equals(key)).toBe(true);
+    expect(await readFile(`${KEY_PATH}.recovery`, 'utf8')).toBe(recoveryBefore);
+    expect((await storedCredentials(key).resolve('ONE', config.businessId))?.value).toBe(
+      'first-secret',
+    );
+  });
+
+  /**
+   * **`restore` is not gated by the floor, and that is the design.** It
+   * *enters* an existing passphrase rather than choosing one, so a floor
+   * there would refuse a copy that was legitimately sealed before the floor
+   * existed — locking an operator out of the one layer standing between a
+   * lost key file and lost secrets. This test seals a copy by hand under a
+   * short passphrase, exactly as an older `create` would have written it, and
+   * requires that `restore` still opens it.
+   */
+  it('still restores from a copy sealed under a short passphrase, from before the floor existed', async () => {
+    await runSecretKeyCli(['create', OPERATOR], deps());
+    const key = await loadMasterKey(KEY_PATH);
+
+    const legacy = 'old-short';
+    const salt = randomBytes(16).toString('hex');
+    const derived = await scrypt(legacy, salt, KEY_BYTES);
+    const sealed = encryptSecret(key.toString('base64'), derived, {
+      businessId: config.businessId,
+      ref: 'key-recovery',
+    });
+    await writeFile(
+      `${KEY_PATH}.recovery`,
+      JSON.stringify({
+        salt,
+        nonce: sealed.nonce.toString('hex'),
+        ciphertext: sealed.ciphertext.toString('hex'),
+      }),
+    );
+    await rm(KEY_PATH);
+
+    await runSecretKeyCli(['restore', OPERATOR], deps({ readPassphrase: reads(legacy) }));
+
+    expect((await loadMasterKey(KEY_PATH)).equals(key)).toBe(true);
+  });
+
+  /**
+   * An EOF or a Ctrl-D at the prompt reaches `restore` as an empty string.
+   * Passed through, it surfaces as "wrong passphrase, or the copy is
+   * corrupted" — which sends the operator looking for a damaged file that is
+   * perfectly fine.
+   */
+  it('names an empty passphrase on restore rather than blaming the copy', async () => {
+    await runSecretKeyCli(['create', OPERATOR], deps());
+    await rm(KEY_PATH);
+
+    await expect(
+      runSecretKeyCli(['restore', OPERATOR], deps({ readPassphrase: reads('') })),
+    ).rejects.toThrow(/לא הוקלדה סיסמה/);
+
+    expect(await exists(KEY_PATH)).toBe(false);
   });
 });

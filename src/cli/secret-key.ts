@@ -126,12 +126,17 @@ export class RotationAuditUnrecordedError extends Error {
 export interface SecretKeyCliDeps {
   log: (line: string) => void;
   /**
-   * Reads the passphrase that protects the recovery copy. Never given a
-   * prompt string or an argv slot — the same rule `SecretCliDeps.readSecret`
-   * follows in `secret.ts`, and for the same reason: a test must never need
-   * a terminal, and an argument would land in shell history.
+   * Reads the passphrase that protects the recovery copy. Never given an
+   * argv slot — the same rule `SecretCliDeps.readSecret` follows in
+   * `secret.ts`, and for the same reason: a test must never need a terminal,
+   * and an argument would land in shell history.
+   *
+   * It *is* given the prompt to show, unlike `readSecret`, because
+   * `readNewPassphrase` calls it twice in a row and an operator facing the
+   * same sentence twice cannot tell a confirmation from a rejected attempt.
+   * A test injects a zero-argument function and ignores it.
    */
-  readPassphrase: () => Promise<string>;
+  readPassphrase: (prompt: string) => Promise<string>;
   /** Where the live key file lives. Injected rather than read from an env
    * var here, so a test never touches `process.env`. */
   keyPath: string;
@@ -266,10 +271,60 @@ async function auditKeyAction(params: {
   );
 }
 
-async function readNonEmptyPassphrase(deps: SecretKeyCliDeps): Promise<string> {
-  const passphrase = await deps.readPassphrase();
+/**
+ * The floor a NEW recovery passphrase must clear.
+ *
+ * Sixteen, where `src/dashboard/server.ts`'s `MIN_PASSWORD_LENGTH` is ten,
+ * and the gap between them is the whole argument. That one guards a login
+ * that answers on a loopback socket, counts its failures and locks the
+ * account after five — an attacker gets a handful of guesses and then
+ * nothing. This one guards a file whose documented purpose is to be copied
+ * somewhere else, `.env.example` and `create`'s own output included; whoever
+ * holds a copy guesses against it offline, as fast as their hardware allows,
+ * with nothing counting and nothing to lock. The weaker secret got the floor
+ * and the stronger one got none.
+ *
+ * This is not hardening for its own sake. The permission to store the copy
+ * beside a database backup is granted on the claim that the copy is worth
+ * nothing without its passphrase — so the passphrase is precisely the thing
+ * that must not be left to an operator in a hurry.
+ */
+const MIN_PASSPHRASE_CHARS = 16;
+
+/**
+ * Reads a NEW passphrase — the one `create` and `rotate` choose for the
+ * recovery copy they are about to seal. Read twice and compared, because of
+ * the property this file's header states: there is no fourth recovery path.
+ * A mistyped passphrase does not fail here. It fails months later, on the
+ * one day the copy is needed, and by then there is nothing to be done —
+ * a typo silently converts the backup layer into an empty file. The second
+ * read costs an operator a few seconds, once.
+ *
+ * **`restore` deliberately does not come through here**, and the two checks
+ * are the reason: it *enters* an existing passphrase rather than choosing
+ * one. A floor there would refuse a copy that was legitimately sealed before
+ * this floor existed — locking an operator out of the very layer this file
+ * exists to protect — and a retype there proves nothing that opening the
+ * copy does not already prove.
+ */
+async function readNewPassphrase(deps: SecretKeyCliDeps): Promise<string> {
+  const passphrase = await deps.readPassphrase('סיסמה לעותק השחזור: ');
   if (passphrase.length === 0) {
     throw new Error('סיסמה ריקה אינה מתקבלת עבור עותק השחזור.');
+  }
+  if (passphrase.length < MIN_PASSPHRASE_CHARS) {
+    throw new Error(
+      `הסיסמה קצרה מדי — נדרשים לפחות ${MIN_PASSPHRASE_CHARS} תווים לעותק השחזור, ` +
+        `ולא נכתב דבר. העותק הזה מיועד להישמר גם מחוץ לשרת, ומי שמחזיק אותו יכול ` +
+        `לנחש עליו סיסמאות בלי הגבלה ובלי שאיש ידע — האורך הוא כל מה שעומד מולו.`,
+    );
+  }
+  const again = await deps.readPassphrase('הקלד שוב את אותה סיסמה: ');
+  if (again !== passphrase) {
+    throw new Error(
+      'שתי ההקלדות אינן זהות, ולא נכתב דבר. סיסמה שהוקלדה בטעות מתגלה רק ביום שבו ' +
+        'צריך לשחזר ממנה — ואז אין דרך רביעית.',
+    );
   }
   return passphrase;
 }
@@ -296,7 +351,7 @@ async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // Measured on this branch, not reasoned about. Sealing the copy is done
   // here too, for the same reason: `scrypt` can fail, and a failure here
   // must land before the first write, not between two of them.
-  const passphrase = await readNonEmptyPassphrase(deps);
+  const passphrase = await readNewPassphrase(deps);
 
   const key = randomBytes(KEY_BYTES);
   const keyId = `KEY-${randomUUID()}`;
@@ -368,9 +423,11 @@ async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   deps.log(key.toString('base64'));
   deps.log(
     'שמור אותו עכשיו במקום בטוח ונפרד מגיבוי בסיס הנתונים. עותק שחזור מוגן בסיסמה נכתב ' +
-      `לצדו (${recoveryPathFor(deps.keyPath)}) ואפשר לגבות אותו בכל מקום, כולל ענן — בלי ` +
-      'הסיסמה הוא חסר ערך. אם גם הקובץ, גם עותק השחזור וגם הסיסמה אבדו — הסודות אבודים ' +
-      'לצמיתות. אין דרך רביעית.',
+      `לצדו (${recoveryPathFor(deps.keyPath)}). מותר לגבות אותו גם מחוץ לשרת — אבל רק ` +
+      'משום שהסיסמה אינה כתובה באף מקום: היא הדבר היחיד שעומד בין מי שמחזיק את העותק ' +
+      'לבין כל הסודות של כל הלקוחות, והוא יכול לנחש עליה בלי הגבלה ובלי שנדע. שמור אותה ' +
+      'במקום שהגיבוי אינו מגיע אליו. אם גם הקובץ, גם עותק השחזור וגם הסיסמה אבדו — ' +
+      'הסודות אבודים לצמיתות. אין דרך רביעית.',
   );
 }
 
@@ -393,7 +450,17 @@ async function restore(deps: SecretKeyCliDeps, operator: string): Promise<void> 
   }
   const file = JSON.parse(raw) as RecoveryFile;
 
-  const passphrase = await deps.readPassphrase();
+  // Read once, with no floor and no retype — the opposite of
+  // `readNewPassphrase`, and deliberately so: this passphrase is being
+  // *entered*, not chosen. A floor here would refuse a copy sealed before
+  // that floor existed, and a retype would prove nothing that opening the
+  // copy does not already prove. The one check worth making is the empty
+  // line, because an EOF or a Ctrl-D otherwise arrives as "wrong passphrase
+  // or corrupted copy" and sends the operator hunting for a damaged file.
+  const passphrase = await deps.readPassphrase('סיסמה של עותק השחזור: ');
+  if (passphrase.length === 0) {
+    throw new Error('לא הוקלדה סיסמה — עותק השחזור לא נפתח, ושום דבר לא נכתב.');
+  }
   const key = await openRecoveryCopy(file, passphrase, businessId);
 
   // Belt and braces: confirm this is genuinely the key this installation's
@@ -457,7 +524,7 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // prompt still comes after the command has established there is a key to
   // rotate at all — this is before the first WRITE, which is the property
   // that matters.
-  const passphrase = await readNonEmptyPassphrase(deps);
+  const passphrase = await readNewPassphrase(deps);
   const recovery = await sealRecoveryCopy(newKey, passphrase, businessId);
 
   const { rotated, previousKeyId } = await withTransaction(async (tx: Queryable) => {
@@ -580,7 +647,7 @@ async function main(): Promise<void> {
   }
   await runSecretKeyCli(process.argv.slice(2), {
     log: (line) => console.log(line),
-    readPassphrase: () => nodePromptIo.readSecret('סיסמה לעותק השחזור: '),
+    readPassphrase: (prompt) => nodePromptIo.readSecret(prompt),
     keyPath,
   });
 }
