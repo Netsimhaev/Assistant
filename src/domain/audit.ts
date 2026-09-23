@@ -72,6 +72,17 @@ export const AuditKind = z.enum([
    * own permissions, not about whoever the action was aimed at.
    */
   'autonomy_change',
+  /**
+   * The platform operator put, removed, or tested a secret through
+   * `secret.ts` — the only door a credential ever enters or leaves through,
+   * since the customer never touches it directly. Carries the business, the
+   * ref and the operator — and never the value: this design concentrates
+   * every customer's secrets in one operator's hands, and the only honest
+   * counterweight is that each use of that power leaves a record nobody can
+   * edit (`audit_log` is append-only at the database level, not by
+   * convention).
+   */
+  'credential_change',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 
