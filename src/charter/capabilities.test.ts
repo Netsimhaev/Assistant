@@ -159,9 +159,21 @@ describe('compiled policy has a reader', () => {
   // string `connections` had been passing the check below only because it
   // also appears, coincidentally, in an English comment inside `engine.ts`
   // ("citing it on two different connections"). A reader on a coincidence is
-  // no reader at all; confirmed by grep that no `CompiledCeilings` key and no
-  // `doNotContact` bucket name appears anywhere in `channels.ts`, so adding
-  // it here does not silently pass either of the two tests above it.
+  // no reader at all; confirmed by grep that no `CompiledCeilings` *key*
+  // (`currency`, `maxDiscountPercent`, etc. — the nested fields the first test
+  // below checks) and no `doNotContact` bucket name appears anywhere in
+  // `channels.ts`, so adding it here does not silently pass either of the two
+  // tests above the third one.
+  //
+  // `channels.ts` brought its own coincidence, though, on the very field this
+  // list was extended to catch drift on: its docblock reads "the ceilings do
+  // not treat a..." — the bare top-level field name `ceilings`, in prose, one
+  // review round after `connections` was fixed for exactly this shape of
+  // mistake. `readsField` below (used only by the third test, which scans
+  // bare top-level field names across all of `GATE_SOURCES`) is the
+  // structural fix: `ceilings` has two genuine readers today
+  // (`engine.ts:316`, `risk.ts:79`), and this comment can no longer stand in
+  // for them.
   const GATE_SOURCE_FILES = {
     budget: '../policy/budget.ts',
     engine: '../policy/engine.ts',
@@ -176,6 +188,33 @@ describe('compiled policy has a reader', () => {
     ]),
   ) as Record<keyof typeof GATE_SOURCE_FILES, string>;
   const GATE_SOURCES = Object.values(GATE_SOURCE_TEXT);
+
+  /**
+   * A field is "read" only if some gate source actually pulls it off an
+   * object — `.field` (through however many hops precede it: `ctx.bundle.
+   * field`, or a local alias like `const ceilings = bundle.ceilings`) — or
+   * destructures it out of one (`const { field } = ...`, `{ a, field }`).
+   * A bare occurrence of the field's name is not a reader: it is exactly the
+   * shape a comment, a docblock, or an unrelated parameter takes, and a plain
+   * substring match cannot tell the two apart from a real access. That gap is
+   * not hypothetical — it is the second field this task's own reader check
+   * itself was fooled by (`connections`, then `ceilings`), inside one round of
+   * review each time.
+   */
+  function readsField(source: string, field: string): boolean {
+    const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // `.field` (`ctx.bundle.field`, or a local alias's `.field`).
+    const memberAccess = new RegExp(`\\.${escaped}\\b`);
+    // `{ ..., field, ... }` or `{ field }` — anchored on an actual `{`, with
+    // only a plain identifier list between it and the field. A plain
+    // parameter list, e.g. `function f(facts, field: T, options)`, lives in
+    // `(...)`, never `{...}`, so it cannot satisfy this — that gap is exactly
+    // how `budget.ts`'s `ceilings: CompiledCeilings` parameter almost passed
+    // this check on a first draft of this regex, on nothing but a preceding
+    // comma and a following colon.
+    const destructured = new RegExp(`\\{\\s*(?:[A-Za-z0-9_$]+\\s*,\\s*)*${escaped}\\s*[,}]`);
+    return memberAccess.test(source) || destructured.test(source);
+  }
 
   it('every compiled ceiling is named somewhere in the gate', () => {
     const ceilings = compileCharter(buildCharter()).ceilings;
@@ -270,7 +309,13 @@ describe('compiled policy has a reader', () => {
     expect(NOT_READ_BY_GATE.size).toBe(6);
     const compiled = compileCharter(buildCharter()) as Record<string, unknown>;
     const fields = Object.keys(compiled).filter((f) => !NOT_READ_BY_GATE.has(f));
-    const unread = fields.filter((field) => !GATE_SOURCES.some((src) => src.includes(field)));
+    // Both properties pinned, not just the exclusion set: 18 top-level fields
+    // total, minus the 6 excluded above, is 12. A refactor that nested some of
+    // these fields under a sub-object would shrink `fields` and pass this
+    // invariant more vacuously than ever — a floor on the exclusion set alone
+    // does not catch that.
+    expect(fields.length).toBe(12);
+    const unread = fields.filter((field) => !GATE_SOURCES.some((src) => readsField(src, field)));
     expect(unread).toEqual([]);
   });
 
