@@ -34,9 +34,16 @@
  * it again next pass.
  *
  * Per-job advisory lock and per-job isolation, the same shape `runDueJobs`
- * already uses and for the same reason: one parent with corrupted state (an
- * `awaiting_envelope_id` pointing at nothing, an envelope with no child ever
- * attached) must not stop every other parent in the same pass from waking.
+ * already uses and for the same reason: one parent with corrupted state must
+ * not stop every other parent in the same pass from waking. Three specific
+ * corruptions — an `awaiting_envelope_id` pointing at nothing, an envelope
+ * with no child ever attached, and a child job that no longer exists — are
+ * not merely reported: the parent is moved to `failed` (see
+ * `failCorruptedParent`), because this function is that parent's only
+ * possible mover and leaving it parked would starve the scheduler's window
+ * exactly the way an unbound job used to (`run-due.ts`'s `RunDueResult.unbound`).
+ * An unreadable `constraints.deadlineAt` gets the same treatment — a value
+ * that cannot be read is never treated as "still inside the window".
  */
 import { ulid } from 'ulid';
 import { config } from '../config.js';
@@ -47,13 +54,34 @@ import { canonicalHash } from '../util/canonical.js';
 import { loadEnvelopeWithChild, writeEnvelope } from '../governance/envelope-store.js';
 import { loadJob, transition } from './jobs.js';
 
+/** A parent whose processing threw before reaching a disposition, and why. */
+export interface ErroredParent {
+  jobId: string;
+  error: string;
+}
+
 export interface ResumeResult {
   /** Parents woken because their child reached a terminal phase. */
   resumed: string[];
   /** Parents woken because the envelope's deadline passed before the child did. */
   timedOut: string[];
-  /** Parents whose processing threw before reaching a disposition. */
-  errored: string[];
+  /**
+   * Parents whose bookkeeping could not be trusted, or whose processing threw
+   * before reaching a disposition. Shaped like `RunDueResult.errored`
+   * (`run-due.ts`) on purpose — the same diagnostic an operator reads there is
+   * the one they need here, not a bare id with the reason discarded.
+   *
+   * A missing envelope, an envelope with no child ever attached, and a
+   * missing child row are all reported here — but, unlike a genuinely
+   * unexpected throw, each of the three is ALSO moved to `failed` first (see
+   * `failCorruptedParent`). Left merely `errored`, such a parent would stay
+   * in `followup` with `awaiting_envelope_id` set forever: `wakeDueJobs`
+   * never looks at that column, so this function is its only possible mover,
+   * and a query that finds the same unmovable row every pass sorts first
+   * under `ORDER BY updated_at ASC LIMIT $n` — the exact starvation
+   * `run-due.ts` documents and fixes for an unbound job (`RunDueResult.unbound`).
+   */
+  errored: ErroredParent[];
 }
 
 interface DueParentRow {
@@ -113,47 +141,77 @@ export async function resumeDelegatedJobs(
 
         const stored = await loadEnvelopeWithChild(parent.awaitingEnvelopeId, { businessId });
         if (stored === null) {
-          throw new Error(
-            `job ${jobId} awaits envelope ${parent.awaitingEnvelopeId}, which does not exist`,
-          );
+          const error = `job ${jobId} awaits envelope ${parent.awaitingEnvelopeId}, which does not exist`;
+          await failCorruptedParent(jobId, businessId, error);
+          result.errored.push({ jobId, error });
+          continue;
         }
         if (stored.childJobId === null) {
           // The crash window `requestHelp`'s own docblock names: the
           // envelope committed but the child was never attached. Not this
-          // function's repair to make — a future pass, or an operator using
-          // `attachChildJob` once the child id is re-derived, resolves it.
-          throw new Error(
-            `job ${jobId} awaits envelope ${stored.envelope.id}, which has no child job attached`,
-          );
+          // function's repair to make — an operator can still re-derive the
+          // child id and call `attachChildJob` by hand — but a parent cannot
+          // be left parked on a promise nothing will ever keep.
+          const error = `job ${jobId} awaits envelope ${stored.envelope.id}, which has no child job attached`;
+          await failCorruptedParent(jobId, businessId, error);
+          result.errored.push({ jobId, error });
+          continue;
         }
 
         const child = await loadJob(stored.childJobId, { businessId });
         if (child === null) {
-          throw new Error(`job ${jobId}'s child ${stored.childJobId} does not exist`);
+          const error = `job ${jobId}'s child ${stored.childJobId} does not exist`;
+          await failCorruptedParent(jobId, businessId, error);
+          result.errored.push({ jobId, error });
+          continue;
         }
 
         const terminal = child.phase === 'closed' || child.phase === 'failed' || child.phase === 'halted';
-        const deadlinePassed = Date.parse(stored.envelope.constraints.deadlineAt) <= now.getTime();
 
-        if (!terminal && !deadlinePassed) {
+        if (terminal) {
+          const outcome: DelegationOutcome = child.phase === 'closed' ? 'succeeded' : 'failed';
+          await writeResultAndWake(stored.envelope, jobId, child.jobId, outcome, { businessId, now });
+          result.resumed.push(jobId);
+          continue;
+        }
+
+        // The child is still running. Whether the parent may keep waiting
+        // depends on the deadline — and a deadline this function cannot read
+        // is never treated as one still ahead. `Date.parse` on a missing or
+        // mangled `deadlineAt` returns `NaN`, and `NaN <= x` is always
+        // `false`: left unchecked, that reads as "still inside the window"
+        // and the parent is skipped silently, forever, with no timeout and no
+        // `errored` line anywhere. The project's rule is explicit and applies
+        // here exactly as it does to `amount_unreadable`: a value that could
+        // not be read is never a permitting value.
+        const deadlineMs = Date.parse(stored.envelope.constraints.deadlineAt);
+        if (Number.isNaN(deadlineMs)) {
+          const error =
+            `job ${jobId}'s envelope ${stored.envelope.id} carries an unreadable deadline ` +
+            `(${JSON.stringify(stored.envelope.constraints.deadlineAt)})`;
+          await failCorruptedParent(jobId, businessId, error);
+          result.errored.push({ jobId, error });
+          continue;
+        }
+
+        if (deadlineMs > now.getTime()) {
           // Still running, still inside the deadline — left exactly alone.
           continue;
         }
 
-        const outcome: DelegationOutcome = !terminal
-          ? 'timeout'
-          : child.phase === 'closed'
-            ? 'succeeded'
-            : 'failed';
-
-        await writeResultAndWake(stored.envelope, jobId, child.jobId, outcome, { businessId, now });
-
-        if (outcome === 'timeout') result.timedOut.push(jobId);
-        else result.resumed.push(jobId);
+        await writeResultAndWake(stored.envelope, jobId, child.jobId, 'timeout', { businessId, now });
+        result.timedOut.push(jobId);
       } catch (error) {
         // This parent's failure must not take the rest of the pass down with
         // it — the same isolation `runDueJobs` gives every job it touches.
-        result.errored.push(jobId);
+        // Unlike the corrupted shapes above, an unexpected throw here is not
+        // moved to `failed`: a transient failure (a dropped connection) is
+        // not evidence the parent's own state is unrecoverable, and forcing
+        // a terminal phase on it would be the wrong direction to guess.
+        result.errored.push({
+          jobId,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     } finally {
       if (holdsLock) {
@@ -181,6 +239,29 @@ export async function resumeDelegatedJobs(
   }
 
   return result;
+}
+
+/**
+ * Fail a parent whose delegation bookkeeping cannot be trusted, instead of
+ * leaving it parked in `followup` forever.
+ *
+ * `wakeDueJobs` (`scheduler.ts`) only ever looks at `jobs.wake_at`, never
+ * `awaiting_envelope_id` — this function is a parent's ONLY possible mover
+ * once that column is corrupted, so leaving it merely `errored` (reported,
+ * untouched) means it never moves again. And because `updated_at` never
+ * advances on a row nothing writes, it sorts first under `ORDER BY
+ * updated_at ASC LIMIT $n` on every subsequent pass: enough such rows and no
+ * parent of that business is ever reached again — the exact starvation
+ * `run-due.ts` documents and fixes for an unbound job (`RunDueResult.unbound`).
+ * Loud and terminal, the same treatment.
+ */
+async function failCorruptedParent(jobId: string, businessId: string, reason: string): Promise<void> {
+  await transition(jobId, {
+    to: 'failed',
+    actor: 'system',
+    reason: `resume_delegated: ${reason}`,
+    businessId,
+  });
 }
 
 function outcomeNote(outcome: DelegationOutcome): string {

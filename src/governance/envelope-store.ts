@@ -182,6 +182,45 @@ export async function loadEnvelopeWithChild(
   return row ? { envelope: toEnvelope(row), childJobId: row.child_job_id } : null;
 }
 
+/**
+ * One envelope by its idempotency key, together with the `child_job_id`
+ * column — or `null` if this exact request was never answered before.
+ *
+ * **This is guard 3, checked BEFORE guard 4 (`noNewInformationGuard`) inside
+ * `requestHelp`, and the ordering is the fix, not a detail of it.** A
+ * `parked` step (`execute.ts`'s `StepOutcome`) writes no completion row, so a
+ * resumed run's retry of `agent.request_help` calls `requestHelp` again with
+ * byte-identical `(correlationId, from, to, intent, contextRefsHash,
+ * payload)` — which means the SAME idempotency key the first, successful
+ * call already wrote. Guard 4 alone would refuse that as
+ * `no_new_information`, which is true but is the wrong answer: the specific
+ * fact "I already did exactly this, here is the child it opened" was being
+ * shadowed by the general fact "you are asking the same thing again", and
+ * `requestHelp`'s caller (`local-tools.ts`'s `agent.request_help` handler)
+ * cannot tell that refusal apart from a genuine one — it read the parent's
+ * phase as still `execute`, threw non-retryably, and `executeStep` failed the
+ * parent job outright. Checking this first, by the idempotency key alone
+ * (unscoped by `correlationId`, unlike guard 4), answers the resumed run
+ * correctly before guard 4 ever runs.
+ */
+export async function loadEnvelopeByIdempotencyKey(
+  idempotencyKey: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<StoredEnvelope | null> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<EnvelopeRow>(
+    `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
+            intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
+            child_job_id
+       FROM agent_envelopes
+      WHERE business_id = $1 AND idempotency_key = $2`,
+    [businessId, idempotencyKey],
+  );
+  const row = rows[0];
+  return row ? { envelope: toEnvelope(row), childJobId: row.child_job_id } : null;
+}
+
 /** One envelope by id, or null if this business has never stored one under it. */
 export async function loadEnvelope(
   envelopeId: string,
@@ -221,9 +260,14 @@ export async function priorQuadruples(
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
   const { rows } = await db.query<QuadrupleRow>(
+    // `kind = 'help_request'` — `resumeDelegatedJobs` (Task 7) is now a
+    // writer of `result` rows in the OPPOSITE direction (`from`/`to`
+    // swapped), and without this filter every answer counts as a fresh
+    // request from the child back to the parent, corrupting guard 4 for a
+    // pair that never actually asked anything twice.
     `SELECT from_agent, to_agent, intent, context_refs_hash
        FROM agent_envelopes
-      WHERE business_id = $1 AND correlation_id = $2`,
+      WHERE business_id = $1 AND correlation_id = $2 AND kind = 'help_request'`,
     [businessId, correlationId],
   );
   return rows.map((row) => ({
@@ -249,10 +293,13 @@ export async function countPairExchanges(
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
   const { rows } = await db.query<{ n: string }>(
+    // `kind = 'help_request'`, for the same reason `priorQuadruples` filters
+    // it above: a `result` envelope going the other way must not inflate the
+    // exchange count between this pair.
     `SELECT count(*)::text AS n
        FROM agent_envelopes
       WHERE business_id = $1 AND correlation_id = $2 AND from_agent = $3
-        AND to_agent = $4 AND intent = $5`,
+        AND to_agent = $4 AND intent = $5 AND kind = 'help_request'`,
     [businessId, correlationId, from, to, intent],
   );
   return Number(rows[0]?.n ?? '0');

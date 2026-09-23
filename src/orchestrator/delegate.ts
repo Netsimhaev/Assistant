@@ -63,6 +63,7 @@ import {
   attachChildJob,
   countPairExchanges,
   delegationsToday,
+  loadEnvelopeByIdempotencyKey,
   loadEnvelopeWithChild,
   priorQuadruples,
   writeEnvelope,
@@ -343,10 +344,9 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
     deadlineAt: new Date(now.getTime() + DEFAULT_DELEGATION_WINDOW_MS).toISOString(),
   };
 
-  // 3. The guards this function owns. Hop limit, daily cap, no-new-information,
-  // oscillation — the graph (who may ask whom) was already checked by the gate
-  // before `requestHelp` was ever called, and idempotency is `writeEnvelope`'s
-  // own unique constraint, checked in step 4 below.
+  // 3. The guards this function owns. Hop limit, daily cap, idempotency,
+  // no-new-information, oscillation — the graph (who may ask whom) was
+  // already checked by the gate before `requestHelp` was ever called.
   const hopDenial = hopGuard(parentHops);
   if (hopDenial !== null) return { status: 'refused', ...hopDenial };
 
@@ -355,6 +355,31 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
   if (capDenial !== null) return { status: 'refused', ...capDenial };
 
   const refsHash = contextRefsHash(input.contextRefs);
+
+  // Guard 3, and it runs BEFORE guard 4 on purpose — see
+  // `loadEnvelopeByIdempotencyKey`'s own docblock for the defect this
+  // ordering fixes. A `parked` step (`execute.ts`) writes no completion row,
+  // so a resumed run's retry of THIS SAME request computes the identical
+  // idempotency key the first, successful call already wrote; guard 4 would
+  // refuse it as "you already asked this" before this more specific answer —
+  // "you already asked this, and here is the child it opened" — ever ran.
+  const idempotencyKey = canonicalHash({
+    correlationId,
+    from: input.from,
+    to: input.to,
+    intent: input.intent,
+    contextRefsHash: refsHash,
+    payload: parsedPayload.data,
+  });
+  const alreadyAnswered = await loadEnvelopeByIdempotencyKey(idempotencyKey, { businessId });
+  if (alreadyAnswered !== null) {
+    return {
+      status: 'duplicate',
+      envelopeId: alreadyAnswered.envelope.id,
+      childJobId: alreadyAnswered.childJobId,
+    };
+  }
+
   const prior = await priorQuadruples(correlationId, { businessId });
   const noInfoDenial = noNewInformationGuard(
     { from: input.from, to: input.to, intent: input.intent, contextRefsHash: refsHash },
@@ -405,14 +430,9 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
     contextRefs: input.contextRefs,
     constraints,
     hops: parentHops + 1,
-    idempotencyKey: canonicalHash({
-      correlationId,
-      from: input.from,
-      to: input.to,
-      intent: input.intent,
-      contextRefsHash: refsHash,
-      payload: parsedPayload.data,
-    }),
+    // Computed once, above, and reused here — it is also the value guard 3
+    // just looked up and found nothing under.
+    idempotencyKey,
     createdAt: now.toISOString(),
   };
 

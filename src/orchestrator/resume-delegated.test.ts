@@ -184,11 +184,50 @@ describe('resumeDelegatedJobs', () => {
 
     const result = await resumeDelegatedJobs({ businessId: BUSINESS });
     expect(result.resumed).toEqual([good.parentJobId]);
-    expect(result.errored).toEqual([bad.parentJobId]);
+    expect(result.errored).toEqual([{ jobId: bad.parentJobId, error: expect.any(String) }]);
+    expect(result.errored[0]?.error).toContain('does not exist');
 
     // The good parent actually woke, despite running in the same pass as the
     // corrupted one.
     const goodParent = await loadJob(good.parentJobId, { businessId: BUSINESS });
     expect(goodParent?.phase).toBe('execute');
+
+    // The bad parent is not left parked forever: `wakeDueJobs` never looks at
+    // `awaiting_envelope_id`, so this function is its only possible mover —
+    // left merely `errored`, it would sort first under `ORDER BY updated_at
+    // ASC` on every subsequent pass and eventually starve the whole window
+    // (the same fix `run-due.ts` already makes for an unbound job).
+    const badParent = await loadJob(bad.parentJobId, { businessId: BUSINESS });
+    expect(badParent?.phase).toBe('failed');
+  });
+
+  /**
+   * A value that cannot be read is never a permitting value — the same rule
+   * `amount_unreadable` enforces for money. `Date.parse` on a mangled
+   * `deadlineAt` returns `NaN`, and `NaN <= now.getTime()` is always `false`;
+   * left unchecked, an unreadable deadline reads as "still inside the
+   * window" and the parent is skipped silently, with no timeout and no
+   * `errored` line, forever.
+   */
+  it('fails a parent outright rather than treating an unreadable deadline as still inside the window', async () => {
+    const { parentJobId } = await openDelegation();
+    // The child is left running — the branch this bug hides in only matters
+    // when there is no terminal phase to decide the outcome outright.
+    const parent = await loadJob(parentJobId, { businessId: BUSINESS });
+    if (parent?.awaitingEnvelopeId == null) throw new Error('expected an awaiting envelope id');
+    await getPool().query(
+      `UPDATE agent_envelopes SET constraints = jsonb_set(constraints, '{deadlineAt}', '"not-a-date"')
+        WHERE business_id = $1 AND envelope_id = $2`,
+      [BUSINESS, parent.awaitingEnvelopeId],
+    );
+
+    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    expect(result.errored).toEqual([{ jobId: parentJobId, error: expect.any(String) }]);
+    expect(result.errored[0]?.error).toContain('unreadable deadline');
+    expect(result.timedOut).toEqual([]);
+    expect(result.resumed).toEqual([]);
+
+    const failedParent = await loadJob(parentJobId, { businessId: BUSINESS });
+    expect(failedParent?.phase).toBe('failed');
   });
 });

@@ -8,6 +8,8 @@ import { installCharter } from '../charter/store.js';
 import { compileCharter } from '../charter/compile.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { Plan } from '../domain/plan.js';
+import type { AgentEnvelope } from '../domain/envelope.js';
+import { attachChildJob, loadEnvelope, writeEnvelope } from '../governance/envelope-store.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { envCredentials } from './credentials.js';
 import { runPlan } from './run-plan.js';
@@ -609,6 +611,72 @@ describe('the local tool executor', () => {
 
       const child = await loadJob(out['childJobId'] as string, { businessId: BUSINESS });
       expect(child?.phase).toBe('execute');
+    });
+
+    /**
+     * Fix round 1, Important 4. `loadEnvelopeForChildJob` had no test at all:
+     * both cases above use a root parent, so the lookup returns `null`
+     * either way and a mutation replacing the real call with a literal
+     * `null` would leave the whole suite green. This seeds a MIDDLE job that
+     * is itself governed by a real ancestor envelope (strict constraints,
+     * `hops: 3`) and asserts a delegation opened FROM that job inherits the
+     * ancestor's values — never `ROOT_ANCESTOR_CONSTRAINTS`'s permissive
+     * defaults, and never `hops: 0`, which would reset the correlation both
+     * anti-ping-pong guards scope by.
+     */
+    it("inherits the ancestor envelope governing the CURRENT job, not a root baseline", async () => {
+      const { jobId: middleJobId, bundle } = await parentJobInExecute();
+
+      // Strictly tighter than anything `requestHelp` would derive on its own
+      // for this call (provenance `boss`, autonomy `auto`, no money cap, a
+      // 24h deadline) — so every field surviving in the grandchild's envelope
+      // proves the ancestor was actually read, not merely defaulted.
+      const strictDeadline = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      const ancestorEnvelope: AgentEnvelope = {
+        v: 1,
+        id: `ENV-${ulid()}`,
+        correlationId: 'JOB-root-of-the-tree',
+        causalChain: ['ENV-earlier'],
+        from: 'sched.meetings',
+        to: 'comms.email',
+        kind: 'help_request',
+        intent: 'an_earlier_intent',
+        payload: {},
+        contextRefs: [],
+        constraints: {
+          charterVersion: bundle.charterVersion,
+          provenanceCeiling: 'unknown_external',
+          autonomyCeiling: 'draft_only',
+          moneyCeilingMinor: 100,
+          deadlineAt: strictDeadline,
+        },
+        hops: 3,
+        idempotencyKey: `IDEM-${ulid()}`,
+        createdAt: new Date().toISOString(),
+      };
+      await writeEnvelope(ancestorEnvelope, { parentJobId: 'JOB-some-grandparent', businessId: BUSINESS });
+      await attachChildJob(ancestorEnvelope.id, middleJobId, { businessId: BUSINESS });
+
+      const documentId = `DOC-${ulid()}`;
+      const out = await runLocalTool(
+        'agent.request_help',
+        {
+          to: 'know.reader',
+          intent: 'read_for_question',
+          payload: { question: 'מה המסמך הזה מבקש?' },
+          contextRefs: [{ kind: 'document', documentId }],
+        },
+        { jobId: middleJobId, businessId: BUSINESS, bundle, agent: 'comms.email' },
+      );
+
+      expect(out['status']).toBe('delegated');
+      const envelope = await loadEnvelope(out['envelopeId'] as string, { businessId: BUSINESS });
+      expect(envelope?.hops).toBe(4); // ancestor's 3 + 1, never 0 + 1
+      expect(envelope?.correlationId).toBe('JOB-root-of-the-tree'); // inherited, not middleJobId
+      expect(envelope?.constraints.provenanceCeiling).toBe('unknown_external');
+      expect(envelope?.constraints.autonomyCeiling).toBe('draft_only');
+      expect(envelope?.constraints.moneyCeilingMinor).toBe(100);
+      expect(envelope?.constraints.deadlineAt).toBe(strictDeadline);
     });
 
     /**

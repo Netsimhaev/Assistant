@@ -53,6 +53,17 @@ function logErrored(result: SchedulerPassResult): void {
   if (result.scanError !== null) {
     console.error(`document inbox scan failed: ${result.scanError}`);
   }
+  // Delegation resumption's own buckets, same rule: a parent moved to
+  // `failed` over corrupted bookkeeping (`resume-delegated.ts`'s
+  // `failCorruptedParent`) or a parent freed only because its envelope's
+  // deadline ran out are both facts an operator needs to see, not just a
+  // count nobody reads.
+  for (const parent of result.delegated.errored) {
+    console.error(`delegation parent ${parent.jobId} errored: ${parent.error}`);
+  }
+  for (const jobId of result.delegated.timedOut) {
+    console.error(`delegation parent ${jobId} woke on its envelope's deadline — its child never answered`);
+  }
   for (const job of result.due.errored) {
     console.error(`job ${job.jobId} errored: ${job.error}`);
   }
