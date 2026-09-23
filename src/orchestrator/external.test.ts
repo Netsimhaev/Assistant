@@ -13,6 +13,8 @@ import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import type { AdapterCall, AdapterResult, ExternalAdapter } from './adapters/types.js';
 import { upsertBinding } from './bindings.js';
 import { envCredentials } from './credentials.js';
+import type { CredentialSource } from './credentials.js';
+import { createCredentialHandle } from './adapters/types.js';
 import { runPlan, runPlanForJob } from './run-plan.js';
 
 const BUSINESS = 'test-business';
@@ -414,6 +416,80 @@ describe('a plan reaches a real external system', () => {
     if (result.status !== 'halted') throw new Error('unreachable');
     expect(result.reason).toBe('credential_unavailable');
     expect(sent).toEqual([]);
+  });
+});
+
+/**
+ * `CredentialSource.resolve` takes the business as a REQUIRED second argument
+ * with no default anywhere on the path, and `runPlan` is its only production
+ * caller — it holds `job.businessId` and passes it on. Nothing observed that
+ * until this stub existed.
+ *
+ * **This is the finding, and it is worth the docblock.** Every other test in
+ * this file — and in `run-due`, `ramp-raise`, `scheduler-runs-plans` and
+ * `resume-plan` — injects `envCredentials`, whose `resolve` takes
+ * `_businessId` and ignores it by construction: it reads one shared process
+ * environment with no per-business partition at all. So replacing
+ * `request.job.businessId` in `run-plan.ts` with a wrong literal felled zero
+ * of forty-six tests. A signature that cannot be observed is a signature
+ * nothing holds up, and the same shape already bit this branch once, where a
+ * test for the query's business filter was in fact being satisfied by the
+ * cipher's AAD binding.
+ *
+ * So this source records what it was asked for and answers everything. The
+ * assertion is the pass-through itself: the business the step resolved under
+ * is the business on the job's own row, not a default and not another
+ * customer's.
+ */
+function recordingCredentials(): {
+  calls: { ref: string; businessId: string }[];
+  source: CredentialSource;
+} {
+  const calls: { ref: string; businessId: string }[] = [];
+  return {
+    calls,
+    source: {
+      async resolve(ref: string, businessId: string) {
+        calls.push({ ref, businessId });
+        return createCredentialHandle(ref, 'pw');
+      },
+    },
+  };
+}
+
+describe("a credential is resolved under the job's own business", () => {
+  it("passes the job's businessId to the credential source, not a default", async () => {
+    const bundle = await installCharter(
+      buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'b.com' }),
+      { businessId: BUSINESS },
+    );
+    const job = await jobInExecute(bundle);
+    const { sent, registry } = recording();
+    const { calls, source } = recordingCredentials();
+
+    const result = await runPlan({
+      job,
+      bundle,
+      plan: mailPlan(),
+      registry,
+      bindings: [LIVE],
+      credentials: source,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    // The step must actually have run. A plan the gate refused earlier would
+    // resolve no credential at all, and `calls` would be empty for a reason
+    // that has nothing to do with what this test claims to cover — the
+    // negative-test trap this project has been bitten by three times.
+    expect(result.status).toBe('done');
+    expect(sent).toHaveLength(1);
+
+    expect(calls).toEqual([{ ref: 'OFFICE_MAIL', businessId: job.businessId }]);
+    // Named explicitly, so a future change to the fixture's business id
+    // cannot quietly make the line above compare two defaults to each other.
+    expect(job.businessId).toBe(BUSINESS);
   });
 });
 
