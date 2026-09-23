@@ -56,21 +56,40 @@ afterAll(async () => {
   await closePool();
 });
 
-/** Every text-bearing column of every `audit_log` row, concatenated. */
+/**
+ * Every column of every `audit_log` row, concatenated — with the column list
+ * read out of `information_schema`, never written here.
+ *
+ * This used to hand-list seventeen columns, which made the claim below ("no
+ * audit row contains the value") quietly narrower than it reads: a column
+ * added to `audit_log` next year would sit outside the scan and the test
+ * would stay green. `src/governance/erasure-invariants.test.ts` solves the
+ * identical problem the identical way, and for the identical reason — the
+ * dangerous gap is the place nobody thought of, so the schema has to be the
+ * thing describing itself.
+ *
+ * Every column, not only the text-typed ones: this is a small table in a
+ * freshly reset database, `::text` renders all of them, and a secret landing
+ * in a column nobody expected to be text-shaped is exactly the surprise worth
+ * catching.
+ */
 async function allAuditText(): Promise<string> {
-  const { rows } = await getPool().query<{ blob: string }>(
-    `SELECT string_agg(
-       coalesce(business_id,'') || '|' || coalesce(job_id,'') || '|' ||
-       coalesce(envelope_id,'') || '|' || coalesce(actor,'') || '|' ||
-       coalesce(on_behalf_of,'') || '|' || coalesce(kind,'') || '|' ||
-       coalesce(action_class,'') || '|' || coalesce(charter_version,'') || '|' ||
-       coalesce(provenance,'') || '|' || coalesce(risk::text,'') || '|' ||
-       coalesce(input_hash,'') || '|' || coalesce(output_hash,'') || '|' ||
-       coalesce(artifacts::text,'') || '|' || coalesce(tokens::text,'') || '|' ||
-       coalesce(reason,'') || '|' || coalesce(prev_hash,'') || '|' || coalesce(hash,''),
-       E'\n'
-     ) AS blob
-     FROM audit_log`,
+  const db = getPool();
+  const { rows: columns } = await db.query<{ column_name: string }>(
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'audit_log'
+      ORDER BY ordinal_position`,
+  );
+  // A scan over zero columns finds nothing and passes for the wrong reason —
+  // the same vacuous-green failure mode `erasure-invariants.test.ts` guards
+  // against. Seventeen today; this only has to stay comfortably above zero.
+  expect(columns.length).toBeGreaterThan(10);
+
+  const expression = columns
+    .map((column) => `coalesce("${column.column_name}"::text,'')`)
+    .join(" || '|' || ");
+  const { rows } = await db.query<{ blob: string }>(
+    `SELECT string_agg(${expression}, chr(10)) AS blob FROM audit_log`,
   );
   return rows[0]?.blob ?? '';
 }
@@ -218,7 +237,15 @@ describe('runSecretCli', () => {
     await runSecretCli(['test', REF, OPERATOR], { log: () => {}, readSecret: reads('unused') });
     await runSecretCli(['remove', REF, OPERATOR], { log: () => {}, readSecret: reads('unused') });
 
-    expect(await allAuditText()).not.toContain(SECRET);
+    const blob = await allAuditText();
+
+    // The positive half, without which the line below passes just as well on
+    // an empty scan: the sweep is demonstrably reading real rows, and the
+    // things that BELONG in an audit row are in it.
+    expect(blob).toContain(OPERATOR);
+    expect(blob).toContain(REF);
+
+    expect(blob).not.toContain(SECRET);
   });
 
   it('refuses an unknown command and names the valid ones', async () => {
