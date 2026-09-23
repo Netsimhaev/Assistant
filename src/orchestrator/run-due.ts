@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
+import { loadEnvelopeForChildJob } from '../governance/envelope-store.js';
 import { loadJob, transition } from './jobs.js';
 import { loadPlanBody } from './plan-store.js';
 import { rampLevelForPlan } from './ramp.js';
@@ -240,6 +241,15 @@ export async function runDueJobs(
 
         const rampLevel = await rampLevelForPlan(stored.plan, { businessId });
 
+        // A hard cap this job inherited from the envelope that opened it as a
+        // delegation's child — `null` for an ordinary root job nothing ever
+        // delegated into. Folded into every step's `GateContext.autonomyCeiling`
+        // so "constraints tighten monotonically down a delegation chain" is
+        // true of what gets ENFORCED, not merely of what gets stored: without
+        // this lookup the ceiling `requestHelp` wrote onto the envelope has no
+        // reader in production at all.
+        const governingEnvelope = await loadEnvelopeForChildJob(job.jobId, { businessId });
+
         const outcome = await runPlanForJob({
           job,
           bundle: active.bundle,
@@ -254,6 +264,9 @@ export async function runDueJobs(
           ...(runtime.notify !== undefined ? { notify: runtime.notify } : {}),
           ...(options.now !== undefined ? { now: options.now } : {}),
           ...(options.reader !== undefined ? { reader: options.reader } : {}),
+          ...(governingEnvelope !== null
+            ? { autonomyCeiling: governingEnvelope.constraints.autonomyCeiling }
+            : {}),
         });
 
         if (outcome.status === 'rejected') {

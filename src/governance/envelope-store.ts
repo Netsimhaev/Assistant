@@ -287,6 +287,42 @@ export async function delegationsToday(
 }
 
 /**
+ * The envelope that opened this job as a delegation's child — `null` for an
+ * ordinary root job nothing ever delegated into.
+ *
+ * Backed by `agent_envelopes_child_idx` (`business_id, child_job_id`),
+ * migration 028's own comment on which names `resumeDelegatedJobs` as the
+ * reader. Task 7 gives it two readers instead: `runDueJobs`, which — before
+ * running a job's step — asks whether some envelope governs it at all, so
+ * `constraints.autonomyCeiling` can be folded into `GateContext.autonomyCeiling`
+ * instead of a hard cap the envelope carries being silently dropped on the
+ * floor; and `agent.request_help`'s own handler (`orchestrator/local-tools.ts`),
+ * which asks the same question about the CURRENT job before it opens a
+ * second-hop delegation, so a child that itself delegates inherits from its
+ * real ancestor rather than being treated as a fresh root.
+ * `resumeDelegatedJobs` itself does not need this: it starts from the PARENT
+ * side, via `jobs.awaiting_envelope_id`, and reaches the envelope by its
+ * primary key instead.
+ */
+export async function loadEnvelopeForChildJob(
+  childJobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<AgentEnvelope | null> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<EnvelopeRow>(
+    `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
+            intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
+            child_job_id
+       FROM agent_envelopes
+      WHERE business_id = $1 AND child_job_id = $2`,
+    [businessId, childJobId],
+  );
+  const row = rows[0];
+  return row ? toEnvelope(row) : null;
+}
+
+/**
  * Fill in the child job a `help_request` envelope spawned, once the
  * orchestrator has actually created it. This is the column Task 7's
  * `resumeDelegatedJobs` will read (via `agent_envelopes_child_idx`) to find

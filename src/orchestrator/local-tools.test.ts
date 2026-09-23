@@ -558,4 +558,111 @@ describe('the local tool executor', () => {
       }
     });
   });
+
+  /**
+   * `agent.request_help` — the tool that opens a delegation. Until Task 7 it
+   * had no implementation at all: a plan naming it landed here and got
+   * `{ performed: false, reason: 'not_implemented' }`, and `requestHelp`
+   * (built in Task 6) had no production caller.
+   */
+  describe('agent.request_help', () => {
+    async function parentJobInExecute(): Promise<{ jobId: string; bundle: ReturnType<typeof compileCharter> }> {
+      const bundle = await installCharter(buildCharter({ version: `req-help-${ulid()}` }), {
+        businessId: BUSINESS,
+      });
+      const job = await createJob({
+        charterVersion: bundle.charterVersion,
+        provenance: 'boss',
+        businessId: BUSINESS,
+        title: 'delegating job',
+      });
+      for (const to of ['understand', 'plan', 'execute'] as const) {
+        await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      }
+      return { jobId: job.jobId, bundle };
+    }
+
+    it('opens a child job, parks the parent, and reports itself as parked', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+
+      const out = await runLocalTool(
+        'agent.request_help',
+        {
+          to: 'know.reader',
+          intent: 'read_for_question',
+          payload: { question: 'מה המסמך הזה מבקש?' },
+          contextRefs: [{ kind: 'document', documentId }],
+        },
+        { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' },
+      );
+
+      expect(out['performed']).toBe(true);
+      expect(out['status']).toBe('delegated');
+      expect(out['parked']).toBe(true);
+      expect(typeof out['childJobId']).toBe('string');
+      expect(typeof out['envelopeId']).toBe('string');
+
+      const parent = await loadJob(jobId, { businessId: BUSINESS });
+      expect(parent?.phase).toBe('followup');
+      expect(parent?.awaitingEnvelopeId).toBe(out['envelopeId']);
+
+      const child = await loadJob(out['childJobId'] as string, { businessId: BUSINESS });
+      expect(child?.phase).toBe('execute');
+    });
+
+    /**
+     * The integration Piece B exists for: `runPlan` must not throw trying to
+     * move a job `requestHelp` already moved out from under it. Before the
+     * `parked` outcome, `executeStep` would try `verify` next on a job
+     * already sitting in `followup`, and `LEGAL_TRANSITIONS` has no
+     * `followup → verify` — an illegal-transition throw, not a clean halt.
+     */
+    it('runs through runPlan as a "parked" halt, not a "done" step — and does not try to move the job a second time', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+      const plan = Plan.parse({
+        goal: 'ask know.reader to read the document',
+        steps: [
+          {
+            id: 's1',
+            agent: 'comms.email',
+            intent: 'delegate',
+            toolName: 'agent.request_help',
+            input: {
+              to: 'know.reader',
+              intent: 'read_for_question',
+              payload: { question: 'מה המסמך הזה מבקש?' },
+              contextRefs: [{ kind: 'document', documentId }],
+            },
+            dependsOn: [],
+            expectedActionClass: 'agent.delegate',
+          },
+        ],
+      });
+      const job = await loadJob(jobId, { businessId: BUSINESS });
+      if (job === null) throw new Error('job vanished');
+
+      const result = await runPlan({
+        job,
+        bundle,
+        plan,
+        registry: new AdapterRegistry([]),
+        bindings: [],
+        credentials: envCredentials({}, 'TEST_CRED_'),
+        counterpartyTags: [],
+        rampLevel: 'auto',
+      });
+
+      expect(result.status).toBe('halted');
+      if (result.status !== 'halted') throw new Error('expected halted');
+      expect(result.reason).toBe('parked');
+      expect(result.steps).toHaveLength(1);
+      expect(result.steps[0]?.outcome.status).toBe('parked');
+
+      const parent = await loadJob(jobId, { businessId: BUSINESS });
+      expect(parent?.phase).toBe('followup');
+      expect(parent?.awaitingEnvelopeId).not.toBeNull();
+    });
+  });
 });

@@ -92,6 +92,16 @@ export interface RunPlanRequest {
    * leave this unset and `readDocument` falls back to `runKnowReader`.
    */
   reader?: (request: ReadRequest) => Promise<ReadOutcome>;
+  /**
+   * The hard cap carried by the envelope that opened THIS JOB as a
+   * delegation's child, forwarded to every step's `GateContext.autonomyCeiling`.
+   *
+   * `runPlan` does not look this up itself — `run-due.ts` does, because it is
+   * the party that already knows which job it is about to run and can ask
+   * `agent_envelopes` (via `loadEnvelopeForChildJob`) whether some envelope
+   * governs it. Absent for a root job no delegation ever opened.
+   */
+  autonomyCeiling?: AutonomyLevel;
 }
 
 /**
@@ -374,6 +384,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       ...(approvalId !== null ? { approvalId } : {}),
       ...(request.notify !== undefined ? { notify: request.notify } : {}),
       ...(provenanceChainDerived ? { provenanceChainDerived } : {}),
+      ...(request.autonomyCeiling !== undefined ? { autonomyCeiling: request.autonomyCeiling } : {}),
     });
     records.push({
       stepId: step.id,
@@ -481,13 +492,25 @@ async function performStep(
       // Only `doc.fetch` reads these today (readDocument needs the active
       // charter to build its prompt, and `reader` is the seam a test drives
       // instead of a live model call); every other local handler ignores
-      // both.
+      // both. `agent` is `agent.request_help`'s: it is `requestHelp`'s `from`,
+      // the requesting agent recorded on the envelope — and it comes from the
+      // step, not from any part of the payload a hostile document could
+      // shape.
       bundle: request.bundle,
+      agent: step.agent,
       ...(request.reader !== undefined ? { reader: request.reader } : {}),
     });
     // No `externalId`: nothing outside the instance issued a handle, and
     // inventing one would tell `verify` it had a far end to ask.
-    return { output, externalId: null };
+    //
+    // `output.parked` is `agent.request_help`'s signal that `requestHelp`
+    // already moved this job's phase itself — see `StepEffect.parked`'s own
+    // docblock. Every other local handler's result never carries this key.
+    return {
+      output,
+      externalId: null,
+      ...(output['parked'] === true ? { parked: true } : {}),
+    };
   }
 
   // Routed by the payload the gate actually judged, not by the one the plan

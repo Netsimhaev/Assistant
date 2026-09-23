@@ -35,11 +35,14 @@
 import { z } from 'zod';
 import { config } from '../config.js';
 import type { Queryable } from '../db/pool.js';
+import { AgentId } from '../domain/audit.js';
 import { SafeLookupKey } from '../domain/charter.js';
+import { ContextRef } from '../domain/envelope.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { readDocument } from '../documents/read.js';
 import { readingsToday } from '../documents/store.js';
 import type { ReadOutcome, ReadRequest } from '../sdk/know-reader.js';
+import { loadEnvelopeForChildJob } from '../governance/envelope-store.js';
 import {
   recallMemories,
   retireMemories,
@@ -47,6 +50,7 @@ import {
   type MemoryKind,
   type MemoryRecord,
 } from '../memory/store.js';
+import { requestHelp } from './delegate.js';
 import { loadJob } from './jobs.js';
 import { StepChannelError } from './step-error.js';
 
@@ -69,6 +73,14 @@ export interface LocalToolContext {
    * omitted.
    */
   reader?: (request: ReadRequest) => Promise<ReadOutcome>;
+  /**
+   * The agent this step runs as — required by `agent.request_help` (it is
+   * `requestHelp`'s `from`, the requesting agent recorded on the envelope)
+   * and read by nothing else today. Optional here so every test that
+   * predates delegation, and every handler that has no use for it, is
+   * unaffected.
+   */
+  agent?: AgentId;
 }
 
 /** What a local handler returns — the value that lands in the step's record. */
@@ -145,6 +157,26 @@ const RecallInput = z.object({
 const DocFetchInput = z.object({
   documentId: SafeLookupKey,
   question: z.string().min(1).max(500).optional(),
+});
+
+/**
+ * `agent.request_help`'s own payload. **The field naming the target agent
+ * must be `to`** — `delegationProblems` (`governance/delegation.ts`) and the
+ * gate's own stage-3 check (`policy/engine.ts`) both read `step.input['to']`
+ * directly off the plan step, before this handler ever runs; a planner that
+ * named it anything else would pass neither check and never reach here at
+ * all, but a handler that parsed a differently-named field would silently
+ * agree with a planner that got it wrong.
+ *
+ * `contextRefs` is optional and defaults to `[]` — most intents need none,
+ * and `resolveIntent`'s own `requiresContextRef` is what actually decides
+ * whether that is fatal, inside `requestHelp` itself.
+ */
+const RequestHelpToolInput = z.object({
+  to: AgentId,
+  intent: z.string().min(1).max(200),
+  payload: z.unknown().optional(),
+  contextRefs: z.array(ContextRef).optional(),
 });
 
 /** Fails the step with the field that was wrong, never a bare "invalid". */
@@ -374,6 +406,131 @@ const HANDLERS: Record<string, LocalHandler> = {
         return { performed: true, status: 'read', reading: outcome.reading, cached: outcome.cached };
     }
   },
+
+  /**
+   * The one plan step that opens a delegation. `agent.request_help` reaches
+   * nothing outside the instance — the child it opens runs like any other
+   * job, through the full gate — so it is a local tool, and this is what was
+   * missing since Task 6 built `requestHelp` and nothing in production ever
+   * called it: a plan naming this tool landed here and got
+   * `{ performed: false, reason: 'not_implemented' }`.
+   *
+   * **This handler can itself move `ctx.jobId`'s phase, and that is not a
+   * bug to route around.** `requestHelp` parks the parent `execute →
+   * followup` on the happy path, and its own oscillation guard — the one
+   * guard that fails the REQUESTER rather than merely refusing — moves it
+   * `execute → failed` directly. Either way the job this handler is running
+   * inside of is no longer in the phase `executeStep` found it in, and the
+   * `parked: true` this returns is what tells `executeStep` not to try to
+   * move it a second time (`StepEffect.parked`).
+   *
+   * **`parentEnvelope` is derived, never trusted from the payload.** A
+   * hostile document cannot claim an ancestry it does not have — the same
+   * reasoning `requestHelp` itself applies to `input.parentEnvelope` by
+   * re-verifying it against the stored row rather than the caller's object.
+   * Here that starts one step earlier: this handler asks `agent_envelopes`
+   * directly (`loadEnvelopeForChildJob`, keyed on `ctx.jobId` — the CURRENT
+   * job, which may itself be a delegation's child) rather than accepting an
+   * envelope id as part of the tool's payload at all, so a second-hop
+   * delegation inherits from its real ancestor and a root job gets `null`.
+   */
+  'agent.request_help': async (input, ctx) => {
+    const parsed = parseOrFail(RequestHelpToolInput, input, 'agent.request_help');
+    if (ctx.bundle === undefined) {
+      throw new Error('runLocalTool: agent.request_help requires ctx.bundle (the active charter)');
+    }
+    if (ctx.agent === undefined) {
+      throw new Error('runLocalTool: agent.request_help requires ctx.agent (the requesting agent)');
+    }
+    const dbOpts = { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) };
+
+    const parentEnvelope = await loadEnvelopeForChildJob(ctx.jobId, dbOpts);
+
+    const result = await requestHelp({
+      parentJobId: ctx.jobId,
+      from: ctx.agent,
+      to: parsed.to,
+      intent: parsed.intent,
+      payload: parsed.payload ?? {},
+      contextRefs: parsed.contextRefs ?? [],
+      bundle: ctx.bundle,
+      parentEnvelope,
+      businessId: ctx.businessId,
+    });
+
+    if (result.status === 'opened') {
+      return {
+        performed: true,
+        status: 'delegated',
+        envelopeId: result.envelopeId,
+        childJobId: result.childJobId,
+        parked: true,
+      };
+    }
+
+    if (result.status === 'duplicate') {
+      if (result.childJobId === null) {
+        // The crash window `requestHelp`'s own docblock names: the envelope
+        // committed but no child was ever attached. Not this step's repair to
+        // make — retryable, so the scheduler's own retry loop comes back
+        // rather than this failing the job outright over a window an
+        // operator (or a future pass) may yet close with `attachChildJob`.
+        throw new StepChannelError(
+          'delegation_orphaned',
+          `envelope ${result.envelopeId} has no child job attached`,
+          true,
+        );
+      }
+      const child = await loadJob(result.childJobId, dbOpts);
+      if (child === null) {
+        throw new Error(
+          `runLocalTool: agent.request_help's child ${result.childJobId} does not exist`,
+        );
+      }
+      if (child.phase === 'closed' || child.phase === 'failed' || child.phase === 'halted') {
+        // A resumed run hitting the same step again, after
+        // `resumeDelegatedJobs` already freed this job — the child has an
+        // answer, and this step completes normally (not `parked`: nothing
+        // here moves the job, `executeStep` records this as `done` and moves
+        // on like any other step).
+        return {
+          performed: true,
+          status: 'answered',
+          envelopeId: result.envelopeId,
+          childJobId: result.childJobId,
+          outcome: child.phase === 'closed' ? 'succeeded' : 'failed',
+        };
+      }
+      // The child has not finished yet, and this is not the call that opened
+      // it (that one already parked the job on the first pass). Retryable,
+      // exactly like any other pending external call.
+      throw new StepChannelError(
+        'delegation_pending',
+        `child job ${result.childJobId} has not reached a terminal phase yet`,
+        true,
+      );
+    }
+
+    // result.status === 'refused'. Most refusals leave `ctx.jobId` exactly
+    // where `executeStep` found it (`execute`), and the thrown error below is
+    // what lets `executeStep`'s own catch block fail it normally. The
+    // oscillation guard is the one exception — it already moved the job to
+    // `failed` itself (see this handler's own docblock) — so that one case is
+    // reported as `parked` instead of thrown, or `executeStep` would try to
+    // fail an already-failed job and hit `LEGAL_TRANSITIONS`'s empty entry for
+    // it.
+    const after = await loadJob(ctx.jobId, dbOpts);
+    if (after !== null && after.phase !== 'execute') {
+      return {
+        performed: false,
+        status: 'refused',
+        code: result.code,
+        reason: result.reason,
+        parked: true,
+      };
+    }
+    throw new StepChannelError(`delegation_refused:${result.code}`, result.reason, false);
+  },
 };
 
 /** The tools this executor actually performs. Exported for the invariant test. */
@@ -441,6 +598,14 @@ export const LOCAL_TOOL_CONTRACTS: readonly { toolName: string; payload: string 
     payload:
       '`{"documentId": מזהה המסמך, "question": טקסט (רשות, עדיין לא נקרא)}` — ' +
       'לא נקרא ישירות על ידי תוכנית; זה הכלי שהצעד היחיד של משימת-בת בהאצלה קורא לו.',
+  },
+  {
+    toolName: 'agent.request_help',
+    payload:
+      '`{"to": מזהה הסוכן שממנו מבקשים עזרה, "intent": שם הכוונה שהוא תומך בה, ' +
+      '"payload": אובייקט לפי סכמת אותה כוונה, "contextRefs": מערך מצביעים (רשות), ' +
+      'למשל `[{"kind":"document","documentId": מזהה המסמך}]`}` — ' +
+      'שם השדה חייב להיות בדיוק `to`; זה השדה שגם השער וגם בדיקת התוכנית קוראים.',
   },
 ];
 
