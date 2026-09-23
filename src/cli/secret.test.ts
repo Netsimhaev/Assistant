@@ -124,6 +124,7 @@ describe('runSecretCli', () => {
     await runSecretCli(['put', REF, OPERATOR], { log, readSecret: reads(SECRET) });
     await runSecretCli(['list', OPERATOR], { log, readSecret: reads('unused') });
     await runSecretCli(['test', REF, OPERATOR], { log, readSecret: reads('unused') });
+    await runSecretCli(['remove', REF, OPERATOR], { log, readSecret: reads('unused') });
 
     for (const line of lines) {
       expect(line).not.toContain(SECRET);
@@ -146,6 +147,53 @@ describe('runSecretCli', () => {
     // The two outcomes must actually read differently — otherwise "reports
     // whether it resolves" would be a report that never changes.
     expect(found.lines.join('\n')).not.toBe(missing.lines.join('\n'));
+  });
+
+  /**
+   * The middle of the three audit cases: a resolve that FAILS is the
+   * interesting event (a misspelled ref, or someone probing), so `test`
+   * must write a row on that outcome exactly as it does on success — not
+   * only when there is good news to record.
+   */
+  it('audits a test resolve that fails to resolve, not only one that succeeds', async () => {
+    const before = await getPool().query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM audit_log WHERE kind = 'credential_change'`,
+    );
+
+    await runSecretCli(['test', 'NEVER_STORED', OPERATOR], {
+      log: () => {},
+      readSecret: reads('unused'),
+    });
+
+    const after = await getPool().query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM audit_log WHERE kind = 'credential_change'`,
+    );
+    expect(Number(after.rows[0]?.n)).toBe(Number(before.rows[0]?.n) + 1);
+  });
+
+  /**
+   * `deps.businessId` follows `set-ramp.ts`'s convention
+   * (`deps.businessId ?? config.businessId`) — but unlike a ramp level, a
+   * secret written under the wrong business is a secret another customer's
+   * `resolve` can reach (`credential-store.ts`'s own docblock). A one-line
+   * regression that ignored the passed business and always used
+   * `config.businessId` would pass every other test in this file.
+   */
+  it('stores the secret under the business passed in deps, not the configured default', async () => {
+    const OTHER_BUSINESS = 'other-business';
+    expect(OTHER_BUSINESS).not.toBe(config.businessId);
+
+    await runSecretCli(['put', REF, OPERATOR], {
+      log: () => {},
+      readSecret: reads(SECRET),
+      businessId: OTHER_BUSINESS,
+    });
+
+    const { rows } = await getPool().query<{ business_id: string; n: string }>(
+      `SELECT business_id, count(*)::text AS n FROM credentials WHERE ref = $1 GROUP BY business_id`,
+      [REF],
+    );
+    expect(rows).toEqual([{ business_id: OTHER_BUSINESS, n: '1' }]);
   });
 
   it('writes an audit row naming the business, the ref and the operator', async () => {
