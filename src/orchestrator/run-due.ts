@@ -134,7 +134,7 @@ export async function runDueJobs(
 ): Promise<RunDueResult> {
   const businessId = options.businessId ?? config.businessId;
   const limit = options.limit ?? 20;
-  const runtime = options.runtime ?? buildRuntime();
+  const runtime = options.runtime ?? (await buildRuntime());
 
   const { rows } = await getPool().query<DueJobRow>(
     `SELECT job_id FROM jobs

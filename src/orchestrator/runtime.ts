@@ -1,10 +1,11 @@
+import { storedCredentials } from '../governance/credential-store.js';
+import { loadMasterKey, MasterKeyError, verifyKeyState } from '../governance/master-key.js';
 import { createEmailNotifier } from '../governance/notify.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import { createSmtpTransport } from '../mail/transport.js';
 import { browserAdapter } from './adapters/browser.js';
 import { createMailAdapter } from './adapters/mail.js';
 import { AdapterRegistry } from './adapters/registry.js';
-import { envCredentials } from './credentials.js';
 import type { CredentialSource } from './credentials.js';
 
 /**
@@ -42,10 +43,36 @@ const SMTP_KEYS = [
   'SMTP_PASS',
 ] as const;
 
-export function buildRuntime(
+/**
+ * Assemble a production runtime.
+ *
+ * **Async because the master key is a file, and it is read here** — once, at
+ * startup, into process memory. Missing SMTP settings are a warning and the
+ * scheduler carries on, but a key that will not load is a REFUSAL: an
+ * installation running with no secrets produces failures that look like
+ * network trouble, one customer at a time, instead of one refusal an operator
+ * sees immediately (spec §4.2).
+ *
+ * `verifyKeyState` runs here for the same reason (spec §5.1). Without it, a
+ * replaced or damaged key file is discovered when a customer's mail fails at
+ * three in the morning, not when the process starts.
+ */
+export async function buildRuntime(
   env: Record<string, string | undefined> = process.env,
-): Runtime {
+): Promise<Runtime> {
   const warnings: string[] = [];
+
+  const keyPath = env['CREDENTIAL_KEY_PATH'];
+  if (keyPath === undefined || keyPath.length === 0) {
+    // A positive requirement, not a fallback. There is deliberately no
+    // default path and no "carry on without secrets" branch: either this
+    // installation has a key or it does not start.
+    throw new MasterKeyError(
+      'CREDENTIAL_KEY_PATH אינו מוגדר — אין מפתח לפתוח בו את הסודות, וההתקנה מסרבת לעלות',
+    );
+  }
+  const key = await loadMasterKey(keyPath);
+  await verifyKeyState(key);
 
   const missing = SMTP_KEYS.filter((key) => {
     const value = env[key];
@@ -121,7 +148,12 @@ export function buildRuntime(
 
   return {
     registry: new AdapterRegistry(systemAdapters, [browserAdapter]),
-    credentials: envCredentials(env),
+    // The encrypted store, never `envCredentials` — that one exists for tests
+    // and reads a single shared process environment with no per-business
+    // partition at all. `runtime.test.ts` locks this as a positive control
+    // rather than as a claim, because a component nobody uses is exactly the
+    // component someone wires by mistake (spec §3.4).
+    credentials: storedCredentials(key),
     ...(notify !== undefined ? { notify } : {}),
     warnings,
   };

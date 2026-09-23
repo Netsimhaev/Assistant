@@ -35,6 +35,9 @@ import { bindPlanToJob } from './plan-store.js';
 import { loadRampLevel, setRampLevel } from './ramp.js';
 import { schedulerPass } from './scheduler.js';
 import { evaluateAutonomy } from './promote.js';
+import { AdapterRegistry } from './adapters/registry.js';
+import { envCredentials } from './credentials.js';
+import type { Runtime } from './runtime.js';
 
 import type { Queryable } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
@@ -463,7 +466,16 @@ describe('the evaluation pass', () => {
 
     // `inbox: null` keeps both document-conductor loops off: this test is
     // about the autonomy pass, and the conductor's half costs money.
-    const pass = await schedulerPass({ businessId: BUSINESS, inbox: null });
+    // `buildRuntime` now reads the installation's master key file and
+    // refuses to build without one, so the lazy default would throw here.
+    // This pass is about the autonomy evaluation and touches no adapter and
+    // no credential, so it is handed an inert runtime rather than a key.
+    const inert: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, 'TEST_CRED_'),
+      warnings: [],
+    };
+    const pass = await schedulerPass({ businessId: BUSINESS, inbox: null, runtime: inert });
 
     expect(pass.autonomy.promoted).toContain('email.reply');
     expect(pass.autonomy.errored).toEqual([]);

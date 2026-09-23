@@ -9,6 +9,9 @@ import { createJob, loadJob, transition } from './jobs.js';
 import { executeStep } from './execute.js';
 import { startScheduler, tick } from './scheduler.js';
 import { applyDecision } from './resume.js';
+import { AdapterRegistry } from './adapters/registry.js';
+import { envCredentials } from './credentials.js';
+import type { Runtime } from './runtime.js';
 
 /**
  * What `perform` returns when a step produced nothing an adapter would hand
@@ -200,9 +203,20 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
   it('runs on an interval and stops cleanly', async () => {
     await install();
     const errors: unknown[] = [];
+    // `buildRuntime` now reads the installation's master key file and
+    // refuses to build without one, so a pass with no runtime would report
+    // that refusal through `onError` on every tick. This test is about the
+    // interval and the clean stop; it runs no plan and resolves no
+    // credential, so it is handed an inert runtime rather than a key.
+    const inert: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, 'TEST_CRED_'),
+      warnings: [],
+    };
     const handle = startScheduler({
       businessId: BUSINESS,
       intervalMs: 50,
+      runtime: inert,
       onError: (error) => errors.push(error),
     });
 

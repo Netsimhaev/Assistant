@@ -231,7 +231,7 @@ export async function schedulerPass(
   // Both conductor loops run after the tick's transaction has committed, not
   // inside it — see the docblock above.
   const inbox = options.inbox !== undefined ? options.inbox : config.documentInbox;
-  const runtime = options.runtime ?? buildRuntime();
+  const runtime = options.runtime ?? (await buildRuntime());
   let scan: ScanResult | null = null;
   let scanError: string | null = null;
   let conduct: ConductResult | null = null;

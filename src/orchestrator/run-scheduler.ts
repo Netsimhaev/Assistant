@@ -22,7 +22,7 @@ console.log(
   `scheduler starting for ${config.businessId}, every ${Math.round(intervalMs / 1000)}s`,
 );
 
-const runtime = buildRuntime();
+const runtime = await buildRuntime();
 for (const warning of runtime.warnings) console.warn(`warning: ${warning}`);
 
 // A job stuck in `execute` — one `runDueJobs` threw on, one with no plan

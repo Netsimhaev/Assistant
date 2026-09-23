@@ -87,6 +87,13 @@ const ACTING: Proposal = {
   },
 };
 
+/**
+ * `buildRuntime` reads the installation's master key file and refuses to
+ * build without one, so a test that is not about the runtime passes an
+ * explicit one rather than falling through to the lazy default — which would
+ * now throw. Nothing in these passes resolves a credential; `runtimeWith` is
+ * simply what "a runtime that is not the subject of this test" looks like.
+ */
 function runtimeWith(sent: MailMessage[]): Runtime {
   return {
     registry: new AdapterRegistry([
@@ -151,6 +158,7 @@ describe('schedulerPass and the conductor', () => {
       businessId: BUSINESS,
       inbox,
       documentRoot,
+      runtime: runtimeWith([]),
       // No reader injected: the pass must not call a model in this test, so
       // the ceiling is set to zero and only the scan runs.
       readsPerDay: 0,
@@ -197,7 +205,7 @@ describe('schedulerPass and the conductor', () => {
       // configured default, a regression that moved `conductPendingDocuments`
       // back outside the `inbox !== null` guard would return a real
       // `ConductResult` and fail the last assertion (I1).
-      const result = await schedulerPass({ businessId: BUSINESS });
+      const result = await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith([]) });
       expect(result.scan).toBeNull();
       expect(result.scanError).toBeNull();
       expect(result.conduct).toBeNull();
@@ -216,7 +224,12 @@ describe('schedulerPass and the conductor', () => {
     const original = mutableConfig.documentInbox;
     mutableConfig.documentInbox = configuredInbox;
     try {
-      const result = await schedulerPass({ businessId: BUSINESS, inbox: null, readsPerDay: 0 });
+      const result = await schedulerPass({
+        businessId: BUSINESS,
+        inbox: null,
+        readsPerDay: 0,
+        runtime: runtimeWith([]),
+      });
       expect(result.scan).toBeNull();
       expect(result.scanError).toBeNull();
       // `scanInbox` creates its four working subdirectories as its first
@@ -261,7 +274,13 @@ describe('schedulerPass and the conductor', () => {
     // inherit whatever `.env` happens to hold.
     const inbox = await mkdtemp(join(tmpdir(), 'sched-conduct-inbox-'));
 
-    const result = await schedulerPass({ businessId: conductBusiness, inbox, reader, proposer });
+    const result = await schedulerPass({
+      businessId: conductBusiness,
+      inbox,
+      reader,
+      proposer,
+      runtime: runtimeWith([]),
+    });
 
     expect(reads).toBe(1);
     expect(proposals).toBe(1);
@@ -351,6 +370,7 @@ describe('schedulerPass and the conductor', () => {
       businessId: hostileBusiness,
       inbox,
       documentRoot,
+      runtime: runtimeWith([]),
       // Both throw rather than return: nothing here should call them at all,
       // and a stub that returns something plausible would let a regression
       // continue quietly past the point this test exists to catch.
