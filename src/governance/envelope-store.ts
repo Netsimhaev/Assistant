@@ -8,7 +8,7 @@
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
 import type { Queryable } from '../db/pool.js';
-import { AgentEnvelope } from '../domain/envelope.js';
+import type { AgentEnvelope } from '../domain/envelope.js';
 import type { EnvelopeConstraints, EnvelopeKind } from '../domain/envelope.js';
 import { contextRefsHash } from './delegation.js';
 

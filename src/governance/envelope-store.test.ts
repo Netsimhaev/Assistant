@@ -119,9 +119,19 @@ describe('countPairExchanges', () => {
     const first = anEnvelope({ correlationId, from: 'comms.email', to: 'know.reader', intent: 'summarise_document' });
     const second = anEnvelope({ correlationId, from: 'comms.email', to: 'know.reader', intent: 'summarise_document' });
     const otherIntent = anEnvelope({ correlationId, from: 'comms.email', to: 'know.reader', intent: 'draft_reply' });
+    // Same pair, same intent, but a DIFFERENT correlation — must not be
+    // counted alongside `correlationId`'s exchanges. Without this the test
+    // cannot distinguish a correlation-scoped query from an unscoped one.
+    const otherCorrelation = anEnvelope({
+      correlationId: 'JOB-unrelated',
+      from: 'comms.email',
+      to: 'know.reader',
+      intent: 'summarise_document',
+    });
     await writeEnvelope(first, { parentJobId: correlationId, businessId: BUSINESS });
     await writeEnvelope(second, { parentJobId: correlationId, businessId: BUSINESS });
     await writeEnvelope(otherIntent, { parentJobId: correlationId, businessId: BUSINESS });
+    await writeEnvelope(otherCorrelation, { parentJobId: 'JOB-unrelated', businessId: BUSINESS });
 
     const count = await countPairExchanges(
       correlationId,
