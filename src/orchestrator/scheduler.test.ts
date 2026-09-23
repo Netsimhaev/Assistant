@@ -7,11 +7,12 @@ import { getApproval, pendingApprovals } from '../governance/approvals.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { executeStep } from './execute.js';
-import { startScheduler, tick } from './scheduler.js';
+import { schedulerPass, startScheduler, tick } from './scheduler.js';
 import { applyDecision } from './resume.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { envCredentials } from './credentials.js';
 import type { Runtime } from './runtime.js';
+import { MasterKeyError } from '../governance/master-key.js';
 
 /**
  * What `perform` returns when a step produced nothing an adapter would hand
@@ -279,5 +280,39 @@ describe('a human decision restarts the job it was blocking', () => {
     // The system did what was asked and a person said no. That is an outcome.
     expect(result.jobPhase).toBe('closed');
     expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.closedAt).not.toBeNull();
+  });
+});
+
+/**
+ * The branch three other test files stopped exercising.
+ *
+ * `schedulerPass` and `runDueJobs` both default to `options.runtime ??
+ * (await buildRuntime())`, and `buildRuntime` now refuses outright when there
+ * is no master key — an installation with no secrets must fail at startup,
+ * not one customer's send at a time. `promote.test.ts`, `scheduler.test.ts`
+ * (above) and `scheduler-conducts.test.ts` all correctly swapped that default
+ * for an injected inert runtime, which left the default itself covered
+ * nowhere at all.
+ *
+ * So: one pass with no runtime injected and no key path in the environment.
+ * The refusal is the assertion.
+ */
+describe('a pass with no master key refuses rather than running blind', () => {
+  it("propagates buildRuntime's refusal out of schedulerPass", async () => {
+    const previous = process.env['CREDENTIAL_KEY_PATH'];
+    delete process.env['CREDENTIAL_KEY_PATH'];
+    try {
+      await expect(
+        schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null }),
+      ).rejects.toThrow(MasterKeyError);
+      // Named, so a MasterKeyError arriving from some other check cannot
+      // stand in for the one this test is about.
+      await expect(
+        schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null }),
+      ).rejects.toThrow(/CREDENTIAL_KEY_PATH/);
+    } finally {
+      if (previous === undefined) delete process.env['CREDENTIAL_KEY_PATH'];
+      else process.env['CREDENTIAL_KEY_PATH'] = previous;
+    }
   });
 });
