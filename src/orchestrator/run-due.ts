@@ -4,7 +4,7 @@ import { loadActiveCharter } from '../charter/store.js';
 import { loadJob, transition } from './jobs.js';
 import { loadPlanBody } from './plan-store.js';
 import { rampLevelForPlan } from './ramp.js';
-import { runPlanForJob } from './run-plan.js';
+import { runPlanForJob, type RunPlanForJobRequest } from './run-plan.js';
 import { buildRuntime } from './runtime.js';
 import type { Runtime } from './runtime.js';
 
@@ -130,7 +130,19 @@ interface DueJobRow {
  * that finds the due jobs in the first place.
  */
 export async function runDueJobs(
-  options: { businessId?: string; limit?: number; runtime?: Runtime; now?: Date } = {},
+  options: {
+    businessId?: string;
+    limit?: number;
+    runtime?: Runtime;
+    now?: Date;
+    /**
+     * Forwarded to `runPlanForJob`'s `RunPlanRequest.reader` — the seam that
+     * keeps a test exercising `doc.fetch` through this real entry point from
+     * reaching the live, billed `runKnowReader`. Production callers leave it
+     * unset.
+     */
+    reader?: RunPlanForJobRequest['reader'];
+  } = {},
 ): Promise<RunDueResult> {
   const businessId = options.businessId ?? config.businessId;
   const limit = options.limit ?? 20;
@@ -241,6 +253,7 @@ export async function runDueJobs(
           rampLevel,
           ...(runtime.notify !== undefined ? { notify: runtime.notify } : {}),
           ...(options.now !== undefined ? { now: options.now } : {}),
+          ...(options.reader !== undefined ? { reader: options.reader } : {}),
         });
 
         if (outcome.status === 'rejected') {

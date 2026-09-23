@@ -14,22 +14,36 @@
  * widening their signatures, which is out of scope for this work (`createJob`
  * and `bindPlanToJob` are interfaces this task consumes rather than owns; even
  * `transition`, which this task does touch, keeps its own internal
- * transaction and `FOR UPDATE` lock unchanged). The ordering below (envelope,
- * then child, then plan, then attach, then park the parent)
- * is chosen so that a crash after `writeEnvelope` but before the parent is
- * parked leaves a durable, idempotent trace — a retry with the same inputs
- * hits the same idempotency key — rather than a duplicate child. It does not
- * close the window entirely: a crash between `createJob` and `attachChildJob`
- * leaves an orphaned child with a plan bound and no envelope pointing at it,
- * and a retry sees `duplicate` and returns without repairing that. This is
- * the same physical limit `recordStepCompletion` already documents for a
- * crash between an adapter call and its completion row — at-least-once, not
- * exactly-once, and the honest thing to do is name the window rather than
- * pretend a single function call can make it disappear.
+ * transaction and `FOR UPDATE` lock unchanged).
+ *
+ * **The order is: envelope, child, plan bound, ATTACH, then the child moves
+ * to `execute`, then the parent is parked — and `attachChildJob` before the
+ * move to `execute` is load-bearing, not incidental.** `runDueJobs` picks up
+ * anything sitting in `execute` with a bound plan; it does not check whether
+ * an envelope points at it. Attaching after would leave a window where the
+ * child is runnable and unattached — the scheduler could run it and it would
+ * answer into a void no envelope names, and `resumeDelegatedJobs` (which
+ * finds a parent through the envelope's `child_job_id`) could never wake the
+ * parent, not even on the deadline path. Attaching first means the only
+ * reachable crash window leaves a child that is attached but not yet
+ * runnable, which the deadline path can still recover.
+ *
+ * A crash after `writeEnvelope` commits but before the child is created still
+ * leaves a durable, idempotent trace: a retry with the same inputs hits the
+ * same idempotency key and is told `duplicate` rather than opening a second
+ * child. That branch also reports the envelope's stored `child_job_id` (`null`
+ * if this is exactly that crash window, a real id once one was attached), so
+ * a caller that sees `null` there knows it is looking at an orphan rather than
+ * a completed delegation — the repair `attachChildJob` exists to make, once
+ * the caller has re-derived the child id some other way. This is the same
+ * physical limit `recordStepCompletion` already documents for a crash between
+ * an adapter call and its completion row — at-least-once, not exactly-once,
+ * and the honest thing to do is name the window rather than pretend a single
+ * function call can make it disappear.
  */
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import type { AgentId } from '../domain/audit.js';
+import { AgentId } from '../domain/audit.js';
 import type { AgentEnvelope, ContextRef, EnvelopeConstraints } from '../domain/envelope.js';
 import type { Plan } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -39,6 +53,7 @@ import {
   contextRefsHash,
   dailyCapGuard,
   hopGuard,
+  mayDelegate,
   noNewInformationGuard,
   oscillationGuard,
   tightenConstraints,
@@ -48,6 +63,7 @@ import {
   attachChildJob,
   countPairExchanges,
   delegationsToday,
+  envelopeOpenedChild,
   priorQuadruples,
   writeEnvelope,
 } from '../governance/envelope-store.js';
@@ -109,12 +125,21 @@ export type RequestHelpDenialCode =
   | 'unknown_intent'
   | 'payload_schema'
   | 'missing_context_ref'
+  | 'ambiguous_context_ref'
+  | 'parent_envelope_mismatch'
   | DelegationDenial['code'];
 
 export type RequestHelpResult =
   | { status: 'opened'; envelopeId: string; childJobId: string }
-  /** The same request was already made — no second child was opened. */
-  | { status: 'duplicate'; envelopeId: string }
+  /**
+   * The same request was already made — no second child was opened.
+   * `childJobId` is `null` when the earlier attempt crashed before attaching
+   * one (see this module's docblock); a caller that sees `null` here is
+   * looking at an orphan and can repair it with `attachChildJob` directly,
+   * once it has re-derived the child id some other way — `requestHelp` itself
+   * has no way to hand back an id nobody ever recorded.
+   */
+  | { status: 'duplicate'; envelopeId: string; childJobId: string | null }
   | { status: 'refused'; code: RequestHelpDenialCode; reason: string };
 
 export interface DelegationOutcome {
@@ -200,6 +225,25 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
     };
   }
 
+  // 1.5. Layer two of §6.3's graph check, duplicated here on purpose.
+  // `evaluateToolCall`'s own `agent.request_help` branch already checks
+  // `mayDelegate`, but only for a call that arrives as a gated plan step —
+  // `requestHelp` is also called directly (Task 10), and that path never
+  // passes through the gate at all. `ops.web`'s empty graph entry is the one
+  // rule the capability tests say must never be relaxed, and a lone check in
+  // `engine.ts` would leave this, the actual choke point that opens a child,
+  // with none. Parsed rather than trusted from the type: `input.from` is
+  // `AgentId`-typed at compile time, but a caller across a process boundary
+  // (or a future one that stops being careful) is not bound by that.
+  const fromAgent = AgentId.safeParse(input.from);
+  if (!fromAgent.success || !mayDelegate(input.bundle.collaborationGraph, fromAgent.data, input.to)) {
+    return {
+      status: 'refused',
+      code: 'not_permitted',
+      reason: `${input.from} אינו רשאי לבקש עזרה מ-${input.to}`,
+    };
+  }
+
   // 2. Resolve the intent, validate the payload, and require the context ref
   // the registry declares.
   const spec = resolveIntent(input.to, input.intent);
@@ -220,20 +264,57 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
       reason: `המטען אינו תואם את סכמת "${input.intent}"${where}`,
     };
   }
-  const matchingRef =
+  // Every ref matching the required kind, not just the first — two matches at
+  // the same level are a refusal, never the first one in the array. The
+  // house rule (`resolveChannel`): "שתי התאמות באותה רמה הן דחייה ולא הראשונה
+  // במערך". A silent first-wins here would let the envelope's own record
+  // (both pointers, both folded into the guard-4 hash) disagree with the one
+  // pointer `buildStepInput` actually hands the child.
+  const matchingRefs =
     spec.requiresContextRef === null
-      ? null
-      : (input.contextRefs.find((ref) => ref.kind === spec.requiresContextRef) ?? null);
-  if (spec.requiresContextRef !== null && matchingRef === null) {
+      ? []
+      : input.contextRefs.filter((ref) => ref.kind === spec.requiresContextRef);
+  if (spec.requiresContextRef !== null && matchingRefs.length === 0) {
     return {
       status: 'refused',
       code: 'missing_context_ref',
       reason: `הכוונה "${input.intent}" דורשת מצביע מסוג ${spec.requiresContextRef} וכזה לא סופק`,
     };
   }
+  if (matchingRefs.length > 1) {
+    return {
+      status: 'refused',
+      code: 'ambiguous_context_ref',
+      reason: `הכוונה "${input.intent}" קיבלה יותר ממצביע אחד מסוג ${spec.requiresContextRef ?? ''}`,
+    };
+  }
+  const matchingRef = matchingRefs[0] ?? null;
+
+  // The caller's claim about its own ancestry is verified against the row,
+  // not trusted — `parentEnvelope: null` is the easiest legal value to pass by
+  // accident (it resets hops to 0, opens a fresh correlation, and hands back
+  // the maximally permissive root ceiling), so a fabricated or stale envelope
+  // here is a real way to widen a child's authority. `envelopeOpenedChild`
+  // answers from `agent_envelopes` itself: does this envelope exist, and does
+  // ITS `child_job_id` really name the job that is asking. The same
+  // correction `grantAuthorization` already applies to a job's claimed
+  // provenance and `GateContext.standing` applies to a claimed authorisation.
+  if (input.parentEnvelope !== null) {
+    const verified = await envelopeOpenedChild(input.parentEnvelope.id, parent.jobId, { businessId });
+    if (!verified) {
+      return {
+        status: 'refused',
+        code: 'parent_envelope_mismatch',
+        reason:
+          `המעטפת ${input.parentEnvelope.id} שסופקה כמעטפת ההורה אינה מצביעה ` +
+          `על המשימה ${parent.jobId} כבת שלה`,
+      };
+    }
+  }
 
   // Ancestry: inherited from the parent's own incoming envelope when it has
-  // one, otherwise this is the root of a new tree.
+  // one (now verified against the row), otherwise this is the root of a new
+  // tree.
   const parentHops = input.parentEnvelope?.hops ?? 0;
   const correlationId = input.parentEnvelope?.correlationId ?? parent.jobId;
   const causalChain = input.parentEnvelope
@@ -330,7 +411,7 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
 
   const written = await writeEnvelope(envelope, { parentJobId: parent.jobId, businessId });
   if (written.status === 'duplicate') {
-    return { status: 'duplicate', envelopeId: written.envelope.id };
+    return { status: 'duplicate', envelopeId: written.envelope.id, childJobId: written.childJobId };
   }
 
   const child = await createJob({
@@ -366,6 +447,18 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
   // because `LEGAL_TRANSITIONS` has no `intake → execute` and nothing
   // downstream should have to special-case a job that arrived at `execute`
   // without passing through `plan`.
+  //
+  // **`attachChildJob` runs BEFORE the move to `execute`, and this order is
+  // load-bearing.** `runDueJobs` picks up anything sitting in `execute` with a
+  // bound plan — it does not check whether an envelope points at it. A crash
+  // in the old order (execute, then attach) left a window where the child was
+  // already runnable and unattached: the scheduler could run it and it would
+  // answer into a void no envelope named, and `resumeDelegatedJobs` — which
+  // finds parents by `awaiting_envelope_id`, reached from the envelope via
+  // `child_job_id` — could never find its way back to wake the parent, not
+  // even on the deadline path. Attaching first means the only reachable crash
+  // window leaves a child that is attached but not yet runnable, which
+  // `resumeDelegatedJobs`'s own deadline check can still recover from.
   await transition(child.jobId, {
     to: 'understand',
     actor: 'orchestrator',
@@ -379,13 +472,13 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
     businessId,
   });
   await bindPlanToJob(child.jobId, childPlan, { businessId });
+  await attachChildJob(envelope.id, child.jobId, { businessId });
   await transition(child.jobId, {
     to: 'execute',
     actor: 'orchestrator',
     reason: 'ready to run its one step',
     businessId,
   });
-  await attachChildJob(envelope.id, child.jobId, { businessId });
   await transition(parent.jobId, {
     to: 'followup',
     actor: 'orchestrator',

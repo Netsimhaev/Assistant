@@ -2,6 +2,7 @@ import type { ActionClass } from '../domain/action.js';
 import type { ConnectionBinding } from '../domain/connection.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel } from '../domain/trust.js';
+import type { ReadOutcome, ReadRequest } from '../sdk/know-reader.js';
 import { planProblems, topologicalOrder, type Plan, type PlanStep } from '../domain/plan.js';
 import {
   classifyAction,
@@ -81,6 +82,16 @@ export interface RunPlanRequest {
   adapterTimeoutMs?: number;
   /** Passed through to the gate so a queued approval reaches the owner. */
   notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
+  /**
+   * The one local step that costs money: `doc.fetch`, threaded down to
+   * `runLocalTool`'s `ctx.reader` and from there to `readDocument`. Injectable
+   * for the same reason `conductPendingDocuments` threads `options.reader` —
+   * a test driving a delegation end to end through `runPlan`/`runDueJobs`
+   * would otherwise reach the real, billed `runKnowReader`, which (unlike
+   * `makePlan`) has no `refuseUnderTest` guard of its own. Production callers
+   * leave this unset and `readDocument` falls back to `runKnowReader`.
+   */
+  reader?: (request: ReadRequest) => Promise<ReadOutcome>;
 }
 
 /**
@@ -467,9 +478,12 @@ async function performStep(
     const output = await runLocalTool(step.toolName, effectiveInput, {
       jobId: request.job.jobId,
       businessId: request.job.businessId,
-      // Only `doc.fetch` reads this today (readDocument needs the active
-      // charter to build its prompt); every other local handler ignores it.
+      // Only `doc.fetch` reads these today (readDocument needs the active
+      // charter to build its prompt, and `reader` is the seam a test drives
+      // instead of a live model call); every other local handler ignores
+      // both.
       bundle: request.bundle,
+      ...(request.reader !== undefined ? { reader: request.reader } : {}),
     });
     // No `externalId`: nothing outside the instance issued a handle, and
     // inventing one would tell `verify` it had a far end to ask.

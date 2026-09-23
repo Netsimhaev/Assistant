@@ -26,6 +26,7 @@ interface EnvelopeRow {
   hops: number;
   idempotency_key: string;
   created_at: Date;
+  child_job_id: string | null;
 }
 
 /**
@@ -55,8 +56,8 @@ function toEnvelope(row: EnvelopeRow): AgentEnvelope {
 }
 
 export type WriteEnvelopeResult =
-  | { status: 'stored'; envelope: AgentEnvelope }
-  | { status: 'duplicate'; envelope: AgentEnvelope };
+  | { status: 'stored'; envelope: AgentEnvelope; childJobId: string | null }
+  | { status: 'duplicate'; envelope: AgentEnvelope; childJobId: string | null };
 
 /**
  * Store one envelope, keyed on `(businessId, idempotencyKey)`.
@@ -88,7 +89,8 @@ export async function writeEnvelope(
      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
      ON CONFLICT (business_id, idempotency_key) DO NOTHING
      RETURNING envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
-               intent, payload, context_refs, constraints, hops, idempotency_key, created_at`,
+               intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
+               child_job_id`,
     [
       businessId,
       envelope.id,
@@ -112,12 +114,13 @@ export async function writeEnvelope(
 
   const storedRow = inserted.rows[0];
   if (storedRow) {
-    return { status: 'stored', envelope: toEnvelope(storedRow) };
+    return { status: 'stored', envelope: toEnvelope(storedRow), childJobId: storedRow.child_job_id };
   }
 
   const { rows } = await db.query<EnvelopeRow>(
     `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
-            intent, payload, context_refs, constraints, hops, idempotency_key, created_at
+            intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
+            child_job_id
        FROM agent_envelopes
       WHERE business_id = $1 AND idempotency_key = $2`,
     [businessId, envelope.idempotencyKey],
@@ -131,7 +134,12 @@ export async function writeEnvelope(
       `envelope with idempotency key ${envelope.idempotencyKey} vanished between insert and read`,
     );
   }
-  return { status: 'duplicate', envelope: toEnvelope(existing) };
+  // `childJobId` on the duplicate branch is what lets a caller that sees
+  // `duplicate` tell "the earlier attempt finished opening its child" from
+  // "it crashed between writing this row and attaching one" — the repair a
+  // retry can make is `attachChildJob`, and it needs to know whether that
+  // repair is even needed.
+  return { status: 'duplicate', envelope: toEnvelope(existing), childJobId: existing.child_job_id };
 }
 
 /** One envelope by id, or null if this business has never stored one under it. */
@@ -143,13 +151,39 @@ export async function loadEnvelope(
   const db = options.db ?? getPool();
   const { rows } = await db.query<EnvelopeRow>(
     `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
-            intent, payload, context_refs, constraints, hops, idempotency_key, created_at
+            intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
+            child_job_id
        FROM agent_envelopes
       WHERE business_id = $1 AND envelope_id = $2`,
     [businessId, envelopeId],
   );
   const row = rows[0];
   return row ? toEnvelope(row) : null;
+}
+
+/**
+ * Whether `envelopeId` exists for this business and its stored `child_job_id`
+ * equals `childJobId` — the check `requestHelp` runs against a
+ * caller-supplied `parentEnvelope` before trusting anything derived from it
+ * (`hops`, `correlationId`, the ancestor ceiling). `parentEnvelope` is a
+ * claim the caller makes about its own history; this is the row agreeing with
+ * it, the same correction `grantAuthorization` already applies to a job's
+ * claimed provenance and `GateContext.standing` applies to a claimed
+ * authorisation. A nonexistent envelope and a mismatched one are refused
+ * identically — both mean the claim cannot be trusted.
+ */
+export async function envelopeOpenedChild(
+  envelopeId: string,
+  childJobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<boolean> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<{ child_job_id: string | null }>(
+    `SELECT child_job_id FROM agent_envelopes WHERE business_id = $1 AND envelope_id = $2`,
+    [businessId, envelopeId],
+  );
+  return rows[0]?.child_job_id === childJobId;
 }
 
 export interface EnvelopeQuadruple {
