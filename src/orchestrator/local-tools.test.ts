@@ -521,5 +521,41 @@ describe('the local tool executor', () => {
       // Refused before the model was ever called.
       expect(callCount()).toBe(0);
     });
+
+    /**
+     * The pair to the test above: that one is a cap that WILL reset at
+     * midnight, retryable. This one — `DOCUMENT_READS_PER_DAY=0`, a
+     * legitimate "off" setting (CLAUDE.md) — never will, so `retryable` must
+     * be `false`. Without this test, reverting
+     * `config.documentReadsPerDay > 0` to a bare `true`, or flipping the
+     * comparison, passes the whole suite untouched — the nonzero test above
+     * asserts `retryable: true` regardless of which branch produced it.
+     */
+    it('refuses finally, not retryably, when the cap itself is zero', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch6');
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v6' }));
+
+      const original = config.documentReadsPerDay;
+      (config as { documentReadsPerDay: number }).documentReadsPerDay = 0;
+      try {
+        const { reader, callCount } = stubReader(
+          JSON.stringify({ summary: 'x', findings: [], intents: [], unreadable: [] }),
+        );
+        let caught: unknown;
+        try {
+          await runLocalTool('doc.fetch', { documentId: 'doc-any' }, { jobId, businessId: BUSINESS, bundle, reader });
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(caught).toBeInstanceOf(StepChannelError);
+        const typed = caught as StepChannelError;
+        expect(typed.code).toBe('document_reads_exhausted');
+        expect(typed.retryable).toBe(false);
+        expect(callCount()).toBe(0);
+      } finally {
+        (config as { documentReadsPerDay: number }).documentReadsPerDay = original;
+      }
+    });
   });
 });
