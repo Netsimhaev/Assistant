@@ -157,4 +157,53 @@ describe('autonomy ramp', () => {
     // gate before the autonomy stage reads this value at all.
     expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('draft_only');
   });
+
+  /**
+   * `agent.request_help` is classified (`agent.delegate`) but exempt from
+   * the plan ceiling — unlike the read-only tools above, it does NOT
+   * short-circuit at the gate. A delegation step sits beside an ordinary
+   * classified step here, and its exemption must not drag the plan-wide
+   * minimum down to whatever `agent.delegate`'s own (unset, draft_only) ramp
+   * row would be. `email.reply`'s `auto_notify` is the only class that
+   * contributes, exactly as `CEILING_EXEMPT_TOOLS`'s docblock promises.
+   */
+  it('lets a delegation step contribute no ceiling, so it cannot floor a plan that also acts', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    const plan = Plan.parse({
+      goal: 'ask for help, then send',
+      steps: [
+        { id: 's1', agent: 'comms.email', intent: 'ask_for_help', toolName: 'agent.request_help', input: {}, expectedActionClass: 'agent.delegate' },
+        { id: 's2', agent: 'comms.email', intent: 'send', toolName: 'mail.send', input: {}, expectedActionClass: 'email.reply' },
+      ],
+    });
+
+    expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('auto_notify');
+  });
+
+  /**
+   * The case Important 1 of the Task 3 review was about, and the one that
+   * proves the fix: a plan whose ONLY step is a delegation. Before the fix,
+   * `levels` ended up empty and the function returned `RAMP_FLOOR`
+   * (`draft_only`) unconditionally — which becomes `ctx.rampLevel` for this
+   * very step, since a delegation is classified and does not short-circuit.
+   * That denied the exact shape Task 6 builds for every child job.
+   *
+   * No ramp row is set for anything here on purpose: the answer must be
+   * `'auto'` regardless of what `agent.delegate`'s own (absent) ramp row
+   * would say, because the exemption means this function has nothing to say
+   * about the step at all — the charter base and provenance ceiling still
+   * bind independently in `effectiveAutonomy`, which this test does not
+   * reach and does not need to.
+   */
+  it('answers auto for a plan that is entirely a delegation, never the floor', async () => {
+    const plan = Plan.parse({
+      goal: 'just ask for help',
+      steps: [
+        { id: 's1', agent: 'comms.email', intent: 'ask_for_help', toolName: 'agent.request_help', input: {}, expectedActionClass: 'agent.delegate' },
+      ],
+    });
+
+    expect(await rampLevelForPlan(plan, { businessId: BUSINESS })).toBe('auto');
+  });
 });

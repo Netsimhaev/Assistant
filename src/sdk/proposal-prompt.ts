@@ -159,14 +159,23 @@ export function buildProposalSystemPrompt(bundle: PolicyBundle, catalogue: strin
     '',
     // The live run of 11/09. The model judged, correctly, that a ₪11,988 quote
     // exceeded its own authority, and proposed to act with
-    // `agent.request_help` — a tool the catalogue offers at `auto`. Nothing
-    // rejected it, `raiseProposalApproval` declined to card a classless tool,
-    // and the owner was told nothing at all. `proposalProblems` now refuses
-    // that shape; this says why, so the model proposes something useful
-    // instead of being refused.
+    // `agent.request_help` — at the time a tool the catalogue offered at
+    // `auto` with no action class of its own. Nothing rejected it,
+    // `raiseProposalApproval` declined to card a classless tool, and the
+    // owner was told nothing at all. `proposalProblems` refused that shape,
+    // and this said why.
+    //
+    // `agent.request_help` is classified now (`agent.delegate`,
+    // `policy/classify.ts`) — delegating to another agent is a legitimate
+    // `action` a proposal may name, and `proposalProblems` cards it. The line
+    // below no longer names it: naming a now-classified tool here would steer
+    // the model away from a shape the gate accepts. What is still true, and
+    // still worth saying explicitly, is `escalate_to_human` — genuinely
+    // read-only, and bringing something to the owner's attention is what
+    // raising the card already does, so it is never the `action` itself.
     'פעולה מוצעת חייבת להיות כלי שיש לו מחלקת פעולה — זה מה שמאפשר להעלות עליה',
     'כרטיס שהבעלים יאשר. כלי שהקטלוג מסמן כקריאה-בלבד אינו יכול להיות `action`,',
-    'וגם לא כלי שמבקש עזרה או מסלים לאדם: **הבאת העניין לידיעת הבעלים היא מה',
+    'וגם לא כלי שמסלים לאדם (`escalate_to_human`): **הבאת העניין לידיעת הבעלים היא מה',
     'שקורה ממילא כשההצעה נרשמת** — אינה פעולה שאתה מציע. אם אין פעולה שהבעלים',
     'יכול לאשר, אמור זאת בעמדה: `ask` עם שאלה, או `no_action` / `advise_against`',
     'עם הנימוק. הצעה שתנקוב בכלי קריאה-בלבד כ-`action` תיפסל.',

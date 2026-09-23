@@ -460,7 +460,15 @@ describe('delegation is classified but contributes no plan ceiling', () => {
    * authority of its own — the child job's own steps face the full ten stages.
    */
   it('exempts exactly one tool from the plan ceiling, and it addresses internally', () => {
-    expect([...CEILING_EXEMPT_TOOLS]).toEqual(['agent.request_help']);
+    // The loop runs first and the count assertion comes after, on purpose:
+    // `toEqual` throws on the first mismatch, so checking the array's
+    // contents before its length would make the count assertion
+    // unreachable whenever a wrong member was also present, and every
+    // failure would report as a size mismatch even when the real defect is
+    // a wrongly-addressed tool. Ordered this way, a tool that addresses a
+    // `person` (e.g. `mail.send`) fails in the loop regardless of count, and
+    // a correctly-addressed extra member (e.g. `crm.write`) fails only the
+    // count below — two mutations, two distinct failures.
     for (const tool of CEILING_EXEMPT_TOOLS) {
       const cls = classifyAction(tool);
       expect(cls, tool).not.toBeNull();
@@ -469,6 +477,7 @@ describe('delegation is classified but contributes no plan ceiling', () => {
       // and a tool in both would be two mechanisms for one property.
       expect(READ_ONLY_TOOLS.has(tool), tool).toBe(false);
     }
+    expect(CEILING_EXEMPT_TOOLS.size).toBe(1);
   });
 });
 
