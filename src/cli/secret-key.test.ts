@@ -8,7 +8,7 @@ import { closePool, getPool } from '../db/pool.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
 import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
 import { resetDatabase } from '../test/db.js';
-import { runSecretKeyCli } from './secret-key.js';
+import { RotationAuditUnrecordedError, runSecretKeyCli } from './secret-key.js';
 import type { SecretKeyCliDeps } from './secret-key.js';
 
 const OPERATOR = 'operator@example.com';
@@ -335,6 +335,101 @@ describe('runSecretKeyCli rotate', () => {
     await writeFile(KEY_PATH, randomBytes(32), { mode: 0o600 });
 
     await expect(runSecretKeyCli(['rotate', OPERATOR], deps())).rejects.toThrow(MasterKeyError);
+  });
+});
+
+/**
+ * The boundary `killswitch.ts` and `erasure.ts` already named, at rotation's
+ * only irreversible seam.
+ *
+ * `rotate` commits the re-encryption, writes the recovery copy and the live
+ * key file, and only then appends its audit row — outside the transaction,
+ * because holding the `audit:<business>` advisory lock for a whole
+ * re-encryption pass would block every other audit writer. That leaves a
+ * window where every secret has been re-encrypted and the record of it has
+ * not been written. A raw database error there reads to the operator as "the
+ * rotation failed", and an operator who believes that runs `rotate` again —
+ * rotating a second time on top of a rotation nobody recorded.
+ *
+ * The audit failure is injected with a real constraint rather than a mock, so
+ * `appendAudit` fails the way it would actually fail: inside its own INSERT.
+ * `NOT VALID` so the rows `create` already wrote are not re-checked.
+ */
+describe('a rotation that committed says so even when its record does not', () => {
+  it('throws RotationAuditUnrecordedError naming the key ids and the row count, with the rotation in force', async () => {
+    await runSecretKeyCli(['create', OPERATOR], deps());
+    const oldKey = await loadMasterKey(KEY_PATH);
+    await putSecret(
+      { businessId: config.businessId, ref: 'ONE', value: 'first-secret', updatedBy: OPERATOR },
+      oldKey,
+    );
+    const { rows: before } = await getPool().query<{ key_id: string }>(
+      'SELECT key_id FROM credential_key_state WHERE business_id = $1',
+      [config.businessId],
+    );
+    const oldKeyId = before[0]?.key_id;
+    expect(oldKeyId).toBeDefined();
+
+    await getPool().query(
+      `ALTER TABLE audit_log ADD CONSTRAINT tmp_reject_credential_change
+         CHECK (kind <> 'credential_change') NOT VALID`,
+    );
+
+    let thrown: unknown;
+    try {
+      await runSecretKeyCli(['rotate', OPERATOR], deps());
+    } catch (error) {
+      thrown = error;
+    } finally {
+      await getPool().query('ALTER TABLE audit_log DROP CONSTRAINT tmp_reject_credential_change');
+    }
+
+    // 1. The typed error, not the raw database error underneath it.
+    expect(thrown).toBeInstanceOf(RotationAuditUnrecordedError);
+    if (!(thrown instanceof RotationAuditUnrecordedError)) throw new Error('unreachable');
+    expect(thrown.rotationInForce).toBe(true);
+
+    // 2. It names what an operator needs to rebuild the missing row — and the
+    //    message carries it too, because `main()` prints `err.message` and
+    //    nothing else.
+    expect(thrown.outcome).toEqual({
+      businessId: config.businessId,
+      previousKeyId: oldKeyId,
+      newKeyId: expect.stringMatching(/^KEY-/) as unknown as string,
+      secretsReEncrypted: 1,
+    });
+    expect(thrown.message).toContain(oldKeyId as string);
+    expect(thrown.message).toContain(thrown.outcome.newKeyId);
+    expect(thrown.message).toContain('1');
+
+    // Never the key, never a secret — the rule an error object is no more
+    // exempt from than a log line.
+    const newKey = await loadMasterKey(KEY_PATH);
+    expect(thrown.message).not.toContain(newKey.toString('base64'));
+    expect(thrown.message).not.toContain(oldKey.toString('base64'));
+    expect(thrown.message).not.toContain('first-secret');
+
+    // 3. The rotation really did take effect — the half that makes the error
+    //    honest rather than merely typed. New key on disk, rows open under it
+    //    and not under the retired one, key state agrees, recovery copy is a
+    //    copy of the NEW key.
+    expect(newKey.equals(oldKey)).toBe(false);
+    await expect(verifyKeyState(newKey, { businessId: config.businessId })).resolves.toBeUndefined();
+    expect((await storedCredentials(newKey).resolve('ONE', config.businessId))?.value).toBe(
+      'first-secret',
+    );
+    expect(await storedCredentials(oldKey).resolve('ONE', config.businessId)).toBeNull();
+
+    await rm(KEY_PATH);
+    await runSecretKeyCli(['restore', OPERATOR], deps());
+    expect((await loadMasterKey(KEY_PATH)).equals(newKey)).toBe(true);
+
+    // And the record really is absent — otherwise this whole test could pass
+    // against a rotation that quietly wrote its row after all.
+    const { rows: audit } = await getPool().query(
+      `SELECT 1 FROM audit_log WHERE kind = 'credential_change' AND reason LIKE '%הוחלף%'`,
+    );
+    expect(audit).toHaveLength(0);
   });
 });
 

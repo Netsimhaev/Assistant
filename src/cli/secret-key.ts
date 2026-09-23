@@ -62,6 +62,67 @@ const scrypt = promisify(scryptCb) as (
  */
 const RECOVERY_AAD_REF = 'key-recovery';
 
+/**
+ * What a rotation did, carried on `RotationAuditUnrecordedError` so an
+ * operator can reconstruct the record by hand.
+ *
+ * Deliberately only identifiers and a count. **Never the key and never a
+ * secret** — the same rule every message in this file and in `secret.ts`
+ * follows, and an error object is no more exempt from it than a log line is.
+ * `previousKeyId` is `string | null` because a rotation on an installation
+ * whose key-state row was somehow absent has no earlier id to name, and
+ * inventing one would be worse than admitting it.
+ */
+export interface RotationOutcome {
+  businessId: string;
+  previousKeyId: string | null;
+  newKeyId: string;
+  secretsReEncrypted: number;
+}
+
+/**
+ * The rotation committed and its audit entry did not.
+ *
+ * Same shape and same reason as `KillSwitchAuditUnrecordedError`
+ * (`src/governance/killswitch.ts`) and `ErasureAuditUnrecordedError`
+ * (`src/governance/erasure.ts`): once the irreversible half of an action has
+ * already committed, the only honest failure left is "it happened, and the
+ * record of it is missing" — never "it didn't happen" and never silence.
+ * Without it the operator sees a raw database error after every secret has
+ * been re-encrypted, cannot tell whether the rotation took effect, and may
+ * run it a second time.
+ *
+ * `rotationInForce` is `true as const` for the same reason the other two
+ * carry their flag: the fact the caller most needs is not in the error's
+ * type name.
+ *
+ * **The message is Hebrew, unlike the two precedents', on purpose.** Both of
+ * those surface through the dashboard, which re-renders them; this one is
+ * printed straight to an operator's terminal by `main()` below, so it follows
+ * the rule every other throw in this file follows (`עברית לבני אדם`). It also
+ * carries every field of `outcome` inline rather than only on the object,
+ * because `main()`'s handler prints `err.message` and nothing else — an
+ * operator must be able to reconstruct the missing row from what reaches the
+ * screen, without a debugger.
+ */
+export class RotationAuditUnrecordedError extends Error {
+  readonly rotationInForce = true as const;
+  readonly outcome: RotationOutcome;
+
+  constructor(outcome: RotationOutcome, cause: unknown) {
+    super(
+      `החלפת המפתח בוצעה במלואה ורשומת הביקורת עליה נכשלה. ההחלפה בתוקף: ` +
+        `${outcome.secretsReEncrypted} סודות הוצפנו מחדש עבור "${outcome.businessId}", ` +
+        `מהמפתח ${outcome.previousKeyId ?? '(לא ידוע)'} אל המפתח ${outcome.newKeyId}, ` +
+        `וקובץ המפתח ועותק השחזור כבר נכתבו — אל תריץ rotate שוב. מה שחסר הוא רק ` +
+        `הרישום, ויש להשלים אותו ידנית.`,
+      { cause },
+    );
+    this.name = 'RotationAuditUnrecordedError';
+    this.outcome = outcome;
+  }
+}
+
 export interface SecretKeyCliDeps {
   log: (line: string) => void;
   /**
@@ -399,8 +460,17 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   const passphrase = await readNonEmptyPassphrase(deps);
   const recovery = await sealRecoveryCopy(newKey, passphrase, businessId);
 
-  const rotated = await withTransaction(async (tx: Queryable) => {
+  const { rotated, previousKeyId } = await withTransaction(async (tx: Queryable) => {
     await acquireAdvisoryLock(tx, ROTATION_LOCK_SCOPE);
+
+    // Read BEFORE `writeKeyState` overwrites it. The id of the key being
+    // retired is half of what an operator needs to reconstruct the audit row
+    // by hand if the append below fails, and after the upsert it is gone.
+    const { rows: stateRows } = await tx.query<{ key_id: string }>(
+      'SELECT key_id FROM credential_key_state WHERE business_id = $1',
+      [businessId],
+    );
+    const previous = stateRows[0]?.key_id ?? null;
 
     const { rows } = await tx.query<CredentialRow>(
       'SELECT business_id, ref, ciphertext, nonce FROM credentials FOR UPDATE',
@@ -426,7 +496,7 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
     }
 
     await writeKeyState(newKey, newKeyId, { businessId, db: tx });
-    return rows.length;
+    return { rotated: rows.length, previousKeyId: previous };
   });
 
   // The database is committed and atomic by this point: every row now opens
@@ -439,24 +509,44 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // next startup as `verifyKeyState`'s refusal rather than as silent
   // corruption of a customer's send.
   //
-  // The audit row goes first of the three, before either file: a rotation
-  // that committed is a rotation that is recorded, whatever happens to the
-  // disk afterwards (spec §6.4, "always"). It is NOT folded into the
-  // transaction above the way `create`'s is — `appendAudit` takes the
+  // Recovery copy before the live key file, so the window in which the backup
+  // on disk is the retired key is as short as the code can make it — and both
+  // before the audit append, which is the reverse of `create`'s order and
+  // deliberate. Once the transaction above has committed, every row opens
+  // ONLY under `newKey`, so putting that key on disk is what makes the
+  // installation work again; an audit failure that jumped the queue and threw
+  // before these two lines would leave a correct database beside a key file
+  // holding the retired key — a dead installation, reported by an error whose
+  // sentence says only that a record is missing. `create` has no such
+  // constraint (nothing is sealed under its key yet), which is why its audit
+  // row can sit inside the transaction and this one cannot.
+  await writeFile(recoveryPathFor(deps.keyPath), JSON.stringify(recovery), { mode: 0o600 });
+  await writeFile(deps.keyPath, newKey, { mode: 0o600 });
+
+  // Last, and outside the transaction on purpose: `appendAudit` takes the
   // `audit:<business>` advisory lock, and holding that for the length of a
   // whole re-encryption pass would block every other audit writer in the
   // installation for as long as rotation runs.
-  await auditKeyAction({
-    businessId,
-    operator,
-    action: 'rotate',
-    reason: `המפתח הוחלף (${newKeyId}) עבור ${businessId} על ידי ${operator} — ${rotated} סודות הוצפנו מחדש`,
-  });
-
-  // Recovery copy before the live key file, so the window in which the
-  // backup on disk is the retired key is as short as the code can make it.
-  await writeFile(recoveryPathFor(deps.keyPath), JSON.stringify(recovery), { mode: 0o600 });
-  await writeFile(deps.keyPath, newKey, { mode: 0o600 });
+  //
+  // Which leaves the boundary `killswitch.ts` and `erasure.ts` already named:
+  // by this line the rotation is irreversibly in force, so a failed append
+  // has exactly one honest report — "it happened, and the record is missing"
+  // — never a raw database error the operator reads as "it failed", and never
+  // silence. An operator who reads this as failure runs `rotate` again, which
+  // rotates a second time on top of a rotation nobody recorded.
+  try {
+    await auditKeyAction({
+      businessId,
+      operator,
+      action: 'rotate',
+      reason: `המפתח הוחלף (${newKeyId}) עבור ${businessId} על ידי ${operator} — ${rotated} סודות הוצפנו מחדש`,
+    });
+  } catch (error) {
+    throw new RotationAuditUnrecordedError(
+      { businessId, previousKeyId, newKeyId, secretsReEncrypted: rotated },
+      error,
+    );
+  }
 
   deps.log(`המפתח הוחלף בהצלחה. ${rotated} סודות הוצפנו מחדש תחת המפתח החדש.`);
 }
