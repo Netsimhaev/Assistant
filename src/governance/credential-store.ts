@@ -32,7 +32,7 @@
  * `WHERE` clause that is wrong in some way we have not thought of.
  */
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { acquireAdvisoryLock, getPool, withTransaction } from '../db/pool.js';
 import type { Queryable } from '../db/pool.js';
 import { createCredentialHandle } from '../orchestrator/adapters/types.js';
 import type { CredentialHandle } from '../orchestrator/adapters/types.js';
@@ -50,6 +50,18 @@ import { decryptSecret, encryptSecret } from './secret-cipher.js';
  * No message this class carries ever names a secret's value (spec §7.3).
  */
 export class CredentialStoreError extends Error {}
+
+/**
+ * The advisory-lock scope that serialises `putSecret` against key rotation
+ * (`cli/secret-key.ts`). Carried from Task 4's review: `putSecret` reads the
+ * live key id and inserts the sealed row in separate statements, and a
+ * rotation landing between them would label a row with one key while it is
+ * sealed by another — a row that opens for nobody, discovered only when a
+ * customer's send fails. A lock taken on only one side of that race is not
+ * a lock, so both sides take this exact string — a shared exported constant
+ * rather than two literals that a future edit could let drift apart.
+ */
+export const ROTATION_LOCK_SCOPE = 'credential-key-rotation';
 
 export interface SecretSummary {
   ref: string;
@@ -211,6 +223,25 @@ export function storedCredentials(
  *
  * `value` reaches the ciphertext column and nothing else: not a log line, not
  * an error message, not the returned value (there is none).
+ *
+ * **Reads the live key id and inserts the sealed row under
+ * `ROTATION_LOCK_SCOPE`, the same advisory lock `cli/secret-key.ts`'s
+ * `rotate` takes for its own re-encryption pass.** Read and insert are two
+ * statements, not one — a rotation landing between them would otherwise
+ * label this row with the key id rotation is about to retire while sealing
+ * it with the key rotation just replaced (or the reverse), a row that opens
+ * for nobody. The lock is what makes "between them" impossible rather than
+ * merely unlikely: `rotate` holds the identical lock for the whole of its
+ * own transaction, so the two genuinely exclude each other instead of a
+ * lock on only one side of the race.
+ *
+ * When the caller supplies `options.db`, it is used as-is and no
+ * transaction is opened here — the same convention `verifyKeyState` and
+ * `liveKeyId` already follow, on the assumption (documented at every other
+ * call site that does this, e.g. `sign-decision.ts`) that a caller passing
+ * its own client is already inside one. No production caller does this
+ * today; it exists for tests that need to observe the statements this
+ * function issues.
  */
 export async function putSecret(
   input: PutSecretInput,
@@ -218,27 +249,35 @@ export async function putSecret(
   options: CredentialStoreOptions = {},
 ): Promise<void> {
   assertLegalRef(input.ref);
-  const db = options.db ?? getPool();
 
-  await verifyKeyState(key, { db });
-  const keyId = await liveKeyId(db);
+  const write = async (db: Queryable): Promise<void> => {
+    await acquireAdvisoryLock(db, ROTATION_LOCK_SCOPE);
+    await verifyKeyState(key, { db });
+    const keyId = await liveKeyId(db);
 
-  const sealed = encryptSecret(input.value, key, {
-    businessId: input.businessId,
-    ref: input.ref,
-  });
+    const sealed = encryptSecret(input.value, key, {
+      businessId: input.businessId,
+      ref: input.ref,
+    });
 
-  await db.query(
-    `INSERT INTO credentials (business_id, ref, ciphertext, nonce, key_id, updated_by)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (business_id, ref) DO UPDATE
-       SET ciphertext = EXCLUDED.ciphertext,
-           nonce = EXCLUDED.nonce,
-           key_id = EXCLUDED.key_id,
-           updated_at = now(),
-           updated_by = EXCLUDED.updated_by`,
-    [input.businessId, input.ref, sealed.ciphertext, sealed.nonce, keyId, input.updatedBy],
-  );
+    await db.query(
+      `INSERT INTO credentials (business_id, ref, ciphertext, nonce, key_id, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (business_id, ref) DO UPDATE
+         SET ciphertext = EXCLUDED.ciphertext,
+             nonce = EXCLUDED.nonce,
+             key_id = EXCLUDED.key_id,
+             updated_at = now(),
+             updated_by = EXCLUDED.updated_by`,
+      [input.businessId, input.ref, sealed.ciphertext, sealed.nonce, keyId, input.updatedBy],
+    );
+  };
+
+  if (options.db) {
+    await write(options.db);
+    return;
+  }
+  await withTransaction((tx) => write(tx));
 }
 
 /**

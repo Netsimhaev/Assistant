@@ -27,6 +27,7 @@
     "job:seed": "tsx src/cli/seed-job.ts",
     "ramp:set": "tsx src/cli/set-ramp.ts",
     "secret": "tsx src/cli/secret.ts",
+    "secret:key": "tsx src/cli/secret-key.ts",
     "doc:ingest": "tsx src/cli/ingest-doc.ts",
     "sdk:curator": "tsx src/sdk/run-curator.ts",
     "sdk:contact-resolver": "tsx src/sdk/run-contact-resolver.ts"
