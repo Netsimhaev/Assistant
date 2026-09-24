@@ -29,6 +29,7 @@ import {
   wasFenceForgeryAttempted,
   type AwaitingDelegation,
   type Judge,
+  type JudgeRequest,
   type VerifyDraftInput,
   type VerifyDraftResult,
 } from './gov-verify.js';
@@ -369,6 +370,66 @@ describe('verifyDraft — the cheap check runs alone', () => {
 
     const reloaded = await loadVerdict(job.jobId, { businessId: BUSINESS });
     expect(reloaded?.fenceForgeryDetected).toBe(true);
+  });
+
+  /**
+   * **The control the whole answer-composition design exists to serve.**
+   * `sources` is the document's own deterministic extraction — hostile text by
+   * assumption — and it is here for `ungroundedNumbers` and nothing else. The
+   * moment any of it reaches the model call, `gov.verify`'s verdict is exposed
+   * to exactly the injection the draft under review is exposed to, and a
+   * verdict formed under injection is worse than no verdict: it carries the
+   * quarantine boundary's signature on the attacker's conclusion.
+   *
+   * Written against the REAL prompt builder, not against a grepped string.
+   * `verifyDraft` hands the judge a `JudgeRequest`, and `buildJudgeCall` is
+   * what `judgeWithModel` turns that request into on the wire — so this
+   * captures the request `verifyDraft` actually composed and renders it the
+   * same way production does. That is what makes it fail for the right
+   * reason: adding a `sources` field to `JudgeRequest` and rendering it in
+   * `renderJudgePrompt` (or naming it in `buildJudgeSystemPrompt`) would put
+   * the sentinel on the wire and turn this red, where a test that only
+   * inspected the request object's own keys would stay green.
+   */
+  it('the judge prompt carries the answer, never the sources', async () => {
+    const { job } = await openVerifyJob();
+    const captured: JudgeRequest[] = [];
+    const stubJudge: Judge = async (request) => {
+      captured.push(request);
+      return {
+        status: 'judged',
+        raw: '{}',
+        criteria: [{ id: 'x', statement: 'y', severity: 'must', passed: true, detail: 'z' }],
+      };
+    };
+
+    await verifyDraft(
+      baseInput(job, {
+        // Two sentinels, one word-shaped and one number-shaped: the numeric
+        // one is what `ungroundedNumbers` actually consumes, so a future
+        // change that fed the grounding set (rather than the raw text) into
+        // the prompt is caught too.
+        sources: ['SENTINEL-DOCUMENT-TEXT 8317'],
+        // No digits in the draft, so nothing here can coincidentally print a
+        // source number by way of `ungroundedNumbers`.
+        draftText: 'תודה, נטפל בזה בהקדם.',
+        answer: 'SENTINEL-ANSWER-TEXT: המסמך מבקש אישור בכתב',
+        judge: stubJudge,
+      }),
+    );
+
+    const request = captured[0];
+    if (request === undefined) throw new Error('the judge was never called');
+    const call = buildJudgeCall(request);
+    const onTheWire = [call.prompt, JSON.stringify(call.options)].join('\n');
+
+    // The positive half first: without it the two negatives below would hold
+    // just as well on an empty string, which is the vacuous-negative shape
+    // this project has already paid for.
+    expect(onTheWire).toContain('SENTINEL-ANSWER-TEXT');
+    expect(onTheWire).toContain('תודה, נטפל בזה בהקדם.');
+    expect(onTheWire).not.toContain('SENTINEL-DOCUMENT-TEXT');
+    expect(onTheWire).not.toContain('8317');
   });
 
   /**

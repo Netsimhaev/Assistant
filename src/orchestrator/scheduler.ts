@@ -239,6 +239,29 @@ export async function schedulerPass(
     readsPerDay?: number;
     reader?: ConductOptions['reader'];
     proposer?: ConductOptions['proposer'];
+    /**
+     * The seam that stands in for `verifyDraft`, so a test can drive the whole
+     * verification loop through this real pass without an API key — the judge
+     * (`judgeWithModel`) is a billed Agent SDK call, and its own
+     * `refuseUnderTest` guard throws rather than letting the loop finish.
+     *
+     * **It reaches BOTH places production calls `verifyDraft`**, and that is
+     * worth stating because the two are not the same call. The conductor's
+     * (`beginVerification`, through the `...options` spread below) passes
+     * `answer: null` and only ever opens the delegation — deterministic and
+     * free. The judging step's (`assert.evaluate`, through `runDueJobs` →
+     * `runPlanForJob` → `runLocalTool`) passes the answer the helper came back
+     * with, and that is the call that pays. A caller that needs the first real
+     * and only the second stubbed therefore must not REPLACE `verifyDraft`
+     * here: it wraps it, injecting `VerifyDraftInput.judge` — the seam that
+     * sits exactly around the billed call and nothing else.
+     *
+     * `NonNullable`, unlike its `reader`/`proposer` siblings above: this whole
+     * options object is spread straight into `conductPendingDocuments`, and
+     * `ConductOptions.verifier` is declared without `| undefined` — so under
+     * `exactOptionalPropertyTypes` the indexed type alone will not assign.
+     */
+    verifier?: NonNullable<ConductOptions['verifier']>;
   } = {},
 ): Promise<SchedulerPassResult> {
   const tickResult = await tick(options);
