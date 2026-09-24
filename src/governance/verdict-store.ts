@@ -119,6 +119,16 @@ export async function saveVerdict(
  * now also covers a not-judged row: `verdict IS NOT NULL` excludes it, so a
  * caller that only wants the real verdict never has to know the sibling
  * column exists. Use `loadVerificationOutcome` to see all three states.
+ *
+ * **No production caller: this is a TEST accessor, and kept deliberately.**
+ * The dashboard route reads `loadVerificationOutcome`, which is the only
+ * reader that has to tell the three states apart. What this function is for is
+ * the assertion `verdict-store.test.ts` and `gov-verify.test.ts` make dozens
+ * of times — "a real verdict, and nothing else, is what got written" — where
+ * collapsing a not-judged row to `null` is precisely the behaviour under test
+ * (`loadVerdict returns null for a not-judged row instead of throwing`). Said
+ * here rather than left implied, because a docblock claiming a caller that
+ * does not exist is this branch's own target defect class.
  */
 export async function loadVerdict(
   jobId: string,

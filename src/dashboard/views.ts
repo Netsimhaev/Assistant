@@ -653,8 +653,9 @@ function notJudgedBlock(reason: NotJudgedReason): string {
 /**
  * `gov.verify`'s verdict for this card's job, when one has been saved by the
  * time the card renders. Rendered from a database row read at REQUEST time —
- * `loadVerdict` is called by the route, not stashed at card-creation time —
- * so a verification that has not finished, or never started, simply leaves
+ * `loadVerificationOutcome` is called by the route, not stashed at
+ * card-creation time — so a verification that has not finished, or never
+ * started, simply leaves
  * this block out; nothing about the rest of the card depends on it existing.
  */
 function verdictBlock(verdict: Verdict): string {
@@ -699,6 +700,54 @@ function verdictBlock(verdict: Verdict): string {
   ${forgeryNote(verdict.fenceForgeryDetected)}
   ${truncationBlock}
 </div>`;
+}
+
+/**
+ * "בבדיקה" — and it renders on a POSITIVE condition, because the absence it
+ * used to be written as has more causes than the one it assumed.
+ *
+ * The three verdict states being absent means "no `verification_verdicts` row
+ * yet". That is "still running" only on a card verification was ever attempted
+ * for, and verification is attempted on every card **the conductor raises** —
+ * not on every card. `beginVerification` has exactly one caller
+ * (`orchestrator/conduct.ts`, inside the conductor loop), so two card classes
+ * never reach it at all and read "still running" forever if absence alone is
+ * trusted:
+ *
+ *   - an ORPHAN card (`approval_requests.job_id IS NULL` — the SDK path, which
+ *     CLAUDE.md names as a shape production really produces). The route does
+ *     not even look for a verdict for one of these.
+ *   - a GATE-RAISED card with a job id, from `enqueueApproval` at gate stage
+ *     10 on the instruction path. Those jobs are never handed to the conductor.
+ *
+ * **`options.document` is the positive test, and it is a PROXY — deliberately,
+ * and this is why.** The exact test is "a `gov.verify` delegation exists for
+ * this job", and nothing links the two rows from this side: the delegation
+ * lives on a SECOND job (`beginVerification`'s own), keyed to this one only by
+ * a `subjectJobId` buried inside that job's `job_plans.plan` — a `plan::text`
+ * search on every card render, to answer a question `options.document` already
+ * answers for free. `documentForApproval` resolving means this card's job
+ * carries a `proposals` row, which is exactly what the conductor path produces
+ * and neither of the two classes above ever has. It costs nothing: the route
+ * resolved it already, for the document block and the sign form.
+ *
+ * What the proxy does not catch, stated rather than hidden: a conductor card
+ * whose `beginVerification` returned `{ opened: false }` still reads "בבדיקה"
+ * though nothing is in flight. That failure is counted
+ * (`ConductResult.verificationFailed`) and printed by `run-scheduler.ts`, so
+ * it is visible somewhere — unlike the two classes above, which were visible
+ * nowhere.
+ */
+function stillRunningNote(options: {
+  document?: DocumentRecord;
+  verdict?: Verdict;
+  notJudged?: NotJudgedReason;
+  verdictUnreadable?: boolean;
+}): string {
+  if (options.document === undefined) return '';
+  if (options.verdict !== undefined || options.notJudged !== undefined) return '';
+  if (options.verdictUnreadable) return '';
+  return '<p class="muted">בבדיקה — פסיקת האימות תופיע כאן כשתהיה מוכנה.</p>';
 }
 
 export function renderApprovalCard(options: {
@@ -782,7 +831,7 @@ ${options.document ? documentBlock(options.document) : ''}
 ${options.verdict ? verdictBlock(options.verdict) : ''}
 ${options.notJudged ? notJudgedBlock(options.notJudged) : ''}
 ${options.verdictUnreadable ? '<p class="muted">קיימת פסיקת אימות (gov.verify) לבקשה זו, אך לא ניתן היה לקרוא אותה.</p>' : ''}
-${options.verdict === undefined && options.notJudged === undefined && !options.verdictUnreadable ? '<p class="muted">בבדיקה — פסיקת האימות תופיע כאן כשתהיה מוכנה.</p>' : ''}
+${stillRunningNote(options)}
 ${signErrorBlock}
 <div class="row">
   <form method="post" action="/a/${esc(approval.approvalId)}/approve" class="edit-form">

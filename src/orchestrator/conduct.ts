@@ -94,8 +94,8 @@ function draftTextFor(action: ProposedAction): string {
  * `execute`; this function opens a fresh one for exactly that
  * (`delegatingJob` below). `ctx.subjectJobId` is the DOCUMENT's own job —
  * already sitting in `await_approval` by the time this runs — which is
- * `saveVerdict`'s key and therefore the id `loadVerdict(approval.jobId)`
- * looks up on the card. The first version of this function passed one job
+ * `saveVerdict`'s key and therefore the id
+ * `loadVerificationOutcome(approval.jobId)` looks up on the card. The first version of this function passed one job
  * for both roles: it compiled, and it silently wrote every verdict where no
  * card would ever find it, because the document's job can never legally be
  * the delegating job (it is never in `execute` at this point) and

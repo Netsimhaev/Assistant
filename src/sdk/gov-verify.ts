@@ -606,7 +606,8 @@ export interface VerifyDraftInput {
   /**
    * The job WHOSE DRAFT IS BEING VERIFIED — the row `saveVerdict` files the
    * outcome under, and therefore the id a card looks the verdict up by
-   * (`loadVerdict(approval.jobId)`). Kept separate from `parentJobId` on
+   * (`loadVerificationOutcome(approval.jobId)`, on the dashboard route).
+   * Kept separate from `parentJobId` on
    * purpose: `requestHelp` requires the delegating job to be in `execute`,
    * but the job whose draft is under review is typically sitting in
    * `await_approval` by the time verification runs (Task 11's conductor

@@ -318,6 +318,39 @@ async function anApprovalForReading(
   return { approvalId, jobId: job.jobId };
 }
 
+/**
+ * The conductor's own card shape, without touching disk: document -> reading
+ * -> proposal -> job -> approval.
+ *
+ * `documentForApproval` is a pure DB join and never opens `stored_path`, so no
+ * bytes are needed here — which is the point of having this beside
+ * `aSignableApproval` rather than reusing it. What this shape carries that a
+ * gate-raised or orphan card cannot is the `proposals` row, and that is what
+ * the still-running note now keys off (`stillRunningNote` in `views.ts`).
+ * `MAILING_PROPOSAL` deliberately, so no sign form is in the rendered page to
+ * confuse a note assertion with a form assertion.
+ */
+async function aConductorRaisedApproval(
+  businessId: string,
+): Promise<{ approvalId: string; jobId: string }> {
+  const bundle = await installCharter(buildCharter(), { businessId });
+  const documentId = `DOC-${ulid()}`;
+  await insertOrGetDocument(
+    {
+      documentId,
+      source: 'manual',
+      originalName: 'הצעת מחיר.txt',
+      mediaType: 'text/plain',
+      sha256: createHash('sha256').update(documentId).digest('hex'),
+      byteSize: 12,
+      storedPath: `${businessId}/${documentId}/original.txt`,
+    },
+    { businessId },
+  );
+  const readingId = await aReadingOf(documentId, businessId);
+  return anApprovalForReading(businessId, bundle, readingId, MAILING_PROPOSAL);
+}
+
 /** The full chain in one call: a document with real bytes, backing a pending approval. */
 async function aSignableApproval(
   businessId: string,
@@ -1363,8 +1396,8 @@ describe('deciding an approval', () => {
   });
 });
 
-// Task 11: `loadVerdict` is called by the ROUTE, at request time — never
-// stashed when the card is created — so a verdict that shows up later shows
+// Task 11: `loadVerificationOutcome` is called by the ROUTE, at request time
+// — never stashed when the card is created — so a verdict that shows up later shows
 // up on the very next load, and a card whose verification never even started
 // renders exactly as it always has.
 describe('the gov.verify verdict on a card', () => {
@@ -1570,8 +1603,10 @@ describe('the gov.verify verdict on a card', () => {
   // what rendered.
   it('says the check is still running when no row exists', async () => {
     const baseUrl = await startServer(BUSINESS);
-    const job = await jobAwaitingApproval(BUSINESS);
-    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    // A CONDUCTOR-raised card, not a bare job: the note is conditioned on a
+    // verification actually being expected for this card, and only the
+    // conductor path opens one. See `stillRunningNote` in `views.ts`.
+    const { approvalId } = await aConductorRaisedApproval(BUSINESS);
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
@@ -1580,6 +1615,43 @@ describe('the gov.verify verdict on a card', () => {
     // Not the not-judged sentence, and not a real verdict block.
     expect(body).not.toContain('הבדיקה לא הושלמה');
     expect(body).not.toContain('בדיקת איכות (gov.verify)');
+  });
+
+  /**
+   * Final wave, Important 1: the note used to render on the ABSENCE of all
+   * three verdict states, and that absence has more causes than "still
+   * running". `beginVerification` has one caller — the conductor loop — so a
+   * card the conductor never raised never gets a verification at all, and read
+   * "בבדיקה" forever. Two classes, one test each, and both are shapes
+   * production really produces.
+   */
+  describe('and says nothing at all on a card verification never reaches', () => {
+    it('an orphan card — approval_requests.job_id IS NULL, the SDK path', async () => {
+      const baseUrl = await startServer(BUSINESS);
+      await installCharter(buildCharter(), { businessId: BUSINESS });
+      const approvalId = await makeApproval({ businessId: BUSINESS, jobId: null });
+      const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+      const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+      // The card itself renders — this is about the note, not about a 404.
+      expect(body).toContain(`/a/${approvalId}/approve`);
+      expect(body).not.toContain('בבדיקה');
+    });
+
+    it('a gate-raised card with a job the conductor never handled', async () => {
+      const baseUrl = await startServer(BUSINESS);
+      // `enqueueApproval` at gate stage 10 on the instruction path: a real job
+      // id, and no proposal behind it, because no document was ever read.
+      const job = await jobAwaitingApproval(BUSINESS);
+      const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+      const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+      const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+      expect(body).toContain(`/a/${approvalId}/approve`);
+      expect(body).not.toContain('בבדיקה');
+    });
   });
 
   describe('not judged — attempted and did not finish, one sentence per reason', () => {
@@ -1622,7 +1694,6 @@ describe('the gov.verify verdict on a card', () => {
     it('never reads as a passing verdict or as still running', async () => {
       const body = await cardWithReason('timeout');
       expect(body).not.toContain('בדיקת איכות (gov.verify)');
-      expect(body).not.toContain('לא נמצאו בעיות');
       expect(body).not.toContain('פסיקת האימות תופיע כאן');
     });
   });

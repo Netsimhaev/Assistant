@@ -70,12 +70,25 @@
  * text to be found by, and the discovery query is what reaches that case.
  * See `AGENT_ENVELOPES_ERASED_PREDICATE`'s own docblock for the full trace.
  * `verification_verdicts` got a writer in Task 10 (`gov-verify.ts`'s
- * `verifyDraft`) and, once Task 11 made its CALLER reachable from
- * production — not the writing branch itself; see the correction below —
- * and showed exactly how its job is opened (no plan ever bound), a
- * discovery query of its own beside `boss_instructions`'s — see
+ * `verifyDraft`) and a production-reachable WRITING BRANCH once the
+ * verification loop closed: `assert.evaluate`'s handler
+ * (`orchestrator/local-tools.ts`) resolves `know.reader`'s answer and calls
+ * `verifyDraft` with it, so `saveVerdict` really does run. It therefore gets
+ * a discovery query of its own beside `boss_instructions`'s — see
  * `VERIFICATION_VERDICTS_ERASED_PREDICATE`'s own docblock for why the answer
  * came out "yes, needed" rather than "no, already covered".
+ *
+ * **The same branch bound a plan to `gov.verify`'s job, and that opened a
+ * DOCUMENT-anchor discovery gap this module had to close.** `conduct.ts`'s
+ * `beginVerification` now binds a one-step plan whose input carries
+ * `documentId`, the draft text and the question verbatim. A contact anchor
+ * already reaches that job through the `job_plans.plan ILIKE` query below. A
+ * document anchor did not: its only job discovery was a single query over
+ * `proposals`, and the `gov.verify` job has no `proposals` row — so a
+ * document-anchored erasure left the draft derived from that very document
+ * sitting in `job_plans.plan`. The `job_plans` query added to the document
+ * branch below is the closure, written the same positive way the contact
+ * anchor's is.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -377,33 +390,25 @@ export const AGENT_ENVELOPES_ERASED_PREDICATE = `business_id = $1
  * `agent_envelopes` briefly had one, because this table carries no separate
  * parent/child distinction at all.
  *
- * **The writer exists (`gov-verify.ts`'s `verifyDraft`, via `saveVerdict`,
- * Task 10) and its CALLER now exists too (`conduct.ts`'s `beginVerification`,
- * Task 11) — but say precisely what that does and does not reach.** The
- * caller is reachable from production; the WRITING BRANCH inside `verifyDraft`
- * is still not, because `beginVerification` hard-codes `answer: null` on
- * every call it makes (see its own docblock) — `saveVerdict` is only ever
- * reached once a caller resolves `input.answer`, which nothing in production
- * does yet. So no `verification_verdicts` row is actually written by this
- * branch today; the query below is added on the strength of how
- * `beginVerification` is built, not evidence of a row it has produced. The
- * discovery-query question this docblock deferred is nonetheless answered:
- * YES, needed, once a row does get written — and the query is added below,
- * beside `boss_instructions`'s and `agent_envelopes.payload`'s.**
- * `Verdict.criteria[].detail` is free text the JUDGE MODEL writes, instructed
- * to quote from the draft or the answer when it helps — exactly the kind of
- * content `agent_envelopes.payload` also is. The tracing argument that closed
- * the gap for `agent_envelopes` (a plan-issued call's payload is already
- * sitting in that job's own `job_plans.plan`) does NOT carry over here:
- * `beginVerification` opens `gov.verify`'s job, walks it straight from
- * `intake` to `execute`, and calls `verifyDraft` there directly — no plan is
- * ever bound (see that function's own docblock for why binding one would be
- * dangerous, not merely unnecessary). So the draft text and the question this
- * job's verdict quotes are NOT sitting in `job_plans.plan` for the query
- * above to find; `Verdict.criteria[].detail` can be the ONLY surviving place
- * a counterparty's name or a quote from the draft appears for this job, with
- * `job_id = ANY ($2)` alone providing no way to FIND that job from the
- * contact side. The query added below closes exactly that gap.
+ * **The writer runs in production, and so does the branch that writes.**
+ * `conduct.ts`'s `beginVerification` opens `gov.verify`'s job with
+ * `answer: null`, so its own call parks rather than judges — but the job now
+ * carries a bound one-step plan, and when `know.reader` answers,
+ * `assert.evaluate`'s handler (`orchestrator/local-tools.ts`) resolves that
+ * answer and calls `verifyDraft` again with it. That is the call that reaches
+ * `saveVerdict`. Rows in this table are real.
+ *
+ * **Discovery is needed from BOTH anchor sides, and for two different
+ * reasons.** `Verdict.criteria[].detail` is free text the JUDGE MODEL writes,
+ * instructed to quote from the draft or the answer when it helps — exactly
+ * the kind of content `agent_envelopes.payload` also is, and it can name a
+ * counterparty the rest of this job never mentions, so the CONTACT anchor
+ * gets a `verdict::text ILIKE` query of its own below. The DOCUMENT anchor is
+ * served one layer over: the same bound plan puts `documentId`, the draft and
+ * the question into `job_plans.plan`, so the document branch's own
+ * `job_plans` query is what places this job in `jobIds` — and once it is
+ * there, `job_id = ANY ($2)` deletes the verdict with it. Neither query
+ * changes this predicate; both change what `jobIds` contains when it runs.
  *
  * Parameters, in both places: `$1` businessId, `$2` jobIds.
  */
@@ -581,18 +586,16 @@ export async function buildErasurePlan(
       'job_id',
     )) jobIds.add(jobId);
 
-    // `verification_verdicts.verdict` — resolved below, in Task 11. The
-    // conductor (`conduct.ts`'s `beginVerification`) opens `gov.verify`'s job
-    // directly, walks it straight to `execute` and calls `verifyDraft` there
-    // with no plan ever bound — so, unlike a plan-issued delegation, the
-    // draft and question this job's verdict quotes are NOT already sitting in
-    // that job's own `job_plans.plan` for the query above to find. A
-    // criterion's `detail` is free text the JUDGE MODEL writes, quoting the
-    // draft or the answer when it helps — exactly the `agent_envelopes.payload`
-    // shape above, and exactly the risk `VERIFICATION_VERDICTS_ERASED_PREDICATE`'s
-    // own docblock named and left open: without this query, a verdict that is
-    // the ONLY surviving place a counterparty's name appears for this job is
-    // invisible to a contact-anchored erasure, even though
+    // `verification_verdicts.verdict`. A criterion's `detail` is free text the
+    // JUDGE MODEL writes, quoting the draft or the answer when it helps —
+    // exactly the `agent_envelopes.payload` shape above. The `job_plans.plan`
+    // query above does reach `gov.verify`'s job for a contact named in the
+    // DRAFT, because `beginVerification` binds the draft into that job's plan
+    // — but the judge writes its own prose, and a name it puts in `detail`
+    // need not appear in the draft at all. So this query is not redundant
+    // with that one: without it, a verdict that is the ONLY surviving place a
+    // counterparty's name appears for this job is invisible to a
+    // contact-anchored erasure, even though
     // `VERIFICATION_VERDICTS_ERASED_PREDICATE` would delete the row once the
     // job is found some other way.
     for (const jobId of await idsFrom(
@@ -681,6 +684,42 @@ export async function buildErasurePlan(
         WHERE r.business_id = $1 AND r.document_id = ANY ($2)
           AND p.business_id = $1 AND p.job_id IS NOT NULL`,
       [businessId, [...documentIds]],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // A job whose BOUND PLAN names this document, which the `proposals` query
+    // above structurally cannot reach.
+    //
+    // `conduct.ts`'s `beginVerification` opens a `gov.verify` job beside the
+    // approval card and binds a one-step plan whose input carries
+    // `documentId`, the question, and `draftText` — the draft DERIVED FROM
+    // THIS DOCUMENT, verbatim. That job has no `proposals` row of its own (the
+    // proposal belongs to the subject job), no reading, and a title that names
+    // only the subject job id. So before this query a document-anchored
+    // erasure destroyed the document, its readings and the subject job's
+    // plan — and left the draft sitting in the `gov.verify` job's
+    // `job_plans.plan`, which is exactly the "content survives because nothing
+    // discovers it" shape this module exists to prevent. A CONTACT anchor
+    // already found it, through the `job_plans.plan ILIKE` query above; only
+    // the document side was blind.
+    //
+    // Written the same positive way that query is: search the column that
+    // holds the text, add the owning `job_id`, and let the unchanged
+    // `job_id = ANY ($2)` deletions close over it — no delete predicate
+    // changes here. `anchor.documentId` rather than the `documentIds` set,
+    // because on a `document` anchor the set is exactly that one id (the
+    // jobs→documents query above ran with `jobIds` still empty), and an
+    // `ILIKE ANY (array)` form cannot carry the `ESCAPE` clause that
+    // `likeLiteral` only works as a pair with.
+    //
+    // Over-deletion is not the risk it would be for a hand-written contact
+    // string: a `documentId` is `DOC-<ulid>`, system-generated, so a plan
+    // whose text contains it named THIS document deliberately.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM job_plans
+        WHERE business_id = $1 AND plan::text ILIKE $2 ${LIKE_ESCAPE}`,
+      [businessId, `%${likeLiteral(anchor.documentId)}%`],
       'job_id',
     )) jobIds.add(jobId);
   }
