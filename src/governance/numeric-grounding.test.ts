@@ -68,4 +68,26 @@ describe('ungroundedNumbers', () => {
   it('grounds a negative amount against a source that carries the same sign', () => {
     expect(ungroundedNumbers('זיכוי בסך -500 ש"ח', ['רישום זיכוי -500 ש"ח'])).toEqual([]);
   });
+
+  /**
+   * A dash after a digit run is not always noise: "500-" is the standard
+   * Israeli and spreadsheet way of writing a negative balance, and a source
+   * that writes it that way must ground a draft that writes "-500" — the
+   * same value, spelled with the sign on the other side. Before this rule
+   * existed both sides simply dropped the sign and compared as "500"; now
+   * that the sign is carried, both spellings of "the same negative number"
+   * must still agree with each other.
+   */
+  it('reads a trailing minus as a sign, not as range noise', () => {
+    expect(ungroundedNumbers('זיכוי בסך -500 ש"ח', ['יתרה 500-'])).toEqual([]);
+  });
+
+  /**
+   * A dash BETWEEN two digit runs is still a range, whether or not the
+   * numbers happen to be four digits — this is the reading that must not
+   * regress when a trailing dash starts being read as a sign.
+   */
+  it('still drops a multi-digit range as noise on both sides', () => {
+    expect(ungroundedNumbers('טווח 1500-2000', ['אין כאן שום סכום'])).toEqual([]);
+  });
 });

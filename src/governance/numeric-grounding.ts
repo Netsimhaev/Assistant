@@ -22,12 +22,13 @@
  * quantity" is not.
  *
  * **What this does NOT catch, and never will by design:** a number that
- * reaches the draft embedded in a date or an identifier is not checked at
- * all — a hallucinated invoice number shaped like `2024-99999`, or an order
- * id the business itself assigned, passes silently. Telling "this is an
- * amount" from "this is an id" is exactly the judgement call the adjacency
- * rule refuses to make; it only ever asks what character is touching the
- * digits.
+ * reaches the draft embedded in a date or a DIGIT-SHAPED identifier is not
+ * checked at all — a hallucinated invoice number shaped like `2024-99999`
+ * passes silently. (A LETTER-prefixed identifier like `ORDER-12345` is a
+ * different, narrower failure — see the known limits below.) Telling "this
+ * is an amount" from "this is an id" is exactly the judgement call the
+ * adjacency rule refuses to make; it only ever asks what character is
+ * touching the digits.
  *
  * **Known limits, left as limits, not bugs to rediscover later:**
  * - European decimal formatting (`11.988,00` meaning eleven thousand, nine
@@ -40,6 +41,12 @@
  *   reads as a leading sign on `12345` rather than as separator noise: the
  *   sign/separator rule below only asks whether the character before the
  *   hyphen is a *digit*, not whether the hyphen sits inside an identifier.
+ * - Two genuine amounts either side of a slash, as in `שולם 5,000/10,000`,
+ *   are both dropped by the `/`-adjacency rule — the same rule that
+ *   correctly drops a date. An adjacency rule cannot tell "date" from "two
+ *   real numbers separated by a slash" because it never looks past the one
+ *   character touching the digits; this is the cost of the narrowing
+ *   above, not a bug to fix separately from it.
  */
 
 /** Digit runs with optional thousands separators and a decimal tail. */
@@ -67,16 +74,19 @@ function normaliseNumber(raw: string): string {
  * minus sign carried through when it is one.
  *
  * The sign/separator split on `-` is the one place this function has to
- * read two different things off the same character: `-500` is a negative
- * amount (the money this whole check exists for — a draft that turns a
- * credit into a debit must not silently ground), while `10-20` and
- * `050-1234567` are a range and a phone number, where the `-` belongs to
- * neither digit run on either side of it. The distinguishing question is
- * "is there a digit immediately before the `-`": if yes, the `-` sits
- * BETWEEN two digit runs and both are noise; if no (start of string,
- * whitespace, punctuation), the `-` is a sign attached to what follows.
- * A `-` immediately AFTER a digit run is never a sign — nothing negates
- * backwards — so that side only ever means "noise, part of a range or id".
+ * read two different things off the same character, symmetrically on
+ * either side of the digit run: `-500` and `500-` are both negative
+ * amounts (the money this whole check exists for — a draft that turns a
+ * credit into a debit must not silently ground; `500-` is the standard
+ * Israeli and spreadsheet way of writing a negative balance), while
+ * `10-20` and `050-1234567` are a range and a phone number, where the `-`
+ * belongs to neither digit run on either side of it. The distinguishing
+ * question, on each side independently, is "is there a DIGIT on the far
+ * side of the `-`": before the run, is the character two positions back a
+ * digit; after the run, is the character one position past the `-` a
+ * digit. If yes, the `-` sits BETWEEN two digit runs and both are noise;
+ * if no (start/end of string, whitespace, punctuation, a letter), the `-`
+ * is a sign attached to this run alone.
  */
 function numbersIn(text: string): string[] {
   const tokens: string[] = [];
@@ -97,7 +107,12 @@ function numbersIn(text: string): string[] {
       if (dashSeparatesTwoRuns) continue; // e.g. "10-20", "050-1234567" — noise on both sides
       sign = '-'; // leading sign, e.g. "-500"
     }
-    if (nextChar === '-') continue; // first half of a range or phone number
+    if (nextChar === '-') {
+      const charAfterDash = end + 1 < text.length ? text[end + 1] : undefined;
+      const dashSeparatesTwoRuns = charAfterDash !== undefined && /\d/.test(charAfterDash);
+      if (dashSeparatesTwoRuns) continue; // e.g. "1500-2000", "050-1234567" — noise on both sides
+      sign = '-'; // trailing sign, e.g. "500-" — the standard Israeli/spreadsheet negative
+    }
 
     tokens.push(sign + normaliseNumber(match[0]));
   }
