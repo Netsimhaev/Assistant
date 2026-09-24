@@ -79,6 +79,12 @@ describe('renderReadingBrief', () => {
     const { brief } = renderReadingBrief([tableArtifact(500)]);
     expect(brief).toContain('פריט');
     expect(brief).toContain('מחיר');
+    // The cell separator itself, pinned — fix round 3, item 2: with
+    // `renderTable` now shared between this (capped) path and
+    // `renderArtifactFull`'s (uncapped) path, a change to the separator must
+    // fail a test on BOTH sides, not silently pass here while only the other
+    // side's test notices.
+    expect(brief).toContain('פריט | מחיר');
   });
 
   it('caps a long text artefact and marks it', () => {
@@ -256,7 +262,79 @@ describe('renderArtifactFull — the numeric-grounding regression', () => {
     expect(ungroundedNumbers(draft, [JSON.stringify(XLSX_LIKE.content)])).toEqual(['11988']);
   });
 
-  it('renders a table the same way renderReadingBrief does, just without its row cap', () => {
-    expect(renderArtifactFull(XLSX_LIKE)).toBe('פריט | סכום\n---\nסה"כ | 11988');
+  /**
+   * Fix round 3, item 2: a hard-coded literal here proved nothing about
+   * equality with `renderReadingBrief`'s own output — changing the shared
+   * separator only in the capped path would have left this test green while
+   * the two renderers silently diverged. Derived from `renderReadingBrief`'s
+   * ACTUAL output instead: `XLSX_LIKE` has one data row, far under
+   * `BRIEF_TABLE_ROWS`, so capping never engages and the body is byte-
+   * identical either way — what differs is only the section header
+   * `renderReadingBrief` prepends, stripped here by its own known format.
+   */
+  it('renders a table exactly as renderReadingBrief renders the same content', () => {
+    const { brief } = renderReadingBrief([XLSX_LIKE]);
+    const header = `[חלק ${XLSX_LIKE.ordinal}] ${XLSX_LIKE.partName ?? '(ללא שם)'} — ${XLSX_LIKE.kind}`;
+    expect(brief.startsWith(`${header}\n`)).toBe(true);
+    expect(brief.slice(header.length + 1)).toBe(renderArtifactFull(XLSX_LIKE));
+  });
+
+  /**
+   * Fix round 3, item 3: `renderTable`'s capped path never reached a row past
+   * `BRIEF_TABLE_ROWS`, so a malformed row further down never had a chance to
+   * throw. Removing the cap on `renderArtifactFull`'s path means it now maps
+   * every row — unless guarded. A malformed row is skipped, not fatal to the
+   * rest of the table.
+   */
+  it('skips a malformed row rather than throwing, on the uncapped path', () => {
+    const malformed: DocumentArtifact = {
+      ordinal: 1,
+      kind: 'table',
+      partName: 'טבלה עם שורה פגומה',
+      content: { rows: [[s('פריט'), s('סכום')], [s('תקין'), n(1)], null, [s('גם תקין'), n(2)]] as unknown as Cell[][] },
+      flags: [],
+    };
+    expect(() => renderArtifactFull(malformed)).not.toThrow();
+    expect(renderArtifactFull(malformed)).toBe('פריט | סכום\n---\nתקין | 1\nגם תקין | 2');
+  });
+
+  /**
+   * A CSV-shaped document is stored as a `table` artefact too (one row per
+   * line, no header semantics beyond "row zero"), and a plain-text artefact
+   * grounds through the same `renderArtifact` path with no table layout at
+   * all. Both exercised here so the fix is shown to hold across every shape
+   * this renderer serves, not only the `.xlsx` case.
+   */
+  it('grounds a number from a CSV-shaped table row', () => {
+    const csvLike: DocumentArtifact = {
+      ordinal: 1,
+      kind: 'table',
+      partName: 'ייצוא CSV',
+      content: { rows: [[s('תאריך'), s('סכום')], [s('2026-01-01'), n(7500)]] },
+      flags: [],
+    };
+    expect(ungroundedNumbers('שולם 7,500 ש"ח', [renderArtifactFull(csvLike)])).toEqual([]);
+  });
+
+  it('grounds a number from a plain text artefact', () => {
+    const textLike: DocumentArtifact = {
+      ordinal: 1,
+      kind: 'text',
+      partName: 'סעיף תשלום',
+      content: { blocks: [{ kind: 'paragraph', text: 'התמורה הכוללת היא 3,200 ש"ח.' }] },
+      flags: [],
+    };
+    expect(ungroundedNumbers('התמורה 3,200 ש"ח', [renderArtifactFull(textLike)])).toEqual([]);
+  });
+
+  it('grounds a number from an outline artefact', () => {
+    const outlineLike: DocumentArtifact = {
+      ordinal: 0,
+      kind: 'outline',
+      partName: null,
+      content: { parts: [{ name: 'עמוד 1', kind: 'text', rowCount: 640 }], flags: [] },
+      flags: [],
+    };
+    expect(ungroundedNumbers('640 שורות בסך הכל', [renderArtifactFull(outlineLike)])).toEqual([]);
   });
 });

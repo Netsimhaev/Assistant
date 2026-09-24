@@ -38,15 +38,38 @@ function cellText(cell: Cell): string {
   return String(cell.v);
 }
 
-function renderTable(content: TableContent): string {
+/**
+ * `maxRows` as a PARAMETER, not a second copy of this function — fix round
+ * 3's item 2. A `renderTableFull` that duplicated this body minus the cap was
+ * tried first and immediately went stale: nothing pinned the two layouts
+ * equal, so a change to the separator or the header line in one would leave
+ * the other silently rendering something different from what
+ * `renderReadingBrief` was tuned against. `body.slice(0, Infinity)` is the
+ * whole array — `Array.prototype.slice` treats an out-of-range `end` as the
+ * array's length — so `Infinity` (the full path, `renderArtifact` below) and
+ * `BRIEF_TABLE_ROWS` (the capped path) are the same function, not two.
+ *
+ * A row that is not itself an array is skipped rather than mapped — fix
+ * round 3's item 3: the capped path never reached past row 40 of whatever a
+ * real extractor produced, so a malformed row further down never had a
+ * chance to throw; removing the cap on the full path means it now does,
+ * unless guarded. A malformed row is dropped from the rendered table, not
+ * fatal to the whole artefact — the same posture `renderContent`'s own
+ * "narrowed here rather than trusted" already takes for `content` as a
+ * whole, one level down.
+ */
+function renderTable(content: TableContent, maxRows: number): string {
   const rows = content.rows;
   const header = rows[0];
   if (header === undefined) return '(טבלה ריקה)';
 
   const body = rows.slice(1);
-  const shown = body.slice(0, BRIEF_TABLE_ROWS);
+  const shown = body.slice(0, maxRows);
   const lines = [header.map(cellText).join(' | '), '---'];
-  for (const row of shown) lines.push(row.map(cellText).join(' | '));
+  for (const row of shown) {
+    if (!Array.isArray(row)) continue; // malformed row: skipped, not fatal
+    lines.push(row.map(cellText).join(' | '));
+  }
 
   const text = lines.join('\n');
   return body.length > shown.length ? text + TRUNCATED('שורות', shown.length) : text;
@@ -58,10 +81,11 @@ function renderBlock(block: Block): string {
   return block.text;
 }
 
-function renderText(content: TextContent): string {
+/** `maxChars: Infinity` on the full path — see `renderTable`'s own docblock for why this is one function, not two. */
+function renderText(content: TextContent, maxChars: number): string {
   const text = content.blocks.map(renderBlock).join('\n\n');
-  if (text.length <= BRIEF_TEXT_CHARS) return text;
-  return text.slice(0, BRIEF_TEXT_CHARS) + TRUNCATED('תווים', BRIEF_TEXT_CHARS);
+  if (text.length <= maxChars) return text;
+  return text.slice(0, maxChars) + TRUNCATED('תווים', maxChars);
 }
 
 function renderOutline(content: OutlineContent): string {
@@ -84,8 +108,18 @@ function renderOutline(content: OutlineContent): string {
  * is narrowed here rather than trusted. A shape that does not match its
  * declared `kind` renders as a stated gap — silence would read as "this part
  * was empty", which is a different and untrue claim.
+ *
+ * `caps` is the ONLY difference between the brief's own rendering
+ * (`renderContent`, `{ BRIEF_TABLE_ROWS, BRIEF_TEXT_CHARS }`) and
+ * `renderArtifactFull`'s (`{ Infinity, Infinity }`) — fix round 3's item 2.
+ * One shared function means the layout literally cannot drift between the
+ * two the way two independent copies already had (`' | '`, the header/`---`
+ * line, the blank line between text blocks) before this round.
  */
-function renderContent(artifact: DocumentArtifact): string {
+function renderArtifact(
+  artifact: DocumentArtifact,
+  caps: { maxTableRows: number; maxTextChars: number },
+): string {
   const content = artifact.content;
   if (artifact.kind === 'outline') {
     const parts = (content as OutlineContent | null)?.parts;
@@ -93,29 +127,25 @@ function renderContent(artifact: DocumentArtifact): string {
   }
   if (artifact.kind === 'table') {
     const rows = (content as TableContent | null)?.rows;
-    return Array.isArray(rows) ? renderTable(content as TableContent) : '(טבלה לא קריאה)';
+    return Array.isArray(rows)
+      ? renderTable(content as TableContent, caps.maxTableRows)
+      : '(טבלה לא קריאה)';
   }
   const blocks = (content as TextContent | null)?.blocks;
-  return Array.isArray(blocks) ? renderText(content as TextContent) : '(טקסט לא קריא)';
+  return Array.isArray(blocks)
+    ? renderText(content as TextContent, caps.maxTextChars)
+    : '(טקסט לא קריא)';
 }
 
-function renderTableFull(content: TableContent): string {
-  const rows = content.rows;
-  const header = rows[0];
-  if (header === undefined) return '(טבלה ריקה)';
-  const lines = [header.map(cellText).join(' | '), '---'];
-  for (const row of rows.slice(1)) lines.push(row.map(cellText).join(' | '));
-  return lines.join('\n');
-}
-
-function renderTextFull(content: TextContent): string {
-  return content.blocks.map(renderBlock).join('\n\n');
+function renderContent(artifact: DocumentArtifact): string {
+  return renderArtifact(artifact, { maxTableRows: BRIEF_TABLE_ROWS, maxTextChars: BRIEF_TEXT_CHARS });
 }
 
 /**
- * One artefact's content as plain text, laid out exactly the way
+ * One artefact's content as plain text, laid out EXACTLY the way
  * `renderContent`/`renderReadingBrief` does — cells pipe-separated, blocks
- * joined by a blank line, an outline as a bulleted list — but with NEITHER of
+ * joined by a blank line, an outline as a bulleted list, via the same shared
+ * `renderArtifact` (fix round 3's item 2) — but with NEITHER of
  * `renderReadingBrief`'s two caps (`BRIEF_TABLE_ROWS` rows per table,
  * `BRIEF_TEXT_CHARS` characters per text block) applied. `renderOutline` is
  * already uncapped, so it is reused as-is.
@@ -137,24 +167,19 @@ function renderTextFull(content: TextContent): string {
  * **What this does NOT capture.** The extractors themselves cap BEFORE
  * storage — sheet count, rows per sheet/table, characters per cell — and
  * record that a cap applied on `artifact.flags` (`truncated`, and friends).
- * This function reads only `content`, never `flags`, so a number that fell
- * outside an EXTRACTION-time cap is invisible here the same way it is
- * invisible to `renderReadingBrief` and to every other reader of
- * `document_artifacts` that does not check `flags` itself — a known limit of
- * the extraction pipeline, not something this function introduces or fixes.
+ * This function reads only `content`, never `flags`. That is a WEAKER
+ * guarantee than `renderReadingBrief`'s own: that function's caller
+ * (`renderReadingBrief` itself) prints `artifact.flags` into every section's
+ * own header line, so a reader of the brief IS told a part was truncated
+ * upstream — this function has no such header at all, and hands back bare
+ * content with no notice that anything was ever cut before storage. A
+ * number that fell outside an EXTRACTION-time cap is therefore invisible
+ * here in a way it is not to a reader of the brief — a known limit of this
+ * function specifically, not a limit this pipeline already carries
+ * everywhere.
  */
 export function renderArtifactFull(artifact: DocumentArtifact): string {
-  const content = artifact.content;
-  if (artifact.kind === 'outline') {
-    const parts = (content as OutlineContent | null)?.parts;
-    return Array.isArray(parts) ? renderOutline(content as OutlineContent) : '(מתאר לא קריא)';
-  }
-  if (artifact.kind === 'table') {
-    const rows = (content as TableContent | null)?.rows;
-    return Array.isArray(rows) ? renderTableFull(content as TableContent) : '(טבלה לא קריאה)';
-  }
-  const blocks = (content as TextContent | null)?.blocks;
-  return Array.isArray(blocks) ? renderTextFull(content as TextContent) : '(טקסט לא קריא)';
+  return renderArtifact(artifact, { maxTableRows: Infinity, maxTextChars: Infinity });
 }
 
 /** Between two part sections. Counted against the total ceiling like any text. */

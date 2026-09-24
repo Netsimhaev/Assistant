@@ -107,4 +107,51 @@ describe('ungroundedNumbers', () => {
   it('does not let a model code ground an unrelated negative amount', () => {
     expect(ungroundedNumbers('זיכוי בסך -100 ש"ח', ['דגם 100-A'])).toEqual(['-100']);
   });
+
+  /**
+   * Fix round 3, item 1. `ו-950`, `ב-11,988`, `ל-7.5` are the ordinary Hebrew
+   * way to write "and 950", "for 11,988", "to 7.5" — before this fix each
+   * normalised to a NEGATIVE number (`-950`, `-11988`, `-7.5`), matched
+   * nothing in a source that (correctly) carries the unsigned amount, and
+   * landed on the owner's card as ungrounded on an ordinary business letter.
+   * `LEADING_HEBREW_PARTICLE` (`typed-recipients.ts`) is the shared source
+   * for the particle letters — the same one `contact-resolver.ts` already
+   * reuses rather than duplicating.
+   */
+  describe('a Hebrew prefix particle glued onto the dash is a prefix, not a sign', () => {
+    it('grounds "ו-950" (and 950) against the unsigned source', () => {
+      expect(ungroundedNumbers('קיבלת ו-950 ש"ח', ['תיעוד: 950 ש"ח'])).toEqual([]);
+    });
+
+    it('grounds "ב-11,988" (for 11,988) against the unsigned source', () => {
+      expect(ungroundedNumbers('התשלום ב-11,988 ש"ח', ['סה"כ 11988'])).toEqual([]);
+    });
+
+    it('grounds "ל-7.5" (to 7.5) against the unsigned source', () => {
+      expect(ungroundedNumbers('עדכון ל-7.5 אחוז', ['הריבית עודכנה ל7.5'])).toEqual([]);
+    });
+
+    /**
+     * Every other dash rule, exercised in the SAME draft, so the particle fix
+     * cannot be shown to hold only in isolation from them: a leading `-` with
+     * no particle before it is still a sign; a dash between two digit runs is
+     * still a range; a phone number's dash is still noise on both sides; a
+     * hyphen preceded by a non-particle LETTER (`ORDER-12345`) still misreads
+     * as a sign, the documented limit; and a trailing dash is still a sign
+     * that can ground a leading one written the other way.
+     */
+    it('holds together with every other dash rule in one draft', () => {
+      const draft =
+        'קיבלת ו-950 ש"ח, זיכוי בסך -500 ש"ח, טווח 1500-2000, ' +
+        'טלפון 052-1234567, דגם ORDER-12345, יתרה 500-';
+      const sources = ['תיעוד: 950 ש"ח', 'רישום: 500-'];
+
+      // "950" grounds via the particle fix; both spellings of "-500" (leading
+      // and trailing) ground via the source's "500-"; "1500-2000" and
+      // "052-1234567" are dropped as range/phone noise on both sides and
+      // never even compared; "-12345" — the `ORDER-12345` limit — has no
+      // source and is the only survivor.
+      expect(ungroundedNumbers(draft, sources)).toEqual(['-12345']);
+    });
+  });
 });

@@ -59,9 +59,16 @@ function logErrored(result: SchedulerPassResult): void {
   // `conduct` is `null` when no document inbox is configured, in which case
   // there is nothing to have failed.
   if (result.conduct !== null && result.conduct.verificationFailed > 0) {
+    // Fix round 3, item 4(b): "see the audit trail" over-promised. A job that
+    // reached `execute` before failing carries its own reason on the
+    // transition that closed it (`beginVerification`'s own `reason:` string).
+    // A job that never got that far — `createJob` itself threw — leaves no
+    // job row at all, so there is no trail to point at; this count is the
+    // only trace such a failure leaves.
     console.error(
       `${result.conduct.verificationFailed} card(s) this pass had gov.verify fail to open — ` +
-        `see the audit trail for the affected jobs`,
+        `a job that reached execute records why on its own failed transition; a failure inside ` +
+        `createJob itself leaves no job to look up, and this count is the only trace of it`,
     );
   }
   // Delegation resumption's own buckets, same rule: a parent moved to

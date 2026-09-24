@@ -41,6 +41,13 @@
  *   reads as a leading sign on `12345` rather than as separator noise: the
  *   sign/separator rule below only asks whether the character before the
  *   hyphen is a *digit*, not whether the hyphen sits inside an identifier.
+ *   Narrowed for Hebrew (fix round 3, item 1): a hyphen preceded specifically
+ *   by a Hebrew PREFIX PARTICLE (`ל`/`ב`/`מ`/`ה`/`ו`/`כ`/`ש` —
+ *   `LEADING_HEBREW_PARTICLE`, `typed-recipients.ts`) is a glued-on prefix,
+ *   never a sign — `ו-950`, `ב-11,988`, `ל-7.5` are the ordinary Hebrew way to
+ *   write "and 950", "for 11,988", "to 7.5", not negative numbers. A hyphen
+ *   preceded by any OTHER letter (`ORDER-12345`) still misreads as a sign;
+ *   that narrower case remains the limit.
  * - Two genuine amounts either side of a slash, as in `שולם 5,000/10,000`,
  *   are both dropped by the `/`-adjacency rule — the same rule that
  *   correctly drops a date. An adjacency rule cannot tell "date" from "two
@@ -48,6 +55,7 @@
  *   character touching the digits; this is the cost of the narrowing
  *   above, not a bug to fix separately from it.
  */
+import { LEADING_HEBREW_PARTICLE } from './typed-recipients.js';
 
 /** Digit runs with optional thousands separators and a decimal tail. */
 const NUMBER_PATTERN = /\d[\d,]*(?:\.\d+)?/g;
@@ -91,9 +99,28 @@ function normaliseNumber(raw: string): string {
  * belongs to something else and drops the run. The leading check only
  * tests for a digit before the dash; a leading `-` preceded by a letter
  * still misreads as a sign (`ORDER-12345` — the known limit documented
- * above). That narrower case is intentionally left as-is here: fixing it
- * is a separate, symmetric change to the leading side that this round's
- * fix — closing the trailing-side regression only — does not make.
+ * above), UNLESS that letter is a Hebrew prefix particle (below) — fixing
+ * the general letter case is a separate, symmetric change to the leading
+ * side that this round's fix — closing the trailing-side regression only —
+ * did not make.
+ *
+ * **Fix round 3, item 1 — a Hebrew prefix particle glued onto the dash is a
+ * PREFIX, never a sign.** `ו-950`, `ב-11,988`, `ל-7.5` are the ordinary
+ * Hebrew way to write "and 950", "for 11,988", "to 7.5" — not `-950`,
+ * `-11988`, `-7.5`. Before this fix every one of those normalised to a
+ * negative number, matched nothing in the source (which carries the
+ * unsigned form), and landed on the owner's card as ungrounded on an
+ * ordinary business letter — the exact false-positive shape this module's
+ * own docblock warns teaches an owner to click past the control, and a far
+ * more common trigger than the spreadsheet-JSON regression round 2 closed.
+ * `LEADING_HEBREW_PARTICLE` (`typed-recipients.ts`) is the shared,
+ * one-definition source for the particle letters — reused here, not
+ * duplicated, the same way `contact-resolver.ts` already reuses it. No
+ * check of what sits before the particle is needed: even where a word
+ * merely ENDS in one of these letters ("שלב-2", "stage-2"), reading the
+ * dash as an unsigned prefix rather than a sign is still the more correct
+ * of the two readings — nothing this rule does is worse than what it
+ * replaces.
  */
 function numbersIn(text: string): string[] {
   const tokens: string[] = [];
@@ -112,7 +139,12 @@ function numbersIn(text: string): string[] {
       const charBeforeDash = start > 1 ? text[start - 2] : undefined;
       const dashSeparatesTwoRuns = charBeforeDash !== undefined && /\d/.test(charBeforeDash);
       if (dashSeparatesTwoRuns) continue; // e.g. "10-20", "050-1234567" — noise on both sides
-      sign = '-'; // leading sign, e.g. "-500"
+      // "ו-950" and friends: the particle+dash is a glued-on prefix, not
+      // part of the number's own text, so the run stays UNSIGNED — `sign`
+      // is simply never set to '-' here.
+      const hebrewPrefix =
+        charBeforeDash !== undefined && LEADING_HEBREW_PARTICLE.test(text.slice(start - 2, start));
+      if (!hebrewPrefix) sign = '-'; // leading sign, e.g. "-500"
     }
     if (nextChar === '-') {
       const charAfterDash = end + 1 < text.length ? text[end + 1] : undefined;
