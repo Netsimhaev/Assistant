@@ -74,14 +74,35 @@ function writeStamp(value) {
   writeFileSync(STAMP, String(value), 'utf8');
 }
 
+/**
+ * Budget for a single command.
+ *
+ * **A budget below the command's real runtime does not report a slow check —
+ * it reports a FAILED one, on every turn, whatever the result.** This was
+ * `150_000` for all three commands while `npm test` took 233–241s measured
+ * across four clean runs, so the suite was killed mid-flight every time and
+ * the hook printed a red `tests` line above output consisting entirely of
+ * passes. Nobody changed the budget; the suite grew past it (1,638 tests when
+ * this hook was written, 1,858 now) and the value quietly became a lie.
+ *
+ * So: per-command budgets, each with real headroom, and the one that needs it
+ * named explicitly at its call site rather than sharing a constant with two
+ * commands that finish in seconds. **When the suite's runtime approaches
+ * `TEST_BUDGET_MS`, raise it — do not let a red line stand in for a slow one.**
+ * `npm test -- --reporter=basic` prints the duration this should be compared
+ * against.
+ */
+const DEFAULT_BUDGET_MS = 120_000;
+const TEST_BUDGET_MS = 480_000;
+
 /** Run a command, returning its outcome rather than throwing. */
-function run(label, command, { tolerateFailure = false } = {}) {
+function run(label, command, { tolerateFailure = false, timeoutMs = DEFAULT_BUDGET_MS } = {}) {
   try {
     execSync(command, {
       cwd: PROJECT_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf8',
-      timeout: 150_000,
+      timeout: timeoutMs,
     });
     return { label, ok: true, tolerated: false, detail: '' };
   } catch (error) {
@@ -116,7 +137,7 @@ async function main() {
 
   const results = [
     run('typecheck', 'npm run typecheck --silent'),
-    run('tests', 'npm test --silent'),
+    run('tests', 'npm test --silent', { timeoutMs: TEST_BUDGET_MS }),
     // A dependency advisory is worth surfacing but should not read as a broken
     // build — it is rarely something this turn introduced.
     run('npm audit', 'npm audit --audit-level=high', { tolerateFailure: true }),
