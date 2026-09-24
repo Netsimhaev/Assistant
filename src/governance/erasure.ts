@@ -165,9 +165,22 @@ export async function executeErasure(
     // otherwise have its `job_plans`, `approval_requests` and
     // `boss_instructions` deleted mid-run. `FOR UPDATE` also serialises two
     // concurrent erasures against the same jobs, which nothing else does.
+    //
+    // The same locked read also identifies STRANDED parents (fix round 2,
+    // item 1): a job in `followup`, parked on its own `agent_envelopes` row,
+    // which `AGENT_ENVELOPES_ERASED_PREDICATE` is about to delete out from
+    // under it. Derived from these already-locked rows, never re-queried —
+    // see `STRANDED_PARENT_PREDICATE`'s docblock for why re-reading the table
+    // after other statements have run would be reading state this same
+    // transaction just changed.
+    const stranded: Array<{ jobId: string; envelopeId: string }> = [];
     if (jobIds.length > 0) {
-      const { rows: lockedJobs } = await client.query<{ job_id: string; phase: string }>(
-        'SELECT job_id, phase FROM jobs WHERE business_id = $1 AND job_id = ANY ($2) FOR UPDATE',
+      const { rows: lockedJobs } = await client.query<{
+        job_id: string;
+        phase: string;
+        awaiting_envelope_id: string | null;
+      }>(
+        'SELECT job_id, phase, awaiting_envelope_id FROM jobs WHERE business_id = $1 AND job_id = ANY ($2) FOR UPDATE',
         [businessId, jobIds],
       );
       const stillLive = lockedJobs.filter((row) => LIVE_PHASES.includes(row.phase));
@@ -181,6 +194,11 @@ export async function executeErasure(
             .join(' · '),
         );
       }
+      for (const row of lockedJobs) {
+        if (row.phase === 'followup' && row.awaiting_envelope_id !== null) {
+          stranded.push({ jobId: row.job_id, envelopeId: row.awaiting_envelope_id });
+        }
+      }
     }
 
     const del = async (table: string, sql: string, params: unknown[]): Promise<void> => {
@@ -190,6 +208,10 @@ export async function executeErasure(
     const scrub = async (table: string, sql: string, params: unknown[]): Promise<void> => {
       const { rowCount } = await client.query(sql, params);
       results.push({ table, action: 'scrub', count: rowCount ?? 0 });
+    };
+    const fail = async (table: string, sql: string, params: unknown[]): Promise<void> => {
+      const { rowCount } = await client.query(sql, params);
+      results.push({ table, action: 'fail', count: rowCount ?? 0 });
     };
 
     // Deleted: rows whose whole existence is the content. `proposals` runs
@@ -276,13 +298,45 @@ export async function executeErasure(
       `UPDATE approval_requests SET ${APPROVAL_REQUESTS_SCRUB_SET} WHERE ${APPROVAL_REQUESTS_SCRUBBED_PREDICATE}`,
       approvalRequestParams(businessId, jobIds, plan.anchor),
     );
-    // `awaiting_envelope_id` is cleared alongside `title` — see
-    // `JOBS_SCRUBBED_PREDICATE`'s docblock in `erasure-plan.ts` for why a
-    // dangling pointer to a just-deleted `agent_envelopes` row silently kills
-    // a parked parent job on the next scheduler pass.
+    // `awaiting_envelope_id` is cleared alongside `title` on EVERY job in
+    // `jobIds` — content hygiene only, not what resolves a stranded parent.
+    // See `JOBS_SCRUBBED_PREDICATE`'s docblock in `erasure-plan.ts` for why
+    // this alone is not enough, and the `fail` block below for what is.
     await scrub('jobs', `UPDATE jobs SET ${JOBS_SCRUB_SET} WHERE ${JOBS_SCRUBBED_PREDICATE}`, [businessId, jobIds]);
     await scrub('job_steps', `UPDATE job_steps SET reason = 'נמחק בהוראת הבעלים' WHERE job_id = ANY($1)`, [jobIds]);
     await scrub('job_step_results', 'UPDATE job_step_results SET external_id = NULL WHERE business_id=$1 AND job_id = ANY($2) AND external_id IS NOT NULL', [businessId, jobIds]);
+
+    // Failed: a job PARKED on the very `agent_envelopes` row this transaction
+    // just deleted. `stranded` was derived from the `FOR UPDATE` lock taken
+    // above, before any delete ran — not re-queried now, per
+    // `STRANDED_PARENT_PREDICATE`'s own docblock. `followup → failed` is a
+    // legal move (`domain/job.ts`'s `LEGAL_TRANSITIONS`). This does not call
+    // `transition()`: that function opens its OWN transaction and re-takes
+    // `SELECT ... FOR UPDATE` on the same row, which would block forever on
+    // the lock this transaction is already holding and has not committed —
+    // the update and its `job_steps` row are written directly on `client`
+    // instead, inside the same transaction that already holds the lock.
+    //
+    // Placed AFTER the `job_steps` reason-scrub above, deliberately: that
+    // statement blanks every existing `job_steps.reason` for `job_id = ANY
+    // ($1)`, and a row inserted before it would be caught by the same
+    // `UPDATE` and lose the sentence below. Inserted after, this row is the
+    // one line in a stranded job's history that says why it failed — counts
+    // and the (now-deleted) envelope's id, never the contact.
+    await fail(
+      'jobs',
+      `UPDATE jobs SET phase = 'failed', closed_at = now(), updated_at = now()
+        WHERE business_id = $1 AND job_id = ANY ($2)`,
+      [businessId, stranded.map((s) => s.jobId)],
+    );
+    for (const { jobId, envelopeId } of stranded) {
+      await client.query(
+        `INSERT INTO job_steps (job_id, from_phase, to_phase, actor, envelope_id, reason)
+         VALUES ($1, 'followup', 'failed', 'human', $2,
+                 'מחיקה בהוראת הבעלים מחקה את הפנייה שהמשימה המתינה למענה עליה, והמשימה לא תוכל להמשיך')`,
+        [jobId, envelopeId],
+      );
+    }
 
     await client.query('COMMIT');
   } catch (err) {

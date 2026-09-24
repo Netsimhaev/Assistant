@@ -13,7 +13,7 @@
  */
 import type { ApprovalRequest } from '../governance/approvals.js';
 import type { DocumentRecord } from '../documents/types.js';
-import type { ErasureAnchor, ErasurePlan } from '../governance/erasure-plan.js';
+import type { ErasureAnchor, ErasureItem, ErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
 import type { KeptItem } from '../governance/kept-items.js';
 import type { IntentName } from '../domain/reading.js';
@@ -818,6 +818,29 @@ const TABLE_LABELS: Record<string, string> = {
   job_step_results: 'מזהי הודעה מהספק',
 };
 
+/**
+ * What will happen to a row, per `ErasureItem.action` — future tense for the
+ * preview, past tense for the done screen. A third `'fail'` disposition
+ * (fix round 2, item 1): a job parked on a delegation whose own
+ * `agent_envelopes` row is about to be deleted, moved to a terminal `failed`
+ * phase as part of the erasure rather than left pointing at nothing. Keyed by
+ * `ErasureItem['action']` so a fourth action added later fails to compile
+ * here instead of silently falling through a two-branch ternary — the exact
+ * shape that would have shown "ינוקה מתוכן" (cleaned) for a job the erasure
+ * actually failed.
+ */
+const DISPOSITION_LABEL_FUTURE: Record<ErasureItem['action'], string> = {
+  delete: 'יימחק',
+  scrub: 'ינוקה מתוכן',
+  fail: 'משימה תלויה תיכשל, כי הפנייה שהיא ממתינה לה נמחקת',
+};
+
+const DISPOSITION_LABEL_PAST: Record<ErasureItem['action'], string> = {
+  delete: 'נמחק',
+  scrub: 'נוקה מתוכן',
+  fail: 'המשימה נכשלה, כי הפנייה שהמתינה לה נמחקה',
+};
+
 /** Hebrew names for what a kept item or a plan entry actually is. */
 const ITEM_KIND_LABELS: Record<string, string> = {
   document: 'מסמך',
@@ -1030,7 +1053,7 @@ export function renderErasure(model: ErasureViewModel): string {
       (item) =>
         `<tr><td>${esc(TABLE_LABELS[item.table] ?? item.table)}</td>` +
         `<td>${item.count}</td>` +
-        `<td>${item.action === 'delete' ? 'יימחק' : 'ינוקה מתוכן'}</td></tr>`,
+        `<td>${DISPOSITION_LABEL_FUTURE[item.action]}</td></tr>`,
     )
     .join('');
 
@@ -1122,7 +1145,7 @@ export function renderErasureDone(model: ErasureDoneViewModel): string {
       (item) =>
         `<tr><td>${esc(TABLE_LABELS[item.table] ?? item.table)}</td>` +
         `<td>${item.count}</td>` +
-        `<td>${item.action === 'delete' ? 'נמחק' : 'נוקה מתוכן'}</td></tr>`,
+        `<td>${DISPOSITION_LABEL_PAST[item.action]}</td></tr>`,
     )
     .join('');
 

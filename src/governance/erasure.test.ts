@@ -557,6 +557,92 @@ describe('executeErasure', () => {
   });
 
   /**
+   * Fix round 2, item 1. The job in the test above sits in `understand` —
+   * `LIVE_PHASES` doesn't cover it either way, so nothing there exercised the
+   * one phase that actually matters: `followup`, parked on the very
+   * `agent_envelopes` row this erasure deletes. Clearing the pointer alone
+   * (fix round 1) leaves such a job in a phase `resumeDelegatedJobs` can no
+   * longer find it in (it requires `awaiting_envelope_id IS NOT NULL`) and
+   * `wakeDueJobs` never picks up (`wake_at` is NULL for a delegation park) —
+   * stranded, not resolved. This test drives a job legally into `followup`
+   * with `awaitingEnvelopeId` set, the same shape `requestHelp` produces, and
+   * checks both sides of the pair: `plan.items` before execution and
+   * `outcome.deleted` after it, plus the job's own final row and history.
+   */
+  it('moves a parked parent to failed when its own delegation envelope is erased', async () => {
+    const jobId = await bareJob('parked-parent');
+    const identifier = 'parked@nowhere.example';
+    await getPool().query(
+      `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
+       VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
+      [BUSINESS, jobId, identifier],
+    );
+
+    const envelopeId = `ENV-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO agent_envelopes
+         (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+          kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+          idempotency_key, parent_job_id)
+       VALUES ($1, $2, $2, ARRAY['office.manager'], 'office.manager', 'ops.web',
+               'help_request', 'lookup_contact', '{}'::jsonb, '[]'::jsonb, 'hash-parked',
+               '{}'::jsonb, 1, $3, $4)`,
+      [BUSINESS, envelopeId, `idem-${ulid()}`, jobId],
+    );
+
+    // Legally into `followup`, parked on the envelope above — the shape
+    // `requestHelp` (`orchestrator/delegate.ts`) produces for a real
+    // delegation.
+    await transition(jobId, { to: 'understand', actor: 'orchestrator', reason: 'x', businessId: BUSINESS });
+    await transition(jobId, { to: 'plan', actor: 'orchestrator', reason: 'x', businessId: BUSINESS });
+    await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'x', businessId: BUSINESS });
+    await transition(jobId, {
+      to: 'followup',
+      actor: 'orchestrator',
+      reason: 'parked on a delegation',
+      awaitingEnvelopeId: envelopeId,
+      businessId: BUSINESS,
+    });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier }, { businessId: BUSINESS });
+    expect(plan.jobIds).toContain(jobId);
+    expect(plan.refusals).toEqual([]);
+    // Side one of the pair: the preview counts it before anything runs.
+    expect(plan.items.find((i) => i.table === 'jobs' && i.action === 'fail')).toEqual({
+      table: 'jobs',
+      action: 'fail',
+      count: 1,
+    });
+
+    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    // Side two of the pair: the executor reports the same disposition.
+    expect(outcome.deleted.find((i) => i.table === 'jobs' && i.action === 'fail')).toEqual({
+      table: 'jobs',
+      action: 'fail',
+      count: 1,
+    });
+
+    const jobRow = await getPool().query<{
+      phase: string;
+      closed_at: Date | null;
+      awaiting_envelope_id: string | null;
+    }>('SELECT phase, closed_at, awaiting_envelope_id FROM jobs WHERE job_id=$1', [jobId]);
+    expect(jobRow.rows[0]?.phase).toBe('failed');
+    expect(jobRow.rows[0]?.closed_at).not.toBeNull();
+    expect(jobRow.rows[0]?.awaiting_envelope_id).toBeNull();
+
+    // A reason exists, names no contact, and it is not the generic scrub
+    // text — it is written after the job_steps reason-scrub runs.
+    const steps = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM job_steps WHERE job_id=$1 AND from_phase='followup' AND to_phase='failed'`,
+      [jobId],
+    );
+    expect(steps.rows).toHaveLength(1);
+    expect(steps.rows[0]?.reason).not.toContain(identifier);
+    expect(steps.rows[0]?.reason).not.toBe('נמחק בהוראת הבעלים');
+  });
+
+  /**
    * I4: the plan-time refusal reads `jobs.phase` with no lock and is never
    * read again. A job that was quiet when the preview was built but that the
    * scheduler wakes into `execute` before the owner confirms would otherwise

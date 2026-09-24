@@ -176,6 +176,37 @@ describe('buildErasurePlan', () => {
       expect(plan.jobIds).toContain(jobId);
     });
 
+    /**
+     * Fix round 2, item 2. `_` is an ordinary character in an email local
+     * part and a LIKE wildcard, and this project has already shipped a broken
+     * `ESCAPE ''` once (the orphan `approval_requests` predicate) that stayed
+     * green because the control probing it carried no wildcard at all. The
+     * job above is reachable through FOUR other seeds (authorization, plan,
+     * instruction, title) in the fixture that test shares, so it would stay
+     * green even if this query's own escaping broke — a control that cannot
+     * fail is not a control. This job has NOTHING else naming the contact:
+     * only the envelope's `payload`, and the identifier below carries the
+     * wildcard.
+     */
+    it('discovers a contact through agent_envelopes.payload even when the identifier contains a LIKE wildcard', async () => {
+      const jobId = await bareJob('via-envelope-wildcard');
+      const identifier = 'zz_env-wild@nowhere.example';
+      await getPool().query(
+        `INSERT INTO agent_envelopes
+           (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+            kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+            idempotency_key, parent_job_id)
+         VALUES ($1, $2, $2, ARRAY['office.manager'], 'office.manager', 'ops.web',
+                 'help_request', 'lookup_contact', $3::jsonb, '[]'::jsonb, 'hash-wild',
+                 '{}'::jsonb, 1, $4, $5)`,
+        [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: identifier }), `idem-${ulid()}`, jobId],
+      );
+
+      const plan = await buildErasurePlan({ kind: 'contact', identifier }, { businessId: BUSINESS });
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
     it('via jobs.title', async () => {
       const jobId = await bareJob(`פנייה בנוגע ל-${RONIT}`);
 
@@ -214,14 +245,27 @@ describe('buildErasurePlan', () => {
       { businessId: BUSINESS },
     );
 
-    const tables = new Map(plan.items.map((i) => [i.table, i]));
-    expect(tables.get('memories')?.action).toBe('delete');
-    expect(tables.get('job_plans')?.action).toBe('delete');
-    expect(tables.get('job_authorizations')?.action).toBe('delete');
+    // Keyed by table AND action, not table alone: `jobs` now reports both a
+    // `scrub` (title/pointer cleared, unconditionally) and a `fail` (a
+    // stranded parent, here always 0) — a map keyed by table alone would let
+    // whichever is pushed last in `countItems` silently stand in for the
+    // other, the same defect `approval_requests`'s `delete`+`scrub` pair
+    // already forced onto `erasure.test.ts`'s `byStatement` map.
+    const tables = new Map(plan.items.map((i) => [`${i.table}:${i.action}`, i]));
+    expect(tables.get('memories:delete')?.action).toBe('delete');
+    expect(tables.get('job_plans:delete')?.action).toBe('delete');
+    expect(tables.get('job_authorizations:delete')?.action).toBe('delete');
     // A job row survives with its content emptied — audit rows point at it.
-    expect(tables.get('jobs')?.action).toBe('scrub');
-    expect(tables.get('agent_envelopes')).toEqual({ table: 'agent_envelopes', action: 'delete', count: 1 });
-    expect(tables.get('verification_verdicts')).toEqual({
+    expect(tables.get('jobs:scrub')?.action).toBe('scrub');
+    // No job here is parked in `followup`, so the `fail` disposition exists
+    // in the preview but counts zero.
+    expect(tables.get('jobs:fail')).toEqual({ table: 'jobs', action: 'fail', count: 0 });
+    expect(tables.get('agent_envelopes:delete')).toEqual({
+      table: 'agent_envelopes',
+      action: 'delete',
+      count: 1,
+    });
+    expect(tables.get('verification_verdicts:delete')).toEqual({
       table: 'verification_verdicts',
       action: 'delete',
       count: 1,

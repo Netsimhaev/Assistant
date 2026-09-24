@@ -85,7 +85,20 @@ export type ErasureAnchor =
 
 export interface ErasureItem {
   table: string;
-  action: 'delete' | 'scrub';
+  /**
+   * `'fail'` is one row: a job PARKED on a delegation (`phase = 'followup'`,
+   * `awaiting_envelope_id` set) whose own `agent_envelopes` row this erasure
+   * is about to delete. Clearing the pointer alone (as `scrub` on `jobs`
+   * already does, unconditionally) leaves that job in `followup` forever —
+   * `resumeDelegatedJobs`'s own docblock calls it that job's ONLY possible
+   * mover, `wakeDueJobs` never picks it up (`wake_at` is NULL for a
+   * delegation park), and its `job_plans` row is gone in the same
+   * transaction regardless. A phase with no reader is the leak this project
+   * already names in prose (`LIVE_PHASES`'s docblock, "a job pointing at a
+   * plan that no longer exists") — moved to `failed` instead, deliberately,
+   * as part of the erasure. See `STRANDED_PARENT_PREDICATE`'s docblock.
+   */
+  action: 'delete' | 'scrub' | 'fail';
   count: number;
 }
 
@@ -336,6 +349,17 @@ export const PROPOSALS_ERASED_PREDICATE = `business_id = $1
  * codebase over-deletion is exactly as serious as under-deletion — the
  * preview is a contract in both directions.
  *
+ * **One keep interaction remains, and it is not a gap the way the dropped arm
+ * was.** If the owner keeps the CHILD job while the PARENT stays in `jobIds`,
+ * this predicate still deletes the envelope: `parent_job_id` names the
+ * parent, not the child, and the parent was never kept. That is correct — the
+ * envelope is the PARENT's own content (its own delegation request), not the
+ * child's, and destroying it is not the `keptJobs`-defeating shape above,
+ * where keeping the very job named on the predicate failed to shield its own
+ * envelope. It is still a second, distinct way "keep" and `agent_envelopes`
+ * interact, worth a reader knowing about before finding it in production
+ * rather than here.
+ *
  * Parameters, in both places: `$1` businessId, `$2` jobIds.
  */
 export const AGENT_ENVELOPES_ERASED_PREDICATE = `business_id = $1
@@ -372,23 +396,54 @@ export const VERIFICATION_VERDICTS_ERASED_PREDICATE = `business_id = $1 AND job_
  * child finishes. `LIVE_PHASES` is `['execute', 'await_approval']`, so a
  * parked parent is not "live" by either the plan-time refusal or the
  * in-transaction re-check — nothing stops `agent_envelopes` from deleting
- * that very row out from under it. Left un-cleared, the job holds a pointer
- * to a row that no longer exists: the next scheduler pass calls
- * `loadEnvelopeWithChild`, gets `null`, and `failCorruptedParent` moves the
- * job to `failed` — an erasure of a contact silently killing a parked job
- * that has nothing to do with why it was parked. This is the same shape
- * `LIVE_PHASES`'s own docblock already names ("leaves a job pointing at a
- * plan that no longer exists"), one column over from `job_plans`.
+ * that very row out from under it. This is the same shape `LIVE_PHASES`'s own
+ * docblock already names ("leaves a job pointing at a plan that no longer
+ * exists"), one column over from `job_plans`.
  *
  * `title` and `awaiting_envelope_id` are cleared together, in one predicate
  * and one `SET`, because a job can need either half alone: a job with no
  * title left to scrub but a live envelope pointer, or vice versa, must still
  * be picked up and scrubbed.
+ *
+ * **Clearing the pointer alone is NOT the fix for a parked parent — it is
+ * only content hygiene, and it used to be mistaken for the fix (fix round 1,
+ * item 2; corrected in fix round 2, item 1).** A cleared `NULL` pointer on a
+ * job still sitting in `phase = 'followup'` gives that job no way out:
+ * `resumeDelegatedJobs`'s own docblock calls itself that job's ONLY possible
+ * mover, and its query requires `awaiting_envelope_id IS NOT NULL` — a job
+ * this `SET` just nulled no longer matches it. `wakeDueJobs` cannot pick it
+ * up either (`wake_at` is NULL for a delegation park, not a retry). The job
+ * is left in a phase with no reader — "parked" became "stranded" instead of
+ * "killed", and a phase with no reader is not a resting place. What actually
+ * resolves this is `STRANDED_PARENT_PREDICATE` below, which moves such a job
+ * to `failed` as part of the same erasure. This `SET` still runs
+ * unconditionally on every job in `jobIds`, stranded or not, because the
+ * `title` half has nothing to do with parking at all.
  */
 export const JOBS_SCRUBBED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)
   AND (title IS NOT NULL OR awaiting_envelope_id IS NOT NULL)`;
 
 export const JOBS_SCRUB_SET = `title = NULL, awaiting_envelope_id = NULL`;
+
+/**
+ * A job parked on a delegation whose OWN `agent_envelopes` row this erasure
+ * is about to delete — the count the preview shows for `ErasureItem`'s
+ * `'fail'` action (see that type's own docblock for the full failure chain).
+ *
+ * Read-only here, for the preview: `buildErasurePlan` has no lock and no
+ * transaction, so this is an estimate exactly like the `LIVE_PHASES` refusal
+ * above is — re-verified at execution time under the SAME `FOR UPDATE` lock
+ * the liveness check already takes, not re-queried against a state that
+ * could have moved between the preview and the confirm. The executor does
+ * NOT reuse this exact SQL text: it derives the identical set from the rows
+ * that lock already returned, so a table it just told the transaction
+ * `agent_envelopes` is about to delete cannot be read again with different
+ * results a few statements later.
+ *
+ * Parameters: `$1` businessId, `$2` jobIds.
+ */
+export const STRANDED_PARENT_PREDICATE = `business_id = $1 AND job_id = ANY ($2)
+  AND phase = 'followup' AND awaiting_envelope_id IS NOT NULL`;
 
 async function idsFrom(
   db: Queryable,
@@ -701,7 +756,7 @@ async function countItems(
 ): Promise<ErasureItem[]> {
   const one = async (
     table: string,
-    action: 'delete' | 'scrub',
+    action: 'delete' | 'scrub' | 'fail',
     sql: string,
     params: unknown[],
   ): Promise<ErasureItem> => {
@@ -807,6 +862,15 @@ async function countItems(
       'jobs',
       'scrub',
       `SELECT count(*)::text AS n FROM jobs WHERE ${JOBS_SCRUBBED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    // See `ErasureItem.action`'s and `STRANDED_PARENT_PREDICATE`'s own
+    // docblocks (fix round 2, item 1) for why this is counted separately from
+    // the `scrub` above rather than folded into it.
+    await one(
+      'jobs',
+      'fail',
+      `SELECT count(*)::text AS n FROM jobs WHERE ${STRANDED_PARENT_PREDICATE}`,
       [businessId, jobIds],
     ),
     await one(
