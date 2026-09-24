@@ -19,6 +19,7 @@ function aVerdict(overrides: Partial<Verdict> = {}): Verdict {
     ],
     ungroundedNumbers: [],
     answerTruncated: false,
+    draftTruncated: false,
     fenceForgeryDetected: false,
     ...overrides,
   };
@@ -73,9 +74,16 @@ describe('verdict-store', () => {
    * `loadVerdict` THROW on every one of them instead of returning it. Writes
    * directly to the table, bypassing `saveVerdict`'s `Verdict`-typed
    * parameter, to reproduce exactly the row shape a version of the code
-   * before `answerTruncated`/`fenceForgeryDetected` existed would have saved.
+   * before `answerTruncated`/`draftTruncated`/`fenceForgeryDetected` existed
+   * would have saved.
+   *
+   * `fenceForgeryDetected` reads back `undefined`, not `false` — it is
+   * `.optional()`, deliberately not defaulted (see the schema's own
+   * docblock): "cannot be read" must stay distinguishable from "checked, and
+   * clean" for a security signal, the two truncation flags being a different
+   * case where a default is fine.
    */
-  it('reads back a row saved before answerTruncated and fenceForgeryDetected existed', async () => {
+  it('reads back a row saved before answerTruncated, draftTruncated and fenceForgeryDetected existed', async () => {
     const oldShapeVerdict = {
       criteria: [
         { id: 'c1', statement: 'x', severity: 'must', passed: true, detail: 'y' },
@@ -90,6 +98,7 @@ describe('verdict-store', () => {
     const loaded = await loadVerdict('job-old-shape', { businessId: BUSINESS });
     expect(loaded).not.toBeNull();
     expect(loaded?.answerTruncated).toBe(false);
-    expect(loaded?.fenceForgeryDetected).toBe(false);
+    expect(loaded?.draftTruncated).toBe(false);
+    expect(loaded?.fenceForgeryDetected).toBeUndefined();
   });
 });

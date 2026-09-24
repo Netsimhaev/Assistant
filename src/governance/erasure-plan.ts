@@ -69,9 +69,9 @@
  * `requestHelp` directly, with no plan step behind it (Task 10), has no plan
  * text to be found by, and the discovery query is what reaches that case.
  * See `AGENT_ENVELOPES_ERASED_PREDICATE`'s own docblock for the full trace.
- * `verification_verdicts` has no writer yet and is not given a discovery
- * query — see that predicate's own docblock for why this must be rechecked
- * once one exists.
+ * `verification_verdicts` now has a writer (`gov-verify.ts`'s `verifyDraft`,
+ * Task 10) and still has no discovery query of its own — see that
+ * predicate's own docblock for why the gap is real, not merely unrechecked.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -373,15 +373,28 @@ export const AGENT_ENVELOPES_ERASED_PREDICATE = `business_id = $1
  * `agent_envelopes` briefly had one, because this table carries no separate
  * parent/child distinction at all.
  *
- * **Wired ahead of its own writer, and that is a real gap, not a settled
- * one.** No code writes `verification_verdicts` yet (Task 11), so there is no
- * production shape to trace the way `agent_envelopes.payload` was traced back
- * to `job_plans.plan` above. A verdict quoting a runtime-resolved draft could
- * plausibly name a party absent from that job's `job_plans.plan`, with no
- * discovery query anywhere searching `verdict` for one. This predicate — and
- * the question of whether a discovery query belongs beside it — must be
- * rechecked once Task 11's writer exists and its actual payload shape is
- * known, not assumed clean because deletion-by-`job_id` was wired in early.
+ * **The writer now exists (`gov-verify.ts`'s `verifyDraft`, via
+ * `saveVerdict`, Task 10), and the discovery-query question this docblock
+ * deferred is now answered: NOT YET CLOSED, and for a sharper reason than
+ * "no writer to trace."** `Verdict.criteria[].detail` is free text the JUDGE
+ * MODEL writes, instructed to quote from the draft or the answer when it
+ * helps — exactly the kind of content `agent_envelopes.payload` also is.
+ * But the tracing argument that closed the gap for `agent_envelopes` (a
+ * plan-issued call's payload is already sitting in that job's own
+ * `job_plans.plan`) does not carry over here without more information than
+ * this module has: `verifyDraft` takes `parentJobId` for a job it treats as
+ * ALREADY OPEN, and is called directly the way `curateJob` writes memory
+ * directly — never through `runLocalTool`/the generic plan-step executor.
+ * Whether gov.verify's own job ends up with a `job_plans` row that already
+ * contains the draft and the answer depends entirely on how its caller
+ * (Task 11's conductor) opens that job — a decision this module cannot see
+ * from here. If that job never gets a bound plan, `Verdict.criteria[].detail`
+ * may be the ONLY surviving place a counterparty's name or quote from the
+ * draft appears for it, with `job_id = ANY ($2)` alone providing no way to
+ * FIND that job from the contact side — the same shape the discovery query
+ * exists to close for `boss_instructions` and `agent_envelopes`. Recorded
+ * here as the answer to the question this docblock asked, not as a query
+ * added on the strength of a guess about a caller this module has not seen.
  *
  * Parameters, in both places: `$1` businessId, `$2` jobIds.
  */

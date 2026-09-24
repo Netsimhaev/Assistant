@@ -47,16 +47,37 @@ export const Verdict = z.object({
    */
   answerTruncated: z.boolean().default(false),
   /**
-   * Whether `answer` or `draftText` contained something shaped like this
-   * module's own fence markers — computed by CODE from the raw input
-   * (`wasFenceForgeryAttempted`, `src/sdk/gov-verify.ts`), independent of
-   * whatever a particular call's random nonce turned out to be. An attempt
-   * is worth an owner's attention regardless of whether the nonce that call
-   * actually used made it impossible to succeed. Same `.default(false)`
-   * reasoning as `answerTruncated`, from the day this field was born rather
-   * than a round later.
+   * Whether `draftText` had to be cut before it reached the judge
+   * (`MAX_DRAFT_CHARS`). Added a round after `draftText` itself gained the
+   * answer's fence and cap (round 3) but not this equivalent — a 4,500
+   * character draft was silently cut to 4,000 with nothing recording it, and
+   * a saved verdict could read `passed: true` with no way to tell the judge
+   * never saw the tail. `ungroundedNumbers` is unaffected by this cut (it
+   * runs on the FULL draft before any truncation — see `verifyDraft`); only
+   * the model's own judgment is blind to whatever this flags. Same
+   * `.default(false)` reasoning as `answerTruncated`.
    */
-  fenceForgeryDetected: z.boolean().default(false),
+  draftTruncated: z.boolean().default(false),
+  /**
+   * Whether `question`, `answer` or `draftText` contained something shaped
+   * like this module's own fence markers — computed by CODE from the raw
+   * input (`wasFenceForgeryAttempted`, `src/sdk/gov-verify.ts`), independent
+   * of whatever a particular call's random nonce turned out to be. An
+   * attempt is worth an owner's attention regardless of whether the nonce
+   * that call actually used made it impossible to succeed.
+   *
+   * **`.optional()`, not `.default(false)` — unlike the two truncation
+   * flags above, and deliberately so.** This is a security signal, and
+   * `.default(false)` would make "we cannot read this field on an old row"
+   * mean "checked, and clean" — the exact inversion of this project's own
+   * rule that a value which could not be read is never a permitting one
+   * (`amount_unreadable`, an unknown data class scored most severe, and so
+   * on throughout this codebase). `.optional()` lets a future reader tell
+   * "false: checked, nothing found" apart from "absent: never checked at
+   * all" — a distinction that costs nothing to keep today, before any reader
+   * exists, and would be expensive to retrofit once one does.
+   */
+  fenceForgeryDetected: z.boolean().optional(),
 });
 export type Verdict = z.infer<typeof Verdict>;
 
