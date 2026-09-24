@@ -2,6 +2,7 @@ import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
 import { conductPendingDocuments } from './conduct.js';
+import type { Judge } from '../sdk/gov-verify.js';
 import type { ConductOptions, ConductResult } from './conduct.js';
 import { scanInbox } from './inbox-scan.js';
 import type { ScanResult } from './inbox-scan.js';
@@ -240,28 +241,36 @@ export async function schedulerPass(
     reader?: ConductOptions['reader'];
     proposer?: ConductOptions['proposer'];
     /**
-     * The seam that stands in for `verifyDraft`, so a test can drive the whole
-     * verification loop through this real pass without an API key — the judge
-     * (`judgeWithModel`) is a billed Agent SDK call, and its own
-     * `refuseUnderTest` guard throws rather than letting the loop finish.
+     * Replaces `verifyDraft` for the CONDUCTOR's call only — `beginVerification`,
+     * which passes `answer: null` and does nothing but open the delegation.
+     * That call is deterministic and free, so this seam exists for tests that
+     * want to observe or fail it, never to avoid a bill.
      *
-     * **It reaches BOTH places production calls `verifyDraft`**, and that is
-     * worth stating because the two are not the same call. The conductor's
-     * (`beginVerification`, through the `...options` spread below) passes
-     * `answer: null` and only ever opens the delegation — deterministic and
-     * free. The judging step's (`assert.evaluate`, through `runDueJobs` →
-     * `runPlanForJob` → `runLocalTool`) passes the answer the helper came back
-     * with, and that is the call that pays. A caller that needs the first real
-     * and only the second stubbed therefore must not REPLACE `verifyDraft`
-     * here: it wraps it, injecting `VerifyDraftInput.judge` — the seam that
-     * sits exactly around the billed call and nothing else.
+     * **Two names, not one, and the split is a control.** Production calls
+     * `verifyDraft` in two places, and one shared option reached both: a
+     * caller that replaced the function to stub the judge silently disabled
+     * `requestHelp` too — no envelope, no parked parent — while
+     * `ConductResult.verificationFailed` stayed 0, because a replacement
+     * returning a `Verdict` is indistinguishable from success. A green run
+     * over a loop that never ran is the exact failure this scheduler's own
+     * verification test exists to prevent, so the judging path gets `judge`
+     * below and this one keeps a name of its own.
      *
      * `NonNullable`, unlike its `reader`/`proposer` siblings above: this whole
-     * options object is spread straight into `conductPendingDocuments`, and
+     * options object is spread into `conductPendingDocuments`, and
      * `ConductOptions.verifier` is declared without `| undefined` — so under
      * `exactOptionalPropertyTypes` the indexed type alone will not assign.
      */
     verifier?: NonNullable<ConductOptions['verifier']>;
+    /**
+     * Replaces only the billed model call inside the JUDGING step
+     * (`assert.evaluate` → `VerifyDraftInput.judge`), threaded through
+     * `runDueJobs` → `runPlanForJob` → `runLocalTool`. A `Judge` cannot decide
+     * not to delegate, which is precisely why this is the seam production
+     * exposes and `verifier` above is not. Held out of the conductor's call
+     * explicitly below — see `conductOptions`.
+     */
+    judge?: Judge;
   } = {},
 ): Promise<SchedulerPassResult> {
   const tickResult = await tick(options);
@@ -274,6 +283,15 @@ export async function schedulerPass(
 
   // Both conductor loops run after the tick's transaction has committed, not
   // inside it — see the docblock above.
+  //
+  // `judge` is destructured OUT rather than left to ride the spread. It is not
+  // a `ConductOptions` field, so nothing would break today — but the whole
+  // point of splitting the two seams (see `verifier`'s and `judge`'s own
+  // docblocks) is that the conductor's `verifyDraft` call and the judging one
+  // are reached by different names, and a `...options` that quietly carried
+  // both would make that separation a matter of what `ConductOptions` happens
+  // to declare rather than a statement this function makes.
+  const { judge, ...conductOptions } = options;
   const inbox = options.inbox !== undefined ? options.inbox : config.documentInbox;
   const runtime = options.runtime ?? (await buildRuntime());
   let scan: ScanResult | null = null;
@@ -298,7 +316,7 @@ export async function schedulerPass(
     }
 
     conduct = await conductPendingDocuments({
-      ...options,
+      ...conductOptions,
       // The conductor writes approvals without passing through the gate, and
       // the gate was carrying the notification. Threaded here so a conductor
       // card reaches the owner's mailbox exactly as a gate-raised one does.
@@ -306,6 +324,9 @@ export async function schedulerPass(
     });
   }
 
+  // `...options` here, not `conductOptions`: this is the path `judge` belongs
+  // on. `verifier` rides along and is ignored — `runDueJobs` declares no such
+  // field, and the judging step reads `judge` alone.
   const due = await runDueJobs({ ...options, runtime });
   // Last, and the order matters as much as the rest: a job `runDueJobs` just
   // finished is sitting in `verify` by the time this looks, so it closes in

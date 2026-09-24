@@ -43,7 +43,12 @@ import { renderArtifactFull } from '../documents/brief.js';
 import { readDocument } from '../documents/read.js';
 import { loadLatestReading } from '../documents/reading-store.js';
 import { loadArtifacts, readingsToday } from '../documents/store.js';
-import { verifyDraft, type VerifyDraftInput, type VerifyDraftResult } from '../sdk/gov-verify.js';
+import {
+  verifyDraft,
+  type Judge,
+  type VerifyDraftInput,
+  type VerifyDraftResult,
+} from '../sdk/gov-verify.js';
 import type { ReadOutcome, ReadRequest } from '../sdk/know-reader.js';
 import {
   loadEnvelopeForChildJob,
@@ -83,12 +88,31 @@ export interface LocalToolContext {
    */
   reader?: (request: ReadRequest) => Promise<ReadOutcome>;
   /**
-   * The second step that costs money, injectable so a test can drive
-   * `assert.evaluate` without an API key — the same seam `ctx.reader` already
-   * is for `doc.fetch`. Defaults to the real `verifyDraft` inside the handler
-   * when omitted.
+   * Replaces `verifyDraft` WHOLESALE for `assert.evaluate` — the seam this
+   * module's own tests use to drive the handler's branching (a refusal, a
+   * second delegation, a throw) without standing up the real function.
+   *
+   * **Nothing in production threads this, and that is deliberate.** A
+   * replacement decides for itself whether to delegate, and the scheduler's
+   * own seam is `judge` below for exactly that reason — see its docblock.
    */
   verifier?: (input: VerifyDraftInput) => Promise<VerifyDraftResult>;
+  /**
+   * Replaces only the BILLED call inside `verifyDraft` — `judgeWithModel` —
+   * and leaves every other thing `verifyDraft` does alone.
+   *
+   * This is the seam the scheduler threads (`schedulerPass` → `runDueJobs` →
+   * `runPlanForJob` → here), and the split from `verifier` above is a control,
+   * not tidiness. One shared name reached both of production's `verifyDraft`
+   * call sites — the conductor's delegation-opening one and this judging one —
+   * so a caller that REPLACED the function silently disabled `requestHelp`:
+   * no envelope, no parked parent, and `ConductResult.verificationFailed`
+   * still 0, because a replacement that returns a `Verdict` looks exactly
+   * like success. That is a green run over a loop that never ran. Narrowing
+   * the production seam to the billed call makes disabling the delegation
+   * impossible to do by accident: a `Judge` cannot decide not to delegate.
+   */
+  judge?: Judge;
   /**
    * The agent this step runs as — required by `agent.request_help` (it is
    * `requestHelp`'s `from`, the requesting agent recorded on the envelope)
@@ -786,6 +810,12 @@ const HANDLERS: Record<string, LocalHandler> = {
       // So `verifyDraft`'s own `saveVerdict` and this handler's land on the
       // SAME connection — see `VerifyDraftInput.db`.
       ...(ctx.db !== undefined ? { db: ctx.db } : {}),
+      // The narrow seam: it replaces the billed model call and nothing else,
+      // so the delegation branch above it cannot be turned off from outside.
+      // Ignored when `ctx.verifier` replaced the whole function — a
+      // replacement has no obligation to honour it, which is itself the
+      // reason production threads this one and not that one.
+      ...(ctx.judge !== undefined ? { judge: ctx.judge } : {}),
     });
 
     // `'status' in result` alone, not `&& result.status === 'awaiting_delegation'`:

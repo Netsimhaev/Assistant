@@ -15,13 +15,14 @@
  *
  * - `reader` — the conductor's own document read.
  * - `proposer` — the conductor's own proposal.
- * - `verifier` — and this one is NOT a replacement for `verifyDraft`. It calls
- *   the real `verifyDraft` and injects `VerifyDraftInput.judge`, the seam that
- *   sits around the billed judge call and nothing else. That matters: the
- *   delegation, the numeric grounding, the nonce-fenced prompt, the truncation
- *   flags and `saveVerdict` are all real here. Replacing `verifyDraft` outright
- *   would have stubbed out the delegation too — and the delegation is half of
- *   what this file exists to prove.
+ * - `judge` — and this one is NOT a replacement for `verifyDraft`. It replaces
+ *   only `judgeWithModel`, the seam inside it that costs money. That matters:
+ *   the delegation, the numeric grounding, the nonce-fenced prompt, the
+ *   truncation flags and `saveVerdict` are all real here. Replacing
+ *   `verifyDraft` outright — which `schedulerPass`'s other seam, `verifier`,
+ *   still does for the conductor's own call — would have stubbed out the
+ *   delegation too, and the delegation is half of what this file exists to
+ *   prove. The second test below is that hazard, pinned.
  *
  * Everything else — the phase machine, the gate, `runDueJobs`, the envelope
  * store, `resumeDelegatedJobs`, `closeVerifiedJobs` — is production code.
@@ -39,12 +40,7 @@ import { ingestDocument } from '../documents/ingest.js';
 import type { Proposal } from '../domain/proposal.js';
 import type { Reading } from '../domain/reading.js';
 import { loadVerificationOutcome } from '../governance/verdict-store.js';
-import {
-  verifyDraft,
-  type Judge,
-  type VerifyDraftInput,
-  type VerifyDraftResult,
-} from '../sdk/gov-verify.js';
+import type { Judge } from '../sdk/gov-verify.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { envCredentials } from './credentials.js';
 import { loadJob } from './jobs.js';
@@ -174,10 +170,6 @@ describe('the verification loop, end to end through schedulerPass', () => {
         };
       };
 
-      // Wraps `verifyDraft`, never replaces it — see this file's docblock.
-      const verifier = (input: VerifyDraftInput): Promise<VerifyDraftResult> =>
-        verifyDraft({ ...input, judge });
-
       let readerCalls = 0;
       const options = {
         businessId: BUSINESS,
@@ -187,7 +179,10 @@ describe('the verification loop, end to end through schedulerPass', () => {
           return { status: 'read' as const, reading: READING, raw: '{}', denials: [], turns: 1 };
         },
         proposer: async () => ({ status: 'proposed' as const, proposal: ACTING, raw: '{}' }),
-        verifier,
+        // The narrow seam. `verifier` is deliberately NOT passed: the
+        // conductor's own `verifyDraft` call has to be the real one, or there
+        // is no delegation to prove.
+        judge,
         runtime: runtime(),
       };
 
@@ -271,6 +266,82 @@ describe('the verification loop, end to end through schedulerPass', () => {
       expect(pass3.due.ran).toEqual([]);
       expect(judgeCalls).toBe(1);
       expect(await envelopes()).toHaveLength(2);
+    } finally {
+      mutableConfig.documentReadsPerDay = originalReads;
+    }
+  });
+
+  /**
+   * **The hazard the two seam names exist to make impossible, pinned.**
+   *
+   * Until the split, `schedulerPass` had one `verifier` option and spread it
+   * into both loops — so a caller wanting a free judge passed a stub that
+   * REPLACED `verifyDraft`, and a replacement owns the delegation branch too.
+   * The result: `requestHelp` never ran, no `help_request` envelope was
+   * written, the `gov.verify` job never parked — and nothing said so.
+   * `ConductResult.verificationFailed` stayed 0, because a stub returning a
+   * `Verdict` is indistinguishable from success, and the pass reported a card
+   * raised and a verification opened.
+   *
+   * This test stubs the judge the way production exposes it and asserts the
+   * delegation happened anyway. It is written as a positive assertion on the
+   * envelope row — the durable artefact — because "no error was reported" is
+   * exactly the signal the old shape produced while doing nothing.
+   */
+  it('stubbing the judge cannot disable the delegation', async () => {
+    const mutableConfig = config as { documentReadsPerDay: number };
+    const originalReads = mutableConfig.documentReadsPerDay;
+    mutableConfig.documentReadsPerDay = 20;
+
+    try {
+      const dir = await mkdtemp(join(tmpdir(), 'verif-seam-doc-'));
+      const path = join(dir, 'quote.txt');
+      await writeFile(path, 'הצעת מחיר: 11988 ש"ח. נא לאשר בכתב.', 'utf8');
+      await ingestDocument(
+        { path, source: 'manual' },
+        { businessId: BUSINESS, documentRoot: dir },
+      );
+      const inbox = await mkdtemp(join(tmpdir(), 'verif-seam-inbox-'));
+
+      let judgeCalls = 0;
+      const judge: Judge = async () => {
+        judgeCalls += 1;
+        return {
+          status: 'judged',
+          raw: '{}',
+          criteria: [{ id: 'x', statement: 'y', severity: 'must', passed: true, detail: 'z' }],
+        };
+      };
+
+      const pass = await schedulerPass({
+        businessId: BUSINESS,
+        inbox,
+        reader: async () => ({
+          status: 'read' as const,
+          reading: READING,
+          raw: '{}',
+          denials: [],
+          turns: 1,
+        }),
+        proposer: async () => ({ status: 'proposed' as const, proposal: ACTING, raw: '{}' }),
+        judge,
+        runtime: runtime(),
+      });
+
+      expect(pass.conduct?.carded).toBe(1);
+      expect(pass.conduct?.verificationFailed).toBe(0);
+      // The two assertions the old shape would have failed: a real envelope,
+      // and a parent actually parked on it.
+      const rows = await envelopes();
+      expect(rows.filter((row) => row.kind === 'help_request')).toHaveLength(1);
+      const request = rows[0];
+      if (request === undefined) throw new Error('the delegation never happened');
+      expect((await loadJob(request.parent_job_id, { businessId: BUSINESS }))?.phase).toBe(
+        'followup',
+      );
+      // And the judge genuinely was not reached on this pass, so the green
+      // above is not a judge call standing in for a delegation.
+      expect(judgeCalls).toBe(0);
     } finally {
       mutableConfig.documentReadsPerDay = originalReads;
     }
