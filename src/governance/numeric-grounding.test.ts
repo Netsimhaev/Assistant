@@ -159,15 +159,57 @@ describe('ungroundedNumbers', () => {
      * single character before the dash, not what precedes THAT character —
      * so any word simply ENDING in one of the seven particle letters (`ה` is
      * the most common word-final letter in Hebrew) was misread as a prefix
-     * too. `הנחה-500` ("a discount of 500", positive) normalised to `-500`
-     * and matched nothing in a source carrying the unsigned amount — a real
-     * credit/debit inversion silently grounded, measured by transpiling and
+     * too. Round 3's actual output for `הנחה-500` ("a discount of 500",
+     * POSITIVE) was the UNSIGNED `500`, which MATCHED a source carrying
+     * `500` — the credit/debit inversion this module tracks signs
+     * specifically to catch passed SILENTLY. Measured by transpiling and
      * running round 3's code. Nothing pinned this word-ending behaviour
-     * either way before now.
+     * either way before round 4.
      */
     it('does NOT treat a word merely ending in a particle letter as a prefix (false negative on money)', () => {
       expect(ungroundedNumbers('הנחה-500 ש"ח', ['סכום 500 ש"ח'])).toEqual(['-500']);
       expect(ungroundedNumbers('יתרה-1,200 ש"ח לזכותך', ['יתרה 1200 ש"ח'])).toEqual(['-1200']);
+    });
+
+    /**
+     * Fix round 5, item 1 — the fourth regression, and the mirror of round
+     * 4's own bug in the opposite direction. Hebrew stacks prefix particles
+     * (`contact-resolver.ts`'s own `MAX_PARTICLE_LAYERS`, `ולדני` = ו + ל +
+     * דני), and round 4's single-letter boundary check looked back only ONE
+     * letter from the particle adjacent to the dash — so a genuine stacked
+     * particle (its outermost letter preceded by ANOTHER particle letter,
+     * not by a word-internal letter) was rejected exactly like `ORDER-12345`.
+     * Measured, six pairs that flipped from correctly grounding to falsely
+     * flagged: `מה-` ("from the"), `ול-`/`וב-`/`וה-` ("and for"/"and in"/
+     * "and the"), and `כשה-` ("when the", three stacked). These constructions
+     * are considerably more common in ordinary Hebrew business text than a
+     * bare word ending in a single particle letter with a glued minus.
+     */
+    it('peels a stacked Hebrew particle chain, not just a single letter', () => {
+      expect(ungroundedNumbers('החשבונית מה-5,000 ש"ח', ['על סך 5,000'])).toEqual([]);
+      expect(ungroundedNumbers('התשלום ול-950 ש"ח', ['950 ש"ח'])).toEqual([]);
+      expect(ungroundedNumbers('הסכום שב-11,988 ש"ח אושר', ['11,988 ש"ח'])).toEqual([]);
+      expect(ungroundedNumbers('ההנחה וה-1,200 הנוספים', ['1,200 ש"ח'])).toEqual([]);
+      expect(ungroundedNumbers('נדחה כשה-2024 הסתיים', ['שנת 2024'])).toEqual([]);
+      expect(ungroundedNumbers('ומ-50 יחידות', ['50 יחידות'])).toEqual([]);
+    });
+
+    /**
+     * The word-ending case (round 4) and the stacked-particle case (round 5)
+     * exercised together, so the next person to touch this file sees both
+     * directions at once: a chain is peeled up to three letters deep, but
+     * the character before the WHOLE chain must still be a non-letter.
+     * `הנחה`/`יתרה`/`ההנחה` each hit a genuine word-internal letter at the
+     * head of their one-letter "chain" and stay signed; `עמלה` hits one two
+     * letters in (its third-from-last letter, `מ`, is itself a letter,
+     * whether or not it is also particle-shaped); `מה`/`כשה` reach an actual
+     * word boundary and read as prefixes.
+     */
+    it('holds both directions together: word-ending letters stay signed, stacked particles do not', () => {
+      expect(ungroundedNumbers('הנחה-500 ש"ח', ['סכום 500 ש"ח'])).toEqual(['-500']);
+      expect(ungroundedNumbers('עמלה-75 ש"ח', ['עמלה 75 ש"ח'])).toEqual(['-75']);
+      expect(ungroundedNumbers('ההנחה-500 ש"ח', ['הנחה 500 ש"ח'])).toEqual(['-500']);
+      expect(ungroundedNumbers('נדחה כשה-2024 הסתיים', ['שנת 2024'])).toEqual([]);
     });
   });
 });
