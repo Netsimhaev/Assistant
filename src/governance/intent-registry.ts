@@ -23,6 +23,18 @@
  */
 import { z } from 'zod';
 
+/**
+ * The cap on `read_for_question`'s `question` field. Named and exported so
+ * `gov-verify.ts` — the only caller that ever composes this intent's payload
+ * outside this schema itself (once a delegation has already answered, and
+ * this schema is not consulted a second time) — derives its own cap from
+ * this constant rather than repeating the literal `500`. Two independent
+ * literals claiming to be "the same cap" is exactly the drift the house
+ * pattern (`sdkToolsFor` deriving from an allowlist, the `OUTBOUND_TOOLS`
+ * invariant deriving from `addresseeOf`) exists to prevent.
+ */
+export const READ_FOR_QUESTION_MAX_CHARS = 500;
+
 export interface IntentSpec {
   payload: z.ZodTypeAny;
   /** A context ref of this kind must be present, or the request is refused. */
@@ -39,7 +51,7 @@ export const INTENT_REGISTRY: Record<string, Record<string, IntentSpec>> = {
      * open an untrusted document itself.
      */
     read_for_question: {
-      payload: z.object({ question: z.string().min(1).max(500) }),
+      payload: z.object({ question: z.string().min(1).max(READ_FOR_QUESTION_MAX_CHARS) }),
       requiresContextRef: 'document',
       // know.reader's allowlist is ['doc.fetch', 'memory.recall'].
       tool: 'doc.fetch',

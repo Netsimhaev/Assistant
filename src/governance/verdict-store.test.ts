@@ -18,6 +18,7 @@ function aVerdict(overrides: Partial<Verdict> = {}): Verdict {
       },
     ],
     ungroundedNumbers: [],
+    answerTruncated: false,
     ...overrides,
   };
 }

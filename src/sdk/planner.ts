@@ -203,13 +203,3 @@ export function parsePlan(raw: string): PlanOutcome {
   return { status: 'unparseable', raw, reason };
 }
 
-/**
- * Re-exported for `curator.ts`'s sake — the implementation moved to
- * `src/util/json-extract.ts` so a module with no business reading document
- * content (`gov-verify.ts`) does not have to import THIS file to get it. This
- * file itself pulls in `local-tools.ts` (for `renderLocalToolContracts`,
- * above), which imports `readDocument` — exactly the transitive edge
- * `gov.verify`'s quarantine forbids. See `src/util/json-extract.ts`'s own
- * docblock.
- */
-export { extractJsonObjects };

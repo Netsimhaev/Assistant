@@ -25,6 +25,18 @@ export const Verdict = z.object({
     )
     .min(1),
   ungroundedNumbers: z.array(z.string()),
+  /**
+   * Whether the answer `gov.verify` received from `know.reader` had to be cut
+   * before it reached the judge (`MAX_ANSWER_CHARS`, `src/sdk/gov-verify.ts`).
+   * Computed and written by CODE, never asked of the model: the in-prompt
+   * truncation notice sits inside the untrusted answer's own fence, so a
+   * hostile answer could otherwise forge it (claim a cut that never happened)
+   * or omit it (a real cut, unremarked). Without a field the code controls,
+   * outside the fence, an owner reading a verdict later has no way to tell a
+   * genuine cut from a claimed one — or to know the judge saw less than the
+   * whole answer at all.
+   */
+  answerTruncated: z.boolean(),
 });
 export type Verdict = z.infer<typeof Verdict>;
 

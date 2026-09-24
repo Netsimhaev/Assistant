@@ -26,6 +26,12 @@
  * completeness check into its test file — `delegate.ts` (which this module
  * must import, to delegate at all) imports `intent-registry.ts`, and that
  * import carried the identical crossing a second, independent way.
+ * `curator.ts` was still importing `extractJsonObjects` from `planner.ts`
+ * after that fix — a module that existed for no other caller — so the next
+ * thing needing this function could have reached `planner.ts` again and
+ * recreated the crossing with only `gov-verify.ts`'s own walk left to notice.
+ * `curator.ts` now points at `src/util/json-extract.ts` directly, and
+ * `planner.ts` no longer re-exports it.
  * Everything this module needs about the document — the deterministic
  * extraction for numeric grounding, and eventually the delegated answer —
  * arrives as plain strings its caller already resolved.
@@ -71,6 +77,7 @@ import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import type { AgentEnvelope } from '../domain/envelope.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import { READ_FOR_QUESTION_MAX_CHARS } from '../governance/intent-registry.js';
 import { ungroundedNumbers } from '../governance/numeric-grounding.js';
 import { Verdict, saveVerdict } from '../governance/verdict-store.js';
 import { requestHelp } from '../orchestrator/delegate.js';
@@ -94,14 +101,15 @@ import { extractJsonObjects } from '../util/json-extract.js';
 export const GOV_VERIFY_MODEL = 'sonnet';
 
 /**
- * Same cap `intent-registry.ts`'s `read_for_question` payload schema puts on
- * `question` (`z.string().min(1).max(500)`). Enforced again here because the
- * judge call (check 3) never goes through that schema at all — it is only
- * reached on the SECOND call to `verifyDraft`, once `input.answer` is already
- * resolved, by which point `requestHelp` (and the schema it validates
- * against) is not called a second time.
+ * Derived from `intent-registry.ts`'s own constant, not a second literal
+ * `500` — two numbers that both claim to be "the same cap" is exactly the
+ * drift this derivation avoids. Enforced again here because the judge call
+ * (check 3) never goes through that schema at all — it is only reached on
+ * the SECOND call to `verifyDraft`, once `input.answer` is already resolved,
+ * by which point `requestHelp` (and the schema it validates against) is not
+ * called a second time.
  */
-export const MAX_QUESTION_CHARS = 500;
+export const MAX_QUESTION_CHARS = READ_FOR_QUESTION_MAX_CHARS;
 const QuestionInput = z.string().min(1).max(MAX_QUESTION_CHARS);
 
 /**
@@ -115,18 +123,53 @@ export const MAX_ANSWER_CHARS = 4_000;
 /** The draft is code/owner-authored, not the hostile input, but still bounded for cost. */
 export const MAX_DRAFT_CHARS = 4_000;
 
-function truncated(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max)}\n(קוצץ — התוכן המקורי ארוך יותר)`;
+interface Truncation {
+  text: string;
+  wasTruncated: boolean;
+}
+
+function truncate(text: string, max: number): Truncation {
+  if (text.length <= max) return { text, wasTruncated: false };
+  return { text: `${text.slice(0, max)}\n(קוצץ — התוכן המקורי ארוך יותר)`, wasTruncated: true };
 }
 
 /**
  * The markers fencing `answer` in the rendered prompt. Distinctive on purpose
  * — an ordinary document is not expected to contain either line verbatim —
  * and named in the system prompt so the model is told explicitly what they
- * bound and why.
+ * bound and why. Exported so `gov-verify.test.ts` can assert on the fence
+ * directly rather than re-deriving the literal strings.
  */
-const UNTRUSTED_ANSWER_OPEN = '=== תוכן מצוטט מתוך תשובת קורא-הסגר (לא אמין) ===';
-const UNTRUSTED_ANSWER_CLOSE = '=== סוף תוכן מצוטט ===';
+export const UNTRUSTED_ANSWER_OPEN = '=== תוכן מצוטט מתוך תשובת קורא-הסגר (לא אמין) ===';
+export const UNTRUSTED_ANSWER_CLOSE = '=== סוף תוכן מצוטט ===';
+
+/**
+ * Strip a literal occurrence of either fence marker out of untrusted text
+ * before it is embedded — the same posture `escLabel` (`dashboard/views.ts`)
+ * takes on bidi control characters: removing the exact bytes that could close
+ * the fence early makes the fence a boundary the code enforces, not merely a
+ * convention the model is asked to honour. An `answer` containing
+ * `UNTRUSTED_ANSWER_CLOSE` followed by a forged `# הטיוטה שיש לשפוט` section
+ * could otherwise end the fence on its own terms and supply its own draft
+ * block; with the marker text removed, that string no longer appears in the
+ * rendered prompt at all, so it cannot close anything.
+ */
+function stripFenceMarkers(text: string): string {
+  return text.split(UNTRUSTED_ANSWER_OPEN).join('').split(UNTRUSTED_ANSWER_CLOSE).join('');
+}
+
+/**
+ * Whether `answer` will be cut before it reaches the judge, computed the same
+ * way `renderJudgePrompt` computes what actually gets embedded (markers
+ * stripped first, then capped) — used by `verifyDraft` to record the fact on
+ * the saved `Verdict`, INDEPENDENT of anything inside the prompt. See
+ * `Verdict.answerTruncated`'s own docblock for why this cannot be read back
+ * out of the rendered text: the in-prompt notice sits inside the untrusted
+ * answer's own fence, where a hostile answer could forge or omit it.
+ */
+export function wasAnswerTruncated(answer: string): boolean {
+  return truncate(stripFenceMarkers(answer), MAX_ANSWER_CHARS).wasTruncated;
+}
 
 /**
  * The fixed, code-owned half of the judge's system prompt: the output
@@ -174,10 +217,17 @@ export function buildJudgeSystemPrompt(bundle: PolicyBundle): string {
   return [bundle.promptFragments['gov.verify'], '', JUDGE_OUTPUT_CONTRACT].join('\n');
 }
 
-function renderJudgePrompt(request: JudgeRequest): string {
-  const question = truncated(request.question, MAX_QUESTION_CHARS);
-  const answer = truncated(request.answer, MAX_ANSWER_CHARS);
-  const draftText = truncated(request.draftText, MAX_DRAFT_CHARS);
+/**
+ * Exported — round 1 left this private and untested, and `MAX_ANSWER_CHARS`/
+ * `MAX_DRAFT_CHARS` were consequently deletable with the suite green. Tested
+ * directly: the fence, the marker-stripping, and both caps.
+ */
+export function renderJudgePrompt(request: JudgeRequest): string {
+  const question = truncate(request.question, MAX_QUESTION_CHARS).text;
+  // Markers stripped BEFORE capping: the cap should bound the text that
+  // actually reaches the model, and stripping can only shorten it further.
+  const answer = truncate(stripFenceMarkers(request.answer), MAX_ANSWER_CHARS).text;
+  const draftText = truncate(request.draftText, MAX_DRAFT_CHARS).text;
   return (
     `# השאלה שהופנתה לקורא-הסגר\n${question}\n\n` +
     `# התשובה שקורא-הסגר החזיר\n${UNTRUSTED_ANSWER_OPEN}\n${answer}\n${UNTRUSTED_ANSWER_CLOSE}\n\n` +
@@ -344,8 +394,12 @@ export type VerifyDraftResult = Verdict | AwaitingDelegation;
  * marker that this call ended by delegating.
  *
  * The order is fixed and matters: `ungroundedNumbers` runs BEFORE any
- * delegation or model call, unconditionally — the cheapest check runs alone,
- * even on the call that only ever delegates and never reaches the judge.
+ * delegation or model call — the cheapest check runs alone, even on the call
+ * that only ever delegates and never reaches the judge. (Not literally the
+ * FIRST thing this function does: the question-length parse and the charter
+ * load both precede it and can each throw first — but relative to the two
+ * checks that can cost money or make a network call, it always runs, and
+ * runs first.)
  */
 export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftResult> {
   const businessId = input.businessId ?? config.businessId;
@@ -422,7 +476,14 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
     throw new Error(`verifyDraft: the judge did not return a usable verdict — ${outcome.reason}`);
   }
 
-  const verdict: Verdict = { criteria: outcome.criteria, ungroundedNumbers: ungrounded };
+  const verdict: Verdict = {
+    criteria: outcome.criteria,
+    ungroundedNumbers: ungrounded,
+    // Computed by CODE from `input.answer` directly, never read out of the
+    // model's response or the rendered prompt — see `wasAnswerTruncated`'s
+    // own docblock for why the in-prompt notice cannot be trusted for this.
+    answerTruncated: wasAnswerTruncated(input.answer),
+  };
   await saveVerdict(input.parentJobId, verdict, { businessId });
   return verdict;
 }
