@@ -660,9 +660,138 @@ describe('the local tool executor', () => {
       // `resumeDelegatedJobs` keeps watching this exact delegation.
       expect(parent?.awaitingEnvelopeId).toBe(envelopeId);
 
+      // Fix round 3, item 3: `job_steps.envelope_id` must name this envelope
+      // too, not just `jobs.awaiting_envelope_id` — the original park
+      // (`delegate.ts`) sets both, and omitting it here left the id
+      // surviving only in the Hebrew reason string.
+      const { rows: stepRows } = await getPool().query<{ envelope_id: string | null }>(
+        'SELECT envelope_id FROM job_steps WHERE job_id = $1 ORDER BY id DESC LIMIT 1',
+        [jobId],
+      );
+      expect(stepRows[0]?.envelope_id).toBe(envelopeId);
+
       // The child itself is untouched by any of this.
       const child = await loadJob(childJobId, { businessId: BUSINESS });
       expect(child?.phase).toBe('execute');
+    });
+
+    /**
+     * Fix round 3, item 1, the good-parse half. A `result` envelope whose
+     * payload actually matches `ResultEnvelopePayload` completes the step
+     * normally — this is the ordinary case the corrupted-payload test right
+     * after it is contrasted against.
+     */
+    it('completes the step from a well-formed result envelope written directly, without asking the child\'s phase', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+      const input = {
+        to: 'know.reader' as const,
+        intent: 'read_for_question',
+        payload: { question: 'מה המסמך הזה מבקש?' },
+        contextRefs: [{ kind: 'document' as const, documentId }],
+      };
+      const ctx = { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' as const };
+
+      const first = await runLocalTool('agent.request_help', input, ctx);
+      const childJobId = first['childJobId'] as string;
+
+      // A well-formed result, written directly rather than through
+      // `resumeDelegatedJobs` — isolating what THIS handler does with one,
+      // not re-testing the writer.
+      await writeEnvelope(
+        {
+          v: 1,
+          id: `ENV-${ulid()}`,
+          correlationId: jobId,
+          causalChain: [],
+          from: 'know.reader',
+          to: 'comms.email',
+          kind: 'result',
+          intent: 'read_for_question',
+          payload: { outcome: 'succeeded', note: 'נענתה' },
+          contextRefs: [{ kind: 'job', jobId: childJobId }],
+          constraints: {
+            charterVersion: bundle.charterVersion,
+            provenanceCeiling: 'boss',
+            autonomyCeiling: 'auto',
+            moneyCeilingMinor: null,
+            deadlineAt: '2026-12-31T00:00:00.000Z',
+          },
+          hops: 1,
+          idempotencyKey: `IDEM-${ulid()}`,
+          createdAt: new Date().toISOString(),
+        },
+        { parentJobId: childJobId, businessId: BUSINESS },
+      );
+
+      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
+      const second = await runLocalTool('agent.request_help', input, ctx);
+      expect(second['performed']).toBe(true);
+      expect(second['status']).toBe('answered');
+      expect(second['outcome']).toBe('succeeded');
+    });
+
+    /**
+     * Fix round 3, item 1, the unparseable half. Before this fix, a `result`
+     * envelope whose `outcome` did not survive `ResultEnvelopePayload`
+     * completed the step as `done` with `outcome: 'unknown'` anyway — a
+     * value we could not read, treated as a permitting one. It must instead
+     * be refused the same way any other corrupted delegation state here is
+     * refused (non-retryably, failing the parent).
+     */
+    it('fails rather than completes when the result envelope payload cannot be parsed', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+      const input = {
+        to: 'know.reader' as const,
+        intent: 'read_for_question',
+        payload: { question: 'מה המסמך הזה מבקש?' },
+        contextRefs: [{ kind: 'document' as const, documentId }],
+      };
+      const ctx = { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' as const };
+
+      const first = await runLocalTool('agent.request_help', input, ctx);
+      const childJobId = first['childJobId'] as string;
+
+      // A malformed result — `outcome` is not one of the closed union.
+      await writeEnvelope(
+        {
+          v: 1,
+          id: `ENV-${ulid()}`,
+          correlationId: jobId,
+          causalChain: [],
+          from: 'know.reader',
+          to: 'comms.email',
+          kind: 'result',
+          intent: 'read_for_question',
+          payload: { outcome: 'not-a-real-outcome' },
+          contextRefs: [{ kind: 'job', jobId: childJobId }],
+          constraints: {
+            charterVersion: bundle.charterVersion,
+            provenanceCeiling: 'boss',
+            autonomyCeiling: 'auto',
+            moneyCeilingMinor: null,
+            deadlineAt: '2026-12-31T00:00:00.000Z',
+          },
+          hops: 1,
+          idempotencyKey: `IDEM-${ulid()}`,
+          createdAt: new Date().toISOString(),
+        },
+        { parentJobId: childJobId, businessId: BUSINESS },
+      );
+
+      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
+
+      let caught: unknown;
+      try {
+        await runLocalTool('agent.request_help', input, ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StepChannelError);
+      const typed = caught as StepChannelError;
+      expect(typed.code).toBe('delegation_result_corrupted');
+      expect(typed.retryable).toBe(false);
     });
 
     /**

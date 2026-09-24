@@ -139,8 +139,14 @@ export type RequestHelpResult =
    * looking at an orphan and can repair it with `attachChildJob` directly,
    * once it has re-derived the child id some other way — `requestHelp` itself
    * has no way to hand back an id nobody ever recorded.
+   *
+   * `correlationId` rides along so a caller can look up the `result`
+   * envelope `resumeDelegatedJobs` may already have written for this
+   * delegation (`loadResultForChildJob`) without a second query to re-derive
+   * it from the envelope — it is already on hand here, from the very row
+   * that answered this lookup.
    */
-  | { status: 'duplicate'; envelopeId: string; childJobId: string | null }
+  | { status: 'duplicate'; envelopeId: string; childJobId: string | null; correlationId: string }
   | { status: 'refused'; code: RequestHelpDenialCode; reason: string };
 
 export interface DelegationOutcome {
@@ -236,6 +242,15 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
   // with none. Parsed rather than trusted from the type: `input.from` is
   // `AgentId`-typed at compile time, but a caller across a process boundary
   // (or a future one that stops being careful) is not bound by that.
+  //
+  // Deliberately still ABOVE guard 3 (idempotency), even after round 2 moved
+  // guard 3 above every OTHER guard this function owns: a signed charter
+  // amendment that drops this exact edge between the original call and a
+  // resumed retry will fail the parent here, with the child's answer already
+  // sitting written and unread. That is correct, not an oversight — a signed
+  // amendment revoking a permission should stop work in flight, and failing
+  // the parent is the honest consequence of the owner having revoked the
+  // very permission that produced the answer.
   const fromAgent = AgentId.safeParse(input.from);
   if (!fromAgent.success || !mayDelegate(input.bundle.collaborationGraph, fromAgent.data, input.to)) {
     return {
@@ -387,6 +402,7 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
       status: 'duplicate',
       envelopeId: alreadyAnswered.envelope.id,
       childJobId: alreadyAnswered.childJobId,
+      correlationId: alreadyAnswered.envelope.correlationId,
     };
   }
 
@@ -455,7 +471,12 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
 
   const written = await writeEnvelope(envelope, { parentJobId: parent.jobId, businessId });
   if (written.status === 'duplicate') {
-    return { status: 'duplicate', envelopeId: written.envelope.id, childJobId: written.childJobId };
+    return {
+      status: 'duplicate',
+      envelopeId: written.envelope.id,
+      childJobId: written.childJobId,
+      correlationId: written.envelope.correlationId,
+    };
   }
 
   const child = await createJob({

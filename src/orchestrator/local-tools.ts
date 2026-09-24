@@ -37,7 +37,7 @@ import { config } from '../config.js';
 import type { Queryable } from '../db/pool.js';
 import { AgentId } from '../domain/audit.js';
 import { SafeLookupKey } from '../domain/charter.js';
-import { ContextRef } from '../domain/envelope.js';
+import { ContextRef, ResultEnvelopePayload } from '../domain/envelope.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { readDocument } from '../documents/read.js';
 import { readingsToday } from '../documents/store.js';
@@ -498,13 +498,37 @@ const HANDLERS: Record<string, LocalHandler> = {
       // timeout alike — fixes this uniformly: whichever of the three it is,
       // an answer that exists is read and the step completes with it,
       // without asking what phase the child happens to be in right now.
-      const resultEnvelope = await loadResultForChildJob(result.childJobId, dbOpts);
+      // Scoped by `result.correlationId` (this delegation's own tree), not
+      // just the child job id — `loadResultForChildJob`'s own docblock says
+      // why that predicate has to be real rather than a comment.
+      const resultEnvelope = await loadResultForChildJob(
+        result.childJobId,
+        result.correlationId,
+        dbOpts,
+      );
       if (resultEnvelope !== null) {
-        const payload = resultEnvelope.payload;
-        const outcome =
-          typeof payload === 'object' && payload !== null && 'outcome' in payload
-            ? (payload as { outcome: unknown }).outcome
-            : undefined;
+        // Fix round 3, item 1. `ResultEnvelopePayload` is the ONE schema
+        // both `resumeDelegatedJobs` (the writer) and this handler (the
+        // reader) agree on — `AgentEnvelope.payload` is `z.unknown()` by
+        // design, so nothing else enforces it. A hand-narrowed read with an
+        // `'unknown'` fallback used to let a payload that failed to parse
+        // (missing, non-string, or out-of-enum `outcome`) complete this step
+        // as `done` anyway — the exact "a value we could not read treated as
+        // a permitting one" shape this project refuses everywhere else
+        // (`amount_unreadable`, an unknown data class scored most severe, an
+        // unknown calendar action becoming `calendar.cancel`). A `result`
+        // envelope that does not parse is a corrupted state, not a
+        // completion, and is refused the same way any other corrupted
+        // delegation state this handler finds is refused.
+        const parsedResult = ResultEnvelopePayload.safeParse(resultEnvelope.payload);
+        if (!parsedResult.success) {
+          throw new StepChannelError(
+            'delegation_result_corrupted',
+            `result envelope ${resultEnvelope.id} has an unreadable payload: ` +
+              parsedResult.error.issues.map((issue) => issue.message).join('; '),
+            false,
+          );
+        }
         // A child that failed or halted still yields a `done` PARENT step
         // here, deliberately: the parent never fails on its own account of
         // its helper's outcome — that is `resumeDelegatedJobs`'s own decision
@@ -516,7 +540,7 @@ const HANDLERS: Record<string, LocalHandler> = {
           status: 'answered',
           envelopeId: result.envelopeId,
           childJobId: result.childJobId,
-          outcome: typeof outcome === 'string' ? outcome : 'unknown',
+          outcome: parsedResult.data.outcome,
         };
       }
 
@@ -540,6 +564,12 @@ const HANDLERS: Record<string, LocalHandler> = {
         to: 'followup',
         actor: 'orchestrator',
         reason: `ממתין לתשובת ${parsed.to} על "${parsed.intent}" (מעטפת ${result.envelopeId})`,
+        // `envelopeId` names the `job_steps` row for this move, the same way
+        // the original park (`delegate.ts`'s `transition(parent.jobId, {to:
+        // 'followup', envelopeId: envelope.id, ...})`) does — omitting it
+        // left the column `NULL` here while the Hebrew reason string was the
+        // only place the envelope id survived.
+        envelopeId: result.envelopeId,
         awaitingEnvelopeId: result.envelopeId,
         businessId: ctx.businessId,
       });

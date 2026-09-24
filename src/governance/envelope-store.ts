@@ -381,31 +381,40 @@ export async function loadEnvelopeForChildJob(
 }
 
 /**
- * The `result` envelope answering a delegation, found by the child job it
- * names — or `null` if `resumeDelegatedJobs` has not yet decided this
- * delegation's outcome.
+ * The `result` envelope answering a delegation, found by its correlation and
+ * the child job it names — or `null` if `resumeDelegatedJobs` has not yet
+ * decided this delegation's outcome.
  *
  * `resumeDelegatedJobs` (`orchestrator/resume-delegated.ts`) writes exactly
- * this shape: `kind = 'result'`, `contextRefs: [{kind:'job', jobId:
- * <childJobId>}]`, for a close, a failure, or a timeout alike. This is what
- * lets `agent.request_help`'s own handler (`orchestrator/local-tools.ts`)
- * complete a resumed step UNIFORMLY across all three outcomes by reading the
- * answer, rather than re-deriving one from the child's raw phase — which
- * broke specifically for a timeout: a child woken past its deadline while
- * still running has no terminal phase at all, so a phase-based check finds
- * nothing to complete the step with and the parent polls forever.
+ * this shape: `kind = 'result'`, the same `correlationId` as the request it
+ * answers, `contextRefs: [{kind:'job', jobId: <childJobId>}]`, for a close, a
+ * failure, or a timeout alike. This is what lets `agent.request_help`'s own
+ * handler (`orchestrator/local-tools.ts`) complete a resumed step UNIFORMLY
+ * across all three outcomes by reading the answer, rather than re-deriving
+ * one from the child's raw phase — which broke specifically for a timeout: a
+ * child woken past its deadline while still running has no terminal phase at
+ * all, so a phase-based check finds nothing to complete the step with and the
+ * parent polls forever.
  *
- * `context_refs @> $2::jsonb` (containment), not equality: `contextRefs` is
+ * `correlation_id = $2` is a real predicate, not decoration: without it, this
+ * query matches on `kind = 'result'` plus a job contextRef alone, and the
+ * only thing standing between that and a cross-tree collision was a comment
+ * asserting `resumeDelegatedJobs` is the only producer and writes one result
+ * per child — an invariant this codebase has already paid to learn belongs in
+ * the predicate, not in prose (`kind = 'help_request'` on `priorQuadruples`
+ * and `countPairExchanges` is the same lesson, paid for twice already).
+ *
+ * `context_refs @> $3::jsonb` (containment), not equality: `contextRefs` is
  * an array, and the result envelope always carries this one ref as its only
  * element, but containment is what generalises correctly for the same reason
  * `contextRefsHash` sorts before hashing (`delegation.ts`) — this reads
  * whichever position holds it rather than assuming exactly one.
- * `ORDER BY created_at DESC LIMIT 1` is defensive: `resumeDelegatedJobs`
- * should produce at most one, but the newest is the honest answer if that
- * ever stops being true.
+ * `ORDER BY created_at DESC LIMIT 1` picks the newest if more than one ever
+ * exists.
  */
 export async function loadResultForChildJob(
   childJobId: string,
+  correlationId: string,
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<AgentEnvelope | null> {
   const businessId = options.businessId ?? config.businessId;
@@ -415,10 +424,10 @@ export async function loadResultForChildJob(
             intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
             child_job_id
        FROM agent_envelopes
-      WHERE business_id = $1 AND kind = 'result' AND context_refs @> $2::jsonb
+      WHERE business_id = $1 AND correlation_id = $2 AND kind = 'result' AND context_refs @> $3::jsonb
       ORDER BY created_at DESC
       LIMIT 1`,
-    [businessId, JSON.stringify([{ kind: 'job', jobId: childJobId }])],
+    [businessId, correlationId, JSON.stringify([{ kind: 'job', jobId: childJobId }])],
   );
   const row = rows[0];
   return row ? toEnvelope(row) : null;

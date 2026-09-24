@@ -35,6 +35,42 @@ export const EnvelopeKind = z.enum(['help_request', 'result']);
 export type EnvelopeKind = z.infer<typeof EnvelopeKind>;
 
 /**
+ * How a delegation ended, as `resumeDelegatedJobs`
+ * (`orchestrator/resume-delegated.ts`) decides it — the child reached
+ * `closed` (`succeeded`), reached `failed` or `halted` (`failed`), or never
+ * reached a terminal phase before the envelope's own deadline ran out
+ * (`timeout`).
+ */
+export const DelegationOutcome = z.enum(['succeeded', 'failed', 'timeout']);
+export type DelegationOutcome = z.infer<typeof DelegationOutcome>;
+
+/**
+ * The payload of a `kind: 'result'` envelope — the ONE shape
+ * `resumeDelegatedJobs` ever writes and `agent.request_help`'s handler
+ * (`orchestrator/local-tools.ts`) ever reads back.
+ *
+ * Shared rather than restated at each end on purpose: `AgentEnvelope.payload`
+ * is `z.unknown()` by design (an envelope's payload shape is the receiving
+ * intent's business, per `intent-registry.ts`), so nothing enforces this
+ * shape for a `result` envelope except both ends agreeing on it — and a
+ * schema defined once and imported twice is the only way "agreeing" means
+ * anything. A hand-rolled narrowing at the read site (a `typeof` check with
+ * an `'unknown'` fallback) let a `result` payload that failed to parse — a
+ * missing, non-string, or out-of-enum `outcome` — complete the step as
+ * `done` anyway, which is exactly the "value we could not read treated as a
+ * permitting one" shape this project refuses everywhere else
+ * (`amount_unreadable`, an unknown data class scored most severe, an unknown
+ * calendar action becoming `calendar.cancel`). The reader now parses this
+ * schema and treats a failure to parse as a corrupted state, not a
+ * completion.
+ */
+export const ResultEnvelopePayload = z.object({
+  outcome: DelegationOutcome,
+  note: z.string(),
+});
+export type ResultEnvelopePayload = z.infer<typeof ResultEnvelopePayload>;
+
+/**
  * A pointer the receiver resolves itself. **No branch carries free text** —
  * an invariant test asserts that, because the next person to add a branch
  * will reach for a convenient `content: string`.

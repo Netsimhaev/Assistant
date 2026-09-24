@@ -49,7 +49,7 @@ import { ulid } from 'ulid';
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
 import { AgentId } from '../domain/audit.js';
-import type { AgentEnvelope } from '../domain/envelope.js';
+import type { AgentEnvelope, DelegationOutcome } from '../domain/envelope.js';
 import { canonicalHash } from '../util/canonical.js';
 import { loadEnvelopeWithChild, writeEnvelope } from '../governance/envelope-store.js';
 import { loadJob, transition } from './jobs.js';
@@ -87,8 +87,6 @@ export interface ResumeResult {
 interface DueParentRow {
   job_id: string;
 }
-
-type DelegationOutcome = 'succeeded' | 'failed' | 'timeout';
 
 /**
  * Wake every parent whose child has answered, or whose patience ran out.
