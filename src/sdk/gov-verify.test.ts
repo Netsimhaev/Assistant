@@ -587,6 +587,18 @@ describe('the judge call', () => {
 });
 
 /**
+ * The guard itself was three correct lines that nothing called with an empty
+ * nonce — unreachable, and therefore deletable with the suite green, exactly
+ * the class round 1's own fix (a two-file completeness requirement nothing
+ * enforced) existed to close, reintroduced here at the scale of one function.
+ */
+describe('buildFence', () => {
+  it('refuses an empty nonce', () => {
+    expect(() => buildFence(ANSWER_FENCE_LABEL, '')).toThrow(/nonce must not be empty/);
+  });
+});
+
+/**
  * `renderJudgePrompt` was private and untested in round 1, so the fence and
  * both new caps (`MAX_ANSWER_CHARS`, `MAX_DRAFT_CHARS`) were deletable with
  * the whole suite still green — exported here and asserted on directly.
