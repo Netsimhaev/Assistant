@@ -39,10 +39,19 @@ import { AgentId } from '../domain/audit.js';
 import { SafeLookupKey } from '../domain/charter.js';
 import { ContextRef, ResultEnvelopePayload } from '../domain/envelope.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import { renderArtifactFull } from '../documents/brief.js';
 import { readDocument } from '../documents/read.js';
-import { readingsToday } from '../documents/store.js';
+import { loadLatestReading } from '../documents/reading-store.js';
+import { loadArtifacts, readingsToday } from '../documents/store.js';
+import { verifyDraft, type VerifyDraftInput, type VerifyDraftResult } from '../sdk/gov-verify.js';
 import type { ReadOutcome, ReadRequest } from '../sdk/know-reader.js';
-import { loadEnvelopeForChildJob, loadResultForChildJob } from '../governance/envelope-store.js';
+import {
+  loadEnvelopeForChildJob,
+  loadHelpRequestFromParentJob,
+  loadResultForChildJob,
+} from '../governance/envelope-store.js';
+import { saveNotJudged, saveVerdict } from '../governance/verdict-store.js';
+import { composeVerificationAnswer } from './verification-answer.js';
 import {
   recallMemories,
   retireMemories,
@@ -73,6 +82,13 @@ export interface LocalToolContext {
    * omitted.
    */
   reader?: (request: ReadRequest) => Promise<ReadOutcome>;
+  /**
+   * The second step that costs money, injectable so a test can drive
+   * `assert.evaluate` without an API key — the same seam `ctx.reader` already
+   * is for `doc.fetch`. Defaults to the real `verifyDraft` inside the handler
+   * when omitted.
+   */
+  verifier?: (input: VerifyDraftInput) => Promise<VerifyDraftResult>;
   /**
    * The agent this step runs as — required by `agent.request_help` (it is
    * `requestHelp`'s `from`, the requesting agent recorded on the envelope)
@@ -172,6 +188,27 @@ const DocFetchInput = z.object({
  * and `resolveIntent`'s own `requiresContextRef` is what actually decides
  * whether that is fatal, inside `requestHelp` itself.
  */
+/**
+ * `assert.evaluate`'s payload — `gov.verify`'s own step, the second half of a
+ * verification whose first half already delegated.
+ *
+ * `subjectJobId` and `ctx.jobId` are deliberately different jobs and neither
+ * substitutes for the other: the verdict is filed under the job whose draft is
+ * being judged, while the step runs inside the `gov.verify` job that did the
+ * delegating. `VerifyDraftInput.subjectJobId`'s own docblock says what
+ * conflating them costs.
+ *
+ * `question` is carried, not re-derived: the handler passes it through to the
+ * judge exactly as the plan wrote it, and never reads it. Capped at 500 to
+ * match `MAX_QUESTION_CHARS`, which `verifyDraft` parses again on its own.
+ */
+const AssertEvaluateInput = z.object({
+  subjectJobId: z.string().min(1),
+  documentId: z.string().min(1),
+  draftText: z.string(),
+  question: z.string().min(1).max(500),
+});
+
 const RequestHelpToolInput = z.object({
   to: AgentId,
   intent: z.string().min(1).max(200),
@@ -599,6 +636,162 @@ const HANDLERS: Record<string, LocalHandler> = {
     }
     throw new StepChannelError(`delegation_refused:${result.code}`, result.reason, false);
   },
+
+  /**
+   * The second half of `gov.verify`'s check: the step that runs once the
+   * helper it asked has an answer.
+   *
+   * **It resolves the delegation's outcome itself rather than being handed
+   * it, because nothing threads one step's output into the next step's
+   * input** — `runPlan` uses `completedSteps` only to decide what to skip —
+   * and because there is no earlier step to be handed it by: the
+   * `gov.verify` job's bound plan is this ONE step. `conduct.ts` calls
+   * `requestHelp` directly rather than through a plan step, for a reason its
+   * own caller documents: `agent.request_help` classifies to `agent.delegate`,
+   * and that job's provenance is `unknown_external`, whose charter ceiling is
+   * `draft_only` — a plan step naming it would be refused by gate stage 8
+   * before it ever delegated. So this step reads the durable record: the
+   * `help_request` envelope it opened (`loadHelpRequestFromParentJob`, keyed
+   * on `parent_job_id`) and the `result` envelope `resumeDelegatedJobs` wrote
+   * to answer it.
+   *
+   * `loadEnvelopeForChildJob(ctx.jobId)` is a DIFFERENT question asked of the
+   * same table and the two must not be confused: it finds the envelope that
+   * caused the `gov.verify` job itself to run — `null` for the root job
+   * `conduct.ts` opens — and is passed to `verifyDraft` as `parentEnvelope`,
+   * never used to find the answer. Asking it for the answer's envelope
+   * returns the ancestor, whose child is this very job, which would make
+   * every verification refuse itself.
+   *
+   * **The judge does not run on a failed or timed-out delegation.** There is
+   * no answer to judge, and a verdict formed on an empty answer is
+   * indistinguishable on screen from one formed on a real one — worse than no
+   * verdict. A row is still written, saying the judge did not run and why,
+   * because with no row at all the absence would mean "still running" early
+   * and "gave up" later with nothing to tell them apart.
+   *
+   * `ctx.bundle` is NOT required here, unlike `doc.fetch` and
+   * `agent.request_help`: `verifyDraft` loads the active charter itself and
+   * refuses to accept one as a parameter (see its own docblock). A guard
+   * demanding a field this handler never reads would be the dead-reader shape
+   * this project already tracks.
+   */
+  'assert.evaluate': async (input, ctx) => {
+    const parsed = parseOrFail(AssertEvaluateInput, input, 'assert.evaluate');
+    const dbOpts = { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) };
+
+    const delegation = await loadHelpRequestFromParentJob(ctx.jobId, dbOpts);
+    if (delegation === null) {
+      throw new StepChannelError(
+        'verification_answer_missing',
+        `job ${ctx.jobId} opened no delegation to read an answer from`,
+        false,
+      );
+    }
+    const childJobId = delegation.childJobId;
+    if (childJobId === null) {
+      throw new StepChannelError(
+        'verification_answer_missing',
+        `envelope ${delegation.envelope.id} has no child job to read an answer from`,
+        false,
+      );
+    }
+    const resultEnvelope = await loadResultForChildJob(
+      childJobId,
+      delegation.envelope.correlationId,
+      dbOpts,
+    );
+    if (resultEnvelope === null) {
+      throw new StepChannelError(
+        'verification_answer_missing',
+        `no result envelope for child ${childJobId} under correlation ` +
+          `${delegation.envelope.correlationId}`,
+        false,
+      );
+    }
+    // The same one schema both sides of a delegation agree on —
+    // `AgentEnvelope.payload` is `z.unknown()` by design, so nothing else
+    // enforces it, and a payload that cannot be read is never a permitting
+    // one. Refused exactly as `agent.request_help` refuses it.
+    const payload = ResultEnvelopePayload.safeParse(resultEnvelope.payload);
+    if (!payload.success) {
+      throw new StepChannelError(
+        'delegation_result_corrupted',
+        `result envelope ${resultEnvelope.id} has an unreadable payload: ` +
+          payload.error.issues.map((issue) => issue.message).join('; '),
+        false,
+      );
+    }
+
+    if (payload.data.outcome !== 'succeeded') {
+      // `DelegationOutcome` minus `succeeded` is exactly `NotJudgedReason` —
+      // narrowed here, never cast.
+      await saveNotJudged(parsed.subjectJobId, payload.data.outcome, dbOpts);
+      return { performed: true, status: 'not_judged', reason: payload.data.outcome };
+    }
+
+    const job = await loadJob(ctx.jobId, dbOpts);
+    if (job === null) {
+      throw new Error(`runLocalTool: assert.evaluate could not load job ${ctx.jobId}`);
+    }
+    // `ReadingRecord.content` is `Reading | null` — a record whose `status` is
+    // `unreadable` exists but carries nothing to compose from, and that is not
+    // an answer either. Both shapes get the same refusal.
+    const record = await loadLatestReading(parsed.documentId, job.provenance, dbOpts);
+    if (record === null || record.content === null) {
+      throw new StepChannelError(
+        'verification_answer_missing',
+        `child ${childJobId} answered but no readable reading exists for document ` +
+          `${parsed.documentId}`,
+        false,
+      );
+    }
+
+    const artifacts = await loadArtifacts(parsed.documentId, dbOpts);
+    const verify = ctx.verifier ?? verifyDraft;
+    const result = await verify({
+      parentJobId: ctx.jobId,
+      subjectJobId: parsed.subjectJobId,
+      documentId: parsed.documentId,
+      draftText: parsed.draftText,
+      // The full deterministic extraction, not the truncated prompt brief —
+      // `sources` feeds `ungroundedNumbers` only, and a cap there turns
+      // grounded numbers into false positives. `conduct.ts` composes the
+      // first call's `sources` the same way and for the same reason.
+      sources: artifacts.map((artifact) => renderArtifactFull(artifact)),
+      question: parsed.question,
+      answer: composeVerificationAnswer(record.content),
+      // The envelope that caused THIS job to run, if any — passed straight
+      // through, and only ever read by the delegating branch `answer`
+      // being non-null means we cannot reach.
+      parentEnvelope: await loadEnvelopeForChildJob(ctx.jobId, dbOpts),
+      businessId: ctx.businessId,
+    });
+
+    // `'status' in result` alone, not `&& result.status === 'awaiting_delegation'`:
+    // the extra clause reads better and defeats the narrowing — `Verdict`
+    // carries no `status` at all, so the key's presence IS the discriminant,
+    // and with the `&&` TypeScript leaves the else-branch a union `saveVerdict`
+    // will not take.
+    if ('status' in result) {
+      // `answer` was non-null on this call, so `verifyDraft` had no reason to
+      // delegate again. Reaching here means its branching changed under us.
+      throw new StepChannelError(
+        'verification_delegated_again',
+        `verifyDraft delegated a second time despite being given an answer ` +
+          `(envelope ${result.envelopeId})`,
+        false,
+      );
+    }
+    // `verifyDraft` already filed this verdict on its own way out, and this
+    // write is deliberately not removed as redundant: an injected `verifier`
+    // has no such obligation, and only this call lands on `ctx.db` when the
+    // caller is running inside a transaction. `saveVerdict` is an upsert on
+    // `(business_id, job_id)`, so the second write of the same verdict is the
+    // same row.
+    await saveVerdict(parsed.subjectJobId, result, dbOpts);
+    return { performed: true, status: 'judged' };
+  },
 };
 
 /** The tools this executor actually performs. Exported for the invariant test. */
@@ -674,6 +867,12 @@ export const LOCAL_TOOL_CONTRACTS: readonly { toolName: string; payload: string 
       '"payload": אובייקט לפי סכמת אותה כוונה, "contextRefs": מערך מצביעים (רשות), ' +
       'למשל `[{"kind":"document","documentId": מזהה המסמך}]`}` — ' +
       'שם השדה חייב להיות בדיוק `to`; זה השדה שגם השער וגם בדיקת התוכנית קוראים.',
+  },
+  {
+    toolName: 'assert.evaluate',
+    payload:
+      '`{"subjectJobId": מזהה המשימה שהטיוטה שלה נבדקת, "documentId": מזהה המסמך, ' +
+      '"draftText": הטקסט שנשפט, "question": השאלה שנשאלה (עד 500 תווים)}`.',
   },
 ];
 
