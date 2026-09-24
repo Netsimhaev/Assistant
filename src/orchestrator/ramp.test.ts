@@ -163,7 +163,8 @@ describe('autonomy ramp', () => {
    * the plan ceiling — unlike the read-only tools above, it does NOT
    * short-circuit at the gate. A delegation step sits beside an ordinary
    * classified step here, and its exemption must not drag the plan-wide
-   * minimum down to whatever `agent.delegate`'s own (unset, draft_only) ramp
+   * minimum down to whatever `agent.delegate`'s own (unset, and therefore
+   * `approve_required` — the floor of mode `learn`, which this test sets) ramp
    * row would be. `email.reply`'s `auto_notify` is the only class that
    * contributes, exactly as `CEILING_EXEMPT_TOOLS`'s docblock promises.
    */

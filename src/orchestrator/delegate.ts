@@ -23,7 +23,8 @@
  * an envelope points at it. Attaching after would leave a window where the
  * child is runnable and unattached — the scheduler could run it and it would
  * answer into a void no envelope names, and whatever reads the envelope back
- * to find the parent to wake (Task 7's `resumeDelegatedJobs`, not built yet)
+ * to find the parent to wake (`resumeDelegatedJobs`, in
+ * `orchestrator/resume-delegated.ts`, run on every `schedulerPass`)
  * would have nothing pointing the other way. Attaching first at least means
  * the only reachable crash window leaves a child that is attached but not yet
  * runnable, which a future deadline check has something to find.
@@ -64,6 +65,7 @@ import {
   countPairExchanges,
   delegationsToday,
   loadEnvelopeByIdempotencyKey,
+  loadEnvelopeForChildJob,
   loadEnvelopeWithChild,
   priorQuadruples,
   writeEnvelope,
@@ -115,6 +117,12 @@ export interface RequestHelpInput {
    * the kind of silent default this codebase does not make). The caller that
    * is actually executing the parent's plan step already knows which envelope
    * it is running under, if any.
+   *
+   * **Both values are verified against the rows, including `null`.** A supplied
+   * envelope must be the one `agent_envelopes` agrees opened this parent
+   * (`parent_envelope_mismatch`); `null` must be true — a parent for which no
+   * envelope names it as `child_job_id` (`parent_envelope_omitted`). Verifying
+   * only the first left the loosest claim as the only unchecked one.
    */
   parentEnvelope: AgentEnvelope | null;
   businessId?: string;
@@ -128,6 +136,7 @@ export type RequestHelpDenialCode =
   | 'missing_context_ref'
   | 'ambiguous_context_ref'
   | 'parent_envelope_mismatch'
+  | 'parent_envelope_omitted'
   | DelegationDenial['code'];
 
 export type RequestHelpResult =
@@ -149,7 +158,18 @@ export type RequestHelpResult =
   | { status: 'duplicate'; envelopeId: string; childJobId: string | null; correlationId: string }
   | { status: 'refused'; code: RequestHelpDenialCode; reason: string };
 
-export interface DelegationOutcome {
+/**
+ * The three ids identifying a delegation that has already taken effect — what
+ * `DelegationAuditUnrecordedError` carries so an operator can reconstruct the
+ * audit row by hand.
+ *
+ * NOT `DelegationOutcome` (`domain/envelope.ts`), which it was called until
+ * this branch's final review: that is the closed enum
+ * `'succeeded' | 'failed' | 'timeout'` a `result` envelope's payload carries,
+ * and two unrelated exported symbols under one name in one subsystem is how a
+ * reader ends up importing the wrong one.
+ */
+export interface RequestHelpOutcome {
   envelopeId: string;
   childJobId: string;
   parentJobId: string;
@@ -167,9 +187,9 @@ export interface DelegationOutcome {
  */
 export class DelegationAuditUnrecordedError extends Error {
   readonly delegated = true as const;
-  readonly outcome: DelegationOutcome;
+  readonly outcome: RequestHelpOutcome;
 
-  constructor(outcome: DelegationOutcome, cause: unknown) {
+  constructor(outcome: RequestHelpOutcome, cause: unknown) {
     super(
       `a delegation opened child job ${outcome.childJobId} from parent ${outcome.parentJobId} ` +
         `(envelope ${outcome.envelopeId}) but the audit entry recording it failed to write. ` +
@@ -334,6 +354,36 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
       };
     }
     verifiedAncestor = stored.envelope;
+  } else {
+    // `parentEnvelope: null` is a CLAIM — "this parent is a root job" — and it
+    // is the most permissive claim this input can make: it resets `hops` to 0,
+    // opens a fresh `correlationId` (taking `noNewInformationGuard` and
+    // `oscillationGuard`, both scoped by it, out of the real tree), and hands
+    // back `ROOT_ANCESTOR_CONSTRAINTS`. The non-null branch above verifies its
+    // claim against the row; leaving the null branch unverified meant the
+    // EASIEST value to pass was the only one nothing checked. Verified the same
+    // way, and positively: a root job is one for which `agent_envelopes` holds
+    // NO row naming it as `child_job_id`. Not reachable from attacker-shaped
+    // input today — all three callers either derive the envelope
+    // (`local-tools.ts`, via `loadEnvelopeForChildJob` on the same key) or
+    // create the parent job two statements earlier (`conduct.ts`) — so this
+    // closes a latent hole structurally rather than a live one, the same
+    // posture `grantAuthorization` takes towards a claimed provenance.
+    //
+    // Placed in this branch, beside the check it mirrors, and therefore still
+    // ABOVE guard 3 (idempotency): it reads no time-varying counter, so unlike
+    // `dailyCapGuard` its answer cannot differ between the call that opened a
+    // delegation and the call retrying it.
+    const governing = await loadEnvelopeForChildJob(parent.jobId, { businessId });
+    if (governing !== null) {
+      return {
+        status: 'refused',
+        code: 'parent_envelope_omitted',
+        reason:
+          `המשימה ${parent.jobId} נפתחה כמשימת-בת של המעטפת ${governing.id} ואינה משימת שורש, ` +
+          `ולכן בקשת עזרה ממנה חייבת למסור את המעטפת הזו ולא null`,
+      };
+    }
   }
 
   // Ancestry: inherited from the VERIFIED ancestor when there is one,
@@ -519,12 +569,12 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
   // in the old order (execute, then attach) left a window where the child was
   // already runnable and unattached: the scheduler could run it and it would
   // answer into a void no envelope named, and whatever eventually wakes the
-  // parent (Task 7's `resumeDelegatedJobs`, which will find it via the
-  // envelope's `child_job_id` and the parent's `awaiting_envelope_id` — not
-  // built yet) would have no envelope pointing at this child to find. Attaching
-  // first at least means the only reachable crash window leaves a child that
-  // is attached but not yet runnable, which a future deadline check has
-  // something to find.
+  // parent (`resumeDelegatedJobs`, which starts from the parent's
+  // `awaiting_envelope_id` and reaches the child through the envelope's
+  // `child_job_id`) would have no envelope pointing at this child to find.
+  // Attaching first at least means the only reachable crash window leaves a
+  // child that is attached but not yet runnable, which the deadline branch of
+  // `resumeDelegatedJobs` has something to find.
   await transition(child.jobId, {
     to: 'understand',
     actor: 'orchestrator',

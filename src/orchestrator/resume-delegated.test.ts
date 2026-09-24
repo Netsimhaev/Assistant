@@ -230,4 +230,68 @@ describe('resumeDelegatedJobs', () => {
     const failedParent = await loadJob(parentJobId, { businessId: BUSINESS });
     expect(failedParent?.phase).toBe('failed');
   });
+
+  /**
+   * `failCorruptedParent`'s second arm: the envelope exists but no child was
+   * ever attached — the crash window `requestHelp`'s own docblock names,
+   * between `writeEnvelope` committing and `attachChildJob` running.
+   *
+   * The assertion is on the RECORDED REASON, not on "the parent did not
+   * resume". A parent that is merely skipped also fails to resume, so an
+   * absence-only assertion would pass with this arm deleted — the arm's whole
+   * point is that a parent parked on a promise nothing can keep is moved to a
+   * terminal phase loudly rather than left to starve the scheduler's window.
+   */
+  it('fails a parent whose envelope has no child attached, rather than skipping it', async () => {
+    const { parentJobId, envelopeId } = await openDelegation();
+    // Undo the attach, leaving exactly what a crash between `writeEnvelope`
+    // and `attachChildJob` leaves: an envelope with no child.
+    await getPool().query(
+      'UPDATE agent_envelopes SET child_job_id = NULL WHERE business_id = $1 AND envelope_id = $2',
+      [BUSINESS, envelopeId],
+    );
+
+    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    expect(result.resumed).toEqual([]);
+    expect(result.timedOut).toEqual([]);
+    expect(result.errored).toEqual([{ jobId: parentJobId, error: expect.any(String) }]);
+    expect(result.errored[0]?.error).toContain('no child job attached');
+    expect(result.errored[0]?.error).toContain(envelopeId);
+
+    const failedParent = await loadJob(parentJobId, { businessId: BUSINESS });
+    expect(failedParent?.phase).toBe('failed');
+  });
+
+  /**
+   * `failCorruptedParent`'s third arm: the envelope names a child job row that
+   * does not exist. Distinguished from the missing-ENVELOPE arm on purpose —
+   * both reasons end in "does not exist", so this asserts the child-shaped
+   * wording and the bogus child id, which the missing-envelope arm's message
+   * never carries.
+   *
+   * Again asserted on the recorded reason and the terminal phase: with the arm
+   * deleted, `child === null` would fall through to `child.phase` and throw,
+   * landing in the generic `catch` that reports `errored` WITHOUT failing the
+   * parent — so "not resumed" alone cannot tell the two apart.
+   */
+  it("fails a parent whose envelope points at a child job row that does not exist", async () => {
+    const { parentJobId, childJobId, envelopeId } = await openDelegation();
+    await getPool().query(
+      'UPDATE agent_envelopes SET child_job_id = $3 WHERE business_id = $1 AND envelope_id = $2',
+      [BUSINESS, envelopeId, 'JOB-never-created'],
+    );
+
+    const result = await resumeDelegatedJobs({ businessId: BUSINESS });
+    expect(result.resumed).toEqual([]);
+    expect(result.timedOut).toEqual([]);
+    expect(result.errored).toEqual([{ jobId: parentJobId, error: expect.any(String) }]);
+    expect(result.errored[0]?.error).toContain("child JOB-never-created does not exist");
+
+    const failedParent = await loadJob(parentJobId, { businessId: BUSINESS });
+    expect(failedParent?.phase).toBe('failed');
+
+    // The real child is untouched — only the envelope's pointer was corrupted.
+    const child = await loadJob(childJobId, { businessId: BUSINESS });
+    expect(child?.phase).toBe('execute');
+  });
 });

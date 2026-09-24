@@ -200,10 +200,12 @@ describe('ungroundedNumbers', () => {
      * directions at once: a chain is peeled up to three letters deep, but
      * the character before the WHOLE chain must still be a non-letter.
      * `הנחה`/`יתרה`/`ההנחה` each hit a genuine word-internal letter at the
-     * head of their one-letter "chain" and stay signed; `עמלה` hits one two
-     * letters in (its third-from-last letter, `מ`, is itself a letter,
-     * whether or not it is also particle-shaped); `מה`/`כשה` reach an actual
-     * word boundary and read as prefixes.
+     * head of their one-letter "chain" and stay signed. `עמלה` is the case an
+     * earlier wording here got wrong: it named `מ` as the blocker, but `ה`,
+     * `ל` and `מ` are ALL in `LEADING_HEBREW_PARTICLE`, so all three peel and
+     * the chain exhausts `MAX_LEADING_PARTICLE_LAYERS` (3) exactly there — the
+     * blocker is `ע`, the letter the peel stops in front of. `מה`/`כשה` reach
+     * an actual word boundary and read as prefixes.
      */
     it('holds both directions together: word-ending letters stay signed, stacked particles do not', () => {
       expect(ungroundedNumbers('הנחה-500 ש"ח', ['סכום 500 ש"ח'])).toEqual(['-500']);

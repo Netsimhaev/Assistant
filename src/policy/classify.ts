@@ -264,6 +264,19 @@ export function isKnownTool(toolName: string): boolean {
  * must not go back there: the two tables must stay disjoint, and an invariant
  * locks that.
  *
+ * **Read this together with the disjointness invariant that guards the OTHER
+ * two tables** — `keeps the classified and read-only tables disjoint`
+ * (`policy/positive-controls.test.ts`). That invariant's argument is "a tool
+ * with a real, side-effecting class must never contribute no ceiling", which
+ * read alone makes this table look impossible. The difference is precisely
+ * why this is a third table and not an entry in `READ_ONLY_TOOLS`: a
+ * read-only tool contributes nothing because it HAS no class and is
+ * short-circuited at stage 4, before stage 8 ever reads the ramp; an exempt
+ * tool has a real class, is gated and audited in full, and reaches stage 8
+ * carrying the plan's ramp value — it is excused from CONTRIBUTING to that
+ * value, never from being bound by it. A reader of either docblock who has
+ * not read the other will believe the other one impossible.
+ *
  * **One member, and the reason is attached to it:** a delegation carries no
  * outbound authority. It opens a child job whose every step faces all ten
  * gate stages under its own ramp and under constraints that could only have

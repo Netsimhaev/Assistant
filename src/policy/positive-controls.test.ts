@@ -259,6 +259,15 @@ describe('constants that must fail closed as the system grows', () => {
    * Written the way the test below it is written — by simulating the mistake
    * rather than asserting today's tables, which are already disjoint and would
    * pass with or without any guard.
+   *
+   * **This is NOT contradicted by `CEILING_EXEMPT_TOOLS` (`policy/classify.ts`),
+   * and the two docblocks have to be read together.** That third table does
+   * let a CLASSIFIED tool contribute no ceiling — but only to the plan-wide
+   * minimum, and without excusing it from anything: it still faces all ten
+   * stages, still leaves an audit row, and still runs under whatever
+   * `rampLevelForPlan` returns. A tool in both tables here is a different and
+   * strictly worse thing: it skips stage 4 as read-only AND carries a real
+   * side-effecting class, so nothing gates it at all.
    */
   it('keeps the classified and read-only tables disjoint, and would notice if they overlapped', () => {
     const classified = classifiedToolNames();
@@ -459,6 +468,17 @@ describe('delegation is classified but contributes no plan ceiling', () => {
    * runs under whatever other class the plan declares, which is the documented
    * hazard. Delegation is admissible only because it carries no outbound
    * authority of its own — the child job's own steps face the full ten stages.
+   *
+   * **What the loop below actually checks is narrower than that argument, and
+   * the difference is worth stating rather than leaving a reader to assume the
+   * stronger claim is mechanised.** `addresseeOf(cls) === 'internal'` is a
+   * proxy, not a test for "no outbound authority": `data.export`,
+   * `media.publish`, `purchase.place` and `charter.amend` are all `internal`
+   * too, and every one of them carries authority a delegation does not. A
+   * future member shaped like those would pass the loop; today the only thing
+   * that would stop it is `size === 1` below. That is deliberate — the
+   * admissibility argument is a judgement about one named tool, and the only
+   * honest way to mechanise "one named tool" is to assert the count.
    */
   it('exempts exactly one tool from the plan ceiling, and it addresses internally', () => {
     // The loop runs first and the count assertion comes after, on purpose:

@@ -35,6 +35,22 @@ interface EnvelopeRow {
  * the one exception: the envelope supplies it, and it is written as-is rather
  * than left to the column's `DEFAULT now()`, because the round trip must hand
  * back the exact instant the caller minted, not the instant it was persisted.
+ *
+ * **`constraints` and `contextRefs` are CAST, not re-parsed — and that was
+ * measured, not assumed.** The final review proposed re-parsing both with their
+ * zod schemas here ("a value we did not verify is not a permissive value"), and
+ * it does not survive contact with `resumeDelegatedJobs`: `EnvelopeConstraints`
+ * types `deadlineAt` as `z.string().datetime()`, so a mangled deadline would
+ * throw HERE instead of reaching that module's own unreadable-deadline arm —
+ * the arm that moves the parent to `failed` precisely so it cannot starve the
+ * scheduler's window. A throw out of this function lands in that module's
+ * generic per-job `catch`, which deliberately does NOT fail a parent (a dropped
+ * connection is not evidence its state is unrecoverable), so the parent would
+ * be reported and left parked in `followup` forever: strictly worse than the
+ * cast, and its existing test measures exactly that. The invariant the review
+ * wanted is held one layer up instead, where the value is USED — see
+ * `resume-delegated.ts`'s `Date.parse`/`Number.isNaN` guard. Only
+ * `writeEnvelope` writes these rows, and only from already-validated objects.
  */
 function toEnvelope(row: EnvelopeRow): AgentEnvelope {
   return {
@@ -54,6 +70,7 @@ function toEnvelope(row: EnvelopeRow): AgentEnvelope {
     createdAt: row.created_at.toISOString(),
   };
 }
+
 
 export type WriteEnvelopeResult =
   | { status: 'stored'; envelope: AgentEnvelope; childJobId: string | null }
@@ -325,10 +342,11 @@ export async function countPairExchanges(
  * `agent_envelopes` rows would also under-count in the crash window between
  * "the call went out" and "the envelope was persisted".
  *
- * `AuditKind` does not carry a `'delegation'` member yet — a later task adds
- * it and starts writing these rows in production. This reader does not wait
- * for that: it counts whatever `audit_log.kind = 'delegation'` rows exist
- * today, by string, exactly as `curationRunsToday` counts `'curation'`.
+ * `AuditKind` carries a `'delegation'` member (`domain/audit.ts`), and
+ * `requestHelp` (`orchestrator/delegate.ts`) writes one such row for every
+ * delegation it opens — after the commit, and never the payload. This reader
+ * counts those rows by string, exactly as `curationRunsToday` counts
+ * `'curation'`.
  */
 export async function delegationsToday(
   options: { businessId?: string; db?: Queryable } = {},
@@ -435,10 +453,23 @@ export async function loadResultForChildJob(
 
 /**
  * Fill in the child job a `help_request` envelope spawned, once the
- * orchestrator has actually created it. This is the column Task 7's
- * `resumeDelegatedJobs` will read (via `agent_envelopes_child_idx`) to find
- * the envelope waiting on a child job that just finished — not built yet, so
- * this states what the column is for, not what already reads it.
+ * orchestrator has actually created it.
+ *
+ * Two readers reach this column through `agent_envelopes_child_idx`, and both
+ * ask the same question — "does an envelope govern THIS job?". `runDueJobs`
+ * (`orchestrator/run-due.ts`) asks it before running a job's step, so the
+ * envelope's `constraints.autonomyCeiling` reaches `GateContext` instead of
+ * being dropped on the floor; and `agent.request_help`'s own handler
+ * (`orchestrator/local-tools.ts`) asks it about the CURRENT job before opening
+ * a second-hop delegation, so a child that itself delegates inherits from its
+ * real ancestor instead of being treated as a fresh root.
+ *
+ * `resumeDelegatedJobs` is NOT one of them, and never was: it starts from the
+ * PARENT side via `jobs.awaiting_envelope_id` and reaches the envelope by its
+ * primary key — exactly as `loadEnvelopeForChildJob`'s own docblock above
+ * already says. An earlier version of this docblock named it as the reader and
+ * contradicted that one, which is the defect class this file's own comments
+ * exist to avoid.
  */
 export async function attachChildJob(
   envelopeId: string,

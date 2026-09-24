@@ -223,6 +223,18 @@ function normaliseNumber(raw: string): string {
  * rule is checked against includes a genuine three-deep stack (`כשה`), so the
  * cap here is 3, not the same value reused from that unrelated constant.
  *
+ * **A stated limit of the cap itself, recorded rather than fixed: a FOUR-deep
+ * stack falls back to a sign.** `וכשה-2024` (ו + כ + ש + ה) and `ולכשה-`
+ * peel three layers, exhaust `MAX_LEADING_PARTICLE_LAYERS`, and then find a
+ * letter — the fourth particle itself — in front of the chain, so
+ * `hasHebrewParticlePrefix` returns `false` and the run is signed. The
+ * DIRECTION is the part worth writing down: exceeding the cap can only ever
+ * ADD a sign (a false ungrounded — the noisy, visible direction), never
+ * suppress one. Raising the cap could therefore only trade that noise for
+ * more of the `שלב` collision below; it can never silently ground a
+ * credit/debit inversion, which is the failure this whole rule exists to
+ * avoid.
+ *
  * **A known, accepted trade-off this fix introduces:** a short word spelled
  * ENTIRELY from these seven letters is mechanically indistinguishable from a
  * genuine stack of the same length — `שלב` ("stage") is ש + ל + ב, all three
@@ -252,9 +264,15 @@ function normaliseNumber(raw: string): string {
  * hyphen) — `LEADING_HEBREW_PARTICLE.test(...)` is reached only on that
  * branch, so its `־` (U+05BE MAQAF) alternative can never be the character
  * that matched. `ו־950`, written with a maqaf instead of a hyphen, is
- * therefore NOT handled by this rule at all and still reads as `-950`. Not
- * fixed here — recorded so the code does not read as though it covers a
- * case it does not.
+ * therefore NOT handled by this rule at all. **Correction: an earlier wording
+ * here concluded from that it "still reads as `-950`", and that was backwards.**
+ * `NUMBER_PATTERN` carries no sign of its own, and `sign` is set ONLY inside
+ * the `prevChar === '-'` branch or the trailing `nextChar === '-'` one — a
+ * maqaf enters neither — so `ו־950` reads as the UNSIGNED `950`, which is the
+ * same answer the rule itself would have produced. What the dead alternative
+ * actually costs is the mirror case: a genuine minus written as a maqaf
+ * (`־950`) is not read as a sign either. Neither is fixed here — both are
+ * recorded so the code does not read as though it covers a case it does not.
  */
 function numbersIn(text: string): string[] {
   const tokens: string[] = [];

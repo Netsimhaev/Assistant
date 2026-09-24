@@ -285,6 +285,36 @@ describe('requestHelp', () => {
   });
 
   /**
+   * The mirror of the test above, and the looser half: `parentEnvelope: null`
+   * is a CLAIM that the parent is a root job, and it is the most permissive
+   * value this input can carry — it resets `hops` to 0, opens a fresh
+   * `correlationId` (taking both correlation-scoped guards out of the real
+   * tree), and inherits `ROOT_ANCESTOR_CONSTRAINTS`. Until this refusal
+   * existed, a supplied envelope was verified against the row and `null` was
+   * not verified at all.
+   *
+   * Written so it cannot pass on an earlier refusal: the parent is in
+   * `execute`, the pair is in `COLLABORATION_GRAPH`, the intent and payload
+   * resolve, and the context ref is the single one the registry requires — so
+   * the only thing that can refuse here is the arm under test. Asserted by its
+   * CODE and by the reason naming the governing envelope, not merely by "no
+   * child was opened": without the arm this call returns `opened`.
+   */
+  it('refuses parentEnvelope: null on a job an envelope already governs, instead of treating it as a root', async () => {
+    const { job, bundle } = await openParentJob();
+    const governing = anAncestorEnvelope({ hops: 2, correlationId: 'JOB-real-root' });
+    await seedAncestor(governing, job.jobId);
+
+    const before = await countJobs();
+    const result = await requestHelp(baseRequest(job, bundle, { parentEnvelope: null }));
+    expect(result.status).toBe('refused');
+    if (result.status !== 'refused') throw new Error('expected refused');
+    expect(result.code).toBe('parent_envelope_omitted');
+    expect(result.reason).toContain(governing.id);
+    expect(await countJobs()).toBe(before);
+  });
+
+  /**
    * Verifying the envelope id is not enough on its own — a caller holding a
    * REAL, correctly-attached envelope could still hand `requestHelp` an
    * object claiming `hops: 0`, a fresh `correlationId` and a fully permissive

@@ -118,10 +118,11 @@
  * round 4 — a round-3 version left it bare, above every fence, interpolated
  * at prompt level, exactly where the fixed contract's "everything inside a
  * fence is quoted" rule does not reach it. The trust class this defends is
- * "text this module did not author", not a specific caller: `verifyDraft`'s
- * real caller (Task 11's conductor) is not written yet, so this module
- * cannot see, and does not assume, how that caller will have produced the
- * question it hands in.
+ * "text this module did not author", not a specific caller. `verifyDraft`'s
+ * production caller is the conductor's `beginVerification`, and it does hand
+ * in a code-owned constant — but this module cannot see that and does not
+ * assume it: the fence is what has to hold for ANY caller, including a later
+ * one that composes the question out of something it read.
  *
  * **`buildJudgeCall` exists so the nonce-pairing itself is testable.**
  * `judgeWithModel`'s first statement is `refuseUnderTest()`, so every line
