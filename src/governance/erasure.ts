@@ -33,11 +33,13 @@ import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { ErasureItem, ErasurePlan, ErasureRefusal } from './erasure-plan.js';
 import {
+  AGENT_ENVELOPES_ERASED_PREDICATE,
   APPROVAL_REQUESTS_ERASED_PREDICATE,
   APPROVAL_REQUESTS_SCRUBBED_PREDICATE,
   APPROVAL_REQUESTS_SCRUB_SET,
   LIVE_PHASES,
   PROPOSALS_ERASED_PREDICATE,
+  VERIFICATION_VERDICTS_ERASED_PREDICATE,
   approvalRequestParams,
 } from './erasure-plan.js';
 
@@ -224,6 +226,23 @@ export async function executeErasure(
     await del('autonomy_marks', 'DELETE FROM autonomy_marks WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
+    // Migration 028's two tables. Neither carries a foreign key to `jobs` or
+    // `documents` (both `parent_job_id`/`child_job_id` and `job_id` are plain
+    // TEXT), so neither can be reached by a cascade from anything deleted
+    // above or below — their placement here is not load-bearing the way
+    // `proposals`-before-`document_readings` is, only grouped with the other
+    // job-scoped delete-only tables for readability. Same predicates, same
+    // parameters, as `countItems` in `erasure-plan.ts`.
+    await del(
+      'agent_envelopes',
+      `DELETE FROM agent_envelopes WHERE ${AGENT_ENVELOPES_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    await del(
+      'verification_verdicts',
+      `DELETE FROM verification_verdicts WHERE ${VERIFICATION_VERDICTS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
     // The only statement that can be refused by the schema itself. A
     // signature added after the preview was built makes migration 020's
     // RESTRICT reject this delete; the transaction rolls back and nothing is

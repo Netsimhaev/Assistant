@@ -53,6 +53,17 @@
  * copy of a probed value, not a proof that these two are empty of content
  * today. The reasoning above is what carries that, and it has to be rechecked
  * if either table ever gains a free-text column.
+ *
+ * **Migration 028 added two more, and both belong here.** `agent_envelopes`
+ * carries `payload`, `context_refs` and `intent` — the content of one agent's
+ * request to another, closing over the same counterparty a job's own plan or
+ * instructions can name — and `verification_verdicts` carries `verdict`,
+ * which quotes the draft it checked. Both are wired below by job id
+ * (`AGENT_ENVELOPES_ERASED_PREDICATE`, `VERIFICATION_VERDICTS_ERASED_PREDICATE`),
+ * the same way `job_plans` already is, and neither is given a discovery query
+ * of its own the way `boss_instructions`/`autonomy_marks` are: an envelope or
+ * a verdict a job carries is always reached through that job's own id, never
+ * the only place a job's tie to a contact is recorded.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -280,6 +291,37 @@ export const PROPOSALS_ERASED_PREDICATE = `business_id = $1
          SELECT reading_id FROM document_readings
           WHERE business_id = $1 AND document_id = ANY ($3)
        ))`;
+
+/**
+ * The `agent_envelopes` rows an erasure destroys, as ONE predicate.
+ *
+ * Matched by EITHER `parent_job_id` OR `child_job_id`. An envelope is content
+ * belonging to both ends of the delegation hop it records — `payload` and
+ * `context_refs` can name the same counterparty regardless of which side of
+ * the hop mentions it — and a job can land in `jobIds` because it is the
+ * CHILD (its own title, plan or instructions named the contact, while the
+ * parent job that opened the delegation carries no other tie to it at all).
+ * Matching `parent_job_id` alone would leave that envelope behind whenever
+ * the parent side is silent — the same "reached from one side only" gap
+ * `PROPOSALS_ERASED_PREDICATE` above already closes between `job_id` and
+ * `reading_id`.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const AGENT_ENVELOPES_ERASED_PREDICATE = `business_id = $1
+  AND (parent_job_id = ANY ($2) OR child_job_id = ANY ($2))`;
+
+/**
+ * The `verification_verdicts` rows an erasure destroys.
+ *
+ * One row per job (migration 028: `PRIMARY KEY (business_id, job_id)`), so
+ * `job_id = ANY ($2)` is the whole predicate — no second arm is needed the
+ * way `agent_envelopes` needs one, because this table carries no separate
+ * parent/child distinction at all.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const VERIFICATION_VERDICTS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
 
 async function idsFrom(
   db: Queryable,
@@ -660,6 +702,20 @@ async function countItems(
       'delete',
       `SELECT count(*)::text AS n FROM job_authorizations
         WHERE business_id = $1 AND job_id = ANY ($2)`,
+      [businessId, jobIds],
+    ),
+    // See `AGENT_ENVELOPES_ERASED_PREDICATE` above for why both
+    // `parent_job_id` and `child_job_id` are checked.
+    await one(
+      'agent_envelopes',
+      'delete',
+      `SELECT count(*)::text AS n FROM agent_envelopes WHERE ${AGENT_ENVELOPES_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'verification_verdicts',
+      'delete',
+      `SELECT count(*)::text AS n FROM verification_verdicts WHERE ${VERIFICATION_VERDICTS_ERASED_PREDICATE}`,
       [businessId, jobIds],
     ),
     await one(

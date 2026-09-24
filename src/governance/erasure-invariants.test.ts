@@ -216,6 +216,35 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, job.jobId, `התיקון היה בעקבות פנייה של ${PROBE}`],
     );
 
+    // --- Migration 028's two tables. --------------------------------------
+    //
+    // `agent_envelopes.payload` and `.context_refs` carry the content of one
+    // agent's request to another and can name a counterparty exactly as
+    // `job_plans.plan` already does; `verification_verdicts.verdict` quotes
+    // the draft it checked, exactly as a proposal's `raw` field does. Both are
+    // job-scoped (`parent_job_id` / `job_id`) and reached through the same
+    // `jobIds` this job already sits in via `job_authorizations` above.
+    await db.query(
+      `INSERT INTO agent_envelopes
+         (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+          kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+          idempotency_key, parent_job_id)
+       VALUES ($1, 'ENV-probe', 'COR-probe', ARRAY['office.manager'], 'office.manager', 'ops.web',
+               'help_request', 'lookup_contact', $2::jsonb, $3::jsonb, 'hash-probe-env',
+               '{}'::jsonb, 1, 'idem-probe', $4)`,
+      [
+        BUSINESS,
+        JSON.stringify({ lookFor: PROBE }),
+        JSON.stringify([{ kind: 'note', text: `פנייה בעניין ${PROBE}` }]),
+        job.jobId,
+      ],
+    );
+    await db.query(
+      `INSERT INTO verification_verdicts (business_id, job_id, verdict)
+       VALUES ($1, $2, $3::jsonb)`,
+      [BUSINESS, job.jobId, JSON.stringify({ mismatch: `שני מספרים בטיוטה אינם במסמך אצל ${PROBE}` })],
+    );
+
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
     await executeErasure(plan, { businessId: BUSINESS });
 
