@@ -46,7 +46,11 @@ import {
 import type { ErasureOutcome } from '../governance/erasure.js';
 import { keepItem, listKept, revokeKeep } from '../governance/kept-items.js';
 import type { KeptItemKind } from '../governance/kept-items.js';
-import { loadVerdict, type Verdict } from '../governance/verdict-store.js';
+import {
+  loadVerificationOutcome,
+  type NotJudgedReason,
+  type Verdict,
+} from '../governance/verdict-store.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -1263,21 +1267,34 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
   // now, or was even opened, is not something this route waits on or cares
   // about: no verdict is a state the card already renders correctly.
   //
-  // Fix round 1, Important 4: `Verdict.parse` (`loadVerdict`) throws on a row
-  // that fails to validate, and this route is the ONLY thing standing between
-  // that row and the owner's entire decision surface — approve, deny, edit,
-  // note AND sign all render through this one function, and an unguarded
-  // throw here would take all of them down with a generic 500 over a single
-  // bad column. `Verdict`'s own docblock already warned the blast radius of a
-  // malformed row was small only because nothing read it back yet; this route
-  // is what changed that. Caught here, and rendered as "unreadable" rather
-  // than "absent" — the owner is told a verdict exists but could not be
-  // shown, not led to believe none was ever produced.
+  // Fix round 1, Important 4: `Verdict.parse` / `NotJudgedReason.parse`
+  // (inside `loadVerificationOutcome`) throw on a row that fails to validate,
+  // and this route is the ONLY thing standing between that row and the
+  // owner's entire decision surface — approve, deny, edit, note AND sign all
+  // render through this one function, and an unguarded throw here would take
+  // all of them down with a generic 500 over a single bad column. Caught
+  // here, and rendered as "unreadable" rather than "absent" — the owner is
+  // told a verdict exists but could not be shown, not led to believe none
+  // was ever produced.
+  //
+  // Task 5: `loadVerificationOutcome` replaces `loadVerdict` so the card can
+  // tell apart the three states it distinguishes: `judged` (a verdict),
+  // `not_judged` (attempted and did not finish, with a reason), and `null`
+  // (nothing written yet — still running). The catch above still covers a
+  // row that fails to parse in either shape.
   let verdict: Verdict | null = null;
+  let notJudgedReason: NotJudgedReason | null = null;
   let verdictUnreadable = false;
   if (approval.jobId !== null) {
     try {
-      verdict = await loadVerdict(approval.jobId, { businessId });
+      const outcome = await loadVerificationOutcome(approval.jobId, { businessId });
+      if (outcome !== null) {
+        if (outcome.status === 'judged') {
+          verdict = outcome.verdict;
+        } else {
+          notJudgedReason = outcome.reason;
+        }
+      }
     } catch {
       verdictUnreadable = true;
     }
@@ -1292,6 +1309,7 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
         ? { document: resolved.document, documentIntent: resolved.intent }
         : {}),
       ...(verdict !== null ? { verdict } : {}),
+      ...(notJudgedReason !== null ? { notJudged: notJudgedReason } : {}),
       ...(verdictUnreadable ? { verdictUnreadable: true } : {}),
     }),
   );

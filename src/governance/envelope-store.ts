@@ -399,6 +399,56 @@ export async function loadEnvelopeForChildJob(
 }
 
 /**
+ * The `help_request` envelope a job OPENED, with the child job it spawned —
+ * the parent-side mirror of `loadEnvelopeForChildJob`, which answers the
+ * opposite question ("which envelope caused THIS job to run").
+ *
+ * `assert.evaluate` (`orchestrator/local-tools.ts`) needs this one and nothing
+ * else could give it. That step runs inside the DELEGATING job, after
+ * `resumeDelegatedJobs` has woken it, and has to find the delegation it
+ * itself opened in order to read the answer — and none of the columns that
+ * already have readers can say: `child_job_id` names the helper, not the
+ * delegator (for a root `gov.verify` job, asking it about the delegating job
+ * returns `null`); `jobs.awaiting_envelope_id` is cleared by the very
+ * transition that wakes the parent (`writeResultAndWake` passes
+ * `awaitingEnvelopeId: null`); and the idempotency key would have to be
+ * recomputed by duplicating `requestHelp`'s own derivation. `parent_job_id`
+ * has carried exactly this since migration 028 and had no reader until now.
+ *
+ * `kind = 'help_request'` is a real predicate, not decoration. A `result`
+ * envelope is filed with `parent_job_id` set to the CHILD's job id
+ * (`writeResultAndWake`), so it cannot collide here today — but a predicate
+ * that holds only because of how one producer happens to behave is the
+ * lesson this file has already paid for twice (`priorQuadruples` and
+ * `countPairExchanges` carry the same clause for the same reason).
+ *
+ * `ORDER BY created_at DESC` picks the newest: a job may legitimately open
+ * more than one delegation over its life, and the one it is waiting on is
+ * the last one it opened. No index covers `parent_job_id` — 028 created none
+ * — and one is not added here: this runs once per verification, against a
+ * table with one row per delegation.
+ */
+export async function loadHelpRequestFromParentJob(
+  parentJobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<StoredEnvelope | null> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<EnvelopeRow>(
+    `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
+            intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
+            child_job_id
+       FROM agent_envelopes
+      WHERE business_id = $1 AND parent_job_id = $2 AND kind = 'help_request'
+      ORDER BY created_at DESC, envelope_id DESC
+      LIMIT 1`,
+    [businessId, parentJobId],
+  );
+  const row = rows[0];
+  return row ? { envelope: toEnvelope(row), childJobId: row.child_job_id } : null;
+}
+
+/**
  * The `result` envelope answering a delegation, found by its correlation and
  * the child job it names — or `null` if `resumeDelegatedJobs` has not yet
  * decided this delegation's outcome.

@@ -8,8 +8,11 @@ import { installCharter } from '../charter/store.js';
 import { compileCharter } from '../charter/compile.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { Plan } from '../domain/plan.js';
-import type { AgentEnvelope } from '../domain/envelope.js';
+import type { AgentEnvelope, DelegationOutcome } from '../domain/envelope.js';
 import { attachChildJob, loadEnvelope, writeEnvelope } from '../governance/envelope-store.js';
+import { loadVerificationOutcome } from '../governance/verdict-store.js';
+import { saveReading } from '../documents/reading-store.js';
+import type { VerifyDraftInput, VerifyDraftResult } from '../sdk/gov-verify.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { envCredentials } from './credentials.js';
 import { runPlan } from './run-plan.js';
@@ -912,6 +915,531 @@ describe('the local tool executor', () => {
       const parent = await loadJob(jobId, { businessId: BUSINESS });
       expect(parent?.phase).toBe('followup');
       expect(parent?.awaitingEnvelopeId).not.toBeNull();
+    });
+  });
+
+  /**
+   * `assert.evaluate` — the second half of `gov.verify`'s check, the step that
+   * runs once the helper it asked has answered. Until this task the tool had
+   * no implementation, so the one-step plan `beginVerification` binds would
+   * have completed with `not_implemented` and filed no verdict at all.
+   *
+   * The question is a local literal on purpose: the real one is module-private
+   * in `conduct.ts` and stays that way — exporting a conductor constant for a
+   * test's convenience couples the two, and this handler passes the question
+   * through without reading it.
+   */
+  describe('assert.evaluate', () => {
+    const VERIFICATION_QUESTION = 'מה המסמך מבקש, ומה בו מחייב תשובה?';
+    const SUMMARY = 'הצעת מחיר לאספקה, עם בקשה לאישור בכתב.';
+
+    /** A minimal valid `Verdict` — `criteria` must carry at least one entry. */
+    const stubJudge = async (_input: VerifyDraftInput): Promise<VerifyDraftResult> => ({
+      criteria: [
+        {
+          id: 'c1',
+          statement: 'הטיוטה עונה על מה שהמסמך ביקש',
+          severity: 'must',
+          passed: true,
+          detail: 'נבדק',
+        },
+      ],
+      ungroundedNumbers: [],
+      answerTruncated: false,
+      draftTruncated: false,
+    });
+
+    /**
+     * A `gov.verify` job in `execute` that has already delegated, plus the
+     * document and the saved reading its answer is composed from.
+     *
+     * `outcome === null` means the helper has not answered: the `help_request`
+     * envelope and its child exist, and no `result` envelope does.
+     */
+    async function seedDelegation(outcome: DelegationOutcome | null): Promise<{
+      parentJobId: string;
+      subjectJobId: string;
+      documentId: string;
+      childJobId: string;
+      bundle: ReturnType<typeof compileCharter>;
+    }> {
+      const bundle = await installCharter(buildCharter({ version: `verify-${ulid()}` }), {
+        businessId: BUSINESS,
+      });
+
+      // `unknown_external`, the literal `conduct.ts` hard-codes for the
+      // delegating job — and therefore the provenance the saved reading must
+      // carry, since `loadLatestReading` is keyed on it.
+      const parent = await createJob({
+        charterVersion: bundle.charterVersion,
+        provenance: 'unknown_external',
+        businessId: BUSINESS,
+        title: 'אימות: טיוטה',
+      });
+      for (const to of ['understand', 'plan', 'execute'] as const) {
+        await transition(parent.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      }
+
+      // The job whose draft is judged — never the same row as the delegating
+      // job, the separation `VerifyDraftInput.subjectJobId` insists on.
+      const subject = await createJob({
+        charterVersion: bundle.charterVersion,
+        provenance: 'unknown_external',
+        businessId: BUSINESS,
+        title: 'הטיוטה שנבדקת',
+      });
+
+      const child = await createJob({
+        charterVersion: bundle.charterVersion,
+        provenance: 'unknown_external',
+        businessId: BUSINESS,
+        title: 'know.reader',
+      });
+
+      const documentId = `DOC-${ulid()}`;
+      await insertOrGetDocument(
+        {
+          documentId,
+          source: 'manual',
+          originalName: 'הצעה.txt',
+          mediaType: 'text/plain',
+          sha256: ulid().padEnd(64, '0'),
+          byteSize: 64,
+          storedPath: `${BUSINESS}/${documentId}/original.txt`,
+        },
+        { businessId: BUSINESS },
+      );
+      await markExtracted(
+        documentId,
+        [
+          {
+            ordinal: 0,
+            kind: 'text',
+            partName: 'גוף',
+            content: { blocks: [{ kind: 'paragraph', text: 'התמורה 11,988 ש"ח.' }] },
+            flags: [],
+          },
+        ],
+        { businessId: BUSINESS },
+      );
+      await saveReading(
+        {
+          readingId: `RD-${ulid()}`,
+          documentId,
+          status: 'read',
+          reason: null,
+          content: {
+            summary: SUMMARY,
+            findings: [],
+            intents: [
+              {
+                intent: 'reply_to_sender',
+                subject: { kind: 'sender' },
+                sourceRef: { ordinal: 0, locator: null },
+                note: '',
+              },
+            ],
+            unreadable: [],
+          },
+          provenance: 'unknown_external',
+          model: 'stub',
+          promptVersion: 'v1',
+          briefHash: `BH-${ulid()}`,
+        },
+        { businessId: BUSINESS },
+      );
+
+      const constraints = {
+        charterVersion: bundle.charterVersion,
+        provenanceCeiling: 'unknown_external' as const,
+        autonomyCeiling: 'draft_only' as const,
+        moneyCeilingMinor: null,
+        deadlineAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      };
+      const request: AgentEnvelope = {
+        v: 1,
+        id: `ENV-${ulid()}`,
+        // A root delegating job correlates on its own id, the way
+        // `requestHelp` derives it when no ancestor envelope exists.
+        correlationId: parent.jobId,
+        causalChain: [],
+        from: 'gov.verify',
+        to: 'know.reader',
+        kind: 'help_request',
+        intent: 'read_for_question',
+        payload: { question: VERIFICATION_QUESTION },
+        contextRefs: [{ kind: 'document', documentId }],
+        constraints,
+        hops: 1,
+        idempotencyKey: `IDEM-${ulid()}`,
+        createdAt: new Date().toISOString(),
+      };
+      // `parentJobId` is the DELEGATING job — the column the handler looks the
+      // request up by.
+      await writeEnvelope(request, { parentJobId: parent.jobId, businessId: BUSINESS });
+      await attachChildJob(request.id, child.jobId, { businessId: BUSINESS });
+
+      if (outcome !== null) {
+        // Exactly the shape `resumeDelegatedJobs`'s `writeResultAndWake`
+        // writes, including `parentJobId: childJobId` — which is why the
+        // handler's `kind = 'help_request'` predicate has work to do.
+        await writeEnvelope(
+          {
+            v: 1,
+            id: `ENV-${ulid()}`,
+            correlationId: parent.jobId,
+            causalChain: [request.id],
+            from: 'know.reader',
+            to: 'gov.verify',
+            kind: 'result',
+            intent: 'read_for_question',
+            payload: { outcome, note: 'נענתה' },
+            contextRefs: [{ kind: 'job', jobId: child.jobId }],
+            constraints,
+            hops: 1,
+            idempotencyKey: `IDEM-${ulid()}`,
+            createdAt: new Date().toISOString(),
+          },
+          { parentJobId: child.jobId, businessId: BUSINESS },
+        );
+      }
+
+      return {
+        parentJobId: parent.jobId,
+        subjectJobId: subject.jobId,
+        documentId,
+        childJobId: child.jobId,
+        bundle,
+      };
+    }
+
+    const seedAnsweredDelegation = (outcome: DelegationOutcome) => seedDelegation(outcome);
+    const seedUnansweredDelegation = () => seedDelegation(null);
+
+    it('judges and files a verdict when the delegation succeeded', async () => {
+      // Full shape: a gov.verify job parked on an envelope whose child answered.
+      const { parentJobId, subjectJobId, documentId, bundle } =
+        await seedAnsweredDelegation('succeeded');
+      // Captures what the judge was actually given, so the assertions below
+      // prove the reading was loaded and composed rather than that the call
+      // merely happened.
+      let seen: VerifyDraftInput | null = null;
+      const capturing = async (input: VerifyDraftInput): Promise<VerifyDraftResult> => {
+        seen = input;
+        return stubJudge(input);
+      };
+
+      const outcome = await runLocalTool(
+        'assert.evaluate',
+        { subjectJobId, documentId, draftText: 'שלום, מאשר את ההצעה.', question: VERIFICATION_QUESTION },
+        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: capturing },
+      );
+
+      // Proves the handler RAN, not merely that nothing bad happened.
+      expect(outcome).toMatchObject({ performed: true, status: 'judged' });
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toMatchObject({
+        status: 'judged',
+      });
+
+      const given = seen as VerifyDraftInput | null;
+      if (given === null) throw new Error('the verifier was never called');
+      // The answer is the composed reading, not the document — the one
+      // document-derived channel into the judge.
+      expect(given.answer).toContain(SUMMARY);
+      expect(given.answer).toContain('reply_to_sender');
+      // The subject job, never the delegating one.
+      expect(given.subjectJobId).toBe(subjectJobId);
+      expect(given.parentJobId).toBe(parentJobId);
+      // A root delegating job has no ancestor envelope, and the request it
+      // opened itself must never be passed as one.
+      expect(given.parentEnvelope).toBeNull();
+      // The artifacts were loaded for numeric grounding.
+      expect(given.sources.join('\n')).toContain('11,988');
+    });
+
+    it('files "not judged" and never calls the judge when the child failed', async () => {
+      const { parentJobId, subjectJobId, documentId, bundle } = await seedAnsweredDelegation('failed');
+      let judgeCalls = 0;
+      const counting = async (input: VerifyDraftInput) => {
+        judgeCalls += 1;
+        return stubJudge(input);
+      };
+      const outcome = await runLocalTool(
+        'assert.evaluate',
+        { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
+      );
+      expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'failed' });
+      expect(judgeCalls).toBe(0);
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+        status: 'not_judged',
+        reason: 'failed',
+      });
+    });
+
+    it('files "not judged" with reason timeout when the deadline fired', async () => {
+      const { parentJobId, subjectJobId, documentId, bundle } = await seedAnsweredDelegation('timeout');
+      // Counted here for the same reason it is counted on the `failed` case:
+      // the point of both is that the judge did not run at all, and a test
+      // that only reads the filed row would pass on a handler that billed a
+      // call and then discarded it.
+      let judgeCalls = 0;
+      const counting = async (input: VerifyDraftInput) => {
+        judgeCalls += 1;
+        return stubJudge(input);
+      };
+      const outcome = await runLocalTool(
+        'assert.evaluate',
+        { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
+      );
+      expect(judgeCalls).toBe(0);
+      expect(outcome).toMatchObject({ status: 'not_judged', reason: 'timeout' });
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+        status: 'not_judged',
+        reason: 'timeout',
+      });
+    });
+
+    it('refuses when no result envelope exists — a state step 1 cannot produce', async () => {
+      const { parentJobId, subjectJobId, documentId, bundle } = await seedUnansweredDelegation();
+      let caught: unknown;
+      try {
+        await runLocalTool(
+          'assert.evaluate',
+          { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+          { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: stubJudge },
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StepChannelError);
+      const typed = caught as StepChannelError;
+      expect(typed.code).toBe('verification_answer_missing');
+      expect(typed.retryable).toBe(false);
+      // A refusal files nothing — the card must keep reading "still running",
+      // not "gave up", while the helper may yet answer.
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toBeNull();
+    });
+
+    /**
+     * The delegation succeeded and came back with nothing to judge.
+     * `ReadingRecord.content` is `Reading | null`, and a record whose `status`
+     * is `unreadable` is exactly that shape — `know.reader` returns it for a
+     * document it could not read, and its child job closes normally, so the
+     * `result` envelope says `succeeded`.
+     *
+     * **Filed, not thrown.** A refusal would write no row, and absence in this
+     * table means "still running" — so every unreadable document would have
+     * left its card saying that forever. `unreadable` is the third
+     * `NotJudgedReason` (migration 031) for exactly this state.
+     */
+    it('files "not judged" with reason unreadable when the reading carries no content', async () => {
+      const { parentJobId, subjectJobId, documentId, bundle } =
+        await seedAnsweredDelegation('succeeded');
+      // Newer than the readable row seeded above, so `loadLatestReading` — which
+      // orders by `created_at DESC` — returns this one.
+      await saveReading(
+        {
+          readingId: `RD-${ulid()}`,
+          documentId,
+          status: 'unreadable',
+          reason: 'לא ניתן היה לקרוא',
+          content: null,
+          provenance: 'unknown_external',
+          model: 'stub',
+          promptVersion: 'v1',
+          briefHash: `BH-${ulid()}`,
+        },
+        { businessId: BUSINESS },
+      );
+      let judgeCalls = 0;
+      const counting = async (input: VerifyDraftInput) => {
+        judgeCalls += 1;
+        return stubJudge(input);
+      };
+
+      const outcome = await runLocalTool(
+        'assert.evaluate',
+        { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
+      );
+
+      expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'unreadable' });
+      expect(judgeCalls).toBe(0);
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+        status: 'not_judged',
+        reason: 'unreadable',
+      });
+    });
+
+    /**
+     * The same state reached the other way: a document with no extracted parts
+     * makes `doc.fetch` return `no_artifacts` and save no reading at all, and
+     * the child still completes. A missing row and an empty one mean the same
+     * thing here — the helper had nothing to tell us — and must file the same
+     * reason rather than one filing and one refusing.
+     */
+    it('files "not judged" with reason unreadable when no reading was saved at all', async () => {
+      const { parentJobId, subjectJobId, bundle } = await seedAnsweredDelegation('succeeded');
+      // A document this job never read: no `document_readings` row exists for
+      // it under any provenance.
+      const unreadDocumentId = `DOC-${ulid()}`;
+      let judgeCalls = 0;
+      const counting = async (input: VerifyDraftInput) => {
+        judgeCalls += 1;
+        return stubJudge(input);
+      };
+
+      const outcome = await runLocalTool(
+        'assert.evaluate',
+        {
+          subjectJobId,
+          documentId: unreadDocumentId,
+          draftText: 'טיוטה',
+          question: VERIFICATION_QUESTION,
+        },
+        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
+      );
+
+      expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'unreadable' });
+      expect(judgeCalls).toBe(0);
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+        status: 'not_judged',
+        reason: 'unreadable',
+      });
+    });
+
+    /**
+     * `answer` is non-null on every call this handler makes, so `verifyDraft`
+     * has no branch left that delegates — and if one appears, the step must
+     * say so loudly rather than file a verdict it never got. Only a stub can
+     * produce this shape today; the refusal is here so the day the real
+     * function's branching changes, it fails visibly.
+     */
+    it('refuses if the verifier delegates a second time, and files nothing', async () => {
+      const { parentJobId, subjectJobId, documentId, childJobId, bundle } =
+        await seedAnsweredDelegation('succeeded');
+      const delegatingAgain = async (): Promise<VerifyDraftResult> => ({
+        status: 'awaiting_delegation',
+        envelopeId: `ENV-${ulid()}`,
+        childJobId,
+        ungroundedNumbers: [],
+      });
+
+      let caught: unknown;
+      try {
+        await runLocalTool(
+          'assert.evaluate',
+          { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+          {
+            jobId: parentJobId,
+            businessId: BUSINESS,
+            bundle,
+            agent: 'gov.verify',
+            verifier: delegatingAgain,
+          },
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StepChannelError);
+      expect((caught as StepChannelError).code).toBe('verification_delegated_again');
+      expect((caught as StepChannelError).retryable).toBe(false);
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toBeNull();
+    });
+
+    /**
+     * A `result` envelope whose payload does not parse is a corrupted state,
+     * not an outcome — refused, never filed as `not_judged`, which would claim
+     * we know the helper failed when we do not.
+     */
+    it('refuses a result envelope whose payload cannot be read', async () => {
+      const { parentJobId, subjectJobId, documentId, childJobId, bundle } =
+        await seedUnansweredDelegation();
+      await writeEnvelope(
+        {
+          v: 1,
+          id: `ENV-${ulid()}`,
+          correlationId: parentJobId,
+          causalChain: [],
+          from: 'know.reader',
+          to: 'gov.verify',
+          kind: 'result',
+          intent: 'read_for_question',
+          payload: { outcome: 'not-a-real-outcome' },
+          contextRefs: [{ kind: 'job', jobId: childJobId }],
+          constraints: {
+            charterVersion: bundle.charterVersion,
+            provenanceCeiling: 'unknown_external',
+            autonomyCeiling: 'draft_only',
+            moneyCeilingMinor: null,
+            deadlineAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          },
+          hops: 1,
+          idempotencyKey: `IDEM-${ulid()}`,
+          createdAt: new Date().toISOString(),
+        },
+        { parentJobId: childJobId, businessId: BUSINESS },
+      );
+
+      let caught: unknown;
+      try {
+        await runLocalTool(
+          'assert.evaluate',
+          { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+          { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: stubJudge },
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StepChannelError);
+      expect((caught as StepChannelError).code).toBe('delegation_result_corrupted');
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toBeNull();
+    });
+
+    it('rejects a payload that names no subject job, without reaching the judge', async () => {
+      const { parentJobId, documentId, bundle } = await seedAnsweredDelegation('succeeded');
+      let judgeCalls = 0;
+      const counting = async (input: VerifyDraftInput) => {
+        judgeCalls += 1;
+        return stubJudge(input);
+      };
+      let caught: unknown;
+      try {
+        await runLocalTool(
+          'assert.evaluate',
+          { documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+          { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StepChannelError);
+      expect((caught as StepChannelError).code).toBe('local_tool_bad_input');
+      expect((caught as StepChannelError).message).toContain('subjectJobId');
+      expect(judgeCalls).toBe(0);
+    });
+
+    it('running twice files one verdict, not two', async () => {
+      const { parentJobId, subjectJobId, documentId, bundle } =
+        await seedAnsweredDelegation('succeeded');
+      const args = [
+        'assert.evaluate',
+        { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: stubJudge },
+      ] as const;
+      const first = await runLocalTool(...args);
+      const second = await runLocalTool(...args);
+      // Both runs judged — the count below is about the row, not about one of
+      // the two calls having quietly refused.
+      expect(first).toMatchObject({ performed: true, status: 'judged' });
+      expect(second).toMatchObject({ performed: true, status: 'judged' });
+      const { rows } = await getPool().query(
+        `SELECT count(*)::int AS n FROM verification_verdicts WHERE business_id = $1 AND job_id = $2`,
+        [BUSINESS, subjectJobId],
+      );
+      expect(rows[0]?.n).toBe(1);
     });
   });
 });

@@ -24,7 +24,7 @@ import { loadJob, transition } from './jobs.js';
 import { bindPlanToJob, completedSteps } from './plan-store.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { StepChannelError } from './step-error.js';
-import { runLocalTool } from './local-tools.js';
+import { runLocalTool, type LocalToolContext } from './local-tools.js';
 import type { Job } from './jobs.js';
 
 /**
@@ -92,6 +92,27 @@ export interface RunPlanRequest {
    * leave this unset and `readDocument` falls back to `runKnowReader`.
    */
   reader?: (request: ReadRequest) => Promise<ReadOutcome>;
+  /**
+   * The second local step that costs money: the judge inside
+   * `assert.evaluate`, threaded down to `runLocalTool`'s `ctx.judge` and from
+   * there into `VerifyDraftInput.judge`. Injectable for exactly the reason
+   * `reader` is — a test driving the verification loop end to end through
+   * `runPlan`/`runDueJobs` would otherwise reach the real `judgeWithModel`, a
+   * billed Agent SDK call.
+   *
+   * `judgeWithModel` does carry its own `refuseUnderTest` guard, so this seam
+   * is not the only thing standing between a test run and a bill — but a test
+   * relying on that guard proves nothing about the loop, because the guard
+   * throws and the step fails. This seam is what lets the loop actually
+   * complete without a key.
+   *
+   * **The judge and not `LocalToolContext.verifier`**, which replaces
+   * `verifyDraft` outright: a replacement also owns the delegation branch, so
+   * threading it from here would let a caller turn `requestHelp` off while
+   * every result still looked like success. See `LocalToolContext.judge`.
+   * Production callers leave this unset and the real judge runs.
+   */
+  judge?: LocalToolContext['judge'];
   /**
    * The hard cap carried by the envelope that opened THIS JOB as a
    * delegation's child, forwarded to every step's `GateContext.autonomyCeiling`.
@@ -489,16 +510,19 @@ async function performStep(
     const output = await runLocalTool(step.toolName, effectiveInput, {
       jobId: request.job.jobId,
       businessId: request.job.businessId,
-      // Only `doc.fetch` reads these today (readDocument needs the active
-      // charter to build its prompt, and `reader` is the seam a test drives
-      // instead of a live model call); every other local handler ignores
-      // both. `agent` is `agent.request_help`'s: it is `requestHelp`'s `from`,
+      // Only `doc.fetch` reads `bundle` and `reader` today (readDocument
+      // needs the active charter to build its prompt, and `reader` is the
+      // seam a test drives instead of a live model call); `judge` is
+      // `assert.evaluate`'s equivalent seam, and no other local handler
+      // reads any of the three.
+      // `agent` is `agent.request_help`'s: it is `requestHelp`'s `from`,
       // the requesting agent recorded on the envelope — and it comes from the
       // step, not from any part of the payload a hostile document could
       // shape.
       bundle: request.bundle,
       agent: step.agent,
       ...(request.reader !== undefined ? { reader: request.reader } : {}),
+      ...(request.judge !== undefined ? { judge: request.judge } : {}),
     });
     // No `externalId`: nothing outside the instance issued a handle, and
     // inventing one would tell `verify` it had a far end to ask.

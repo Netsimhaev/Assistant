@@ -8,7 +8,10 @@ import { resetDatabase } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { ingestDocument } from '../documents/ingest.js';
+import { loadVerificationOutcome } from '../governance/verdict-store.js';
 import { conductPendingDocuments } from './conduct.js';
+import { loadJob } from './jobs.js';
+import { loadPlanBody } from './plan-store.js';
 import type { Reading } from '../domain/reading.js';
 import type { Proposal } from '../domain/proposal.js';
 
@@ -503,17 +506,24 @@ describe('conductPendingDocuments', () => {
   });
 
   /**
-   * Fix round 1, Critical 2. A round-0 version of `beginVerification`'s
-   * docblock claimed a delegated verification job would "sit in `execute`
-   * un-rerun" — false: `resumeDelegatedJobs` wakes a parked parent once its
-   * child finishes, and `run-due.ts` fails a job it finds in `execute` with
-   * no plan bound (`run_due: no_plan_bound`), printing an operator-visible
-   * error line for every single card the conductor ever raises. This test
-   * pins the actual fix: the delegating job is ended, by this module,
-   * the moment the delegation opens — never left parked for that later
-   * failure to happen.
+   * Task 4 (verification-loop) supersedes fix round 1's Critical 2 — this is
+   * the same test, RETARGETED at the opposite behaviour. The OLD assertion
+   * here (`expect(jobs.rows[1]?.phase).toBe('failed')`) locked the very bug
+   * this task removes: `beginVerification` transitioning the delegating job
+   * straight to `failed` the instant a delegation opened, undoing the park
+   * `requestHelp` had just performed on EVERY card the conductor ever
+   * raised. That transition is gone; nothing in `beginVerification` moves
+   * the job's phase once its own `ctx.verifier` call succeeds. This stub
+   * returns a canned `awaiting_delegation` result without performing any
+   * real side effect (no actual `requestHelp`, no real park) — precisely
+   * because that absence is what proves the point: with no code path left
+   * that fails the job on this arm, and nothing else touching its phase
+   * either, the job is simply wherever `beginVerification` last put it
+   * (`execute`) once the call returns. The real park, performed by the real
+   * `requestHelp`, is covered separately below
+   * ("parks the gov.verify job on the delegation rather than ending it").
    */
-  it('ends the verification job itself rather than leaving it parked for run_due to fail later', async () => {
+  it('does not fail the verification job when the delegation opens successfully', async () => {
     await aDocument('חוזה שיווק לאימות תקין');
     const d = deps();
 
@@ -523,8 +533,7 @@ describe('conductPendingDocuments', () => {
       proposer: d.proposer,
       // A well-behaved stand-in for the real `verifyDraft` on the branch
       // this module always takes (`answer: null`): it opens a delegation and
-      // returns normally, exactly the shape `beginVerification` must end
-      // itself rather than leave parked.
+      // returns normally, without performing the real `requestHelp` park.
       verifier: async () => ({
         status: 'awaiting_delegation' as const,
         envelopeId: 'env-noop',
@@ -534,8 +543,7 @@ describe('conductPendingDocuments', () => {
     });
 
     expect(result.carded).toBe(1);
-    // Not a failure — this is the deliberate, immediate close, not a caught
-    // exception.
+    // Not a failure — the delegation opened cleanly.
     expect(result.verificationFailed).toBe(0);
 
     const jobs = await getPool().query<{ title: string | null; phase: string }>(
@@ -545,27 +553,27 @@ describe('conductPendingDocuments', () => {
     expect(jobs.rows).toHaveLength(2);
     expect(jobs.rows[0]?.phase).toBe('await_approval');
     expect(jobs.rows[1]?.title).toContain('אימות');
-    // Terminal, not `execute` — never left for `resumeDelegatedJobs` /
-    // `run-due.ts` to find and fail later.
-    expect(jobs.rows[1]?.phase).toBe('failed');
+    // The bug this replaces: this used to be `failed`, unconditionally,
+    // right here.
+    expect(jobs.rows[1]?.phase).not.toBe('failed');
   });
 
   /**
-   * Fix round 2, item 3. A `Verdict` return is `VerifyDraftResult`'s OTHER
-   * arm — no `status` key at all — and a round-1 version of
-   * `beginVerification` only terminated the delegating job on the
-   * `awaiting_delegation` arm, falling through to `{ opened: true }` on this
-   * one and leaving the job sitting in `execute` with no plan bound: the
-   * exact state Critical 2 exists to remove, one branch over.
-   * `verifyDraft`'s own Verdict-producing branch never moves the parent's
-   * phase (only its `requestHelp` call, on the OTHER arm, does that), so
-   * nothing else would have caught this. Not reachable through the real
-   * `verifyDraft` today — `beginVerification` hard-codes `answer: null`, so
-   * the judge is never reached — but reachable through `options.verifier`
-   * right now, and in production the moment a second half resolves `answer`
-   * and calls `verifyDraft` again on this job.
+   * Task 4 (verification-loop) supersedes fix round 2's item 3 — again the
+   * same test, retargeted. The OLD assertion locked "the Verdict arm must be
+   * closed out exactly like the delegation arm", because round-1's code only
+   * failed the job on ONE of the two arms `ctx.verifier` could return and
+   * this test caught the other slipping through un-failed. Now that
+   * `beginVerification` fails the job on NEITHER arm (it does not touch the
+   * phase after a successful call at all), there is no asymmetry left to
+   * guard — the two arms behave identically, by construction, because
+   * nothing branches on which one it was. What remains worth pinning is that
+   * this arm, too, does not fail the job. Still not reachable through the
+   * real `verifyDraft` today — `beginVerification` hard-codes `answer:
+   * null`, so the judge is never reached on this call — but reachable
+   * through `options.verifier`.
    */
-  it('ends the verification job even when the verifier returns a Verdict directly', async () => {
+  it('does not fail the verification job when the verifier returns a Verdict directly', async () => {
     await aDocument('חוזה שיווק — אימות שהושלם');
     const d = deps();
 
@@ -591,9 +599,99 @@ describe('conductPendingDocuments', () => {
     );
     expect(jobs.rows).toHaveLength(2);
     expect(jobs.rows[1]?.title).toContain('אימות');
-    // Terminal, not `execute` — the Verdict arm must be closed out exactly
-    // like the delegation arm.
-    expect(jobs.rows[1]?.phase).toBe('failed');
+    // The bug this replaces: this used to be `failed`, unconditionally,
+    // right here.
+    expect(jobs.rows[1]?.phase).not.toBe('failed');
+  });
+
+  // Task 4 (verification-loop). Three tests against the REAL `verifyDraft` —
+  // no `verifier` override — proving what a carded document actually leaves
+  // behind now that `beginVerification` binds a plan and stops killing the
+  // job: a one-step judging plan, a real park (not a stub's canned result),
+  // and no verdict yet.
+
+  it('binds a one-step judging plan to the gov.verify job and leaves it running', async () => {
+    await aDocument('חוזה שיווק לתוכנית האימות');
+    const d = deps();
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+    });
+    expect(result.carded).toBe(1);
+    expect(result.verificationFailed).toBe(0);
+
+    const jobs = await getPool().query<{ job_id: string; title: string | null }>(
+      `SELECT job_id, title FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
+      [BUSINESS],
+    );
+    // Three, not two: the document's own job, the `gov.verify` job
+    // `beginVerification` opens beside its card, and — since this test uses
+    // the REAL `verifyDraft`, not a stub — the `know.reader` child job its
+    // own `requestHelp` call actually opens.
+    expect(jobs.rows).toHaveLength(3);
+    const verifyJobId = jobs.rows[1]?.job_id;
+    expect(jobs.rows[1]?.title).toContain('אימות');
+    expect(verifyJobId).toBeTruthy();
+
+    const bound = await loadPlanBody(verifyJobId as string, { businessId: BUSINESS });
+    expect(bound).not.toBeNull();
+    // One step, and specifically NOT `agent.request_help` — see
+    // `beginVerification`'s own docblock: that tool classifies to
+    // `agent.delegate`, and this job's `unknown_external` provenance floors
+    // gate stage 8 at `draft_only` before it could ever delegate.
+    expect(bound?.plan.steps.map((s) => s.toolName)).toEqual(['assert.evaluate']);
+  });
+
+  it('parks the gov.verify job on the delegation rather than ending it', async () => {
+    await aDocument('חוזה שיווק לחניה על ההאצלה');
+    const d = deps();
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+    });
+    expect(result.carded).toBe(1);
+
+    const jobs = await getPool().query<{ job_id: string; title: string | null }>(
+      `SELECT job_id, title FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
+      [BUSINESS],
+    );
+    const verifyJobId = jobs.rows[1]?.job_id;
+    expect(jobs.rows[1]?.title).toContain('אימות');
+    expect(verifyJobId).toBeTruthy();
+
+    const verifyJob = await loadJob(verifyJobId as string, { businessId: BUSINESS });
+    // The bug this replaces: the job was transitioned to `failed`
+    // unconditionally, every time, right after the delegation opened.
+    expect(verifyJob?.phase).not.toBe('failed');
+    expect(verifyJob?.phase).toBe('followup');
+    // Positive marker: the park is the delegation's, so the column
+    // `resumeDelegatedJobs` selects on must be set. A park with this column
+    // null is a job nothing will ever wake.
+    expect(verifyJob?.awaitingEnvelopeId).not.toBeNull();
+  });
+
+  it('raises the approval card immediately, with no verdict yet', async () => {
+    await aDocument('חוזה שיווק בלי פסיקה עדיין');
+    const d = deps();
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+    });
+    expect(result.carded).toBe(1);
+
+    const jobs = await getPool().query<{ job_id: string }>(
+      `SELECT job_id FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
+      [BUSINESS],
+    );
+    const subjectJobId = jobs.rows[0]?.job_id;
+    expect(subjectJobId).toBeTruthy();
+    expect(await loadVerificationOutcome(subjectJobId as string, { businessId: BUSINESS })).toBeNull();
   });
 
   /**

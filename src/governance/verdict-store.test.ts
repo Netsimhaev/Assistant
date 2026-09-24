@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { loadVerdict, saveVerdict } from './verdict-store.js';
+import { loadVerdict, loadVerificationOutcome, saveNotJudged, saveVerdict } from './verdict-store.js';
 import type { Verdict } from './verdict-store.js';
 
 const BUSINESS = 'test-business';
@@ -100,5 +100,53 @@ describe('verdict-store', () => {
     expect(loaded?.answerTruncated).toBe(false);
     expect(loaded?.draftTruncated).toBe(false);
     expect(loaded?.fenceForgeryDetected).toBeUndefined();
+  });
+
+  it('records a verification that was attempted and did not complete', async () => {
+    await saveNotJudged('JOB-1', 'timeout', { businessId: BUSINESS });
+    const outcome = await loadVerificationOutcome('JOB-1', { businessId: BUSINESS });
+    expect(outcome).toEqual({ status: 'not_judged', reason: 'timeout' });
+  });
+
+  it('reports no row at all as null — the state that means "still running"', async () => {
+    expect(await loadVerificationOutcome('JOB-NONE', { businessId: BUSINESS })).toBeNull();
+  });
+
+  it('a real verdict written over a not-judged row clears the reason, and vice versa', async () => {
+    // Both writers upsert the same primary key. Without each clearing the
+    // other's column the CHECK rejects the second write, which would surface
+    // as a raw Postgres error on a path that should simply overwrite.
+    await saveNotJudged('JOB-2', 'failed', { businessId: BUSINESS });
+    await saveVerdict('JOB-2', aVerdict(), { businessId: BUSINESS });
+    expect(await loadVerificationOutcome('JOB-2', { businessId: BUSINESS })).toEqual({
+      status: 'judged',
+      verdict: expect.objectContaining({ criteria: expect.any(Array) }),
+    });
+
+    await saveNotJudged('JOB-2', 'timeout', { businessId: BUSINESS });
+    expect(await loadVerificationOutcome('JOB-2', { businessId: BUSINESS })).toEqual({
+      status: 'not_judged',
+      reason: 'timeout',
+    });
+  });
+
+  it('loadVerdict returns null for a not-judged row instead of throwing', async () => {
+    // `toVerdict` calls `Verdict.parse`. Before this change the column was NOT
+    // NULL, so the parse always had an object; a not-judged row would hand it
+    // `null` and throw — and the dashboard route wraps `loadVerdict` in a
+    // try/catch that renders "a verdict exists but could not be read", which
+    // would be a lie about a row that says the judge never ran.
+    await saveNotJudged('JOB-3', 'failed', { businessId: BUSINESS });
+    expect(await loadVerdict('JOB-3', { businessId: BUSINESS })).toBeNull();
+  });
+
+  it('refuses a reason outside the enum at the database, not only in zod', async () => {
+    await expect(
+      getPool().query(
+        `INSERT INTO verification_verdicts (business_id, job_id, verdict, not_judged_reason)
+         VALUES ($1, $2, NULL, 'whatever')`,
+        [BUSINESS, 'JOB-4'],
+      ),
+    ).rejects.toThrow(/verification_verdicts_one_shape/);
   });
 });

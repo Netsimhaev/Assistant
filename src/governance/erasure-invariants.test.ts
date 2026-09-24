@@ -332,6 +332,123 @@ describe('what an erasure leaves behind', () => {
   });
 
   /**
+   * The document anchor's own discovery-only gap, and the sweep above cannot
+   * see it for a structural reason: that sweep is CONTACT-anchored and seeds
+   * every job it checks into the anchor set through four independent routes,
+   * so a store riding along on any one of them proves nothing about whether
+   * its own job is ever found.
+   *
+   * This isolates the shape the verification loop introduced.
+   * `conduct.ts`'s `beginVerification` opens a SECOND job beside the approval
+   * card — `gov.verify`'s own — and binds it a one-step plan whose input
+   * carries `documentId`, the question and `draftText`: the draft derived from
+   * that document, verbatim. That job has no `proposals` row, no reading and
+   * no title naming the document, and the document anchor's only job discovery
+   * was a single query over `proposals`. So the erasure destroyed the
+   * document, its reading, the subject job's plan — and left the draft in the
+   * `gov.verify` job's `job_plans.plan`. Asserted below on the job that is
+   * deliberately OUTSIDE the anchor's `proposals` set, which is the whole
+   * point: the subject job's own plan row going away says nothing here.
+   */
+  it('reaches a gov.verify job whose bound plan names the document, on a document anchor', async () => {
+    const bundle = await installCharter(buildCharter({ version: 'doc-anchor' }), { businessId: BUSINESS });
+    const db = getPool();
+    const documentId = `DOC-anchor-${Date.now()}`;
+
+    await db.query(
+      `INSERT INTO documents
+         (document_id, business_id, source, original_name, media_type, sha256,
+          byte_size, stored_path, status)
+       VALUES ($1, $2, 'manual', 'הצעת מחיר.txt', 'text/plain', repeat('d', 64), 12, $3, 'extracted')`,
+      [documentId, BUSINESS, `${BUSINESS}/${documentId}/original.txt`],
+    );
+
+    // The SUBJECT job: the one the document anchor already found, through
+    // reading → proposal. Seeded so the test proves a gap rather than an empty
+    // anchor set, and so the assertion below can distinguish the two jobs.
+    const subject = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      businessId: BUSINESS,
+      title: 'משימת המסמך',
+    });
+    const readingId = `READ-anchor-${Date.now()}`;
+    await db.query(
+      `INSERT INTO document_readings
+         (reading_id, business_id, document_id, status, content, provenance, model,
+          prompt_version, brief_hash)
+       VALUES ($1, $2, $3, 'read', '{}'::jsonb, 'unknown_external', 'test-model', 'v1', 'hash-anchor')`,
+      [readingId, BUSINESS, documentId],
+    );
+    await db.query(
+      `INSERT INTO proposals
+         (proposal_id, business_id, reading_id, status, content, model, prompt_version, raw, job_id)
+       VALUES ($1, $2, $3, 'proposed', '{}'::jsonb, 'test-model', 'v1', 'גולמי', $4)`,
+      [`PROP-anchor-${Date.now()}`, BUSINESS, readingId, subject.jobId],
+    );
+
+    // The `gov.verify` job, exactly as `beginVerification` opens it: its own
+    // row, NO proposal, and a bound plan carrying the document id and the
+    // draft. The title names only the subject job — nothing here mentions the
+    // document except the plan itself.
+    const verifier = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      businessId: BUSINESS,
+      // The shape `beginVerification` writes: `אימות: <כותרת ההצעה>` — the
+      // subject job id appears only in the plan's own `goal`, never here.
+      title: 'אימות: אשיב לדנה',
+    });
+    await db.query(
+      `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
+       VALUES ($1, $2, 'hp-verify', $3::jsonb)`,
+      [
+        BUSINESS,
+        verifier.jobId,
+        JSON.stringify({
+          steps: [
+            {
+              id: 'judge',
+              toolName: 'assert.evaluate',
+              input: {
+                subjectJobId: subject.jobId,
+                documentId,
+                draftText: `שלום, בעקבות ההצעה שלך ${PROBE}`,
+                question: 'מה מבקש המסמך הזה בפועל?',
+              },
+            },
+          ],
+        }),
+      ],
+    );
+
+    const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+    // The precondition the gap lived in: the `proposals` query reaches the
+    // subject job only. If a future change makes the verifier job reachable
+    // that way too, this assertion fails and the test below stops proving the
+    // discovery it was written for.
+    expect(plan.jobIds).toContain(subject.jobId);
+    expect(plan.jobIds).toContain(verifier.jobId);
+
+    await executeErasure(plan, { businessId: BUSINESS });
+
+    const { rows } = await db.query(
+      'SELECT 1 FROM job_plans WHERE business_id = $1 AND job_id = $2',
+      [BUSINESS, verifier.jobId],
+    );
+    expect(rows).toHaveLength(0);
+
+    // And the draft itself, by content: a row count going to zero for the
+    // wrong reason would still pass the check above.
+    const { rows: leftovers } = await db.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM job_plans
+        WHERE business_id = $1 AND plan::text LIKE $2`,
+      [BUSINESS, `%${PROBE}%`],
+    );
+    expect(leftovers[0]?.n).toBe('0');
+  });
+
+  /**
    * And the other direction, without which the scan above is satisfied
    * perfectly by an erasure that deletes the whole database.
    */

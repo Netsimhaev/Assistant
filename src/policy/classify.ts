@@ -144,6 +144,12 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   // to read content the business did not write) — so what comes back is, by
   // construction, a summary of content this job did not author.
   'agent.request_help': true,
+  // `gov.verify`'s judging step composes the answer it hands the judge from a
+  // `Reading` of a document (`composeVerificationAnswer`, reached through
+  // `loadLatestReading` in the handler) and loads that document's artifacts
+  // for numeric grounding. `false` was accurate only while nothing
+  // implemented the tool: a step that reads nothing ingests nothing.
+  'assert.evaluate': true,
 
   // — local composition, owner-authored data, and outbound writes —
   'mail.draft': false,
@@ -161,7 +167,6 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   'followup.schedule': false,
   'schema.map': false,
   'norms.query': false,
-  'assert.evaluate': false,
   'recipe.save': false,
   'media.generate_image': false,
   'media.generate_video': false,

@@ -136,6 +136,7 @@ import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
+import type { Queryable } from '../db/pool.js';
 import type { AgentEnvelope } from '../domain/envelope.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { READ_FOR_QUESTION_MAX_CHARS } from '../governance/intent-registry.js';
@@ -605,7 +606,8 @@ export interface VerifyDraftInput {
   /**
    * The job WHOSE DRAFT IS BEING VERIFIED — the row `saveVerdict` files the
    * outcome under, and therefore the id a card looks the verdict up by
-   * (`loadVerdict(approval.jobId)`). Kept separate from `parentJobId` on
+   * (`loadVerificationOutcome(approval.jobId)`, on the dashboard route).
+   * Kept separate from `parentJobId` on
    * purpose: `requestHelp` requires the delegating job to be in `execute`,
    * but the job whose draft is under review is typically sitting in
    * `await_approval` by the time verification runs (Task 11's conductor
@@ -642,6 +644,15 @@ export interface VerifyDraftInput {
    */
   parentEnvelope: AgentEnvelope | null;
   businessId?: string;
+  /**
+   * The caller's connection, when it has one. Only `saveVerdict` uses it, and
+   * only so that this write and the caller's own land on the SAME connection:
+   * `assert.evaluate` (`orchestrator/local-tools.ts`) files the returned
+   * verdict itself, and with this omitted that step's write would go through
+   * the caller's transaction while this one went to a pooled connection — a
+   * row left behind, committed, after the caller rolled back.
+   */
+  db?: Queryable;
   now?: Date;
   /** Injected by tests. Production leaves it unset and gets the billed call. */
   judge?: Judge;
@@ -771,6 +782,9 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
   };
   // `subjectJobId`, never `parentJobId` — see `VerifyDraftInput.subjectJobId`'s
   // own docblock for why the two must never be the same field.
-  await saveVerdict(input.subjectJobId, verdict, { businessId });
+  await saveVerdict(input.subjectJobId, verdict, {
+    businessId,
+    ...(input.db !== undefined ? { db: input.db } : {}),
+  });
   return verdict;
 }

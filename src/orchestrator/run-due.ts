@@ -143,6 +143,16 @@ export async function runDueJobs(
      * unset.
      */
     reader?: RunPlanForJobRequest['reader'];
+    /**
+     * Forwarded to `runPlanForJob`'s `RunPlanRequest.judge` — the same kind of
+     * seam `reader` is, for the other local step that costs money (the judge
+     * inside `assert.evaluate`, `gov.verify`'s judging step). A test driving
+     * the verification loop through this real entry point would otherwise
+     * reach the billed `judgeWithModel`, whose own `refuseUnderTest` guard
+     * would throw and fail the step rather than let the loop finish.
+     * Production callers leave it unset.
+     */
+    judge?: RunPlanForJobRequest['judge'];
   } = {},
 ): Promise<RunDueResult> {
   const businessId = options.businessId ?? config.businessId;
@@ -264,6 +274,7 @@ export async function runDueJobs(
           ...(runtime.notify !== undefined ? { notify: runtime.notify } : {}),
           ...(options.now !== undefined ? { now: options.now } : {}),
           ...(options.reader !== undefined ? { reader: options.reader } : {}),
+          ...(options.judge !== undefined ? { judge: options.judge } : {}),
           ...(governingEnvelope !== null
             ? { autonomyCeiling: governingEnvelope.constraints.autonomyCeiling }
             : {}),

@@ -48,7 +48,12 @@ describe('the content-ingesting table', () => {
     for (const t of ['memory.recall', 'memory.recall_shallow', 'doc.fetch',
                      'crm.read', 'accounting.read', 'calendar.read', 'tasks.read',
                      'artifact.read', 'recipe.load', 'media.inspect', 'code_execution',
-                     'calendar.propose_slots']) {
+                     'calendar.propose_slots',
+                     // `gov.verify`'s judging step: it loads the saved `Reading`
+                     // of a document and that document's artifacts, and composes
+                     // the judge's answer from them. `false` was accurate only
+                     // while nothing implemented the tool.
+                     'assert.evaluate']) {
       expect(ingestsExternalContent(t), t).toBe(true);
     }
   });
@@ -56,7 +61,7 @@ describe('the content-ingesting table', () => {
   it('does not classify local composition or outbound writes as ingesting', () => {
     for (const t of ['mail.draft', 'mail.send', 'template.render', 'render.markdown',
                      'chart.render', 'charter.read', 'charter.voice', 'norms.query',
-                     'schema.map', 'assert.evaluate', 'escalate_to_human',
+                     'schema.map', 'escalate_to_human',
                      'wa.conversation_state', 'credential.request_session',
                      'calendar.write', 'crm.write', 'file.write']) {
       expect(ingestsExternalContent(t), t).toBe(false);
