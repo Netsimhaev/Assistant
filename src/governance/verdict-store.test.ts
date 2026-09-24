@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { loadVerdict, saveVerdict } from './verdict-store.js';
 import type { Verdict } from './verdict-store.js';
@@ -19,6 +19,7 @@ function aVerdict(overrides: Partial<Verdict> = {}): Verdict {
     ],
     ungroundedNumbers: [],
     answerTruncated: false,
+    fenceForgeryDetected: false,
     ...overrides,
   };
 }
@@ -64,5 +65,31 @@ describe('verdict-store', () => {
   it('scopes verdicts to the business', async () => {
     await saveVerdict('job-3', aVerdict(), { businessId: BUSINESS });
     expect(await loadVerdict('job-3', { businessId: 'other-business' })).toBeNull();
+  });
+
+  /**
+   * `toVerdict` calls `Verdict.parse`, not `safeParse` — a bare `z.boolean()`
+   * on a field added after this table already held rows would make
+   * `loadVerdict` THROW on every one of them instead of returning it. Writes
+   * directly to the table, bypassing `saveVerdict`'s `Verdict`-typed
+   * parameter, to reproduce exactly the row shape a version of the code
+   * before `answerTruncated`/`fenceForgeryDetected` existed would have saved.
+   */
+  it('reads back a row saved before answerTruncated and fenceForgeryDetected existed', async () => {
+    const oldShapeVerdict = {
+      criteria: [
+        { id: 'c1', statement: 'x', severity: 'must', passed: true, detail: 'y' },
+      ],
+      ungroundedNumbers: [],
+    };
+    await getPool().query(
+      `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3)`,
+      [BUSINESS, 'job-old-shape', JSON.stringify(oldShapeVerdict)],
+    );
+
+    const loaded = await loadVerdict('job-old-shape', { businessId: BUSINESS });
+    expect(loaded).not.toBeNull();
+    expect(loaded?.answerTruncated).toBe(false);
+    expect(loaded?.fenceForgeryDetected).toBe(false);
   });
 });

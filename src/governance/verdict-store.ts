@@ -35,8 +35,28 @@ export const Verdict = z.object({
    * outside the fence, an owner reading a verdict later has no way to tell a
    * genuine cut from a claimed one — or to know the judge saw less than the
    * whole answer at all.
+   *
+   * `.default(false)` — added a round after this field's own first commit,
+   * for a reason worth stating so the next field added here does not repeat
+   * it: `toVerdict` calls `Verdict.parse`, not `safeParse`, so a bare
+   * `z.boolean()` here made `loadVerdict` THROW on any row a version of the
+   * code before this field existed had already saved. The blast radius was
+   * small only because nothing downstream reads a verdict back yet — that is
+   * exactly why it is cheap to fix now and would have been expensive to
+   * discover later, once something did.
    */
-  answerTruncated: z.boolean(),
+  answerTruncated: z.boolean().default(false),
+  /**
+   * Whether `answer` or `draftText` contained something shaped like this
+   * module's own fence markers — computed by CODE from the raw input
+   * (`wasFenceForgeryAttempted`, `src/sdk/gov-verify.ts`), independent of
+   * whatever a particular call's random nonce turned out to be. An attempt
+   * is worth an owner's attention regardless of whether the nonce that call
+   * actually used made it impossible to succeed. Same `.default(false)`
+   * reasoning as `answerTruncated`, from the day this field was born rather
+   * than a round later.
+   */
+  fenceForgeryDetected: z.boolean().default(false),
 });
 export type Verdict = z.infer<typeof Verdict>;
 
