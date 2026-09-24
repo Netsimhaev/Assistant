@@ -73,6 +73,11 @@ async function openVerifyJob(): Promise<{ job: Job; bundle: PolicyBundle }> {
 function baseInput(job: Job, overrides: Partial<VerifyDraftInput> = {}): VerifyDraftInput {
   return {
     parentJobId: job.jobId,
+    // Same job as `parentJobId` in most of these tests, deliberately: they
+    // are not testing the parent/subject split (see the dedicated test for
+    // that below) and reusing one job keeps every existing `loadVerdict(job.jobId, …)`
+    // assertion meaningful.
+    subjectJobId: job.jobId,
     documentId: 'doc-quote-1',
     draftText: 'הסכום לתשלום הוא 11,988 ש"ח עד 15/10.',
     sources: ['סה"כ לתשלום: 11988 ש"ח, עד תאריך 15/10'],
@@ -226,6 +231,48 @@ describe('verifyDraft — the cheap check runs alone', () => {
     // with Task 9, not merely "saveVerdict was awaited and did not throw".
     const reloaded = await loadVerdict(job.jobId, { businessId: BUSINESS });
     expect(reloaded).toEqual(result);
+  });
+
+  /**
+   * Fix round 1, Critical 1: `parentJobId` (the job DOING the delegating,
+   * required to be in `execute`) and `subjectJobId` (the job whose DRAFT is
+   * under review, the one a card looks the verdict up by) must never be
+   * conflated. A caller that passed one job for both — Task 11's first draft
+   * of `conduct.ts` did exactly this — writes a verdict nobody's approval
+   * card will ever find, because `approval_requests.job_id` names the
+   * document's own job, not the delegating job `verifyDraft` requires to be
+   * in `execute`.
+   */
+  it('saves the verdict under subjectJobId, never under parentJobId', async () => {
+    const { job: delegatingJob, bundle } = await openVerifyJob();
+    // The subject job stands in for the document's own job — it does NOT
+    // need to be in `execute` (in production it is typically sitting in
+    // `await_approval` by the time verification runs), which is exactly why
+    // it cannot be the same row as the delegating job.
+    const subjectJob = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      businessId: BUSINESS,
+      title: 'the document job whose draft is under review',
+    });
+
+    const stubJudge: Judge = async () => ({
+      status: 'judged',
+      raw: '{}',
+      criteria: [{ id: 'x', statement: 'y', severity: 'must', passed: true, detail: 'z' }],
+    });
+
+    const result = await verifyDraft(
+      baseInput(delegatingJob, {
+        subjectJobId: subjectJob.jobId,
+        answer: 'תשובה רגילה',
+        judge: stubJudge,
+      }),
+    );
+    if (!('criteria' in result)) throw new Error('expected a Verdict');
+
+    expect(await loadVerdict(subjectJob.jobId, { businessId: BUSINESS })).toEqual(result);
+    expect(await loadVerdict(delegatingJob.jobId, { businessId: BUSINESS })).toBeNull();
   });
 
   /**

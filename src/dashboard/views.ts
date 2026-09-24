@@ -590,25 +590,6 @@ function signForm(
 }
 
 /**
- * `Verdict.ungroundedNumbers` entries are COMPARISON forms, not display
- * forms — no thousands separators, a trailing decimal zero already stripped,
- * a trailing minus rewritten to a leading one
- * (`governance/numeric-grounding.ts`'s own docblock). Printed raw, `12500`
- * reads as a different figure than the `12,500` the owner's own draft
- * actually spelled, which defeats the point of showing it at all — the owner
- * is meant to recognise the number, not decode it. Reformatted here with
- * thousands separators for DISPLAY ONLY; this is never the string
- * `ungroundedNumbers` itself compared against.
- */
-function formatUngroundedNumber(raw: string): string {
-  const negative = raw.startsWith('-');
-  const unsigned = negative ? raw.slice(1) : raw;
-  const [intPart, decPart] = unsigned.split('.');
-  const withSeparators = (intPart ?? '').replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  return (negative ? '-' : '') + withSeparators + (decPart === undefined ? '' : `.${decPart}`);
-}
-
-/**
  * `fenceForgeryDetected` has three states, on purpose (`Verdict`'s own
  * docblock): `true` and `false` are both something the check actually ran and
  * found; `undefined` is a verdict saved before this field existed, and must
@@ -653,11 +634,27 @@ function criterionItem(criterion: Verdict['criteria'][number]): string {
 function verdictBlock(verdict: Verdict): string {
   const criteriaItems = verdict.criteria.map(criterionItem).join('');
 
+  // Fix round 1, Important 6: printed VERBATIM, not reformatted. A prior
+  // version added thousands separators, but `ungroundedNumbers` entries are
+  // a COMPARISON form, not a display form
+  // (`governance/numeric-grounding.ts`'s own docblock) — a trailing minus is
+  // already rewritten to a leading one, a trailing decimal zero is already
+  // stripped, and thousands separators are already gone, but nothing here
+  // can UNDO those (`500-` still prints `-500`; `11,988.00` still prints
+  // `11,988`), and re-grouping digits with commas ACTIVELY misrepresents a
+  // token that was never a formatted number at all — a phone number's
+  // leading zero is preserved by this same normalisation, so `0521234567`
+  // would have rendered as `0,521,234,567`, asserting a magnitude grouping
+  // the draft never contained. The one sentence below is the same posture
+  // this codebase already takes for a document's hash prefix beside its
+  // filename (`documentBlock`): show the real token, and say plainly what
+  // kind of token it is, rather than prettify it into something it is not.
   const ungroundedBlock =
     verdict.ungroundedNumbers.length === 0
       ? ''
-      : `<p>מספרים בטיוטה שלא אותרו במסמך המקורי: ${verdict.ungroundedNumbers
-          .map((n) => `<code>${escLabel(formatUngroundedNumber(n))}</code>`)
+      : `<p>מספרים בטיוטה שלא אותרו במסמך המקורי (בצורתם המנורמלת להשוואה — ` +
+        `לאו דווקא כפי שנכתבו בטיוטה עצמה): ${verdict.ungroundedNumbers
+          .map((n) => `<code>${escLabel(n)}</code>`)
           .join(', ')}</p>`;
 
   const truncationBlock =
@@ -696,6 +693,14 @@ export function renderApprovalCard(options: {
    * all.
    */
   verdict?: Verdict;
+  /**
+   * The route found a `verification_verdicts` row for this job but it failed
+   * to parse (fix round 1, Important 4) — `verdict` is `undefined` in this
+   * case, not a malformed value passed through. Rendered as a distinct,
+   * honest note: the owner is told a verdict exists but could not be shown,
+   * not left to believe none was ever produced.
+   */
+  verdictUnreadable?: boolean;
   editValue?: string;
   noteValue?: string;
   error?: string;
@@ -736,6 +741,7 @@ export function renderApprovalCard(options: {
 </div>
 ${options.document ? documentBlock(options.document) : ''}
 ${options.verdict ? verdictBlock(options.verdict) : ''}
+${options.verdictUnreadable ? '<p class="muted">קיימת פסיקת אימות (gov.verify) לבקשה זו, אך לא ניתן היה לקרוא אותה.</p>' : ''}
 ${signErrorBlock}
 <div class="row">
   <form method="post" action="/a/${esc(approval.approvalId)}/approve" class="edit-form">

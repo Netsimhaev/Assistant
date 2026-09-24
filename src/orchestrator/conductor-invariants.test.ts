@@ -32,40 +32,65 @@ function source(rel: string): string {
 }
 
 /**
- * The full text of one call, from `name(` to its matching closing paren.
+ * The full text of every call to `name(...)` in `src`, in source order.
  *
  * Anchoring an assertion to "somewhere in the file" lets one literal — the
  * `readDocument` call's `provenance: 'unknown_external'`, say — satisfy a
- * check meant for a different call entirely (`createJob`'s). A refactor that
- * parameterises `createJob`'s provenance while leaving `readDocument`'s
- * literal untouched passed the old, file-wide version of this test for
- * exactly that reason. Extracting the call's own text first means each call
- * is judged only by what it itself sets.
+ * check meant for a different call entirely (`createJob`'s). Extracting each
+ * call's own text first means each is judged only by what it itself sets.
  *
- * Assumes exactly one call to `name` in the source — true for every call this
- * file inspects — and simple paren balance (no unbalanced parens inside
- * string or template contents, which holds for these files' actual source).
+ * Simple paren balance (no unbalanced parens inside string or template
+ * contents, which holds for these files' actual source).
  */
-function callBlock(src: string, name: string): string {
+function allCallBlocks(src: string, name: string): string[] {
   const marker = `${name}(`;
-  const start = src.indexOf(marker);
-  if (start === -1) {
-    throw new Error(`no call to ${name}(...) found`);
-  }
-  let depth = 0;
-  let i = start + name.length;
-  for (; i < src.length; i += 1) {
-    const ch = src[i];
-    if (ch === '(') depth += 1;
-    else if (ch === ')') {
-      depth -= 1;
-      if (depth === 0) {
-        i += 1;
-        break;
+  const blocks: string[] = [];
+  let searchFrom = 0;
+  for (;;) {
+    const start = src.indexOf(marker, searchFrom);
+    if (start === -1) break;
+    let depth = 0;
+    let i = start + name.length;
+    for (; i < src.length; i += 1) {
+      const ch = src[i];
+      if (ch === '(') depth += 1;
+      else if (ch === ')') {
+        depth -= 1;
+        if (depth === 0) {
+          i += 1;
+          break;
+        }
       }
     }
+    blocks.push(src.slice(start, i));
+    searchFrom = i;
   }
-  return src.slice(start, i);
+  return blocks;
+}
+
+/**
+ * The full text of one call to `name(...)`, by its 0-indexed occurrence in
+ * source order.
+ *
+ * **Fix round 1, Important 7.** This used to assume exactly one call to
+ * `name` in the source and always return the first — true when this file was
+ * written, but `conduct.ts` gained a SECOND `createJob(...)` call (Task 11's
+ * `beginVerification`, textually before the document job's own call) without
+ * this file's stated assumption being rechecked. The old implementation kept
+ * silently returning `beginVerification`'s call — the WRONG one — for a test
+ * whose name says it pins the document job's provenance. An occurrence index
+ * makes the choice explicit at every call site instead of an unstated
+ * assumption a future second call can quietly invalidate again.
+ */
+function callBlock(src: string, name: string, occurrence = 0): string {
+  const blocks = allCallBlocks(src, name);
+  const block = blocks[occurrence];
+  if (block === undefined) {
+    throw new Error(
+      `no call to ${name}(...) found at occurrence ${occurrence} (found ${blocks.length} total)`,
+    );
+  }
+  return block;
 }
 
 /**
@@ -95,8 +120,16 @@ function expectOnlyLiteralProvenance(block: string, label: string): void {
 describe('the conductor cannot grant authority', () => {
   it('stamps the job it opens as external, and offers no way to ask otherwise', () => {
     const conduct = source('orchestrator/conduct.ts');
-    const createJobCall = callBlock(conduct, 'createJob');
-    expectOnlyLiteralProvenance(createJobCall, 'conduct.ts createJob(...)');
+    // Occurrence 1, not the default 0: `conduct.ts` now makes TWO `createJob`
+    // calls — `beginVerification`'s (Task 11), textually first in the file,
+    // and the document's own job, textually second — and this test is about
+    // the DOCUMENT job specifically (see `callBlock`'s own docblock, fix
+    // round 1's Important 7). The verify job's own literal is pinned
+    // separately and just as strictly by `conduct.test.ts`'s own
+    // `the verification job carries unknown_external as a literal`, which
+    // checks BOTH calls independently rather than trusting an index here.
+    const createJobCall = callBlock(conduct, 'createJob', 1);
+    expectOnlyLiteralProvenance(createJobCall, 'conduct.ts createJob(...) (document job)');
   });
 
   it('reads the document under the same fixed provenance it stamped the job with', () => {

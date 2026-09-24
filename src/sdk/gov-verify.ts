@@ -594,11 +594,27 @@ export const judgeWithModel: Judge = async (request) => {
 
 export interface VerifyDraftInput {
   /**
-   * `gov.verify`'s own job — the one `requestHelp` parks in `followup` while
-   * it waits on `know.reader`. Must already be in `execute`, the same
-   * precondition `requestHelp` itself enforces.
+   * The job DOING THE DELEGATING — `gov.verify`'s own job, the one
+   * `requestHelp` parks in `followup` while it waits on `know.reader`. Must
+   * already be in `execute`, the same precondition `requestHelp` itself
+   * enforces. This is deliberately NOT the job the verdict is filed under —
+   * see `subjectJobId`.
    */
   parentJobId: string;
+  /**
+   * The job WHOSE DRAFT IS BEING VERIFIED — the row `saveVerdict` files the
+   * outcome under, and therefore the id a card looks the verdict up by
+   * (`loadVerdict(approval.jobId)`). Kept separate from `parentJobId` on
+   * purpose: `requestHelp` requires the delegating job to be in `execute`,
+   * but the job whose draft is under review is typically sitting in
+   * `await_approval` by the time verification runs (Task 11's conductor
+   * raises the card, THEN opens verification) — it can never legally be the
+   * same row as `parentJobId`. A caller that conflated the two (an earlier
+   * version of this task did, passing one job id for both) would write a
+   * verdict under a job id no approval ever looks up, so it could never
+   * reach a card no matter how the rest of the pipeline behaved.
+   */
+  subjectJobId: string;
   /** The document the draft is meant to answer. */
   documentId: string;
   /** The draft being verified. */
@@ -752,6 +768,8 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
     draftTruncated: wasDraftTruncated(input.draftText),
     fenceForgeryDetected: wasFenceForgeryAttempted(input.question, input.answer, input.draftText),
   };
-  await saveVerdict(input.parentJobId, verdict, { businessId });
+  // `subjectJobId`, never `parentJobId` — see `VerifyDraftInput.subjectJobId`'s
+  // own docblock for why the two must never be the same field.
+  await saveVerdict(input.subjectJobId, verdict, { businessId });
   return verdict;
 }

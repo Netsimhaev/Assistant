@@ -70,9 +70,10 @@
  * text to be found by, and the discovery query is what reaches that case.
  * See `AGENT_ENVELOPES_ERASED_PREDICATE`'s own docblock for the full trace.
  * `verification_verdicts` got a writer in Task 10 (`gov-verify.ts`'s
- * `verifyDraft`) and, once Task 11 made that writer reachable from
- * production and showed exactly how its job is opened (no plan ever bound),
- * a discovery query of its own beside `boss_instructions`'s — see
+ * `verifyDraft`) and, once Task 11 made its CALLER reachable from
+ * production — not the writing branch itself; see the correction below —
+ * and showed exactly how its job is opened (no plan ever bound), a
+ * discovery query of its own beside `boss_instructions`'s — see
  * `VERIFICATION_VERDICTS_ERASED_PREDICATE`'s own docblock for why the answer
  * came out "yes, needed" rather than "no, already covered".
  */
@@ -376,10 +377,18 @@ export const AGENT_ENVELOPES_ERASED_PREDICATE = `business_id = $1
  * `agent_envelopes` briefly had one, because this table carries no separate
  * parent/child distinction at all.
  *
- * **The writer now exists (`gov-verify.ts`'s `verifyDraft`, via
- * `saveVerdict`, Task 10), its caller now exists too (`conduct.ts`'s
- * `beginVerification`, Task 11), and the discovery-query question this
- * docblock deferred is now answered: YES, and the query is added below,
+ * **The writer exists (`gov-verify.ts`'s `verifyDraft`, via `saveVerdict`,
+ * Task 10) and its CALLER now exists too (`conduct.ts`'s `beginVerification`,
+ * Task 11) — but say precisely what that does and does not reach.** The
+ * caller is reachable from production; the WRITING BRANCH inside `verifyDraft`
+ * is still not, because `beginVerification` hard-codes `answer: null` on
+ * every call it makes (see its own docblock) — `saveVerdict` is only ever
+ * reached once a caller resolves `input.answer`, which nothing in production
+ * does yet. So no `verification_verdicts` row is actually written by this
+ * branch today; the query below is added on the strength of how
+ * `beginVerification` is built, not evidence of a row it has produced. The
+ * discovery-query question this docblock deferred is nonetheless answered:
+ * YES, needed, once a row does get written — and the query is added below,
  * beside `boss_instructions`'s and `agent_envelopes.payload`'s.**
  * `Verdict.criteria[].detail` is free text the JUDGE MODEL writes, instructed
  * to quote from the draft or the answer when it helps — exactly the kind of

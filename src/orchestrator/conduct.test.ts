@@ -452,6 +452,9 @@ describe('conductPendingDocuments', () => {
     const approvals = await getPool().query(`SELECT 1 FROM approval_requests`);
     expect(approvals.rows).toHaveLength(1);
     expect(verifierCalls).toBe(1);
+    // Fix round 1, Important 3: a stumbling verification is counted, not
+    // silently indistinguishable from "never attempted".
+    expect(result.verificationFailed).toBe(1);
 
     const jobs = await getPool().query<{ title: string | null; phase: string }>(
       `SELECT title, phase FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
@@ -461,8 +464,90 @@ describe('conductPendingDocuments', () => {
     // verification job's own failure.
     expect(jobs.rows).toHaveLength(2);
     expect(jobs.rows[0]?.phase).toBe('await_approval');
-    // The second job is the one `beginVerification` opened.
+    // The second job is the one `beginVerification` opened, and a throw
+    // inside `beginVerification` must not leave it in a phase with no
+    // reader (`intake`/`understand`/`plan`) — it is closed out, terminal.
     expect(jobs.rows[1]?.title).toContain('אימות');
+    expect(jobs.rows[1]?.phase).toBe('failed');
+  });
+
+  /**
+   * Fix round 1, Critical 1. The real `verifyDraft` — no injected `verifier`
+   * — actually calls `requestHelp`, which refuses immediately unless the job
+   * named as `parentJobId` is in `execute`. `beginVerification` opens a FRESH
+   * job for exactly that and passes the document's own job (sitting in
+   * `await_approval`) as `subjectJobId` instead. A version that conflated the
+   * two — passed the document's own job as `parentJobId` — makes this
+   * `requestHelp` call refuse with `job_not_executable`, `verifyDraft` throw,
+   * and `beginVerification` count it as a failure. This test exercises that
+   * real wiring end to end without any stub standing in for it, and without
+   * any model call (the branch this module always takes never reaches the
+   * judge).
+   */
+  it('opens the delegation through the real verifyDraft, with the two job ids kept apart', async () => {
+    await aDocument('חוזה שיווק לאימות אמיתי');
+    const d = deps();
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+      // No `verifier` override — the real `verifyDraft` runs.
+    });
+
+    expect(result.carded).toBe(1);
+    expect(
+      result.verificationFailed,
+      'the real verifyDraft must not refuse — parentJobId and subjectJobId must be two different jobs',
+    ).toBe(0);
+  });
+
+  /**
+   * Fix round 1, Critical 2. A round-0 version of `beginVerification`'s
+   * docblock claimed a delegated verification job would "sit in `execute`
+   * un-rerun" — false: `resumeDelegatedJobs` wakes a parked parent once its
+   * child finishes, and `run-due.ts` fails a job it finds in `execute` with
+   * no plan bound (`run_due: no_plan_bound`), printing an operator-visible
+   * error line for every single card the conductor ever raises. This test
+   * pins the actual fix: the delegating job is ended, by this module,
+   * the moment the delegation opens — never left parked for that later
+   * failure to happen.
+   */
+  it('ends the verification job itself rather than leaving it parked for run_due to fail later', async () => {
+    await aDocument('חוזה שיווק לאימות תקין');
+    const d = deps();
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+      // A well-behaved stand-in for the real `verifyDraft` on the branch
+      // this module always takes (`answer: null`): it opens a delegation and
+      // returns normally, exactly the shape `beginVerification` must end
+      // itself rather than leave parked.
+      verifier: async () => ({
+        status: 'awaiting_delegation' as const,
+        envelopeId: 'env-noop',
+        childJobId: null,
+        ungroundedNumbers: [],
+      }),
+    });
+
+    expect(result.carded).toBe(1);
+    // Not a failure — this is the deliberate, immediate close, not a caught
+    // exception.
+    expect(result.verificationFailed).toBe(0);
+
+    const jobs = await getPool().query<{ title: string | null; phase: string }>(
+      `SELECT title, phase FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
+      [BUSINESS],
+    );
+    expect(jobs.rows).toHaveLength(2);
+    expect(jobs.rows[0]?.phase).toBe('await_approval');
+    expect(jobs.rows[1]?.title).toContain('אימות');
+    // Terminal, not `execute` — never left for `resumeDelegatedJobs` /
+    // `run-due.ts` to find and fail later.
+    expect(jobs.rows[1]?.phase).toBe('failed');
   });
 
   /**
