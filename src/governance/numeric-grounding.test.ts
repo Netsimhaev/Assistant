@@ -90,4 +90,21 @@ describe('ungroundedNumbers', () => {
   it('still drops a multi-digit range as noise on both sides', () => {
     expect(ungroundedNumbers('טווח 1500-2000', ['אין כאן שום סכום'])).toEqual([]);
   });
+
+  /**
+   * A trailing dash is only a sign when nothing is glued to its far side —
+   * "100-A" is a model or lot code, not a negative 100, and a letter right
+   * after the dash proves it the same way a digit does for "1500-2000".
+   * Before this rule, only a digit after the dash was checked, so "100-A"
+   * read as "-100" and a source carrying it would silently ground an
+   * unrelated genuine "-100" credit in the draft — a false grounding this
+   * test guards against directly.
+   */
+  it('drops a number before a letter-suffixed dash as an identifier, not a sign', () => {
+    expect(ungroundedNumbers('דגם 100-A', ['אין כאן שום סכום'])).toEqual([]);
+  });
+
+  it('does not let a model code ground an unrelated negative amount', () => {
+    expect(ungroundedNumbers('זיכוי בסך -100 ש"ח', ['דגם 100-A'])).toEqual(['-100']);
+  });
 });

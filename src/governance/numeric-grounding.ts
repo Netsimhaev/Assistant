@@ -74,19 +74,26 @@ function normaliseNumber(raw: string): string {
  * minus sign carried through when it is one.
  *
  * The sign/separator split on `-` is the one place this function has to
- * read two different things off the same character, symmetrically on
- * either side of the digit run: `-500` and `500-` are both negative
- * amounts (the money this whole check exists for — a draft that turns a
- * credit into a debit must not silently ground; `500-` is the standard
- * Israeli and spreadsheet way of writing a negative balance), while
- * `10-20` and `050-1234567` are a range and a phone number, where the `-`
- * belongs to neither digit run on either side of it. The distinguishing
- * question, on each side independently, is "is there a DIGIT on the far
- * side of the `-`": before the run, is the character two positions back a
- * digit; after the run, is the character one position past the `-` a
- * digit. If yes, the `-` sits BETWEEN two digit runs and both are noise;
- * if no (start/end of string, whitespace, punctuation, a letter), the `-`
- * is a sign attached to this run alone.
+ * read two different things off the same character: `-500` and `500-` are
+ * both negative amounts (the money this whole check exists for — a draft
+ * that turns a credit into a debit must not silently ground; `500-` is the
+ * standard Israeli and spreadsheet way of writing a negative balance),
+ * while `10-20` and `050-1234567` are a range and a phone number, where
+ * the `-` belongs to neither digit run on either side of it — and
+ * `100-A`, a model or lot code, is a third shape where the `-` belongs to
+ * an identifier and the number must be dropped, not signed.
+ *
+ * The two sides are checked differently, and that is a real asymmetry, not
+ * an oversight: a trailing sign can only be followed by whitespace,
+ * punctuation, or the end of the string — nothing glues a letter or a
+ * digit to the far side of a genuine trailing minus — so the trailing
+ * check treats BOTH a digit and a letter past the dash as proof the `-`
+ * belongs to something else and drops the run. The leading check only
+ * tests for a digit before the dash; a leading `-` preceded by a letter
+ * still misreads as a sign (`ORDER-12345` — the known limit documented
+ * above). That narrower case is intentionally left as-is here: fixing it
+ * is a separate, symmetric change to the leading side that this round's
+ * fix — closing the trailing-side regression only — does not make.
  */
 function numbersIn(text: string): string[] {
   const tokens: string[] = [];
@@ -109,8 +116,13 @@ function numbersIn(text: string): string[] {
     }
     if (nextChar === '-') {
       const charAfterDash = end + 1 < text.length ? text[end + 1] : undefined;
-      const dashSeparatesTwoRuns = charAfterDash !== undefined && /\d/.test(charAfterDash);
-      if (dashSeparatesTwoRuns) continue; // e.g. "1500-2000", "050-1234567" — noise on both sides
+      // A digit past the dash means a range or a phone number ("1500-2000",
+      // "050-1234567"); a LETTER past the dash means an identifier suffix
+      // ("100-A", a model or lot code) — a genuine trailing sign is never
+      // followed by either, only by whitespace, punctuation, or the end of
+      // the string.
+      const dashHasTokenAfter = charAfterDash !== undefined && /[\p{L}\p{N}]/u.test(charAfterDash);
+      if (dashHasTokenAfter) continue;
       sign = '-'; // trailing sign, e.g. "500-" — the standard Israeli/spreadsheet negative
     }
 
