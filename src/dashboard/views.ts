@@ -634,21 +634,25 @@ function criterionItem(criterion: Verdict['criteria'][number]): string {
 function verdictBlock(verdict: Verdict): string {
   const criteriaItems = verdict.criteria.map(criterionItem).join('');
 
-  // Fix round 1, Important 6: printed VERBATIM, not reformatted. A prior
-  // version added thousands separators, but `ungroundedNumbers` entries are
-  // a COMPARISON form, not a display form
-  // (`governance/numeric-grounding.ts`'s own docblock) — a trailing minus is
-  // already rewritten to a leading one, a trailing decimal zero is already
-  // stripped, and thousands separators are already gone, but nothing here
-  // can UNDO those (`500-` still prints `-500`; `11,988.00` still prints
-  // `11,988`), and re-grouping digits with commas ACTIVELY misrepresents a
-  // token that was never a formatted number at all — a phone number's
-  // leading zero is preserved by this same normalisation, so `0521234567`
-  // would have rendered as `0,521,234,567`, asserting a magnitude grouping
-  // the draft never contained. The one sentence below is the same posture
-  // this codebase already takes for a document's hash prefix beside its
-  // filename (`documentBlock`): show the real token, and say plainly what
-  // kind of token it is, rather than prettify it into something it is not.
+  // Fix round 1, Important 6: printed VERBATIM — the stored token, exactly —
+  // not reformatted. `ungroundedNumbers` entries are a COMPARISON form, not a
+  // display form (`governance/numeric-grounding.ts`'s own docblock): a
+  // trailing minus is already rewritten to a leading one, a trailing decimal
+  // zero is already stripped, and thousands separators are already gone. So
+  // even VERBATIM is not identical to what the draft actually wrote — a
+  // draft that wrote `500-` normalises to, and this prints, `-500`; a draft
+  // that wrote `11,988.00` normalises to, and this prints, `11988` — which is
+  // exactly why the sentence below states plainly that this is a normalised
+  // comparison form, not a claim that it matches the draft's own spelling.
+  // Reformatting on top of that (a prior version added thousands separators
+  // back) does not recover the original either, and can ACTIVELY
+  // misrepresent a token that was never a formatted number at all: a phone
+  // number's leading zero survives this same normalisation unchanged, so
+  // `0521234567` would have rendered `0,521,234,567` — a magnitude grouping
+  // the draft never contained. The posture here is the one this codebase
+  // already takes for a document's hash prefix beside its filename
+  // (`documentBlock`): show the real token, and say plainly what kind of
+  // token it is, rather than prettify it into something it is not.
   const ungroundedBlock =
     verdict.ungroundedNumbers.length === 0
       ? ''

@@ -14,6 +14,7 @@
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { getPool } from '../db/pool.js';
+import { renderArtifactFull } from '../documents/brief.js';
 import { readDocument, type ReadDocumentOptions } from '../documents/read.js';
 import {
   documentsAwaitingRead,
@@ -136,8 +137,34 @@ function draftTextFor(action: ProposedAction): string {
  * all or with a reader that fails it loudly — CLAUDE.md's "a phase with no
  * reader is not a resting place, it's a leak". `{ opened: false }` is this
  * function's own count of that failure, surfaced by the caller as
- * `ConductResult.verificationFailed` — visible, unlike a bare swallow, and
- * distinguishable from "verification simply was never attempted".
+ * `ConductResult.verificationFailed` and distinguishable from "verification
+ * simply was never attempted". **Fix round 2's item 2:** a count nobody
+ * prints is not yet visible — this file's own rule, stated plainly here
+ * because a round-1 version of this sentence claimed the count already was.
+ * `run-scheduler.ts`'s `logErrored` is what actually reads it, printing a
+ * line whenever `verificationFailed > 0`.
+ *
+ * **A known, unclosed race across TWO SCHEDULER PROCESSES — fix round 2's
+ * item 5, written down rather than solved.** Within one process the ordering
+ * is safe: `schedulerPass` runs the conductor to completion before it calls
+ * `runDueJobs` (`scheduler.ts`'s own docblock), so the delegating job this
+ * function creates is never still sitting in `execute` when that same
+ * process's `runDueJobs` looks. Across two separate scheduler PROCESSES this
+ * does not hold: `conductPendingDocuments`'s advisory lock (`conductor:
+ * ${businessId}`) and `runDueJobs`'s (`run-due:${businessId}:${jobId}`) are
+ * different scopes, so a second process's `runDueJobs` can take the
+ * delegating job the instant it is in `execute` — the window between this
+ * function's own `transition(..., 'execute')` above and its `transition(...,
+ * 'failed')` below — fail it with `run_due: no_plan_bound`, and print the
+ * very operator line this function exists to prevent. This function's own
+ * `transition(..., 'failed')` then runs against a job already `failed`
+ * (`LEGAL_TRANSITIONS['failed']` is empty — no transition out, including to
+ * itself), throws, is caught by this function's own outer `catch`, and
+ * reports `{ opened: false }` for a delegation that, in fact, did open. Not
+ * reachable with a single `npm run scheduler` process, which is every
+ * deployment this codebase runs today (`docs/dashboard-deployment.md`); it
+ * becomes reachable the day a second scheduler process is ever started
+ * against the same business.
  */
 async function beginVerification(
   action: ProposedAction,
@@ -181,18 +208,27 @@ async function beginVerification(
       businessId: ctx.businessId,
     });
 
-    // The document's own deterministic extraction, in full — never the
-    // truncated prompt brief (`renderReadingBrief`), which DROPS WHOLE
-    // SECTIONS past its character cap (fix round 1's Important 5). A number
-    // surviving only in a section the brief cut away would read as
-    // ungrounded on the owner's card with nothing recording that the
-    // comparison was incomplete — the exact false-positive shape
-    // `numeric-grounding.ts`'s own docblock warns teaches an owner to click
-    // past the control. `JSON.stringify` per artifact keeps every digit the
-    // extraction actually holds, at the cost of readability nothing here
-    // needs — `ungroundedNumbers` only scans for digit runs.
+    // The document's own deterministic extraction, laid out as PLAIN TEXT —
+    // never the truncated prompt brief (`renderReadingBrief`), which DROPS
+    // WHOLE SECTIONS past its character cap (fix round 1's Important 5), and
+    // never `JSON.stringify(artifact.content)` either (fix round 2's item 1:
+    // that was tried and was WORSE than the brief). `numbersIn`
+    // (`numeric-grounding.ts`) skips any digit run immediately preceded by
+    // `:` — a date/time/range guard — and `JSON.stringify` emits no space
+    // after a key's colon, so a numeric cell (`{"v":11988,"t":"number"}`) has
+    // its own value skipped by that exact guard. On a spreadsheet or table
+    // artefact this zeroes the ENTIRE grounded set, and because `sources` is
+    // non-empty the "an empty source list grounds everything" safety never
+    // fires — every number in the draft then reads as ungrounded, the exact
+    // false-positive shape `numeric-grounding.ts`'s own docblock warns
+    // teaches an owner to click past the control. `renderArtifactFull`
+    // (`documents/brief.ts`) is the fix: the same cell/block layout
+    // `renderReadingBrief` renders, with neither of its two caps applied. See
+    // that function's own docblock for what it still does NOT capture
+    // (extraction-time caps recorded in `artifact.flags`, which it does not
+    // read).
     const artifacts = await loadArtifacts(ctx.documentId, { businessId: ctx.businessId });
-    const sources = artifacts.map((artifact) => JSON.stringify(artifact.content));
+    const sources = artifacts.map((artifact) => renderArtifactFull(artifact));
 
     const result = await ctx.verifier({
       parentJobId: delegatingJob.jobId,
@@ -206,20 +242,34 @@ async function beginVerification(
       businessId: ctx.businessId,
     });
 
-    // See this function's own docblock (Critical 2): ending the delegating
-    // job here, ourselves, is the fix for the operator-visible
-    // `no_plan_bound` failure that leaving it parked would eventually cause.
-    if ('status' in result && result.status === 'awaiting_delegation') {
-      await transition(delegatingJob.jobId, {
-        to: 'failed',
-        actor: 'orchestrator',
-        reason:
-          'gov.verify: delegated to know.reader, but nothing yet resumes this job to complete ' +
+    // See this function's own docblock (Critical 2, and fix round 2's item
+    // 3): ending the delegating job here, ourselves, is the fix for the
+    // operator-visible `no_plan_bound` failure that leaving it running would
+    // eventually cause — and BOTH arms of `result` leave it running if this
+    // function does nothing. `awaiting_delegation` leaves it parked in
+    // `followup` by `requestHelp`'s own transition; a `Verdict` return is the
+    // OTHER arm, and `verifyDraft`'s Verdict-producing branch moves nothing's
+    // phase at all, so the job sits exactly where this function last put it —
+    // `execute`, with no plan bound. Not reachable today only because this
+    // function hard-codes `answer: null` on every call it makes, so `result`
+    // is always `awaiting_delegation` in production; reachable through
+    // `options.verifier` in a test today, and in production the moment a
+    // second half resolves `answer` and calls `verifyDraft` again on this
+    // same job. Terminated unconditionally, with a reason that names which
+    // arm it was.
+    const isAwaitingDelegation = 'status' in result && result.status === 'awaiting_delegation';
+    await transition(delegatingJob.jobId, {
+      to: 'failed',
+      actor: 'orchestrator',
+      reason: isAwaitingDelegation
+        ? 'gov.verify: delegated to know.reader, but nothing yet resumes this job to complete ' +
           'the check (known gap, Task 11) — ended here rather than parked for run_due to fail ' +
-          'later as no_plan_bound',
-        businessId: ctx.businessId,
-      });
-    }
+          'later as no_plan_bound'
+        : 'gov.verify: produced a verdict directly, but this job still carries no bound plan and ' +
+          'nothing else moves its phase — ended here rather than left in execute for run_due to ' +
+          'fail later as no_plan_bound',
+      businessId: ctx.businessId,
+    });
 
     return { opened: true };
   } catch (err) {
@@ -253,9 +303,10 @@ export interface ConductResult {
    * `beginVerification` returned `{ opened: false }` — a refusal, a charter
    * load failure, or a database blip stopped verification from ever getting
    * under way. This never touches `failed`: the card it sat beside already
-   * exists and stays exactly as raised (fix round 1's Important 3) — this
-   * count exists only so the failure is visible instead of indistinguishable
-   * from "no verification was ever attempted".
+   * exists and stays exactly as raised (fix round 1's Important 3). Printed
+   * by `run-scheduler.ts`'s `logErrored` whenever nonzero (fix round 2's
+   * item 2) — a count this struct carries but nothing ever printed is not
+   * yet distinguishable from "no verification was ever attempted".
    */
   verificationFailed: number;
 }

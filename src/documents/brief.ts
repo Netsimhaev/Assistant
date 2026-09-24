@@ -99,6 +99,64 @@ function renderContent(artifact: DocumentArtifact): string {
   return Array.isArray(blocks) ? renderText(content as TextContent) : '(טקסט לא קריא)';
 }
 
+function renderTableFull(content: TableContent): string {
+  const rows = content.rows;
+  const header = rows[0];
+  if (header === undefined) return '(טבלה ריקה)';
+  const lines = [header.map(cellText).join(' | '), '---'];
+  for (const row of rows.slice(1)) lines.push(row.map(cellText).join(' | '));
+  return lines.join('\n');
+}
+
+function renderTextFull(content: TextContent): string {
+  return content.blocks.map(renderBlock).join('\n\n');
+}
+
+/**
+ * One artefact's content as plain text, laid out exactly the way
+ * `renderContent`/`renderReadingBrief` does — cells pipe-separated, blocks
+ * joined by a blank line, an outline as a bulleted list — but with NEITHER of
+ * `renderReadingBrief`'s two caps (`BRIEF_TABLE_ROWS` rows per table,
+ * `BRIEF_TEXT_CHARS` characters per text block) applied. `renderOutline` is
+ * already uncapped, so it is reused as-is.
+ *
+ * Exists for `gov-verify.ts`'s `sources` (`governance/numeric-grounding.ts`'s
+ * `ungroundedNumbers`, via `conduct.ts`'s `beginVerification`): that check
+ * needs the DETERMINISTIC EXTRACTION IN FULL, in the same layout the brief
+ * uses, never `JSON.stringify(artifact.content)` — `numbersIn` skips any
+ * digit run immediately preceded by `:` (a date/time/range guard), and
+ * `JSON.stringify` emits no space after a key's colon, so a numeric cell like
+ * `{"v":11988,"t":"number"}` has its own value skipped by that exact guard.
+ * Measured: on a one-cell `.xlsx`-shaped table, the JSON form grounds
+ * nothing (`[]`) while this pipe-separated form grounds the number
+ * correctly. Handing the judge JSON zeroed the entire grounded set for every
+ * spreadsheet or table artefact — every number in the draft then read as
+ * ungrounded, exactly the false-positive shape this module's own docblock
+ * says teaches an owner to click past the control.
+ *
+ * **What this does NOT capture.** The extractors themselves cap BEFORE
+ * storage — sheet count, rows per sheet/table, characters per cell — and
+ * record that a cap applied on `artifact.flags` (`truncated`, and friends).
+ * This function reads only `content`, never `flags`, so a number that fell
+ * outside an EXTRACTION-time cap is invisible here the same way it is
+ * invisible to `renderReadingBrief` and to every other reader of
+ * `document_artifacts` that does not check `flags` itself — a known limit of
+ * the extraction pipeline, not something this function introduces or fixes.
+ */
+export function renderArtifactFull(artifact: DocumentArtifact): string {
+  const content = artifact.content;
+  if (artifact.kind === 'outline') {
+    const parts = (content as OutlineContent | null)?.parts;
+    return Array.isArray(parts) ? renderOutline(content as OutlineContent) : '(מתאר לא קריא)';
+  }
+  if (artifact.kind === 'table') {
+    const rows = (content as TableContent | null)?.rows;
+    return Array.isArray(rows) ? renderTableFull(content as TableContent) : '(טבלה לא קריאה)';
+  }
+  const blocks = (content as TextContent | null)?.blocks;
+  return Array.isArray(blocks) ? renderTextFull(content as TextContent) : '(טקסט לא קריא)';
+}
+
 /** Between two part sections. Counted against the total ceiling like any text. */
 const SECTION_GAP = '\n\n';
 

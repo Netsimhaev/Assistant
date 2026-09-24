@@ -551,6 +551,52 @@ describe('conductPendingDocuments', () => {
   });
 
   /**
+   * Fix round 2, item 3. A `Verdict` return is `VerifyDraftResult`'s OTHER
+   * arm — no `status` key at all — and a round-1 version of
+   * `beginVerification` only terminated the delegating job on the
+   * `awaiting_delegation` arm, falling through to `{ opened: true }` on this
+   * one and leaving the job sitting in `execute` with no plan bound: the
+   * exact state Critical 2 exists to remove, one branch over.
+   * `verifyDraft`'s own Verdict-producing branch never moves the parent's
+   * phase (only its `requestHelp` call, on the OTHER arm, does that), so
+   * nothing else would have caught this. Not reachable through the real
+   * `verifyDraft` today — `beginVerification` hard-codes `answer: null`, so
+   * the judge is never reached — but reachable through `options.verifier`
+   * right now, and in production the moment a second half resolves `answer`
+   * and calls `verifyDraft` again on this job.
+   */
+  it('ends the verification job even when the verifier returns a Verdict directly', async () => {
+    await aDocument('חוזה שיווק — אימות שהושלם');
+    const d = deps();
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+      // No `status` key — the OTHER arm of `VerifyDraftResult`.
+      verifier: async () => ({
+        criteria: [{ id: 'x', statement: 'y', severity: 'must' as const, passed: true, detail: 'z' }],
+        ungroundedNumbers: [],
+        answerTruncated: false,
+        draftTruncated: false,
+      }),
+    });
+
+    expect(result.carded).toBe(1);
+    expect(result.verificationFailed).toBe(0);
+
+    const jobs = await getPool().query<{ title: string | null; phase: string }>(
+      `SELECT title, phase FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
+      [BUSINESS],
+    );
+    expect(jobs.rows).toHaveLength(2);
+    expect(jobs.rows[1]?.title).toContain('אימות');
+    // Terminal, not `execute` — the Verdict arm must be closed out exactly
+    // like the delegation arm.
+    expect(jobs.rows[1]?.phase).toBe('failed');
+  });
+
+  /**
    * Structural, in the style of `conductor-invariants.test.ts` — anchored per
    * call, never per file (that file's own docblock explains why a file-wide
    * scan lets one call's literal answer for another). `conduct.ts` now makes

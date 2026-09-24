@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { BRIEF_TABLE_ROWS, BRIEF_TEXT_CHARS, BRIEF_TOTAL_CHARS, renderReadingBrief } from './brief.js';
+import { ungroundedNumbers } from '../governance/numeric-grounding.js';
+import {
+  BRIEF_TABLE_ROWS,
+  BRIEF_TEXT_CHARS,
+  BRIEF_TOTAL_CHARS,
+  renderArtifactFull,
+  renderReadingBrief,
+} from './brief.js';
 import type { Cell, DocumentArtifact } from './types.js';
 
 function s(v: string): Cell { return { v, t: 'string' }; }
@@ -211,5 +218,45 @@ describe('renderReadingBrief', () => {
   it('produces a brief for an empty artefact list rather than an empty string', () => {
     // An empty document is a fact to state, not a prompt with nothing in it.
     expect(renderReadingBrief([]).brief.trim()).not.toBe('');
+  });
+});
+
+/**
+ * `conduct.ts`'s `beginVerification` (Task 11, fix round 2's item 1). The
+ * regression: `JSON.stringify(artifact.content)` puts no space after a key's
+ * colon, so a numeric cell (`{"v":11988,"t":"number"}`) sits immediately
+ * after a `:` — exactly the shape `numeric-grounding.ts`'s `numbersIn` skips
+ * on purpose (its date/time/range guard). On a spreadsheet or table artefact
+ * this zeroed the ENTIRE grounded set, and because the source list was
+ * non-empty, `ungroundedNumbers`'s own "an empty list grounds everything"
+ * safety never fired — every number in the draft read as ungrounded. This is
+ * the canonical `.xlsx`-quote shape (an amount in its own cell), so it is
+ * pinned here directly, against `ungroundedNumbers` itself, not merely
+ * against `renderArtifactFull`'s own output shape.
+ */
+describe('renderArtifactFull — the numeric-grounding regression', () => {
+  const XLSX_LIKE: DocumentArtifact = {
+    ordinal: 1,
+    kind: 'table',
+    partName: 'הצעת מחיר',
+    content: { rows: [[s('פריט'), s('סכום')], [s('סה"כ'), n(11988)]] },
+    flags: [],
+  };
+
+  it('grounds a number that sits in its own table cell', () => {
+    const draft = 'הסכום לתשלום הוא 11,988 ש"ח.';
+    expect(ungroundedNumbers(draft, [renderArtifactFull(XLSX_LIKE)])).toEqual([]);
+  });
+
+  it('is the fix for a real regression: JSON.stringify of the same content does NOT ground it', () => {
+    const draft = 'הסכום לתשלום הוא 11,988 ש"ח.';
+    // Not an assertion about `renderArtifactFull` — a demonstration that the
+    // alternative this replaced was actually broken, on the exact content
+    // the test above proves the fix for.
+    expect(ungroundedNumbers(draft, [JSON.stringify(XLSX_LIKE.content)])).toEqual(['11988']);
+  });
+
+  it('renders a table the same way renderReadingBrief does, just without its row cap', () => {
+    expect(renderArtifactFull(XLSX_LIKE)).toBe('פריט | סכום\n---\nסה"כ | 11988');
   });
 });

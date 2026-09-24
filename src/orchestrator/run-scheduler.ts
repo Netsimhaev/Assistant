@@ -53,6 +53,17 @@ function logErrored(result: SchedulerPassResult): void {
   if (result.scanError !== null) {
     console.error(`document inbox scan failed: ${result.scanError}`);
   }
+  // `ConductResult.verificationFailed` (fix round 1's Important 3) is exactly
+  // this file's own rule applied to a bucket that, until now, had no printer
+  // at all: "visible, unlike a bare swallow" was true only to a test.
+  // `conduct` is `null` when no document inbox is configured, in which case
+  // there is nothing to have failed.
+  if (result.conduct !== null && result.conduct.verificationFailed > 0) {
+    console.error(
+      `${result.conduct.verificationFailed} card(s) this pass had gov.verify fail to open — ` +
+        `see the audit trail for the affected jobs`,
+    );
+  }
   // Delegation resumption's own buckets, same rule: a parent moved to
   // `failed` over corrupted bookkeeping (`resume-delegated.ts`'s
   // `failCorruptedParent`) or a parent freed only because its envelope's
