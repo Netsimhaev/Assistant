@@ -37,6 +37,8 @@ import {
   APPROVAL_REQUESTS_ERASED_PREDICATE,
   APPROVAL_REQUESTS_SCRUBBED_PREDICATE,
   APPROVAL_REQUESTS_SCRUB_SET,
+  JOBS_SCRUBBED_PREDICATE,
+  JOBS_SCRUB_SET,
   LIVE_PHASES,
   PROPOSALS_ERASED_PREDICATE,
   VERIFICATION_VERDICTS_ERASED_PREDICATE,
@@ -274,7 +276,11 @@ export async function executeErasure(
       `UPDATE approval_requests SET ${APPROVAL_REQUESTS_SCRUB_SET} WHERE ${APPROVAL_REQUESTS_SCRUBBED_PREDICATE}`,
       approvalRequestParams(businessId, jobIds, plan.anchor),
     );
-    await scrub('jobs', 'UPDATE jobs SET title = NULL WHERE business_id=$1 AND job_id = ANY($2) AND title IS NOT NULL', [businessId, jobIds]);
+    // `awaiting_envelope_id` is cleared alongside `title` — see
+    // `JOBS_SCRUBBED_PREDICATE`'s docblock in `erasure-plan.ts` for why a
+    // dangling pointer to a just-deleted `agent_envelopes` row silently kills
+    // a parked parent job on the next scheduler pass.
+    await scrub('jobs', `UPDATE jobs SET ${JOBS_SCRUB_SET} WHERE ${JOBS_SCRUBBED_PREDICATE}`, [businessId, jobIds]);
     await scrub('job_steps', `UPDATE job_steps SET reason = 'נמחק בהוראת הבעלים' WHERE job_id = ANY($1)`, [jobIds]);
     await scrub('job_step_results', 'UPDATE job_step_results SET external_id = NULL WHERE business_id=$1 AND job_id = ANY($2) AND external_id IS NOT NULL', [businessId, jobIds]);
 

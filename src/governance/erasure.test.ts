@@ -348,9 +348,18 @@ describe('executeErasure', () => {
    * deleting any of the other lines left the whole suite green. One row
    * seeded for every statement; removing any single line from
    * `executeErasure` must make this fail. Thirteen since the signed-approval
-   * scrub of spec §5.1.1 was implemented (final review, N3).
+   * scrub of spec §5.1.1 was implemented (final review, N3); fifteen since
+   * migration 028's `agent_envelopes`/`verification_verdicts` were wired in
+   * (Task 8, fix round 1, item 3) — the invariant scan proves the *rows*
+   * disappear, but nothing before this asserted `plan.items`/`outcome.deleted`
+   * for either table, so deleting either `await one(...)` block in
+   * `countItems` or either `del(...)` call here left the whole suite green.
+   * The `jobs` row here also carries `awaiting_envelope_id`, so this is the
+   * same seed that proves fix round 1's item 2: the envelope is destroyed and
+   * the dangling pointer on the job it named is cleared alongside `title`,
+   * not left pointing at a row that no longer exists.
    */
-  it('touches every one of the thirteen statements — deletes vanish, scrubs stay and empty', async () => {
+  it('touches every one of the fifteen statements — deletes vanish, scrubs stay and empty', async () => {
     const jobId = await bareJob('twelve-statements');
 
     const documentId = `DOC-${ulid()}`;
@@ -426,6 +435,30 @@ describe('executeErasure', () => {
        VALUES ($1, $2, 'email.reply', ARRAY['x@example.com'])`,
       [BUSINESS, jobId],
     );
+    const envelopeId = `ENV-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO agent_envelopes
+         (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+          kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+          idempotency_key, parent_job_id)
+       VALUES ($1, $2, $2, ARRAY['office.manager'], 'office.manager', 'ops.web',
+               'help_request', 'lookup_contact', '{}'::jsonb, '[]'::jsonb, 'hash-i2env',
+               '{}'::jsonb, 1, $3, $4)`,
+      [BUSINESS, envelopeId, `idem-${ulid()}`, jobId],
+    );
+    // Standing in for what a parked delegation looks like: a job with a live
+    // pointer to the very envelope row this erasure is about to delete. See
+    // `JOBS_SCRUBBED_PREDICATE`'s docblock for why leaving this uncleared
+    // kills a parked parent on the next scheduler pass.
+    await getPool().query('UPDATE jobs SET awaiting_envelope_id = $2 WHERE job_id = $1', [
+      jobId,
+      envelopeId,
+    ]);
+    await getPool().query(
+      `INSERT INTO verification_verdicts (business_id, job_id, verdict)
+       VALUES ($1, $2, '{}'::jsonb)`,
+      [BUSINESS, jobId],
+    );
     await transition(jobId, { to: 'understand', actor: 'orchestrator', reason: 'seed reason', businessId: BUSINESS });
     await getPool().query(
       `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id)
@@ -465,6 +498,8 @@ describe('executeErasure', () => {
     expect(byStatement.get('boss_instructions:delete')).toEqual({ table: 'boss_instructions', action: 'delete', count: 1 });
     expect(byStatement.get('job_plans:delete')).toEqual({ table: 'job_plans', action: 'delete', count: 1 });
     expect(byStatement.get('job_authorizations:delete')).toEqual({ table: 'job_authorizations', action: 'delete', count: 1 });
+    expect(byStatement.get('agent_envelopes:delete')).toEqual({ table: 'agent_envelopes', action: 'delete', count: 1 });
+    expect(byStatement.get('verification_verdicts:delete')).toEqual({ table: 'verification_verdicts', action: 'delete', count: 1 });
     expect(byStatement.get('documents:delete')).toEqual({ table: 'documents', action: 'delete', count: 1 });
     expect(byStatement.get('jobs:scrub')).toEqual({ table: 'jobs', action: 'scrub', count: 1 });
     expect(byStatement.get('job_steps:scrub')?.action).toBe('scrub');
@@ -479,6 +514,8 @@ describe('executeErasure', () => {
       ['proposals', 'proposal_id', proposalId],
       ['job_plans', 'job_id', jobId],
       ['job_authorizations', 'job_id', jobId],
+      ['agent_envelopes', 'envelope_id', envelopeId],
+      ['verification_verdicts', 'job_id', jobId],
       ['documents', 'document_id', documentId],
     ];
     for (const [table, column, value] of deletedChecks) {
@@ -497,9 +534,15 @@ describe('executeErasure', () => {
     expect(instructions.rows).toHaveLength(0);
 
     // Scrubbed rows survive, emptied.
-    const jobRow = await getPool().query<{ title: string | null }>('SELECT title FROM jobs WHERE job_id=$1', [jobId]);
+    const jobRow = await getPool().query<{ title: string | null; awaiting_envelope_id: string | null }>(
+      'SELECT title, awaiting_envelope_id FROM jobs WHERE job_id=$1',
+      [jobId],
+    );
     expect(jobRow.rows).toHaveLength(1);
     expect(jobRow.rows[0]?.title).toBeNull();
+    // The dangling pointer to the now-deleted envelope must not survive —
+    // see JOBS_SCRUBBED_PREDICATE's docblock (fix round 1, item 2).
+    expect(jobRow.rows[0]?.awaiting_envelope_id).toBeNull();
 
     const stepRows = await getPool().query<{ reason: string }>('SELECT reason FROM job_steps WHERE job_id=$1', [jobId]);
     expect(stepRows.rows.length).toBeGreaterThan(0);

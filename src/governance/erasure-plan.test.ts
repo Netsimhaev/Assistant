@@ -152,6 +152,30 @@ describe('buildErasurePlan', () => {
       expect(plan.jobIds).toContain(jobId);
     });
 
+    it('via agent_envelopes.payload', async () => {
+      // Standing in for `requestHelp` called directly, with no plan step
+      // behind it (Task 10) — the one shape `job_plans.plan` cannot discover
+      // by itself, per `AGENT_ENVELOPES_ERASED_PREDICATE`'s docblock.
+      const jobId = await bareJob('via-envelope');
+      await getPool().query(
+        `INSERT INTO agent_envelopes
+           (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+            kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+            idempotency_key, parent_job_id)
+         VALUES ($1, $2, $2, ARRAY['office.manager'], 'office.manager', 'ops.web',
+                 'help_request', 'lookup_contact', $3::jsonb, '[]'::jsonb, 'hash-env',
+                 '{}'::jsonb, 1, $4, $5)`,
+        [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: RONIT }), `idem-${ulid()}`, jobId],
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
     it('via jobs.title', async () => {
       const jobId = await bareJob(`פנייה בנוגע ל-${RONIT}`);
 
@@ -170,6 +194,20 @@ describe('buildErasurePlan', () => {
       { jobId, kind: 'entity', subjectKey: RONIT, body: { name: 'רונית' } },
       { businessId: BUSINESS },
     );
+    await getPool().query(
+      `INSERT INTO agent_envelopes
+         (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+          kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+          idempotency_key, parent_job_id)
+       VALUES ($1, $2, $2, ARRAY['office.manager'], 'office.manager', 'ops.web',
+               'help_request', 'lookup_contact', $3::jsonb, '[]'::jsonb, 'hash-cls',
+               '{}'::jsonb, 1, $4, $5)`,
+      [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: RONIT }), `idem-${ulid()}`, jobId],
+    );
+    await getPool().query(
+      `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, '{}'::jsonb)`,
+      [BUSINESS, jobId],
+    );
 
     const plan = await buildErasurePlan(
       { kind: 'contact', identifier: RONIT },
@@ -182,6 +220,12 @@ describe('buildErasurePlan', () => {
     expect(tables.get('job_authorizations')?.action).toBe('delete');
     // A job row survives with its content emptied — audit rows point at it.
     expect(tables.get('jobs')?.action).toBe('scrub');
+    expect(tables.get('agent_envelopes')).toEqual({ table: 'agent_envelopes', action: 'delete', count: 1 });
+    expect(tables.get('verification_verdicts')).toEqual({
+      table: 'verification_verdicts',
+      action: 'delete',
+      count: 1,
+    });
   });
 
   /**

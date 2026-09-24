@@ -218,12 +218,20 @@ describe('what an erasure leaves behind', () => {
 
     // --- Migration 028's two tables. --------------------------------------
     //
-    // `agent_envelopes.payload` and `.context_refs` carry the content of one
-    // agent's request to another and can name a counterparty exactly as
-    // `job_plans.plan` already does; `verification_verdicts.verdict` quotes
-    // the draft it checked, exactly as a proposal's `raw` field does. Both are
-    // job-scoped (`parent_job_id` / `job_id`) and reached through the same
-    // `jobIds` this job already sits in via `job_authorizations` above.
+    // `agent_envelopes.payload` carries the content of one agent's request to
+    // another and can name a counterparty exactly as `job_plans.plan` already
+    // does — it is, in fact, the same plan-step input, byte for byte, for a
+    // plan-issued delegation (`AGENT_ENVELOPES_ERASED_PREDICATE`'s docblock in
+    // `erasure-plan.ts`). `.context_refs` is seeded too, but only to prove the
+    // schema-derived sweep below also clears a column that CANNOT carry free
+    // text: `ContextRef` (`domain/envelope.ts`) is a closed union of four
+    // id-only pointers, so the probe is embedded here as a legal
+    // `{kind:'document', documentId:…}` ref — a shape production could
+    // actually write — never as prose no real writer could produce.
+    // `verification_verdicts.verdict` quotes the draft it checked, exactly as
+    // a proposal's `raw` field does. Both are job-scoped (`parent_job_id` /
+    // `job_id`) and reached through the same `jobIds` this job already sits
+    // in via `job_authorizations` above.
     await db.query(
       `INSERT INTO agent_envelopes
          (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
@@ -235,7 +243,7 @@ describe('what an erasure leaves behind', () => {
       [
         BUSINESS,
         JSON.stringify({ lookFor: PROBE }),
-        JSON.stringify([{ kind: 'note', text: `פנייה בעניין ${PROBE}` }]),
+        JSON.stringify([{ kind: 'document', documentId: PROBE }]),
         job.jobId,
       ],
     );
