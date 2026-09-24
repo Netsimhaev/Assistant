@@ -213,6 +213,76 @@ describe('buildErasurePlan', () => {
       expect(plan.jobIds).toContain(jobId);
     });
 
+    // Task 11: `gov.verify`'s job carries no bound plan (`conduct.ts`'s
+    // `beginVerification`), so unlike a plan-issued delegation's
+    // `agent_envelopes.payload`, this content is NOT already reachable
+    // through `job_plans.plan` — the same shape the query above closes for a
+    // directly-invoked delegation, one table over.
+    it('via verification_verdicts.verdict', async () => {
+      const jobId = await bareJob('via-verdict');
+      await getPool().query(
+        `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
+        [
+          BUSINESS,
+          jobId,
+          JSON.stringify({
+            criteria: [
+              {
+                id: 'answers_question',
+                statement: 'x',
+                severity: 'must',
+                passed: true,
+                detail: `מצטט: לפנות ל-${RONIT}`,
+              },
+            ],
+            ungroundedNumbers: [],
+            answerTruncated: false,
+            draftTruncated: false,
+          }),
+        ],
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    // Fix round 2, item 2's lesson, repeated one table over: `_` is an
+    // ordinary email character and a LIKE wildcard, and a broken `ESCAPE ''`
+    // only shows up against an identifier that actually carries one.
+    it('discovers a contact through verification_verdicts.verdict even when the identifier contains a LIKE wildcard', async () => {
+      const jobId = await bareJob('via-verdict-wildcard');
+      const identifier = 'zz_verdict-wild@nowhere.example';
+      await getPool().query(
+        `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
+        [
+          BUSINESS,
+          jobId,
+          JSON.stringify({
+            criteria: [
+              {
+                id: 'answers_question',
+                statement: 'x',
+                severity: 'must',
+                passed: true,
+                detail: `מצטט: לפנות ל-${identifier}`,
+              },
+            ],
+            ungroundedNumbers: [],
+            answerTruncated: false,
+            draftTruncated: false,
+          }),
+        ],
+      );
+
+      const plan = await buildErasurePlan({ kind: 'contact', identifier }, { businessId: BUSINESS });
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
     it('via jobs.title', async () => {
       const jobId = await bareJob(`פנייה בנוגע ל-${RONIT}`);
 

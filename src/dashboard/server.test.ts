@@ -26,6 +26,7 @@ import { insertOrGetDocument } from '../documents/store.js';
 import { saveReading } from '../documents/reading-store.js';
 import { saveProposal } from '../orchestrator/proposal-store.js';
 import { loadSignature } from '../governance/signatures.js';
+import { saveVerdict } from '../governance/verdict-store.js';
 import { queryAudit } from '../audit/log.js';
 import {
   loadInstructionForJob,
@@ -1359,6 +1360,100 @@ describe('deciding an approval', () => {
     expect(approval?.state).toBe('denied');
     const updatedJob = await loadJob(job.jobId, { businessId: BUSINESS });
     expect(updatedJob?.phase).toBe('closed');
+  });
+});
+
+// Task 11: `loadVerdict` is called by the ROUTE, at request time — never
+// stashed when the card is created — so a verdict that shows up later shows
+// up on the very next load, and a card whose verification never even started
+// renders exactly as it always has.
+describe('the gov.verify verdict on a card', () => {
+  it('shows the verdict when one exists, with its numbers reformatted for display', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const job = await jobAwaitingApproval(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    await saveVerdict(
+      job.jobId,
+      {
+        criteria: [
+          {
+            id: 'answers_question',
+            statement: 'הטיוטה עונה על מה שהמסמך מבקש',
+            severity: 'must',
+            passed: true,
+            detail: 'הסכום תואם את הצעת המחיר',
+          },
+        ],
+        // Comparison forms — no thousands separators, a leading rather than a
+        // trailing minus (`numeric-grounding.ts`) — the card must show these
+        // reformatted, not raw.
+        ungroundedNumbers: ['12500', '-99'],
+        answerTruncated: false,
+        draftTruncated: false,
+        fenceForgeryDetected: false,
+      },
+      { businessId: BUSINESS },
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+    expect(body).toContain('12,500');
+    expect(body).toContain('-99');
+    expect(body).not.toContain('12500');
+    expect(body).toContain('הסכום תואם את הצעת המחיר');
+  });
+
+  it('renders exactly as before when no verdict exists', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const job = await jobAwaitingApproval(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const body = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(body).not.toContain('gov.verify');
+    // The ordinary controls are untouched — a missing verdict removes only
+    // its own block, nothing else on the card.
+    expect(body).toContain(`/a/${approvalId}/approve`);
+    expect(body).toContain(`/a/${approvalId}/deny`);
+  });
+
+  it('escapes the verdict like every other untrusted label on this page', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const job = await jobAwaitingApproval(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    await saveVerdict(
+      job.jobId,
+      {
+        criteria: [
+          {
+            id: 'x',
+            statement: '<script>alert(1)</script>',
+            // U+202E RIGHT-TO-LEFT OVERRIDE inside a quoted fragment — the
+            // exact category `escLabel` exists for (views.ts's own docblock),
+            // quoting a draft written after reading a document someone else
+            // sent.
+            detail: 'מצטט מהטיוטה: <img src=x onerror=alert(1)>‮attack',
+            severity: 'should',
+            passed: false,
+          },
+        ],
+        ungroundedNumbers: [],
+        answerTruncated: false,
+        draftTruncated: false,
+      },
+      { businessId: BUSINESS },
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+    expect(body).not.toContain('<script>');
+    expect(body).not.toContain('<img src=x onerror=alert(1)>');
+    expect(body).not.toContain('‮');
   });
 });
 

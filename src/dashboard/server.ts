@@ -46,6 +46,7 @@ import {
 import type { ErasureOutcome } from '../governance/erasure.js';
 import { keepItem, listKept, revokeKeep } from '../governance/kept-items.js';
 import type { KeptItemKind } from '../governance/kept-items.js';
+import { loadVerdict } from '../governance/verdict-store.js';
 import { documentForApproval } from './document-for-approval.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -1257,6 +1258,11 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
   // either way; the sign form is a second, narrower question, answered by the
   // proposal's own intent against `DOCUMENT_DECISION_INTENTS` (I4).
   const resolved = await documentForApproval(approvalId, { businessId });
+  // Read at REQUEST time, deliberately — the same reasoning `documentForApproval`
+  // already carries a level up. Whether `gov.verify`'s own job has finished by
+  // now, or was even opened, is not something this route waits on or cares
+  // about: no verdict is a state the card already renders correctly.
+  const verdict = approval.jobId !== null ? await loadVerdict(approval.jobId, { businessId }) : null;
   sendHtml(
     res,
     200,
@@ -1266,6 +1272,7 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
       ...(resolved !== null
         ? { document: resolved.document, documentIntent: resolved.intent }
         : {}),
+      ...(verdict !== null ? { verdict } : {}),
     }),
   );
 }

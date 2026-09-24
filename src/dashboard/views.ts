@@ -16,6 +16,7 @@ import type { DocumentRecord } from '../documents/types.js';
 import type { ErasureAnchor, ErasureItem, ErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
 import type { KeptItem } from '../governance/kept-items.js';
+import type { Verdict } from '../governance/verdict-store.js';
 import type { IntentName } from '../domain/reading.js';
 import type { MemoryRecord } from '../memory/store.js';
 import { AutonomyMode } from '../governance/autonomy-mode.js';
@@ -588,6 +589,91 @@ function signForm(
   </form>`;
 }
 
+/**
+ * `Verdict.ungroundedNumbers` entries are COMPARISON forms, not display
+ * forms — no thousands separators, a trailing decimal zero already stripped,
+ * a trailing minus rewritten to a leading one
+ * (`governance/numeric-grounding.ts`'s own docblock). Printed raw, `12500`
+ * reads as a different figure than the `12,500` the owner's own draft
+ * actually spelled, which defeats the point of showing it at all — the owner
+ * is meant to recognise the number, not decode it. Reformatted here with
+ * thousands separators for DISPLAY ONLY; this is never the string
+ * `ungroundedNumbers` itself compared against.
+ */
+function formatUngroundedNumber(raw: string): string {
+  const negative = raw.startsWith('-');
+  const unsigned = negative ? raw.slice(1) : raw;
+  const [intPart, decPart] = unsigned.split('.');
+  const withSeparators = (intPart ?? '').replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (negative ? '-' : '') + withSeparators + (decPart === undefined ? '' : `.${decPart}`);
+}
+
+/**
+ * `fenceForgeryDetected` has three states, on purpose (`Verdict`'s own
+ * docblock): `true` and `false` are both something the check actually ran and
+ * found; `undefined` is a verdict saved before this field existed, and must
+ * never read as "checked, clean" — the same rule `amount_unreadable` and
+ * every other unreadable-is-never-permitting value in this codebase already
+ * holds. So the three render as three different things, not two.
+ */
+function forgeryNote(detected: boolean | undefined): string {
+  if (detected === true) {
+    return '<p class="error">בתוכן שנבדק זוהה ניסיון לחקות את גבולות בדיקת האימות עצמה.</p>';
+  }
+  if (detected === false) {
+    return '<p class="muted">נבדק, ולא נמצא ניסיון לחקות את גבולות בדיקת האימות.</p>';
+  }
+  return '<p class="muted">פסיקה זו נשמרה לפני שהמערכת עקבה אחר ניסיון כזה — לא ידוע אם נבדק.</p>';
+}
+
+/**
+ * One judged criterion. `statement` and `detail` are model-authored text about
+ * a draft written after reading a document somebody else sent — `detail` in
+ * particular quotes it when that helps the judge explain a verdict — so both
+ * go through `escLabel`, not `esc`, the same category `escLabel` exists for
+ * elsewhere on this page (see its own docblock): a bidirectional override
+ * inside a quoted fragment could make the owner read something other than
+ * what is actually there. `severity` and `passed` are the judge's own closed
+ * vocabulary, not text it composed, so they are rendered from a fixed Hebrew
+ * label rather than passed through at all.
+ */
+function criterionItem(criterion: Verdict['criteria'][number]): string {
+  const severity = criterion.severity === 'must' ? 'חובה' : 'שיפור רצוי';
+  const status = criterion.passed ? 'עומד בקריטריון' : 'לא עומד בקריטריון';
+  return `<li>${esc(status)} (${esc(severity)}): ${escLabel(criterion.statement)} — ${escLabel(criterion.detail)}</li>`;
+}
+
+/**
+ * `gov.verify`'s verdict for this card's job, when one has been saved by the
+ * time the card renders. Rendered from a database row read at REQUEST time —
+ * `loadVerdict` is called by the route, not stashed at card-creation time —
+ * so a verification that has not finished, or never started, simply leaves
+ * this block out; nothing about the rest of the card depends on it existing.
+ */
+function verdictBlock(verdict: Verdict): string {
+  const criteriaItems = verdict.criteria.map(criterionItem).join('');
+
+  const ungroundedBlock =
+    verdict.ungroundedNumbers.length === 0
+      ? ''
+      : `<p>מספרים בטיוטה שלא אותרו במסמך המקורי: ${verdict.ungroundedNumbers
+          .map((n) => `<code>${escLabel(formatUngroundedNumber(n))}</code>`)
+          .join(', ')}</p>`;
+
+  const truncationBlock =
+    verdict.answerTruncated || verdict.draftTruncated
+      ? '<p class="muted">חלק מהתוכן שנבדק היה ארוך מדי ונחתך לפני הבדיקה — הפסיקה מבוססת רק על מה שנבדק בפועל.</p>'
+      : '';
+
+  return `<div class="card">
+  <h3>בדיקת איכות (gov.verify)</h3>
+  <ul>${criteriaItems}</ul>
+  ${ungroundedBlock}
+  ${forgeryNote(verdict.fenceForgeryDetected)}
+  ${truncationBlock}
+</div>`;
+}
+
 export function renderApprovalCard(options: {
   approval: ApprovalRequest;
   csrf: string;
@@ -601,6 +687,15 @@ export function renderApprovalCard(options: {
    * default, not a case somebody has to remember to handle.
    */
   documentIntent?: IntentName | null;
+  /**
+   * `gov.verify`'s verdict for this card's job, when the route resolved one.
+   * Absent means exactly what it says — no verdict exists yet, whether
+   * because none was ever opened, the delegation has not answered, or nothing
+   * has yet resumed the second half of the check (Task 11's known gap) — and
+   * the card renders exactly as it would if `gov.verify` did not exist at
+   * all.
+   */
+  verdict?: Verdict;
   editValue?: string;
   noteValue?: string;
   error?: string;
@@ -640,6 +735,7 @@ export function renderApprovalCard(options: {
   </table>
 </div>
 ${options.document ? documentBlock(options.document) : ''}
+${options.verdict ? verdictBlock(options.verdict) : ''}
 ${signErrorBlock}
 <div class="row">
   <form method="post" action="/a/${esc(approval.approvalId)}/approve" class="edit-form">

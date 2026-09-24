@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -68,6 +69,20 @@ async function aDocument(text: string): Promise<string> {
     { businessId: BUSINESS, documentRoot: dir },
   );
   return doc.documentId;
+}
+
+/**
+ * A `verifier` stub that opens nothing further of its own — no `requestHelp`
+ * call, no `know.reader` child job — for tests whose own concern (the daily
+ * ceiling, two racing passes) has nothing to do with verification. Without
+ * it, those tests would be coupled to exactly how many jobs the REAL
+ * `verifyDraft` happens to open today (the verification job itself, plus a
+ * `know.reader` child from its own `requestHelp` call) — a number this task
+ * owns and a future one may change, unrelated to what those tests actually
+ * assert.
+ */
+async function noopVerifier() {
+  return { status: 'awaiting_delegation' as const, envelopeId: 'noop', childJobId: null, ungroundedNumbers: [] };
 }
 
 function deps(proposal: Proposal = ACTING) {
@@ -288,6 +303,7 @@ describe('conductPendingDocuments', () => {
       readsPerDay: 1,
       reader: d.reader,
       proposer: d.proposer,
+      verifier: noopVerifier,
     });
 
     expect(result.ceilingReached).toBe(true);
@@ -309,7 +325,12 @@ describe('conductPendingDocuments', () => {
       'the skipped document must be untouched',
     ).toBe(0);
     const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
-    expect(jobs.rows, 'no job for the document left for tomorrow').toHaveLength(1);
+    // Two, not one: the carded document's own job, plus the `gov.verify` job
+    // `beginVerification` opens beside its card (`noopVerifier` stops it
+    // there — no third, `know.reader` child job). The point of this
+    // assertion is still "nothing for the SECOND document" — it stays at two
+    // rather than growing to four.
+    expect(jobs.rows, 'no job for the document left for tomorrow').toHaveLength(2);
   });
 
   it('records a failure and carries on to the next document', async () => {
@@ -383,13 +404,114 @@ describe('conductPendingDocuments', () => {
     const d = deps();
 
     const [a, b] = await Promise.all([
-      conductPendingDocuments({ businessId: BUSINESS, reader: d.reader, proposer: d.proposer }),
-      conductPendingDocuments({ businessId: BUSINESS, reader: d.reader, proposer: d.proposer }),
+      conductPendingDocuments({
+        businessId: BUSINESS,
+        reader: d.reader,
+        proposer: d.proposer,
+        verifier: noopVerifier,
+      }),
+      conductPendingDocuments({
+        businessId: BUSINESS,
+        reader: d.reader,
+        proposer: d.proposer,
+        verifier: noopVerifier,
+      }),
     ]);
 
     expect(a.considered + b.considered, 'the single document is considered exactly once').toBe(1);
     expect(d.calls.reads, 'the model must not be called twice for one document').toBe(1);
     const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1`, [BUSINESS]);
-    expect(jobs.rows, 'exactly one job for the one document').toHaveLength(1);
+    // Two, not one: the document's own job, plus the `gov.verify` job opened
+    // beside its card (`noopVerifier` stops it there). The invariant this
+    // test exists for is unchanged — the race must not double either count.
+    expect(jobs.rows, 'exactly one document worth of jobs').toHaveLength(2);
+  });
+
+  // Task 11: the conductor opens a `gov.verify` job beside the card it
+  // raises, never before it — raising the card must never wait on, and must
+  // never be undone by, a verification that stumbles or never even starts.
+  it('opens a gov.verify job beside the card and never before it', async () => {
+    await aDocument('חוזה שיווק לאימות');
+    const d = deps();
+    let verifierCalls = 0;
+
+    const result = await conductPendingDocuments({
+      businessId: BUSINESS,
+      reader: d.reader,
+      proposer: d.proposer,
+      verifier: async () => {
+        verifierCalls += 1;
+        throw new Error('gov.verify boom');
+      },
+    });
+
+    // The card exists regardless of the throw above — proof that raising it
+    // does not depend on the verification finishing, or even succeeding.
+    expect(result.carded).toBe(1);
+    expect(result.failed, 'a stumbling verification must not fail the document').toBe(0);
+    const approvals = await getPool().query(`SELECT 1 FROM approval_requests`);
+    expect(approvals.rows).toHaveLength(1);
+    expect(verifierCalls).toBe(1);
+
+    const jobs = await getPool().query<{ title: string | null; phase: string }>(
+      `SELECT title, phase FROM jobs WHERE business_id = $1 ORDER BY created_at ASC`,
+      [BUSINESS],
+    );
+    // The document's own job still reached the card, untouched by the
+    // verification job's own failure.
+    expect(jobs.rows).toHaveLength(2);
+    expect(jobs.rows[0]?.phase).toBe('await_approval');
+    // The second job is the one `beginVerification` opened.
+    expect(jobs.rows[1]?.title).toContain('אימות');
+  });
+
+  /**
+   * Structural, in the style of `conductor-invariants.test.ts` — anchored per
+   * call, never per file (that file's own docblock explains why a file-wide
+   * scan lets one call's literal answer for another). `conduct.ts` now makes
+   * TWO `createJob` calls — the document's own job, and the `gov.verify` job
+   * `beginVerification` opens beside the card — and both must set the same
+   * fixed literal: a caller that could choose either job's provenance could
+   * launder trust into it.
+   */
+  it('the verification job carries unknown_external as a literal', () => {
+    const src = readFileSync(join(process.cwd(), 'src', 'orchestrator', 'conduct.ts'), 'utf8');
+
+    const marker = 'createJob(';
+    const blocks: string[] = [];
+    let searchFrom = 0;
+    for (;;) {
+      const start = src.indexOf(marker, searchFrom);
+      if (start === -1) break;
+      let depth = 0;
+      let i = start + 'createJob'.length;
+      for (; i < src.length; i += 1) {
+        const ch = src[i];
+        if (ch === '(') depth += 1;
+        else if (ch === ')') {
+          depth -= 1;
+          if (depth === 0) {
+            i += 1;
+            break;
+          }
+        }
+      }
+      blocks.push(src.slice(start, i));
+      searchFrom = i;
+    }
+
+    // Both calls must actually be found — a test that silently checked zero
+    // blocks would pass for the wrong reason.
+    expect(blocks.length, 'conduct.ts must call createJob exactly twice').toBe(2);
+
+    for (const block of blocks) {
+      const matches = [...block.matchAll(/provenance\s*:\s*([^,\n}]+)/g)];
+      expect(matches.length, `every createJob(...) call must set provenance: ${block}`).toBe(1);
+      const rhs = (matches[0]?.[1] ?? '').trim();
+      expect(
+        rhs,
+        `conduct.ts createJob(...): provenance must be the literal 'unknown_external', not an expression a caller could steer`,
+      ).toBe("'unknown_external'");
+    }
   });
 });

@@ -14,12 +14,16 @@
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { getPool } from '../db/pool.js';
+import { renderReadingBrief } from '../documents/brief.js';
 import { readDocument, type ReadDocumentOptions } from '../documents/read.js';
 import {
   documentsAwaitingRead,
+  loadArtifacts,
   readingsToday,
   recordReadFailure,
 } from '../documents/store.js';
+import type { ProposedAction } from '../domain/proposal.js';
+import { verifyDraft, type VerifyDraftInput, type VerifyDraftResult } from '../sdk/gov-verify.js';
 import { createJob, transition, type Job } from './jobs.js';
 import { bindPlanToJob } from './plan-store.js';
 import { proposalToPlan } from './proposal-to-plan.js';
@@ -45,6 +49,127 @@ export interface ConductOptions {
    * for it rather than simply omitting the field (I3).
    */
   notify?: NotifyTarget;
+  /**
+   * Injected by tests so `verifyDraft`'s own delegation (`requestHelp` —
+   * deterministic and free of any model call on the branch this module ever
+   * takes, since it never supplies `answer`) can be replaced with a stub that
+   * observes or throws, without needing a slow or billed call to prove the
+   * card never waits on it and is never undone by it. Production leaves this
+   * unset and gets the real `verifyDraft`.
+   */
+  verifier?: (input: VerifyDraftInput) => Promise<VerifyDraftResult>;
+}
+
+/**
+ * Fixed and code-owned, never derived from the document or the proposal.
+ * `gov.verify` composes its own question to `know.reader` — letting a
+ * hostile document (or even the proposal a model wrote from reading one)
+ * choose the question would be asking the thing under suspicion to pick the
+ * question the quarantine boundary is graded against.
+ */
+const VERIFICATION_QUESTION =
+  'מה מבקש המסמך הזה בפועל, ומה צריך להיכלל בתגובה כדי לענות על כך במלואו?';
+
+/**
+ * The text `gov.verify` judges — the proposed action's own `body` when it has
+ * one (the common case: an email, a message), or the whole payload
+ * stringified when it does not. `ProposedAction.input` carries no fixed
+ * schema across tools (`domain/proposal.ts`), so there is no single field
+ * name this module can trust to exist.
+ */
+function draftTextFor(action: ProposedAction): string {
+  const body = action.input['body'];
+  return typeof body === 'string' && body.length > 0 ? body : JSON.stringify(action.input);
+}
+
+/**
+ * Open a `gov.verify` job for the action a card is about to be (or was just)
+ * raised for — BESIDE the card, never before it. Called only after the
+ * card's own job has already reached `await_approval`, and wrapped in its own
+ * `try`/`catch` at the call site: a verification that cannot even get
+ * started must never undo, or fail, a card the owner is already able to see.
+ *
+ * **No plan is bound to this job.** `verifyDraft` is called directly here,
+ * the same way `curateJob` calls `writeMemory` directly — never through
+ * `runLocalTool`/the generic plan-step executor (see `verifyDraft`'s own
+ * docblock, and `erasure-plan.ts`'s `VERIFICATION_VERDICTS_ERASED_PREDICATE`
+ * docblock, which names this exact decision). Binding a plan anyway would
+ * leave a job sitting in `execute` with something `runDueJobs` might pick up
+ * and try to run for real — racing this very call, the same danger
+ * `requestHelp`'s own docblock names for its child job and closes by never
+ * leaving that window open. The same fix applies here: create, walk straight
+ * to `execute`, and call `verifyDraft` in the same breath, under this pass's
+ * own advisory lock.
+ *
+ * **`answer: null` on every call this function makes.** This task opens the
+ * delegation and stops there — `verifyDraft` ends its own run and returns
+ * `awaiting_delegation`; nothing yet resumes this job with a second call once
+ * `know.reader`'s child job answers. `resumeDelegatedJobs` will free this job
+ * back to `execute` when its child finishes, but this job carries no bound
+ * plan for `runDueJobs` to run once it gets there, so it will sit in
+ * `execute` un-rerun. A known, named gap — not an oversight — see the task
+ * report for Task 11.
+ *
+ * **A `requestHelp` refusal surfaces from `verifyDraft` as a thrown error**
+ * (its own docblock), and this function does not distinguish it from any
+ * other failure here (a charter that failed to load, a database blip while
+ * reading artefacts). All of it is caught, uniformly, at the call site: the
+ * verification is advisory to what the card already shows, never a gate on
+ * it, and its absence renders as no verdict at all — a state the card already
+ * has to handle, since a verdict may equally never arrive because nothing
+ * resumed the delegation yet.
+ */
+async function beginVerification(
+  action: ProposedAction,
+  ctx: {
+    documentId: string;
+    businessId: string;
+    charterVersion: string;
+    verifier: (input: VerifyDraftInput) => Promise<VerifyDraftResult>;
+  },
+): Promise<void> {
+  const verifyJob = await createJob({
+    charterVersion: ctx.charterVersion,
+    // Not a parameter, and not derived from anything the document or the
+    // proposal says — see `the verification job carries unknown_external as
+    // a literal` in conduct.test.ts.
+    provenance: 'unknown_external',
+    businessId: ctx.businessId,
+    title: `אימות: ${action.headline}`,
+  });
+
+  await transition(verifyJob.jobId, {
+    to: 'understand',
+    actor: 'orchestrator',
+    reason: 'conductor: opening gov.verify beside the card',
+    businessId: ctx.businessId,
+  });
+  await transition(verifyJob.jobId, {
+    to: 'plan',
+    actor: 'orchestrator',
+    reason: 'conductor: no plan is bound — verifyDraft runs directly',
+    businessId: ctx.businessId,
+  });
+  await transition(verifyJob.jobId, {
+    to: 'execute',
+    actor: 'orchestrator',
+    reason: 'conductor: ready for gov.verify to run its checks',
+    businessId: ctx.businessId,
+  });
+
+  const artifacts = await loadArtifacts(ctx.documentId, { businessId: ctx.businessId });
+  const { brief } = renderReadingBrief(artifacts);
+
+  await ctx.verifier({
+    parentJobId: verifyJob.jobId,
+    documentId: ctx.documentId,
+    draftText: draftTextFor(action),
+    sources: [brief],
+    question: VERIFICATION_QUESTION,
+    answer: null,
+    parentEnvelope: null,
+    businessId: ctx.businessId,
+  });
 }
 
 export interface ConductResult {
@@ -325,6 +450,27 @@ export async function conductPendingDocuments(
           businessId,
         });
         result.carded += 1;
+
+        // Beside the card, never before it — see `beginVerification`'s own
+        // docblock. Swallowed here, deliberately, and not by letting it reach
+        // the `catch` below: that `catch` fails the DOCUMENT's own job, and a
+        // verification that stumbles must never undo a card the owner can
+        // already see.
+        if (proposed.proposal.action !== null) {
+          try {
+            await beginVerification(proposed.proposal.action, {
+              documentId: document.documentId,
+              businessId,
+              charterVersion: active.charter.charterVersion,
+              verifier: options.verifier ?? verifyDraft,
+            });
+          } catch {
+            // Best-effort. The card already exists and the job already moved
+            // to `await_approval`; a verification that could not even start
+            // is a known gap (see `beginVerification`'s docblock), not a
+            // reason to take either of those back.
+          }
+        }
       } catch (err) {
         // Per document, never per batch.
         const message = err instanceof Error ? err.message : String(err);
