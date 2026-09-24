@@ -22,6 +22,7 @@ import {
   readingsToday,
   recordReadFailure,
 } from '../documents/store.js';
+import type { Plan } from '../domain/plan.js';
 import type { ProposedAction } from '../domain/proposal.js';
 import { verifyDraft, type VerifyDraftInput, type VerifyDraftResult } from '../sdk/gov-verify.js';
 import { createJob, transition, type Job } from './jobs.js';
@@ -100,71 +101,81 @@ function draftTextFor(action: ProposedAction): string {
  * the delegating job (it is never in `execute` at this point) and
  * `saveVerdict` was keyed on `parentJobId`.
  *
- * **No plan is bound to the delegating job.** `verifyDraft` is called
- * directly here, the same way `curateJob` calls `writeMemory` directly —
- * never through `runLocalTool`/the generic plan-step executor (see
- * `verifyDraft`'s own docblock, and `erasure-plan.ts`'s
- * `VERIFICATION_VERDICTS_ERASED_PREDICATE` docblock, which names this exact
- * decision). Binding a plan anyway would leave a job sitting in `execute`
- * with something `runDueJobs` might pick up and try to run for real —
- * racing this very call, the same danger `requestHelp`'s own docblock names
- * for its child job and closes by never leaving that window open.
+ * **A one-step judging plan is bound to the delegating job — Task 4 of the
+ * verification-loop plan, replacing what this docblock used to describe.**
+ * A round-0/1 version of this function bound no plan at all, on the theory
+ * that binding one would race `runDueJobs` picking the job up and running it
+ * for real while the delegation call below was still in flight. That theory
+ * was sound about the DANGER (see the race note below) but wrong about the
+ * fix: the actual repair this task makes is to bind the plan FIRST, while
+ * the job is still in `execute`, and never fail the job afterward — not to
+ * leave it planless. The bound plan's one step names `assert.evaluate`
+ * (`orchestrator/local-tools.ts`), never `agent.request_help`: that tool
+ * classifies to `agent.delegate`, and this job's `unknown_external`
+ * provenance floors gate stage 8's `provenanceCeiling` at `draft_only` —
+ * a step naming it would be refused before it could ever delegate.
+ * `assert.evaluate` is read-only and short-circuits at gate stage 4, so no
+ * ceiling ever applies to it. It carries `ctx.subjectJobId`, `ctx.documentId`,
+ * the same `draftTextFor(action)` this function hands the delegation call
+ * below, and `VERIFICATION_QUESTION` — the four fields its own handler
+ * parses — so that once an answer exists, the step can find and judge it
+ * without anything threading a first step's output into a second step's
+ * input (there is no first step; the delegation below is a direct call, not
+ * a plan step).
  *
- * **`answer: null` on every call this function makes, and the delegating
- * job is ended here rather than left parked — fix round 1's Critical 2.**
- * `verifyDraft`'s own `requestHelp` call parks the delegating job in
- * `followup`, awaiting an envelope `know.reader`'s child will answer, and
- * this task builds no second half that ever resolves it. **A round-0
- * version of this docblock claimed the parked job would simply "sit in
- * `execute` un-rerun" — that was false.** Left alone,
- * `resumeDelegatedJobs` wakes a parked job with a terminal child straight
- * back to `execute`; with no plan ever bound, `run-due.ts` (lines ~194-223)
- * then transitions it to `failed` with `run_due: no_plan_bound`, and
- * `run-scheduler.ts` prints an operator-visible error line for it —
- * `run-due.ts`'s own docblock already names the conductor as the first
- * production producer of exactly this shape of bug. So every carded
- * document would eventually leave one such line on a healthy installation.
- * This function does not wait for that: the moment the delegation opens, it
- * transitions the delegating job straight to `failed` itself, with a reason
- * that names the real cause — a known, named gap (see the Task 11 report),
- * not a silent, deferred, operator-visible one.
+ * **`answer: null` on every call this function makes, and the delegating job
+ * is left running rather than ended here — the actual fix, corrected from
+ * what used to be fix round 1's Critical 2.** `verifyDraft`'s own
+ * `requestHelp` call parks the delegating job in `followup`, awaiting an
+ * envelope `know.reader`'s child will answer. A round-0/1 version of this
+ * function believed nothing would ever resume that park and transitioned the
+ * delegating job straight to `failed` itself, immediately, to pre-empt an
+ * operator-visible `run_due: no_plan_bound` it believed was otherwise
+ * inevitable — undoing the very park `requestHelp` had just performed, on
+ * EVERY card the conductor ever raised. That belief was the bug: with a plan
+ * now bound before the delegation opens, `resumeDelegatedJobs` (run on every
+ * `schedulerPass`) wakes the parked job back to `execute` once `know.reader`
+ * answers, and `runDueJobs` finds a job that actually has something to run —
+ * the bound `assert.evaluate` step, which judges the draft and saves the
+ * verdict. Nothing in this function moves the job's phase after the
+ * delegation call succeeds; `requestHelp` (inside it) already did, and
+ * `resumeDelegatedJobs` owns it from there.
  *
- * **Every failure here is caught and turned into a terminal transition of
- * whatever job this call created — fix round 1's Important 3.** The same
- * repair the sibling `catch` lower in this file makes for the document's own
- * job: a throw that leaves a job in `intake`/`understand`/`plan`, or in
- * `execute` with no plan bound, is a job in a phase either with no reader at
- * all or with a reader that fails it loudly — CLAUDE.md's "a phase with no
- * reader is not a resting place, it's a leak". `{ opened: false }` is this
- * function's own count of that failure, surfaced by the caller as
- * `ConductResult.verificationFailed` and distinguishable from "verification
- * simply was never attempted". **Fix round 2's item 2:** a count nobody
- * prints is not yet visible — this file's own rule, stated plainly here
- * because a round-1 version of this sentence claimed the count already was.
- * `run-scheduler.ts`'s `logErrored` is what actually reads it, printing a
- * line whenever `verificationFailed > 0`.
+ * **Every failure here is still caught and turned into a terminal transition
+ * of whatever job this call created — fix round 1's Important 3, unchanged.**
+ * The same repair the sibling `catch` lower in this file makes for the
+ * document's own job: a throw that leaves a job in
+ * `intake`/`understand`/`plan`, or in `execute` with a plan nothing will ever
+ * run because the throw happened before the delegation could park it, is a
+ * job in a phase either with no reader at all or with a reader that fails it
+ * loudly — CLAUDE.md's "a phase with no reader is not a resting place, it's
+ * a leak". `{ opened: false }` is this function's own count of that failure,
+ * surfaced by the caller as `ConductResult.verificationFailed` and
+ * distinguishable from "verification simply was never attempted".
+ * `run-scheduler.ts`'s `logErrored` prints a line whenever it is nonzero.
  *
- * **A known, unclosed race across TWO SCHEDULER PROCESSES — fix round 2's
- * item 5, written down rather than solved.** Within one process the ordering
- * is safe: `schedulerPass` runs the conductor to completion before it calls
+ * **A known, unclosed race across TWO SCHEDULER PROCESSES, now a different
+ * shape than it used to be.** Within one process the ordering is safe:
+ * `schedulerPass` runs the conductor to completion before it calls
  * `runDueJobs` (`scheduler.ts`'s own docblock), so the delegating job this
  * function creates is never still sitting in `execute` when that same
  * process's `runDueJobs` looks. Across two separate scheduler PROCESSES this
  * does not hold: `conductPendingDocuments`'s advisory lock (`conductor:
  * ${businessId}`) and `runDueJobs`'s (`run-due:${businessId}:${jobId}`) are
- * different scopes, so a second process's `runDueJobs` can take the
- * delegating job the instant it is in `execute` — the window between this
- * function's own `transition(..., 'execute')` above and its `transition(...,
- * 'failed')` below — fail it with `run_due: no_plan_bound`, and print the
- * very operator line this function exists to prevent. This function's own
- * `transition(..., 'failed')` then runs against a job already `failed`
- * (`LEGAL_TRANSITIONS['failed']` is empty — no transition out, including to
- * itself), throws, is caught by this function's own outer `catch`, and
- * reports `{ opened: false }` for a delegation that, in fact, did open. Not
+ * different scopes. The window this function used to leave open — a job in
+ * `execute` with NO bound plan — is closed by binding the plan first. A
+ * narrower window remains: between this function's own `bindPlanToJob` call
+ * and the delegation call parking the job to `followup`, a second process's
+ * `runDueJobs` can find the delegating job in `execute` WITH its plan
+ * already bound, and run the `assert.evaluate` step for real before any
+ * delegation has been requested — that step finds no help-request envelope
+ * yet (`loadHelpRequestFromParentJob` returns `null`) and refuses
+ * non-retryably with `verification_answer_missing`, failing the job. Not
  * reachable with a single `npm run scheduler` process, which is every
  * deployment this codebase runs today (`docs/dashboard-deployment.md`); it
  * becomes reachable the day a second scheduler process is ever started
- * against the same business.
+ * against the same business — the same caveat the old race note carried,
+ * on a narrower window than before.
  */
 async function beginVerification(
   action: ProposedAction,
@@ -198,7 +209,7 @@ async function beginVerification(
     await transition(delegatingJob.jobId, {
       to: 'plan',
       actor: 'orchestrator',
-      reason: 'conductor: no plan is bound — verifyDraft runs directly',
+      reason: 'conductor: binding the one-step judging plan',
       businessId: ctx.businessId,
     });
     await transition(delegatingJob.jobId, {
@@ -207,6 +218,39 @@ async function beginVerification(
       reason: 'conductor: ready for gov.verify to run its checks',
       businessId: ctx.businessId,
     });
+
+    // Bound BEFORE the delegation opens, while the job is still in
+    // `execute` — see this function's own docblock. The single step names
+    // `assert.evaluate`, never `agent.request_help`: that tool classifies to
+    // `agent.delegate`, and gate stage 8's `provenanceCeiling` for this job's
+    // `unknown_external` provenance floors at `draft_only`, refusing it
+    // before it could ever delegate. `assert.evaluate` is read-only and
+    // short-circuits at gate stage 4, so no ceiling ever reaches it. Its
+    // payload is exactly the four fields its own handler
+    // (`orchestrator/local-tools.ts`) parses.
+    const plan: Plan = {
+      goal: `אימות הטיוטה של משימה ${ctx.subjectJobId}`,
+      assumptions: [],
+      clarifyingQuestion: null,
+      estimatedCostMinor: 0,
+      steps: [
+        {
+          id: 'judge',
+          agent: 'gov.verify',
+          intent: 'לשפוט את הטיוטה מול מה שהמסמך מבקש',
+          toolName: 'assert.evaluate',
+          input: {
+            subjectJobId: ctx.subjectJobId,
+            documentId: ctx.documentId,
+            draftText: draftTextFor(action),
+            question: VERIFICATION_QUESTION,
+          },
+          dependsOn: [],
+          expectedActionClass: null,
+        },
+      ],
+    };
+    await bindPlanToJob(delegatingJob.jobId, plan, { businessId: ctx.businessId });
 
     // The document's own deterministic extraction, laid out as PLAIN TEXT —
     // never the truncated prompt brief (`renderReadingBrief`), which DROPS
@@ -230,7 +274,15 @@ async function beginVerification(
     const artifacts = await loadArtifacts(ctx.documentId, { businessId: ctx.businessId });
     const sources = artifacts.map((artifact) => renderArtifactFull(artifact));
 
-    const result = await ctx.verifier({
+    // The delegation itself, unchanged — this task changes what happens
+    // around this call, never the call: same args, same `answer: null`, same
+    // refusal-throwing inside `verifyDraft`. What no longer follows it is a
+    // kill: `requestHelp` (inside `ctx.verifier`, on the branch production
+    // always takes) has already parked the job in `followup`, with a plan
+    // now bound for `resumeDelegatedJobs`/`runDueJobs` to find and run once
+    // `know.reader` answers. Nothing here moves the phase again — see this
+    // function's own docblock for the bug this replaces.
+    await ctx.verifier({
       parentJobId: delegatingJob.jobId,
       subjectJobId: ctx.subjectJobId,
       documentId: ctx.documentId,
@@ -239,35 +291,6 @@ async function beginVerification(
       question: VERIFICATION_QUESTION,
       answer: null,
       parentEnvelope: null,
-      businessId: ctx.businessId,
-    });
-
-    // See this function's own docblock (Critical 2, and fix round 2's item
-    // 3): ending the delegating job here, ourselves, is the fix for the
-    // operator-visible `no_plan_bound` failure that leaving it running would
-    // eventually cause — and BOTH arms of `result` leave it running if this
-    // function does nothing. `awaiting_delegation` leaves it parked in
-    // `followup` by `requestHelp`'s own transition; a `Verdict` return is the
-    // OTHER arm, and `verifyDraft`'s Verdict-producing branch moves nothing's
-    // phase at all, so the job sits exactly where this function last put it —
-    // `execute`, with no plan bound. Not reachable today only because this
-    // function hard-codes `answer: null` on every call it makes, so `result`
-    // is always `awaiting_delegation` in production; reachable through
-    // `options.verifier` in a test today, and in production the moment a
-    // second half resolves `answer` and calls `verifyDraft` again on this
-    // same job. Terminated unconditionally, with a reason that names which
-    // arm it was.
-    const isAwaitingDelegation = 'status' in result && result.status === 'awaiting_delegation';
-    await transition(delegatingJob.jobId, {
-      to: 'failed',
-      actor: 'orchestrator',
-      reason: isAwaitingDelegation
-        ? 'gov.verify: delegated to know.reader, but nothing yet resumes this job to complete ' +
-          'the check (known gap, Task 11) — ended here rather than parked for run_due to fail ' +
-          'later as no_plan_bound'
-        : 'gov.verify: produced a verdict directly, but this job still carries no bound plan and ' +
-          'nothing else moves its phase — ended here rather than left in execute for run_due to ' +
-          'fail later as no_plan_bound',
       businessId: ctx.businessId,
     });
 
