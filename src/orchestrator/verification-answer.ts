@@ -20,8 +20,9 @@ import type { Reading } from '../domain/reading.js';
  * literally "what the document asks for", which is the first half of
  * `VERIFICATION_QUESTION`. Everything else in a `Reading` is excluded on
  * purpose: `findings[].label` and `intents[].note` are model-authored free
- * text, `sourceRef.quote` is a verbatim fragment of the hostile document
- * itself, and none of them tells the judge anything the summary does not.
+ * text, `sourceRef.locator` is the reader's own words about where in the
+ * document a claim sat, and none of them tells the judge anything the summary
+ * does not.
  *
  * **No truncation here.** `verifyDraft` caps the answer it receives and
  * records the cut on the verdict (`Verdict.answerTruncated`). A second cap
