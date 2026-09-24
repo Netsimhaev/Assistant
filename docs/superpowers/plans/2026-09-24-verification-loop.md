@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `gov.verify`'s judge actually run in production, by giving its job a two-step plan instead of killing it, so the verdict reaches the owner's approval card.
+**Goal:** Make `gov.verify`'s judge actually run in production, by giving its job a bound plan instead of killing it, so the verdict reaches the owner's approval card.
 
-**Architecture:** `beginVerification` binds a two-step plan to the `gov.verify` job — `agent.request_help` (existing, unchanged) then `assert.evaluate` (new). The existing engine drives the rest: step 1 delegates and parks, re-parks while waiting, and completes when the result envelope lands; step 2 composes the answer from the child's reading, runs the judge, and files the outcome. No new loop, no new phase, no change to the generic delegation machinery.
+**Architecture:** `beginVerification` keeps calling `requestHelp` directly — as it does today, through the documented gate bypass — and additionally binds a **one-step** plan to the `gov.verify` job, whose only step is the new `assert.evaluate`. The existing engine drives the rest: `requestHelp` parks the job on the delegation, `resumeDelegatedJobs` wakes it when the result envelope lands, `runDueJobs` runs the bound step, and it composes the answer from the child's reading, runs the judge and files the outcome. No new loop, no new phase, no change to the generic delegation machinery.
+
+> **Why one step and not two — read this before Task 4.** An earlier draft put `agent.request_help` in the plan as step 1. That cannot work: it classifies to `agent.delegate` (`src/policy/classify.ts:59`), the `gov.verify` job's provenance is `unknown_external` (hard-coded at `src/orchestrator/conduct.ts:186`), and gate stage 8 takes the minimum over all ceilings — `provenanceCeiling['unknown_external']` is `draft_only`, so the step is refused `draft_only:persist_as_draft` before it ever delegates. `CEILING_EXEMPT_TOOLS` does not save it: that list only stops a tool contributing a ceiling to `rampLevelForPlan`, and never exempts a step from the ceilings that always apply. `assert.evaluate` is read-only, short-circuits at stage 4, and never reaches stage 8 — which is why the plan holds only that step. Raising the provenance ceiling, or giving this job a friendlier provenance, were both rejected: the first weakens the control that stops a hostile document from acting, and the second is the trust-laundering `writeMemory` and `grantAuthorization` both exist to refuse.
 
 **Tech Stack:** TypeScript NodeNext ESM, Postgres 17 via `pg`, zod, vitest against a real database.
 
@@ -446,6 +448,8 @@ const AssertEvaluateInput = z.object({
 
 Add to `src/orchestrator/local-tools.test.ts`, reusing the file's existing job/charter setup helpers.
 
+You must write three helpers; none of them exists yet. `seedAnsweredDelegation(outcome)` creates a `gov.verify` job, an envelope naming a child job, and a `result` envelope carrying that outcome — build it from `writeEnvelope`/`attachChildJob` the way `delegate.test.ts` already does, and return `{ parentJobId, subjectJobId, documentId }`. `seedUnansweredDelegation()` is the same without the `result` envelope. `stubJudge` returns a minimal valid `Verdict` (`criteria` needs at least one entry). **Declare the question as a local `const VERIFICATION_QUESTION` in the test file** — the real one is module-private in `conduct.ts` and stays that way; exporting a conductor constant for a test's convenience couples the two, and this handler passes the question through without reading it.
+
 ```ts
   it('judges and files a verdict when the delegation succeeded', async () => {
     // Full shape: a gov.verify job parked on an envelope whose child answered.
@@ -595,11 +599,14 @@ Expected: FAIL — `assert.evaluate` has no implementation, so `runLocalTool` re
     if (job === null) {
       throw new Error(`runLocalTool: assert.evaluate could not load job ${ctx.jobId}`);
     }
-    const reading = await loadLatestReading(parsed.documentId, job.provenance, dbOpts);
-    if (reading === null) {
+    // `ReadingRecord.content` is `Reading | null` — a record whose `status` is
+    // `unreadable` exists but carries nothing to compose from, and that is not
+    // an answer either. Both shapes get the same refusal.
+    const record = await loadLatestReading(parsed.documentId, job.provenance, dbOpts);
+    if (record === null || record.content === null) {
       throw new StepChannelError(
         'verification_answer_missing',
-        `child ${childJobId} answered but no reading exists for document ${parsed.documentId}`,
+        `child ${childJobId} answered but no readable reading exists for document ${parsed.documentId}`,
         false,
       );
     }
@@ -613,7 +620,7 @@ Expected: FAIL — `assert.evaluate` has no implementation, so `runLocalTool` re
       draftText: parsed.draftText,
       sources: artifacts.map((artifact) => renderArtifactFull(artifact)),
       question: parsed.question,
-      answer: composeVerificationAnswer(reading.reading),
+      answer: composeVerificationAnswer(record.content),
       parentEnvelope: governing,
       businessId: ctx.businessId,
     });
@@ -670,12 +677,12 @@ git commit -m "The step that judges once the helper has answered"
 
 **Interfaces:**
 - Consumes: `bindPlanToJob(jobId, plan, options)` from `src/orchestrator/plan-store.ts`; `Plan`/`PlanStep` from `src/domain/plan.ts`; the `assert.evaluate` payload shape from Task 3.
-- Produces: a `gov.verify` job that carries a two-step plan and is NOT transitioned to `failed`.
+- Produces: a `gov.verify` job that carries a one-step judging plan and is NOT transitioned to `failed`. The delegation itself stays the direct `requestHelp` call it already is.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
-  it('binds a two-step plan to the gov.verify job and leaves it running', async () => {
+  it('binds a one-step judging plan to the gov.verify job and leaves it running', async () => {
     const { subjectJobId, documentId } = await seedCardRaised();
     await beginVerification({ subjectJobId, documentId, businessId: BUSINESS, /* …existing ctx */ });
 
@@ -684,11 +691,10 @@ git commit -m "The step that judges once the helper has answered"
     // unconditionally, every time, right after the delegation opened.
     expect(verifyJob?.phase).not.toBe('failed');
     const bound = await loadPlanForJob(verifyJob!.jobId, { businessId: BUSINESS });
-    expect(bound?.plan.steps.map((s) => s.toolName)).toEqual([
-      'agent.request_help',
-      'assert.evaluate',
-    ]);
-    expect(bound?.plan.steps[1]?.dependsOn).toEqual([bound?.plan.steps[0]?.id]);
+    // One step, and specifically NOT `agent.request_help` — see the plan header's
+    // note. A step naming that tool is floored at gate stage 8 by
+    // `provenanceCeiling['unknown_external']` before it can delegate.
+    expect(bound?.plan.steps.map((s) => s.toolName)).toEqual(['assert.evaluate']);
   });
 
   it('parks the gov.verify job on the delegation rather than ending it', async () => {
@@ -714,42 +720,36 @@ git commit -m "The step that judges once the helper has answered"
 Run: `npx vitest run src/orchestrator/conduct.test.ts`
 Expected: FAIL — the job is `failed` and no plan is bound.
 
-- [ ] **Step 3: Replace the direct call with a bound plan**
+- [ ] **Step 3: Bind the judging plan, and stop killing the job**
 
-Delete the `ctx.verifier({...})` call and the unconditional `transition(delegatingJob.jobId, { to: 'failed', … })` that follows it. In their place:
+Two edits, in this order.
+
+**First, bind the plan — BEFORE the existing `requestHelp` call**, while the job is still in `execute`. Binding after it would write a plan row for a job `requestHelp` has already moved to `followup`, which is the case `runPlan`'s own phase check exists to refuse.
 
 ```ts
-    // The delegating job gets a real plan, and the engine drives it from here.
+    // The delegating job gets a plan, and the engine drives the second half
+    // from here.
     //
-    // **Why this replaces calling `verifyDraft` directly and then ending the
-    // job.** A job in `execute` with no bound plan fails as `no_plan_bound` on
-    // the next `runDueJobs` pass, so the previous version ended the job itself
-    // to make that failure legible rather than mysterious. Binding a plan
-    // removes the cause instead of labelling the symptom: step 1 parks the job
-    // on the delegation, `resumeDelegatedJobs` wakes it when the answer lands,
-    // the same step completes, and step 2 judges. Nothing in the generic
-    // delegation machinery changes — see `agent.request_help`'s handler, which
-    // already implements all three of its passes.
+    // **One step, and deliberately not `agent.request_help`.** The delegation
+    // itself stays a direct `requestHelp` call below — the documented gate
+    // bypass this function already relies on. A plan step naming
+    // `agent.request_help` would classify as `agent.delegate`, and this job's
+    // provenance is `unknown_external`, so gate stage 8's minimum over
+    // ceilings (`provenanceCeiling['unknown_external'] === 'draft_only'`)
+    // refuses it before it can delegate at all. `CEILING_EXEMPT_TOOLS` does
+    // not help: it stops a tool CONTRIBUTING a ceiling to the plan, and never
+    // exempts a step from the ceilings that always apply. `assert.evaluate` is
+    // read-only, short-circuits at stage 4, and never reaches stage 8.
+    //
+    // **Bound before the park, not after.** `requestHelp` moves this job
+    // `execute → followup`, and `bindPlanToJob` on a job no longer in
+    // `execute` is exactly what `runPlan`'s phase check refuses.
     const plan: Plan = {
       goal: `אימות הטיוטה של משימה ${ctx.subjectJobId}`,
       assumptions: [],
       clarifyingQuestion: null,
       estimatedCostMinor: 0,
       steps: [
-        {
-          id: 'ask-reader',
-          agent: 'gov.verify',
-          intent: 'לברר מה המסמך מבקש בפועל',
-          toolName: 'agent.request_help',
-          input: {
-            to: 'know.reader',
-            intent: 'read_for_question',
-            payload: { question: VERIFICATION_QUESTION },
-            contextRefs: [{ kind: 'document', documentId: ctx.documentId }],
-          },
-          dependsOn: [],
-          expectedActionClass: null,
-        },
         {
           id: 'judge',
           agent: 'gov.verify',
@@ -761,16 +761,17 @@ Delete the `ctx.verifier({...})` call and the unconditional `transition(delegati
             draftText: draftTextFor(action),
             question: VERIFICATION_QUESTION,
           },
-          dependsOn: ['ask-reader'],
+          dependsOn: [],
           expectedActionClass: null,
         },
       ],
     };
     await bindPlanToJob(delegatingJob.jobId, plan, { businessId: ctx.businessId });
-    return { opened: true };
 ```
 
-`ctx.verifier` becomes unused by `beginVerification` — the judge now runs inside the step, injected through `ctx.verifier` on `LocalToolContext` instead. Remove the option from `beginVerification`'s own input type if nothing else reads it; if its test helpers pass it, update them rather than keeping a dead field.
+**Second, delete the unconditional kill.** The `transition(delegatingJob.jobId, { to: 'failed', … })` that follows the verifier call goes away entirely, and so does the `ctx.verifier({...})` call that produced its two-armed reason — the judge now runs inside the step, injected through `ctx.verifier` on `LocalToolContext` instead. Nothing replaces either: `requestHelp` has already parked the job, and `resumeDelegatedJobs` owns it from there.
+
+Remove `verifier` from `beginVerification`'s own input type if nothing else reads it, and update its test helpers rather than leaving a dead field. Keep the delegation's own `requestHelp` call, its arguments and its error handling exactly as they are — this task changes what happens around that call, never the call itself.
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
@@ -937,7 +938,7 @@ git commit -m "Prove the loop end to end, and correct what it makes false"
 
 ## Self-Review
 
-**Spec coverage.** §1 goal → Tasks 3–4. §2 (do not rebuild) → honoured: no task touches `agent.request_help`'s handler or `resumeDelegatedJobs`. §3 gap א' → Task 4; gap ב' → Task 3. §4 two-step plan → Task 4. §5 answer composition → Task 1. §6 terminal semantics and the verdict-shape change → Tasks 2 and 3. §7 informational verdict and `assert.evaluate` staying read-only → Task 3 Step 5 plus Task 6 Step 4 item 4. §8 card → Task 5. §9 out-of-scope → no task touches the autonomy dial, the missing envelope kinds, the intents seam, or any unimplemented agent; the two debts are recorded in Task 6 Step 4 items 4 and 5. §10 invariants: 1 → Task 6 Step 1; 2 → Task 3 Step 2 case 1 and Task 6; 3 → Task 3 Step 2 cases 2 and 3; 4 → Task 6 Step 1's envelope count; 5 → Task 6 Step 2; 6 → Task 3 Step 2 case 5; 7 → Global Constraints, and every negative test above asserts a positive marker.
+**Spec coverage.** §1 goal → Tasks 3–4. §2 (do not rebuild) → honoured: no task touches `agent.request_help`'s handler or `resumeDelegatedJobs`. §3 gap א' → Task 4; gap ב' → Task 3. §4 (amended: one step, not two — see the spec's own note) → Task 4. §5 answer composition → Task 1. §6 terminal semantics and the verdict-shape change → Tasks 2 and 3. §7 informational verdict and `assert.evaluate` staying read-only → Task 3 Step 5 plus Task 6 Step 4 item 4. §8 card → Task 5. §9 out-of-scope → no task touches the autonomy dial, the missing envelope kinds, the intents seam, or any unimplemented agent; the two debts are recorded in Task 6 Step 4 items 4 and 5. §10 invariants: 1 → Task 6 Step 1; 2 → Task 3 Step 2 case 1 and Task 6; 3 → Task 3 Step 2 cases 2 and 3; 4 → Task 6 Step 1's envelope count; 5 → Task 6 Step 2; 6 → Task 3 Step 2 case 5; 7 → Global Constraints, and every negative test above asserts a positive marker.
 
 **Placeholder scan.** No "TBD", no "handle edge cases", no "similar to Task N". Two places name existing test helpers (`seedAnsweredDelegation`, `seedCardRaised`, `stubJudge`, `stubReader`) that the implementer must write or adapt from the neighbouring tests in those files — called out explicitly in each task rather than assumed.
 
