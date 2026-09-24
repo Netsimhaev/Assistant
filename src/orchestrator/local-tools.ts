@@ -42,7 +42,7 @@ import type { PolicyBundle } from '../domain/policy.js';
 import { readDocument } from '../documents/read.js';
 import { readingsToday } from '../documents/store.js';
 import type { ReadOutcome, ReadRequest } from '../sdk/know-reader.js';
-import { loadEnvelopeForChildJob } from '../governance/envelope-store.js';
+import { loadEnvelopeForChildJob, loadResultForChildJob } from '../governance/envelope-store.js';
 import {
   recallMemories,
   retireMemories,
@@ -51,7 +51,7 @@ import {
   type MemoryRecord,
 } from '../memory/store.js';
 import { requestHelp } from './delegate.js';
-import { loadJob } from './jobs.js';
+import { loadJob, transition } from './jobs.js';
 import { StepChannelError } from './step-error.js';
 
 export interface LocalToolContext {
@@ -481,34 +481,75 @@ const HANDLERS: Record<string, LocalHandler> = {
           true,
         );
       }
+
+      // Fix round 2, item 2. This used to ask `child.phase` directly and
+      // complete only for a terminal one — which had no terminal phase to
+      // find for a child `resumeDelegatedJobs` woke the PARENT for on a
+      // TIMEOUT: that child is still running by definition. The resumed step
+      // then fell through to `delegation_pending` below every single time,
+      // and because that threw retryably, `executeStep` deferred through the
+      // generic path, which clears `awaiting_envelope_id` on every deferral —
+      // `resumeDelegatedJobs` never saw this parent again, its deadline could
+      // never fire a second time, and the parent polled on a flat five-minute
+      // timer forever instead of resolving.
+      //
+      // Reading the `result` envelope instead — the durable record
+      // `resumeDelegatedJobs` already wrote for a close, a failure, AND a
+      // timeout alike — fixes this uniformly: whichever of the three it is,
+      // an answer that exists is read and the step completes with it,
+      // without asking what phase the child happens to be in right now.
+      const resultEnvelope = await loadResultForChildJob(result.childJobId, dbOpts);
+      if (resultEnvelope !== null) {
+        const payload = resultEnvelope.payload;
+        const outcome =
+          typeof payload === 'object' && payload !== null && 'outcome' in payload
+            ? (payload as { outcome: unknown }).outcome
+            : undefined;
+        // A child that failed or halted still yields a `done` PARENT step
+        // here, deliberately: the parent never fails on its own account of
+        // its helper's outcome — that is `resumeDelegatedJobs`'s own decision
+        // for the envelope it writes, and this is the other half of it — the
+        // failure is carried in `outcome` for whatever reads this step's
+        // result next, not re-raised as this step's own failure.
+        return {
+          performed: true,
+          status: 'answered',
+          envelopeId: result.envelopeId,
+          childJobId: result.childJobId,
+          outcome: typeof outcome === 'string' ? outcome : 'unknown',
+        };
+      }
+
       const child = await loadJob(result.childJobId, dbOpts);
       if (child === null) {
         throw new Error(
           `runLocalTool: agent.request_help's child ${result.childJobId} does not exist`,
         );
       }
-      if (child.phase === 'closed' || child.phase === 'failed' || child.phase === 'halted') {
-        // A resumed run hitting the same step again, after
-        // `resumeDelegatedJobs` already freed this job — the child has an
-        // answer, and this step completes normally (not `parked`: nothing
-        // here moves the job, `executeStep` records this as `done` and moves
-        // on like any other step).
-        return {
-          performed: true,
-          status: 'answered',
-          envelopeId: result.envelopeId,
-          childJobId: result.childJobId,
-          outcome: child.phase === 'closed' ? 'succeeded' : 'failed',
-        };
-      }
-      // The child has not finished yet, and this is not the call that opened
-      // it (that one already parked the job on the first pass). Retryable,
-      // exactly like any other pending external call.
-      throw new StepChannelError(
-        'delegation_pending',
-        `child job ${result.childJobId} has not reached a terminal phase yet`,
-        true,
-      );
+
+      // No answer yet — re-park under the SAME envelope rather than throw a
+      // `delegation_pending` retry through the generic path. `transition`
+      // overwrites `awaiting_envelope_id` on every move rather than merging
+      // with it, so a plain retryable throw here would clear the column via
+      // `executeStep`'s deferral branch, and `resumeDelegatedJobs` — the ONLY
+      // mechanism enforcing this delegation's deadline — would never look at
+      // this parent again. Re-parking under the same envelope id keeps that
+      // mechanism in charge of the wait instead of an uncapped five-minute
+      // poll.
+      await transition(ctx.jobId, {
+        to: 'followup',
+        actor: 'orchestrator',
+        reason: `ממתין לתשובת ${parsed.to} על "${parsed.intent}" (מעטפת ${result.envelopeId})`,
+        awaitingEnvelopeId: result.envelopeId,
+        businessId: ctx.businessId,
+      });
+      return {
+        performed: false,
+        status: 'pending',
+        envelopeId: result.envelopeId,
+        childJobId: result.childJobId,
+        parked: true,
+      };
     }
 
     // result.status === 'refused'. Most refusals leave `ctx.jobId` exactly

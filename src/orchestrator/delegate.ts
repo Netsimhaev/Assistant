@@ -344,26 +344,36 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
     deadlineAt: new Date(now.getTime() + DEFAULT_DELEGATION_WINDOW_MS).toISOString(),
   };
 
-  // 3. The guards this function owns. Hop limit, daily cap, idempotency,
-  // no-new-information, oscillation — the graph (who may ask whom) was
-  // already checked by the gate before `requestHelp` was ever called.
-  const hopDenial = hopGuard(parentHops);
-  if (hopDenial !== null) return { status: 'refused', ...hopDenial };
-
-  const usedToday = await delegationsToday({ businessId });
-  const capDenial = dailyCapGuard(usedToday, config.delegationsPerDay);
-  if (capDenial !== null) return { status: 'refused', ...capDenial };
-
+  // 3. The guards this function owns — and guard 3 (idempotency) runs FIRST,
+  // before hop, cap, no-new-information and oscillation alike. Round 1 of
+  // this task's review put it ahead of guard 4 only, and that was not
+  // enough: `dailyCapGuard` reads `delegationsToday()`, a SHARED,
+  // TIME-VARYING counter, so its answer can differ between the call that
+  // opened this exact delegation and the resumed call retrying it — an
+  // installation that reaches its daily cap between the two would fail
+  // every parked parent resuming that day with `daily_cap`, even though each
+  // one is asking nothing new. `hopGuard` has no such hazard (`parentHops` is
+  // derived identically both times), but there is no reason to trust that of
+  // every future guard added here, and "the answer to an already-answered
+  // question never depends on today's counters" is the simpler invariant to
+  // hold. A repeat of an already-answered request is checked and answered
+  // before ANY of this function's own guards run.
+  //
+  // `parentJobId` is part of the key — not just
+  // `(correlationId, from, to, intent, contextRefsHash, payload)` — because
+  // two DIFFERENT parent jobs in the same correlation can legitimately issue
+  // the byte-identical request (a sibling asking the same thing `from` the
+  // same agent `to` the same agent about the same context). Without
+  // `parentJobId`, the second one would silently resolve to the FIRST one's
+  // envelope and child — reporting `duplicate`/`answered` for a delegation it
+  // never opened, with no envelope of its own. Adding it also restores the
+  // division between this guard and guard 4 that the reordering blurred:
+  // guard 3 now answers "is THIS JOB retrying its own prior request", and
+  // guard 4 (`noNewInformationGuard`, unchanged — it stays keyed without
+  // `parentJobId`) answers "has ANYONE in this tree already asked this".
   const refsHash = contextRefsHash(input.contextRefs);
-
-  // Guard 3, and it runs BEFORE guard 4 on purpose — see
-  // `loadEnvelopeByIdempotencyKey`'s own docblock for the defect this
-  // ordering fixes. A `parked` step (`execute.ts`) writes no completion row,
-  // so a resumed run's retry of THIS SAME request computes the identical
-  // idempotency key the first, successful call already wrote; guard 4 would
-  // refuse it as "you already asked this" before this more specific answer —
-  // "you already asked this, and here is the child it opened" — ever ran.
   const idempotencyKey = canonicalHash({
+    parentJobId: parent.jobId,
     correlationId,
     from: input.from,
     to: input.to,
@@ -379,6 +389,13 @@ export async function requestHelp(input: RequestHelpInput): Promise<RequestHelpR
       childJobId: alreadyAnswered.childJobId,
     };
   }
+
+  const hopDenial = hopGuard(parentHops);
+  if (hopDenial !== null) return { status: 'refused', ...hopDenial };
+
+  const usedToday = await delegationsToday({ businessId });
+  const capDenial = dailyCapGuard(usedToday, config.delegationsPerDay);
+  if (capDenial !== null) return { status: 'refused', ...capDenial };
 
   const prior = await priorQuadruples(correlationId, { businessId });
   const noInfoDenial = noNewInformationGuard(

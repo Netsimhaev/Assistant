@@ -186,22 +186,33 @@ export async function loadEnvelopeWithChild(
  * One envelope by its idempotency key, together with the `child_job_id`
  * column — or `null` if this exact request was never answered before.
  *
- * **This is guard 3, checked BEFORE guard 4 (`noNewInformationGuard`) inside
- * `requestHelp`, and the ordering is the fix, not a detail of it.** A
- * `parked` step (`execute.ts`'s `StepOutcome`) writes no completion row, so a
- * resumed run's retry of `agent.request_help` calls `requestHelp` again with
- * byte-identical `(correlationId, from, to, intent, contextRefsHash,
- * payload)` — which means the SAME idempotency key the first, successful
- * call already wrote. Guard 4 alone would refuse that as
- * `no_new_information`, which is true but is the wrong answer: the specific
- * fact "I already did exactly this, here is the child it opened" was being
- * shadowed by the general fact "you are asking the same thing again", and
- * `requestHelp`'s caller (`local-tools.ts`'s `agent.request_help` handler)
- * cannot tell that refusal apart from a genuine one — it read the parent's
- * phase as still `execute`, threw non-retryably, and `executeStep` failed the
- * parent job outright. Checking this first, by the idempotency key alone
- * (unscoped by `correlationId`, unlike guard 4), answers the resumed run
- * correctly before guard 4 ever runs.
+ * **This is guard 3, checked BEFORE every other guard `requestHelp` owns —
+ * hop, daily cap, no-new-information, oscillation — and the ordering is the
+ * fix, not a detail of it.** A `parked` step (`execute.ts`'s `StepOutcome`)
+ * writes no completion row, so a resumed run's retry of `agent.request_help`
+ * calls `requestHelp` again with a byte-identical request, which means the
+ * SAME idempotency key the first, successful call already wrote. Guard 4
+ * alone would refuse that as `no_new_information` — true, but the wrong
+ * answer, and `requestHelp`'s caller (`local-tools.ts`'s `agent.request_help`
+ * handler) cannot tell that refusal apart from a genuine one, so it read the
+ * parent's phase as still `execute`, threw non-retryably, and `executeStep`
+ * failed the parent job outright. Checking guard 3 first only got half of
+ * this fixed: `dailyCapGuard` reads a SHARED, TIME-VARYING counter
+ * (`delegationsToday()`), so an installation that reached its cap between
+ * the original call and the resumed one still failed every parked parent
+ * that day — a repeat of an already-answered request must not depend on
+ * ANY guard's answer, because the question it is answering ("did this
+ * already happen") has nothing to do with today's counters.
+ *
+ * The key includes `parentJobId`, not just
+ * `(correlationId, from, to, intent, contextRefsHash, payload)` — two
+ * DIFFERENT parent jobs in one correlation can legitimately issue the
+ * byte-identical request, and without `parentJobId` the second one would
+ * silently resolve to the first one's envelope and child rather than being
+ * refused or opening its own. That also restores the division between guard
+ * 3 and guard 4: guard 3 now answers "is THIS JOB retrying its own prior
+ * request", and guard 4 (unscoped by `parentJobId`) answers "has ANYONE in
+ * this tree already asked this".
  */
 export async function loadEnvelopeByIdempotencyKey(
   idempotencyKey: string,
@@ -364,6 +375,50 @@ export async function loadEnvelopeForChildJob(
        FROM agent_envelopes
       WHERE business_id = $1 AND child_job_id = $2`,
     [businessId, childJobId],
+  );
+  const row = rows[0];
+  return row ? toEnvelope(row) : null;
+}
+
+/**
+ * The `result` envelope answering a delegation, found by the child job it
+ * names — or `null` if `resumeDelegatedJobs` has not yet decided this
+ * delegation's outcome.
+ *
+ * `resumeDelegatedJobs` (`orchestrator/resume-delegated.ts`) writes exactly
+ * this shape: `kind = 'result'`, `contextRefs: [{kind:'job', jobId:
+ * <childJobId>}]`, for a close, a failure, or a timeout alike. This is what
+ * lets `agent.request_help`'s own handler (`orchestrator/local-tools.ts`)
+ * complete a resumed step UNIFORMLY across all three outcomes by reading the
+ * answer, rather than re-deriving one from the child's raw phase — which
+ * broke specifically for a timeout: a child woken past its deadline while
+ * still running has no terminal phase at all, so a phase-based check finds
+ * nothing to complete the step with and the parent polls forever.
+ *
+ * `context_refs @> $2::jsonb` (containment), not equality: `contextRefs` is
+ * an array, and the result envelope always carries this one ref as its only
+ * element, but containment is what generalises correctly for the same reason
+ * `contextRefsHash` sorts before hashing (`delegation.ts`) — this reads
+ * whichever position holds it rather than assuming exactly one.
+ * `ORDER BY created_at DESC LIMIT 1` is defensive: `resumeDelegatedJobs`
+ * should produce at most one, but the newest is the honest answer if that
+ * ever stops being true.
+ */
+export async function loadResultForChildJob(
+  childJobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<AgentEnvelope | null> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<EnvelopeRow>(
+    `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
+            intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
+            child_job_id
+       FROM agent_envelopes
+      WHERE business_id = $1 AND kind = 'result' AND context_refs @> $2::jsonb
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [businessId, JSON.stringify([{ kind: 'job', jobId: childJobId }])],
   );
   const row = rows[0];
   return row ? toEnvelope(row) : null;

@@ -111,6 +111,37 @@ describe('priorQuadruples', () => {
       intent: 'summarise_document',
     });
   });
+
+  /**
+   * Fix round 2, item 4. `resumeDelegatedJobs` (Task 7) writes a `result`
+   * envelope answering a request in the OPPOSITE direction — same
+   * correlation, `from`/`to` swapped. Without `kind = 'help_request'` here,
+   * that answer counts as a fresh request from the child back to the
+   * parent, and a genuine reverse request would land on guard 4
+   * (`no_new_information`) as though it had already been asked.
+   */
+  it('excludes a result envelope even though it shares the correlation and would otherwise match', async () => {
+    const correlationId = 'JOB-root';
+    const request = anEnvelope({
+      correlationId,
+      from: 'comms.email',
+      to: 'know.reader',
+      intent: 'summarise_document',
+    });
+    await writeEnvelope(request, { parentJobId: correlationId, businessId: BUSINESS });
+    const answer = anEnvelope({
+      correlationId,
+      kind: 'result',
+      from: 'know.reader',
+      to: 'comms.email',
+      intent: 'summarise_document',
+    });
+    await writeEnvelope(answer, { parentJobId: correlationId, businessId: BUSINESS });
+
+    const quadruples = await priorQuadruples(correlationId, { businessId: BUSINESS });
+    expect(quadruples).toHaveLength(1);
+    expect(quadruples[0]).toMatchObject({ from: 'comms.email', to: 'know.reader' });
+  });
 });
 
 describe('countPairExchanges', () => {
@@ -141,6 +172,33 @@ describe('countPairExchanges', () => {
       { businessId: BUSINESS },
     );
     expect(count).toBe(2);
+  });
+
+  /**
+   * Same defect as `priorQuadruples`'s own test above, guard 5's side: a
+   * `result` envelope answering A→B must not count toward how many times B
+   * has asked A back, or a genuine reverse exchange hits the oscillation
+   * guard sooner than it earned.
+   */
+  it('excludes a result envelope from the reverse-direction count', async () => {
+    const correlationId = 'JOB-root';
+    const answer = anEnvelope({
+      correlationId,
+      kind: 'result',
+      from: 'know.reader',
+      to: 'comms.email',
+      intent: 'summarise_document',
+    });
+    await writeEnvelope(answer, { parentJobId: correlationId, businessId: BUSINESS });
+
+    const count = await countPairExchanges(
+      correlationId,
+      'know.reader',
+      'comms.email',
+      'summarise_document',
+      { businessId: BUSINESS },
+    );
+    expect(count).toBe(0);
   });
 });
 

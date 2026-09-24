@@ -614,6 +614,58 @@ describe('the local tool executor', () => {
     });
 
     /**
+     * Fix round 2, item 2. A resumed run of the same step while the child is
+     * STILL RUNNING and no `result` envelope exists yet must not throw a
+     * plain retryable error: `executeStep`'s generic deferral clears
+     * `awaiting_envelope_id` on every move (`transition` overwrites it,
+     * never merges), and clearing it here would mean `resumeDelegatedJobs` —
+     * the only thing enforcing this delegation's deadline — never looks at
+     * this parent again. The fix re-parks under the SAME envelope id, so the
+     * next scheduler pass finds it exactly as it would have found a freshly
+     * opened delegation.
+     */
+    it('re-parks under the same envelope when resumed before the child has answered, rather than clearing the watch', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+      const input = {
+        to: 'know.reader' as const,
+        intent: 'read_for_question',
+        payload: { question: 'מה המסמך הזה מבקש?' },
+        contextRefs: [{ kind: 'document' as const, documentId }],
+      };
+      const ctx = { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' as const };
+
+      const first = await runLocalTool('agent.request_help', input, ctx);
+      expect(first['status']).toBe('delegated');
+      const envelopeId = first['envelopeId'] as string;
+      const childJobId = first['childJobId'] as string;
+
+      // Simulate the resumed run: the parent is back in `execute` (as
+      // `resumeDelegatedJobs` would only ever put it once it has an answer —
+      // this test deliberately does NOT go through it, to isolate what the
+      // handler does when no `result` envelope exists at all), and the SAME
+      // step runs again.
+      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
+
+      const second = await runLocalTool('agent.request_help', input, ctx);
+      expect(second['performed']).toBe(false);
+      expect(second['status']).toBe('pending');
+      expect(second['parked']).toBe(true);
+      expect(second['envelopeId']).toBe(envelopeId);
+      expect(second['childJobId']).toBe(childJobId);
+
+      const parent = await loadJob(jobId, { businessId: BUSINESS });
+      expect(parent?.phase).toBe('followup');
+      // The SAME envelope id — not cleared, not a new one — so
+      // `resumeDelegatedJobs` keeps watching this exact delegation.
+      expect(parent?.awaitingEnvelopeId).toBe(envelopeId);
+
+      // The child itself is untouched by any of this.
+      const child = await loadJob(childJobId, { businessId: BUSINESS });
+      expect(child?.phase).toBe('execute');
+    });
+
+    /**
      * Fix round 1, Important 4. `loadEnvelopeForChildJob` had no test at all:
      * both cases above use a root parent, so the lookup returns `null`
      * either way and a mutation replacing the real call with a literal

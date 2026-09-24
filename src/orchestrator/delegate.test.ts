@@ -397,6 +397,7 @@ describe('requestHelp', () => {
     const request = baseRequest(job, bundle);
     const refsHash = contextRefsHash(request.contextRefs);
     const idempotencyKey = canonicalHash({
+      parentJobId: job.jobId,
       correlationId: job.jobId, // what requestHelp will use — job is root
       from: request.from,
       to: request.to,
@@ -436,6 +437,7 @@ describe('requestHelp', () => {
     const request = baseRequest(job, bundle);
     const refsHash = contextRefsHash(request.contextRefs);
     const idempotencyKey = canonicalHash({
+      parentJobId: job.jobId,
       correlationId: job.jobId,
       from: request.from,
       to: request.to,
@@ -528,6 +530,123 @@ describe('requestHelp', () => {
 
     const { rows } = await getPool().query('SELECT 1 FROM agent_envelopes WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
+  });
+
+  /**
+   * Fix round 2, item 1. `dailyCapGuard` reads `delegationsToday()`, a
+   * SHARED, TIME-VARYING counter — checking guard 3 (idempotency) before
+   * guard 4/5 alone was not enough, because the cap could still be reached
+   * BETWEEN the call that opened this exact delegation and the resumed call
+   * retrying it. Before this fix: the resumed run of a `parked` step would be
+   * refused `daily_cap` even though it asks nothing new, the handler would
+   * see the parent still in `execute`, throw non-retryably, and the parent
+   * would be marked `failed` with its child's answer sitting unread. Once an
+   * installation hits its cap, EVERY parked parent resuming that day would
+   * fail this way.
+   */
+  it('resumes past an exhausted daily cap when the request repeats one already answered', async () => {
+    const { job, bundle } = await openParentJob();
+    const request = baseRequest(job, bundle);
+
+    const first = await requestHelp(request);
+    if (first.status !== 'opened') throw new Error('expected opened');
+
+    // Exhaust the cap with unrelated rows, on top of the one real row the
+    // successful call above just wrote — an ordinary operational state, not
+    // corruption.
+    for (let i = 0; i < config.delegationsPerDay; i++) {
+      await getPool().query(
+        `INSERT INTO audit_log (
+           business_id, actor, kind, charter_version, provenance, input_hash, reason, prev_hash, hash
+         ) VALUES ($1, 'orchestrator', 'delegation', $2, 'boss', 'seed', 'seed row', $3, $4)`,
+        [BUSINESS, bundle.charterVersion, '1'.repeat(64), i.toString(16).padStart(64, '0')],
+      );
+    }
+
+    await retryParent(job.jobId);
+    const resumed = await requestHelp(request);
+    expect(resumed.status).toBe('duplicate');
+    if (resumed.status !== 'duplicate') throw new Error('expected duplicate');
+    expect(resumed.envelopeId).toBe(first.envelopeId);
+    expect(resumed.childJobId).toBe(first.childJobId);
+  });
+
+  /**
+   * Fix round 2, item 3, the other direction. Adding `parentJobId` to guard
+   * 3's key restores the division between the two guards: guard 3 answers
+   * "is THIS JOB retrying its own prior request" and must say yes only for
+   * the actual retrying job; guard 4 (unscoped by `parentJobId`) answers "has
+   * ANYONE in this tree already asked this" and must still catch a genuine
+   * sibling. Two real jobs share one correlation by both being attached,
+   * separately, to real ancestor envelopes naming the same `correlationId`.
+   */
+  it('a sibling job asking the identical question is refused by guard 4, not silently answered as a duplicate', async () => {
+    // One shared charter for both siblings — each ancestor envelope's
+    // `constraints.charterVersion` must name a version `createJob` can
+    // actually satisfy the foreign key for, and `openParentJob` (which
+    // installs a fresh, uniquely-versioned charter per call) would give the
+    // two jobs two different ones.
+    const bundle = await installCharter(buildCharter({ version: `siblings-${ulid()}` }), {
+      businessId: BUSINESS,
+    });
+    async function jobUnderSharedCharter(): Promise<Job> {
+      const created = await createJob({
+        charterVersion: bundle.charterVersion,
+        provenance: 'boss',
+        businessId: BUSINESS,
+        title: 'sibling job',
+      });
+      for (const to of ['understand', 'plan', 'execute'] as const) {
+        await transition(created.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      }
+      const loaded = await loadJob(created.jobId, { businessId: BUSINESS });
+      if (loaded === null) throw new Error('job vanished');
+      return loaded;
+    }
+    const jobA = await jobUnderSharedCharter();
+    const jobB = await jobUnderSharedCharter();
+
+    const ancestorForA = anAncestorEnvelope({
+      id: `ENV-${ulid()}`,
+      correlationId: 'JOB-shared-root',
+      hops: 1,
+      constraints: {
+        charterVersion: bundle.charterVersion,
+        provenanceCeiling: 'boss',
+        autonomyCeiling: 'auto',
+        moneyCeilingMinor: null,
+        deadlineAt: '2026-12-31T00:00:00.000Z',
+      },
+    });
+    await seedAncestor(ancestorForA, jobA.jobId);
+    const ancestorForB = anAncestorEnvelope({
+      id: `ENV-${ulid()}`,
+      correlationId: 'JOB-shared-root',
+      hops: 1,
+      constraints: ancestorForA.constraints,
+    });
+    await seedAncestor(ancestorForB, jobB.jobId);
+
+    const openedA = await requestHelp(baseRequest(jobA, bundle, { parentEnvelope: ancestorForA }));
+    expect(openedA.status).toBe('opened');
+
+    const before = await getPool().query<{ n: string }>(
+      'SELECT count(*)::text AS n FROM agent_envelopes WHERE business_id = $1',
+      [BUSINESS],
+    );
+
+    const resultB = await requestHelp(baseRequest(jobB, bundle, { parentEnvelope: ancestorForB }));
+    expect(resultB.status).toBe('refused');
+    if (resultB.status !== 'refused') throw new Error('expected refused');
+    expect(resultB.code).toBe('no_new_information');
+
+    // No envelope was written for B's refused request — the two ancestors
+    // plus A's one real envelope, unchanged.
+    const after = await getPool().query<{ n: string }>(
+      'SELECT count(*)::text AS n FROM agent_envelopes WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(after.rows[0]?.n).toBe(before.rows[0]?.n);
   });
 
   it('refuses an unregistered intent', async () => {
