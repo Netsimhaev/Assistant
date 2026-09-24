@@ -1179,11 +1179,21 @@ describe('the local tool executor', () => {
 
     it('files "not judged" with reason timeout when the deadline fired', async () => {
       const { parentJobId, subjectJobId, documentId, bundle } = await seedAnsweredDelegation('timeout');
+      // Counted here for the same reason it is counted on the `failed` case:
+      // the point of both is that the judge did not run at all, and a test
+      // that only reads the filed row would pass on a handler that billed a
+      // call and then discarded it.
+      let judgeCalls = 0;
+      const counting = async (input: VerifyDraftInput) => {
+        judgeCalls += 1;
+        return stubJudge(input);
+      };
       const outcome = await runLocalTool(
         'assert.evaluate',
         { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: stubJudge },
+        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
       );
+      expect(judgeCalls).toBe(0);
       expect(outcome).toMatchObject({ status: 'not_judged', reason: 'timeout' });
       expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
         status: 'not_judged',
@@ -1213,12 +1223,18 @@ describe('the local tool executor', () => {
     });
 
     /**
-     * A reading row that exists and carries no content is not an answer
-     * either. `ReadingRecord.content` is `Reading | null`, and a record whose
-     * `status` is `unreadable` is exactly that shape — refused identically to
-     * a missing one, never treated as an empty answer worth judging.
+     * The delegation succeeded and came back with nothing to judge.
+     * `ReadingRecord.content` is `Reading | null`, and a record whose `status`
+     * is `unreadable` is exactly that shape — `know.reader` returns it for a
+     * document it could not read, and its child job closes normally, so the
+     * `result` envelope says `succeeded`.
+     *
+     * **Filed, not thrown.** A refusal would write no row, and absence in this
+     * table means "still running" — so every unreadable document would have
+     * left its card saying that forever. `unreadable` is the third
+     * `NotJudgedReason` (migration 031) for exactly this state.
      */
-    it('refuses an unreadable reading the same way as a missing one, and calls no judge', async () => {
+    it('files "not judged" with reason unreadable when the reading carries no content', async () => {
       const { parentJobId, subjectJobId, documentId, bundle } =
         await seedAnsweredDelegation('succeeded');
       // Newer than the readable row seeded above, so `loadLatestReading` — which
@@ -1243,19 +1259,93 @@ describe('the local tool executor', () => {
         return stubJudge(input);
       };
 
+      const outcome = await runLocalTool(
+        'assert.evaluate',
+        { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
+        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
+      );
+
+      expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'unreadable' });
+      expect(judgeCalls).toBe(0);
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+        status: 'not_judged',
+        reason: 'unreadable',
+      });
+    });
+
+    /**
+     * The same state reached the other way: a document with no extracted parts
+     * makes `doc.fetch` return `no_artifacts` and save no reading at all, and
+     * the child still completes. A missing row and an empty one mean the same
+     * thing here — the helper had nothing to tell us — and must file the same
+     * reason rather than one filing and one refusing.
+     */
+    it('files "not judged" with reason unreadable when no reading was saved at all', async () => {
+      const { parentJobId, subjectJobId, bundle } = await seedAnsweredDelegation('succeeded');
+      // A document this job never read: no `document_readings` row exists for
+      // it under any provenance.
+      const unreadDocumentId = `DOC-${ulid()}`;
+      let judgeCalls = 0;
+      const counting = async (input: VerifyDraftInput) => {
+        judgeCalls += 1;
+        return stubJudge(input);
+      };
+
+      const outcome = await runLocalTool(
+        'assert.evaluate',
+        {
+          subjectJobId,
+          documentId: unreadDocumentId,
+          draftText: 'טיוטה',
+          question: VERIFICATION_QUESTION,
+        },
+        { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
+      );
+
+      expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'unreadable' });
+      expect(judgeCalls).toBe(0);
+      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+        status: 'not_judged',
+        reason: 'unreadable',
+      });
+    });
+
+    /**
+     * `answer` is non-null on every call this handler makes, so `verifyDraft`
+     * has no branch left that delegates — and if one appears, the step must
+     * say so loudly rather than file a verdict it never got. Only a stub can
+     * produce this shape today; the refusal is here so the day the real
+     * function's branching changes, it fails visibly.
+     */
+    it('refuses if the verifier delegates a second time, and files nothing', async () => {
+      const { parentJobId, subjectJobId, documentId, childJobId, bundle } =
+        await seedAnsweredDelegation('succeeded');
+      const delegatingAgain = async (): Promise<VerifyDraftResult> => ({
+        status: 'awaiting_delegation',
+        envelopeId: `ENV-${ulid()}`,
+        childJobId,
+        ungroundedNumbers: [],
+      });
+
       let caught: unknown;
       try {
         await runLocalTool(
           'assert.evaluate',
           { subjectJobId, documentId, draftText: 'טיוטה', question: VERIFICATION_QUESTION },
-          { jobId: parentJobId, businessId: BUSINESS, bundle, agent: 'gov.verify', verifier: counting },
+          {
+            jobId: parentJobId,
+            businessId: BUSINESS,
+            bundle,
+            agent: 'gov.verify',
+            verifier: delegatingAgain,
+          },
         );
       } catch (error) {
         caught = error;
       }
       expect(caught).toBeInstanceOf(StepChannelError);
-      expect((caught as StepChannelError).code).toBe('verification_answer_missing');
-      expect(judgeCalls).toBe(0);
+      expect((caught as StepChannelError).code).toBe('verification_delegated_again');
+      expect((caught as StepChannelError).retryable).toBe(false);
       expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toBeNull();
     });
 

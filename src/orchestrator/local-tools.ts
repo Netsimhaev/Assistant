@@ -730,21 +730,38 @@ const HANDLERS: Record<string, LocalHandler> = {
       return { performed: true, status: 'not_judged', reason: payload.data.outcome };
     }
 
-    const job = await loadJob(ctx.jobId, dbOpts);
-    if (job === null) {
-      throw new Error(`runLocalTool: assert.evaluate could not load job ${ctx.jobId}`);
-    }
-    // `ReadingRecord.content` is `Reading | null` — a record whose `status` is
-    // `unreadable` exists but carries nothing to compose from, and that is not
-    // an answer either. Both shapes get the same refusal.
-    const record = await loadLatestReading(parsed.documentId, job.provenance, dbOpts);
-    if (record === null || record.content === null) {
-      throw new StepChannelError(
-        'verification_answer_missing',
-        `child ${childJobId} answered but no readable reading exists for document ` +
-          `${parsed.documentId}`,
-        false,
+    // **The CHILD's provenance, never this job's.** `loadLatestReading` is
+    // keyed on it, and the row was written by the child: `requestHelp` gives
+    // that job `constraints.provenanceCeiling`, which `tightenConstraints`
+    // may lower below the delegating job's own level. The two are equal today
+    // — both `unknown_external` — and reading the parent's would work by
+    // coincidence, not by construction: the moment they diverge, the key
+    // misses the reading the child actually wrote and either refuses forever
+    // or composes from an older row at the wrong trust level.
+    const child = await loadJob(childJobId, dbOpts);
+    if (child === null) {
+      throw new Error(
+        `runLocalTool: assert.evaluate's child job ${childJobId} does not exist`,
       );
+    }
+    const record = await loadLatestReading(parsed.documentId, child.provenance, dbOpts);
+    // Two shapes, one meaning: the delegation succeeded and came back with
+    // nothing to judge. `ReadingRecord.content` is `Reading | null`, so a
+    // record whose `status` is `unreadable` exists and carries nothing to
+    // compose from; and a document with no extracted parts at all makes
+    // `doc.fetch` return `no_artifacts` without saving any reading, so the
+    // child still completes and no row exists to find. Both are ordinary
+    // production states, not corruption.
+    //
+    // **Filed, not thrown.** A refusal here would write no row, and this
+    // table's whole purpose is that absence means "still running" and nothing
+    // else — so an unreadable document would have left its card saying that
+    // forever. `unreadable` (migration 031) is the third `NotJudgedReason` for
+    // exactly this, and it is deliberately not one of the two that come from
+    // `DelegationOutcome`: the delegation did not fail.
+    if (record === null || record.content === null) {
+      await saveNotJudged(parsed.subjectJobId, 'unreadable', dbOpts);
+      return { performed: true, status: 'not_judged', reason: 'unreadable' };
     }
 
     const artifacts = await loadArtifacts(parsed.documentId, dbOpts);
@@ -766,6 +783,9 @@ const HANDLERS: Record<string, LocalHandler> = {
       // being non-null means we cannot reach.
       parentEnvelope: await loadEnvelopeForChildJob(ctx.jobId, dbOpts),
       businessId: ctx.businessId,
+      // So `verifyDraft`'s own `saveVerdict` and this handler's land on the
+      // SAME connection — see `VerifyDraftInput.db`.
+      ...(ctx.db !== undefined ? { db: ctx.db } : {}),
     });
 
     // `'status' in result` alone, not `&& result.status === 'awaiting_delegation'`:
@@ -785,10 +805,10 @@ const HANDLERS: Record<string, LocalHandler> = {
     }
     // `verifyDraft` already filed this verdict on its own way out, and this
     // write is deliberately not removed as redundant: an injected `verifier`
-    // has no such obligation, and only this call lands on `ctx.db` when the
-    // caller is running inside a transaction. `saveVerdict` is an upsert on
-    // `(business_id, job_id)`, so the second write of the same verdict is the
-    // same row.
+    // has no such obligation. Both now run on the same connection — `ctx.db`
+    // is threaded into `VerifyDraftInput.db` above — and `saveVerdict` is an
+    // upsert on `(business_id, job_id)`, so the second write of the same
+    // verdict is the same row.
     await saveVerdict(parsed.subjectJobId, result, dbOpts);
     return { performed: true, status: 'judged' };
   },

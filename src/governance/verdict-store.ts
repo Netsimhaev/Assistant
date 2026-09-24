@@ -136,13 +136,23 @@ export async function loadVerdict(
 }
 
 /**
- * Why a verification produced no judgment. Both values come from
- * `DelegationOutcome` (`src/domain/envelope.ts`) — the helper failed, or it
- * never answered inside the envelope's deadline. `succeeded` is deliberately
- * absent: a delegation that succeeded produces a real `Verdict`, so there is
- * no third value this enum could carry without meaning "judged after all".
+ * Why a verification produced no judgment.
+ *
+ * The first two come from `DelegationOutcome` (`src/domain/envelope.ts`) — the
+ * helper failed, or it never answered inside the envelope's deadline. They say
+ * something about the DELEGATION.
+ *
+ * `unreadable` (migration 031) says something else, and `succeeded` is still
+ * deliberately absent as a value: the delegation succeeded, and the answer it
+ * came back with is empty. `know.reader` returns
+ * `{ performed: true, status: 'unreadable' }` for a document it could not read,
+ * so its child job completes, the `result` envelope reads `succeeded`, and the
+ * saved `ReadingRecord` carries `content: null`. Before this member the judging
+ * step had nothing to file for that and refused — which left every unreadable
+ * document's card reading "still running" forever, the one ambiguity this
+ * table exists to remove.
  */
-export const NotJudgedReason = z.enum(['failed', 'timeout']);
+export const NotJudgedReason = z.enum(['failed', 'timeout', 'unreadable']);
 export type NotJudgedReason = z.infer<typeof NotJudgedReason>;
 
 /**
