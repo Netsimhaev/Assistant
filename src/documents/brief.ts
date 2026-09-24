@@ -33,9 +33,19 @@ export const BRIEF_TOTAL_CHARS = 24_000;
 const TRUNCATED = (what: string, kept: number): string =>
   `\n(קוצץ — מוצגים ${kept} ${what} בלבד; במסמך יש יותר)`;
 
+/**
+ * `cell` is narrowed here rather than trusted, the same posture `renderTable`
+ * takes for a whole row one level up — fix round 4, item 2: `cell.v` throws
+ * on a malformed cell (`null`/`undefined`) exactly the way `row.map(cellText)`
+ * threw on a malformed ROW before round 3's item 3 guarded that; a table
+ * whose row IS an array but holds a malformed cell (`[null, {v:60}]`) threw
+ * on the now-uncapped full path only, since the capped path never mapped far
+ * enough to reach it. A malformed cell renders as an empty string, not fatal
+ * to the row it sits in.
+ */
 function cellText(cell: Cell): string {
-  if (cell.v === null) return '';
-  return String(cell.v);
+  const value = (cell as Cell | null | undefined)?.v;
+  return value === null || value === undefined ? '' : String(value);
 }
 
 /**
@@ -53,10 +63,12 @@ function cellText(cell: Cell): string {
  * round 3's item 3: the capped path never reached past row 40 of whatever a
  * real extractor produced, so a malformed row further down never had a
  * chance to throw; removing the cap on the full path means it now does,
- * unless guarded. A malformed row is dropped from the rendered table, not
- * fatal to the whole artefact — the same posture `renderContent`'s own
- * "narrowed here rather than trusted" already takes for `content` as a
- * whole, one level down.
+ * unless guarded. A malformed row is dropped from the RENDERED TABLE, not
+ * fatal to it — true of that one shape (a non-array row) specifically, not a
+ * blanket guarantee about every way `content` could be malformed; a row that
+ * IS an array but holds a malformed CELL is `cellText`'s own guard, one level
+ * down (fix round 4, item 2), for the identical reason: the capped path never
+ * mapped far enough to reach a cell past row 40 either.
  */
 function renderTable(content: TableContent, maxRows: number): string {
   const rows = content.rows;
@@ -168,12 +180,15 @@ function renderContent(artifact: DocumentArtifact): string {
  * storage — sheet count, rows per sheet/table, characters per cell — and
  * record that a cap applied on `artifact.flags` (`truncated`, and friends).
  * This function reads only `content`, never `flags`. That is a WEAKER
- * guarantee than `renderReadingBrief`'s own: that function's caller
- * (`renderReadingBrief` itself) prints `artifact.flags` into every section's
- * own header line, so a reader of the brief IS told a part was truncated
- * upstream — this function has no such header at all, and hands back bare
- * content with no notice that anything was ever cut before storage. A
- * number that fell outside an EXTRACTION-time cap is therefore invisible
+ * guarantee than `renderReadingBrief`'s own: `renderReadingBrief` — this
+ * function's SIBLING, not its caller; both call the shared `renderArtifact`
+ * with different `caps`, and nothing but `conduct.ts` calls
+ * `renderArtifactFull` at all — prints `artifact.flags`, WHEN THERE ARE ANY,
+ * on their own line right after each section's header, so a reader of the
+ * brief IS told a part was truncated upstream. This function has no header
+ * at all, and hands back bare content with no notice that anything was ever
+ * cut before storage. A number that fell outside an EXTRACTION-time cap is
+ * therefore invisible
  * here in a way it is not to a reader of the brief — a known limit of this
  * function specifically, not a limit this pipeline already carries
  * everywhere.

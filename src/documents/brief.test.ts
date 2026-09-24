@@ -299,6 +299,38 @@ describe('renderArtifactFull — the numeric-grounding regression', () => {
   });
 
   /**
+   * Fix round 4, item 2 — the same class of bug as item 3, one level down.
+   * A row that IS an array but holds a malformed CELL is unguarded by
+   * `renderTable`'s own row check: `cellText` dereferences `cell.v` directly.
+   * A 100-row table whose row 60 is `[null, {v:60}]` throws on the uncapped
+   * path only, because the capped path never maps past row 40 to reach it.
+   */
+  it('skips a malformed cell rather than throwing, on the uncapped path', () => {
+    const rows: Cell[][] = [[s('פריט'), s('סכום')]];
+    for (let i = 0; i < 100; i += 1) rows.push([s(`שורה ${i}`), n(i)]);
+    // Data row 60 (`rows[61]`, well past `BRIEF_TABLE_ROWS` = 40) has its
+    // first CELL replaced with `null` — the row is still a real array, so
+    // `renderTable`'s row guard does not catch this; only `cellText`'s own
+    // guard does.
+    (rows[61] as unknown as (Cell | null)[])[0] = null;
+    const artifact: DocumentArtifact = {
+      ordinal: 1,
+      kind: 'table',
+      partName: 'טבלה עם תא פגום',
+      content: { rows },
+      flags: [],
+    };
+
+    expect(() => renderArtifactFull(artifact)).not.toThrow();
+    const text = renderArtifactFull(artifact);
+    // The malformed cell renders as empty, not fatal — the amount beside it
+    // still renders, and the untouched rows around it are unaffected.
+    expect(text).toContain(' | 60');
+    expect(text).toContain('שורה 59 | 59');
+    expect(text).toContain('שורה 61 | 61');
+  });
+
+  /**
    * A CSV-shaped document is stored as a `table` artefact too (one row per
    * line, no header semantics beyond "row zero"), and a plain-text artefact
    * grounds through the same `renderArtifact` path with no table layout at

@@ -41,13 +41,17 @@
  *   reads as a leading sign on `12345` rather than as separator noise: the
  *   sign/separator rule below only asks whether the character before the
  *   hyphen is a *digit*, not whether the hyphen sits inside an identifier.
- *   Narrowed for Hebrew (fix round 3, item 1): a hyphen preceded specifically
- *   by a Hebrew PREFIX PARTICLE (`ל`/`ב`/`מ`/`ה`/`ו`/`כ`/`ש` —
- *   `LEADING_HEBREW_PARTICLE`, `typed-recipients.ts`) is a glued-on prefix,
- *   never a sign — `ו-950`, `ב-11,988`, `ל-7.5` are the ordinary Hebrew way to
- *   write "and 950", "for 11,988", "to 7.5", not negative numbers. A hyphen
- *   preceded by any OTHER letter (`ORDER-12345`) still misreads as a sign;
- *   that narrower case remains the limit.
+ *   Narrowed for Hebrew (fix round 3, item 1; corrected in round 4 — see
+ *   `numbersIn`'s own docblock): a hyphen preceded by a Hebrew PREFIX
+ *   PARTICLE (`ל`/`ב`/`מ`/`ה`/`ו`/`כ`/`ש` — `LEADING_HEBREW_PARTICLE`,
+ *   `typed-recipients.ts`) that ITSELF sits at a word boundary is a glued-on
+ *   prefix, never a sign — `ו-950`, `ב-11,988`, `ל-7.5` are the ordinary
+ *   Hebrew way to write "and 950", "for 11,988", "to 7.5", not negative
+ *   numbers. A hyphen preceded by any OTHER letter (`ORDER-12345`), or by one
+ *   of these seven letters when IT is itself preceded by a letter
+ *   (`שלב-2`), still misreads as a sign; `סה"כ-500` is a recorded exception
+ *   that still misreads positive, since the character before its `כ` is a
+ *   quotation mark, not a letter.
  * - Two genuine amounts either side of a slash, as in `שולם 5,000/10,000`,
  *   are both dropped by the `/`-adjacency rule — the same rule that
  *   correctly drops a date. An adjacency rule cannot tell "date" from "two
@@ -115,12 +119,56 @@ function normaliseNumber(raw: string): string {
  * more common trigger than the spreadsheet-JSON regression round 2 closed.
  * `LEADING_HEBREW_PARTICLE` (`typed-recipients.ts`) is the shared,
  * one-definition source for the particle letters — reused here, not
- * duplicated, the same way `contact-resolver.ts` already reuses it. No
- * check of what sits before the particle is needed: even where a word
- * merely ENDS in one of these letters ("שלב-2", "stage-2"), reading the
- * dash as an unsigned prefix rather than a sign is still the more correct
- * of the two readings — nothing this rule does is worse than what it
- * replaces.
+ * duplicated, the same way `contact-resolver.ts` already reuses it.
+ *
+ * **Fix round 4, item 1 — round 3's version of this rule introduced a false
+ * NEGATIVE on money, and is corrected below.** `LEADING_HEBREW_PARTICLE` is
+ * `/^[לבמהוכש][-־]/`, and its home callers apply it to a
+ * WHITESPACE-SPLIT TOKEN, where `^` means "this word begins with a
+ * particle". Round 3 applied it to `text.slice(start - 2, start)` — a
+ * two-character window cut from the middle of running text — so `^`
+ * anchored to that artificial cut, and what was actually enforced was only
+ * "the single character before the dash is one of these seven letters",
+ * with no check of what precedes THAT letter. Seven of twenty-two letters
+ * include `ה`, the most common word-final letter in Hebrew: `הנחה-500`,
+ * `יתרה-1,200`, `עמלה`, `הוצאה`, `הכנסה`, `חובה` and `הלואה` all end in it,
+ * and `סה"כ` ends in `כ`. So `הנחה-500 ש"ח` (a discount of 500, positive)
+ * read as `-500` and matched nothing in a source carrying `500` — a real
+ * credit/debit inversion silently grounded, in the one place this module
+ * tracks signs specifically so that cannot happen. Measured (not merely
+ * argued) by the reviewer transpiling and running the round-3 code. The
+ * claim that stood here — "no check of what precedes the particle is
+ * needed... nothing this rule does is worse than what it replaces" — was
+ * false in exactly the direction this module cares about, and is removed
+ * rather than left to mislead the next reader.
+ *
+ * **The fix: the particle itself must not be preceded by a letter** — i.e.
+ * it must sit at an actual word start, the same condition `^` enforces for
+ * `LEADING_HEBREW_PARTICLE`'s own token-based callers, checked here by hand
+ * because there is no isolated token to anchor `^` against. `שלב-2`
+ * ("stage-2") still reads its dash as an unsigned prefix under this
+ * tightened rule (`ב` is preceded by a letter — `ל` — so the rule does NOT
+ * fire, and the dash falls through to the ordinary "leading sign" default,
+ * same as before round 3 ever existed for that shape) — restored, not
+ * broken, by requiring a real boundary.
+ *
+ * **One case knowingly NOT covered, recorded rather than fixed:** `סה"כ-500`
+ * still reads positive. The character before the particle `כ` is `"`
+ * (a quotation mark), which is not a Hebrew letter, so the boundary check
+ * passes and the rule still fires — `סה"כ` is itself an abbreviation ending
+ * in a particle letter, and this rule cannot distinguish "the last letter of
+ * a word" from "a genuine prefix particle" any further than "is a letter
+ * immediately before it". A known limit, not silently swallowed: this
+ * sentence is here so the next reader does not have to rediscover it.
+ *
+ * **The maqaf alternative in `LEADING_HEBREW_PARTICLE` (`[-־]`) is DEAD
+ * CODE here.** The branch below only runs when `prevChar === '-'` (an ASCII
+ * hyphen) — `LEADING_HEBREW_PARTICLE.test(...)` is reached only on that
+ * branch, so its `־` (U+05BE MAQAF) alternative can never be the character
+ * that matched. `ו־950`, written with a maqaf instead of a hyphen, is
+ * therefore NOT handled by this rule at all and still reads as `-950`. Not
+ * fixed here — recorded so the code does not read as though it covers a
+ * case it does not.
  */
 function numbersIn(text: string): string[] {
   const tokens: string[] = [];
@@ -141,9 +189,16 @@ function numbersIn(text: string): string[] {
       if (dashSeparatesTwoRuns) continue; // e.g. "10-20", "050-1234567" — noise on both sides
       // "ו-950" and friends: the particle+dash is a glued-on prefix, not
       // part of the number's own text, so the run stays UNSIGNED — `sign`
-      // is simply never set to '-' here.
+      // is simply never set to '-' here. The third condition is round 4's
+      // fix (see this function's own docblock): the particle itself must
+      // sit at a word boundary — not preceded by another letter — or a word
+      // that merely ENDS in one of these seven letters ("הנחה-500") would
+      // misread a positive amount as negative, the false negative on money
+      // round 3 introduced.
       const hebrewPrefix =
-        charBeforeDash !== undefined && LEADING_HEBREW_PARTICLE.test(text.slice(start - 2, start));
+        charBeforeDash !== undefined &&
+        LEADING_HEBREW_PARTICLE.test(text.slice(start - 2, start)) &&
+        (start < 3 || !/\p{L}/u.test(text[start - 3] as string));
       if (!hebrewPrefix) sign = '-'; // leading sign, e.g. "-500"
     }
     if (nextChar === '-') {

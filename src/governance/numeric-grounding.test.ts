@@ -153,5 +153,21 @@ describe('ungroundedNumbers', () => {
       // source and is the only survivor.
       expect(ungroundedNumbers(draft, sources)).toEqual(['-12345']);
     });
+
+    /**
+     * Fix round 4, item 1. Round 3's version of this rule checked only the
+     * single character before the dash, not what precedes THAT character —
+     * so any word simply ENDING in one of the seven particle letters (`ה` is
+     * the most common word-final letter in Hebrew) was misread as a prefix
+     * too. `הנחה-500` ("a discount of 500", positive) normalised to `-500`
+     * and matched nothing in a source carrying the unsigned amount — a real
+     * credit/debit inversion silently grounded, measured by transpiling and
+     * running round 3's code. Nothing pinned this word-ending behaviour
+     * either way before now.
+     */
+    it('does NOT treat a word merely ending in a particle letter as a prefix (false negative on money)', () => {
+      expect(ungroundedNumbers('הנחה-500 ש"ח', ['סכום 500 ש"ח'])).toEqual(['-500']);
+      expect(ungroundedNumbers('יתרה-1,200 ש"ח לזכותך', ['יתרה 1200 ש"ח'])).toEqual(['-1200']);
+    });
   });
 });
