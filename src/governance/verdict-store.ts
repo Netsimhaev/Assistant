@@ -108,12 +108,18 @@ export async function saveVerdict(
   await db.query(
     `INSERT INTO verification_verdicts (business_id, job_id, verdict)
      VALUES ($1, $2, $3)
-     ON CONFLICT (business_id, job_id) DO UPDATE SET verdict = EXCLUDED.verdict`,
+     ON CONFLICT (business_id, job_id)
+     DO UPDATE SET verdict = EXCLUDED.verdict, not_judged_reason = NULL`,
     [businessId, jobId, JSON.stringify(verdict)],
   );
 }
 
-/** The current verdict for a job, or `null` if none has been saved yet. */
+/**
+ * The current verdict for a job, or `null` if none has been saved yet — which
+ * now also covers a not-judged row: `verdict IS NOT NULL` excludes it, so a
+ * caller that only wants the real verdict never has to know the sibling
+ * column exists. Use `loadVerificationOutcome` to see all three states.
+ */
 export async function loadVerdict(
   jobId: string,
   options: { businessId?: string; db?: Queryable } = {},
@@ -121,9 +127,83 @@ export async function loadVerdict(
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
   const { rows } = await db.query<VerdictRow>(
-    `SELECT verdict FROM verification_verdicts WHERE business_id = $1 AND job_id = $2`,
+    `SELECT verdict FROM verification_verdicts
+      WHERE business_id = $1 AND job_id = $2 AND verdict IS NOT NULL`,
     [businessId, jobId],
   );
   const row = rows[0];
   return row ? toVerdict(row) : null;
+}
+
+/**
+ * Why a verification produced no judgment. Both values come from
+ * `DelegationOutcome` (`src/domain/envelope.ts`) — the helper failed, or it
+ * never answered inside the envelope's deadline. `succeeded` is deliberately
+ * absent: a delegation that succeeded produces a real `Verdict`, so there is
+ * no third value this enum could carry without meaning "judged after all".
+ */
+export const NotJudgedReason = z.enum(['failed', 'timeout']);
+export type NotJudgedReason = z.infer<typeof NotJudgedReason>;
+
+/**
+ * What verification has to say about a job, in the three states the card
+ * distinguishes. `null` from `loadVerificationOutcome` is the fourth and it is
+ * the important one: no row means the check is still running, and it means
+ * ONLY that, because verification is attempted on every card the conductor
+ * raises. Were it selective, absence would also cover "nobody tried".
+ */
+export type VerificationOutcome =
+  | { status: 'judged'; verdict: Verdict }
+  | { status: 'not_judged'; reason: NotJudgedReason };
+
+/**
+ * Record that verification was attempted for a job and did not produce a
+ * verdict. `ON CONFLICT ... DO UPDATE` clears `verdict` the same way
+ * `saveVerdict` clears `not_judged_reason` — each writer owns clearing the
+ * other's column, because the CHECK constraint (`verification_verdicts_one_shape`)
+ * rejects a row that claims both at once.
+ */
+export async function saveNotJudged(
+  jobId: string,
+  reason: NotJudgedReason,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<void> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  await db.query(
+    `INSERT INTO verification_verdicts (business_id, job_id, verdict, not_judged_reason)
+     VALUES ($1, $2, NULL, $3)
+     ON CONFLICT (business_id, job_id)
+     DO UPDATE SET verdict = NULL, not_judged_reason = EXCLUDED.not_judged_reason`,
+    [businessId, jobId, reason],
+  );
+}
+
+interface OutcomeRow {
+  verdict: unknown;
+  not_judged_reason: string | null;
+}
+
+/** The full three-state outcome for a job, or `null` if verification has not written anything yet. */
+export async function loadVerificationOutcome(
+  jobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<VerificationOutcome | null> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<OutcomeRow>(
+    `SELECT verdict, not_judged_reason FROM verification_verdicts
+      WHERE business_id = $1 AND job_id = $2`,
+    [businessId, jobId],
+  );
+  const row = rows[0];
+  if (row === undefined) return null;
+  if (row.not_judged_reason !== null) {
+    // The DB CHECK already constrains this column, so a value outside the enum
+    // means the constraint was dropped or bypassed. Parsed rather than cast for
+    // the same reason every other read here is: a value we could not read is
+    // not a value we report.
+    return { status: 'not_judged', reason: NotJudgedReason.parse(row.not_judged_reason) };
+  }
+  return { status: 'judged', verdict: Verdict.parse(row.verdict) };
 }
