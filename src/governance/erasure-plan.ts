@@ -430,15 +430,28 @@ export const JOBS_SCRUB_SET = `title = NULL, awaiting_envelope_id = NULL`;
  * is about to delete — the count the preview shows for `ErasureItem`'s
  * `'fail'` action (see that type's own docblock for the full failure chain).
  *
- * Read-only here, for the preview: `buildErasurePlan` has no lock and no
- * transaction, so this is an estimate exactly like the `LIVE_PHASES` refusal
- * above is — re-verified at execution time under the SAME `FOR UPDATE` lock
- * the liveness check already takes, not re-queried against a state that
- * could have moved between the preview and the confirm. The executor does
- * NOT reuse this exact SQL text: it derives the identical set from the rows
- * that lock already returned, so a table it just told the transaction
- * `agent_envelopes` is about to delete cannot be read again with different
- * results a few statements later.
+ * **One predicate, shared by text, not just by agreement (fix round 3, item
+ * 2).** A first version of this had the executor re-express the same
+ * condition as a JS filter over the locked rows — correct today, but exactly
+ * the drift every OTHER disposition in this module avoids by sharing one
+ * exported SQL constant (`PROPOSALS_ERASED_PREDICATE`,
+ * `APPROVAL_REQUESTS_ERASED_PREDICATE`, `AGENT_ENVELOPES_ERASED_PREDICATE`,
+ * `JOBS_SCRUBBED_PREDICATE` all do this; spec §5.1.1's whole point is that
+ * the preview and the destruction cannot differ in text any more than in
+ * values). The argument for not RE-QUERYING `jobs` after other statements
+ * run is real (a table `agent_envelopes` is about to delete would be read a
+ * second time with different results) — but that argues against a second
+ * `SELECT`, not against reusing this constant's TEXT. The executor now
+ * interpolates it as a computed column on the SAME locked `SELECT` the
+ * liveness check already runs (`(${STRANDED_PARENT_PREDICATE}) AS
+ * stranded`), so the condition is evaluated exactly once, before any delete,
+ * and the preview and the executor read the identical SQL.
+ *
+ * Read-only here for the PREVIEW specifically: `buildErasurePlan` has no lock
+ * and no transaction, so its own use of this constant is an estimate exactly
+ * like the `LIVE_PHASES` refusal above is — re-verified at execution time
+ * under the `FOR UPDATE` lock, not trusted as still true by the time the
+ * owner confirms.
  *
  * Parameters: `$1` businessId, `$2` jobIds.
  */

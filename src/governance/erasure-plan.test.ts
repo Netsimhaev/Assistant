@@ -180,13 +180,19 @@ describe('buildErasurePlan', () => {
      * Fix round 2, item 2. `_` is an ordinary character in an email local
      * part and a LIKE wildcard, and this project has already shipped a broken
      * `ESCAPE ''` once (the orphan `approval_requests` predicate) that stayed
-     * green because the control probing it carried no wildcard at all. The
-     * job above is reachable through FOUR other seeds (authorization, plan,
-     * instruction, title) in the fixture that test shares, so it would stay
-     * green even if this query's own escaping broke — a control that cannot
-     * fail is not a control. This job has NOTHING else naming the contact:
-     * only the envelope's `payload`, and the identifier below carries the
-     * wildcard.
+     * green because the control probing it carried no wildcard at all.
+     *
+     * **The neighbouring `'via agent_envelopes.payload'` test's job is
+     * reachable ONLY through the envelope too** (`bareJob` alone — a charter
+     * and a title that never mentions `RONIT` — plus one envelope; `beforeEach`
+     * calls `resetDatabase()`, so there is no shared fixture underneath it to
+     * be reachable through). Fix round 3, item 6 corrected an earlier version
+     * of this comment that claimed otherwise. The real and only reason that
+     * test cannot catch broken escaping is that `RONIT` carries no LIKE
+     * wildcard — a broken `ESCAPE ''` still matches a pattern with no `_`, `%`
+     * or `\` in it, so that test would stay green either way. This test is
+     * isolated the identical way and differs only in the identifier, which
+     * does carry one.
      */
     it('discovers a contact through agent_envelopes.payload even when the identifier contains a LIKE wildcard', async () => {
       const jobId = await bareJob('via-envelope-wildcard');

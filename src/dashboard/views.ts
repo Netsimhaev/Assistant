@@ -841,6 +841,19 @@ const DISPOSITION_LABEL_PAST: Record<ErasureItem['action'], string> = {
   fail: 'המשימה נכשלה, כי הפנייה שהמתינה לה נמחקה',
 };
 
+/**
+ * The "מה" column's label — keyed by table normally, but `TABLE_LABELS.jobs`
+ * ("כותרות משימה") was chosen for the TITLE scrub and is the wrong name for a
+ * `'fail'` row, which is not about titles at all (fix round 3, item 5). Given
+ * its own label rather than folded into `TABLE_LABELS`, which stays keyed by
+ * table alone for every disposition that really is about that table's
+ * content.
+ */
+function rowLabel(item: ErasureItem): string {
+  if (item.action === 'fail') return 'משימות שנעצרו בעקבות המחיקה';
+  return TABLE_LABELS[item.table] ?? item.table;
+}
+
 /** Hebrew names for what a kept item or a plan entry actually is. */
 const ITEM_KIND_LABELS: Record<string, string> = {
   document: 'מסמך',
@@ -1051,7 +1064,7 @@ export function renderErasure(model: ErasureViewModel): string {
     .filter((item) => item.count > 0)
     .map(
       (item) =>
-        `<tr><td>${esc(TABLE_LABELS[item.table] ?? item.table)}</td>` +
+        `<tr><td>${esc(rowLabel(item))}</td>` +
         `<td>${item.count}</td>` +
         `<td>${DISPOSITION_LABEL_FUTURE[item.action]}</td></tr>`,
     )
@@ -1143,7 +1156,7 @@ export function renderErasureDone(model: ErasureDoneViewModel): string {
     .filter((item) => item.count > 0)
     .map(
       (item) =>
-        `<tr><td>${esc(TABLE_LABELS[item.table] ?? item.table)}</td>` +
+        `<tr><td>${esc(rowLabel(item))}</td>` +
         `<td>${item.count}</td>` +
         `<td>${DISPOSITION_LABEL_PAST[item.action]}</td></tr>`,
     )

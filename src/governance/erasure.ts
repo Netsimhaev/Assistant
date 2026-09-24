@@ -41,6 +41,7 @@ import {
   JOBS_SCRUB_SET,
   LIVE_PHASES,
   PROPOSALS_ERASED_PREDICATE,
+  STRANDED_PARENT_PREDICATE,
   VERIFICATION_VERDICTS_ERASED_PREDICATE,
   approvalRequestParams,
 } from './erasure-plan.js';
@@ -169,18 +170,21 @@ export async function executeErasure(
     // The same locked read also identifies STRANDED parents (fix round 2,
     // item 1): a job in `followup`, parked on its own `agent_envelopes` row,
     // which `AGENT_ENVELOPES_ERASED_PREDICATE` is about to delete out from
-    // under it. Derived from these already-locked rows, never re-queried —
-    // see `STRANDED_PARENT_PREDICATE`'s docblock for why re-reading the table
-    // after other statements have run would be reading state this same
-    // transaction just changed.
-    const stranded: Array<{ jobId: string; envelopeId: string }> = [];
+    // under it. `stranded` is a computed COLUMN on this same `SELECT`,
+    // interpolating `STRANDED_PARENT_PREDICATE` verbatim (fix round 3, item
+    // 2) — the identical text `countItems` uses for the preview, evaluated
+    // once here, before any delete runs, never re-queried against a table a
+    // later statement in this same transaction is about to change.
+    const stranded: Array<{ jobId: string; envelopeId: string; phase: string }> = [];
     if (jobIds.length > 0) {
       const { rows: lockedJobs } = await client.query<{
         job_id: string;
         phase: string;
         awaiting_envelope_id: string | null;
+        stranded: boolean;
       }>(
-        'SELECT job_id, phase, awaiting_envelope_id FROM jobs WHERE business_id = $1 AND job_id = ANY ($2) FOR UPDATE',
+        `SELECT job_id, phase, awaiting_envelope_id, (${STRANDED_PARENT_PREDICATE}) AS stranded
+           FROM jobs WHERE business_id = $1 AND job_id = ANY ($2) FOR UPDATE`,
         [businessId, jobIds],
       );
       const stillLive = lockedJobs.filter((row) => LIVE_PHASES.includes(row.phase));
@@ -195,8 +199,12 @@ export async function executeErasure(
         );
       }
       for (const row of lockedJobs) {
-        if (row.phase === 'followup' && row.awaiting_envelope_id !== null) {
-          stranded.push({ jobId: row.job_id, envelopeId: row.awaiting_envelope_id });
+        // `row.awaiting_envelope_id !== null` is provably true whenever
+        // `row.stranded` is, per the predicate itself — checked again here
+        // only to satisfy the type system without an unsafe assertion, not
+        // because it can disagree.
+        if (row.stranded && row.awaiting_envelope_id !== null) {
+          stranded.push({ jobId: row.job_id, envelopeId: row.awaiting_envelope_id, phase: row.phase });
         }
       }
     }
@@ -208,10 +216,6 @@ export async function executeErasure(
     const scrub = async (table: string, sql: string, params: unknown[]): Promise<void> => {
       const { rowCount } = await client.query(sql, params);
       results.push({ table, action: 'scrub', count: rowCount ?? 0 });
-    };
-    const fail = async (table: string, sql: string, params: unknown[]): Promise<void> => {
-      const { rowCount } = await client.query(sql, params);
-      results.push({ table, action: 'fail', count: rowCount ?? 0 });
     };
 
     // Deleted: rows whose whole existence is the content. `proposals` runs
@@ -314,27 +318,59 @@ export async function executeErasure(
     // `transition()`: that function opens its OWN transaction and re-takes
     // `SELECT ... FOR UPDATE` on the same row, which would block forever on
     // the lock this transaction is already holding and has not committed —
-    // the update and its `job_steps` row are written directly on `client`
-    // instead, inside the same transaction that already holds the lock.
+    // and, separately, `transition()` commits independently, so a move made
+    // through it would survive a rollback of the erasure itself. The update
+    // and its `job_steps` row are written directly on `client` instead,
+    // inside the same transaction that already holds the lock and that the
+    // erasure's own rollback already covers.
+    //
+    // **`AND phase = 'followup'` is the legality guard, written into the SQL
+    // rather than left to the JS filter above (fix round 3, item 1).** The
+    // `stranded` array is already computed from a predicate that requires
+    // `phase = 'followup'`, so today this WHERE clause is provably redundant
+    // — but redundant is the point: if the JS side is ever widened (a second
+    // stranding shape, a dropped phase check), this is the line that still
+    // refuses to move a job whose phase was never actually `followup`, and
+    // does so LOUDLY, as zero affected rows, rather than writing a
+    // `job_steps.from_phase` that never happened. `wake_at = NULL` alongside
+    // `phase`/`closed_at`, matching what `transition()` itself always
+    // overwrites on every move (fix round 3, item 3) — harmless today only
+    // because no current park sets both a pointer and a wake time, and this
+    // statement should normalise the terminal row rather than rely on that
+    // staying true.
+    //
+    // `RETURNING job_id` — not `stranded.map(...)` — is what actually gates
+    // the `job_steps` insert below: a job the WHERE clause refused (because
+    // its real phase was not `followup`, contradicting a widened JS filter)
+    // must not receive a `job_steps` row claiming a transition that never
+    // happened in `jobs` itself. Only fetch `job_id` because the SET clause
+    // does not touch `from_phase` — the row's phase as OBSERVED at lock time
+    // (`stranded`'s own `phase` field), not the literal `'followup'`, is what
+    // is written to `job_steps.from_phase` for the rows this UPDATE actually
+    // moved.
     //
     // Placed AFTER the `job_steps` reason-scrub above, deliberately: that
     // statement blanks every existing `job_steps.reason` for `job_id = ANY
     // ($1)`, and a row inserted before it would be caught by the same
     // `UPDATE` and lose the sentence below. Inserted after, this row is the
-    // one line in a stranded job's history that says why it failed — counts
-    // and the (now-deleted) envelope's id, never the contact.
-    await fail(
-      'jobs',
-      `UPDATE jobs SET phase = 'failed', closed_at = now(), updated_at = now()
-        WHERE business_id = $1 AND job_id = ANY ($2)`,
+    // one line in a stranded job's history that says why it failed — the
+    // (now-deleted) envelope's id, never the contact.
+    const { rows: failedRows } = await client.query<{ job_id: string }>(
+      `UPDATE jobs SET phase = 'failed', wake_at = NULL, closed_at = now(), updated_at = now()
+        WHERE business_id = $1 AND job_id = ANY ($2) AND phase = 'followup'
+        RETURNING job_id`,
       [businessId, stranded.map((s) => s.jobId)],
     );
-    for (const { jobId, envelopeId } of stranded) {
+    results.push({ table: 'jobs', action: 'fail', count: failedRows.length });
+
+    const actuallyFailed = new Set(failedRows.map((row) => row.job_id));
+    for (const { jobId, envelopeId, phase } of stranded) {
+      if (!actuallyFailed.has(jobId)) continue;
       await client.query(
         `INSERT INTO job_steps (job_id, from_phase, to_phase, actor, envelope_id, reason)
-         VALUES ($1, 'followup', 'failed', 'human', $2,
+         VALUES ($1, $2, 'failed', 'human', $3,
                  'מחיקה בהוראת הבעלים מחקה את הפנייה שהמשימה המתינה למענה עליה, והמשימה לא תוכל להמשיך')`,
-        [jobId, envelopeId],
+        [jobId, phase, envelopeId],
       );
     }
 
@@ -394,7 +430,19 @@ export async function executeErasure(
   // on it — but the deviation was never written down anywhere, and a spec
   // claiming a row the code does not write is the same defect as a control
   // that overstates itself.
-  const total = results.reduce((sum, item) => sum + item.count, 0);
+  // `total` counts CONTENT DESTROYED — `delete` and `scrub` rows. `fail`
+  // excluded on purpose (fix round 3, item 4): failing a stranded job
+  // destroys nothing, it stops one, and folding it into the same sum would
+  // double-count the one physical row it shares with `jobs:scrub` (a
+  // stranded job's pointer is non-null, so it always matches
+  // `JOBS_SCRUBBED_PREDICATE` too) — the first place in this module where two
+  // items are NOT disjoint by construction the way `approval_requests`'s
+  // `delete`/`scrub` pair is. The item still appears in `plan.items` and
+  // `outcome.deleted` in full — the owner should see the job will be
+  // stopped — it just is not content the erasure destroyed.
+  const total = results
+    .filter((item) => item.action !== 'fail')
+    .reduce((sum, item) => sum + item.count, 0);
 
   try {
     await appendAudit(
