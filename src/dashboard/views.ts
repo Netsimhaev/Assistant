@@ -802,8 +802,15 @@ export function renderServerError(): string {
 // control rather than sitting beside it. An erasure that quietly passed over
 // something would be exactly the silence this codebase keeps stamping out.
 
-/** Hebrew names for the tables, so the owner reads what they are losing. */
-const TABLE_LABELS: Record<string, string> = {
+/**
+ * Hebrew names for the tables, so the owner reads what they are losing —
+ * never a raw English identifier on the one screen that is a contract (fix
+ * round 4, item 2). An invariant in `erasure-routes.test.ts` derives the
+ * full set of tables `countItems` (`governance/erasure-plan.ts`) can ever
+ * emit straight from that function's own source text — not from a second
+ * list restated by hand here — and fails if any of them is missing below.
+ */
+export const TABLE_LABELS: Record<string, string> = {
   memories: 'זיכרונות',
   documents: 'מסמכים',
   document_artifacts: 'טקסט שחולץ ממסמכים',
@@ -811,8 +818,15 @@ const TABLE_LABELS: Record<string, string> = {
   proposals: 'הצעות',
   approval_requests: 'כרטיסי אישור',
   boss_instructions: 'לשון הוראות',
+  // Owner-typed free text on a corrected step (`governance/corrections.ts`) —
+  // can name a counterparty the job's plan/title/instructions never do.
+  autonomy_marks: 'הערות תיקון',
   job_plans: 'תוכניות',
   job_authorizations: 'הרשאות',
+  // A delegation request from one agent to another (migration 028).
+  agent_envelopes: 'פניות בין סוכנים',
+  // A verifier's finding on a draft it checked (migration 028).
+  verification_verdicts: 'פסיקות אימות',
   jobs: 'כותרות משימה',
   job_steps: 'שורות מעבר',
   job_step_results: 'מזהי הודעה מהספק',

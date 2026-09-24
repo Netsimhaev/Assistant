@@ -640,6 +640,25 @@ describe('executeErasure', () => {
     expect(steps.rows).toHaveLength(1);
     expect(steps.rows[0]?.reason).not.toContain(identifier);
     expect(steps.rows[0]?.reason).not.toBe('נמחק בהוראת הבעלים');
+
+    // Fix round 4, item 1: this is the ONE fixture where the fail count is
+    // non-zero, which makes it the only place that can tell the fixed total
+    // formula apart from the pre-fix one — every other test's fail count is
+    // 0, so `outcome.deleted.reduce(...)` over every action and
+    // `.filter(i => i.action !== 'fail').reduce(...)` agree by coincidence
+    // and neither would catch the exclusion being deleted. This job's own
+    // `jobs:scrub` (pointer cleared) AND `jobs:fail` (moved to failed) both
+    // count the SAME physical row, so an unfiltered sum here would be
+    // provably wrong, not just double-counted by accident.
+    const total = outcome.deleted
+      .filter((item) => item.action !== 'fail')
+      .reduce((sum, item) => sum + item.count, 0);
+    const { rows: auditRows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE business_id=$1 AND kind='erasure'`,
+      [BUSINESS],
+    );
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]?.reason).toContain(`${total} פריטים`);
   });
 
   /**

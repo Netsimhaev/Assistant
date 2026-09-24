@@ -453,6 +453,19 @@ export const JOBS_SCRUB_SET = `title = NULL, awaiting_envelope_id = NULL`;
  * under the `FOR UPDATE` lock, not trusted as still true by the time the
  * owner confirms.
  *
+ * **Only the meaningful half is shared (fix round 4, item 3).** The
+ * job-scoping arm — `business_id = $1 AND job_id = ANY ($2)` — is still
+ * restated by hand as the executor's own locked `SELECT`'s `WHERE`, not read
+ * from this constant; only `phase = 'followup' AND awaiting_envelope_id IS
+ * NOT NULL` is shared as the computed column. If the SCOPING arm here ever
+ * changed, `countItems` would count under the new scope while the executor
+ * kept applying its own, intersected with whatever changed — preview and
+ * execution would diverge one clause over from where this fix round closed
+ * the gap. Not restructured, because the direction of that failure is safe:
+ * the executor can only fail FEWER jobs than the preview promised, never
+ * more, and it would surface as a visible count mismatch rather than
+ * silently. Worth a sentence, not worth the extra indirection today.
+ *
  * Parameters: `$1` businessId, `$2` jobIds.
  */
 export const STRANDED_PARENT_PREDICATE = `business_id = $1 AND job_id = ANY ($2)
