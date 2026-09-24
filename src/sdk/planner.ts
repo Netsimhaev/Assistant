@@ -6,6 +6,7 @@ import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import { READ_ONLY_CLASS_LABEL, capabilityCatalogue, renderCatalogue } from '../orchestrator/catalogue.js';
 import { REFINEMENT_RULES } from '../policy/classify.js';
 import { renderLocalToolContracts } from '../orchestrator/local-tools.js';
+import { extractJsonObjects } from '../util/json-extract.js';
 
 export interface PlanRequest {
   bundle: PolicyBundle;
@@ -203,42 +204,12 @@ export function parsePlan(raw: string): PlanOutcome {
 }
 
 /**
- * Every balanced JSON object in a response that may be wrapped in prose or a
- * fenced block.
- *
- * Balanced scanning rather than first `{` to last `}`: across two objects that
- * span is not valid JSON at all. Returning every candidate rather than the
- * first lets the caller decide which one is the plan — being parseable and
- * being a plan are different questions.
+ * Re-exported for `curator.ts`'s sake — the implementation moved to
+ * `src/util/json-extract.ts` so a module with no business reading document
+ * content (`gov-verify.ts`) does not have to import THIS file to get it. This
+ * file itself pulls in `local-tools.ts` (for `renderLocalToolContracts`,
+ * above), which imports `readDocument` — exactly the transitive edge
+ * `gov.verify`'s quarantine forbids. See `src/util/json-extract.ts`'s own
+ * docblock.
  */
-export function extractJsonObjects(raw: string): unknown[] {
-  const text = raw.replace(/```(?:json)?/g, '');
-  const found: unknown[] = [];
-
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-
-    for (let i = start; i < text.length; i += 1) {
-      const ch = text[i];
-      if (escaped) { escaped = false; continue; }
-      if (ch === '\\') { escaped = true; continue; }
-      if (ch === '"') { inString = !inString; continue; }
-      if (inString) continue;
-      if (ch === '{') depth += 1;
-      else if (ch === '}') {
-        depth -= 1;
-        if (depth === 0) {
-          try {
-            found.push(JSON.parse(text.slice(start, i + 1)));
-          } catch {
-            // Not valid on its own; the next opening brace may still be.
-          }
-          break;
-        }
-      }
-    }
-  }
-  return found;
-}
+export { extractJsonObjects };

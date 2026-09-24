@@ -9,9 +9,19 @@
  *
  * Lookup is `Object.hasOwn`, never `in`: `constructor` and `toString` resolve
  * through the prototype and would read as registered intents.
+ *
+ * **This file must never import `local-tools.ts`.** `delegate.ts`'s
+ * `requestHelp` imports this module to resolve an intent, and `gov.verify`
+ * (`src/sdk/gov-verify.ts`) imports `delegate.ts` to delegate at all — its own
+ * quarantine forbids transitively reaching `readDocument`, which
+ * `local-tools.ts` imports. The completeness check that used to live here
+ * (`registryToolsMissingImplementation`, "every registered tool is actually
+ * implemented") needed `implementedLocalTools` for exactly that reason and
+ * for no other, so it moved to `intent-registry.test.ts`, the only place that
+ * ever called it — see `gov-verify.test.ts`'s import-graph invariant, which
+ * would catch a reintroduction of this import.
  */
 import { z } from 'zod';
-import { implementedLocalTools } from '../orchestrator/local-tools.js';
 
 export interface IntentSpec {
   payload: z.ZodTypeAny;
@@ -44,7 +54,15 @@ export function resolveIntent(to: string, intent: string): IntentSpec | null {
   return forAgent[intent]!;
 }
 
-/** Every tool named in the registry, for the reachability invariants below. */
+/**
+ * Every tool named in the registry, for the reachability invariants in
+ * `intent-registry.test.ts` — including the completeness check that every
+ * registered tool is actually IMPLEMENTED by the local tool executor, not
+ * merely known to the policy engine. That check needs `implementedLocalTools`
+ * (`orchestrator/local-tools.ts`), which this production module must never
+ * import (see this file's own docblock) — so it lives in the test file, the
+ * only place that ever called it.
+ */
 export function registeredTools(): string[] {
   const tools: string[] = [];
   for (const forAgent of Object.values(INTENT_REGISTRY)) {
@@ -53,27 +71,4 @@ export function registeredTools(): string[] {
     }
   }
   return tools;
-}
-
-/**
- * Every registered intent must name a tool that is not merely known to the
- * policy engine (classified or explicitly read-only — `isKnownTool`, checked
- * directly in `intent-registry.test.ts`) but actually IMPLEMENTED by the local
- * tool executor.
- *
- * A registry entry that names a known-but-unimplemented tool is a capability
- * that completes with `{ performed: false, reason: 'not_implemented' }` the
- * moment the ramp allows the child's one step to run — a delegation that runs
- * end to end and teaches the parent nothing. That is the hollow-mechanism
- * failure this whole sub-project was chosen to close, so it is checked here as
- * a structural fact about the registry, not left to be discovered the next
- * time someone actually delegates.
- *
- * Scoped to local, unimplemented tools only: a registry entry naming a tool
- * that reaches an adapter (none do today) would not appear here as a defect,
- * because `implementedLocalTools` only speaks for the local executor.
- */
-export function registryToolsMissingImplementation(): string[] {
-  const implemented = new Set(implementedLocalTools());
-  return registeredTools().filter((tool) => !implemented.has(tool));
 }

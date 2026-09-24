@@ -5,8 +5,11 @@
  * The shape of this module mirrors `parsePlan` (`src/sdk/planner.ts`): a
  * balanced-brace scan that tolerates prose and fenced blocks, zod for the
  * shape, and a separate structural pass for what a schema cannot express. The
- * scanner is written here rather than imported — it is private to `planner.ts`,
- * and the two callers answer to different prompts and are allowed to diverge.
+ * scan itself (`extractJsonObjects`) is shared from `src/util/json-extract.ts`
+ * — it was a private, byte-identical copy in this file, `proposal-parse.ts`
+ * and `planner.ts` before that; the scan is prompt-agnostic (it only finds
+ * balanced JSON objects in text), so sharing it does not stop this module's
+ * own interpretation of what it finds from diverging from the others'.
  *
  * Nothing here throws on bad model output. A response that is not a reading is
  * a result to record, exactly as `ingestDocument` records a rejected document
@@ -14,6 +17,7 @@
  */
 
 import { Reading } from '../domain/reading.js';
+import { extractJsonObjects } from '../util/json-extract.js';
 
 export type ParseOutcome =
   | { status: 'read'; reading: Reading }
@@ -106,52 +110,4 @@ export function parseReading(
   }
 
   return { status: 'unreadable', reason: reason ?? 'schema mismatch' };
-}
-
-/**
- * Every balanced JSON object in a response that may be wrapped in prose or a
- * fenced block.
- *
- * Balanced scanning rather than first `{` to last `}`: across two objects that
- * span is not valid JSON at all.
- */
-function extractJsonObjects(raw: string): unknown[] {
-  const text = raw.replace(/```(?:json)?/g, '');
-  const found: unknown[] = [];
-
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-
-    for (let i = start; i < text.length; i += 1) {
-      const ch = text[i];
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (ch === '\\') {
-        escaped = true;
-        continue;
-      }
-      if (ch === '"') {
-        inString = !inString;
-        continue;
-      }
-      if (inString) continue;
-      if (ch === '{') depth += 1;
-      else if (ch === '}') {
-        depth -= 1;
-        if (depth === 0) {
-          try {
-            found.push(JSON.parse(text.slice(start, i + 1)));
-          } catch {
-            // Not valid on its own; the next opening brace may still be.
-          }
-          break;
-        }
-      }
-    }
-  }
-  return found;
 }
