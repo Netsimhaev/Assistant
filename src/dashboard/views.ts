@@ -13,9 +13,10 @@
  */
 import type { ApprovalRequest } from '../governance/approvals.js';
 import type { DocumentRecord } from '../documents/types.js';
-import type { ErasureAnchor, ErasurePlan } from '../governance/erasure-plan.js';
+import type { ErasureAnchor, ErasureItem, ErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
 import type { KeptItem } from '../governance/kept-items.js';
+import type { Verdict } from '../governance/verdict-store.js';
 import type { IntentName } from '../domain/reading.js';
 import type { MemoryRecord } from '../memory/store.js';
 import { AutonomyMode } from '../governance/autonomy-mode.js';
@@ -588,6 +589,92 @@ function signForm(
   </form>`;
 }
 
+/**
+ * `fenceForgeryDetected` has three states, on purpose (`Verdict`'s own
+ * docblock): `true` and `false` are both something the check actually ran and
+ * found; `undefined` is a verdict saved before this field existed, and must
+ * never read as "checked, clean" — the same rule `amount_unreadable` and
+ * every other unreadable-is-never-permitting value in this codebase already
+ * holds. So the three render as three different things, not two.
+ */
+function forgeryNote(detected: boolean | undefined): string {
+  if (detected === true) {
+    return '<p class="error">בתוכן שנבדק זוהה ניסיון לחקות את גבולות בדיקת האימות עצמה.</p>';
+  }
+  if (detected === false) {
+    return '<p class="muted">נבדק, ולא נמצא ניסיון לחקות את גבולות בדיקת האימות.</p>';
+  }
+  return '<p class="muted">פסיקה זו נשמרה לפני שהמערכת עקבה אחר ניסיון כזה — לא ידוע אם נבדק.</p>';
+}
+
+/**
+ * One judged criterion. `statement` and `detail` are model-authored text about
+ * a draft written after reading a document somebody else sent — `detail` in
+ * particular quotes it when that helps the judge explain a verdict — so both
+ * go through `escLabel`, not `esc`, the same category `escLabel` exists for
+ * elsewhere on this page (see its own docblock): a bidirectional override
+ * inside a quoted fragment could make the owner read something other than
+ * what is actually there. `severity` and `passed` are the judge's own closed
+ * vocabulary, not text it composed, so they are rendered from a fixed Hebrew
+ * label rather than passed through at all.
+ */
+function criterionItem(criterion: Verdict['criteria'][number]): string {
+  const severity = criterion.severity === 'must' ? 'חובה' : 'שיפור רצוי';
+  const status = criterion.passed ? 'עומד בקריטריון' : 'לא עומד בקריטריון';
+  return `<li>${esc(status)} (${esc(severity)}): ${escLabel(criterion.statement)} — ${escLabel(criterion.detail)}</li>`;
+}
+
+/**
+ * `gov.verify`'s verdict for this card's job, when one has been saved by the
+ * time the card renders. Rendered from a database row read at REQUEST time —
+ * `loadVerdict` is called by the route, not stashed at card-creation time —
+ * so a verification that has not finished, or never started, simply leaves
+ * this block out; nothing about the rest of the card depends on it existing.
+ */
+function verdictBlock(verdict: Verdict): string {
+  const criteriaItems = verdict.criteria.map(criterionItem).join('');
+
+  // Fix round 1, Important 6: printed VERBATIM — the stored token, exactly —
+  // not reformatted. `ungroundedNumbers` entries are a COMPARISON form, not a
+  // display form (`governance/numeric-grounding.ts`'s own docblock): a
+  // trailing minus is already rewritten to a leading one, a trailing decimal
+  // zero is already stripped, and thousands separators are already gone. So
+  // even VERBATIM is not identical to what the draft actually wrote — a
+  // draft that wrote `500-` normalises to, and this prints, `-500`; a draft
+  // that wrote `11,988.00` normalises to, and this prints, `11988` — which is
+  // exactly why the sentence below states plainly that this is a normalised
+  // comparison form, not a claim that it matches the draft's own spelling.
+  // Reformatting on top of that (a prior version added thousands separators
+  // back) does not recover the original either, and can ACTIVELY
+  // misrepresent a token that was never a formatted number at all: a phone
+  // number's leading zero survives this same normalisation unchanged, so
+  // `0521234567` would have rendered `0,521,234,567` — a magnitude grouping
+  // the draft never contained. The posture here is the one this codebase
+  // already takes for a document's hash prefix beside its filename
+  // (`documentBlock`): show the real token, and say plainly what kind of
+  // token it is, rather than prettify it into something it is not.
+  const ungroundedBlock =
+    verdict.ungroundedNumbers.length === 0
+      ? ''
+      : `<p>מספרים בטיוטה שלא אותרו במסמך המקורי (בצורתם המנורמלת להשוואה — ` +
+        `לאו דווקא כפי שנכתבו בטיוטה עצמה): ${verdict.ungroundedNumbers
+          .map((n) => `<code>${escLabel(n)}</code>`)
+          .join(', ')}</p>`;
+
+  const truncationBlock =
+    verdict.answerTruncated || verdict.draftTruncated
+      ? '<p class="muted">חלק מהתוכן שנבדק היה ארוך מדי ונחתך לפני הבדיקה — הפסיקה מבוססת רק על מה שנבדק בפועל.</p>'
+      : '';
+
+  return `<div class="card">
+  <h3>בדיקת איכות (gov.verify)</h3>
+  <ul>${criteriaItems}</ul>
+  ${ungroundedBlock}
+  ${forgeryNote(verdict.fenceForgeryDetected)}
+  ${truncationBlock}
+</div>`;
+}
+
 export function renderApprovalCard(options: {
   approval: ApprovalRequest;
   csrf: string;
@@ -601,6 +688,23 @@ export function renderApprovalCard(options: {
    * default, not a case somebody has to remember to handle.
    */
   documentIntent?: IntentName | null;
+  /**
+   * `gov.verify`'s verdict for this card's job, when the route resolved one.
+   * Absent means exactly what it says — no verdict exists yet, whether
+   * because none was ever opened, the delegation has not answered, or nothing
+   * has yet resumed the second half of the check (Task 11's known gap) — and
+   * the card renders exactly as it would if `gov.verify` did not exist at
+   * all.
+   */
+  verdict?: Verdict;
+  /**
+   * The route found a `verification_verdicts` row for this job but it failed
+   * to parse (fix round 1, Important 4) — `verdict` is `undefined` in this
+   * case, not a malformed value passed through. Rendered as a distinct,
+   * honest note: the owner is told a verdict exists but could not be shown,
+   * not left to believe none was ever produced.
+   */
+  verdictUnreadable?: boolean;
   editValue?: string;
   noteValue?: string;
   error?: string;
@@ -640,6 +744,8 @@ export function renderApprovalCard(options: {
   </table>
 </div>
 ${options.document ? documentBlock(options.document) : ''}
+${options.verdict ? verdictBlock(options.verdict) : ''}
+${options.verdictUnreadable ? '<p class="muted">קיימת פסיקת אימות (gov.verify) לבקשה זו, אך לא ניתן היה לקרוא אותה.</p>' : ''}
 ${signErrorBlock}
 <div class="row">
   <form method="post" action="/a/${esc(approval.approvalId)}/approve" class="edit-form">
@@ -802,8 +908,15 @@ export function renderServerError(): string {
 // control rather than sitting beside it. An erasure that quietly passed over
 // something would be exactly the silence this codebase keeps stamping out.
 
-/** Hebrew names for the tables, so the owner reads what they are losing. */
-const TABLE_LABELS: Record<string, string> = {
+/**
+ * Hebrew names for the tables, so the owner reads what they are losing —
+ * never a raw English identifier on the one screen that is a contract (fix
+ * round 4, item 2). An invariant in `erasure-routes.test.ts` derives the
+ * full set of tables `countItems` (`governance/erasure-plan.ts`) can ever
+ * emit straight from that function's own source text — not from a second
+ * list restated by hand here — and fails if any of them is missing below.
+ */
+export const TABLE_LABELS: Record<string, string> = {
   memories: 'זיכרונות',
   documents: 'מסמכים',
   document_artifacts: 'טקסט שחולץ ממסמכים',
@@ -811,12 +924,55 @@ const TABLE_LABELS: Record<string, string> = {
   proposals: 'הצעות',
   approval_requests: 'כרטיסי אישור',
   boss_instructions: 'לשון הוראות',
+  // Owner-typed free text on a corrected step (`governance/corrections.ts`) —
+  // can name a counterparty the job's plan/title/instructions never do.
+  autonomy_marks: 'הערות תיקון',
   job_plans: 'תוכניות',
   job_authorizations: 'הרשאות',
+  // A delegation request from one agent to another (migration 028).
+  agent_envelopes: 'פניות בין סוכנים',
+  // A verifier's finding on a draft it checked (migration 028).
+  verification_verdicts: 'פסיקות אימות',
   jobs: 'כותרות משימה',
   job_steps: 'שורות מעבר',
   job_step_results: 'מזהי הודעה מהספק',
 };
+
+/**
+ * What will happen to a row, per `ErasureItem.action` — future tense for the
+ * preview, past tense for the done screen. A third `'fail'` disposition
+ * (fix round 2, item 1): a job parked on a delegation whose own
+ * `agent_envelopes` row is about to be deleted, moved to a terminal `failed`
+ * phase as part of the erasure rather than left pointing at nothing. Keyed by
+ * `ErasureItem['action']` so a fourth action added later fails to compile
+ * here instead of silently falling through a two-branch ternary — the exact
+ * shape that would have shown "ינוקה מתוכן" (cleaned) for a job the erasure
+ * actually failed.
+ */
+const DISPOSITION_LABEL_FUTURE: Record<ErasureItem['action'], string> = {
+  delete: 'יימחק',
+  scrub: 'ינוקה מתוכן',
+  fail: 'משימה תלויה תיכשל, כי הפנייה שהיא ממתינה לה נמחקת',
+};
+
+const DISPOSITION_LABEL_PAST: Record<ErasureItem['action'], string> = {
+  delete: 'נמחק',
+  scrub: 'נוקה מתוכן',
+  fail: 'המשימה נכשלה, כי הפנייה שהמתינה לה נמחקה',
+};
+
+/**
+ * The "מה" column's label — keyed by table normally, but `TABLE_LABELS.jobs`
+ * ("כותרות משימה") was chosen for the TITLE scrub and is the wrong name for a
+ * `'fail'` row, which is not about titles at all (fix round 3, item 5). Given
+ * its own label rather than folded into `TABLE_LABELS`, which stays keyed by
+ * table alone for every disposition that really is about that table's
+ * content.
+ */
+function rowLabel(item: ErasureItem): string {
+  if (item.action === 'fail') return 'משימות שנעצרו בעקבות המחיקה';
+  return TABLE_LABELS[item.table] ?? item.table;
+}
 
 /** Hebrew names for what a kept item or a plan entry actually is. */
 const ITEM_KIND_LABELS: Record<string, string> = {
@@ -1028,9 +1184,9 @@ export function renderErasure(model: ErasureViewModel): string {
     .filter((item) => item.count > 0)
     .map(
       (item) =>
-        `<tr><td>${esc(TABLE_LABELS[item.table] ?? item.table)}</td>` +
+        `<tr><td>${esc(rowLabel(item))}</td>` +
         `<td>${item.count}</td>` +
-        `<td>${item.action === 'delete' ? 'יימחק' : 'ינוקה מתוכן'}</td></tr>`,
+        `<td>${DISPOSITION_LABEL_FUTURE[item.action]}</td></tr>`,
     )
     .join('');
 
@@ -1120,9 +1276,9 @@ export function renderErasureDone(model: ErasureDoneViewModel): string {
     .filter((item) => item.count > 0)
     .map(
       (item) =>
-        `<tr><td>${esc(TABLE_LABELS[item.table] ?? item.table)}</td>` +
+        `<tr><td>${esc(rowLabel(item))}</td>` +
         `<td>${item.count}</td>` +
-        `<td>${item.action === 'delete' ? 'נמחק' : 'נוקה מתוכן'}</td></tr>`,
+        `<td>${DISPOSITION_LABEL_PAST[item.action]}</td></tr>`,
     )
     .join('');
 

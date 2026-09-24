@@ -22,6 +22,13 @@ export interface Job {
    * full rationale and `markContentIngested` for how it is set.
    */
   contentIngested: boolean;
+  /**
+   * The `help_request` envelope this job is parked on, or `null`. Set when
+   * `requestHelp` (`orchestrator/delegate.ts`) moves a delegating job to
+   * `followup`; read by `resumeDelegatedJobs` to find which job to wake once
+   * the child it spawned closes. Migration 028.
+   */
+  awaitingEnvelopeId: string | null;
 }
 
 interface JobRow {
@@ -34,6 +41,7 @@ interface JobRow {
   wake_at: Date | null;
   closed_at: Date | null;
   content_ingested: boolean;
+  awaiting_envelope_id: string | null;
 }
 
 function toJob(row: JobRow): Job {
@@ -47,6 +55,7 @@ function toJob(row: JobRow): Job {
     wakeAt: row.wake_at?.toISOString() ?? null,
     closedAt: row.closed_at?.toISOString() ?? null,
     contentIngested: row.content_ingested,
+    awaitingEnvelopeId: row.awaiting_envelope_id,
   };
 }
 
@@ -98,6 +107,16 @@ export interface TransitionInput {
   /** Set when moving to `followup`: when the job should be picked up again. */
   wakeAt?: Date | null;
   envelopeId?: string | null;
+  /**
+   * The `help_request` envelope id to park this job on, or omitted/`null` to
+   * clear it.
+   *
+   * Overwritten on every transition, exactly like `wakeAt` above and for the
+   * same reason: each move states its own wake condition rather than merging
+   * with whatever the row already held, so a job that is no longer waiting on
+   * a delegation cannot carry a stale envelope id forward by omission.
+   */
+  awaitingEnvelopeId?: string | null;
   costMinor?: number | null;
   businessId?: string;
   /**
@@ -154,10 +173,11 @@ export async function transition(
           SET phase = $3,
               wake_at = $4,
               closed_at = CASE WHEN $5::boolean THEN now() ELSE closed_at END,
+              awaiting_envelope_id = $6,
               updated_at = now()
         WHERE job_id = $1 AND business_id = $2
         RETURNING *`,
-      [jobId, businessId, input.to, input.wakeAt ?? null, terminal],
+      [jobId, businessId, input.to, input.wakeAt ?? null, terminal, input.awaitingEnvelopeId ?? null],
     );
 
     await tx.query(

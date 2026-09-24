@@ -107,6 +107,25 @@ export async function runSetRampCli(argv: string[], deps: SetRampCliDeps): Promi
   if (dialClamped !== level) {
     log(`המתג מהדק את ${level} ל-${dialClamped} — ההעלאה הזו אינה מורגשת עד שהמתג ישונה.`);
   }
+
+  // `agent.delegate` is the one class whose raise no plan can ever feel, and
+  // for a reason that has nothing to do with any ceiling: the only tool that
+  // carries it, `agent.request_help`, sits in `CEILING_EXEMPT_TOOLS`
+  // (`policy/classify.ts`), and `rampLevelForPlan` SKIPS an exempt step rather
+  // than folding its ramp row into the plan-wide minimum. Printing this class
+  // a plain success line and nothing else is exactly the "a raise that isn't
+  // felt looks identical to a broken system" half-truth this command exists to
+  // prevent — the same failure the ceiling table below was added for.
+  if (actionClass === 'agent.delegate') {
+    log('');
+    log(
+      'שים לב: הכלי היחיד שנושא את המחלקה הזו, `agent.request_help`, יושב ב-`CEILING_EXEMPT_TOOLS` ' +
+        '(`policy/classify.ts`), ו-`rampLevelForPlan` מדלג על צעד כזה במקום לצרף את הרמפה שלו לתקרת ' +
+        'התוכנית. ההעלאה הזו אינה מורגשת בשום תוכנית שמכילה האצלה — היא מבנית, לא תקרה שגוברת. ' +
+        'מה שכן גודר האצלה הוא שלב 3 של השער (`COLLABORATION_GRAPH`) וחמשת שומרי הלולאה, ' +
+        'ומה שגודר את מה שהמשימה-הבת עושה הוא הרמפה של המחלקות שהיא עצמה מפעילה.',
+    );
+  }
   log('');
   log('הרמה שתיאכף בפועל היא המחמירה מבין הרמפה (אחרי הידוק המתג), תקרת המחלקה, ותקרת מקור התוכן:');
 

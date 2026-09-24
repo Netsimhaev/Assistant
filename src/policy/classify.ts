@@ -49,6 +49,14 @@ const TOOL_ACTION_CLASS: Record<string, ActionClass> = {
   'memory.upsert_preference': 'memory.write_longterm',
   'memory.retire': 'memory.write_longterm',
   'charter.apply_amendment': 'charter.amend',
+  // Was read-only. A request for help is a side effect — it opens a child job
+  // that is itself audited and gated — and "read-only" means the call skips
+  // gate steps 5–10 and leaves no audit row at all. Classified so it is
+  // audited, and exempted from the plan ceiling below rather than left
+  // read-only, because the two mean different things: read-only says the call
+  // has no side effect, while this one plainly does — it just carries no
+  // outbound authority of its own (see `CEILING_EXEMPT_TOOLS`).
+  'agent.request_help': 'agent.delegate',
 };
 
 /**
@@ -92,7 +100,6 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'media.inspect',
   'brand.check',
   'escalate_to_human',
-  'agent.request_help',
 ]);
 
 /**
@@ -242,6 +249,41 @@ export function isKnownTool(toolName: string): boolean {
   // as a tool the policy knows.
   return Object.hasOwn(TOOL_ACTION_CLASS, toolName) || READ_ONLY_TOOLS.has(toolName);
 }
+
+/**
+ * Classified and audited, but contributing no ceiling to the plan.
+ *
+ * `rampLevelForPlan` takes the minimum over the classes a plan declares. With
+ * a class of its own and no exemption, every plan containing a delegation is
+ * floored by `agent.delegate`'s ramp — and since the owner's dial defaults to
+ * `off`, which clamps both floor and ceiling to `draft_only`, no delegation
+ * would ever run in a fresh install. That is exactly what happened on 11/09
+ * with `memory.recall` and `mail.draft`.
+ *
+ * `READ_ONLY_TOOLS` is the existing way to contribute no ceiling, and the tool
+ * must not go back there: the two tables must stay disjoint, and an invariant
+ * locks that.
+ *
+ * **Read this together with the disjointness invariant that guards the OTHER
+ * two tables** — `keeps the classified and read-only tables disjoint`
+ * (`policy/positive-controls.test.ts`). That invariant's argument is "a tool
+ * with a real, side-effecting class must never contribute no ceiling", which
+ * read alone makes this table look impossible. The difference is precisely
+ * why this is a third table and not an entry in `READ_ONLY_TOOLS`: a
+ * read-only tool contributes nothing because it HAS no class and is
+ * short-circuited at stage 4, before stage 8 ever reads the ramp; an exempt
+ * tool has a real class, is gated and audited in full, and reaches stage 8
+ * carrying the plan's ramp value — it is excused from CONTRIBUTING to that
+ * value, never from being bound by it. A reader of either docblock who has
+ * not read the other will believe the other one impossible.
+ *
+ * **One member, and the reason is attached to it:** a delegation carries no
+ * outbound authority. It opens a child job whose every step faces all ten
+ * gate stages under its own ramp and under constraints that could only have
+ * tightened. The ceiling belongs to what the child does, not to the request
+ * that opened it.
+ */
+export const CEILING_EXEMPT_TOOLS: ReadonlySet<string> = new Set(['agent.request_help']);
 
 /**
  * Whether a tool call causes something to leave the instance.

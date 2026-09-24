@@ -34,6 +34,21 @@ const RETRY_DELAY_MS = 5 * 60 * 1000;
 export interface StepEffect {
   output: unknown;
   externalId: string | null;
+  /**
+   * True when performing this step already moved the JOB itself, and
+   * `executeStep` must not also move it.
+   *
+   * `agent.request_help` (`orchestrator/local-tools.ts`) calls `requestHelp`,
+   * which — inside its own transaction, before `perform` even returns — parks
+   * the delegating job `execute → followup` (on the happy path) or, for the
+   * one guard that fails the requester itself (the oscillation guard),
+   * `execute → failed`. Either way the phase this function would normally
+   * move next (`verify`) is no longer the phase the job is in, and both of
+   * `LEGAL_TRANSITIONS`'s answers to that — throwing on an illegal move, or
+   * silently overwriting a decision `requestHelp` already committed — are
+   * wrong. See `StepOutcome`'s `parked` member for the outcome this becomes.
+   */
+  parked?: boolean;
 }
 
 export interface StepRequest {
@@ -102,13 +117,25 @@ export interface StepRequest {
    * `ActionFacts.provenanceChainDerived` for the three conditions.
    */
   provenanceChainDerived?: boolean;
+  /**
+   * Hard cap carried by the envelope that opened this job as a delegation's
+   * child — forwarded verbatim into `GateContext.autonomyCeiling`.
+   *
+   * The executor does not look this up; `runPlan` does (by way of
+   * `runPlanForJob`'s caller, `run-due.ts`, which is the one party that knows
+   * which job it is about to run and can ask `agent_envelopes` whether some
+   * envelope governs it). Absent for an ordinary root job that no delegation
+   * ever opened.
+   */
+  autonomyCeiling?: AutonomyLevel;
 }
 
 export type StepOutcome =
   | { status: 'done'; result: unknown; spendRecorded: boolean; externalId: string | null }
   | { status: 'awaiting_approval'; approvalId: string }
   | { status: 'deferred'; code: string; wakeAt: string }
-  | { status: 'refused'; code: string; reason: string };
+  | { status: 'refused'; code: string; reason: string }
+  | { status: 'parked'; result: unknown; externalId: string | null };
 
 /**
  * Run one plan step: gate, then act, then account for it.
@@ -116,6 +143,15 @@ export type StepOutcome =
  * The order is the whole point. Nothing performs a side effect that has not
  * passed `evaluateToolCall` first, and nothing that spent money returns without
  * the spend being written to the ledger.
+ *
+ * **`parked` is a bookmark of a different shape than `deferred`.** `deferred`
+ * means nothing happened — the step did not run, and the job comes back to
+ * try it again. `parked` means something DID happen, and what happened is
+ * that the step moved the job itself: `agent.request_help` opens a child job
+ * and parks the parent on it before `perform` returns at all, and this
+ * function must not then try to move the phase a second time. See
+ * `StepEffect.parked` for the mechanism and the one non-happy-path that also
+ * produces it (the oscillation guard failing the parent directly).
  *
  * **A `deferred` outcome is now a bookmark, for the steps before it.** Quiet
  * hours and a retryable channel failure both move the job to `followup` with a
@@ -237,6 +273,9 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     ...(request.provenanceChainDerived !== undefined
       ? { provenanceChainDerived: request.provenanceChainDerived }
       : {}),
+    ...(request.autonomyCeiling !== undefined
+      ? { autonomyCeiling: request.autonomyCeiling }
+      : {}),
   });
 
   if (decision.outcome === 'queue_approval') {
@@ -357,6 +396,13 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
       businessId: job.businessId,
     });
     return { status: 'refused', code, reason: message };
+  }
+
+  if (effect.parked === true) {
+    // The job already moved — see `StepEffect.parked`. No spend to record
+    // (a delegation itself carries no amount), and no transition to make:
+    // there is nothing left in `execute` for this call to move.
+    return { status: 'parked', result: effect.output, externalId: effect.externalId };
   }
 
   const spendRecorded = await recordStepSpend(request, effectiveInput);

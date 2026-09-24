@@ -30,7 +30,8 @@
     "secret:key": "tsx src/cli/secret-key.ts",
     "doc:ingest": "tsx src/cli/ingest-doc.ts",
     "sdk:curator": "tsx src/sdk/run-curator.ts",
-    "sdk:contact-resolver": "tsx src/sdk/run-contact-resolver.ts"
+    "sdk:contact-resolver": "tsx src/sdk/run-contact-resolver.ts",
+    "sdk:delegate": "tsx src/sdk/run-delegate.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.234",

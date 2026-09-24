@@ -47,6 +47,10 @@ export const ActionClass = z.enum([
   'data.export',
   'memory.write_longterm',
   'charter.amend',
+  // Asking another agent for help. `internal` and therefore not outbound: a
+  // delegation does not leave the installation, so it is not redacted, not
+  // subject to quiet hours, and not in the kill switch's `outbound` scope.
+  'agent.delegate',
 ]);
 export type ActionClass = z.infer<typeof ActionClass>;
 
@@ -99,6 +103,9 @@ export const BASELINE_REVERSIBILITY: Record<ActionClass, Reversibility> = {
   'data.export': 'irreversible',
   'memory.write_longterm': 'reversible',
   'charter.amend': 'reversible',
+  // Asking for help has no effect of its own to undo — whatever the child job
+  // does carries its own reversibility, scored when it acts.
+  'agent.delegate': 'trivial',
 };
 
 /**
@@ -131,6 +138,10 @@ const NEVER_FULLY_AUTONOMOUS_TABLE: Record<ActionClass, boolean> = {
   'media.publish': false,
   'memory.write_longterm': false,
   'charter.amend': true,
+  // Carries no outbound authority of its own — see `CEILING_EXEMPT_TOOLS` in
+  // `policy/classify.ts` for why the tool this class covers needs no ceiling
+  // at all, let alone a permanent one.
+  'agent.delegate': false,
 };
 
 /**
@@ -222,6 +233,9 @@ const ACTION_ADDRESSEE: Record<ActionClass, Addressee> = {
   'data.export': 'internal',
   'memory.write_longterm': 'internal',
   'charter.amend': 'internal',
+  // A delegation does not leave the installation, so it is not redacted, not
+  // subject to quiet hours, and not in the kill switch's `outbound` scope.
+  'agent.delegate': 'internal',
 };
 
 /** Look up who or what a single action class reaches. */

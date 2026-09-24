@@ -152,6 +152,137 @@ describe('buildErasurePlan', () => {
       expect(plan.jobIds).toContain(jobId);
     });
 
+    it('via agent_envelopes.payload', async () => {
+      // Standing in for `requestHelp` called directly, with no plan step
+      // behind it (Task 10) — the one shape `job_plans.plan` cannot discover
+      // by itself, per `AGENT_ENVELOPES_ERASED_PREDICATE`'s docblock.
+      const jobId = await bareJob('via-envelope');
+      await getPool().query(
+        `INSERT INTO agent_envelopes
+           (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+            kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+            idempotency_key, parent_job_id)
+         VALUES ($1, $2, $2, ARRAY['office.manager'], 'office.manager', 'ops.web',
+                 'help_request', 'lookup_contact', $3::jsonb, '[]'::jsonb, 'hash-env',
+                 '{}'::jsonb, 1, $4, $5)`,
+        [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: RONIT }), `idem-${ulid()}`, jobId],
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    /**
+     * Fix round 2, item 2. `_` is an ordinary character in an email local
+     * part and a LIKE wildcard, and this project has already shipped a broken
+     * `ESCAPE ''` once (the orphan `approval_requests` predicate) that stayed
+     * green because the control probing it carried no wildcard at all.
+     *
+     * **The neighbouring `'via agent_envelopes.payload'` test's job is
+     * reachable ONLY through the envelope too** (`bareJob` alone — a charter
+     * and a title that never mentions `RONIT` — plus one envelope; `beforeEach`
+     * calls `resetDatabase()`, so there is no shared fixture underneath it to
+     * be reachable through). Fix round 3, item 6 corrected an earlier version
+     * of this comment that claimed otherwise. The real and only reason that
+     * test cannot catch broken escaping is that `RONIT` carries no LIKE
+     * wildcard — a broken `ESCAPE ''` still matches a pattern with no `_`, `%`
+     * or `\` in it, so that test would stay green either way. This test is
+     * isolated the identical way and differs only in the identifier, which
+     * does carry one.
+     */
+    it('discovers a contact through agent_envelopes.payload even when the identifier contains a LIKE wildcard', async () => {
+      const jobId = await bareJob('via-envelope-wildcard');
+      const identifier = 'zz_env-wild@nowhere.example';
+      await getPool().query(
+        `INSERT INTO agent_envelopes
+           (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+            kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+            idempotency_key, parent_job_id)
+         VALUES ($1, $2, $2, ARRAY['office.manager'], 'office.manager', 'ops.web',
+                 'help_request', 'lookup_contact', $3::jsonb, '[]'::jsonb, 'hash-wild',
+                 '{}'::jsonb, 1, $4, $5)`,
+        [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: identifier }), `idem-${ulid()}`, jobId],
+      );
+
+      const plan = await buildErasurePlan({ kind: 'contact', identifier }, { businessId: BUSINESS });
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    // Task 11: `gov.verify`'s job carries no bound plan (`conduct.ts`'s
+    // `beginVerification`), so unlike a plan-issued delegation's
+    // `agent_envelopes.payload`, this content is NOT already reachable
+    // through `job_plans.plan` — the same shape the query above closes for a
+    // directly-invoked delegation, one table over.
+    it('via verification_verdicts.verdict', async () => {
+      const jobId = await bareJob('via-verdict');
+      await getPool().query(
+        `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
+        [
+          BUSINESS,
+          jobId,
+          JSON.stringify({
+            criteria: [
+              {
+                id: 'answers_question',
+                statement: 'x',
+                severity: 'must',
+                passed: true,
+                detail: `מצטט: לפנות ל-${RONIT}`,
+              },
+            ],
+            ungroundedNumbers: [],
+            answerTruncated: false,
+            draftTruncated: false,
+          }),
+        ],
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: RONIT },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    // Fix round 2, item 2's lesson, repeated one table over: `_` is an
+    // ordinary email character and a LIKE wildcard, and a broken `ESCAPE ''`
+    // only shows up against an identifier that actually carries one.
+    it('discovers a contact through verification_verdicts.verdict even when the identifier contains a LIKE wildcard', async () => {
+      const jobId = await bareJob('via-verdict-wildcard');
+      const identifier = 'zz_verdict-wild@nowhere.example';
+      await getPool().query(
+        `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
+        [
+          BUSINESS,
+          jobId,
+          JSON.stringify({
+            criteria: [
+              {
+                id: 'answers_question',
+                statement: 'x',
+                severity: 'must',
+                passed: true,
+                detail: `מצטט: לפנות ל-${identifier}`,
+              },
+            ],
+            ungroundedNumbers: [],
+            answerTruncated: false,
+            draftTruncated: false,
+          }),
+        ],
+      );
+
+      const plan = await buildErasurePlan({ kind: 'contact', identifier }, { businessId: BUSINESS });
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
     it('via jobs.title', async () => {
       const jobId = await bareJob(`פנייה בנוגע ל-${RONIT}`);
 
@@ -170,18 +301,51 @@ describe('buildErasurePlan', () => {
       { jobId, kind: 'entity', subjectKey: RONIT, body: { name: 'רונית' } },
       { businessId: BUSINESS },
     );
+    await getPool().query(
+      `INSERT INTO agent_envelopes
+         (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+          kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+          idempotency_key, parent_job_id)
+       VALUES ($1, $2, $2, ARRAY['office.manager'], 'office.manager', 'ops.web',
+               'help_request', 'lookup_contact', $3::jsonb, '[]'::jsonb, 'hash-cls',
+               '{}'::jsonb, 1, $4, $5)`,
+      [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: RONIT }), `idem-${ulid()}`, jobId],
+    );
+    await getPool().query(
+      `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, '{}'::jsonb)`,
+      [BUSINESS, jobId],
+    );
 
     const plan = await buildErasurePlan(
       { kind: 'contact', identifier: RONIT },
       { businessId: BUSINESS },
     );
 
-    const tables = new Map(plan.items.map((i) => [i.table, i]));
-    expect(tables.get('memories')?.action).toBe('delete');
-    expect(tables.get('job_plans')?.action).toBe('delete');
-    expect(tables.get('job_authorizations')?.action).toBe('delete');
+    // Keyed by table AND action, not table alone: `jobs` now reports both a
+    // `scrub` (title/pointer cleared, unconditionally) and a `fail` (a
+    // stranded parent, here always 0) — a map keyed by table alone would let
+    // whichever is pushed last in `countItems` silently stand in for the
+    // other, the same defect `approval_requests`'s `delete`+`scrub` pair
+    // already forced onto `erasure.test.ts`'s `byStatement` map.
+    const tables = new Map(plan.items.map((i) => [`${i.table}:${i.action}`, i]));
+    expect(tables.get('memories:delete')?.action).toBe('delete');
+    expect(tables.get('job_plans:delete')?.action).toBe('delete');
+    expect(tables.get('job_authorizations:delete')?.action).toBe('delete');
     // A job row survives with its content emptied — audit rows point at it.
-    expect(tables.get('jobs')?.action).toBe('scrub');
+    expect(tables.get('jobs:scrub')?.action).toBe('scrub');
+    // No job here is parked in `followup`, so the `fail` disposition exists
+    // in the preview but counts zero.
+    expect(tables.get('jobs:fail')).toEqual({ table: 'jobs', action: 'fail', count: 0 });
+    expect(tables.get('agent_envelopes:delete')).toEqual({
+      table: 'agent_envelopes',
+      action: 'delete',
+      count: 1,
+    });
+    expect(tables.get('verification_verdicts:delete')).toEqual({
+      table: 'verification_verdicts',
+      action: 'delete',
+      count: 1,
+    });
   });
 
   /**

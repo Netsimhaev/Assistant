@@ -100,6 +100,23 @@ describe('capability table invariants', () => {
     expect(COLLABORATION_GRAPH['ops.web']).toEqual([]);
   });
 
+  /**
+   * The capability layer denies before the charter, so an agent with graph
+   * neighbours but without the delegation tool holds a signed edge it can never
+   * use — the dead-rule class this file already guards against for
+   * `UNOWNED_TOOLS`. And the other direction is the dangerous one: `ops.web`
+   * must not hold the tool at all, not merely be refused at the gate. A hijacked
+   * browser session should not reach even a call that would be denied.
+   */
+  it('holds the delegation tool if and only if its graph entry is non-empty', () => {
+    for (const agent of AgentId.options) {
+      const hasNeighbours = (COLLABORATION_GRAPH[agent] ?? []).length > 0;
+      const holdsTool = isToolPermitted(agent, 'agent.request_help');
+      expect(holdsTool, `${agent}: neighbours=${hasNeighbours}`).toBe(hasNeighbours);
+    }
+    expect(isToolPermitted('ops.web', 'agent.request_help')).toBe(false);
+  });
+
   it('every agent appears in the denylist and collaboration tables', () => {
     for (const agent of AGENTS) {
       expect(AGENT_DENYLISTS[agent], agent).toBeDefined();
@@ -126,9 +143,78 @@ describe('capability table invariants', () => {
  * what "compiled but unenforced" actually looks like.
  */
 describe('compiled policy has a reader', () => {
-  const GATE_SOURCES = ['../policy/budget.ts', '../policy/engine.ts', '../policy/risk.ts'].map(
-    (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'),
-  );
+  // Keyed by name, not array position: `GATE_SOURCES[1]` used to be "the
+  // engine" only because it was the second entry written down, and the very
+  // next edit to this list (`channels.ts`, below) would have silently
+  // repointed it at a different file. A named lookup can't drift that way.
+  //
+  // `redact.ts` joined this list because it is `engine.ts`'s sibling for two
+  // of the gate's own stages (redaction and quiet hours), exactly the same
+  // relationship `budget.ts` and `risk.ts` already have, and it was simply
+  // missing — `bundle.redactPatterns` is read there, not in `engine.ts` itself.
+  //
+  // `channels.ts` joined for the same reason, one review round later:
+  // `resolveChannel` is where `bundle.connections` is actually filtered
+  // (`bundle.connections.filter(...)`, `orchestrator/channels.ts`) — the
+  // string `connections` had been passing the check below only because it
+  // also appears, coincidentally, in an English comment inside `engine.ts`
+  // ("citing it on two different connections"). A reader on a coincidence is
+  // no reader at all; confirmed by grep that no `CompiledCeilings` *key*
+  // (`currency`, `maxDiscountPercent`, etc. — the nested fields the first test
+  // below checks) and no `doNotContact` bucket name appears anywhere in
+  // `channels.ts`, so adding it here does not silently pass either of the two
+  // tests above the third one.
+  //
+  // `channels.ts` brought its own coincidence, though, on the very field this
+  // list was extended to catch drift on: its docblock reads "the ceilings do
+  // not treat a..." — the bare top-level field name `ceilings`, in prose, one
+  // review round after `connections` was fixed for exactly this shape of
+  // mistake. `readsField` below (used only by the third test, which scans
+  // bare top-level field names across all of `GATE_SOURCES`) is the
+  // structural fix: `ceilings` has two genuine readers today
+  // (`engine.ts:316`, `risk.ts:79`), and this comment can no longer stand in
+  // for them.
+  const GATE_SOURCE_FILES = {
+    budget: '../policy/budget.ts',
+    engine: '../policy/engine.ts',
+    risk: '../policy/risk.ts',
+    redact: '../policy/redact.ts',
+    channels: '../orchestrator/channels.ts',
+  } as const;
+  const GATE_SOURCE_TEXT = Object.fromEntries(
+    Object.entries(GATE_SOURCE_FILES).map(([name, rel]) => [
+      name,
+      readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'),
+    ]),
+  ) as Record<keyof typeof GATE_SOURCE_FILES, string>;
+  const GATE_SOURCES = Object.values(GATE_SOURCE_TEXT);
+
+  /**
+   * A field is "read" only if some gate source actually pulls it off an
+   * object — `.field` (through however many hops precede it: `ctx.bundle.
+   * field`, or a local alias like `const ceilings = bundle.ceilings`) — or
+   * destructures it out of one (`const { field } = ...`, `{ a, field }`).
+   * A bare occurrence of the field's name is not a reader: it is exactly the
+   * shape a comment, a docblock, or an unrelated parameter takes, and a plain
+   * substring match cannot tell the two apart from a real access. That gap is
+   * not hypothetical — it is the second field this task's own reader check
+   * itself was fooled by (`connections`, then `ceilings`), inside one round of
+   * review each time.
+   */
+  function readsField(source: string, field: string): boolean {
+    const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // `.field` (`ctx.bundle.field`, or a local alias's `.field`).
+    const memberAccess = new RegExp(`\\.${escaped}\\b`);
+    // `{ ..., field, ... }` or `{ field }` — anchored on an actual `{`, with
+    // only a plain identifier list between it and the field. A plain
+    // parameter list, e.g. `function f(facts, field: T, options)`, lives in
+    // `(...)`, never `{...}`, so it cannot satisfy this — that gap is exactly
+    // how `budget.ts`'s `ceilings: CompiledCeilings` parameter almost passed
+    // this check on a first draft of this regex, on nothing but a preceding
+    // comma and a following colon.
+    const destructured = new RegExp(`\\{\\s*(?:[A-Za-z0-9_$]+\\s*,\\s*)*${escaped}\\s*[,}]`);
+    return memberAccess.test(source) || destructured.test(source);
+  }
 
   it('every compiled ceiling is named somewhere in the gate', () => {
     const ceilings = compileCharter(buildCharter()).ceilings;
@@ -144,13 +230,105 @@ describe('compiled policy has a reader', () => {
 
   it('every do-not-contact match key is read by the gate', () => {
     const buckets = Object.keys(compileCharter(buildCharter()).doNotContact);
-    const engine = GATE_SOURCES[1] ?? '';
+    const engine = GATE_SOURCE_TEXT.engine;
     const unread = buckets.filter((bucket) => !engine.includes(bucket));
 
     // Three of these four used to compile into a flat list compared against
     // `counterpartyId` alone, so a block by domain, phone or tag matched
     // nothing at all while appearing in the signed document.
     expect(unread).toEqual([]);
+  });
+
+  /**
+   * The two tests above cover `ceilings` and `doNotContact`. `collaborationGraph`
+   * sat outside both, compiled into the signed charter and read by nobody — the
+   * fifth instance of this defect class in this project, and the first that the
+   * mechanical check was supposed to catch and did not.
+   *
+   * This asserts over EVERY top-level field of the compiled bundle, so the sixth
+   * instance cannot exist. A field genuinely not meant for the gate is added to
+   * `NOT_READ_BY_GATE` by name, with a reason — which is a decision someone
+   * writes down, not a gap nobody noticed.
+   */
+  it('every compiled top-level field is named somewhere in the gate', () => {
+    const NOT_READ_BY_GATE = new Set<string>([
+      // Signature/integrity metadata: verified when the charter is installed
+      // (`charter/sign.ts`, `charter/store.ts`), not consulted for any
+      // per-call permission decision. A gate that read `contentHash` would be
+      // reading a fingerprint of itself, not a rule.
+      'contentHash',
+
+      // A compilation timestamp with zero readers anywhere in `src/` — not
+      // just outside the gate. It names no rule and carries no permission, so
+      // there is nothing here for the gate to enforce. Worth a cleanup pass
+      // on its own; not a policy gap.
+      'compiledAt',
+
+      // Deliberately model-facing, not code-enforced: `domain/policy.ts`'s own
+      // docblock calls this "prose injected into agent prompts ... the model
+      // could in principle be talked out of" — the opposite of the data the
+      // gate evaluates. Read by `sdk/reading-prompt.ts`.
+      'promptFragments',
+
+      // "What the owner actually signed" (same docblock) — the human-legible
+      // text fed into planner/proposal prompts (`sdk/planner.ts`,
+      // `sdk/proposal-prompt.ts`) and shown to people. Never compared against
+      // a fact to produce allow/deny.
+      'plainLanguage',
+
+      // NOT a gap, on review: neither field is signed-charter data at all.
+      // `compileCharter` (`charter/compile.ts:51-53`) injects `allowlists` and
+      // `denylists` straight from the module constants `AGENT_ALLOWLISTS` /
+      // `AGENT_DENYLISTS` (`charter/capabilities.ts`) — nothing in the signed
+      // document produced them, so there is nothing signed that goes unread.
+      // `isToolPermitted(agent, toolName)` reads those same constants
+      // directly rather than `ctx.bundle.allowlists` / `.denylists`, and that
+      // is the *fresher* source, not a staler one: a tightened allowlist
+      // deployed to `capabilities.ts` takes effect on the next call, where
+      // reading it off an old signed bundle would keep permitting a tool the
+      // new code just withdrew — the opposite failure direction from
+      // `connections`, which is signed-charter data and does need the pinned
+      // bundle. The test below asserts the property this comment claims
+      // (`b.allowlists` / `b.denylists` equal the live constants verbatim),
+      // so the claim doesn't rest on prose alone.
+      'allowlists',
+      'denylists',
+    ]);
+    // `charterVersion` was excluded here originally on the theory that stage
+    // 2 compares it "by value rather than by name lookup" — true, but stage 2
+    // (`engine.ts:142`, `currentVersion !== ctx.bundle.charterVersion`) also
+    // contains the literal substring `charterVersion`, so the field passes
+    // the check on its own merits. Excluding it bought nothing but a blind
+    // spot: deleting the stage-2 staleness comparison entirely left this test
+    // green. Not excluded any more.
+    //
+    // The exclusion set is the one place this invariant can be defeated, so
+    // its size is asserted directly rather than as a loose lower bound on
+    // survivors — growing it should be a deliberate, reviewed edit, not
+    // something that quietly fits under a stale slack number.
+    expect(NOT_READ_BY_GATE.size).toBe(6);
+    const compiled = compileCharter(buildCharter()) as Record<string, unknown>;
+    const fields = Object.keys(compiled).filter((f) => !NOT_READ_BY_GATE.has(f));
+    // Both properties pinned, not just the exclusion set: 18 top-level fields
+    // total, minus the 6 excluded above, is 12. A refactor that nested some of
+    // these fields under a sub-object would shrink `fields` and pass this
+    // invariant more vacuously than ever — a floor on the exclusion set alone
+    // does not catch that.
+    expect(fields.length).toBe(12);
+    const unread = fields.filter((field) => !GATE_SOURCES.some((src) => readsField(src, field)));
+    expect(unread).toEqual([]);
+  });
+
+  it('the compiled bundle carries the live capability tables verbatim', () => {
+    // Proves what the exclusion comment above claims: `allowlists` and
+    // `denylists` are not signed-charter data with a missing reader — they
+    // are the live `capabilities.ts` constants, copied into the bundle
+    // unchanged. If a future edit to `compileCharter` ever derived these from
+    // the charter document instead, this fails and the exclusion above stops
+    // being true.
+    const compiled = compileCharter(buildCharter());
+    expect(compiled.allowlists).toEqual(AGENT_ALLOWLISTS);
+    expect(compiled.denylists).toEqual(AGENT_DENYLISTS);
   });
 });
 
@@ -217,6 +395,7 @@ describe('addresseeOf is pinned class by class', () => {
     'data.export': 'internal',
     'memory.write_longterm': 'internal',
     'charter.amend': 'internal',
+    'agent.delegate': 'internal',
   };
 
   it('has an entry for every action class', () => {

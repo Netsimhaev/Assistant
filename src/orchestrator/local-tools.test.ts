@@ -1,14 +1,23 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { ulid } from 'ulid';
+import { closePool, getPool } from '../db/pool.js';
+import { config } from '../config.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
+import { compileCharter } from '../charter/compile.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { Plan } from '../domain/plan.js';
+import type { AgentEnvelope } from '../domain/envelope.js';
+import { attachChildJob, loadEnvelope, writeEnvelope } from '../governance/envelope-store.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { envCredentials } from './credentials.js';
 import { runPlan } from './run-plan.js';
 import { recallMemories } from '../memory/store.js';
+import { insertOrGetDocument, markExtracted } from '../documents/store.js';
+import { renderReadingBrief } from '../documents/brief.js';
+import { interpretReaderResponse, type ReadOutcome } from '../sdk/know-reader.js';
+import type { DocumentArtifact } from '../documents/types.js';
 import {
   LOCAL_TOOL_CONTRACTS,
   implementedLocalTools,
@@ -363,5 +372,546 @@ describe('the local tool executor', () => {
       expect(known.has(tool), `${tool} is not a tool the policy knows`).toBe(true);
       expect(isOutbound(tool), `${tool} is outbound and must not run locally`).toBe(false);
     }
+  });
+
+  /**
+   * `doc.fetch` — know.reader's half of a delegation. Until this task it had
+   * no implementation at all, so a child job created by `requestHelp` would
+   * have completed with `not_implemented` and taught the parent nothing.
+   */
+  describe('doc.fetch', () => {
+    async function anExtractedDocument(text: string): Promise<string> {
+      const documentId = `DOC-${ulid()}`;
+      await insertOrGetDocument(
+        {
+          documentId,
+          source: 'manual',
+          originalName: 'מסמך.txt',
+          mediaType: 'text/plain',
+          sha256: ulid().padEnd(64, '0'),
+          byteSize: text.length,
+          storedPath: `${BUSINESS}/${documentId}/original.txt`,
+        },
+        { businessId: BUSINESS },
+      );
+      await markExtracted(
+        documentId,
+        [{ ordinal: 0, kind: 'text', partName: 'גוף', content: { blocks: [{ kind: 'paragraph', text }] }, flags: [] }],
+        { businessId: BUSINESS },
+      );
+      return documentId;
+    }
+
+    function stubReader(raw: string) {
+      let calls = 0;
+      const reader = async (request: { artifacts: readonly DocumentArtifact[] }): Promise<ReadOutcome> => {
+        calls += 1;
+        const { includedOrdinals } = renderReadingBrief(request.artifacts);
+        return interpretReaderResponse(raw, includedOrdinals, [], 1);
+      };
+      return { reader, callCount: () => calls };
+    }
+
+    it('reads an extracted document and hands back the reading', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch1');
+      const documentId = await anExtractedDocument('מה המחיר לאספקה?');
+      const { reader, callCount } = stubReader(
+        JSON.stringify({
+          summary: 'שאלה על מחיר אספקה.',
+          findings: [],
+          intents: [
+            {
+              intent: 'file_document',
+              subject: { kind: 'sender' },
+              sourceRef: { ordinal: 0, locator: null },
+              note: '',
+            },
+          ],
+          unreadable: [],
+        }),
+      );
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v1' }));
+
+      const out = await runLocalTool(
+        'doc.fetch',
+        { documentId, question: 'מה המסמך מבקש?' },
+        { jobId, businessId: BUSINESS, bundle, reader },
+      );
+
+      expect(out['performed']).toBe(true);
+      expect(out['status']).toBe('read');
+      expect((out['reading'] as { summary: string }).summary).toBe('שאלה על מחיר אספקה.');
+      expect(callCount()).toBe(1);
+    });
+
+    it('reports no_artifacts without calling the reader, for a document with nothing extracted', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch2');
+      const documentId = `DOC-${ulid()}`;
+      await insertOrGetDocument(
+        {
+          documentId,
+          source: 'manual',
+          originalName: 'ריק.txt',
+          mediaType: 'text/plain',
+          sha256: ulid().padEnd(64, '0'),
+          byteSize: 0,
+          storedPath: `${BUSINESS}/${documentId}/original.txt`,
+        },
+        { businessId: BUSINESS },
+      );
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v2' }));
+      let called = false;
+      const reader = async (): Promise<ReadOutcome> => {
+        called = true;
+        throw new Error('must not be called for a document with no artifacts');
+      };
+
+      const out = await runLocalTool('doc.fetch', { documentId }, { jobId, businessId: BUSINESS, bundle, reader });
+      expect(out).toEqual({ performed: false, reason: 'no_artifacts' });
+      expect(called).toBe(false);
+    });
+
+    it('throws a clear internal error when the caller forgot to supply a bundle', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch3');
+      await expect(
+        runLocalTool('doc.fetch', { documentId: 'doc-x' }, { jobId, businessId: BUSINESS }),
+      ).rejects.toThrow(/bundle/);
+    });
+
+    it('fails the step on a payload missing documentId', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch4');
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v4' }));
+      await expect(
+        runLocalTool('doc.fetch', { question: 'מה זה?' }, { jobId, businessId: BUSINESS, bundle }),
+      ).rejects.toBeInstanceOf(StepChannelError);
+    });
+
+    /**
+     * `DOCUMENT_READS_PER_DAY` bounds document reads for the instance.
+     * `conductPendingDocuments` enforces it for the inbox path; a delegation's
+     * `doc.fetch` step reaches `readDocument` without ever going through that
+     * loop, and without a check here it would be billed and counted only
+     * against `delegationsPerDay`, which bounds a different thing entirely.
+     */
+    it('refuses once the daily document-reads cap is used up, retryably', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch5');
+      const documentId = await anExtractedDocument('כמה זה עולה?');
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v5' }));
+
+      for (let i = 0; i < config.documentReadsPerDay; i++) {
+        await getPool().query(
+          `INSERT INTO document_readings (
+             reading_id, business_id, document_id, status, reason, content,
+             provenance, model, prompt_version, brief_hash
+           ) VALUES ($1, $2, $3, 'unreadable', 'seed', NULL, 'boss', 'test', 'v1', $4)`,
+          [`RDG-${ulid()}`, BUSINESS, documentId, `seed-${i}`],
+        );
+      }
+
+      const { reader, callCount } = stubReader(JSON.stringify({ summary: 'x', findings: [], intents: [], unreadable: [] }));
+      let caught: unknown;
+      try {
+        await runLocalTool('doc.fetch', { documentId }, { jobId, businessId: BUSINESS, bundle, reader });
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(StepChannelError);
+      const typed = caught as StepChannelError;
+      expect(typed.code).toBe('document_reads_exhausted');
+      expect(typed.retryable).toBe(true);
+      // Refused before the model was ever called.
+      expect(callCount()).toBe(0);
+    });
+
+    /**
+     * The pair to the test above: that one is a cap that WILL reset at
+     * midnight, retryable. This one — `DOCUMENT_READS_PER_DAY=0`, a
+     * legitimate "off" setting (CLAUDE.md) — never will, so `retryable` must
+     * be `false`. Without this test, reverting
+     * `config.documentReadsPerDay > 0` to a bare `true`, or flipping the
+     * comparison, passes the whole suite untouched — the nonzero test above
+     * asserts `retryable: true` regardless of which branch produced it.
+     */
+    it('refuses finally, not retryably, when the cap itself is zero', async () => {
+      const jobId = await aJob('unknown_external', 'docfetch6');
+      const bundle = compileCharter(buildCharter({ version: 'docfetch-v6' }));
+
+      const original = config.documentReadsPerDay;
+      (config as { documentReadsPerDay: number }).documentReadsPerDay = 0;
+      try {
+        const { reader, callCount } = stubReader(
+          JSON.stringify({ summary: 'x', findings: [], intents: [], unreadable: [] }),
+        );
+        let caught: unknown;
+        try {
+          await runLocalTool('doc.fetch', { documentId: 'doc-any' }, { jobId, businessId: BUSINESS, bundle, reader });
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(caught).toBeInstanceOf(StepChannelError);
+        const typed = caught as StepChannelError;
+        expect(typed.code).toBe('document_reads_exhausted');
+        expect(typed.retryable).toBe(false);
+        expect(callCount()).toBe(0);
+      } finally {
+        (config as { documentReadsPerDay: number }).documentReadsPerDay = original;
+      }
+    });
+  });
+
+  /**
+   * `agent.request_help` — the tool that opens a delegation. Until Task 7 it
+   * had no implementation at all: a plan naming it landed here and got
+   * `{ performed: false, reason: 'not_implemented' }`, and `requestHelp`
+   * (built in Task 6) had no production caller.
+   */
+  describe('agent.request_help', () => {
+    async function parentJobInExecute(): Promise<{ jobId: string; bundle: ReturnType<typeof compileCharter> }> {
+      const bundle = await installCharter(buildCharter({ version: `req-help-${ulid()}` }), {
+        businessId: BUSINESS,
+      });
+      const job = await createJob({
+        charterVersion: bundle.charterVersion,
+        provenance: 'boss',
+        businessId: BUSINESS,
+        title: 'delegating job',
+      });
+      for (const to of ['understand', 'plan', 'execute'] as const) {
+        await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+      }
+      return { jobId: job.jobId, bundle };
+    }
+
+    it('opens a child job, parks the parent, and reports itself as parked', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+
+      const out = await runLocalTool(
+        'agent.request_help',
+        {
+          to: 'know.reader',
+          intent: 'read_for_question',
+          payload: { question: 'מה המסמך הזה מבקש?' },
+          contextRefs: [{ kind: 'document', documentId }],
+        },
+        { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' },
+      );
+
+      expect(out['performed']).toBe(true);
+      expect(out['status']).toBe('delegated');
+      expect(out['parked']).toBe(true);
+      expect(typeof out['childJobId']).toBe('string');
+      expect(typeof out['envelopeId']).toBe('string');
+
+      const parent = await loadJob(jobId, { businessId: BUSINESS });
+      expect(parent?.phase).toBe('followup');
+      expect(parent?.awaitingEnvelopeId).toBe(out['envelopeId']);
+
+      const child = await loadJob(out['childJobId'] as string, { businessId: BUSINESS });
+      expect(child?.phase).toBe('execute');
+    });
+
+    /**
+     * Fix round 2, item 2. A resumed run of the same step while the child is
+     * STILL RUNNING and no `result` envelope exists yet must not throw a
+     * plain retryable error: `executeStep`'s generic deferral clears
+     * `awaiting_envelope_id` on every move (`transition` overwrites it,
+     * never merges), and clearing it here would mean `resumeDelegatedJobs` —
+     * the only thing enforcing this delegation's deadline — never looks at
+     * this parent again. The fix re-parks under the SAME envelope id, so the
+     * next scheduler pass finds it exactly as it would have found a freshly
+     * opened delegation.
+     */
+    it('re-parks under the same envelope when resumed before the child has answered, rather than clearing the watch', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+      const input = {
+        to: 'know.reader' as const,
+        intent: 'read_for_question',
+        payload: { question: 'מה המסמך הזה מבקש?' },
+        contextRefs: [{ kind: 'document' as const, documentId }],
+      };
+      const ctx = { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' as const };
+
+      const first = await runLocalTool('agent.request_help', input, ctx);
+      expect(first['status']).toBe('delegated');
+      const envelopeId = first['envelopeId'] as string;
+      const childJobId = first['childJobId'] as string;
+
+      // Simulate the resumed run: the parent is back in `execute` (as
+      // `resumeDelegatedJobs` would only ever put it once it has an answer —
+      // this test deliberately does NOT go through it, to isolate what the
+      // handler does when no `result` envelope exists at all), and the SAME
+      // step runs again.
+      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
+
+      const second = await runLocalTool('agent.request_help', input, ctx);
+      expect(second['performed']).toBe(false);
+      expect(second['status']).toBe('pending');
+      expect(second['parked']).toBe(true);
+      expect(second['envelopeId']).toBe(envelopeId);
+      expect(second['childJobId']).toBe(childJobId);
+
+      const parent = await loadJob(jobId, { businessId: BUSINESS });
+      expect(parent?.phase).toBe('followup');
+      // The SAME envelope id — not cleared, not a new one — so
+      // `resumeDelegatedJobs` keeps watching this exact delegation.
+      expect(parent?.awaitingEnvelopeId).toBe(envelopeId);
+
+      // Fix round 3, item 3: `job_steps.envelope_id` must name this envelope
+      // too, not just `jobs.awaiting_envelope_id` — the original park
+      // (`delegate.ts`) sets both, and omitting it here left the id
+      // surviving only in the Hebrew reason string.
+      const { rows: stepRows } = await getPool().query<{ envelope_id: string | null }>(
+        'SELECT envelope_id FROM job_steps WHERE job_id = $1 ORDER BY id DESC LIMIT 1',
+        [jobId],
+      );
+      expect(stepRows[0]?.envelope_id).toBe(envelopeId);
+
+      // The child itself is untouched by any of this.
+      const child = await loadJob(childJobId, { businessId: BUSINESS });
+      expect(child?.phase).toBe('execute');
+    });
+
+    /**
+     * Fix round 3, item 1, the good-parse half. A `result` envelope whose
+     * payload actually matches `ResultEnvelopePayload` completes the step
+     * normally — this is the ordinary case the corrupted-payload test right
+     * after it is contrasted against.
+     */
+    it('completes the step from a well-formed result envelope written directly, without asking the child\'s phase', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+      const input = {
+        to: 'know.reader' as const,
+        intent: 'read_for_question',
+        payload: { question: 'מה המסמך הזה מבקש?' },
+        contextRefs: [{ kind: 'document' as const, documentId }],
+      };
+      const ctx = { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' as const };
+
+      const first = await runLocalTool('agent.request_help', input, ctx);
+      const childJobId = first['childJobId'] as string;
+
+      // A well-formed result, written directly rather than through
+      // `resumeDelegatedJobs` — isolating what THIS handler does with one,
+      // not re-testing the writer.
+      await writeEnvelope(
+        {
+          v: 1,
+          id: `ENV-${ulid()}`,
+          correlationId: jobId,
+          causalChain: [],
+          from: 'know.reader',
+          to: 'comms.email',
+          kind: 'result',
+          intent: 'read_for_question',
+          payload: { outcome: 'succeeded', note: 'נענתה' },
+          contextRefs: [{ kind: 'job', jobId: childJobId }],
+          constraints: {
+            charterVersion: bundle.charterVersion,
+            provenanceCeiling: 'boss',
+            autonomyCeiling: 'auto',
+            moneyCeilingMinor: null,
+            deadlineAt: '2026-12-31T00:00:00.000Z',
+          },
+          hops: 1,
+          idempotencyKey: `IDEM-${ulid()}`,
+          createdAt: new Date().toISOString(),
+        },
+        { parentJobId: childJobId, businessId: BUSINESS },
+      );
+
+      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
+      const second = await runLocalTool('agent.request_help', input, ctx);
+      expect(second['performed']).toBe(true);
+      expect(second['status']).toBe('answered');
+      expect(second['outcome']).toBe('succeeded');
+    });
+
+    /**
+     * Fix round 3, item 1, the unparseable half. Before this fix, a `result`
+     * envelope whose `outcome` did not survive `ResultEnvelopePayload`
+     * completed the step as `done` with `outcome: 'unknown'` anyway — a
+     * value we could not read, treated as a permitting one. It must instead
+     * be refused the same way any other corrupted delegation state here is
+     * refused (non-retryably, failing the parent).
+     */
+    it('fails rather than completes when the result envelope payload cannot be parsed', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+      const input = {
+        to: 'know.reader' as const,
+        intent: 'read_for_question',
+        payload: { question: 'מה המסמך הזה מבקש?' },
+        contextRefs: [{ kind: 'document' as const, documentId }],
+      };
+      const ctx = { jobId, businessId: BUSINESS, bundle, agent: 'comms.email' as const };
+
+      const first = await runLocalTool('agent.request_help', input, ctx);
+      const childJobId = first['childJobId'] as string;
+
+      // A malformed result — `outcome` is not one of the closed union.
+      await writeEnvelope(
+        {
+          v: 1,
+          id: `ENV-${ulid()}`,
+          correlationId: jobId,
+          causalChain: [],
+          from: 'know.reader',
+          to: 'comms.email',
+          kind: 'result',
+          intent: 'read_for_question',
+          payload: { outcome: 'not-a-real-outcome' },
+          contextRefs: [{ kind: 'job', jobId: childJobId }],
+          constraints: {
+            charterVersion: bundle.charterVersion,
+            provenanceCeiling: 'boss',
+            autonomyCeiling: 'auto',
+            moneyCeilingMinor: null,
+            deadlineAt: '2026-12-31T00:00:00.000Z',
+          },
+          hops: 1,
+          idempotencyKey: `IDEM-${ulid()}`,
+          createdAt: new Date().toISOString(),
+        },
+        { parentJobId: childJobId, businessId: BUSINESS },
+      );
+
+      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
+
+      let caught: unknown;
+      try {
+        await runLocalTool('agent.request_help', input, ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StepChannelError);
+      const typed = caught as StepChannelError;
+      expect(typed.code).toBe('delegation_result_corrupted');
+      expect(typed.retryable).toBe(false);
+    });
+
+    /**
+     * Fix round 1, Important 4. `loadEnvelopeForChildJob` had no test at all:
+     * both cases above use a root parent, so the lookup returns `null`
+     * either way and a mutation replacing the real call with a literal
+     * `null` would leave the whole suite green. This seeds a MIDDLE job that
+     * is itself governed by a real ancestor envelope (strict constraints,
+     * `hops: 3`) and asserts a delegation opened FROM that job inherits the
+     * ancestor's values — never `ROOT_ANCESTOR_CONSTRAINTS`'s permissive
+     * defaults, and never `hops: 0`, which would reset the correlation both
+     * anti-ping-pong guards scope by.
+     */
+    it("inherits the ancestor envelope governing the CURRENT job, not a root baseline", async () => {
+      const { jobId: middleJobId, bundle } = await parentJobInExecute();
+
+      // Strictly tighter than anything `requestHelp` would derive on its own
+      // for this call (provenance `boss`, autonomy `auto`, no money cap, a
+      // 24h deadline) — so every field surviving in the grandchild's envelope
+      // proves the ancestor was actually read, not merely defaulted.
+      const strictDeadline = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      const ancestorEnvelope: AgentEnvelope = {
+        v: 1,
+        id: `ENV-${ulid()}`,
+        correlationId: 'JOB-root-of-the-tree',
+        causalChain: ['ENV-earlier'],
+        from: 'sched.meetings',
+        to: 'comms.email',
+        kind: 'help_request',
+        intent: 'an_earlier_intent',
+        payload: {},
+        contextRefs: [],
+        constraints: {
+          charterVersion: bundle.charterVersion,
+          provenanceCeiling: 'unknown_external',
+          autonomyCeiling: 'draft_only',
+          moneyCeilingMinor: 100,
+          deadlineAt: strictDeadline,
+        },
+        hops: 3,
+        idempotencyKey: `IDEM-${ulid()}`,
+        createdAt: new Date().toISOString(),
+      };
+      await writeEnvelope(ancestorEnvelope, { parentJobId: 'JOB-some-grandparent', businessId: BUSINESS });
+      await attachChildJob(ancestorEnvelope.id, middleJobId, { businessId: BUSINESS });
+
+      const documentId = `DOC-${ulid()}`;
+      const out = await runLocalTool(
+        'agent.request_help',
+        {
+          to: 'know.reader',
+          intent: 'read_for_question',
+          payload: { question: 'מה המסמך הזה מבקש?' },
+          contextRefs: [{ kind: 'document', documentId }],
+        },
+        { jobId: middleJobId, businessId: BUSINESS, bundle, agent: 'comms.email' },
+      );
+
+      expect(out['status']).toBe('delegated');
+      const envelope = await loadEnvelope(out['envelopeId'] as string, { businessId: BUSINESS });
+      expect(envelope?.hops).toBe(4); // ancestor's 3 + 1, never 0 + 1
+      expect(envelope?.correlationId).toBe('JOB-root-of-the-tree'); // inherited, not middleJobId
+      expect(envelope?.constraints.provenanceCeiling).toBe('unknown_external');
+      expect(envelope?.constraints.autonomyCeiling).toBe('draft_only');
+      expect(envelope?.constraints.moneyCeilingMinor).toBe(100);
+      expect(envelope?.constraints.deadlineAt).toBe(strictDeadline);
+    });
+
+    /**
+     * The integration Piece B exists for: `runPlan` must not throw trying to
+     * move a job `requestHelp` already moved out from under it. Before the
+     * `parked` outcome, `executeStep` would try `verify` next on a job
+     * already sitting in `followup`, and `LEGAL_TRANSITIONS` has no
+     * `followup → verify` — an illegal-transition throw, not a clean halt.
+     */
+    it('runs through runPlan as a "parked" halt, not a "done" step — and does not try to move the job a second time', async () => {
+      const { jobId, bundle } = await parentJobInExecute();
+      const documentId = `DOC-${ulid()}`;
+      const plan = Plan.parse({
+        goal: 'ask know.reader to read the document',
+        steps: [
+          {
+            id: 's1',
+            agent: 'comms.email',
+            intent: 'delegate',
+            toolName: 'agent.request_help',
+            input: {
+              to: 'know.reader',
+              intent: 'read_for_question',
+              payload: { question: 'מה המסמך הזה מבקש?' },
+              contextRefs: [{ kind: 'document', documentId }],
+            },
+            dependsOn: [],
+            expectedActionClass: 'agent.delegate',
+          },
+        ],
+      });
+      const job = await loadJob(jobId, { businessId: BUSINESS });
+      if (job === null) throw new Error('job vanished');
+
+      const result = await runPlan({
+        job,
+        bundle,
+        plan,
+        registry: new AdapterRegistry([]),
+        bindings: [],
+        credentials: envCredentials({}, 'TEST_CRED_'),
+        counterpartyTags: [],
+        rampLevel: 'auto',
+      });
+
+      expect(result.status).toBe('halted');
+      if (result.status !== 'halted') throw new Error('expected halted');
+      expect(result.reason).toBe('parked');
+      expect(result.steps).toHaveLength(1);
+      expect(result.steps[0]?.outcome.status).toBe('parked');
+
+      const parent = await loadJob(jobId, { businessId: BUSINESS });
+      expect(parent?.phase).toBe('followup');
+      expect(parent?.awaitingEnvelopeId).not.toBeNull();
+    });
   });
 });

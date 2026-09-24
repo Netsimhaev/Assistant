@@ -1,12 +1,15 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
 import type { CharterConnection } from '../domain/connection.js';
+import type { AgentEnvelope } from '../domain/envelope.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
+import { attachChildJob, writeEnvelope } from '../governance/envelope-store.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import { upsertBinding } from './bindings.js';
@@ -413,5 +416,58 @@ describe('runDueJobs', () => {
     expect(result.errored[0]?.error).toContain('does not parse as a Plan');
     expect(result.ran).toEqual([{ jobId: healthyJobId, status: 'done', detail: null }]);
     expect(sent).toHaveLength(1);
+  });
+
+  /**
+   * Task 7, piece C: `GateContext.autonomyCeiling` has always been folded into
+   * `effectiveAutonomy` (`policy/engine.ts`), but nothing ever populated it —
+   * `runDueJobs` built the child's gate context knowing nothing about the
+   * delegation that opened it. "Constraints tighten monotonically down a
+   * delegation chain" was therefore true of what got STORED on the envelope
+   * and false of what got ENFORCED. This test gives the envelope a ceiling
+   * strictly tighter than every other autonomy source in play (base autonomy
+   * `auto`, ramp `auto` — the exact setup the "runs a job that is in execute"
+   * test above proves reaches `done` with NO envelope attached) and asserts
+   * the step is held at that ceiling instead.
+   */
+  it("holds a job at the ceiling carried by the envelope that opened it as a delegation's child", async () => {
+    const jobId = await seedExecutableJob();
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
+
+    const envelope: AgentEnvelope = {
+      v: 1,
+      id: `ENV-${ulid()}`,
+      correlationId: 'JOB-root-of-the-tree',
+      causalChain: [],
+      from: 'comms.email',
+      to: 'comms.email',
+      kind: 'help_request',
+      intent: 'send_the_confirmation',
+      payload: {},
+      contextRefs: [],
+      constraints: {
+        charterVersion: 'irrelevant-to-this-lookup',
+        provenanceCeiling: 'boss',
+        // Strictly tighter than the `auto` that base autonomy and the ramp
+        // both grant — the one thing standing between `done` and `draft_only`
+        // in this test.
+        autonomyCeiling: 'draft_only',
+        moneyCeilingMinor: null,
+        deadlineAt: '2026-12-31T00:00:00.000Z',
+      },
+      hops: 1,
+      idempotencyKey: `IDEM-${ulid()}`,
+      createdAt: '2026-09-24T00:00:00.000Z',
+    };
+    await writeEnvelope(envelope, { parentJobId: 'JOB-some-other-job', businessId: BUSINESS });
+    await attachChildJob(envelope.id, jobId, { businessId: BUSINESS });
+
+    const sent: MailMessage[] = [];
+    const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+
+    expect(result.ran).toEqual([{ jobId, status: 'halted', detail: 'draft_only:persist_as_draft' }]);
+    expect(sent).toHaveLength(0);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
   });
 });

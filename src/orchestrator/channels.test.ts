@@ -534,6 +534,7 @@ describe('resolving a channel', () => {
       'data.export': 'c_812',
       'memory.write_longterm': 'c_812',
       'charter.amend': 'c_812',
+      'agent.delegate': 'c_812',
     };
 
     it.each(ActionClass.options)('%s routes to its pinned target', (cls) => {

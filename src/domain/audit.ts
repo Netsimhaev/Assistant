@@ -83,6 +83,14 @@ export const AuditKind = z.enum([
    * convention).
    */
   'credential_change',
+  /**
+   * One agent asked another for help. Carries the pair, the intent, the hop
+   * count and the envelope id — never the payload and never what the context
+   * refs point at. A delegation is a fact about the system's own plumbing, and
+   * a row naming the subject would make the audit log the one place that
+   * subject survives.
+   */
+  'delegation',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 

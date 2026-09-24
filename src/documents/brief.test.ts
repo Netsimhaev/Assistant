@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { BRIEF_TABLE_ROWS, BRIEF_TEXT_CHARS, BRIEF_TOTAL_CHARS, renderReadingBrief } from './brief.js';
+import { ungroundedNumbers } from '../governance/numeric-grounding.js';
+import {
+  BRIEF_TABLE_ROWS,
+  BRIEF_TEXT_CHARS,
+  BRIEF_TOTAL_CHARS,
+  renderArtifactFull,
+  renderReadingBrief,
+} from './brief.js';
 import type { Cell, DocumentArtifact } from './types.js';
 
 function s(v: string): Cell { return { v, t: 'string' }; }
@@ -72,6 +79,12 @@ describe('renderReadingBrief', () => {
     const { brief } = renderReadingBrief([tableArtifact(500)]);
     expect(brief).toContain('פריט');
     expect(brief).toContain('מחיר');
+    // The cell separator itself, pinned — fix round 3, item 2: with
+    // `renderTable` now shared between this (capped) path and
+    // `renderArtifactFull`'s (uncapped) path, a change to the separator must
+    // fail a test on BOTH sides, not silently pass here while only the other
+    // side's test notices.
+    expect(brief).toContain('פריט | מחיר');
   });
 
   it('caps a long text artefact and marks it', () => {
@@ -211,5 +224,149 @@ describe('renderReadingBrief', () => {
   it('produces a brief for an empty artefact list rather than an empty string', () => {
     // An empty document is a fact to state, not a prompt with nothing in it.
     expect(renderReadingBrief([]).brief.trim()).not.toBe('');
+  });
+});
+
+/**
+ * `conduct.ts`'s `beginVerification` (Task 11, fix round 2's item 1). The
+ * regression: `JSON.stringify(artifact.content)` puts no space after a key's
+ * colon, so a numeric cell (`{"v":11988,"t":"number"}`) sits immediately
+ * after a `:` — exactly the shape `numeric-grounding.ts`'s `numbersIn` skips
+ * on purpose (its date/time/range guard). On a spreadsheet or table artefact
+ * this zeroed the ENTIRE grounded set, and because the source list was
+ * non-empty, `ungroundedNumbers`'s own "an empty list grounds everything"
+ * safety never fired — every number in the draft read as ungrounded. This is
+ * the canonical `.xlsx`-quote shape (an amount in its own cell), so it is
+ * pinned here directly, against `ungroundedNumbers` itself, not merely
+ * against `renderArtifactFull`'s own output shape.
+ */
+describe('renderArtifactFull — the numeric-grounding regression', () => {
+  const XLSX_LIKE: DocumentArtifact = {
+    ordinal: 1,
+    kind: 'table',
+    partName: 'הצעת מחיר',
+    content: { rows: [[s('פריט'), s('סכום')], [s('סה"כ'), n(11988)]] },
+    flags: [],
+  };
+
+  it('grounds a number that sits in its own table cell', () => {
+    const draft = 'הסכום לתשלום הוא 11,988 ש"ח.';
+    expect(ungroundedNumbers(draft, [renderArtifactFull(XLSX_LIKE)])).toEqual([]);
+  });
+
+  it('is the fix for a real regression: JSON.stringify of the same content does NOT ground it', () => {
+    const draft = 'הסכום לתשלום הוא 11,988 ש"ח.';
+    // Not an assertion about `renderArtifactFull` — a demonstration that the
+    // alternative this replaced was actually broken, on the exact content
+    // the test above proves the fix for.
+    expect(ungroundedNumbers(draft, [JSON.stringify(XLSX_LIKE.content)])).toEqual(['11988']);
+  });
+
+  /**
+   * Fix round 3, item 2: a hard-coded literal here proved nothing about
+   * equality with `renderReadingBrief`'s own output — changing the shared
+   * separator only in the capped path would have left this test green while
+   * the two renderers silently diverged. Derived from `renderReadingBrief`'s
+   * ACTUAL output instead: `XLSX_LIKE` has one data row, far under
+   * `BRIEF_TABLE_ROWS`, so capping never engages and the body is byte-
+   * identical either way — what differs is only the section header
+   * `renderReadingBrief` prepends, stripped here by its own known format.
+   */
+  it('renders a table exactly as renderReadingBrief renders the same content', () => {
+    const { brief } = renderReadingBrief([XLSX_LIKE]);
+    const header = `[חלק ${XLSX_LIKE.ordinal}] ${XLSX_LIKE.partName ?? '(ללא שם)'} — ${XLSX_LIKE.kind}`;
+    expect(brief.startsWith(`${header}\n`)).toBe(true);
+    expect(brief.slice(header.length + 1)).toBe(renderArtifactFull(XLSX_LIKE));
+  });
+
+  /**
+   * Fix round 3, item 3: `renderTable`'s capped path never reached a row past
+   * `BRIEF_TABLE_ROWS`, so a malformed row further down never had a chance to
+   * throw. Removing the cap on `renderArtifactFull`'s path means it now maps
+   * every row — unless guarded. A malformed row is skipped, not fatal to the
+   * rest of the table.
+   */
+  it('skips a malformed row rather than throwing, on the uncapped path', () => {
+    const malformed: DocumentArtifact = {
+      ordinal: 1,
+      kind: 'table',
+      partName: 'טבלה עם שורה פגומה',
+      content: { rows: [[s('פריט'), s('סכום')], [s('תקין'), n(1)], null, [s('גם תקין'), n(2)]] as unknown as Cell[][] },
+      flags: [],
+    };
+    expect(() => renderArtifactFull(malformed)).not.toThrow();
+    expect(renderArtifactFull(malformed)).toBe('פריט | סכום\n---\nתקין | 1\nגם תקין | 2');
+  });
+
+  /**
+   * Fix round 4, item 2 — the same class of bug as item 3, one level down.
+   * A row that IS an array but holds a malformed CELL is unguarded by
+   * `renderTable`'s own row check: `cellText` dereferences `cell.v` directly.
+   * A 100-row table whose row 60 is `[null, {v:60}]` throws on the uncapped
+   * path only, because the capped path never maps past row 40 to reach it.
+   */
+  it('skips a malformed cell rather than throwing, on the uncapped path', () => {
+    const rows: Cell[][] = [[s('פריט'), s('סכום')]];
+    for (let i = 0; i < 100; i += 1) rows.push([s(`שורה ${i}`), n(i)]);
+    // Data row 60 (`rows[61]`, well past `BRIEF_TABLE_ROWS` = 40) has its
+    // first CELL replaced with `null` — the row is still a real array, so
+    // `renderTable`'s row guard does not catch this; only `cellText`'s own
+    // guard does.
+    (rows[61] as unknown as (Cell | null)[])[0] = null;
+    const artifact: DocumentArtifact = {
+      ordinal: 1,
+      kind: 'table',
+      partName: 'טבלה עם תא פגום',
+      content: { rows },
+      flags: [],
+    };
+
+    expect(() => renderArtifactFull(artifact)).not.toThrow();
+    const text = renderArtifactFull(artifact);
+    // The malformed cell renders as empty, not fatal — the amount beside it
+    // still renders, and the untouched rows around it are unaffected.
+    expect(text).toContain(' | 60');
+    expect(text).toContain('שורה 59 | 59');
+    expect(text).toContain('שורה 61 | 61');
+  });
+
+  /**
+   * A CSV-shaped document is stored as a `table` artefact too (one row per
+   * line, no header semantics beyond "row zero"), and a plain-text artefact
+   * grounds through the same `renderArtifact` path with no table layout at
+   * all. Both exercised here so the fix is shown to hold across every shape
+   * this renderer serves, not only the `.xlsx` case.
+   */
+  it('grounds a number from a CSV-shaped table row', () => {
+    const csvLike: DocumentArtifact = {
+      ordinal: 1,
+      kind: 'table',
+      partName: 'ייצוא CSV',
+      content: { rows: [[s('תאריך'), s('סכום')], [s('2026-01-01'), n(7500)]] },
+      flags: [],
+    };
+    expect(ungroundedNumbers('שולם 7,500 ש"ח', [renderArtifactFull(csvLike)])).toEqual([]);
+  });
+
+  it('grounds a number from a plain text artefact', () => {
+    const textLike: DocumentArtifact = {
+      ordinal: 1,
+      kind: 'text',
+      partName: 'סעיף תשלום',
+      content: { blocks: [{ kind: 'paragraph', text: 'התמורה הכוללת היא 3,200 ש"ח.' }] },
+      flags: [],
+    };
+    expect(ungroundedNumbers('התמורה 3,200 ש"ח', [renderArtifactFull(textLike)])).toEqual([]);
+  });
+
+  it('grounds a number from an outline artefact', () => {
+    const outlineLike: DocumentArtifact = {
+      ordinal: 0,
+      kind: 'outline',
+      partName: null,
+      content: { parts: [{ name: 'עמוד 1', kind: 'text', rowCount: 640 }], flags: [] },
+      flags: [],
+    };
+    expect(ungroundedNumbers('640 שורות בסך הכל', [renderArtifactFull(outlineLike)])).toEqual([]);
   });
 });

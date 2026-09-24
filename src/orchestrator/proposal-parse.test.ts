@@ -77,20 +77,26 @@ describe('parseProposal', () => {
    * the gate cannot classify can never become a card, so proposing one is not
    * a proposal to act — and "bring this to the owner" is not an action the
    * assistant takes, it is what raising the card already does.
+   *
+   * The fixture below no longer names `agent.request_help` itself: the
+   * envelope work classified that tool as `agent.delegate`
+   * (`policy/classify.ts`), so it is no longer an example of a tool the gate
+   * cannot classify. The invariant this test guards — a proposed action
+   * naming an uncarded tool is `unproposable` — is unchanged, so it is pinned
+   * here against `mail.draft`, a tool that is still, and should stay,
+   * read-only.
    */
   it('refuses an action naming a tool the gate cannot classify', () => {
     const readOnlyAction = {
       ...ACTION,
-      toolName: 'agent.request_help',
+      toolName: 'mail.draft',
       input: { subject: 'הצעת מחיר', summary: 'דורש החלטה' },
       expectedActionClass: null,
     };
     const catalogue: CatalogueEntry[] = [
       {
         agent: 'comms.email',
-        tools: [
-          { toolName: 'agent.request_help', actionClass: null, effectiveAutonomy: 'auto' },
-        ],
+        tools: [{ toolName: 'mail.draft', actionClass: null, effectiveAutonomy: 'auto' }],
       },
     ];
 

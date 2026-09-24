@@ -4,7 +4,7 @@ import type { ActionClass } from '../domain/action.js';
 import type { Plan } from '../domain/plan.js';
 import { AutonomyLevel, mostRestrictiveAutonomy, permits } from '../domain/trust.js';
 import { loadAutonomyMode, rampBoundsForMode } from '../governance/autonomy-mode.js';
-import { READ_ONLY_TOOLS } from '../policy/classify.js';
+import { CEILING_EXEMPT_TOOLS, READ_ONLY_TOOLS } from '../policy/classify.js';
 
 /**
  * The default floor `rampLevelForPlan` uses for a step that has a class but no
@@ -178,7 +178,18 @@ export async function rampLevelForPlan(
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<AutonomyLevel> {
   const levels: AutonomyLevel[] = [];
+  // Tracks *why* a step contributed nothing to `levels`, because the two
+  // reasons demand different answers when `levels` ends up empty (see below).
+  let sawExemptStep = false;
   for (const step of plan.steps) {
+    // Classified but exempt from the ceiling by design (see the docblock on
+    // `CEILING_EXEMPT_TOOLS`) — checked before the `null`-class branch below,
+    // because this step does have a real class and would otherwise floor the
+    // whole plan at its ramp.
+    if (CEILING_EXEMPT_TOOLS.has(step.toolName)) {
+      sawExemptStep = true;
+      continue;
+    }
     if (step.expectedActionClass === null) {
       if (READ_ONLY_TOOLS.has(step.toolName)) continue;
       levels.push(RAMP_FLOOR);
@@ -186,11 +197,25 @@ export async function rampLevelForPlan(
     }
     levels.push(await loadRampLevel(step.expectedActionClass, options));
   }
-  // A plan made entirely of read-only steps contributes no ceiling at all.
-  // `mostRestrictiveAutonomy` throws on an empty list rather than defaulting
-  // to permissive, and the floor is the right answer here anyway: there is
-  // nothing for the ramp to cap, and every step short-circuits before the
-  // autonomy stage reads it.
-  if (levels.length === 0) return RAMP_FLOOR;
+  if (levels.length === 0) {
+    // Two different reasons land here, and they are not the same answer.
+    //
+    // All read-only: this ramp level is moot for every step in the plan — a
+    // read-only tool short-circuits at gate stage 4, before stage 8 ever
+    // reads `ctx.rampLevel` — so the floor is harmless and stays the floor.
+    //
+    // At least one exempt step: that step is CLASSIFIED and does not
+    // short-circuit. It reaches stage 8, where this same plan-wide value
+    // becomes its `ctx.rampLevel`. Returning `RAMP_FLOOR` here would floor a
+    // delegation at `draft_only` in exactly the shape `CEILING_EXEMPT_TOOLS`
+    // exists to free — a single-step delegation plan, which is what a
+    // request-for-help job looks like. `'auto'` is the honest answer: the
+    // exempt tool carries no ceiling of its own by design, and the charter's
+    // `autonomyBase[actionClass]` and `provenanceCeiling[provenance]` still
+    // bind independently in `effectiveAutonomy` — this function is not the
+    // only ceiling in the room, so answering permissively here does not mean
+    // the step runs unconstrained.
+    return sawExemptStep ? 'auto' : RAMP_FLOOR;
+  }
   return mostRestrictiveAutonomy(levels);
 }

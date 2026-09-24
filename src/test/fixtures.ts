@@ -41,6 +41,9 @@ const BASE_AUTONOMY: Record<ActionClass, AutonomyLevel> = {
   'data.export': 'approve_required',
   'memory.write_longterm': 'auto',
   'charter.amend': 'draft_only',
+  // Carries no outbound authority of its own (see `CEILING_EXEMPT_TOOLS` in
+  // `policy/classify.ts`); the child job it opens faces its own ceiling.
+  'agent.delegate': 'auto',
 };
 
 /**

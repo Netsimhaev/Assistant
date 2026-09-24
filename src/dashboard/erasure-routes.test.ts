@@ -18,6 +18,7 @@
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
+import { readFile } from 'node:fs/promises';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
@@ -30,7 +31,7 @@ import { readForgetCommand } from '../governance/forget-command.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
 import { createOwner } from './auth.js';
 import { createServer } from './server.js';
-import { renderErasure, renderErasureDone } from './views.js';
+import { renderErasure, renderErasureDone, TABLE_LABELS } from './views.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
 
 const BUSINESS = 'test-business';
@@ -901,5 +902,53 @@ describe('the smaller things the screen owes the owner', () => {
       [BUSINESS, jobId],
     );
     expect(rows.rows[0]?.note).toBe('צריך את זה לביקורת המס');
+  });
+});
+
+/**
+ * Fix round 4, item 2. `TABLE_LABELS` had no entry for `agent_envelopes`,
+ * `verification_verdicts` or `autonomy_marks` — three tables `countItems`
+ * (`governance/erasure-plan.ts`) already counts — and `rowLabel`'s fallback
+ * (`?? item.table`) let the confirmation screen print the raw English
+ * identifier next to every other row's Hebrew name, on the one page this
+ * project's own docblock calls a contract.
+ *
+ * The expected set is READ OUT of `countItems`'s own source text, not
+ * restated by hand here — the same principle `erasure-invariants.test.ts`
+ * already applies by reading `information_schema` instead of a written
+ * table list: a hand-written expectation list is exactly the kind of second
+ * copy that drifts, and a table added to `countItems` a year from now with
+ * no matching `TABLE_LABELS` entry must fail this test without anyone having
+ * remembered it exists.
+ */
+describe('every table countItems can emit has a Hebrew label', () => {
+  /** Every table name `countItems` passes as its first argument to `one(...)`. */
+  async function countedTables(): Promise<string[]> {
+    const source = await readFile('src/governance/erasure-plan.ts', 'utf8');
+    const tables: string[] = [];
+    for (const match of source.matchAll(/await one\(\s*\n\s*'([a-z_]+)'/g)) {
+      const table = match[1];
+      if (table !== undefined) tables.push(table);
+    }
+    return tables;
+  }
+
+  it('finds table names in countItems, sanity-checking the extraction itself', async () => {
+    const tables = await countedTables();
+
+    // An empty or tiny result would make the invariant below vacuous — the
+    // same failure mode `reading-invariants.test.ts` and
+    // `erasure-invariants.test.ts` both guard against for their own sweeps.
+    expect(tables.length).toBeGreaterThan(10);
+    expect(tables).toContain('agent_envelopes');
+    expect(tables).toContain('verification_verdicts');
+    expect(tables).toContain('autonomy_marks');
+  });
+
+  it('has a TABLE_LABELS entry for every one of them', async () => {
+    const tables = new Set(await countedTables());
+
+    const missing = [...tables].filter((table) => !Object.hasOwn(TABLE_LABELS, table));
+    expect(missing).toEqual([]);
   });
 });

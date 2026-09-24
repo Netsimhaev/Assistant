@@ -11,6 +11,18 @@ import type { AgentId } from '../domain/audit.js';
  * The lists are static and identical for every business. They describe what an
  * agent *is*, not what a particular owner permits — that is the charter's job,
  * and it can only tighten from here, never widen.
+ *
+ * **These arrays are deliberately NOT frozen, and must stay that way.** The
+ * final review of the delegation branch proposed `Object.freeze` on the
+ * grounds that they are handed out by reference after compile — a fair reading
+ * with no production mutator behind it. But the invariant at
+ * `policy/positive-controls.test.ts` ("refuses an unowned tool even when an
+ * allowlist names it") *pushes* `contract.sign` onto `ops.systems` and pops it
+ * again, because asserting today's tables passes with or without the control:
+ * the defect it locks is the ONE LINE someone adds later. Freezing would
+ * silently convert that test into one that proves nothing — exactly the class
+ * of failure this branch caught three times. A speculative hardening is not
+ * worth a proven test.
  */
 export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
   // --- Front Office -------------------------------------------------------
@@ -41,6 +53,7 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
     'wa.conversation_state',
     'memory.recall',
     'escalate_to_human',
+    'agent.request_help',
   ],
 
   'sched.meetings': [
@@ -66,6 +79,7 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
     'memory.upsert_preference',
     'memory.retire',
     'memory.recall',
+    'agent.request_help',
   ],
 
   // Receives a precomputed facts object; deliberately has no query tools.
@@ -106,11 +120,18 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
     'data.export',
     'schema.map',
     'memory.recall',
+    'agent.request_help',
   ],
 
   // --- Production ---------------------------------------------------------
   // Produces an artifact; delivery is a separate gated action owned by comms.*
-  'prod.docs': ['code_execution', 'file.write', 'memory.recall', 'template.load'],
+  'prod.docs': [
+    'code_execution',
+    'file.write',
+    'memory.recall',
+    'template.load',
+    'agent.request_help',
+  ],
 
   'prod.media': [
     'media.generate_image',
@@ -119,12 +140,13 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
     'brand.check',
     'media.publish',
     'file.write',
+    'agent.request_help',
   ],
 
   // --- Governance ---------------------------------------------------------
   'gov.charter': ['charter.read', 'charter.propose_amendment', 'memory.recall'],
-  'gov.risk': ['norms.query', 'charter.evaluate', 'memory.recall'],
-  'gov.verify': ['artifact.read', 'assert.evaluate', 'memory.recall'],
+  'gov.risk': ['norms.query', 'charter.evaluate', 'memory.recall', 'agent.request_help'],
+  'gov.verify': ['artifact.read', 'assert.evaluate', 'memory.recall', 'agent.request_help'],
 };
 
 /**

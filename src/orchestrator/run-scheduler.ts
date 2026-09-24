@@ -53,6 +53,35 @@ function logErrored(result: SchedulerPassResult): void {
   if (result.scanError !== null) {
     console.error(`document inbox scan failed: ${result.scanError}`);
   }
+  // `ConductResult.verificationFailed` (fix round 1's Important 3) is exactly
+  // this file's own rule applied to a bucket that, until now, had no printer
+  // at all: "visible, unlike a bare swallow" was true only to a test.
+  // `conduct` is `null` when no document inbox is configured, in which case
+  // there is nothing to have failed.
+  if (result.conduct !== null && result.conduct.verificationFailed > 0) {
+    // Fix round 3, item 4(b): "see the audit trail" over-promised. A job that
+    // reached `execute` before failing carries its own reason on the
+    // transition that closed it (`beginVerification`'s own `reason:` string).
+    // A job that never got that far — `createJob` itself threw — leaves no
+    // job row at all, so there is no trail to point at; this count is the
+    // only trace such a failure leaves.
+    console.error(
+      `${result.conduct.verificationFailed} card(s) this pass had gov.verify fail to open — ` +
+        `a job that reached execute records why on its own failed transition; a failure inside ` +
+        `createJob itself leaves no job to look up, and this count is the only trace of it`,
+    );
+  }
+  // Delegation resumption's own buckets, same rule: a parent moved to
+  // `failed` over corrupted bookkeeping (`resume-delegated.ts`'s
+  // `failCorruptedParent`) or a parent freed only because its envelope's
+  // deadline ran out are both facts an operator needs to see, not just a
+  // count nobody reads.
+  for (const parent of result.delegated.errored) {
+    console.error(`delegation parent ${parent.jobId} errored: ${parent.error}`);
+  }
+  for (const jobId of result.delegated.timedOut) {
+    console.error(`delegation parent ${jobId} woke on its envelope's deadline — its child never answered`);
+  }
   for (const job of result.due.errored) {
     console.error(`job ${job.jobId} errored: ${job.error}`);
   }

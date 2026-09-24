@@ -1067,3 +1067,74 @@ describe('browser gate', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Stage 3 reads `collaborationGraph`: "whom may you ask" is a permission
+// question, answered where every other permission question is answered.
+
+describe('delegation graph', () => {
+  it("refuses a delegation to an agent outside the caller's graph entry", async () => {
+    const bundle = await install();
+
+    // `ops.web` no longer holds `agent.request_help` at all after Task 3, so
+    // using it here would refuse at `tool_not_allowlisted` before this check
+    // ever runs — a pass for the wrong reason. `gov.verify` holds the tool and
+    // its graph entry is `['know.reader']` only, so `comms.email` is outside
+    // it and the refusal must come from the delegation check itself.
+    const decision = await evaluateToolCall(
+      'agent.request_help',
+      { to: 'comms.email', intent: 'x', payload: {} },
+      ctx(bundle, { agent: 'gov.verify' }),
+    );
+
+    expect(decision.outcome).toBe('deny');
+    if (decision.outcome !== 'deny') throw new Error('unreachable');
+    expect(decision.code).toBe('delegation_not_permitted');
+  });
+
+  it('allows a delegation the graph permits', async () => {
+    const bundle = await install();
+
+    const decision = await evaluateToolCall(
+      'agent.request_help',
+      { to: 'know.reader', intent: 'x', payload: {} },
+      ctx(bundle, { agent: 'gov.verify' }),
+    );
+
+    expect(decision.outcome).toBe('allow');
+  });
+
+  it('refuses a delegation whose payload has no readable "to"', async () => {
+    const bundle = await install();
+
+    // Both cases fall through `mayDelegate` too — `(graph[from] ?? []).
+    // includes(to)` is `false` for `undefined` and for `123` alike — and land
+    // on the *second* deny, which carries the same code as the first. `code`
+    // alone cannot tell "unreadable to" apart from "readable but not
+    // permitted"; only `reason` differs, so that is what proves this guard
+    // (engine.ts's unreadable-`to` check) actually ran rather than the graph
+    // check underneath it catching both by coincidence.
+    const missing = await evaluateToolCall(
+      'agent.request_help',
+      { intent: 'x' },
+      ctx(bundle, { agent: 'gov.verify' }),
+    );
+    expect(missing.outcome).toBe('deny');
+    if (missing.outcome !== 'deny') throw new Error('unreachable');
+    expect(missing.code).toBe('delegation_not_permitted');
+    expect(missing.reason).toContain('בלי נמען קריא');
+
+    // A value that isn't even a string is not a value we failed to read as a
+    // string — it's read fine and it isn't one. Same code either way: a value
+    // we cannot read as a permitted recipient is never a permitting value.
+    const wrongType = await evaluateToolCall(
+      'agent.request_help',
+      { to: 123, intent: 'x' },
+      ctx(bundle, { agent: 'gov.verify' }),
+    );
+    expect(wrongType.outcome).toBe('deny');
+    if (wrongType.outcome !== 'deny') throw new Error('unreachable');
+    expect(wrongType.code).toBe('delegation_not_permitted');
+    expect(wrongType.reason).toContain('בלי נמען קריא');
+  });
+});

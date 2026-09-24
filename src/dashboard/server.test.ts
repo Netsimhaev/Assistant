@@ -26,6 +26,7 @@ import { insertOrGetDocument } from '../documents/store.js';
 import { saveReading } from '../documents/reading-store.js';
 import { saveProposal } from '../orchestrator/proposal-store.js';
 import { loadSignature } from '../governance/signatures.js';
+import { saveVerdict } from '../governance/verdict-store.js';
 import { queryAudit } from '../audit/log.js';
 import {
   loadInstructionForJob,
@@ -1359,6 +1360,206 @@ describe('deciding an approval', () => {
     expect(approval?.state).toBe('denied');
     const updatedJob = await loadJob(job.jobId, { businessId: BUSINESS });
     expect(updatedJob?.phase).toBe('closed');
+  });
+});
+
+// Task 11: `loadVerdict` is called by the ROUTE, at request time — never
+// stashed when the card is created — so a verdict that shows up later shows
+// up on the very next load, and a card whose verification never even started
+// renders exactly as it always has.
+describe('the gov.verify verdict on a card', () => {
+  // Fix round 1, Important 6: printed VERBATIM, with one caveat sentence —
+  // never reformatted. A prior version added thousands separators and could
+  // not undo the other two transformations `ungroundedNumbers` entries
+  // already carry (a stripped trailing decimal zero, a rewritten sign), and
+  // it MANUFACTURED a false one of its own: grouping a phone-shaped token's
+  // digits with commas asserts a magnitude the draft never had.
+  it('shows the verdict when one exists, with its numbers printed verbatim and a caveat', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const job = await jobAwaitingApproval(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    await saveVerdict(
+      job.jobId,
+      {
+        criteria: [
+          {
+            id: 'answers_question',
+            statement: 'הטיוטה עונה על מה שהמסמך מבקש',
+            severity: 'must',
+            passed: true,
+            detail: 'הסכום תואם את הצעת המחיר',
+          },
+        ],
+        ungroundedNumbers: ['12500', '-99'],
+        answerTruncated: false,
+        draftTruncated: false,
+        fenceForgeryDetected: false,
+      },
+      { businessId: BUSINESS },
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+    // Verbatim — not reformatted with separators.
+    expect(body).toContain('12500');
+    expect(body).toContain('-99');
+    expect(body).not.toContain('12,500');
+    // The caveat sentence saying these are a normalised comparison form.
+    expect(body).toContain('בצורתם המנורמלת להשוואה');
+    expect(body).toContain('הסכום תואם את הצעת המחיר');
+  });
+
+  it('renders exactly as before when no verdict exists', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const job = await jobAwaitingApproval(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const body = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(body).not.toContain('gov.verify');
+    // The ordinary controls are untouched — a missing verdict removes only
+    // its own block, nothing else on the card.
+    expect(body).toContain(`/a/${approvalId}/approve`);
+    expect(body).toContain(`/a/${approvalId}/deny`);
+  });
+
+  // Small (a): a hostile ungrounded-number entry, so the escaping on THAT
+  // path is proven too — swapping `escLabel` for raw interpolation there
+  // fails nothing if this is missing, because the criteria-text path alone
+  // already exercises `escLabel`.
+  it('escapes the verdict like every other untrusted label on this page', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const job = await jobAwaitingApproval(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    await saveVerdict(
+      job.jobId,
+      {
+        criteria: [
+          {
+            id: 'x',
+            statement: '<script>alert(1)</script>',
+            // U+202E RIGHT-TO-LEFT OVERRIDE inside a quoted fragment — the
+            // exact category `escLabel` exists for (views.ts's own docblock),
+            // quoting a draft written after reading a document someone else
+            // sent.
+            detail: 'מצטט מהטיוטה: <img src=x onerror=alert(1)>‮attack',
+            severity: 'should',
+            passed: false,
+          },
+        ],
+        // Not a realistic normalised number, but the numbers path prints
+        // whatever string is in the column — it must be escaped exactly like
+        // any other untrusted field reaching this page.
+        ungroundedNumbers: ['<b>1</b>‮2'],
+        answerTruncated: false,
+        draftTruncated: false,
+      },
+      { businessId: BUSINESS },
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+    expect(body).not.toContain('<script>');
+    expect(body).not.toContain('<img src=x onerror=alert(1)>');
+    expect(body).not.toContain('<b>1</b>');
+    expect(body).not.toContain('‮');
+  });
+
+  // Small (b): all three `fenceForgeryDetected` states, each rendering a
+  // distinct, own sentence — including the `true` branch, the actual
+  // security signal, which no test previously rendered at all.
+  describe('fenceForgeryDetected — three states, three sentences', () => {
+    async function cardWith(
+      businessId: string,
+      overrides: { fenceForgeryDetected?: boolean } = {},
+    ): Promise<{ baseUrl: string; approvalId: string }> {
+      const baseUrl = await startServer(businessId);
+      const job = await jobAwaitingApproval(businessId);
+      const approvalId = await makeApproval({ businessId, jobId: job.jobId });
+      await saveVerdict(
+        job.jobId,
+        {
+          criteria: [{ id: 'x', statement: 'y', severity: 'must', passed: true, detail: 'z' }],
+          ungroundedNumbers: [],
+          answerTruncated: false,
+          draftTruncated: false,
+          ...overrides,
+        },
+        { businessId },
+      );
+      return { baseUrl, approvalId };
+    }
+
+    it('true — a warning naming the attempt', async () => {
+      const { baseUrl, approvalId } = await cardWith(BUSINESS, { fenceForgeryDetected: true });
+      const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+      const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+      expect(body).toContain('זוהה');
+    });
+
+    it('false — a quiet confirmation that it was checked', async () => {
+      const { baseUrl, approvalId } = await cardWith(BUSINESS, { fenceForgeryDetected: false });
+      const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+      const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+      expect(body).toContain('נבדק, ולא נמצא');
+    });
+
+    it('absent (a pre-field row) — "not known whether checked", never conflated with false', async () => {
+      const baseUrl = await startServer(BUSINESS);
+      const job = await jobAwaitingApproval(BUSINESS);
+      const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+      // Bypasses `saveVerdict`'s TS type on purpose — a row written before
+      // `fenceForgeryDetected` existed carries no such key at all.
+      await getPool().query(
+        `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
+        [
+          BUSINESS,
+          job.jobId,
+          JSON.stringify({
+            criteria: [{ id: 'x', statement: 'y', severity: 'must', passed: true, detail: 'z' }],
+            ungroundedNumbers: [],
+            answerTruncated: false,
+            draftTruncated: false,
+          }),
+        ],
+      );
+      const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+      const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+      expect(body).toContain('לא ידוע אם נבדק');
+    });
+  });
+
+  // Fix round 1, Important 4: `Verdict.parse` throws on a row that fails to
+  // validate, and this route is the only thing between that row and the
+  // owner's entire decision surface (approve/deny/edit/note/sign all render
+  // through the same function). A bad row must degrade to a note, never a
+  // generic 500 that takes every control on the page down with it.
+  it('renders a note instead of a 500 when the verdict row cannot be parsed', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const job = await jobAwaitingApproval(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    // `criteria: []` violates `Verdict`'s own `.min(1)` — a row `saveVerdict`
+    // itself could never produce, exactly the "corrupted or pre-migration
+    // row" shape this guard exists for.
+    await getPool().query(
+      `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
+      [BUSINESS, job.jobId, JSON.stringify({ criteria: [] })],
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } });
+    const body = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(body).toContain('לא ניתן היה לקרוא');
+    // The rest of the decision surface survives untouched.
+    expect(body).toContain(`/a/${approvalId}/approve`);
+    expect(body).toContain(`/a/${approvalId}/deny`);
   });
 });
 

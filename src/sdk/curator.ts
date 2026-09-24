@@ -20,7 +20,7 @@ import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from '../config.js';
 import type { CurationBrief } from '../memory/curation-brief.js';
 import { CurationResult } from '../memory/curation-parse.js';
-import { extractJsonObjects } from './planner.js';
+import { extractJsonObjects } from '../util/json-extract.js';
 
 export const CURATION_PROMPT_VERSION = 'v1';
 

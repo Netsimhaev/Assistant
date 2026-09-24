@@ -4,9 +4,13 @@ import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { getApproval, pendingApprovals } from '../governance/approvals.js';
+import { loadEnvelopeWithChild } from '../governance/envelope-store.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import { Plan } from '../domain/plan.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { executeStep } from './execute.js';
+import { bindPlanToJob } from './plan-store.js';
+import { runDueJobs } from './run-due.js';
 import { schedulerPass, startScheduler, tick } from './scheduler.js';
 import { applyDecision } from './resume.js';
 import { AdapterRegistry } from './adapters/registry.js';
@@ -314,5 +318,91 @@ describe('a pass with no master key refuses rather than running blind', () => {
       if (previous === undefined) delete process.env['CREDENTIAL_KEY_PATH'];
       else process.env['CREDENTIAL_KEY_PATH'] = previous;
     }
+  });
+});
+
+/**
+ * Task 7 fix round 1, Critical. A `parked` step writes no completion row, so
+ * on resume `runPlan`'s `alreadyDone` set is empty and `agent.request_help`
+ * runs a SECOND time. Before this fix, `requestHelp`'s guard 4
+ * (`no_new_information`) fired on that second call — the request is,
+ * byte-for-byte, identical to the one that already succeeded — and the
+ * local-tool handler could not tell that refusal apart from a real one: it
+ * read the parent's phase as still `execute`, threw non-retryably, and
+ * `executeStep` marked the parent `failed`. In the DEFAULT production
+ * configuration — an envelope closes before its parent is next scheduled —
+ * every successful delegation ended this way.
+ *
+ * This also pins the one fact about `schedulerPass` that was previously only
+ * prose: `resumeDelegatedJobs` runs BEFORE `runDueJobs`, in the same pass, so
+ * a parent freed this pass is not left waiting a full interval to resume.
+ */
+describe('a delegation resumes in the same pass it is freed', () => {
+  it('parks a parent, closes its child, and one schedulerPass completes the parent instead of failing it', async () => {
+    const bundle = await install();
+    const job = await jobInExecute(bundle);
+    const plan = Plan.parse({
+      goal: 'ask know.reader to read the document',
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'delegate',
+          toolName: 'agent.request_help',
+          input: {
+            to: 'know.reader',
+            intent: 'read_for_question',
+            payload: { question: 'מה המסמך הזה מבקש?' },
+            contextRefs: [{ kind: 'document', documentId: 'doc-scheduler-test' }],
+          },
+          dependsOn: [],
+          expectedActionClass: 'agent.delegate',
+        },
+      ],
+    });
+    await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
+
+    const runtime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, 'TEST_CRED_'),
+      warnings: [],
+    };
+
+    // Sets up the state a real earlier scheduler pass would already have
+    // produced: the delegation opens, and the parent parks in `followup`.
+    const opening = await runDueJobs({ businessId: BUSINESS, runtime, now: NOON });
+    const openedEntry = opening.ran.find((r) => r.jobId === job.jobId);
+    if (openedEntry === undefined) throw new Error('expected the parent to have run and parked');
+    expect(openedEntry.status).toBe('halted');
+
+    const parkedParent = await loadJob(job.jobId, { businessId: BUSINESS });
+    expect(parkedParent?.phase).toBe('followup');
+    if (parkedParent?.awaitingEnvelopeId == null) throw new Error('expected an awaiting envelope id');
+
+    const stored = await loadEnvelopeWithChild(parkedParent.awaitingEnvelopeId, { businessId: BUSINESS });
+    if (stored?.childJobId == null) throw new Error('expected an attached child job');
+    const childJobId = stored.childJobId;
+
+    // Close the child, simulating a completed delegation.
+    for (const to of ['verify', 'remember', 'closed'] as const) {
+      await transition(childJobId, { to, actor: 'orchestrator', reason: 'test setup', businessId: BUSINESS });
+    }
+
+    // The critical assertion: ONE schedulerPass both wakes the parent
+    // (`resumeDelegatedJobs`) and re-runs its plan (`runDueJobs`) in the SAME
+    // pass, and the parent completes rather than being marked `failed`.
+    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime });
+
+    expect(pass.delegated.resumed).toEqual([job.jobId]);
+    expect(pass.delegated.errored).toEqual([]);
+
+    const resumedEntry = pass.due.ran.find((r) => r.jobId === job.jobId);
+    if (resumedEntry === undefined) {
+      throw new Error('expected the parent to run again in the very same pass that freed it');
+    }
+    expect(resumedEntry.status).toBe('done');
+
+    const finalParent = await loadJob(job.jobId, { businessId: BUSINESS });
+    expect(finalParent?.phase).not.toBe('failed');
   });
 });

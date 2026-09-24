@@ -2,6 +2,7 @@ import type { ActionClass } from '../domain/action.js';
 import type { ConnectionBinding } from '../domain/connection.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel } from '../domain/trust.js';
+import type { ReadOutcome, ReadRequest } from '../sdk/know-reader.js';
 import { planProblems, topologicalOrder, type Plan, type PlanStep } from '../domain/plan.js';
 import {
   classifyAction,
@@ -11,6 +12,7 @@ import {
 } from '../policy/classify.js';
 import { canonicalHash } from '../util/canonical.js';
 import { unspentApprovalFor } from '../governance/approvals.js';
+import { delegationProblems } from '../governance/delegation.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import type { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
@@ -80,6 +82,26 @@ export interface RunPlanRequest {
   adapterTimeoutMs?: number;
   /** Passed through to the gate so a queued approval reaches the owner. */
   notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
+  /**
+   * The one local step that costs money: `doc.fetch`, threaded down to
+   * `runLocalTool`'s `ctx.reader` and from there to `readDocument`. Injectable
+   * for the same reason `conductPendingDocuments` threads `options.reader` —
+   * a test driving a delegation end to end through `runPlan`/`runDueJobs`
+   * would otherwise reach the real, billed `runKnowReader`, which (unlike
+   * `makePlan`) has no `refuseUnderTest` guard of its own. Production callers
+   * leave this unset and `readDocument` falls back to `runKnowReader`.
+   */
+  reader?: (request: ReadRequest) => Promise<ReadOutcome>;
+  /**
+   * The hard cap carried by the envelope that opened THIS JOB as a
+   * delegation's child, forwarded to every step's `GateContext.autonomyCeiling`.
+   *
+   * `runPlan` does not look this up itself — `run-due.ts` does, because it is
+   * the party that already knows which job it is about to run and can ask
+   * `agent_envelopes` (via `loadEnvelopeForChildJob`) whether some envelope
+   * governs it. Absent for a root job no delegation ever opened.
+   */
+  autonomyCeiling?: AutonomyLevel;
 }
 
 /**
@@ -207,6 +229,21 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
   const problems = planProblems(plan);
   if (problems.length > 0) {
     return { status: 'rejected', code: 'malformed_plan', reason: describe(problems[0]!) };
+  }
+
+  // Layer one of two. The gate answers "is it permitted right now" per call;
+  // this answers "can the charter ever serve this plan" for the plan as a
+  // whole — the same split the channel already has (feasibility at validation,
+  // availability at execution), and for the same reason: a step that fails
+  // alone leaves the steps before it already done.
+  const delegationIssues = delegationProblems(plan, bundle.collaborationGraph);
+  if (delegationIssues.length > 0) {
+    const first = delegationIssues[0]!;
+    return {
+      status: 'rejected',
+      code: 'malformed_plan',
+      reason: `צעד ${first.stepId}: ${first.from} אינו רשאי לבקש עזרה מ-${first.to}`,
+    };
   }
 
   for (const step of plan.steps) {
@@ -347,6 +384,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
       ...(approvalId !== null ? { approvalId } : {}),
       ...(request.notify !== undefined ? { notify: request.notify } : {}),
       ...(provenanceChainDerived ? { provenanceChainDerived } : {}),
+      ...(request.autonomyCeiling !== undefined ? { autonomyCeiling: request.autonomyCeiling } : {}),
     });
     records.push({
       stepId: step.id,
@@ -451,10 +489,28 @@ async function performStep(
     const output = await runLocalTool(step.toolName, effectiveInput, {
       jobId: request.job.jobId,
       businessId: request.job.businessId,
+      // Only `doc.fetch` reads these today (readDocument needs the active
+      // charter to build its prompt, and `reader` is the seam a test drives
+      // instead of a live model call); every other local handler ignores
+      // both. `agent` is `agent.request_help`'s: it is `requestHelp`'s `from`,
+      // the requesting agent recorded on the envelope — and it comes from the
+      // step, not from any part of the payload a hostile document could
+      // shape.
+      bundle: request.bundle,
+      agent: step.agent,
+      ...(request.reader !== undefined ? { reader: request.reader } : {}),
     });
     // No `externalId`: nothing outside the instance issued a handle, and
     // inventing one would tell `verify` it had a far end to ask.
-    return { output, externalId: null };
+    //
+    // `output.parked` is `agent.request_help`'s signal that `requestHelp`
+    // already moved this job's phase itself — see `StepEffect.parked`'s own
+    // docblock. Every other local handler's result never carries this key.
+    return {
+      output,
+      externalId: null,
+      ...(output['parked'] === true ? { parked: true } : {}),
+    };
   }
 
   // Routed by the payload the gate actually judged, not by the one the plan

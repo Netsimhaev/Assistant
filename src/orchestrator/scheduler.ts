@@ -8,6 +8,8 @@ import type { ScanResult } from './inbox-scan.js';
 import { loadJob, transition } from './jobs.js';
 import { evaluateAutonomy } from './promote.js';
 import type { AutonomyPassResult } from './promote.js';
+import { resumeDelegatedJobs } from './resume-delegated.js';
+import type { ResumeResult } from './resume-delegated.js';
 import { runDueJobs } from './run-due.js';
 import type { RunDueResult } from './run-due.js';
 import { buildRuntime } from './runtime.js';
@@ -148,6 +150,19 @@ export interface SchedulerPassResult {
    * about how it is configured.
    */
   conduct: ConductResult | null;
+  /**
+   * Parents freed this pass — either because their child reached a terminal
+   * phase, or because the envelope's own deadline ran out first.
+   *
+   * Run first, right after the tick and before `runDueJobs`: a child that
+   * closed on the PREVIOUS pass wakes its parent at the top of THIS one, so
+   * the parent is sitting in `execute` by the time `runDueJobs` looks and
+   * runs in this very pass instead of waiting a full interval. Running it
+   * after the plans instead would cost every delegation a full extra
+   * interval for no reason — the same ordering argument this function's own
+   * docblock makes for `runDueJobs` before `closeVerifiedJobs`.
+   */
+  delegated: ResumeResult;
   due: RunDueResult;
   verified: CloseVerifiedResult;
   /** Which action classes this round moved up, and which moved down. */
@@ -228,6 +243,12 @@ export async function schedulerPass(
 ): Promise<SchedulerPassResult> {
   const tickResult = await tick(options);
 
+  // First after the tick, and the order matters: a child that closed on the
+  // previous pass wakes its parent at the top of this one, so the parent runs
+  // in this very pass through `runDueJobs` below. Run it after the plans
+  // instead and every delegation would cost a full extra interval.
+  const delegated = await resumeDelegatedJobs(options);
+
   // Both conductor loops run after the tick's transaction has committed, not
   // inside it — see the docblock above.
   const inbox = options.inbox !== undefined ? options.inbox : config.documentInbox;
@@ -289,6 +310,7 @@ export async function schedulerPass(
     scan,
     scanError,
     conduct,
+    delegated,
     due,
     verified,
     autonomy,

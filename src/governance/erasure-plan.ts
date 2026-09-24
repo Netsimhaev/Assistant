@@ -53,6 +53,29 @@
  * copy of a probed value, not a proof that these two are empty of content
  * today. The reasoning above is what carries that, and it has to be rechecked
  * if either table ever gains a free-text column.
+ *
+ * **Migration 028 added two more, and both belong here.** `agent_envelopes`
+ * carries `payload` — the content of one agent's request to another, and the
+ * ONLY column of this row that can name a counterparty at all: `context_refs`
+ * is a closed union of four id-only pointers (`domain/envelope.ts`'s
+ * `ContextRef`), `intent` is a registry key, and the rest are hashes,
+ * generated ids or enums. `verification_verdicts` carries `verdict`, which
+ * quotes the draft it checked. Both are wired below by job id
+ * (`AGENT_ENVELOPES_ERASED_PREDICATE`, `VERIFICATION_VERDICTS_ERASED_PREDICATE`),
+ * the same way `job_plans` already is. `agent_envelopes` IS also given a
+ * discovery query of its own, beside `boss_instructions`'s: `payload` is the
+ * calling plan step's own input, so for a plan-issued delegation it is
+ * already found through `job_plans.plan` — but a delegation opened by calling
+ * `requestHelp` directly, with no plan step behind it (Task 10), has no plan
+ * text to be found by, and the discovery query is what reaches that case.
+ * See `AGENT_ENVELOPES_ERASED_PREDICATE`'s own docblock for the full trace.
+ * `verification_verdicts` got a writer in Task 10 (`gov-verify.ts`'s
+ * `verifyDraft`) and, once Task 11 made its CALLER reachable from
+ * production — not the writing branch itself; see the correction below —
+ * and showed exactly how its job is opened (no plan ever bound), a
+ * discovery query of its own beside `boss_instructions`'s — see
+ * `VERIFICATION_VERDICTS_ERASED_PREDICATE`'s own docblock for why the answer
+ * came out "yes, needed" rather than "no, already covered".
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -66,7 +89,20 @@ export type ErasureAnchor =
 
 export interface ErasureItem {
   table: string;
-  action: 'delete' | 'scrub';
+  /**
+   * `'fail'` is one row: a job PARKED on a delegation (`phase = 'followup'`,
+   * `awaiting_envelope_id` set) whose own `agent_envelopes` row this erasure
+   * is about to delete. Clearing the pointer alone (as `scrub` on `jobs`
+   * already does, unconditionally) leaves that job in `followup` forever —
+   * `resumeDelegatedJobs`'s own docblock calls it that job's ONLY possible
+   * mover, `wakeDueJobs` never picks it up (`wake_at` is NULL for a
+   * delegation park), and its `job_plans` row is gone in the same
+   * transaction regardless. A phase with no reader is the leak this project
+   * already names in prose (`LIVE_PHASES`'s docblock, "a job pointing at a
+   * plan that no longer exists") — moved to `failed` instead, deliberately,
+   * as part of the erasure. See `STRANDED_PARENT_PREDICATE`'s docblock.
+   */
+  action: 'delete' | 'scrub' | 'fail';
   count: number;
 }
 
@@ -281,6 +317,182 @@ export const PROPOSALS_ERASED_PREDICATE = `business_id = $1
           WHERE business_id = $1 AND document_id = ANY ($3)
        ))`;
 
+/**
+ * The `agent_envelopes` rows an erasure destroys, as ONE predicate.
+ *
+ * `parent_job_id` only, and that is a traced conclusion, not an
+ * oversimplification (fix round 1, item 1). Of the columns this row carries,
+ * only `payload` can name a counterparty at all: `context_refs` is a closed
+ * union of four id-only pointers (`domain/envelope.ts`'s `ContextRef` — "no
+ * branch carries free text"), `intent` is a registry key, and every other
+ * column is a hash, a generated id or an enum. `payload` is exactly the
+ * object `requestHelp` (`orchestrator/delegate.ts`) parses off the calling
+ * PLAN STEP's own input, which is to say it already lives, byte for byte, in
+ * the delegating job's `job_plans.plan` — and `buildErasurePlan` already
+ * searches that column with `plan::text ILIKE` below. So whenever this
+ * envelope's payload names the contact, its `parent_job_id` is already in
+ * `jobIds` through that discovery, for a plan-issued delegation.
+ *
+ * The one gap that is real: a caller that invokes `requestHelp` directly, not
+ * through a plan step (Task 10), can put a contact-naming payload into an
+ * envelope with no plan text anywhere to discover it by. `parent_job_id` is
+ * still the right column to search FOR that gap — see the `agent_envelopes`
+ * discovery query below, which searches `payload` itself and adds the
+ * matching `parent_job_id` to `jobIds`. Once that discovery exists, a single
+ * `parent_job_id` arm is sufficient: nothing about a contact is ever findable
+ * through `child_job_id` that discovery has not already put in `jobIds` via
+ * `parent_job_id`.
+ *
+ * A `child_job_id` arm was tried here first and reverted: since an envelope
+ * reached only through its child means the payload does NOT name the
+ * contact, that arm produced pure over-deletion — destroying a delegation
+ * record for a reason unrelated to the contact, including one whose PARENT
+ * job the owner explicitly kept (`keptJobs`, below): a kept job's `jobIds`
+ * membership is removed, but the envelope would still be reached through the
+ * child and destroyed out from under it, defeating the keep. In this
+ * codebase over-deletion is exactly as serious as under-deletion — the
+ * preview is a contract in both directions.
+ *
+ * **One keep interaction remains, and it is not a gap the way the dropped arm
+ * was.** If the owner keeps the CHILD job while the PARENT stays in `jobIds`,
+ * this predicate still deletes the envelope: `parent_job_id` names the
+ * parent, not the child, and the parent was never kept. That is correct — the
+ * envelope is the PARENT's own content (its own delegation request), not the
+ * child's, and destroying it is not the `keptJobs`-defeating shape above,
+ * where keeping the very job named on the predicate failed to shield its own
+ * envelope. It is still a second, distinct way "keep" and `agent_envelopes`
+ * interact, worth a reader knowing about before finding it in production
+ * rather than here.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const AGENT_ENVELOPES_ERASED_PREDICATE = `business_id = $1
+  AND parent_job_id = ANY ($2)`;
+
+/**
+ * The `verification_verdicts` rows an erasure destroys.
+ *
+ * One row per job (migration 028: `PRIMARY KEY (business_id, job_id)`), so
+ * `job_id = ANY ($2)` is the whole predicate — no second arm the way
+ * `agent_envelopes` briefly had one, because this table carries no separate
+ * parent/child distinction at all.
+ *
+ * **The writer exists (`gov-verify.ts`'s `verifyDraft`, via `saveVerdict`,
+ * Task 10) and its CALLER now exists too (`conduct.ts`'s `beginVerification`,
+ * Task 11) — but say precisely what that does and does not reach.** The
+ * caller is reachable from production; the WRITING BRANCH inside `verifyDraft`
+ * is still not, because `beginVerification` hard-codes `answer: null` on
+ * every call it makes (see its own docblock) — `saveVerdict` is only ever
+ * reached once a caller resolves `input.answer`, which nothing in production
+ * does yet. So no `verification_verdicts` row is actually written by this
+ * branch today; the query below is added on the strength of how
+ * `beginVerification` is built, not evidence of a row it has produced. The
+ * discovery-query question this docblock deferred is nonetheless answered:
+ * YES, needed, once a row does get written — and the query is added below,
+ * beside `boss_instructions`'s and `agent_envelopes.payload`'s.**
+ * `Verdict.criteria[].detail` is free text the JUDGE MODEL writes, instructed
+ * to quote from the draft or the answer when it helps — exactly the kind of
+ * content `agent_envelopes.payload` also is. The tracing argument that closed
+ * the gap for `agent_envelopes` (a plan-issued call's payload is already
+ * sitting in that job's own `job_plans.plan`) does NOT carry over here:
+ * `beginVerification` opens `gov.verify`'s job, walks it straight from
+ * `intake` to `execute`, and calls `verifyDraft` there directly — no plan is
+ * ever bound (see that function's own docblock for why binding one would be
+ * dangerous, not merely unnecessary). So the draft text and the question this
+ * job's verdict quotes are NOT sitting in `job_plans.plan` for the query
+ * above to find; `Verdict.criteria[].detail` can be the ONLY surviving place
+ * a counterparty's name or a quote from the draft appears for this job, with
+ * `job_id = ANY ($2)` alone providing no way to FIND that job from the
+ * contact side. The query added below closes exactly that gap.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const VERIFICATION_VERDICTS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
+
+/**
+ * The `jobs` rows an erasure scrubs, and what gets emptied on them — as
+ * shared constants for the same reason `APPROVAL_REQUESTS_SCRUB_SET` is one
+ * (fix round 1, item 2). `awaiting_envelope_id` is migration 028's plain
+ * `TEXT` column with no foreign key, pointing at the `agent_envelopes` row
+ * that reports back to a PARKED parent (`jobs.phase = 'followup'`) once its
+ * child finishes. `LIVE_PHASES` is `['execute', 'await_approval']`, so a
+ * parked parent is not "live" by either the plan-time refusal or the
+ * in-transaction re-check — nothing stops `agent_envelopes` from deleting
+ * that very row out from under it. This is the same shape `LIVE_PHASES`'s own
+ * docblock already names ("leaves a job pointing at a plan that no longer
+ * exists"), one column over from `job_plans`.
+ *
+ * `title` and `awaiting_envelope_id` are cleared together, in one predicate
+ * and one `SET`, because a job can need either half alone: a job with no
+ * title left to scrub but a live envelope pointer, or vice versa, must still
+ * be picked up and scrubbed.
+ *
+ * **Clearing the pointer alone is NOT the fix for a parked parent — it is
+ * only content hygiene, and it used to be mistaken for the fix (fix round 1,
+ * item 2; corrected in fix round 2, item 1).** A cleared `NULL` pointer on a
+ * job still sitting in `phase = 'followup'` gives that job no way out:
+ * `resumeDelegatedJobs`'s own docblock calls itself that job's ONLY possible
+ * mover, and its query requires `awaiting_envelope_id IS NOT NULL` — a job
+ * this `SET` just nulled no longer matches it. `wakeDueJobs` cannot pick it
+ * up either (`wake_at` is NULL for a delegation park, not a retry). The job
+ * is left in a phase with no reader — "parked" became "stranded" instead of
+ * "killed", and a phase with no reader is not a resting place. What actually
+ * resolves this is `STRANDED_PARENT_PREDICATE` below, which moves such a job
+ * to `failed` as part of the same erasure. This `SET` still runs
+ * unconditionally on every job in `jobIds`, stranded or not, because the
+ * `title` half has nothing to do with parking at all.
+ */
+export const JOBS_SCRUBBED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)
+  AND (title IS NOT NULL OR awaiting_envelope_id IS NOT NULL)`;
+
+export const JOBS_SCRUB_SET = `title = NULL, awaiting_envelope_id = NULL`;
+
+/**
+ * A job parked on a delegation whose OWN `agent_envelopes` row this erasure
+ * is about to delete — the count the preview shows for `ErasureItem`'s
+ * `'fail'` action (see that type's own docblock for the full failure chain).
+ *
+ * **One predicate, shared by text, not just by agreement (fix round 3, item
+ * 2).** A first version of this had the executor re-express the same
+ * condition as a JS filter over the locked rows — correct today, but exactly
+ * the drift every OTHER disposition in this module avoids by sharing one
+ * exported SQL constant (`PROPOSALS_ERASED_PREDICATE`,
+ * `APPROVAL_REQUESTS_ERASED_PREDICATE`, `AGENT_ENVELOPES_ERASED_PREDICATE`,
+ * `JOBS_SCRUBBED_PREDICATE` all do this; spec §5.1.1's whole point is that
+ * the preview and the destruction cannot differ in text any more than in
+ * values). The argument for not RE-QUERYING `jobs` after other statements
+ * run is real (a table `agent_envelopes` is about to delete would be read a
+ * second time with different results) — but that argues against a second
+ * `SELECT`, not against reusing this constant's TEXT. The executor now
+ * interpolates it as a computed column on the SAME locked `SELECT` the
+ * liveness check already runs (`(${STRANDED_PARENT_PREDICATE}) AS
+ * stranded`), so the condition is evaluated exactly once, before any delete,
+ * and the preview and the executor read the identical SQL.
+ *
+ * Read-only here for the PREVIEW specifically: `buildErasurePlan` has no lock
+ * and no transaction, so its own use of this constant is an estimate exactly
+ * like the `LIVE_PHASES` refusal above is — re-verified at execution time
+ * under the `FOR UPDATE` lock, not trusted as still true by the time the
+ * owner confirms.
+ *
+ * **Only the meaningful half is shared (fix round 4, item 3).** The
+ * job-scoping arm — `business_id = $1 AND job_id = ANY ($2)` — is still
+ * restated by hand as the executor's own locked `SELECT`'s `WHERE`, not read
+ * from this constant; only `phase = 'followup' AND awaiting_envelope_id IS
+ * NOT NULL` is shared as the computed column. If the SCOPING arm here ever
+ * changed, `countItems` would count under the new scope while the executor
+ * kept applying its own, intersected with whatever changed — preview and
+ * execution would diverge one clause over from where this fix round closed
+ * the gap. Not restructured, because the direction of that failure is safe:
+ * the executor can only fail FEWER jobs than the preview promised, never
+ * more, and it would surface as a visible count mismatch rather than
+ * silently. Worth a sentence, not worth the extra indirection today.
+ *
+ * Parameters: `$1` businessId, `$2` jobIds.
+ */
+export const STRANDED_PARENT_PREDICATE = `business_id = $1 AND job_id = ANY ($2)
+  AND phase = 'followup' AND awaiting_envelope_id IS NOT NULL`;
+
 async function idsFrom(
   db: Queryable,
   sql: string,
@@ -347,6 +559,46 @@ export async function buildErasurePlan(
       db,
       `SELECT DISTINCT job_id FROM autonomy_marks
         WHERE business_id = $1 AND note ILIKE $2 ${LIKE_ESCAPE}`,
+      [businessId, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // `agent_envelopes.payload` is a plan-issued delegation's own step input,
+    // and is therefore normally already found through `job_plans.plan` above
+    // — but `requestHelp` can also be invoked directly, with no plan step
+    // behind it (Task 10), and that delegation's contact-naming payload would
+    // otherwise have no text anywhere for this search to find it by. Keyed on
+    // `parent_job_id`, the same column `AGENT_ENVELOPES_ERASED_PREDICATE`
+    // deletes by, for the same reason `boss_instructions`/`autonomy_marks`
+    // above are both a discovery source and a closure target: see that
+    // predicate's own docblock for the full trace of why no `child_job_id`
+    // side is needed here.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT parent_job_id AS job_id FROM agent_envelopes
+        WHERE business_id = $1 AND payload::text ILIKE $2 ${LIKE_ESCAPE}`,
+      [businessId, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // `verification_verdicts.verdict` — resolved below, in Task 11. The
+    // conductor (`conduct.ts`'s `beginVerification`) opens `gov.verify`'s job
+    // directly, walks it straight to `execute` and calls `verifyDraft` there
+    // with no plan ever bound — so, unlike a plan-issued delegation, the
+    // draft and question this job's verdict quotes are NOT already sitting in
+    // that job's own `job_plans.plan` for the query above to find. A
+    // criterion's `detail` is free text the JUDGE MODEL writes, quoting the
+    // draft or the answer when it helps — exactly the `agent_envelopes.payload`
+    // shape above, and exactly the risk `VERIFICATION_VERDICTS_ERASED_PREDICATE`'s
+    // own docblock named and left open: without this query, a verdict that is
+    // the ONLY surviving place a counterparty's name appears for this job is
+    // invisible to a contact-anchored erasure, even though
+    // `VERIFICATION_VERDICTS_ERASED_PREDICATE` would delete the row once the
+    // job is found some other way.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM verification_verdicts
+        WHERE business_id = $1 AND verdict::text ILIKE $2 ${LIKE_ESCAPE}`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
@@ -574,7 +826,7 @@ async function countItems(
 ): Promise<ErasureItem[]> {
   const one = async (
     table: string,
-    action: 'delete' | 'scrub',
+    action: 'delete' | 'scrub' | 'fail',
     sql: string,
     params: unknown[],
   ): Promise<ErasureItem> => {
@@ -662,11 +914,33 @@ async function countItems(
         WHERE business_id = $1 AND job_id = ANY ($2)`,
       [businessId, jobIds],
     ),
+    // See `AGENT_ENVELOPES_ERASED_PREDICATE` above for why `parent_job_id`
+    // alone is sufficient once the discovery query above it exists.
+    await one(
+      'agent_envelopes',
+      'delete',
+      `SELECT count(*)::text AS n FROM agent_envelopes WHERE ${AGENT_ENVELOPES_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'verification_verdicts',
+      'delete',
+      `SELECT count(*)::text AS n FROM verification_verdicts WHERE ${VERIFICATION_VERDICTS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
     await one(
       'jobs',
       'scrub',
-      `SELECT count(*)::text AS n FROM jobs
-        WHERE business_id = $1 AND job_id = ANY ($2) AND title IS NOT NULL`,
+      `SELECT count(*)::text AS n FROM jobs WHERE ${JOBS_SCRUBBED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    // See `ErasureItem.action`'s and `STRANDED_PARENT_PREDICATE`'s own
+    // docblocks (fix round 2, item 1) for why this is counted separately from
+    // the `scrub` above rather than folded into it.
+    await one(
+      'jobs',
+      'fail',
+      `SELECT count(*)::text AS n FROM jobs WHERE ${STRANDED_PARENT_PREDICATE}`,
       [businessId, jobIds],
     ),
     await one(

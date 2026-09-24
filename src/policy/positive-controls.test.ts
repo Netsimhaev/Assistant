@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { readFile } from 'node:fs/promises';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -8,6 +9,7 @@ import { BusinessCharter } from '../domain/charter.js';
 import { addresseeOf, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
 import { AGENT_ALLOWLISTS, isToolPermitted } from '../charter/capabilities.js';
 import {
+  CEILING_EXEMPT_TOOLS,
   classifyAction,
   classifiedToolNames,
   isOutbound,
@@ -257,6 +259,15 @@ describe('constants that must fail closed as the system grows', () => {
    * Written the way the test below it is written — by simulating the mistake
    * rather than asserting today's tables, which are already disjoint and would
    * pass with or without any guard.
+   *
+   * **This is NOT contradicted by `CEILING_EXEMPT_TOOLS` (`policy/classify.ts`),
+   * and the two docblocks have to be read together.** That third table does
+   * let a CLASSIFIED tool contribute no ceiling — but only to the plan-wide
+   * minimum, and without excusing it from anything: it still faces all ten
+   * stages, still leaves an audit row, and still runs under whatever
+   * `rampLevelForPlan` returns. A tool in both tables here is a different and
+   * strictly worse thing: it skips stage 4 as read-only AND carries a real
+   * side-effecting class, so nothing gates it at all.
    */
   it('keeps the classified and read-only tables disjoint, and would notice if they overlapped', () => {
     const classified = classifiedToolNames();
@@ -441,6 +452,57 @@ describe('outbound is a positive list, and it is complete', () => {
 });
 
 /**
+ * Delegation is classified so it is gated and audited, and exempt from the
+ * plan ceiling so it can actually run. Both halves are load-bearing and both
+ * are easy to undo by accident, so both are asserted here.
+ */
+describe('delegation is classified but contributes no plan ceiling', () => {
+  it('classifies agent.request_help and keeps it off the read-only list', () => {
+    expect(classifyAction('agent.request_help')).toBe('agent.delegate');
+    expect(READ_ONLY_TOOLS.has('agent.request_help')).toBe(false);
+  });
+
+  /**
+   * The list that lets a plan containing a delegation still run. Kept to one
+   * member: a tool that carries a real side effect and contributes no ceiling
+   * runs under whatever other class the plan declares, which is the documented
+   * hazard. Delegation is admissible only because it carries no outbound
+   * authority of its own — the child job's own steps face the full ten stages.
+   *
+   * **What the loop below actually checks is narrower than that argument, and
+   * the difference is worth stating rather than leaving a reader to assume the
+   * stronger claim is mechanised.** `addresseeOf(cls) === 'internal'` is a
+   * proxy, not a test for "no outbound authority": `data.export`,
+   * `media.publish`, `purchase.place` and `charter.amend` are all `internal`
+   * too, and every one of them carries authority a delegation does not. A
+   * future member shaped like those would pass the loop; today the only thing
+   * that would stop it is `size === 1` below. That is deliberate — the
+   * admissibility argument is a judgement about one named tool, and the only
+   * honest way to mechanise "one named tool" is to assert the count.
+   */
+  it('exempts exactly one tool from the plan ceiling, and it addresses internally', () => {
+    // The loop runs first and the count assertion comes after, on purpose:
+    // `toEqual` throws on the first mismatch, so checking the array's
+    // contents before its length would make the count assertion
+    // unreachable whenever a wrong member was also present, and every
+    // failure would report as a size mismatch even when the real defect is
+    // a wrongly-addressed tool. Ordered this way, a tool that addresses a
+    // `person` (e.g. `mail.send`) fails in the loop regardless of count, and
+    // a correctly-addressed extra member (e.g. `crm.write`) fails only the
+    // count below — two mutations, two distinct failures.
+    for (const tool of CEILING_EXEMPT_TOOLS) {
+      const cls = classifyAction(tool);
+      expect(cls, tool).not.toBeNull();
+      expect(addresseeOf(cls!), tool).toBe('internal');
+      // Disjoint from READ_ONLY_TOOLS: that list already means "no ceiling",
+      // and a tool in both would be two mechanisms for one property.
+      expect(READ_ONLY_TOOLS.has(tool), tool).toBe(false);
+    }
+    expect(CEILING_EXEMPT_TOOLS.size).toBe(1);
+  });
+});
+
+/**
  * Facts for a first contact: an address nothing in the charter resolves,
  * with only `provenance` varying. Mirrors the helper in first-contact.test.ts
  * (which exercises the boss/staff/unknown_external distinction in isolation);
@@ -515,6 +577,27 @@ describe('the first-contact exemption is empty: no TrustLevel escapes the escala
     for (const level of TrustLevel.options) {
       const risk = await assessRisk(firstContactFacts(level, false), bundle);
       expect(risk.band, `provenance=${level}, not chain-derived`).toBe('sensitive');
+    }
+  });
+});
+
+describe('the graph check in the gate is keyed on every agent.delegate tool, not one name', () => {
+  it("names every 'agent.delegate' tool in engine.ts's collaboration-graph branch", async () => {
+    // `engine.ts` gates the graph check on `toolName === 'agent.request_help'`
+    // — one literal string. A second tool ever classified as `agent.delegate`
+    // (there is only one today) would be classified, ceiling-exempt via
+    // `CEILING_EXEMPT_TOOLS`, and allowlisted, and still sail through stage 3
+    // ungraphed, because nothing ties the branch's condition to the action
+    // class rather than to this one tool name. Read as text, the way the
+    // erasure invariants scan for a forbidden name: a type-level check can't
+    // see a string literal compared with `===`.
+    const engineSource = await readFile('src/policy/engine.ts', 'utf8');
+    const delegateTools = classifiedToolNames().filter(
+      (tool) => classifyAction(tool) === 'agent.delegate',
+    );
+    expect(delegateTools.length).toBeGreaterThan(0);
+    for (const tool of delegateTools) {
+      expect(engineSource.includes(`'${tool}'`), `engine.ts names ${tool}`).toBe(true);
     }
   });
 });
