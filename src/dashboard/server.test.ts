@@ -26,7 +26,7 @@ import { insertOrGetDocument } from '../documents/store.js';
 import { saveReading } from '../documents/reading-store.js';
 import { saveProposal } from '../orchestrator/proposal-store.js';
 import { loadSignature } from '../governance/signatures.js';
-import { saveVerdict } from '../governance/verdict-store.js';
+import { saveNotJudged, saveVerdict, type NotJudgedReason } from '../governance/verdict-store.js';
 import { queryAudit } from '../audit/log.js';
 import {
   loadInstructionForJob,
@@ -1560,6 +1560,71 @@ describe('the gov.verify verdict on a card', () => {
     // The rest of the decision surface survives untouched.
     expect(body).toContain(`/a/${approvalId}/approve`);
     expect(body).toContain(`/a/${approvalId}/deny`);
+  });
+
+  // Task 5: `loadVerificationOutcome` replaces `loadVerdict` on the route, so
+  // the card can tell apart three states instead of two — "still running"
+  // (no row), the real verdict (already covered above), and "attempted and
+  // did not finish" with one of three reasons. Absence must mean only one
+  // thing, so each assertion below also checks the OTHER states' text is not
+  // what rendered.
+  it('says the check is still running when no row exists', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const job = await jobAwaitingApproval(BUSINESS);
+    const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+
+    expect(body).toContain('בבדיקה');
+    // Not the not-judged sentence, and not a real verdict block.
+    expect(body).not.toContain('הבדיקה לא הושלמה');
+    expect(body).not.toContain('בדיקת איכות (gov.verify)');
+  });
+
+  describe('not judged — attempted and did not finish, one sentence per reason', () => {
+    async function cardWithReason(reason: NotJudgedReason): Promise<string> {
+      const baseUrl = await startServer(BUSINESS);
+      const job = await jobAwaitingApproval(BUSINESS);
+      const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
+      await saveNotJudged(job.jobId, reason, { businessId: BUSINESS });
+      const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+      return (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
+    }
+
+    it('failed — names the helper failure, not the other two reasons', async () => {
+      const body = await cardWithReason('failed');
+      expect(body).toContain('הבדיקה לא הושלמה');
+      expect(body).toContain('נכשל בהרצת הבדיקה');
+      expect(body).not.toContain('לא השיב בזמן שהוקצב');
+      expect(body).not.toContain('לא הצליח לחלץ תוכן קריא');
+    });
+
+    it('timeout — names the deadline, not the other two reasons', async () => {
+      const body = await cardWithReason('timeout');
+      expect(body).toContain('הבדיקה לא הושלמה');
+      expect(body).toContain('לא השיב בזמן שהוקצב');
+      expect(body).not.toContain('נכשל בהרצת הבדיקה');
+      expect(body).not.toContain('לא הצליח לחלץ תוכן קריא');
+    });
+
+    it('unreadable — names the unreadable document, not the other two reasons', async () => {
+      const body = await cardWithReason('unreadable');
+      expect(body).toContain('הבדיקה לא הושלמה');
+      expect(body).toContain('לא הצליח לחלץ תוכן קריא');
+      expect(body).not.toContain('נכשל בהרצת הבדיקה');
+      expect(body).not.toContain('לא השיב בזמן שהוקצב');
+    });
+
+    // The distinction the whole third state exists for: it must never read
+    // as "checked and found nothing wrong" — a real verdict's own block, or
+    // the still-running note, rendering instead.
+    it('never reads as a passing verdict or as still running', async () => {
+      const body = await cardWithReason('timeout');
+      expect(body).not.toContain('בדיקת איכות (gov.verify)');
+      expect(body).not.toContain('לא נמצאו בעיות');
+      expect(body).not.toContain('פסיקת האימות תופיע כאן');
+    });
   });
 });
 

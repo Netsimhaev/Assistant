@@ -16,7 +16,7 @@ import type { DocumentRecord } from '../documents/types.js';
 import type { ErasureAnchor, ErasureItem, ErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
 import type { KeptItem } from '../governance/kept-items.js';
-import type { Verdict } from '../governance/verdict-store.js';
+import type { NotJudgedReason, Verdict } from '../governance/verdict-store.js';
 import type { IntentName } from '../domain/reading.js';
 import type { MemoryRecord } from '../memory/store.js';
 import { AutonomyMode } from '../governance/autonomy-mode.js';
@@ -625,6 +625,32 @@ function criterionItem(criterion: Verdict['criteria'][number]): string {
 }
 
 /**
+ * The sentence for each `NotJudgedReason` — written by hand, not derived from
+ * the enum's own token, because the whole point of the third state is that a
+ * reason never masquerades as another one or as a passing verdict. The
+ * `never` branch below is a compile-time tripwire: a fourth member added to
+ * `NotJudgedReason` without a matching case here fails `npm run typecheck`
+ * instead of silently falling through to some other reason's text.
+ */
+function notJudgedBlock(reason: NotJudgedReason): string {
+  const sentence: string = (() => {
+    switch (reason) {
+      case 'failed':
+        return 'העוזר (know.reader) נכשל בהרצת הבדיקה.';
+      case 'timeout':
+        return 'העוזר לא השיב בזמן שהוקצב לבדיקה.';
+      case 'unreadable':
+        return 'העוזר סיים בהצלחה, אך לא הצליח לחלץ תוכן קריא מהמסמך שעליו מבוססת הטיוטה — אין מול מה לבדוק.';
+      default: {
+        const exhaustive: never = reason;
+        throw new Error(`unhandled NotJudgedReason: ${String(exhaustive)}`);
+      }
+    }
+  })();
+  return `<p class="muted">בדיקת האימות (gov.verify) נוסתה — הבדיקה לא הושלמה: ${sentence} הטיוטה לא נבדקה.</p>`;
+}
+
+/**
  * `gov.verify`'s verdict for this card's job, when one has been saved by the
  * time the card renders. Rendered from a database row read at REQUEST time —
  * `loadVerdict` is called by the route, not stashed at card-creation time —
@@ -705,6 +731,15 @@ export function renderApprovalCard(options: {
    * not left to believe none was ever produced.
    */
   verdictUnreadable?: boolean;
+  /**
+   * Verification was attempted for this job and did not produce a verdict —
+   * `verdict` is `undefined` in this case. Each of the three reasons
+   * (`src/governance/verdict-store.ts`'s `NotJudgedReason`) gets its own
+   * sentence via `notJudgedBlock`, below: this state must never read as "no
+   * issues found" (that is what a real verdict with passing criteria says),
+   * and one reason must never borrow another's text.
+   */
+  notJudged?: NotJudgedReason;
   editValue?: string;
   noteValue?: string;
   error?: string;
@@ -745,7 +780,9 @@ export function renderApprovalCard(options: {
 </div>
 ${options.document ? documentBlock(options.document) : ''}
 ${options.verdict ? verdictBlock(options.verdict) : ''}
+${options.notJudged ? notJudgedBlock(options.notJudged) : ''}
 ${options.verdictUnreadable ? '<p class="muted">קיימת פסיקת אימות (gov.verify) לבקשה זו, אך לא ניתן היה לקרוא אותה.</p>' : ''}
+${options.verdict === undefined && options.notJudged === undefined && !options.verdictUnreadable ? '<p class="muted">בבדיקה — פסיקת האימות תופיע כאן כשתהיה מוכנה.</p>' : ''}
 ${signErrorBlock}
 <div class="row">
   <form method="post" action="/a/${esc(approval.approvalId)}/approve" class="edit-form">
