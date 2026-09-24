@@ -42,12 +42,18 @@
  * outgoing steps and, when the job carries a `proposals` row, that reading's
  * own entity-kind intents. Neither source contributes anything here, so
  * `touched` is empty and `siftCandidates` rejects every candidate the curator
- * could ever propose about this probe, model or no model. This script still
- * does not risk it: it injects a curator stub that returns zero candidates
- * outright, both to keep this run's cost and scope to the one thing it
- * demonstrates (delegation, not curation) and to make the "no memory can be
- * written from this job" claim structural rather than dependent on what a
- * live model happens to return this time.
+ * could ever propose about this probe, model or no model. **`closeVerifiedJobs`
+ * is called here WITHOUT an injected curator, on purpose, even though the
+ * paragraph above proves a stub would be harmless for this one probe job.**
+ * `closeVerifiedJobs`'s `curator` option is not scoped to one job — it is
+ * forwarded inside a loop over every business-wide `verify`/`remember` row
+ * this pass picks up (see the queue-wide warning below), so a stub here would
+ * curate every unrelated job in that batch with a curator that always
+ * returns nothing, and a closed job is never re-curated: that is permanent,
+ * irreversible loss of what those OTHER jobs would have had remembered,
+ * caused by a script that never touched them. The one-job argument above is
+ * true and is exactly why omitting the option costs nothing here — it does
+ * not justify the option's blast radius on rows this script does not own.
  *
  * SAFETY, nothing left runnable. Every job this script opens is moved to a
  * terminal phase before it exits — the parent and the child by the ordinary
@@ -57,6 +63,21 @@
  * the same row) failed in cleanup because nothing else in this script ever
  * advances it. A job left sitting in `execute` with no plan bound is exactly
  * what `run-scheduler.ts` prints an error line for on its very next pass.
+ *
+ * **THIS SCRIPT RUNS THE BUSINESS'S WHOLE `execute`/`verify`/`remember`/
+ * `followup` QUEUE, NOT JUST THE PROBE.** `runDueJobs`, `closeVerifiedJobs`
+ * and `resumeDelegatedJobs` are the same business-wide, oldest-first,
+ * limited queries the real scheduler runs — there is no way to ask any of
+ * them for "just this job." The probe's own rows are the NEWEST in each
+ * queue (`ORDER BY updated_at ASC`), so on an installation with real backlog
+ * they sort LAST — a limit too low silently excludes the probe (a check
+ * fails with nothing actually wrong) while every unrelated job ahead of it
+ * runs, closes, or wakes for real: real outbound sends, real spend, real
+ * curation. The limits below are raised well past any plausible backlog for
+ * that reason, not for the probe's sake alone. **Stop `npm run scheduler`
+ * before running this** — its three loops read the identical queues and can
+ * claim the probe's rows before this script's own calls do, which again
+ * fails every check with nothing wrong.
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -68,6 +89,7 @@ import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { queryAudit } from '../audit/log.js';
 import { ingestDocument } from '../documents/ingest.js';
+import { readingsToday } from '../documents/store.js';
 import { loadEnvelopeWithChild, loadResultForChildJob } from '../governance/envelope-store.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import { runDueJobs } from '../orchestrator/run-due.js';
@@ -76,6 +98,17 @@ import { closeVerifiedJobs } from '../orchestrator/verify.js';
 import { verifyDraft, type AwaitingDelegation, type VerifyDraftResult } from './gov-verify.js';
 
 const BUSINESS = config.businessId;
+
+/**
+ * Applied to every business-wide, oldest-first queue this script drives
+ * (`runDueJobs`, `closeVerifiedJobs`, `resumeDelegatedJobs`). The probe's own
+ * rows are always the newest, so they sort LAST under each query's
+ * `ORDER BY updated_at ASC` — a limit no larger than a plausible backlog
+ * would silently exclude the probe while running everyone else's queue
+ * ahead of it. See this file's own docblock ("THIS SCRIPT RUNS THE
+ * BUSINESS'S WHOLE QUEUE").
+ */
+const QUEUE_LIMIT = 500;
 
 /** One id per run — see this file's own docblock on why every seed uses it. */
 const PROBE = `probe-${ulid()}`;
@@ -223,8 +256,6 @@ async function main(): Promise<void> {
     "constraints.provenanceCeiling שווה ל-provenance של המשימה המאצילה (unknown_external) — לא הורפה חזרה ל-'boss'",
     envelope.constraints.provenanceCeiling === parent.provenance,
   );
-  check("constraints.autonomyCeiling === 'auto'", envelope.constraints.autonomyCeiling === 'auto');
-  check('constraints.moneyCeilingMinor === null', envelope.constraints.moneyCeilingMinor === null);
   check(
     'constraints.deadlineAt מהודק לחלון האצלה של כ-24 שעות — לא לתאריך הסנטינל המתירני של שורש חסר-הורה',
     deadlineMs > nowMs && deadlineMs < nowMs + 25 * 60 * 60 * 1000,
@@ -233,10 +264,35 @@ async function main(): Promise<void> {
     'constraints.charterVersion זהה לתקנון שהמשימה המאצילה רצה תחתיו',
     envelope.constraints.charterVersion === bundle.charterVersion,
   );
+  // These two are NOT proof of tightening: for a root delegation both sides
+  // of `tightenConstraints` already agree ('auto'/null on the root ceiling
+  // AND on what the parent job contributes), so a mutation that broke the
+  // tightening logic on either field would still pass this exact check.
+  // Printed as facts, not asserted as evidence — see the two checks above
+  // and `provenanceCeiling`'s for the fields that actually carry weight.
+  console.log(
+    `  [עובדה, לא הוכחה] constraints.autonomyCeiling = ${envelope.constraints.autonomyCeiling} ` +
+      "(שווה ל-'auto' משני הצדדים באצלת-שורש — לא מוכיח הידוק)",
+  );
+  console.log(
+    `  [עובדה, לא הוכחה] constraints.moneyCeilingMinor = ${String(envelope.constraints.moneyCeilingMinor)} ` +
+      '(null משני הצדדים באצלת-שורש — לא מוכיח הידוק)',
+  );
 
   // ------------------------------------------------------------- RUN THE CHILD
   banner('שלב 2: הילד רץ — קריאה חיה אמיתית אל know.reader (doc.fetch)');
-  const due = await runDueJobs({ businessId: BUSINESS, limit: 5 });
+  console.log(`DOCUMENT_READS_PER_DAY = ${config.documentReadsPerDay}`);
+  const readsSoFarToday = await readingsToday({ businessId: BUSINESS });
+  console.log(`קריאות מסמך שנוצלו כבר היום: ${readsSoFarToday}`);
+  if (readsSoFarToday >= config.documentReadsPerDay) {
+    console.log(
+      'התקרה היומית כבר מוצתה — doc.fetch יחזור לא-done, וזה לא באג במנגנון ' +
+        'ההאצלה, זו תקרת מדיניות רגילה. ראו CLAUDE.md: DOCUMENT_READS_PER_DAY.',
+    );
+  }
+  // This runs the business's whole `execute` queue — see this file's own
+  // docblock. Not scoped to the probe child alone.
+  const due = await runDueJobs({ businessId: BUSINESS, limit: QUEUE_LIMIT });
   console.log(`due.ran: ${JSON.stringify(due.ran)}`);
   if (due.errored.length > 0) console.log(`due.errored: ${JSON.stringify(due.errored)}`);
   const childRan = due.ran.find((r) => r.jobId === childJobId);
@@ -245,13 +301,15 @@ async function main(): Promise<void> {
   const afterRun = await loadJob(childJobId, { businessId: BUSINESS });
   check("שלב הילד עבר ל-verify אחרי הריצה", afterRun?.phase === 'verify');
 
-  banner('שלב 3: סגירת הילד — closeVerifiedJobs (אוצר מדומה: אפס מועמדים, ראו תיעוד)');
-  const verified = await closeVerifiedJobs({
-    businessId: BUSINESS,
-    // Not the point of this run — see this file's own docblock on why zero
-    // candidates is safe here regardless, and why the stub is chosen anyway.
-    curator: async () => ({ candidates: [] }),
-  });
+  banner('שלב 3: סגירת הילד — closeVerifiedJobs, בלי אוצר מוזרק');
+  // No `curator` option here — deliberately. See this file's own docblock:
+  // `closeVerifiedJobs`'s `curator` is forwarded to EVERY job this
+  // business-wide pass picks up, not only the probe child, so a stub that
+  // returns zero candidates would permanently strip real curation from any
+  // unrelated job sitting in `verify`/`remember` right now. The real,
+  // default curator runs for all of them, exactly as production's own
+  // scheduler pass would.
+  const verified = await closeVerifiedJobs({ businessId: BUSINESS, limit: QUEUE_LIMIT });
   console.log(`verified.closed: ${JSON.stringify(verified.closed)}`);
   if (verified.failed.length > 0) console.log(`verified.failed: ${JSON.stringify(verified.failed)}`);
   check('הילד נמצא ברשימת verified.closed', verified.closed.includes(childJobId));
@@ -261,7 +319,7 @@ async function main(): Promise<void> {
 
   // ------------------------------------------------------------ WAKE THE PARENT
   banner('שלב 4: resumeDelegatedJobs — האם ואם מתעוררת');
-  const delegatedResult = await resumeDelegatedJobs({ businessId: BUSINESS });
+  const delegatedResult = await resumeDelegatedJobs({ businessId: BUSINESS, limit: QUEUE_LIMIT });
   console.log(`resumed: ${JSON.stringify(delegatedResult.resumed)}`);
   console.log(`timedOut: ${JSON.stringify(delegatedResult.timedOut)}`);
   if (delegatedResult.errored.length > 0) console.log(`errored: ${JSON.stringify(delegatedResult.errored)}`);
@@ -272,11 +330,15 @@ async function main(): Promise<void> {
   check('awaitingEnvelopeId נוקה', wokenParent?.awaitingEnvelopeId === null);
 
   banner('אימות 2: שורת agent_envelopes מסוג result');
+  // `loadResultForChildJob`'s own SQL already filters on
+  // `kind = 'result' AND correlation_id = $2` — a non-null row found by this
+  // call cannot have any other kind or correlationId, so asserting those two
+  // again here would be a tautology proven by the query's WHERE clause, not
+  // by anything this run did. The one fact worth checking is the payload's
+  // content, which the query does not constrain.
   const resultEnvelope = await loadResultForChildJob(childJobId, parent.jobId, { businessId: BUSINESS });
-  check('שורת result נמצאה', resultEnvelope !== null);
+  check('שורת result נמצאה (resumeDelegatedJobs כתב אותה בפועל)', resultEnvelope !== null);
   if (resultEnvelope !== null) {
-    check("kind === result", resultEnvelope.kind === 'result');
-    check('correlationId זהה לזו של help_request', resultEnvelope.correlationId === parent.jobId);
     const payload = resultEnvelope.payload as { outcome?: unknown; note?: unknown };
     console.log(`תוצאה: ${JSON.stringify(payload)}`);
     check("payload.outcome === 'succeeded'", payload.outcome === 'succeeded');
@@ -319,17 +381,26 @@ async function main(): Promise<void> {
     businessId: BUSINESS,
   });
   const finalParent = await loadJob(parent.jobId, { businessId: BUSINESS });
-  check('ההורה הושלם (closed)', finalParent?.phase === 'closed');
+  // This proves `transition()` executed three calls in a row — nothing more.
+  // Unlike every check above it, it is not evidence that gov.verify's own
+  // flow completed on its own: this script drove the three transitions by
+  // hand, in the same breath, specifically because nothing in `src/` does
+  // this today (see Step 5's own printed note above). Kept separate from
+  // "ההורה התעוררה" in the summary below for exactly that reason.
+  check('ההורה הועבר ל-closed בהצלחה (מוכיח ש-transition() עבד — לא שהמנגנון סגר אותה לבד)', finalParent?.phase === 'closed');
 
   // --------------------------------------------------------------- SUMMARY
   banner('סיכום');
   if (failures.length === 0) {
-    console.log('כל הבדיקות עברו. ראה את שבעת הסעיפים שהמשימה דרשה, כולם למעלה:');
+    console.log('כל הבדיקות עברו. ראה את חמשת הסעיפים שהמשימה דרשה, כולם למעלה:');
     console.log('  1. שורת agent_envelopes אחת help_request ואחת result');
     console.log('  2. משימת-בת שנסגרה, עם correlationId זהה לזה של האם');
-    console.log('  3. constraints של הבת מהודקות או שוות בכל שדה');
+    console.log('  3. constraints של הבת מהודקות או שוות בכל שדה — שני שדות מוכיחים הידוק');
+    console.log('     בפועל (provenanceCeiling, deadlineAt), ושניים שווים-מבנייה כבר בקלט');
+    console.log('     (autonomyCeiling, moneyCeilingMinor) ולכן אינם עדות, ראו הערה בפלט');
     console.log('  4. שורות audit_log מסוג delegation עם envelope_id שאינו null');
-    console.log('  5. האם התעוררה והשלימה');
+    console.log('  5א. ההורה התעוררה: אמיתי ובעל משקל — resumeDelegatedJobs עשה זאת, לא הסקריפט');
+    console.log('  5ב. ההורה הושלמה: הסקריפט עצמו סגר אותה ביד, ומוכיח רק ש-transition() עובד');
   } else {
     console.log(`${failures.length} בדיקות נכשלו:`);
     for (const f of failures) console.log(`  - ${f}`);
