@@ -18,7 +18,7 @@ const BASE = {
   SMTP_SECURE: 'false',
   SMTP_FROM: 'assistant@example.com',
   SMTP_USER: 'assistant',
-  SMTP_PASS: 'pw',
+  NOTIFY_CREDENTIAL_REF: 'NOTIFY_MAIL',
   APPROVAL_NOTIFY_TO: 'boss@example.com',
   DASHBOARD_BASE_URL: 'http://127.0.0.1:8787',
   ANTHROPIC_API_KEY: 'sk-test-key',
@@ -72,6 +72,35 @@ describe('buildRuntime', () => {
     const runtime = await buildRuntime(withoutTo);
     expect(runtime.notify).toBeUndefined();
     expect(runtime.warnings.join(' ')).toMatch(/APPROVAL_NOTIFY_TO/);
+  });
+
+  it('warns and runs without mail when the notify ref is missing, rather than throwing', async () => {
+    const { NOTIFY_CREDENTIAL_REF: _ref, ...withoutRef } = FULL;
+    // The scheduler still has to expire approvals — this was already the
+    // shape for a missing SMTP variable, and an unset ref is the same class.
+    const runtime = await buildRuntime(withoutRef);
+    expect(runtime.notify).toBeUndefined();
+    expect(runtime.warnings.join(' ')).toMatch(/NOTIFY_CREDENTIAL_REF/);
+    // Unrelated to the mail adapter itself, same as the ANTHROPIC_API_KEY case.
+    expect(runtime.registry.get('office-mail')).not.toBeNull();
+  });
+
+  it('rejects a notify ref that is not a legal credential ref', async () => {
+    // CREDENTIAL_REF_PATTERN is uppercase, digits and underscore only, and
+    // `key-check` / `key-recovery` are lowercase-with-hyphen precisely so a
+    // real ref can never collide with them. A misconfigured ref must be
+    // refused at startup, not at the first approval.
+    await expect(
+      buildRuntime({ ...FULL, NOTIFY_CREDENTIAL_REF: 'key-check' }),
+    ).rejects.toThrow();
+  });
+
+  it('no longer reads SMTP_PASS at all', async () => {
+    const runtime = await buildRuntime({ ...FULL, SMTP_PASS: 'סוד-נשכח' });
+    // Positive half first, so the negative assertion cannot pass vacuously —
+    // the notifier really was built from this exact env.
+    expect(runtime.notify).toBeDefined();
+    expect(JSON.stringify(runtime)).not.toContain('סוד-נשכח');
   });
 
   it('warns when ANTHROPIC_API_KEY is absent, so curation-off does not look like nothing-to-remember', async () => {

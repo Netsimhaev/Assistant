@@ -1,3 +1,4 @@
+import { config } from '../config.js';
 import { storedCredentials } from '../governance/credential-store.js';
 import { loadMasterKey, MasterKeyError, verifyKeyState } from '../governance/master-key.js';
 import { createEmailNotifier } from '../governance/notify.js';
@@ -6,6 +7,7 @@ import { createSmtpTransport } from '../mail/transport.js';
 import { browserAdapter } from './adapters/browser.js';
 import { createMailAdapter } from './adapters/mail.js';
 import { AdapterRegistry } from './adapters/registry.js';
+import { CREDENTIAL_REF_PATTERN } from './credentials.js';
 import type { CredentialSource } from './credentials.js';
 
 /**
@@ -40,7 +42,6 @@ const SMTP_KEYS = [
   'SMTP_SECURE',
   'SMTP_FROM',
   'SMTP_USER',
-  'SMTP_PASS',
 ] as const;
 
 /**
@@ -73,6 +74,19 @@ export async function buildRuntime(
   }
   const key = await loadMasterKey(keyPath);
   await verifyKeyState(key);
+  const credentials = storedCredentials(key);
+
+  // A missing ref is a warning below, in the same place APPROVAL_NOTIFY_TO's
+  // absence already is — the notifier simply does not get built. A *present*
+  // ref that cannot be legal is different in kind: it is a typo an operator
+  // made, not a switch they left off, and finding out about it at the first
+  // approval hours later is strictly worse than refusing to start now.
+  const notifyRef = env['NOTIFY_CREDENTIAL_REF'];
+  if (notifyRef !== undefined && notifyRef.length > 0 && !CREDENTIAL_REF_PATTERN.test(notifyRef)) {
+    throw new Error(
+      `NOTIFY_CREDENTIAL_REF אינו ref חוקי (אותיות גדולות, ספרות וקו תחתון בלבד): ${notifyRef}`,
+    );
+  }
 
   const missing = SMTP_KEYS.filter((key) => {
     const value = env[key];
@@ -98,7 +112,10 @@ export async function buildRuntime(
         // Positive check. `!== 'false'` would make a typo mean TLS.
         secure: env['SMTP_SECURE'] === 'true',
         from: env['SMTP_FROM'] as string,
-        auth: { user: env['SMTP_USER'] as string, pass: env['SMTP_PASS'] as string },
+        // No `auth` here any more — see `SmtpConfig.user`'s own docblock.
+        // The password comes from a resolved credential per send, never from
+        // a value this function reads out of `process.env`.
+        user: env['SMTP_USER'] as string,
       });
 
       const mailSystem = env['MAIL_SYSTEM'];
@@ -120,10 +137,21 @@ export async function buildRuntime(
           `no approval notifier: APPROVAL_NOTIFY_TO not set — approvals will ` +
             `queue and appear on the dashboard, and nobody will be emailed`,
         );
+      } else if (notifyRef === undefined || notifyRef.length === 0) {
+        warnings.push(
+          `no approval notifier: NOTIFY_CREDENTIAL_REF not set — approvals will ` +
+            `queue and appear on the dashboard, and nobody will be emailed`,
+        );
       } else {
         const dashboardBaseUrl = env['DASHBOARD_BASE_URL'];
         notify = {
-          notifier: createEmailNotifier(transport, to),
+          notifier: createEmailNotifier({
+            transport,
+            to,
+            credentials,
+            ref: notifyRef,
+            businessId: config.businessId,
+          }),
           dashboardBaseUrl:
             dashboardBaseUrl === undefined || dashboardBaseUrl.length === 0
               ? DEFAULT_DASHBOARD_BASE_URL
@@ -152,8 +180,9 @@ export async function buildRuntime(
     // and reads a single shared process environment with no per-business
     // partition at all. `runtime.test.ts` locks this as a positive control
     // rather than as a claim, because a component nobody uses is exactly the
-    // component someone wires by mistake (spec §3.4).
-    credentials: storedCredentials(key),
+    // component someone wires by mistake (spec §3.4). The same instance the
+    // notifier above resolves against, not a second one built from the same key.
+    credentials,
     ...(notify !== undefined ? { notify } : {}),
     warnings,
   };
