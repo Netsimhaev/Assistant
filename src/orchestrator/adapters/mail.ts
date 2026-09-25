@@ -242,7 +242,7 @@ function classifyTransportFailure(error: unknown): AdapterResult {
 
   // The connection dropped while (or after) the message body was in
   // transit, with no final reply -- the server may or may not have it.
-  if (shape['command'] === 'DATA') {
+  if (shape['command'] === AMBIGUOUS_FAILURE_COMMAND) {
     return { ok: false, retryable: false, code: 'delivery_unknown', message };
   }
 
