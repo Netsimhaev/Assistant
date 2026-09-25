@@ -4,6 +4,7 @@ import { loadMasterKey, MasterKeyError, verifyKeyState } from '../governance/mas
 import { createEmailNotifier } from '../governance/notify.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import { createSmtpTransport } from '../mail/transport.js';
+import type { SmtpConfig } from '../mail/transport.js';
 import { browserAdapter } from './adapters/browser.js';
 import { createMailAdapter } from './adapters/mail.js';
 import { AdapterRegistry } from './adapters/registry.js';
@@ -57,9 +58,17 @@ const SMTP_KEYS = [
  * `verifyKeyState` runs here for the same reason (spec §5.1). Without it, a
  * replaced or damaged key file is discovered when a customer's mail fails at
  * three in the morning, not when the process starts.
+ *
+ * `overrides.createTransport` exists for exactly one caller: a test that
+ * needs to see what `SmtpConfig` and per-send credential actually reached
+ * nodemailer, the same seam `SmtpConfig.createTransport` documents for
+ * `createSmtpTransport` itself. No production caller ever passes it — every
+ * real call site (`run-scheduler.ts`, `run-due.ts`, `scheduler.ts`) calls
+ * `buildRuntime()` with zero arguments.
  */
 export async function buildRuntime(
   env: Record<string, string | undefined> = process.env,
+  overrides: { createTransport?: SmtpConfig['createTransport'] } = {},
 ): Promise<Runtime> {
   const warnings: string[] = [];
 
@@ -116,6 +125,9 @@ export async function buildRuntime(
         // The password comes from a resolved credential per send, never from
         // a value this function reads out of `process.env`.
         user: env['SMTP_USER'] as string,
+        ...(overrides.createTransport !== undefined
+          ? { createTransport: overrides.createTransport }
+          : {}),
       });
 
       const mailSystem = env['MAIL_SYSTEM'];

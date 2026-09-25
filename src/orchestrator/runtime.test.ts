@@ -1,12 +1,14 @@
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
 import { closePool } from '../db/pool.js';
+import type { ApprovalRequest } from '../governance/approvals.js';
 import { putSecret } from '../governance/credential-store.js';
 import { KEY_BYTES, MasterKeyError, writeKeyState } from '../governance/master-key.js';
+import type { RiskAssessment } from '../domain/risk.js';
 import { DEFAULT_CREDENTIAL_ENV_PREFIX } from './credentials.js';
 import { resetDatabase } from '../test/db.js';
 import { buildRuntime } from './runtime.js';
@@ -46,6 +48,55 @@ afterEach(async () => {
 afterAll(async () => {
   await closePool();
 });
+
+/**
+ * Just enough of a `RiskAssessment`/`ApprovalRequest` for `notify()` to build
+ * a message from — the values themselves are inert, only the notifier's
+ * *wiring* (which ref, which store, does it reach the transport) is under
+ * test here. Deliberately not routed through `enqueueApproval`: this file is
+ * not re-testing the approval pipeline, only what `buildRuntime` hands
+ * `createEmailNotifier`.
+ */
+function riskFixture(): RiskAssessment {
+  return {
+    actionId: 'A-test',
+    actionClass: 'purchase.place',
+    dimensions: {
+      money: { amountMinor: 0, pctOfDailyCeiling: 0, score: 0 },
+      reversibility: { class: 'reversible', score: 0 },
+      externalVisibility: { audience: 'one_known', score: 0 },
+      dataSensitivity: { classes: [], leavesInstance: false, score: 0 },
+      novelty: { metric: null, z: 0, precedentIds: [], score: 0 },
+      provenance: { level: 'boss', chainDepth: 0, score: 0 },
+      charterFit: { verdict: 'within', citedRuleIds: [], score: 0 },
+    },
+    total: 0,
+    band: 'routine',
+    decidedBy: 'rules',
+    explanation: 'בדיקה',
+    suggestedApprovers: [],
+  };
+}
+
+function approvalFixture(): ApprovalRequest {
+  return {
+    approvalId: 'AP-test',
+    jobId: null,
+    envelopeId: null,
+    actionClass: 'purchase.place',
+    summary: 'בדיקה',
+    detail: 'בדיקה',
+    diffVsNorm: null,
+    risk: riskFixture(),
+    proposedTool: 'mail.send',
+    proposedInput: null,
+    inputHash: 'test-hash',
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    state: 'pending',
+    editedInput: null,
+  };
+}
 
 describe('buildRuntime', () => {
   it('registers a mail adapter under the configured system name', async () => {
@@ -89,18 +140,104 @@ describe('buildRuntime', () => {
     // CREDENTIAL_REF_PATTERN is uppercase, digits and underscore only, and
     // `key-check` / `key-recovery` are lowercase-with-hyphen precisely so a
     // real ref can never collide with them. A misconfigured ref must be
-    // refused at startup, not at the first approval.
+    // refused at startup, not at the first approval. Matched against the
+    // message naming the control, not `toThrow()` bare — an unrelated throw
+    // (a stray typo elsewhere in the same build) would otherwise pass this
+    // just as well.
     await expect(
       buildRuntime({ ...FULL, NOTIFY_CREDENTIAL_REF: 'key-check' }),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/NOTIFY_CREDENTIAL_REF/);
   });
 
-  it('no longer reads SMTP_PASS at all', async () => {
-    const runtime = await buildRuntime({ ...FULL, SMTP_PASS: 'סוד-נשכח' });
-    // Positive half first, so the negative assertion cannot pass vacuously —
-    // the notifier really was built from this exact env.
-    expect(runtime.notify).toBeDefined();
-    expect(JSON.stringify(runtime)).not.toContain('סוד-נשכח');
+  /**
+   * `JSON.stringify(runtime)` can never see `SMTP_PASS`, whatever the code
+   * does: `createSmtpTransport` returns a closure with `config` captured
+   * (nothing serialisable), and `AdapterRegistry` holds adapters in private
+   * `Map`s that serialise to `{}`. A runtime-object probe here is vacuous by
+   * construction — this project already treats that as a control-design bug
+   * and reads source as text instead when the property is "this string must
+   * not appear in production code" (`erasure-invariants.test.ts`'s import
+   * scan, `conductor-invariants.test.ts`'s call-block scan). Put the literal
+   * back anywhere non-test under `src/` and this goes red.
+   */
+  it('reads no SMTP_PASS anywhere in production source', async () => {
+    const offenders: string[] = [];
+
+    const walk = async (dir: string): Promise<void> => {
+      let entries;
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(path);
+          continue;
+        }
+        if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) continue;
+        const source = await readFile(path, 'utf8');
+        if (source.includes('SMTP_PASS')) offenders.push(path);
+      }
+    };
+
+    await walk('src');
+    expect(offenders).toEqual([]);
+  });
+
+  /**
+   * The wiring in `buildRuntime` (ref, credential source, business id) is
+   * unmeasured by every test above it: none of them ever calls the notifier
+   * it builds. Driving it end to end is what actually proves three things at
+   * once — the ref resolved is the *configured* one and not some other ref
+   * that happens to also be stored, the source resolving it is the real
+   * encrypted store rather than a stub, and the resolved value actually
+   * reaches the transport's authentication. `overrides.createTransport` is
+   * `buildRuntime`'s own injection seam for exactly this, mirroring
+   * `SmtpConfig.createTransport` one layer down.
+   */
+  it('notifies using the configured NOTIFY_CREDENTIAL_REF resolved from the real store, not a different stored ref', async () => {
+    await putSecret(
+      {
+        businessId: config.businessId,
+        ref: 'NOTIFY_MAIL',
+        value: 'סוד-הנוטיפייר',
+        updatedBy: 'operator@example.com',
+      },
+      KEY,
+    );
+    await putSecret(
+      {
+        businessId: config.businessId,
+        ref: 'DECOY_REF',
+        value: 'סוד-אחר-לגמרי',
+        updatedBy: 'operator@example.com',
+      },
+      KEY,
+    );
+
+    const captured: Array<{ user?: string; pass?: string }> = [];
+    const runtime = await buildRuntime(FULL, {
+      createTransport: (opts) => {
+        captured.push(opts.auth);
+        return { sendMail: () => Promise.resolve({ messageId: 'stub-message-id' }) };
+      },
+    });
+
+    const notify = runtime.notify;
+    expect(notify).toBeDefined();
+    if (notify === undefined) throw new Error('unreachable — asserted above');
+
+    const result = await notify.notifier.notify(
+      approvalFixture(),
+      'http://127.0.0.1:8787/a/AP-test',
+    );
+    // Positive half first: the send genuinely went through and reached the
+    // (fake) transport, so the pass value below did not come from nowhere.
+    expect(result.ok).toBe(true);
+    expect(captured[0]?.pass).toBe('סוד-הנוטיפייר');
+    expect(captured[0]?.pass).not.toBe('סוד-אחר-לגמרי');
   });
 
   it('warns when ANTHROPIC_API_KEY is absent, so curation-off does not look like nothing-to-remember', async () => {
