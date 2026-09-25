@@ -315,7 +315,7 @@ describe('createEmailNotifier', () => {
     expect(result).toEqual({ ok: true });
   });
 
-  it('resolves its own credential per notification and sends with it', async () => {
+  it('sends with the value the credential source holds for the ref', async () => {
     const { transport, credentialsUsed } = recordingTransport();
     const secret = 'סוד-המודיע';
     const notifier = createEmailNotifier(
@@ -378,5 +378,33 @@ describe('createEmailNotifier', () => {
     expect(credentialsUsed).toEqual([secret]);
     expect(result.ok).toBe(false);
     expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it('turns a rejecting credential source into a graceful { ok: false }, never a rejected promise', async () => {
+    // The production CredentialSource (`storedCredentials`,
+    // src/governance/credential-store.ts) awaits a db.query that can
+    // reject — a lost connection, an exhausted pool. That rejection must
+    // land inside notify's own try, not escape it.
+    const { transport, sent } = recordingTransport();
+    let resolveCalls = 0;
+    const rejectingCredentials: CredentialSource = {
+      async resolve() {
+        resolveCalls += 1;
+        throw new Error('connection terminated unexpectedly');
+      },
+    };
+    const notifier = createEmailNotifier(
+      baseNotifierOptions({ transport, credentials: rejectingCredentials }),
+    );
+    const request = await makeApproval();
+
+    const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
+
+    // Positive first: prove the rejection actually happened on this call's
+    // path — resolve was reached and is the thing that threw — so the
+    // shape asserted below is not passing for some unrelated reason.
+    expect(resolveCalls).toBe(1);
+    expect(result).toEqual({ ok: false, error: 'connection terminated unexpectedly' });
+    expect(sent).toHaveLength(0);
   });
 });

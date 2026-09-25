@@ -176,15 +176,22 @@ export function createEmailNotifier(options: EmailNotifierOptions): ApprovalNoti
     channel: 'email',
 
     async notify(request, link) {
-      const credential = await credentials.resolve(ref, businessId);
-      if (credential === null) {
-        // `ref` is a configuration name, not a secret — safe to quote here,
-        // unlike anything that could come from `credential.value`.
-        return { ok: false, error: `לא נמצא credential עבור ${ref}` };
-      }
-
-      const { subject, body } = buildMessage(request, link);
+      // The `resolve` call sits inside this same `try`, not before it: the
+      // production `CredentialSource` (`storedCredentials`,
+      // `src/governance/credential-store.ts`) awaits a `db.query` that can
+      // reject — a lost connection, an exhausted pool — and a rejection
+      // there is exactly as much "notify failed" as a throwing transport
+      // below. `notify` never throws, full stop; a resolve outside this
+      // block would make that only two-thirds true.
       try {
+        const credential = await credentials.resolve(ref, businessId);
+        if (credential === null) {
+          // `ref` is a configuration name, not a secret — safe to quote
+          // here, unlike anything that could come from `credential.value`.
+          return { ok: false, error: `לא נמצא credential עבור ${ref}` };
+        }
+
+        const { subject, body } = buildMessage(request, link);
         await withDeadline(
           transport.send(
             { to: [to], subject, body },
