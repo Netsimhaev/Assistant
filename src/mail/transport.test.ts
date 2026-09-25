@@ -144,16 +144,38 @@ describe('createSmtpTransport', () => {
     expect(JSON.stringify({ c: createCredentialHandle('OFFICE_MAIL', secret) })).not.toContain(secret);
   });
 
-  it('never enables nodemailer\'s debug or logger options', () => {
+  it('never enables nodemailer\'s debug or logger options', async () => {
     // Both print the SMTP dialogue, and the AUTH exchange is inside it.
     const captured: Array<Record<string, unknown>> = [];
     const transport = createSmtpTransport(configWithoutAuth({ createTransport: (opts) => {
       captured.push(opts as unknown as Record<string, unknown>);
       return fakeTransporter();
     } }));
-    void transport.send(aMessage(), aContext());
+    await transport.send(aMessage(), aContext());
+    // The positive half first: without this, an aborted or otherwise
+    // short-circuited send that never reaches `createTransport` at all would
+    // leave `captured` empty and pass the two assertions below vacuously.
+    expect(captured).toHaveLength(1);
     expect(captured[0]?.['debug']).toBeUndefined();
     expect(captured[0]?.['logger']).toBeUndefined();
+  });
+
+  it('drops a failed send\'s extra fields, keeping only the message', async () => {
+    const sentinel = 'SENTINEL-COMMAND-AUTH-LOGIN';
+    const transport = createSmtpTransport(configWithoutAuth({ createTransport: () => ({
+      sendMail: () => {
+        const error = new Error('535 Authentication credentials invalid') as Error & { command?: string };
+        error.command = sentinel;
+        return Promise.reject(error);
+      },
+    }) }));
+    const err = await transport.send(aMessage(), aContext()).catch((e: unknown) => e);
+    // The positive half first: the message — what an operator actually
+    // needs — must survive the rethrow.
+    expect(String(err)).toContain('535');
+    // Then the negative: `command` (which can itself be the AUTH line) and
+    // every other field the library attached must not cross this boundary.
+    expect(String(err)).not.toContain(sentinel);
   });
 });
 

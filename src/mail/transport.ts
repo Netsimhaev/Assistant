@@ -192,16 +192,29 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
       const domain = config.from.split('@')[1] ?? 'localhost';
       const messageId = `<${context.idempotencyKey}@${domain}>`;
 
-      const info = await raceAbort(
-        transporter.sendMail({
-          from: config.from,
-          to: message.to.join(', '),
-          subject: message.subject,
-          text: message.body,
-          messageId,
-        }),
-        context.signal,
-      );
+      let info: { messageId: string };
+      try {
+        info = await raceAbort(
+          transporter.sendMail({
+            from: config.from,
+            to: message.to.join(', '),
+            subject: message.subject,
+            text: message.body,
+            messageId,
+          }),
+          context.signal,
+        );
+      } catch (error) {
+        // Only the message crosses this boundary. Real nodemailer failures
+        // carry `command`, `response`, `responseCode` and more, and an AUTH
+        // failure's `command` can be the AUTH line itself — an echoed error
+        // reaching `StepChannelError` and from there an audit row's `reason`
+        // would cross far more than this function's own boundary. This is a
+        // positive selection of the one field an operator actually needs
+        // (the server's own response text), not a scrub of a list of
+        // dangerous fields this file would have to keep current.
+        throw new Error(error instanceof Error ? error.message : String(error));
+      }
 
       return { messageId: info.messageId };
     },

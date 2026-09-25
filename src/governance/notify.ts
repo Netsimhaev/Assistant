@@ -89,12 +89,11 @@ function buildMessage(request: ApprovalRequest, link: string): { subject: string
  *
  * No connection binding backs this send — it is a system notification, not
  * a governed business action — so there is no per-call secret to resolve.
- * A placeholder is enough *and no more than that*: since round 1,
- * `createSmtpTransport` (`src/mail/transport.ts`) requires its own `auth` at
- * construction and never reads `context.credential` for authentication, so
- * this handle's `value` is structurally never used to authenticate anything
- * — not "shouldn't be," but can't be, because the one implementation this
- * module is meant to run against no longer looks at it.
+ * `createSmtpTransport` (`src/mail/transport.ts`) now authenticates from
+ * exactly the credential each send carries — it holds no `auth` of its own —
+ * so this placeholder's empty `value` makes every notification fail closed
+ * (the transport refuses an empty credential before opening a socket) until
+ * this module resolves a real ref for it.
  */
 const SYSTEM_CREDENTIAL = createCredentialHandle('notify:system', '');
 
