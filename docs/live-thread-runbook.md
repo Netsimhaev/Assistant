@@ -72,36 +72,57 @@ npx maildev
 ## 2. משתני הסביבה
 
 הרשימה הבאה היא **בדיוק** מה ש-`buildRuntime` (`src/orchestrator/runtime.ts`)
-קורא בפועל — לא רשימה כללית. חסר אחד מששת משתני ה-SMTP הראשונים משבית את כל
-מתאם הדואר, כולל הודעת בקשת האישור עצמה.
+קורא בפועל — לא רשימה כללית. חסר אחד מחמשת משתני ה-SMTP הראשונים משבית את כל
+מתאם הדואר, כולל הודעת בקשת האישור עצמה. הסיסמה עצמה אינה כאן — היא מוקצית
+בשלב נפרד אחרי הבלוק הזה.
 
 ```bash
-# מתאם הדואר (SMTP_KEYS ב-runtime.ts) — כל שישה נדרשים; חסר אחד משבית
-# את המתאם כולו, כולל שליחת מיילים הודעת אישור:
+# מתאם הדואר (SMTP_KEYS ב-runtime.ts) — חמישה נדרשים יחד; חסר אחד משבית
+# את המתאם כולו, כולל שליחת מייל הודעת האישור. אין כאן SMTP_PASS: מתאם
+# הדואר מזדהה מהסוד שנפתר מהמאגר המוצפן, לא ממשתנה סביבה (ראה למטה):
 SMTP_HOST=127.0.0.1
 SMTP_PORT=1025
 SMTP_SECURE=false
 SMTP_FROM=assistant@example.com
 SMTP_USER=assistant
-SMTP_PASS=anything   # maildev לא בודק אימות בכלל
 
 # בלעדיו evaluateToolCall לא מקבל ApprovalNotifier ואף מייל בקשת-אישור
 # לא נשלח — הבקשה עדיין נכתבת ומופיעה בדשבורד, רק בלי הודעה:
 APPROVAL_NOTIFY_TO=owner@example.com
+
+# הפניית הסוד שהתראת בקשת-האישור מזדהה איתה (createEmailNotifier,
+# src/governance/notify.ts) — בלעדיה, כמו בלעדי APPROVAL_NOTIFY_TO, אין
+# הודעת מייל. כאן משתמשים באותה הפניה כמו זו של החיבור עצמו (שלב 3),
+# כך שסוד אחד משרת את שניהם:
+NOTIFY_CREDENTIAL_REF=OFFICE_MAIL
 
 # הקישור שנכנס לתוך הודעת בקשת האישור. ברירת המחדל של buildRuntime היא
 # http://127.0.0.1:8787 — ואילו הדשבורד עצמו (run-dashboard.ts) מאזין
 # כברירת מחדל על 4173. אם לא מציבים כאן ערך שתואם לפורט שהדשבורד באמת
 # מאזין עליו, הקישור בהודעה יצביע על פורט שאין בו כלום:
 DASHBOARD_BASE_URL=http://127.0.0.1:4173
-
-# credential_ref של החיבור ל-office-mail. envCredentials קורא
-# ASSISTANT_CREDENTIAL_<ref>, לעולם לא <ref> עצמו — ראה .env.example:
-ASSISTANT_CREDENTIAL_OFFICE_MAIL=anything
 ```
 
 `MAIL_SYSTEM` הוא משתנה אופציונלי נוסף ש-`buildRuntime` קורא (ברירת המחדל
 `office-mail`); אין צורך להגדיר אותו אלא אם רוצים שם מערכת אחר.
+
+הסוד עצמו — הסיסמה ש-`SMTP_USER` מזדהה איתה בפועל — אינו משתנה סביבה בכלל.
+`src/mail/transport.ts` מזדהה אך ורק מהסוד שנפתר מהמאגר המוצפן (`credentials`,
+`src/governance/credential-store.ts`), לא מ-`envCredentials`/`ASSISTANT_CREDENTIAL_<ref>`
+— אלה קיימים לבדיקות בלבד ואינם רצים כאן. הקצה את הסוד תחת ההפניה
+`OFFICE_MAIL` (אותה הפניה ששלב 3 קושר ל-`credential_ref` של החיבור, ושהוגדרה
+למעלה גם כ-`NOTIFY_CREDENTIAL_REF`):
+
+```bash
+npm run secret put OFFICE_MAIL <המפעיל שלך>
+```
+
+הפקודה קוראת את הסוד מהקלט הסטנדרטי, לא מארגומנט. `maildev` לא בודק אימות
+בכלל, כך שכל ערך עובד — מה שחשוב הוא שההפניה תיפתר בכלל, לא הערך שבה. בלי
+הצעד הזה כל `mail.send` נדחה ב-`credential_unavailable` (ראה טבלת הכשלים
+למטה), ואף הודעת בקשת-אישור לא יוצאת. הפקודה דורשת `CREDENTIAL_KEY_PATH`
+מוגדר ומפתח שכבר נוצר (`npm run secret:key create <מפעיל>`) — אם עוד אין
+כזה במכונה הזו, זהו הזמן ליצור אחד.
 
 ---
 
@@ -153,8 +174,10 @@ npx tsx scripts/seed-charter.ts
 
 `installCharter` בלי `{ businessId }` פועל על `config.businessId` (`BUSINESS_ID`
 מה-`.env`) — אותו עסק שכל שאר הפקודות במדריך הזה פועלות עליו כברירת מחדל.
-`credentialRef: 'OFFICE_MAIL'` הוא מה שהופך את `ASSISTANT_CREDENTIAL_OFFICE_MAIL`
-משלב 2 לרלוונטי — שם שונה כאן דורש שינוי תואם שם.
+`credentialRef: 'OFFICE_MAIL'` הוא מה שהופך את הסוד שהוקצה בשלב 2
+(`npm run secret put OFFICE_MAIL`) לרלוונטי — שם שונה כאן דורש הקצאה תחת אותו
+שם, ושינוי תואם ב-`NOTIFY_CREDENTIAL_REF` אם רוצים שההתראה תמשיך להשתמש
+באותו סוד.
 
 ---
 
@@ -248,7 +271,7 @@ SELECT seq, kind, actor, action_class, reason FROM audit_log
 | **מריצים בין 20:00 ל-07:00 שעון ישראל** (ראה האזהרה בראש המדריך) | `evaluateToolCall` (שלב 7, `src/policy/engine.ts`) נתקל ב-`inQuietHours` לפני שהוא בכלל מגיע לשלב האוטונומיה, ומחזיר `deny(DENY_CODES.quietHours, ...)`. `executeStep` מרדים את המשימה ל-`followup` עם `wakeAt` בסוף החלון (07:00). אין שורת `approval_requests`, אין מייל, ואין `queue_approval` — הריצה הראשונה של ה-scheduler "לא עושה כלום" באופן שנראה זהה לכשל שקט אחר. | **אין שום פלט קונסולה** בשני התהליכים — לא ב-`job:seed` (כבר סיים בהצלחה) ולא ב-`scheduler` (זה `deny` רגיל, לא `errored`). האות היחיד הוא ה-DB: <br>`SELECT phase, wake_at FROM jobs WHERE job_id = '<job-id>';` <br>מחזיר `phase = 'followup'` ו-`wake_at` מוגדר לזמן שאחרי 07:00 שעון ישראל. ה-scheduler יריץ את המשימה שוב לבד ברגע שמגיע `wake_at` — אין צורך לעשות דבר מלבד לחכות, או להריץ שוב בשעות היום. |
 | **לא הותקן תקנון** (דילגו על שלב 3) | `job:seed` נכשל מיד: `seedMailJob` קורא ל-`activeCharterVersion`, מקבל `null`, וזורק `no active charter for business ... — install one first`. שום משימה לא נוצרת. | ההודעה מודפסת ישירות לטרמינל של `job:seed`, לא בלוג של תהליך אחר. |
 | **החיבור `office-mail` לא `live`** (נשכח `upsertBinding`, או שהסטטוס `disconnected`/`error`) | `resolveChannel` (`src/orchestrator/channels.ts`) מחזיר `unavailable`, ו-`performStep` (`src/orchestrator/run-plan.ts`) זורק `StepChannelError('channel_unavailable', JSON.stringify(resolution), true)`. **ניתן לניסיון חוזר**: `execute.ts`'s retryable branch כותב `reason: \`${code} — retry:${stepId} at ${wakeAt}\`` — היא **אינה** משתמשת ב-`message` שנשא את ה-JSON; הצורה `${code} — ${message}` שכן הייתה מכילה אותו קיימת רק בענף ה-`failed`, ומחזור-חוזר לעולם לא מגיע אליו. המשימה עוברת ל-`followup` עם `wakeAt` בעוד 5 דקות (`RETRY_DELAY_MS`). שום שורת `job_step_results` לא נכתבת, כי `channel_unavailable` אינו `outcomeUnknown`. | **אין שום פלט קונסולה** — לא ב-`npm run job:seed` ולא ב-`npm run scheduler`: ל-`run-due.ts` אין קריאות `console.*` בכלל, ו-`logErrored` ב-`run-scheduler.ts` מדפיס רק את `due.errored` (עבודות שזרקו) — לא `due.ran` (שאליו שייך המחזור הזה). האות היחיד הוא ה-DB עצמו: `jobs.phase` מתנדנד בין `followup` ל-`execute` בכל פעימה בלי להגיע ל-`verify`. שאילתה: <br>`SELECT phase, wake_at FROM jobs WHERE job_id = '<job-id>';` <br>`SELECT reason, at FROM job_steps WHERE job_id = '<job-id>' ORDER BY at DESC LIMIT 3;` — השורה האחרונה מציגה `channel_unavailable — retry:s1 at 2026-...`. |
-| **`ASSISTANT_CREDENTIAL_OFFICE_MAIL` לא מוגדר** | `performStep` פותר את ה-credential *לפני* קריאה למתאם. `envCredentials.resolve('OFFICE_MAIL')` מחזיר `null`, ו-`performStep` זורק `StepChannelError('credential_unavailable', 'OFFICE_MAIL')` — **לא** ניתן לניסיון חוזר (ref שגוי או סוד שלא הוקצה לא מסתדרים בהמתנה). המשימה עוברת ישר ל-`failed`. | `job_steps.reason` מציג `credential_unavailable — OFFICE_MAIL`; אין שורת `job_step_results` כלל, כי שום קריאה חיצונית לא יצאה. |
+| **הסוד `OFFICE_MAIL` לא הוקצה במאגר** (לא הרצת `npm run secret put OFFICE_MAIL <מפעיל>`, או שהוקצה תחת שם אחר) | `performStep` פותר את ה-credential *לפני* קריאה למתאם. `storedCredentials(...).resolve('OFFICE_MAIL', businessId)` לא מוצא שורה במאגר ומחזיר `null`, ו-`performStep` זורק `StepChannelError('credential_unavailable', 'OFFICE_MAIL')` — **לא** ניתן לניסיון חוזר (ref שגוי או סוד שלא הוקצה לא מסתדרים בהמתנה). המשימה עוברת ישר ל-`failed`. | `job_steps.reason` מציג `credential_unavailable — OFFICE_MAIL`; אין שורת `job_step_results` כלל, כי שום קריאה חיצונית לא יצאה. |
 | **הרמפה לא הועלתה** (למשל הריצו `setRampLevel` ידנית ל-`auto`, או שהעבירו `--to` בלי להריץ `job:seed` בכלל) | אם הרמפה עדיין ב-`draft_only` (ברירת המחדל): `effectiveAutonomy` (`src/policy/engine.ts`) מחזיר `draft_only`, השער קורא `deny(DENY_CODES.draftOnly, ...)` כאשר `DENY_CODES.draftOnly = 'draft_only:persist_as_draft'` (`src/domain/policy.ts`), וענף ה-deny הרגיל (לא `quiet_hours`) ב-`execute.ts` כותב `reason: \`${decision.code} — ${decision.reason}\`` ומעביר את המשימה ישר ל-`failed`. אף אישור לא נוצר ואף מייל לא נשלח. אם מישהו כבר העלה אותה ל-`auto` (לא `approve_required`): **אין הבדל בהדגמה הזו** — `seedMailJob` (`src/cli/seed-job.ts`) כותב `input: { to, subject, body }` בלי `counterpartyId`, ו-`runDueJobs` מעביר `counterpartyTags: []`; `scoreVisibility` (`src/policy/risk.ts`) לא מוצא שום התאמה ב-`knownCounterparties` ומחזיר `one_unknown`, `bandFor` מסלים ל-`sensitive` בלי קשר לאוטונומיה, ו-`evaluateToolCall`'s `risk.band !== 'routine'` check (`src/policy/engine.ts`) מבקש אישור **גם ב-`auto`**. `dana@example.com` פשוט אינו counterparty מוכר לתקנון-הדוגמה — כדי לראות `auto` באמת מדלג על אישור צריך תקנון עם `knownCounterparties` שכולל אותו, וזה מחוץ למה שהמדריך הזה מקים. | **גם כאן אין פלט קונסולה**: זה `RanJob` רגיל בתוך `due.ran`, לא חריגה ב-`due.errored`, ו-`logErrored` (`src/orchestrator/run-scheduler.ts`) לא הבדיל בעבר בין `done` ל-`rejected` בתוך `due.ran`; מאז התיקון הוא כן מדפיס כל `ran` שסטטוסו `rejected` — אך `done`/`halted` עדיין לא נדפסים, וזה `RanJob` תקין (`halted` על `queue_approval`) ולא כשל. למקרה `draft_only`: <br>`SELECT phase FROM jobs WHERE job_id = '<job-id>';` מחזיר `failed`, ו-`job_steps.reason` מתחיל ב-`draft_only:persist_as_draft — `. למקרה `auto`: <br>`SELECT count(*) FROM approval_requests WHERE job_id = '<job-id>';` מחזיר `1`, לא `0` — האישור עדיין נוצר, מהסיבה שבעמודה הקודמת. |
 
 ---
@@ -257,10 +280,11 @@ SELECT seq, kind, actor, action_class, reason FROM audit_log
 
 | משתנה | חובה? | ברירת מחדל | קורא |
 |---|---|---|---|
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_FROM`, `SMTP_USER`, `SMTP_PASS` | כן, כל השישה יחד | אין | `buildRuntime` (`SMTP_KEYS`) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_FROM`, `SMTP_USER` | כן, כל החמישה יחד | אין | `buildRuntime` (`SMTP_KEYS`) |
 | `MAIL_SYSTEM` | לא | `office-mail` | `buildRuntime` |
 | `APPROVAL_NOTIFY_TO` | לא (בלעדיו אין הודעת מייל, אבל השרשרת עדיין עובדת דרך הדשבורד) | אין | `buildRuntime` |
+| `NOTIFY_CREDENTIAL_REF` | לא (בלעדיו, כמו בלעדי `APPROVAL_NOTIFY_TO`, אין הודעת מייל) | אין | `buildRuntime`, נפתר מחדש בכל הודעה על ידי `createEmailNotifier` |
 | `DASHBOARD_BASE_URL` | לא, אבל ברירת המחדל כנראה שגויה אצלך | `http://127.0.0.1:8787` | `buildRuntime` |
-| `ASSISTANT_CREDENTIAL_OFFICE_MAIL` | כן, לכל `credential_ref` בשם `OFFICE_MAIL` | אין | `envCredentials` (`DEFAULT_CREDENTIAL_ENV_PREFIX`) |
+| הסוד `OFFICE_MAIL` (במאגר, לא משתנה סביבה) | כן, לכל `credential_ref` בשם `OFFICE_MAIL` | אין | `storedCredentials` — מוקצה עם `npm run secret put OFFICE_MAIL <מפעיל>` |
 | `DASHBOARD_PORT`, `DASHBOARD_HOST`, `DASHBOARD_TRUST_PROXY`, `DASHBOARD_ALLOW_PUBLIC_BIND` | לא | `4173`, `127.0.0.1`, כבוי, כבוי | `run-dashboard.ts` |
 | `SCHEDULER_INTERVAL_MS` | לא | `30000` | `run-scheduler.ts` |
