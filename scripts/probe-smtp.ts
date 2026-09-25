@@ -6,6 +6,15 @@
  * message through it. If this fails, the live thread would fail tomorrow at
  * the same point — better to learn it now than to spend the morning on it.
  *
+ * **Needs a provisioned secret.** It reads the value from
+ * `ASSISTANT_CREDENTIAL_OFFICE_MAIL` in the process environment rather than
+ * from the encrypted store, which is not how production resolves anything —
+ * `storedCredentials` is (`src/governance/credential-store.js`). Unset, the
+ * handle carries an empty string and `createSmtpTransport` refuses the send
+ * outright, so this prints FAIL without ever opening a socket. To probe the
+ * real path instead, run `npx tsx scripts/live-thread-status.ts`, which
+ * resolves the same refs the way the scheduler does.
+ *
  *   npx tsx scripts/probe-smtp.ts
  */
 // `.env` is loaded as a side effect of importing config. `runtime.ts` does
@@ -17,7 +26,11 @@ import '../src/config.js';
 import { buildRuntime } from '../src/orchestrator/runtime.js';
 import { createCredentialHandle } from '../src/orchestrator/adapters/types.js';
 
-const runtime = buildRuntime();
+// `await`: `buildRuntime` is async (it reads the master key file), and without
+// this the next line read `.warnings` off a Promise and the one after it died
+// with a TypeError about `undefined`. A missing or unreadable key file now
+// surfaces as the `MasterKeyError` it is.
+const runtime = await buildRuntime();
 for (const warning of runtime.warnings) console.log(`warning: ${warning}`);
 
 const adapter = runtime.registry.get('office-mail');

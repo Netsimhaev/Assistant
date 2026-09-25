@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -9,6 +9,7 @@ import type { CharterConnection, ConnectionBinding } from '../domain/connection.
 import type { PolicyBundle } from '../domain/policy.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
 import { writeKeyState } from '../governance/master-key.js';
+import { createEmailNotifier } from '../governance/notify.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import { createSmtpTransport } from '../mail/transport.js';
 import { createJob, loadJob, transition } from './jobs.js';
@@ -263,5 +264,105 @@ describe('approval notification wiring', () => {
 
     expect(result.status).toBe('done');
     expect(captured).toEqual(['סוד-מהמאגר']);
+  });
+
+  /**
+   * Spec §10.3 — "the value does not appear in an audit row, including when
+   * authentication failed" — had no test at all, in this file or any other.
+   * The security review established the value was not *reachable* there; §10
+   * requires it be *locked*, which is a different claim.
+   *
+   * This drives the one production path that writes an `audit_log` row out of
+   * a mail failure: the gate queues an approval, calls `notifier.notify`
+   * inline, and on a not-ok result writes `kind: 'incident'` with
+   * `approval_notify_failed:<id> … <message>` (`src/policy/engine.ts`). So the
+   * secret is resolved from the real store, reaches the real transport's
+   * authentication, and the send then fails with a relay reply that quotes it
+   * — the shape a relay that echoes its input would actually produce.
+   *
+   * Both halves are here, in order. The positive one is not decoration: an
+   * unresolvable ref, a notifier that was never called, or an approval that
+   * never queued would each leave "the value is not in the row" trivially
+   * true, and this plan has already produced five tests that passed for
+   * exactly that kind of reason.
+   */
+  it('keeps the resolved secret out of the audit row a failed notification writes', async () => {
+    const secret = 'סוד-התראה-שאסור-להופיע';
+    const bundle = await installCharter(
+      buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } }),
+      { businessId: BUSINESS },
+    );
+    const job = await jobInExecute(bundle);
+
+    const key = randomBytes(32);
+    await writeKeyState(key, 'key-1');
+    // Two refs, two rows: the binding's and the notifier's. The notifier must
+    // resolve its own, which is what makes `captured` below evidence about
+    // NOTIFY_MAIL specifically rather than about whatever else is stored.
+    await putSecret({ businessId: BUSINESS, ref: 'OFFICE_MAIL', value: 'סוד-החיבור', updatedBy: 'test' }, key);
+    await putSecret({ businessId: BUSINESS, ref: 'NOTIFY_MAIL', value: secret, updatedBy: 'test' }, key);
+
+    const captured: string[] = [];
+    const notifier = createEmailNotifier({
+      to: 'owner@example.com',
+      credentials: storedCredentials(key),
+      ref: 'NOTIFY_MAIL',
+      businessId: BUSINESS,
+      // The real transport, so the rethrow in `src/mail/transport.ts` is the
+      // thing actually standing between the relay's reply and the audit row.
+      transport: createSmtpTransport({
+        host: 'smtp.invalid.example',
+        port: 587,
+        secure: false,
+        from: 'assistant@example.com',
+        user: 'assistant',
+        createTransport: (options) => {
+          captured.push(options.auth.pass);
+          return {
+            sendMail: () =>
+              Promise.reject(
+                Object.assign(new Error('535 Authentication credentials invalid'), {
+                  responseCode: 535,
+                  command: 'AUTH PLAIN',
+                  response: `535 rejected assistant/${secret}`,
+                }),
+              ),
+          };
+        },
+      }),
+    });
+
+    const result = await runPlan({
+      job,
+      bundle,
+      plan: PLAN,
+      registry: registry(),
+      bindings: [LIVE],
+      credentials: storedCredentials(key),
+      counterpartyTags: [],
+      rampLevel: 'approve_required',
+      now: NOON,
+      notify: { notifier, dashboardBaseUrl: 'http://127.0.0.1:8787' },
+    });
+
+    // Positive half, three facts, all required before the absence below means
+    // anything: the approval queued, the notifier ran, and the value it
+    // authenticated with is the exact row `putSecret` wrote.
+    expect(result.status).toBe('halted');
+    expect(captured).toEqual([secret]);
+
+    const rows = await getPool().query<{ reason: string; input_hash: string }>(
+      `SELECT reason, input_hash FROM audit_log
+        WHERE business_id = $1 AND kind = 'incident' AND reason LIKE 'approval_notify_failed%'`,
+      [BUSINESS],
+    );
+    // Positive half again: the failure path really did write a row. Without
+    // this, a notification that silently succeeded would satisfy every
+    // assertion below with zero rows to check.
+    expect(rows.rows).toHaveLength(1);
+    const row = rows.rows[0];
+    expect(row?.reason).toContain('535');
+    expect(row?.reason).not.toContain(secret);
+    expect(row?.input_hash).not.toContain(secret);
   });
 });

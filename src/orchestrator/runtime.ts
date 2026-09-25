@@ -63,8 +63,10 @@ const SMTP_KEYS = [
  * needs to see what `SmtpConfig` and per-send credential actually reached
  * nodemailer, the same seam `SmtpConfig.createTransport` documents for
  * `createSmtpTransport` itself. No production caller ever passes it — every
- * real call site (`run-scheduler.ts`, `run-due.ts`, `scheduler.ts`) calls
- * `buildRuntime()` with zero arguments.
+ * real call site calls `buildRuntime()` with zero arguments:
+ * `run-scheduler.ts`, `run-due.ts` and `scheduler.ts` in the product, plus the
+ * two operator scripts `scripts/live-thread-status.ts` and
+ * `scripts/probe-smtp.ts`.
  */
 export async function buildRuntime(
   env: Record<string, string | undefined> = process.env,
@@ -115,11 +117,25 @@ export async function buildRuntime(
     if (!Number.isInteger(port) || port <= 0) {
       warnings.push(`no mail adapter: SMTP_PORT is not a positive integer`);
     } else {
+      // Positive check, the same shape as `SMTP_SECURE` below: a typo must
+      // read as "not set", never as "cleartext is fine". Warned about rather
+      // than merely honoured — an installation sending a stored secret over a
+      // downgradeable channel must say so on every startup, because the
+      // symptom of getting this wrong is silence (see `SmtpConfig.secure`).
+      const allowCleartext = env['SMTP_ALLOW_CLEARTEXT'] === '1';
+      if (allowCleartext) {
+        warnings.push(
+          `SMTP_ALLOW_CLEARTEXT=1: STARTTLS is not required — the mail password ` +
+            `may travel in the clear. Intended for a local test relay only.`,
+        );
+      }
+
       const transport = createSmtpTransport({
         host: env['SMTP_HOST'] as string,
         port,
         // Positive check. `!== 'false'` would make a typo mean TLS.
         secure: env['SMTP_SECURE'] === 'true',
+        allowCleartext,
         from: env['SMTP_FROM'] as string,
         // No `auth` here any more — see `SmtpConfig.user`'s own docblock.
         // The password comes from a resolved credential per send, never from

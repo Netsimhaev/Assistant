@@ -162,14 +162,16 @@ describe('buildRuntime', () => {
    */
   it('reads no SMTP_PASS anywhere in production source', async () => {
     const offenders: string[] = [];
+    const scanned: string[] = [];
 
     const walk = async (dir: string): Promise<void> => {
-      let entries;
-      try {
-        entries = await readdir(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
+      // No `catch { return }` here. The version that had one turned a moved
+      // `src/`, a renamed directory or a different cwd into permanent green on
+      // zero files read — "סריקה ריקה שעוברת אינה בקרה" (CLAUDE.md), the same
+      // defect `reading-invariants.test.ts` fixed by asserting it found files
+      // before asserting anything about them. A `readdir` that fails is a
+      // broken control, so it fails the test.
+      const entries = await readdir(dir, { withFileTypes: true });
       for (const entry of entries) {
         const path = join(dir, entry.name);
         if (entry.isDirectory()) {
@@ -177,12 +179,19 @@ describe('buildRuntime', () => {
           continue;
         }
         if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) continue;
+        scanned.push(path);
         const source = await readFile(path, 'utf8');
         if (source.includes('SMTP_PASS')) offenders.push(path);
       }
     };
 
     await walk('src');
+    // The positive half, and a floor rather than an exact count so ordinary
+    // growth does not break it: this tree holds several hundred non-test
+    // modules, so anything near zero means the walk did not run, not that the
+    // string is absent.
+    expect(scanned.length).toBeGreaterThan(100);
+    expect(scanned).toContain(join('src', 'orchestrator', 'runtime.ts'));
     expect(offenders).toEqual([]);
   });
 
@@ -238,6 +247,51 @@ describe('buildRuntime', () => {
     expect(result.ok).toBe(true);
     expect(captured[0]?.pass).toBe('סוד-הנוטיפייר');
     expect(captured[0]?.pass).not.toBe('סוד-אחר-לגמרי');
+  });
+
+  /**
+   * `SMTP_SECURE=false` is the shipped default and the runbook's value, so the
+   * mandatory-STARTTLS path is the one every installation takes. The switch
+   * that turns it off exists for a local relay that speaks no TLS at all
+   * (`maildev`), and it must be impossible to be in that state quietly — the
+   * whole point of this branch is that one password stops travelling in the
+   * clear.
+   */
+  it('requires STARTTLS by default, and says so loudly when told not to', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const capture = (opts: unknown): { sendMail: () => Promise<{ messageId: string }> } => {
+      seen.push(opts as Record<string, unknown>);
+      return { sendMail: () => Promise.resolve({ messageId: 'stub-message-id' }) };
+    };
+
+    await putSecret(
+      { businessId: config.businessId, ref: 'NOTIFY_MAIL', value: 'pw', updatedBy: 'test' },
+      KEY,
+    );
+
+    const strict = await buildRuntime(FULL, { createTransport: capture });
+    expect(strict.warnings.join(' ')).not.toMatch(/SMTP_ALLOW_CLEARTEXT/);
+    // Positive half: an option object was actually built, so the assertion
+    // about its `requireTLS` is about a real send and not about nothing.
+    await strict.notify?.notifier.notify(approvalFixture(), 'http://127.0.0.1:8787/a/AP-test');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.['requireTLS']).toBe(true);
+
+    seen.length = 0;
+    const lax = await buildRuntime({ ...FULL, SMTP_ALLOW_CLEARTEXT: '1' }, { createTransport: capture });
+    expect(lax.warnings.join(' ')).toMatch(/SMTP_ALLOW_CLEARTEXT/);
+    await lax.notify?.notifier.notify(approvalFixture(), 'http://127.0.0.1:8787/a/AP-test');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.['requireTLS']).toBe(false);
+
+    // A value that is not exactly `1` is not the opt-out: same positive-check
+    // discipline as `SMTP_SECURE === 'true'` one field over, so a typo can
+    // only ever leave the stricter setting in place.
+    seen.length = 0;
+    const typo = await buildRuntime({ ...FULL, SMTP_ALLOW_CLEARTEXT: 'true' }, { createTransport: capture });
+    expect(typo.warnings.join(' ')).not.toMatch(/SMTP_ALLOW_CLEARTEXT/);
+    await typo.notify?.notifier.notify(approvalFixture(), 'http://127.0.0.1:8787/a/AP-test');
+    expect(seen[0]?.['requireTLS']).toBe(true);
   });
 
   it('warns when ANTHROPIC_API_KEY is absent, so curation-off does not look like nothing-to-remember', async () => {

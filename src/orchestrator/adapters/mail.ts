@@ -194,6 +194,20 @@ export function createMailAdapter(options: MailAdapterOptions): ExternalAdapter 
 }
 
 /**
+ * The one `command` value `classifyTransportFailure` below actually reads.
+ *
+ * Exported because `createSmtpTransport` (`src/mail/transport.ts`) rethrows a
+ * fresh error carrying only the fields this function reads, and `command` is
+ * the one of the three whose *value* matters rather than just its type: the
+ * transport carries it forward only when it equals this constant, so a library
+ * that put anything else in `command` cannot get that string across the
+ * rethrow. Single-sourced here so the transport's carry-forward and this
+ * function's check cannot drift into disagreeing about which value is the
+ * ambiguous one.
+ */
+export const AMBIGUOUS_FAILURE_COMMAND = 'DATA';
+
+/**
  * Turn a thrown transport failure into a result, in three distinct shapes.
  *
  * - **Permanent** (`responseCode` 5xx — "550 no such mailbox", "535 bad

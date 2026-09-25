@@ -8,6 +8,7 @@
  * outside this one file.
  */
 import nodemailer from 'nodemailer';
+import { AMBIGUOUS_FAILURE_COMMAND } from '../orchestrator/adapters/mail.js';
 import type {
   MailMessage,
   MailSendContext,
@@ -30,6 +31,13 @@ interface SmtpTransportOptions {
   host: string;
   port: number;
   secure: boolean;
+  /**
+   * Always the negation of `secure`, unless `SmtpConfig.allowCleartext` says
+   * otherwise — see `SmtpConfig.secure`'s docblock for the whole argument.
+   * Not optional: an omitted `requireTLS` is nodemailer's silent
+   * "upgrade if offered", which is the state this field exists to remove.
+   */
+  requireTLS: boolean;
   auth: { user: string; pass: string };
   connectionTimeout: number;
   socketTimeout: number;
@@ -39,7 +47,38 @@ export interface SmtpConfig {
   /** Used when a call's `context.endpoint` is `null`. */
   host: string;
   port: number;
+  /**
+   * `true` is implicit TLS (the whole session is encrypted from the first
+   * byte, port 465). `false` makes STARTTLS **mandatory** — `requireTLS` goes
+   * on the options object below — and there is no third setting.
+   *
+   * There used to be one, by omission, and it was the default: with `secure:
+   * false` and no `requireTLS`, nodemailer connects in cleartext and upgrades
+   * only *if the server advertises STARTTLS in its EHLO reply*. An on-path
+   * attacker who strips that one advertisement line gets the `AUTH` exchange
+   * verbatim — and this transport resolves and transmits a stored secret on
+   * every single send. A whole subsystem (an encrypted row, an AAD-bound
+   * cipher, a mode-0600 key file, a non-enumerable handle) protecting a value
+   * that then leaves the host over a downgradeable channel is decorative.
+   * With `requireTLS`, a stripped advertisement is a connection failure
+   * instead of a silent downgrade.
+   */
   secure: boolean;
+  /**
+   * Opt out of the mandatory STARTTLS above. `false` unless a caller says
+   * otherwise, and the only legitimate use is a local test relay that speaks
+   * no TLS at all (`maildev`, `docs/live-thread-runbook.md`).
+   *
+   * Same shape as `assertBindableHost`'s `allowNonLoopback`
+   * (`src/dashboard/server.ts`) and for the same reason: the dangerous
+   * configuration stays reachable, because an operator who genuinely needs it
+   * is better served by a named switch than by a workaround, but it is never
+   * what happens by default and never silent — `buildRuntime`
+   * (`src/orchestrator/runtime.ts`) reads `SMTP_ALLOW_CLEARTEXT=1` for this
+   * and pushes a warning whenever it is on. A silent default is what this
+   * field removes; a visible opt-out is not the same thing.
+   */
+  allowCleartext?: boolean;
   /** The envelope `From:` header. */
   from: string;
   /**
@@ -98,11 +137,17 @@ const DEFAULT_CREATE_TRANSPORT = nodemailer.createTransport as unknown as (
 
 /**
  * Applies to both `connectionTimeoutMs` and `socketTimeoutMs` when a config
- * omits either. This transport has exactly one caller today — the approval
- * notifier, itself bounded by `NOTIFY_TIMEOUT_MS` in `src/governance/notify.ts`
- * — so five seconds gives nodemailer room to actually attempt a handshake
- * against a healthy relay while still resolving comfortably inside that
- * caller's own deadline instead of racing against it.
+ * omits either.
+ *
+ * `buildRuntime` (`src/orchestrator/runtime.ts`) builds **one** transport and
+ * hands the same instance to two readers: the approval notifier
+ * (`createEmailNotifier`, bounded by `NOTIFY_TIMEOUT_MS` in
+ * `src/governance/notify.ts`) and the mail adapter (`createMailAdapter`, whose
+ * calls `runPlan` bounds with `callWithDeadline`). Five seconds gives
+ * nodemailer room to actually attempt a handshake against a healthy relay
+ * while still resolving comfortably inside either caller's own deadline
+ * instead of racing it — the notifier's is the tighter of the two, so it is
+ * the one this value is chosen against.
  */
 const DEFAULT_TIMEOUT_MS = 5_000;
 
@@ -181,6 +226,10 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
         host: context.endpoint ?? config.host,
         port: config.port,
         secure: config.secure,
+        // Two settings, not three: implicit TLS, or cleartext-then-mandatory
+        // STARTTLS. See `SmtpConfig.secure` for why the third — "upgrade if
+        // the server happens to offer it" — is the one that had to go.
+        requireTLS: !config.secure && config.allowCleartext !== true,
         auth: { user: config.user, pass: context.credential.value },
         connectionTimeout,
         socketTimeout,
@@ -205,20 +254,76 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
           context.signal,
         );
       } catch (error) {
-        // Only the message crosses this boundary. Real nodemailer failures
-        // carry `command`, `response`, `responseCode` and more, and an AUTH
-        // failure's `command` can be the AUTH line itself — an echoed error
-        // reaching `StepChannelError` and from there an audit row's `reason`
-        // would cross far more than this function's own boundary. This is a
-        // positive selection of the one field an operator actually needs
-        // (the server's own response text), not a scrub of a list of
-        // dangerous fields this file would have to keep current.
-        throw new Error(error instanceof Error ? error.message : String(error));
+        throw rethrowClassifiable(error);
       }
 
       return { messageId: info.messageId };
     },
   };
+}
+
+/** Own properties only — see `rethrowClassifiable` below for why that matters. */
+function ownField(error: unknown, field: string): unknown {
+  if (typeof error !== 'object' || error === null) return undefined;
+  return Object.hasOwn(error, field) ? (error as Record<string, unknown>)[field] : undefined;
+}
+
+/**
+ * A fresh error carrying the message and **exactly three** of the fields the
+ * library attached — nothing else survives.
+ *
+ * The rethrow itself is the redaction: a real nodemailer failure carries
+ * `response` (the server's own reply text, which is also already folded into
+ * `message` by nodemailer's `_formatError`), and possibly more the library
+ * adds later, and an echoed error object reaching `StepChannelError` and from
+ * there an audit row would cross far more than this function's boundary.
+ *
+ * But **three of those fields are load-bearing**, and an earlier version of
+ * this function dropped all three. `classifyTransportFailure`
+ * (`src/orchestrator/adapters/mail.ts`) reads `responseCode`, `command` and
+ * `code` — and only those — to decide `retryable` and the result code. With
+ * them stripped, every real SMTP failure fell to that function's last branch:
+ * `{ retryable: false, code: 'delivery_unknown' }`. Two harms, the second
+ * worse: a `421 too busy`, an `ECONNREFUSED`, a DNS failure — cases where
+ * nothing was ever accepted and this project deliberately made the step
+ * retryable — terminally failed the job; and `delivery_unknown` is the code
+ * reserved for *the message may already have left this process*, so a
+ * connection that was **refused** was recorded as an outcome nobody can
+ * determine. The trail asserted an ambiguity that provably did not exist, and
+ * this project treats the trail's honesty as the control.
+ *
+ * Positive selection, not a filter: each field is named, type-checked, and
+ * read as an **own** property (a `command: 'DATA'` inherited from a prototype
+ * is not something the far end said). `command` is narrower still — carried
+ * forward only when it equals `AMBIGUOUS_FAILURE_COMMAND`, the single value
+ * the classifier compares it against, and the constant is substituted for the
+ * library's own string — so a library that put a credential where the command
+ * label belongs cannot get it across this boundary at all. Narrowing `code`
+ * the same way (to `TRANSIENT_ERROR_CODES`) was considered and rejected: that
+ * would reintroduce, for the next branch the classifier grows, exactly the bug
+ * described above.
+ *
+ * What holds for all three regardless: **none of them reaches a human-visible
+ * row.** `classifyTransportFailure` puts only `message` into
+ * `AdapterResult.message`, and that is the single value `executeStep`
+ * (`src/orchestrator/execute.ts`) renders into `job_steps.reason`. The three
+ * carried fields are read by that classifier and by nothing else.
+ */
+function rethrowClassifiable(error: unknown): Error {
+  const rethrown: Error & { responseCode?: number; command?: string; code?: string } = new Error(
+    error instanceof Error ? error.message : String(error),
+  );
+
+  const responseCode = ownField(error, 'responseCode');
+  if (typeof responseCode === 'number') rethrown.responseCode = responseCode;
+
+  const command = ownField(error, 'command');
+  if (command === AMBIGUOUS_FAILURE_COMMAND) rethrown.command = AMBIGUOUS_FAILURE_COMMAND;
+
+  const code = ownField(error, 'code');
+  if (typeof code === 'string') rethrown.code = code;
+
+  return rethrown;
 }
 
 /**

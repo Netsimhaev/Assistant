@@ -66,8 +66,14 @@ if (declaresMail) {
   );
 }
 
-// `credentialRef` is OFFICE_MAIL, so `envCredentials` reads
-// ASSISTANT_CREDENTIAL_OFFICE_MAIL — never OFFICE_MAIL itself.
+// `credentialRef` is OFFICE_MAIL, and production resolves that ref through
+// `storedCredentials` (`src/governance/credential-store.ts`) — the encrypted
+// per-business table, provisioned with `npm run secret put OFFICE_MAIL
+// <operator>`. This comment used to name `envCredentials` and its
+// `ASSISTANT_CREDENTIAL_OFFICE_MAIL` variable, which exists for tests only and
+// runs nowhere in production; the runbook runs this script, so an operator
+// reading it was being pointed at an environment variable that resolves
+// nothing.
 await upsertBinding(
   {
     system: 'office-mail',

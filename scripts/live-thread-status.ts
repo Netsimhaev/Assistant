@@ -48,10 +48,50 @@ line(
     : `${owner.username}${owner.locked_until ? ` (LOCKED until ${owner.locked_until.toISOString()})` : ''}`,
 );
 
-const runtime = buildRuntime();
-line(runtime.registry.get('office-mail') !== null, 'mail adapter built', runtime.registry.systems().join(', '));
-line(runtime.notify !== undefined, 'approval notifier', runtime.notify ? `link base ${runtime.notify.dashboardBaseUrl}` : 'not built');
-for (const warning of runtime.warnings) console.log(`      warning: ${warning}`);
+// `await`, which this line lacked: `buildRuntime` has been async since before
+// the credential store was wired to the mail path, so the un-awaited call left
+// `runtime` a Promise and the next line died with
+// `TypeError: Cannot read properties of undefined (reading 'get')` — the
+// runbook's own "run this first" step, crashing. It also hid `MasterKeyError`:
+// a missing key file surfaced as that TypeError instead of as the refusal it
+// is. Caught rather than left to reject, because a readiness check whose whole
+// job is printing MISS lines should print one for the key too, not stop with a
+// stack trace before the remaining checks run.
+let runtime: Awaited<ReturnType<typeof buildRuntime>> | null = null;
+try {
+  runtime = await buildRuntime();
+} catch (error) {
+  line(false, 'credential key', error instanceof Error ? error.message : String(error));
+}
+
+if (runtime !== null) {
+  line(true, 'credential key', 'loaded and verified');
+  line(runtime.registry.get('office-mail') !== null, 'mail adapter built', runtime.registry.systems().join(', '));
+  line(runtime.notify !== undefined, 'approval notifier', runtime.notify ? `link base ${runtime.notify.dashboardBaseUrl}` : 'not built');
+
+  // "The adapter was built" says the five SMTP variables are set; it says
+  // nothing about whether the secret they authenticate with exists. An
+  // unprovisioned ref read as ready here, and then every `mail.send` failed
+  // with `credential_unavailable` at run time — the one failure this script's
+  // own table tells the operator to expect. Both refs are checked: the
+  // binding's (whatever `credential_ref` the row carries) and the notifier's
+  // (`NOTIFY_CREDENTIAL_REF`), because they are resolved by different callers
+  // and either can be missing on its own.
+  const refs = new Set<string>();
+  if (mail?.credentialRef) refs.add(mail.credentialRef);
+  const notifyRef = process.env['NOTIFY_CREDENTIAL_REF'];
+  if (notifyRef !== undefined && notifyRef.length > 0) refs.add(notifyRef);
+  for (const ref of refs) {
+    const handle = await runtime.credentials.resolve(ref, businessId);
+    line(
+      handle !== null,
+      `secret ${ref}`,
+      handle === null ? `not provisioned — run \`npm run secret put ${ref} <operator>\`` : 'provisioned',
+    );
+  }
+
+  for (const warning of runtime.warnings) console.log(`      warning: ${warning}`);
+}
 
 const ramp = await loadRampLevel('email.initiate', { businessId });
 line(true, 'ramp email.initiate', `${ramp} (job:seed raises it to approve_required)`);

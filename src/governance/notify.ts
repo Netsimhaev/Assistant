@@ -133,11 +133,11 @@ const NOTIFY_TIMEOUT_MS = 5_000;
  * worth sending, because it lets a *cooperating* transport give up on its
  * own socket early, but this function does not depend on that cooperation.
  */
-function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+function withDeadline<T>(promise: Promise<T>, timeoutMs: number, what = 'השליחה'): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(
-      () => reject(new Error(`השליחה לא הסתיימה תוך ${timeoutMs} מ״ש`)),
+      () => reject(new Error(`${what} לא הסתיימה תוך ${timeoutMs} מ״ש`)),
       timeoutMs,
     );
   });
@@ -163,12 +163,22 @@ function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
  * them apart.
  *
  * Resolution happens before `buildMessage` runs — no point assembling a
- * message this call will not be able to send — but it is deliberately not
- * raced against its own deadline the way the transport call below is:
- * `withDeadline`'s own docblock explains why the transport needs one (a
- * socket that may never settle); a credential lookup is a local read with
- * no such failure mode, and inventing a second deadline for it would be
- * exactly that — invented, not needed.
+ * message this call will not be able to send — and it is raced against the
+ * same `withDeadline` the transport call is.
+ *
+ * An earlier version of this docblock argued the opposite, that "a credential
+ * lookup is a local read with no such failure mode". That was wrong, and it is
+ * recorded here rather than deleted. The production `CredentialSource`
+ * (`storedCredentials`, `src/governance/credential-store.ts`) is a `db.query`
+ * on a **pooled** connection, and an exhausted pool does not reject — it
+ * *queues*, which is a hang, which is precisely the failure mode
+ * `withDeadline` exists for and precisely the one an `AbortSignal` and a
+ * try/catch both fail to catch. The try/catch below turns a rejection into
+ * `{ ok: false }`; nothing but a race turns silence into one. And the gate
+ * (`evaluateToolCall`, `src/policy/engine.ts`) awaits `notify` **inline**
+ * before it can return `queue_approval`, so an unbounded wait here stalls the
+ * approval path itself — the same reasoning that put a deadline on the
+ * transport, one call earlier in the same function.
  */
 export function createEmailNotifier(options: EmailNotifierOptions): ApprovalNotifier {
   const { transport, to, credentials, ref, businessId } = options;
@@ -179,12 +189,19 @@ export function createEmailNotifier(options: EmailNotifierOptions): ApprovalNoti
       // The `resolve` call sits inside this same `try`, not before it: the
       // production `CredentialSource` (`storedCredentials`,
       // `src/governance/credential-store.ts`) awaits a `db.query` that can
-      // reject — a lost connection, an exhausted pool — and a rejection
+      // reject — a lost connection, a pool that gave up — and a rejection
       // there is exactly as much "notify failed" as a throwing transport
       // below. `notify` never throws, full stop; a resolve outside this
-      // block would make that only two-thirds true.
+      // block would make that only two-thirds true. And it is inside
+      // `withDeadline` for the other half of the same argument: an exhausted
+      // pool queues rather than rejecting, and a try/catch cannot catch
+      // silence (see this function's docblock).
       try {
-        const credential = await credentials.resolve(ref, businessId);
+        const credential = await withDeadline(
+          credentials.resolve(ref, businessId),
+          NOTIFY_TIMEOUT_MS,
+          'פתירת הסוד',
+        );
         if (credential === null) {
           // `ref` is a configuration name, not a secret — safe to quote
           // here, unlike anything that could come from `credential.value`.
