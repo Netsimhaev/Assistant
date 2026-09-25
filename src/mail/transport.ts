@@ -14,6 +14,27 @@ import type {
   MailTransport,
 } from '../orchestrator/adapters/mail.js';
 
+/** The minimal `{ sendMail }` shape the send path below actually uses. */
+interface MinimalTransporter {
+  sendMail(mailOptions: {
+    from: string;
+    to: string;
+    subject: string;
+    text: string;
+    messageId: string;
+  }): Promise<{ messageId: string }>;
+}
+
+/** The exact options object this module ever builds for `createTransport`. */
+interface SmtpTransportOptions {
+  host: string;
+  port: number;
+  secure: boolean;
+  auth: { user: string; pass: string };
+  connectionTimeout: number;
+  socketTimeout: number;
+}
+
 export interface SmtpConfig {
   /** Used when a call's `context.endpoint` is `null`. */
   host: string;
@@ -22,20 +43,22 @@ export interface SmtpConfig {
   /** The envelope `From:` header. */
   from: string;
   /**
-   * The account this transport instance always authenticates as.
+   * The account this transport always authenticates as — the username only.
    *
-   * Required, not optional — round 1 of review found the earlier optional
-   * design silently authenticating with an empty password: when `auth` was
-   * omitted, `send()` fell back to `context.credential`, and the only real
-   * caller (`createEmailNotifier`, `src/governance/notify.ts`) has no per-call
-   * credential of its own to offer, so that fallback resolved to a
-   * placeholder handle with `value: ''`. Nothing failed until an actual SMTP
-   * server rejected an empty `AUTH`, at send time, deep in a call the gate was
-   * already waiting on. Requiring `auth` up front, and validating it below,
-   * turns that into a synchronous throw the moment a misconfigured transport
-   * is built — long before anything tries to use it.
+   * There used to be an `auth: { user, pass }` pair here, required precisely
+   * so a caller with no credential of its own (`createEmailNotifier`,
+   * `src/governance/notify.ts`) could not build a working transport with an
+   * empty password. The notifier now resolves its own credential, so that
+   * protection has nothing left to guard, and keeping a password on this
+   * config was the hazard: it meant a transport instance had a secret of its
+   * own that every send could reach, instead of authenticating with exactly
+   * the secret that send was handed. The password now comes from
+   * `context.credential.value` on every `send()` call — see the check at the
+   * top of `send` below. `user` stays here because it genuinely is
+   * configuration: the account name does not vary per send the way the
+   * secret does.
    */
-  auth: { user: string; pass: string };
+  user: string;
   /**
    * Milliseconds nodemailer waits for the TCP/TLS handshake before giving up.
    * Defaults to `DEFAULT_TIMEOUT_MS` — left unset before round 1, which meant
@@ -46,7 +69,32 @@ export interface SmtpConfig {
   connectionTimeoutMs?: number;
   /** Milliseconds nodemailer waits for the far end mid-conversation (after `HELO`/`AUTH`/`DATA`) before giving up. Same default and same reasoning as `connectionTimeoutMs`. */
   socketTimeoutMs?: number;
+  /**
+   * The seam this module needs so a test can see what a send hands
+   * nodemailer, without any test ever dialing a real socket.
+   *
+   * The same pattern as `LocalToolContext.reader` and
+   * `LocalToolContext.verifier` (`src/orchestrator/local-tools.ts`) — "the one
+   * step that costs money, injectable so a test can drive it without an API
+   * key" — and `ReadDocumentOptions.reader` (`src/documents/read.ts`) before
+   * them: an optional factory that defaults to the real thing, so production
+   * never passes it and every test that needs to inspect a send can, without
+   * a fake network layer underneath it.
+   */
+  createTransport?: (options: SmtpTransportOptions) => MinimalTransporter;
 }
+
+/**
+ * `nodemailer.createTransport`'s real signature is far broader than
+ * `SmtpTransportOptions` — every option is optional, several shapes are
+ * unioned together — so it is cast once, here, rather than at every call
+ * site. This is the only place in the module that needs to know the real
+ * type does not line up exactly with the narrow one this module actually
+ * uses.
+ */
+const DEFAULT_CREATE_TRANSPORT = nodemailer.createTransport as unknown as (
+  options: SmtpTransportOptions,
+) => MinimalTransporter;
 
 /**
  * Applies to both `connectionTimeoutMs` and `socketTimeoutMs` when a config
@@ -89,15 +137,18 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
   // Fails synchronously, at construction — before this function ever returns
   // a usable `MailTransport` — rather than at the first `send()`, which
   // would already be inside whatever deadline a caller is racing against.
-  // `SmtpConfig.auth`'s own docblock explains why this exists.
-  if (config.auth.user.length === 0 || config.auth.pass.length === 0) {
+  // Only the username is checked here now; the password no longer lives on
+  // this config at all (see `SmtpConfig.user`'s own docblock), so there is
+  // nothing left to validate about it until a send actually arrives.
+  if (config.user.length === 0) {
     throw new Error(
-      'createSmtpTransport: auth.user/auth.pass ריקים — לא ניתן להקים מתאם SMTP בלי חשבון אמיתי',
+      'createSmtpTransport: שם המשתמש (user) ריק — לא ניתן להקים מתאם SMTP בלי חשבון אמיתי',
     );
   }
 
   const connectionTimeout = config.connectionTimeoutMs ?? DEFAULT_TIMEOUT_MS;
   const socketTimeout = config.socketTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const buildTransporter = config.createTransport ?? DEFAULT_CREATE_TRANSPORT;
 
   return {
     async send(
@@ -113,17 +164,24 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
         throw new Error('הבקשה בוטלה לפני שהחיבור נפתח');
       }
 
-      // `context.credential` is still required by `MailSendContext` — every
-      // implementation of the interface must accept one — but this
-      // implementation never reads it for authentication: `config.auth`
-      // above is now unconditional, precisely so a caller with no per-call
-      // credential of its own (the notifier) cannot end up authenticating
-      // with one anyway.
-      const transporter = nodemailer.createTransport({
+      // `config.auth` is gone. The credential this send was handed is the only
+      // source, which is what makes "a caller with no credential" a compile
+      // error rather than a silent fallback to somebody else's account. The
+      // previous shape held an unconditional `auth` precisely so the notifier
+      // — which had no per-call credential — could not authenticate with one;
+      // the notifier now resolves its own, so the default has nothing left to
+      // protect and its existence is the hazard.
+      if (context.credential.value.length === 0) {
+        throw new Error(
+          'createSmtpTransport: ה-credential שהועבר לשליחה ריק — לא ניתן להזדהות מול שרת הדואר',
+        );
+      }
+
+      const transporter = buildTransporter({
         host: context.endpoint ?? config.host,
         port: config.port,
         secure: config.secure,
-        auth: config.auth,
+        auth: { user: config.user, pass: context.credential.value },
         connectionTimeout,
         socketTimeout,
       });
