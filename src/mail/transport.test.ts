@@ -172,10 +172,16 @@ describe('createSmtpTransport', () => {
     const err = await transport.send(aMessage(), aContext()).catch((e: unknown) => e);
     // The positive half first: the message — what an operator actually
     // needs — must survive the rethrow.
-    expect(String(err)).toContain('535');
-    // Then the negative: `command` (which can itself be the AUTH line) and
-    // every other field the library attached must not cross this boundary.
-    expect(String(err)).not.toContain(sentinel);
+    expect((err as Error).message).toContain('535');
+    // Then the negative, checked against the thrown object itself rather
+    // than its stringified form: `String(Object.assign(new Error('x'), {
+    // command: 'y' }))` is `"Error: x"` regardless of whether `command`
+    // survived, so a string assertion here could never go red. `command`
+    // (which can itself be the AUTH line) must not be an own property of
+    // what was thrown, and neither must anything else the library attached
+    // — the point is that nothing survives, not just this one field.
+    expect((err as { command?: unknown }).command).toBeUndefined();
+    expect(Object.keys(err as object)).toEqual([]);
   });
 });
 
