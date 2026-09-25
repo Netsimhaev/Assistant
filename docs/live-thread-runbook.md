@@ -109,9 +109,18 @@ DASHBOARD_BASE_URL=http://127.0.0.1:4173
 הסוד עצמו — הסיסמה ש-`SMTP_USER` מזדהה איתה בפועל — אינו משתנה סביבה בכלל.
 `src/mail/transport.ts` מזדהה אך ורק מהסוד שנפתר מהמאגר המוצפן (`credentials`,
 `src/governance/credential-store.ts`), לא מ-`envCredentials`/`ASSISTANT_CREDENTIAL_<ref>`
-— אלה קיימים לבדיקות בלבד ואינם רצים כאן. הקצה את הסוד תחת ההפניה
-`OFFICE_MAIL` (אותה הפניה ששלב 3 קושר ל-`credential_ref` של החיבור, ושהוגדרה
-למעלה גם כ-`NOTIFY_CREDENTIAL_REF`):
+— אלה קיימים לבדיקות בלבד ואינם רצים כאן.
+
+**קודם, אם עוד אין מפתח אב במכונה הזו.** `secret put` דורש `CREDENTIAL_KEY_PATH`
+מוגדר וקובץ מפתח שכבר נוצר תחתיו — בלעדיו הפקודה למטה נכשלת. פעם אחת לכל
+התקנה:
+
+```bash
+npm run secret:key create <המפעיל שלך>
+```
+
+**עכשיו הקצה את הסוד**, תחת ההפניה `OFFICE_MAIL` (אותה הפניה ששלב 3 קושר
+ל-`credential_ref` של החיבור, ושהוגדרה למעלה גם כ-`NOTIFY_CREDENTIAL_REF`):
 
 ```bash
 npm run secret put OFFICE_MAIL <המפעיל שלך>
@@ -120,9 +129,7 @@ npm run secret put OFFICE_MAIL <המפעיל שלך>
 הפקודה קוראת את הסוד מהקלט הסטנדרטי, לא מארגומנט. `maildev` לא בודק אימות
 בכלל, כך שכל ערך עובד — מה שחשוב הוא שההפניה תיפתר בכלל, לא הערך שבה. בלי
 הצעד הזה כל `mail.send` נדחה ב-`credential_unavailable` (ראה טבלת הכשלים
-למטה), ואף הודעת בקשת-אישור לא יוצאת. הפקודה דורשת `CREDENTIAL_KEY_PATH`
-מוגדר ומפתח שכבר נוצר (`npm run secret:key create <מפעיל>`) — אם עוד אין
-כזה במכונה הזו, זהו הזמן ליצור אחד.
+למטה), ואף הודעת בקשת-אישור לא יוצאת.
 
 ---
 
