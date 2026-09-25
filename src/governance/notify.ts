@@ -27,12 +27,35 @@
  * `AbortSignal` handed to `transport.send` is not, on its own, enough.
  */
 import type { MailTransport } from '../orchestrator/adapters/mail.js';
-import { createCredentialHandle } from '../orchestrator/adapters/types.js';
+import type { CredentialSource } from '../orchestrator/credentials.js';
 import type { ApprovalRequest } from './approvals.js';
 
 export interface ApprovalNotifier {
   readonly channel: 'email';
   notify(request: ApprovalRequest, link: string): Promise<{ ok: boolean; error?: string }>;
+}
+
+/**
+ * Everything `createEmailNotifier` needs, as one object rather than five
+ * positional parameters — `ref` and `businessId` sit next to each other with
+ * the same type (`string`), and a call site that swapped them would still
+ * typecheck under positional parameters. None of these fields has a
+ * default: a caller with no owner address, no credential source, no ref or
+ * no business id has nothing sensible to fall back to, and `businessId`
+ * above all must never be silently supplied — see `CredentialSource.resolve`
+ * (`src/orchestrator/credentials.ts`) for why.
+ */
+export interface EmailNotifierOptions {
+  /** Where the transport actually sends bytes. */
+  transport: MailTransport;
+  /** The owner's address — fixed configuration, not a per-request value. */
+  to: string;
+  /** Resolved fresh on every `notify` call — see the docblock below. */
+  credentials: CredentialSource;
+  /** The `credential_ref` this notifier always resolves. */
+  ref: string;
+  /** Required, with no default — see `EmailNotifierOptions`'s own docblock. */
+  businessId: string;
 }
 
 const BAND_LABELS: Record<string, string> = {
@@ -85,19 +108,6 @@ function buildMessage(request: ApprovalRequest, link: string): { subject: string
 }
 
 /**
- * The credential every `notify` call presents to the transport.
- *
- * No connection binding backs this send — it is a system notification, not
- * a governed business action — so there is no per-call secret to resolve.
- * `createSmtpTransport` (`src/mail/transport.ts`) now authenticates from
- * exactly the credential each send carries — it holds no `auth` of its own —
- * so this placeholder's empty `value` makes every notification fail closed
- * (the transport refuses an empty credential before opening a socket) until
- * this module resolves a real ref for it.
- */
-const SYSTEM_CREDENTIAL = createCredentialHandle('notify:system', '');
-
-/**
  * How long `notify` waits for a send before giving up.
  *
  * This is a courtesy notification, not the work the approval represents —
@@ -136,11 +146,43 @@ function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
-export function createEmailNotifier(transport: MailTransport, to: string): ApprovalNotifier {
+/**
+ * `notify` resolves a fresh credential on every call rather than once at
+ * construction, so a rotation (`putSecret`, `src/governance/credential-store.ts`)
+ * takes effect on the very next notification, with no process restart.
+ * There is no connection binding behind this send — it is a system
+ * notification, not a governed business action — so `endpoint` is always
+ * `null`; the credential is the only per-call thing this module resolves.
+ *
+ * An unresolved ref (a missing key, a rotation gone wrong, the wrong
+ * business id) is reported through the same `{ ok: false }` shape a
+ * transport failure already returns, and it is never thrown: this module's
+ * contract (see the top docblock) is that a notification failure never
+ * fails the approval it announces. An unresolved ref is the same class of
+ * event as an unreachable relay, so the call site does not need to tell
+ * them apart.
+ *
+ * Resolution happens before `buildMessage` runs — no point assembling a
+ * message this call will not be able to send — but it is deliberately not
+ * raced against its own deadline the way the transport call below is:
+ * `withDeadline`'s own docblock explains why the transport needs one (a
+ * socket that may never settle); a credential lookup is a local read with
+ * no such failure mode, and inventing a second deadline for it would be
+ * exactly that — invented, not needed.
+ */
+export function createEmailNotifier(options: EmailNotifierOptions): ApprovalNotifier {
+  const { transport, to, credentials, ref, businessId } = options;
   return {
     channel: 'email',
 
     async notify(request, link) {
+      const credential = await credentials.resolve(ref, businessId);
+      if (credential === null) {
+        // `ref` is a configuration name, not a secret — safe to quote here,
+        // unlike anything that could come from `credential.value`.
+        return { ok: false, error: `לא נמצא credential עבור ${ref}` };
+      }
+
       const { subject, body } = buildMessage(request, link);
       try {
         await withDeadline(
@@ -148,7 +190,7 @@ export function createEmailNotifier(transport: MailTransport, to: string): Appro
             { to: [to], subject, body },
             {
               endpoint: null,
-              credential: SYSTEM_CREDENTIAL,
+              credential,
               idempotencyKey: `approval-notify:${request.approvalId}`,
               signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
             },
