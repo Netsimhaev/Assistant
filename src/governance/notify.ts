@@ -27,12 +27,35 @@
  * `AbortSignal` handed to `transport.send` is not, on its own, enough.
  */
 import type { MailTransport } from '../orchestrator/adapters/mail.js';
-import { createCredentialHandle } from '../orchestrator/adapters/types.js';
+import type { CredentialSource } from '../orchestrator/credentials.js';
 import type { ApprovalRequest } from './approvals.js';
 
 export interface ApprovalNotifier {
   readonly channel: 'email';
   notify(request: ApprovalRequest, link: string): Promise<{ ok: boolean; error?: string }>;
+}
+
+/**
+ * Everything `createEmailNotifier` needs, as one object rather than five
+ * positional parameters — `ref` and `businessId` sit next to each other with
+ * the same type (`string`), and a call site that swapped them would still
+ * typecheck under positional parameters. None of these fields has a
+ * default: a caller with no owner address, no credential source, no ref or
+ * no business id has nothing sensible to fall back to, and `businessId`
+ * above all must never be silently supplied — see `CredentialSource.resolve`
+ * (`src/orchestrator/credentials.ts`) for why.
+ */
+export interface EmailNotifierOptions {
+  /** Where the transport actually sends bytes. */
+  transport: MailTransport;
+  /** The owner's address — fixed configuration, not a per-request value. */
+  to: string;
+  /** Resolved fresh on every `notify` call — see the docblock below. */
+  credentials: CredentialSource;
+  /** The `credential_ref` this notifier always resolves. */
+  ref: string;
+  /** Required, with no default — see `EmailNotifierOptions`'s own docblock. */
+  businessId: string;
 }
 
 const BAND_LABELS: Record<string, string> = {
@@ -85,20 +108,6 @@ function buildMessage(request: ApprovalRequest, link: string): { subject: string
 }
 
 /**
- * The credential every `notify` call presents to the transport.
- *
- * No connection binding backs this send — it is a system notification, not
- * a governed business action — so there is no per-call secret to resolve.
- * A placeholder is enough *and no more than that*: since round 1,
- * `createSmtpTransport` (`src/mail/transport.ts`) requires its own `auth` at
- * construction and never reads `context.credential` for authentication, so
- * this handle's `value` is structurally never used to authenticate anything
- * — not "shouldn't be," but can't be, because the one implementation this
- * module is meant to run against no longer looks at it.
- */
-const SYSTEM_CREDENTIAL = createCredentialHandle('notify:system', '');
-
-/**
  * How long `notify` waits for a send before giving up.
  *
  * This is a courtesy notification, not the work the approval represents —
@@ -124,11 +133,11 @@ const NOTIFY_TIMEOUT_MS = 5_000;
  * worth sending, because it lets a *cooperating* transport give up on its
  * own socket early, but this function does not depend on that cooperation.
  */
-function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+function withDeadline<T>(promise: Promise<T>, timeoutMs: number, what = 'השליחה'): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(
-      () => reject(new Error(`השליחה לא הסתיימה תוך ${timeoutMs} מ״ש`)),
+      () => reject(new Error(`${what} לא הסתיימה תוך ${timeoutMs} מ״ש`)),
       timeoutMs,
     );
   });
@@ -137,19 +146,75 @@ function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
-export function createEmailNotifier(transport: MailTransport, to: string): ApprovalNotifier {
+/**
+ * `notify` resolves a fresh credential on every call rather than once at
+ * construction, so a rotation (`putSecret`, `src/governance/credential-store.ts`)
+ * takes effect on the very next notification, with no process restart.
+ * There is no connection binding behind this send — it is a system
+ * notification, not a governed business action — so `endpoint` is always
+ * `null`; the credential is the only per-call thing this module resolves.
+ *
+ * An unresolved ref (a missing key, a rotation gone wrong, the wrong
+ * business id) is reported through the same `{ ok: false }` shape a
+ * transport failure already returns, and it is never thrown: this module's
+ * contract (see the top docblock) is that a notification failure never
+ * fails the approval it announces. An unresolved ref is the same class of
+ * event as an unreachable relay, so the call site does not need to tell
+ * them apart.
+ *
+ * Resolution happens before `buildMessage` runs — no point assembling a
+ * message this call will not be able to send — and it is raced against the
+ * same `withDeadline` the transport call is.
+ *
+ * An earlier version of this docblock argued the opposite, that "a credential
+ * lookup is a local read with no such failure mode". That was wrong, and it is
+ * recorded here rather than deleted. The production `CredentialSource`
+ * (`storedCredentials`, `src/governance/credential-store.ts`) is a `db.query`
+ * on a **pooled** connection, and an exhausted pool does not reject — it
+ * *queues*, which is a hang, which is precisely the failure mode
+ * `withDeadline` exists for and precisely the one an `AbortSignal` and a
+ * try/catch both fail to catch. The try/catch below turns a rejection into
+ * `{ ok: false }`; nothing but a race turns silence into one. And the gate
+ * (`evaluateToolCall`, `src/policy/engine.ts`) awaits `notify` **inline**
+ * before it can return `queue_approval`, so an unbounded wait here stalls the
+ * approval path itself — the same reasoning that put a deadline on the
+ * transport, one call earlier in the same function.
+ */
+export function createEmailNotifier(options: EmailNotifierOptions): ApprovalNotifier {
+  const { transport, to, credentials, ref, businessId } = options;
   return {
     channel: 'email',
 
     async notify(request, link) {
-      const { subject, body } = buildMessage(request, link);
+      // The `resolve` call sits inside this same `try`, not before it: the
+      // production `CredentialSource` (`storedCredentials`,
+      // `src/governance/credential-store.ts`) awaits a `db.query` that can
+      // reject — a lost connection, a pool that gave up — and a rejection
+      // there is exactly as much "notify failed" as a throwing transport
+      // below. `notify` never throws, full stop; a resolve outside this
+      // block would make that only two-thirds true. And it is inside
+      // `withDeadline` for the other half of the same argument: an exhausted
+      // pool queues rather than rejecting, and a try/catch cannot catch
+      // silence (see this function's docblock).
       try {
+        const credential = await withDeadline(
+          credentials.resolve(ref, businessId),
+          NOTIFY_TIMEOUT_MS,
+          'פתירת הסוד',
+        );
+        if (credential === null) {
+          // `ref` is a configuration name, not a secret — safe to quote
+          // here, unlike anything that could come from `credential.value`.
+          return { ok: false, error: `לא נמצא credential עבור ${ref}` };
+        }
+
+        const { subject, body } = buildMessage(request, link);
         await withDeadline(
           transport.send(
             { to: [to], subject, body },
             {
               endpoint: null,
-              credential: SYSTEM_CREDENTIAL,
+              credential,
               idempotencyKey: `approval-notify:${request.approvalId}`,
               signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
             },

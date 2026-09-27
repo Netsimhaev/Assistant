@@ -1176,8 +1176,8 @@ describe('POST /instruct/:jobId/answer', () => {
   });
 
   /**
-   * I2: two POSTs of the same answer must produce one job, and the loser must
-   * refuse cleanly.
+   * I2: a POST that cannot take the job's claim is turned away and writes
+   * nothing.
    *
    * The phase guard is a read, and `runInstruction` makes a live model call
    * before anything writes — nothing held a lock across that window. Two
@@ -1188,44 +1188,74 @@ describe('POST /instruct/:jobId/answer', () => {
    * threw uncaught to the 500 handler: two authorised, bound plans for one
    * answer, and an error suggesting nothing happened.
    *
+   * **Why this test holds the claim itself instead of firing two POSTs at
+   * once.** The racing form of this test was flaky, and the reason is worth
+   * keeping: when the two requests do NOT overlap, the second one takes the
+   * claim uncontested and the phase guard does not stop it either — a
+   * `refused` re-run deliberately leaves the parked job in `understand`
+   * (see `withJobClaim`'s docblock for why), so under `NODE_ENV=test`, where
+   * `refuseUnderTest` makes every re-run refuse, BOTH serialised requests
+   * legitimately run to the end and open a job. The racing test therefore
+   * asserted on an overlap no test can schedule, and failed on whichever
+   * machine happened to run the two back to back. Taking the route's own
+   * advisory lock from this connection makes the contested case the only
+   * case: the request below provably loses the claim.
+   *
    * Unlike every other test in this block, this one deliberately posts a
-   * SHORT answer, so the pipeline runs past the length cap and reaches
-   * `createJob` — that is the write this test counts. It still never touches
-   * the network: `makePlan`'s `refuseUnderTest` throws under
-   * `NODE_ENV=test`, `runInstruction` catches it, fails the new job and
-   * returns `refused`. So a winning request creates exactly one job and a
-   * losing one creates none.
+   * SHORT answer, so nothing but the claim stands between the request and
+   * `createJob` — which is what the job count at the end proves did not
+   * happen. It still never touches the network.
    */
-  it('lets only one of two concurrent answers through, and the loser refuses without a 500', async () => {
+  it('turns away an answer while the job is already claimed, and writes nothing', async () => {
     const baseUrl = await startServer(BUSINESS);
     const jobId = await anInstructionJob(BUSINESS, 'תשלחי לדנה את ההצעה');
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
     const csrf = extractCsrf(await boxPage.text());
 
-    const post = () =>
-      fetch(`${baseUrl}/instruct/${jobId}/answer`, {
+    // The same scope string and the same key derivation the route uses.
+    const scope = `instruct-answer:${BUSINESS}:${jobId}`;
+    const holder = await getPool().connect();
+    let response: Response;
+    try {
+      const taken = await holder.query<{ locked: boolean }>(
+        'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
+        [scope],
+      );
+      // Positive half: the lock is genuinely held while the POST runs. Without
+      // this, a scope string that stopped matching the route's would leave
+      // every assertion below passing for the wrong reason.
+      expect(taken.rows[0]?.locked).toBe(true);
+
+      response = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
         method: 'POST',
         headers: { cookie },
         body: new URLSearchParams({ csrf, answer: 'דנה כהן' }),
       });
+    } finally {
+      await holder.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [scope]);
+      holder.release();
+    }
 
-    const [a, b] = await Promise.all([post(), post()]);
-    const bodies = [await a.text(), await b.text()];
+    // Refused with something the owner can read — never a 500.
+    expect(response.status).toBe(409);
+    expect(await response.text()).toContain('כבר בטיפול');
 
-    // Nobody gets a 500 — the shape the owner actually met.
-    expect([a.status, b.status]).not.toContain(500);
-    // Exactly one of the two was turned away by the claim.
-    expect(bodies.filter((body) => body.includes('כבר בטיפול'))).toHaveLength(1);
-
-    // The count is the point: the parked job, plus the one job the winner
-    // opened. Without the claim both requests reach `createJob` and there are
-    // three.
+    // Nothing was written: no answer recorded, and no second job opened. The
+    // parked job is still the only one. Without the claim this request reaches
+    // `recordAnswer` and `createJob` and both of these go red.
+    const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
+    expect(stored?.answer).toBeNull();
     const { rows } = await getPool().query<{ n: string }>(
       'SELECT count(*)::text AS n FROM jobs WHERE business_id = $1',
       [BUSINESS],
     );
-    expect(rows[0]?.n).toBe('2');
+    expect(rows[0]?.n).toBe('1');
+
+    // And the job is still waiting, so the owner's resubmit lands on a job in
+    // the phase the route requires.
+    const job = await loadJob(jobId, { businessId: BUSINESS });
+    expect(job?.phase).toBe('understand');
   });
 
   // Fix round 2, N2: the route must not be able to fail an unrelated,

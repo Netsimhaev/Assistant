@@ -115,7 +115,11 @@ Add to `src/mail/transport.test.ts`. The existing file already builds an `SmtpCo
   });
 ```
 
-The existing test file may not have a `createTransport` injection seam. If it does not, add one: an optional field on `SmtpConfig` typed as a function returning the minimal `{ sendMail }` shape the send path uses, defaulting to `nodemailer.createTransport`. Document it as the seam that lets a test read what the transport authenticated with — without it, none of the assertions above can be written, and the only alternative is a real SMTP server.
+**The seam does not exist and you must add it — this is settled, not a judgement call.** `src/mail/transport.test.ts` has eight tests and every one of them stops before a socket opens; the file's own comment at `:16-19` says so explicitly. So none of the assertions above can be written today.
+
+Add an optional factory field to `SmtpConfig`, typed as a function returning the minimal `{ sendMail }` shape the send path actually uses, defaulting to `nodemailer.createTransport`. In its docblock, name the precedent rather than inventing a justification: `LocalToolContext.reader` and `LocalToolContext.verifier` exist for the identical reason — "the one step that costs money, injectable so a test can drive it without an API key" — and `ReadDocumentOptions.reader` before them. Production never passes it.
+
+**Two existing tests in that file need deciding, and here is the decision.** `:85` refuses to build a transport with an empty username and `:97` refuses to build one with an empty password. The username stays configuration, so `:85` is unaffected and stays exactly as it is. The password is no longer present at build time at all, so `:97`'s property moves to where the value now arrives — a send whose credential carries an empty value, which is the third test above. **Move it; do not delete it.** Deleting a real control because its location became inconvenient is how controls disappear.
 
 - [ ] **Step 2: Run them and watch them fail**
 
@@ -170,6 +174,8 @@ git commit -m "The transport authenticates with the credential it was handed"
 - Produces: `createEmailNotifier(transport: MailTransport, to: string, credentials: CredentialSource, ref: string, businessId: string): ApprovalNotifier` — four positional arguments become five plus one; if that reads badly at the call site, take an options object instead and say so in the report, but do not give any parameter a default.
 
 - [ ] **Step 1: Write the failing tests**
+
+**Use the file's own fake, not new ones.** `src/governance/notify.test.ts:100` already has `recordingTransport()`, which returns a `MailTransport` and a `sent` array. Extend it so it also records the credential each send presented — that is the one thing it is missing. The helper names in the test code below (`transportCapturing`, `stubSource`, `mutableSource`, and the rest) are placeholders for shapes you should build from that existing fake plus a small `CredentialSource` stub; five new single-use helpers beside an existing one is the duplication the review rubric treats as a defect.
 
 ```ts
   it('resolves its own credential per notification and sends with it', async () => {
@@ -257,6 +263,8 @@ git commit -m "The notifier resolves its own credential, per notification"
 
 - [ ] **Step 1: Write the failing tests**
 
+**Follow this file's own conventions, not the names below.** `src/orchestrator/runtime.test.ts` uses a `FULL` env constant with `withoutX` variants derived from it, and asserts on `runtime.warnings.join(' ')` with `toMatch`. The `envWith` / `envWithout` in the code below are my invention and do not exist — build each case the way the neighbouring tests already do.
+
 ```ts
   it('builds a notifier when the mail settings and the notify ref are all present', async () => {
     const runtime = await buildRuntime(envWith({ NOTIFY_CREDENTIAL_REF: 'NOTIFY_MAIL' }));
@@ -329,6 +337,11 @@ One end-to-end wiring assertion, in the file that already covers this path:
 ```ts
   it('carries a real secret from the store to the transport, for a plan-driven send', async () => {
     // The store is the source: nothing in this test sets SMTP_PASS.
+    //
+    // `putSecret` takes an input OBJECT and the master key — check its real
+    // signature in `src/governance/credential-store.ts` before calling it. The
+    // three-loose-arguments form below is wrong; it is my error, not the
+    // codebase's, and the compiler will say so immediately.
     await putSecret('OFFICE_MAIL', 'סוד-מהמאגר', { businessId: BUSINESS, db: getPool() });
     const captured: string[] = [];
     // …drive a plan whose binding names OFFICE_MAIL, through runDueJobs…

@@ -5,11 +5,14 @@ import { canonicalHash } from '../util/canonical.js';
 import type { ActionFacts } from '../domain/policy.js';
 import type { RiskAssessment } from '../domain/risk.js';
 import { enqueueApproval, getApproval, type ApprovalRequest } from './approvals.js';
-import { createEmailNotifier, type ApprovalNotifier } from './notify.js';
+import { createEmailNotifier, type ApprovalNotifier, type EmailNotifierOptions } from './notify.js';
 import { createSmtpTransport } from '../mail/transport.js';
 import type { MailMessage, MailTransport } from '../orchestrator/adapters/mail.js';
+import { createCredentialHandle, type CredentialHandle } from '../orchestrator/adapters/types.js';
+import type { CredentialSource } from '../orchestrator/credentials.js';
 
 const BUSINESS = 'test-business';
+const DEFAULT_REF = 'NOTIFY_MAIL';
 
 beforeEach(async () => {
   await resetDatabase();
@@ -95,29 +98,84 @@ async function makeApproval(options: {
   return request;
 }
 
-function recordingTransport(): { transport: MailTransport; sent: MailMessage[] } {
+/**
+ * `credentialsUsed` records `context.credential.value` for every send — the
+ * one thing this fake was missing once the notifier started resolving its
+ * own credential per call instead of presenting a shared placeholder.
+ */
+function recordingTransport(): {
+  transport: MailTransport;
+  sent: MailMessage[];
+  credentialsUsed: string[];
+} {
   const sent: MailMessage[] = [];
+  const credentialsUsed: string[] = [];
   const transport: MailTransport = {
-    async send(message) {
+    async send(message, context) {
       sent.push(message);
+      credentialsUsed.push(context.credential.value);
       return { messageId: 'MSG-1' };
     },
   };
-  return { transport, sent };
+  return { transport, sent, credentialsUsed };
 }
 
-function throwingTransport(error: unknown): MailTransport {
+/**
+ * `credentialsUsed`, populated before the throw, is what lets a test that
+ * asserts a secret is *absent* from the failure result first prove the
+ * secret was genuinely resolved and handed to the transport — otherwise
+ * "the secret never appears" would be true for the trivial reason that it
+ * was never in the path at all.
+ */
+function throwingTransport(error: unknown, credentialsUsed: string[] = []): MailTransport {
   return {
-    async send() {
+    async send(_message, context) {
+      credentialsUsed.push(context.credential.value);
       throw error;
     },
+  };
+}
+
+/**
+ * A `CredentialSource` backed by an in-memory map, keyed by ref only — the
+ * real store also partitions by business, but `credential-store.test.ts`
+ * already covers that, and nothing here needs to re-prove it. `set` lets a
+ * test simulate a rotation landing between two `notify` calls.
+ */
+function stubCredentialSource(secrets: Record<string, string>): CredentialSource & {
+  set(ref: string, value: string): void;
+} {
+  const map = new Map(Object.entries(secrets));
+  return {
+    async resolve(ref: string, _businessId: string): Promise<CredentialHandle | null> {
+      const value = map.get(ref);
+      return value === undefined ? null : createCredentialHandle(ref, value);
+    },
+    set(ref: string, value: string): void {
+      map.set(ref, value);
+    },
+  };
+}
+
+/**
+ * Defaults for every field `createEmailNotifier` now requires, so each test
+ * below only spells out the field it actually varies.
+ */
+function baseNotifierOptions(overrides: Partial<EmailNotifierOptions> = {}): EmailNotifierOptions {
+  return {
+    transport: recordingTransport().transport,
+    to: 'owner@example.com',
+    credentials: stubCredentialSource({ [DEFAULT_REF]: 'notify-secret' }),
+    ref: DEFAULT_REF,
+    businessId: BUSINESS,
+    ...overrides,
   };
 }
 
 describe('createEmailNotifier', () => {
   it('sends to the configured owner address with a link containing the approval id', async () => {
     const { transport, sent } = recordingTransport();
-    const notifier = createEmailNotifier(transport, 'owner@example.com');
+    const notifier = createEmailNotifier(baseNotifierOptions({ transport }));
     const request = await makeApproval();
 
     const link = `https://dash.example.com/a/${request.approvalId}`;
@@ -132,7 +190,7 @@ describe('createEmailNotifier', () => {
 
   it('does not leak the proposed payload — only the risk sentence and the label reach the mail', async () => {
     const { transport, sent } = recordingTransport();
-    const notifier = createEmailNotifier(transport, 'owner@example.com');
+    const notifier = createEmailNotifier(baseNotifierOptions({ transport }));
     const secret = 'SECRET-CARD-4111-1111-1111-1111';
     const request = await makeApproval({ secretMarker: secret });
 
@@ -155,7 +213,7 @@ describe('createEmailNotifier', () => {
 
   it('never lets a proposal headline reach the mail, even when it differs from the risk sentence', async () => {
     const { transport, sent } = recordingTransport();
-    const notifier = createEmailNotifier(transport, 'owner@example.com');
+    const notifier = createEmailNotifier(baseNotifierOptions({ transport }));
     // A headline a model could have written from ingested content — distinct
     // from `summary` in every other fixture here on purpose.
     const request = await makeApproval({ summary: 'אשלח מייל לדנה עוד היום' });
@@ -169,8 +227,7 @@ describe('createEmailNotifier', () => {
 
   it('turns a throwing transport into a graceful { ok: false }, never a rejected promise', async () => {
     const notifier = createEmailNotifier(
-      throwingTransport(new Error('smtp connection refused')),
-      'owner@example.com',
+      baseNotifierOptions({ transport: throwingTransport(new Error('smtp connection refused')) }),
     );
     const request = await makeApproval();
 
@@ -181,7 +238,7 @@ describe('createEmailNotifier', () => {
   });
 
   it('turns a transport that throws a non-Error value into a graceful { ok: false } too', async () => {
-    const notifier = createEmailNotifier(throwingTransport('boom'), 'owner@example.com');
+    const notifier = createEmailNotifier(baseNotifierOptions({ transport: throwingTransport('boom') }));
     const request = await makeApproval();
 
     const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
@@ -196,21 +253,25 @@ describe('createEmailNotifier', () => {
     // open a `Bcc:` header on the real transport. `createSmtpTransport`
     // rejects it before it ever calls out to a socket — see
     // src/mail/transport.ts — so this exercises the real implementation, not
-    // a fake, with no network involved.
+    // a fake, with no network involved. `auth` is gone from `SmtpConfig` as
+    // of the mail-credential work; only `user` stays.
     const transport = createSmtpTransport({
       host: 'smtp.invalid.example',
       port: 587,
       secure: false,
       from: 'assistant@example.com',
-      auth: { user: 'assistant', pass: 'test-pass' },
+      user: 'assistant',
     });
-    const notifier: ApprovalNotifier = createEmailNotifier(transport, 'owner@example.com');
+    const notifier: ApprovalNotifier = createEmailNotifier(baseNotifierOptions({ transport }));
     const request = await makeApproval({
       riskOverrides: { explanation: 'שלום\r\nBcc: attacker@evil.com' },
     });
 
     const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
 
+    // The CRLF refusal fires inside the transport, before it ever asks for
+    // the credential — so this passes unchanged once `SmtpConfig` compiles,
+    // regardless of what `assertNoCrlf` runs against.
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/CR\/LF|שורה חדשה/);
   });
@@ -227,7 +288,7 @@ describe('createEmailNotifier', () => {
         });
       },
     };
-    const notifier = createEmailNotifier(hangingTransport, 'owner@example.com');
+    const notifier = createEmailNotifier(baseNotifierOptions({ transport: hangingTransport }));
     const request = await makeApproval();
 
     const started = Date.now();
@@ -246,11 +307,104 @@ describe('createEmailNotifier', () => {
     // as MailTransport's contract promises (resolve fast, or throw) must
     // not be slowed down or altered by the deadline machinery wrapping it.
     const { transport } = recordingTransport();
-    const notifier = createEmailNotifier(transport, 'owner@example.com');
+    const notifier = createEmailNotifier(baseNotifierOptions({ transport }));
     const request = await makeApproval();
 
     const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
 
     expect(result).toEqual({ ok: true });
+  });
+
+  it('sends with the value the credential source holds for the ref', async () => {
+    const { transport, credentialsUsed } = recordingTransport();
+    const secret = 'סוד-המודיע';
+    const notifier = createEmailNotifier(
+      baseNotifierOptions({ transport, credentials: stubCredentialSource({ [DEFAULT_REF]: secret }) }),
+    );
+    const request = await makeApproval();
+
+    const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
+
+    expect(result).toEqual({ ok: true });
+    expect(credentialsUsed).toEqual([secret]);
+  });
+
+  it('resolves again on the second notification, so a rotation takes effect without a restart', async () => {
+    const { transport, credentialsUsed } = recordingTransport();
+    const source = stubCredentialSource({ [DEFAULT_REF]: 'לפני' });
+    const notifier = createEmailNotifier(baseNotifierOptions({ transport, credentials: source }));
+
+    const first = await makeApproval();
+    await notifier.notify(first, `https://dash.example.com/a/${first.approvalId}`);
+    source.set(DEFAULT_REF, 'אחרי');
+    const second = await makeApproval();
+    await notifier.notify(second, `https://dash.example.com/a/${second.approvalId}`);
+
+    expect(credentialsUsed).toEqual(['לפני', 'אחרי']);
+  });
+
+  it('reports a failure without sending when the ref does not resolve', async () => {
+    const { transport, sent } = recordingTransport();
+    const notifier = createEmailNotifier(
+      baseNotifierOptions({ transport, credentials: stubCredentialSource({}) }),
+    );
+    const request = await makeApproval();
+
+    // `notify` never throws by contract — the approval row already exists
+    // and the dashboard already shows it. An unresolved ref is the same
+    // class of event as an unreachable relay.
+    const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
+
+    expect(result.ok).toBe(false);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('keeps the secret out of the failure it reports', async () => {
+    const secret = 'סוד-המודיע-שאסור-להופיע';
+    const credentialsUsed: string[] = [];
+    const notifier = createEmailNotifier(
+      baseNotifierOptions({
+        transport: throwingTransport(new Error('535 Authentication credentials invalid'), credentialsUsed),
+        credentials: stubCredentialSource({ [DEFAULT_REF]: secret }),
+      }),
+    );
+    const request = await makeApproval();
+
+    const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
+
+    // Positive assertion first: prove the secret really was resolved and
+    // handed to the transport before the send failed, so the negative
+    // assertion below is not vacuously true for having nothing to leak.
+    expect(credentialsUsed).toEqual([secret]);
+    expect(result.ok).toBe(false);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it('turns a rejecting credential source into a graceful { ok: false }, never a rejected promise', async () => {
+    // The production CredentialSource (`storedCredentials`,
+    // src/governance/credential-store.ts) awaits a db.query that can
+    // reject — a lost connection, an exhausted pool. That rejection must
+    // land inside notify's own try, not escape it.
+    const { transport, sent } = recordingTransport();
+    let resolveCalls = 0;
+    const rejectingCredentials: CredentialSource = {
+      async resolve() {
+        resolveCalls += 1;
+        throw new Error('connection terminated unexpectedly');
+      },
+    };
+    const notifier = createEmailNotifier(
+      baseNotifierOptions({ transport, credentials: rejectingCredentials }),
+    );
+    const request = await makeApproval();
+
+    const result = await notifier.notify(request, `https://dash.example.com/a/${request.approvalId}`);
+
+    // Positive first: prove the rejection actually happened on this call's
+    // path — resolve was reached and is the thing that threw — so the
+    // shape asserted below is not passing for some unrelated reason.
+    expect(resolveCalls).toBe(1);
+    expect(result).toEqual({ ok: false, error: 'connection terminated unexpectedly' });
+    expect(sent).toHaveLength(0);
   });
 });

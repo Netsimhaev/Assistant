@@ -12,6 +12,8 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import { createEmailNotifier, type ApprovalNotifier } from '../governance/notify.js';
 import type { MailTransport } from '../orchestrator/adapters/mail.js';
+import { createCredentialHandle } from '../orchestrator/adapters/types.js';
+import type { CredentialSource } from '../orchestrator/credentials.js';
 
 const BUSINESS = 'test-business';
 
@@ -416,7 +418,21 @@ describe('approval notification', () => {
         });
       },
     };
-    const notifier = createEmailNotifier(hangingTransport, 'owner@example.com');
+    // The hang under test is in the transport, not credential resolution —
+    // this source resolves immediately so the deadline being measured is
+    // unambiguously the transport's.
+    const credentials: CredentialSource = {
+      async resolve(ref) {
+        return createCredentialHandle(ref, 'test-secret');
+      },
+    };
+    const notifier = createEmailNotifier({
+      transport: hangingTransport,
+      to: 'owner@example.com',
+      credentials,
+      ref: 'NOTIFY_MAIL',
+      businessId: BUSINESS,
+    });
 
     const started = Date.now();
     const decision = await evaluateToolCall(
