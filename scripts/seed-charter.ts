@@ -15,7 +15,7 @@
  *
  *   npx tsx scripts/seed-charter.ts
  */
-import { installCharter, loadActiveCharter } from '../src/charter/store.js';
+import { installCharter, probeActiveCharter } from '../src/charter/store.js';
 import { buildCharter } from '../src/test/fixtures.js';
 import { upsertBinding } from '../src/orchestrator/bindings.js';
 import { closePool } from '../src/db/pool.js';
@@ -45,7 +45,21 @@ const MAIL_CONNECTION: CharterConnection = {
  * (`charter_versions.charter_version` is the primary key on its own), so a
  * charter that lacks the connection is superseded by a new version instead.
  */
-const active = await loadActiveCharter(config.businessId);
+/**
+ * Probed rather than loaded, because this script IS the recovery path.
+ *
+ * `loadActiveCharter` throws on a charter this code cannot read — correct
+ * everywhere in production, and fatal here: an installation whose charter had
+ * fallen behind the schema could not be repaired, because the repair began by
+ * reading the thing that was broken. An unreadable charter answers this
+ * script's only question ("is a correct charter already installed?") with a
+ * plain no.
+ */
+const probe = await probeActiveCharter(config.businessId);
+if (!probe.ok) {
+  console.log(`active charter could not be read, so it will be superseded: ${probe.reason}`);
+}
+const active = probe.ok ? probe.active : null;
 const declaresMail = active?.charter.connections.some((c) => c.system === MAIL_CONNECTION.system) === true;
 
 if (declaresMail) {

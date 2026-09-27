@@ -467,8 +467,27 @@ export const CharterSignature = z.object({
  * stored charter's version *before* parsing and raise a legible error naming
  * the problem, instead of parsing straight into a raw `ZodError` — the same
  * illegibility this bump was meant to fix, one layer down on the read path.
+ *
+ * **Bumped to '1.2' when `agent.delegate` joined `ActionClass`.** That member
+ * was added on the `agent-envelope` branch with this constant left at '1.1',
+ * and the consequence was measured rather than predicted: `autonomy.base` is
+ * a `z.record(ActionClass, …)` — exhaustive — so a charter signed before the
+ * addition declares 24 of the 25 classes and no longer parses at all. The
+ * installation this was found on failed every job on every scheduler pass
+ * with the raw `ZodError` described above, and could not install a
+ * replacement either, because the recovery path reads the active charter
+ * first. Growing an enum the charter serialises exhaustively is a schema
+ * change, and it is now one that cannot be made quietly:
+ * `src/charter/schema-version.test.ts` pins the membership of both such enums
+ * against this version and fails with the remedy spelled out.
+ *
+ * What a bump costs, and why it is the honest price: a charter signed under
+ * the old version must be **re-signed**, not reinterpreted. Filling the
+ * missing class in with a restrictive default at read time would keep the
+ * installation running, but it would also mean the code deciding, after the
+ * fact, what a signed document says about an authority its owner never saw.
  */
-export const CURRENT_SCHEMA_VERSION = '1.1';
+export const CURRENT_SCHEMA_VERSION = '1.2';
 
 const BusinessCharterShape = z.object({
   schemaVersion: z.literal(CURRENT_SCHEMA_VERSION),

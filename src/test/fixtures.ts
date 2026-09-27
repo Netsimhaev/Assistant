@@ -1,6 +1,6 @@
 import type { ActionClass } from '../domain/action.js';
 import type { BusinessCharter, ForbiddenRule, UnsignedCharter } from '../domain/charter.js';
-import { BusinessCharter as CharterSchema } from '../domain/charter.js';
+import { BusinessCharter as CharterSchema, CURRENT_SCHEMA_VERSION } from '../domain/charter.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { signCharter } from '../charter/sign.js';
@@ -86,7 +86,13 @@ export interface CharterOverrides {
 /** A realistic small-business charter: an Israeli firm working Sun–Thu. */
 export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter {
   const unsigned: UnsignedCharter = {
-    schemaVersion: '1.1',
+    // Read from the constant, never restated. A hand-written literal here was
+    // the same defect one layer down: a bump to CURRENT_SCHEMA_VERSION would
+    // leave every fixture signing the previous version, and the suite would
+    // go red across hundreds of tests on a mismatch that is not what any of
+    // them is about. The guard that forces a conscious look at a bump is
+    // `src/charter/schema-version.test.ts`, not this line.
+    schemaVersion: CURRENT_SCHEMA_VERSION,
     charterVersion: overrides.version ?? '2026-08-15.1',
     effectiveFrom: '2026-08-15T00:00:00.000Z',
 

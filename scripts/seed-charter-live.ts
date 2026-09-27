@@ -25,7 +25,7 @@
  *
  *   npx tsx scripts/seed-charter-live.ts
  */
-import { installCharter, loadActiveCharter } from '../src/charter/store.js';
+import { installCharter, probeActiveCharter } from '../src/charter/store.js';
 import { signCharter } from '../src/charter/sign.js';
 import { buildCharter } from '../src/test/fixtures.js';
 import { upsertBinding } from '../src/orchestrator/bindings.js';
@@ -63,7 +63,11 @@ const charter = signCharter(
   { signedByPersonId: 'owner', method: 'dashboard_click' },
 );
 
-const previous = await loadActiveCharter(config.businessId);
+// Probed, not loaded — see the same call in `seed-charter.ts`: a script whose
+// job is to install a charter must not be stopped by the charter it replaces.
+const probe = await probeActiveCharter(config.businessId);
+const previous = probe.ok ? probe.active : null;
+if (!probe.ok) console.log(`previous charter is unreadable and will be superseded: ${probe.reason}`);
 const bundle = await installCharter(charter);
 console.log(
   previous === null

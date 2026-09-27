@@ -9,7 +9,7 @@
  */
 import { config } from '../src/config.js';
 import { closePool, getPool } from '../src/db/pool.js';
-import { activeCharterVersion } from '../src/charter/store.js';
+import { activeCharterVersion, probeActiveCharter } from '../src/charter/store.js';
 import { loadBindings } from '../src/orchestrator/bindings.js';
 import { loadRampLevel } from '../src/orchestrator/ramp.js';
 import { buildRuntime } from '../src/orchestrator/runtime.js';
@@ -22,7 +22,25 @@ const businessId = config.businessId;
 console.log(`business: ${businessId}\n`);
 
 const charterVersion = await activeCharterVersion(businessId);
-line(charterVersion !== null, 'charter installed', charterVersion ?? 'none — run scripts/seed-charter.ts');
+/**
+ * Two questions, not one: is a charter installed, and can this code still
+ * READ it. `activeCharterVersion` answers only the first — it reads one
+ * column and never parses the document — so an installation whose charter had
+ * fallen behind the schema showed a green line here while every job failed on
+ * every scheduler pass. That is the exact shape this whole report exists to
+ * prevent, and it was found the hard way; see `CURRENT_SCHEMA_VERSION` in
+ * `src/domain/charter.ts`.
+ */
+const charterProbe = await probeActiveCharter(businessId);
+line(
+  charterVersion !== null && charterProbe.ok,
+  'charter installed',
+  charterVersion === null
+    ? 'none — run scripts/seed-charter.ts'
+    : charterProbe.ok
+      ? charterVersion
+      : `${charterVersion} — STORED BUT UNREADABLE: ${charterProbe.reason}`,
+);
 
 const bindings = await loadBindings({ businessId });
 const mail = bindings.find((b) => b.system === 'office-mail') ?? null;
