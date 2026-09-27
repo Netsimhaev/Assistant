@@ -6,3 +6,13 @@ coverage/
 .superpowers/
 .claude/worktrees/
 /documents/
+
+# The master key that opens every stored secret, and the passphrase-protected
+# recovery copy beside it. `secret:key create` writes both here and does NOT
+# create this directory itself -- so the first live run on a machine makes it
+# by hand, and without this rule the key sits untracked and one `git add -A`
+# away from the history.
+secrets/
+# .env is ignored above; its hand-made backups were not.
+.env.*
+!.env.example
