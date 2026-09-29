@@ -95,12 +95,27 @@ if (runtime !== null) {
   refs.add(GOOGLE_CLIENT_ID_REF);
   refs.add(GOOGLE_CLIENT_SECRET_REF);
   for (const ref of refs) {
-    const handle = await runtime.credentials.resolve(ref, businessId);
-    line(
-      handle !== null,
-      `secret ${ref}`,
-      handle === null ? `not provisioned — run \`npm run secret put ${ref} <operator>\`` : 'provisioned',
-    );
+    // `resolve` can THROW, not just return `null` — `oauthCredentials.resolve`
+    // (`oauth-token.ts`) throws five error classes of its own (a revoked
+    // grant, a rejected refresh, an ambiguous ref, a missing local app
+    // secret, or a transient failure) on top of whatever the fallback can
+    // throw. `AmbiguousCredentialRefError` in particular is exactly the C1
+    // state this readiness script most needs to diagnose (`OFFICE_MAIL`
+    // resolving through both a grant and the static SMTP secret), and this
+    // loop used to call `resolve` unguarded and die with a stack trace on
+    // that exact ref instead of printing a MISS line for it. Guarded the same
+    // way `connector-calendar.ts` already guards its own `resolve` call
+    // (final fix wave, item 10).
+    try {
+      const handle = await runtime.credentials.resolve(ref, businessId);
+      line(
+        handle !== null,
+        `secret ${ref}`,
+        handle === null ? `not provisioned — run \`npm run secret put ${ref} <operator>\`` : 'provisioned',
+      );
+    } catch (error) {
+      line(false, `secret ${ref}`, error instanceof Error ? error.message : String(error));
+    }
   }
 
   for (const warning of runtime.warnings) console.log(`      warning: ${warning}`);
