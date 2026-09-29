@@ -422,6 +422,7 @@ describe('a rotation that committed says so even when its record does not', () =
       previousKeyId: oldKeyId,
       newKeyId: expect.stringMatching(/^KEY-/) as unknown as string,
       secretsReEncrypted: 1,
+      grantsReEncrypted: 0,
     });
     expect(thrown.message).toContain(oldKeyId as string);
     expect(thrown.message).toContain(thrown.outcome.newKeyId);
