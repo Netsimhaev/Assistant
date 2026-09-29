@@ -20,7 +20,7 @@ import {
   GOOGLE_CLIENT_SECRET_REF,
 } from '../orchestrator/adapters/google-token-http.js';
 import { loadBindings } from '../orchestrator/bindings.js';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createOwner } from './auth.js';
 import { issueCsrfToken } from './csrf.js';
@@ -208,6 +208,100 @@ describe('GET /oauth/callback', () => {
 
     const audit = await queryAudit({ businessId: BUSINESS, kind: 'credential_change' });
     expect(audit.some((row) => row.reason.includes(SYSTEM))).toBe(true);
+    // M11: extend the "no secrets" assertion beyond the two tokens above to
+    // the app's own client secret — on the page and in the permanent record.
+    expect(body).not.toContain('test-client-secret');
+    for (const row of audit) expect(row.reason).not.toContain('test-client-secret');
+  });
+
+  /**
+   * I2 — the session-binding check has no coverage today: every existing
+   * test reuses one cookie for both `/start` and the callback, so
+   * `consumed.sessionId !== session.sessionId` could be deleted and every
+   * other test here would stay green. A second, independent login (NOT a
+   * revoke of the first — `login` never revokes prior sessions, only a
+   * password change does) begins consent under cookie A and completes the
+   * callback under cookie B.
+   */
+  it('refuses a callback completed from a different session than the one that began it (I2)', async () => {
+    const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
+    const cookieA = await loginWithPassword(baseUrl);
+    const cookieB = await loginWithPassword(baseUrl);
+    expect(cookieB).not.toBe(cookieA);
+    const state = await beginConsent(baseUrl, cookieA);
+
+    const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=auth-code-value`, {
+      headers: { cookie: cookieB },
+    });
+    expect(res.status).toBe(400);
+    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
+  });
+
+  /**
+   * I3 — the fake used everywhere else grants exactly the scope that was
+   * requested, so `scopes: exchange.grantedScopes` could be swapped for the
+   * requested constant and stay green. This fake grants something else
+   * entirely, and the grant must record THAT, not the calendar-readonly
+   * scope the `/start` redirect actually asked for.
+   */
+  it('records what the provider granted, not what was requested (I3)', async () => {
+    const grantedInstead = 'https://example.com/a-completely-different-scope';
+    const baseUrl = await startServer({
+      oauthFetch: (async (url: string | URL, init?: RequestInit) => {
+        const href = url.toString();
+        if (href.includes('oauth2.googleapis.com/token')) {
+          return jsonResponse(200, {
+            access_token: 'access-token-value',
+            refresh_token: 'refresh-token-value',
+            scope: grantedInstead,
+          });
+        }
+        return successfulProviderFetch()(url as string, init);
+      }) as typeof fetch,
+    });
+    const cookie = await loginWithPassword(baseUrl);
+    const state = await beginConsent(baseUrl, cookie);
+
+    const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=auth-code-value`, {
+      headers: { cookie },
+    });
+    expect(res.status).toBe(200);
+
+    const grant = await readGrantBySystem(SYSTEM, BUSINESS, key);
+    expect(grant?.scopes).toEqual([grantedInstead]);
+    expect(grant?.scopes).not.toContain('https://www.googleapis.com/auth/calendar.readonly');
+  });
+
+  it('refuses with a readable message, and writes nothing, when the provider returns no refresh token (M11)', async () => {
+    const baseUrl = await startServer({
+      oauthFetch: (async (url: string | URL, init?: RequestInit) => {
+        const href = url.toString();
+        if (href.includes('oauth2.googleapis.com/token')) {
+          // No `refresh_token` field at all — the exact shape `buildConsentUrl`'s
+          // own docblock says a stale, already-approved consent can produce
+          // even with `access_type=offline` requested.
+          return jsonResponse(200, { access_token: 'access-token-value', scope: 'x' });
+        }
+        return successfulProviderFetch()(url as string, init);
+      }) as typeof fetch,
+    });
+    const cookie = await loginWithPassword(baseUrl);
+    const state = await beginConsent(baseUrl, cookie);
+
+    const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=auth-code-value`, {
+      headers: { cookie },
+    });
+    expect(res.status).toBe(400);
+    expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
+  });
+
+  it('refuses without a session, before even reading the query string (M11)', async () => {
+    const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
+    const res = await fetch(`${baseUrl}/oauth/callback?state=anything&code=anything`, {
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
   });
 
   /**
@@ -328,6 +422,83 @@ describe('POST /oauth/:system/revoke', () => {
     });
     expect(res.status).toBe(403);
     expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).not.toBeNull();
+  });
+
+  /**
+   * I4 — "still revokes locally even when the provider fails" (below) passes
+   * under EITHER ordering: a provider-first implementation that catches the
+   * throw and then still calls `revokeGrant` would pass it too. This test
+   * pins the order from inside the fake itself: the provider handler reads
+   * the row directly and records what it saw AT THE MOMENT it was called.
+   */
+  it('has already revoked the local row by the time the provider is called (I4)', async () => {
+    let revokedAtWhenProviderWasCalled: Date | null | undefined;
+    const orderedFetch = (async (url: string | URL, init?: RequestInit) => {
+      const href = url.toString();
+      if (href.includes('oauth2.googleapis.com/revoke')) {
+        const { rows } = await getPool().query<{ revoked_at: Date | null }>(
+          'SELECT revoked_at FROM oauth_grants WHERE business_id = $1 AND system = $2',
+          [BUSINESS, SYSTEM],
+        );
+        revokedAtWhenProviderWasCalled = rows[0]?.revoked_at ?? null;
+        return new Response('', { status: 200 });
+      }
+      return successfulProviderFetch()(url as string, init);
+    }) as typeof fetch;
+
+    const baseUrl = await startServer({ oauthFetch: orderedFetch });
+    const cookie = await loginWithPassword(baseUrl);
+    await grantedSystem(baseUrl, cookie);
+
+    const sessionId = sessionIdFromCookie(cookie);
+    const res = await fetch(`${baseUrl}/oauth/${SYSTEM}/revoke`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf: issueCsrfToken(sessionId) }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(revokedAtWhenProviderWasCalled).not.toBeNull();
+  });
+
+  /**
+   * I5 — the audit row must distinguish "nothing was live" from "we could
+   * not check because the key would not open". A live grant existed here;
+   * the master key file is corrupted just before the revoke request, so the
+   * route can neither decrypt the grant nor attempt provider revocation —
+   * and the record must say exactly that, never the unrelated "no live
+   * grant was found" sentence (which would tell the owner, falsely, that
+   * nothing is left to worry about upstream).
+   */
+  it('records that the key could not be checked, never that no grant existed (I5)', async () => {
+    const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
+    const cookie = await loginWithPassword(baseUrl);
+    await grantedSystem(baseUrl, cookie);
+
+    // Corrupt the key file (wrong length) so `loadMasterKey` throws on the
+    // revoke request specifically, after a perfectly good grant was written.
+    await writeFile(keyPath, randomBytes(16));
+
+    const sessionId = sessionIdFromCookie(cookie);
+    const res = await fetch(`${baseUrl}/oauth/${SYSTEM}/revoke`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf: issueCsrfToken(sessionId) }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+
+    // The local revoke does not need the key at all, and must still happen.
+    const { rows } = await getPool().query<{ revoked_at: Date | null }>(
+      'SELECT revoked_at FROM oauth_grants WHERE business_id = $1 AND system = $2',
+      [BUSINESS, SYSTEM],
+    );
+    expect(rows[0]?.revoked_at).not.toBeNull();
+
+    const audit = await queryAudit({ businessId: BUSINESS, kind: 'credential_change' });
+    const revokeRow = audit.find((row) => row.reason.includes('revoked locally'));
+    expect(revokeRow?.reason).toContain('master key');
+    expect(revokeRow?.reason).not.toContain('no live grant was found');
   });
 
   it('still revokes locally even when the provider-side attempt fails', async () => {

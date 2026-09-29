@@ -32,6 +32,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { appendAudit } from '../audit/log.js';
+import { withTransaction } from '../db/pool.js';
 import { canonicalHash } from '../util/canonical.js';
 import { storedCredentials } from '../governance/credential-store.js';
 import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
@@ -329,59 +330,86 @@ export async function handleOAuthCallback(
     );
   }
 
+  // Narrowed into its own binding: the null-check above narrows
+  // `exchange.refreshToken` only in THIS scope, not inside the `withTransaction`
+  // closure below, which TypeScript cannot prove runs before anything else
+  // could reassign the property.
+  const refreshToken: string = exchange.refreshToken;
+
   const account = (await fetchGoogleAccount(exchange.accessToken, options.fetchImpl)) ?? 'לא זוהה';
   const credentialRef = credentialRefForSystem(system);
 
-  await writeGrant(
-    {
-      businessId,
-      system,
-      provider: OAUTH_PROVIDER,
-      credentialRef,
-      account,
-      scopes: exchange.grantedScopes,
-      refreshToken: exchange.refreshToken,
-      grantedBy: session.username,
-    },
-    key,
-  );
+  // The grant, its audit row, and the binding write are ONE transaction --
+  // not three independent commits. `appendAudit` committing separately AFTER
+  // `writeGrant` would leave a refresh token for the business's own Google
+  // account sealed in the database with no `credential_change` row anywhere
+  // if the append failed -- exactly the shape `upsertBinding`'s own docblock
+  // refuses ("an append that fails must roll the write back ... which would
+  // make the audit trail a mitigation in name only") and `decideAndSign`
+  // refuses for the identical reason. Both provider calls (`exchangeCode`,
+  // `fetchGoogleAccount`) already completed ABOVE this point, deliberately:
+  // holding a pooled connection open across a network round trip is the
+  // usual reason to refuse a transaction like this one, and neither call
+  // needs to be inside it. `consumeState` (above) stays OUTSIDE too -- it is
+  // the anti-forgery claim, and rolling it back on a downstream failure would
+  // make the state reusable. So a failure here rolls the grant, audit and
+  // binding back together while the state stays consumed, and the owner
+  // simply restarts the ceremony -- the same trade `decideAndSign` makes for
+  // a failed sign-and-approve. The success page below is rendered only after
+  // this commits.
+  await withTransaction(async (tx) => {
+    await writeGrant(
+      {
+        businessId,
+        system,
+        provider: OAUTH_PROVIDER,
+        credentialRef,
+        account,
+        scopes: exchange.grantedScopes,
+        refreshToken,
+        grantedBy: session.username,
+      },
+      key,
+      { db: tx },
+    );
 
-  await appendAudit(
-    {
-      actor: 'human',
-      onBehalfOf: session.username,
-      kind: 'credential_change',
-      // No charter decision to name a version for -- this sits beside the
-      // gate, like `secret.ts`'s own `credential_change` rows and
-      // `erasure.ts`'s owner-triggered actions.
-      charterVersion: 'n/a',
-      provenance: 'boss',
-      inputHash: canonicalHash({ businessId, system, provider: OAUTH_PROVIDER, credentialRef }),
-      reason:
-        `oauth consent granted for system "${system}" (provider: ${OAUTH_PROVIDER}) by ${session.username}; ` +
-        `scopes: ${exchange.grantedScopes.length > 0 ? exchange.grantedScopes.join(', ') : '(none reported)'}`,
-    },
-    { businessId },
-  );
+    await appendAudit(
+      {
+        actor: 'human',
+        onBehalfOf: session.username,
+        kind: 'credential_change',
+        // No charter decision to name a version for -- this sits beside the
+        // gate, like `secret.ts`'s own `credential_change` rows and
+        // `erasure.ts`'s owner-triggered actions.
+        charterVersion: 'n/a',
+        provenance: 'boss',
+        inputHash: canonicalHash({ businessId, system, provider: OAUTH_PROVIDER, credentialRef }),
+        reason:
+          `oauth consent granted for system "${system}" (provider: ${OAUTH_PROVIDER}) by ${session.username}; ` +
+          `scopes: ${exchange.grantedScopes.length > 0 ? exchange.grantedScopes.join(', ') : '(none reported)'}`,
+      },
+      { businessId, tx },
+    );
 
-  // Task 4's fix: the callback must also write the binding's `provider`, not
-  // only the grant -- otherwise the owner has authorised Google with no
-  // adapter ever registered for it. Existing operational fields (`endpoint`,
-  // health) are preserved rather than reset, since `upsertBinding` is a
-  // whole-row replace.
-  const existing = (await loadBindings({ businessId })).find((b) => b.system === system) ?? null;
-  await upsertBinding(
-    {
-      system,
-      status: 'live',
-      endpoint: existing?.endpoint ?? null,
-      credentialRef,
-      provider: OAUTH_PROVIDER,
-      lastOkAt: existing?.lastOkAt ?? null,
-      lastError: existing?.lastError ?? null,
-    },
-    { businessId, by: session.username },
-  );
+    // Task 4's fix: the callback must also write the binding's `provider`,
+    // not only the grant -- otherwise the owner has authorised Google with
+    // no adapter ever registered for it. Existing operational fields
+    // (`endpoint`, health) are preserved rather than reset, since
+    // `upsertBinding` is a whole-row replace.
+    const existing = (await loadBindings({ businessId, db: tx })).find((b) => b.system === system) ?? null;
+    await upsertBinding(
+      {
+        system,
+        status: 'live',
+        endpoint: existing?.endpoint ?? null,
+        credentialRef,
+        provider: OAUTH_PROVIDER,
+        lastOkAt: existing?.lastOkAt ?? null,
+        lastError: existing?.lastError ?? null,
+      },
+      { businessId, by: session.username, db: tx },
+    );
+  });
 
   sendHtml(
     res,
@@ -407,6 +435,18 @@ export async function handleOAuthCallback(
  * longer see it, which is exactly the point of a soft revoke, but it means
  * the plaintext token for the provider-side attempt has to be captured
  * first and held only in this function's own memory.
+ *
+ * **The audit row states which of three things actually happened, never a
+ * sentence that could be false.** `revokeGrant`'s own return value (whether a
+ * live row actually changed) decides the local half, so "revoked locally" is
+ * never written when nothing was live. The provider half distinguishes a
+ * live grant the provider confirmed or refused revoking from the case where
+ * the master key itself would not open -- that case is NOT "no live grant
+ * was found": a live grant may well exist and remain valid at the provider,
+ * and the honest thing to record is that this attempt could not check. Same
+ * standard `KillSwitchAuditUnrecordedError`/`ErasureAuditUnrecordedError`
+ * hold elsewhere in this codebase: say what happened, never what merely
+ * looks similar.
  */
 export async function handleOAuthRevoke(
   req: IncomingMessage,
@@ -422,6 +462,7 @@ export async function handleOAuthRevoke(
   }
 
   let key: Buffer | null = null;
+  let keyUnavailable = false;
   try {
     key = await loadKeyForRequest(options.credentialKeyPath);
   } catch {
@@ -429,17 +470,25 @@ export async function handleOAuthRevoke(
     // master key -- it is authoritative for us regardless of whether we can
     // also reach the provider. See module docblock.
     key = null;
+    keyUnavailable = true;
   }
 
   const grant = key !== null ? await readGrantBySystem(system, businessId, key) : null;
 
   // Local-first, and authoritative: written before any network call to the
   // provider, matching `killswitch.ts`'s `trip()` writing its state before
-  // recording it, for the identical reason.
-  await revokeGrant(system, businessId, session.username);
+  // recording it, for the identical reason. `changed` is `revokeGrant`'s own
+  // report of whether a live row actually existed to revoke -- used below
+  // instead of assuming the call itself proves something was live.
+  const changed = await revokeGrant(system, businessId, session.username);
 
-  let providerOutcome: 'not_attempted' | 'revoked' | 'failed' = 'not_attempted';
-  if (grant !== null) {
+  type ProviderOutcome = 'revoked' | 'failed' | 'no_live_grant' | 'key_unavailable';
+  let providerOutcome: ProviderOutcome;
+  if (keyUnavailable) {
+    providerOutcome = 'key_unavailable';
+  } else if (grant === null) {
+    providerOutcome = 'no_live_grant';
+  } else {
     providerOutcome = 'failed';
     try {
       const doFetch = options.fetchImpl ?? fetch;
@@ -454,12 +503,16 @@ export async function handleOAuthRevoke(
     }
   }
 
-  const outcomeNote =
-    providerOutcome === 'revoked'
-      ? '; the provider confirmed revocation'
-      : providerOutcome === 'failed'
-        ? '; the provider-side revocation attempt failed — the local revoke is authoritative regardless'
-        : '; no live grant was found to revoke at the provider';
+  const localNote = changed
+    ? 'the grant was revoked locally'
+    : 'no live grant existed locally to revoke';
+  const providerNote: Record<ProviderOutcome, string> = {
+    revoked: 'the provider confirmed revocation',
+    failed: 'the provider-side revocation attempt failed — the local revoke is authoritative regardless',
+    no_live_grant: 'no live grant was found to revoke at the provider',
+    key_unavailable:
+      'could not attempt provider revocation — the master key would not open, so whether access remains at the provider is unknown',
+  };
 
   await appendAudit(
     {
@@ -469,7 +522,7 @@ export async function handleOAuthRevoke(
       charterVersion: 'n/a',
       provenance: 'boss',
       inputHash: canonicalHash({ businessId, system, action: 'revoke' }),
-      reason: `oauth grant for system "${system}" revoked locally by ${session.username}${outcomeNote}`,
+      reason: `oauth revoke for system "${system}" by ${session.username}: ${localNote}; ${providerNote[providerOutcome]}`,
     },
     { businessId },
   );

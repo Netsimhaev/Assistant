@@ -139,12 +139,29 @@ describe('exchangeCode', () => {
       ok: true,
       accessToken: 'access-token-value',
       refreshToken: 'refresh-token-value',
-      expiresInSeconds: 3600,
       grantedScopes: ['https://www.googleapis.com/auth/calendar.readonly'],
     });
     // PKCE actually travels: the verifier must reach the token request body.
     expect(capturedBody).toContain('code_verifier=verifier-value');
     expect(capturedBody).toContain('grant_type=authorization_code');
+  });
+
+  it('succeeds even when the provider omits expires_in, which this module never reads', async () => {
+    const outcome = await exchangeCode({
+      code: 'auth-code',
+      codeVerifier: 'verifier',
+      redirectUri: REDIRECT_URI,
+      credentials: CREDENTIALS,
+      businessId: 'biz',
+      fetchImpl: async () =>
+        jsonResponse(200, { access_token: 'access-token-value', refresh_token: 'refresh-token-value' }),
+    });
+    expect(outcome).toEqual({
+      ok: true,
+      accessToken: 'access-token-value',
+      refreshToken: 'refresh-token-value',
+      grantedScopes: [],
+    });
   });
 
   it('reports null refreshToken rather than inventing one when the provider omits it', async () => {

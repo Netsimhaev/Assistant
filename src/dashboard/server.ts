@@ -158,12 +158,24 @@ export interface DashboardOptions {
   oauthFetch?: typeof fetch;
 }
 
+/**
+ * `SameSite=Lax`, not `Strict`. Google returns the owner to `/oauth/callback`
+ * by a cross-site TOP-LEVEL NAVIGATION (a real browser redirect after the
+ * owner clicks "allow"), and a `Strict` cookie is withheld on exactly that —
+ * the callback would see no session, redirect to `/login` without preserving
+ * the query string, and silently discard the authorisation code. `Lax` still
+ * withholds the cookie on a cross-site POST, which is every state-changing
+ * route this dashboard has; the one cross-site GET this adds
+ * (`/oauth/:system/start`'s eventual redirect target, and the callback
+ * itself) is not exploitable in the harmful direction — see the
+ * `SECURITY_HEADERS` docblock below for why.
+ */
 function sessionCookie(token: string): string {
-  return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`;
+  return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`;
 }
 
 function clearedCookie(): string {
-  return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`;
+  return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
 }
 
 /** An audited address is never longer than this. A header is attacker-supplied text even when the proxy is trusted. */
@@ -191,6 +203,24 @@ const MAX_ADDRESS_LENGTH = 64;
  *     its left may have been sent by the client. Reading the leftmost entry
  *     — the usual mistake — is reading whatever an attacker typed.
  */
+/**
+ * `decodeURIComponent` on a path segment, refused rather than thrown.
+ *
+ * Mirrors `parseCookies`'s own handling of the identical hazard eighteen
+ * lines below this file's cookie parsing (a malformed `%` escape must mean
+ * "not this", never a 500): a system name in an OAuth route's path is
+ * attacker-reachable text (anyone who can get the owner to click a link, or
+ * who is probing directly), and a hand-crafted `%` escape must read as a
+ * readable refusal, not a crash.
+ */
+function decodePathSegment(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
 function clientAddress(req: IncomingMessage, trustProxy: boolean): string {
   const socketAddress = req.socket.remoteAddress ?? 'unknown';
   if (!trustProxy) return `${socketAddress} (proxy hop; not the client address)`;
@@ -257,10 +287,14 @@ async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
  * rule, a corporate proxy), and a cached approval card is an email body, a
  * counterparty and an amount served to whoever asks next.
  *
- * `X-Frame-Options: DENY` is defence in depth, not a hole being closed —
- * `SameSite=Strict` already keeps the session cookie out of a cross-site
- * iframe, so the approve/deny buttons cannot be clickjacked today. This is
- * cheap insurance against that assumption ever changing.
+ * `X-Frame-Options: DENY` is defence in depth, not a hole being closed. The
+ * session cookie is `SameSite=Lax`, not `Strict` (see `sessionCookie`'s own
+ * docblock for why the OAuth callback needs that) — so what actually keeps
+ * the approve/deny buttons from being clickjacked is that every
+ * state-changing route on this dashboard is a POST, which `Lax` withholds
+ * the cookie from cross-site regardless of framing, not the cookie's
+ * SameSite mode on its own. `X-Frame-Options` is cheap insurance on top of
+ * that, not the control itself.
  */
 const SECURITY_HEADERS = {
   'Cache-Control': 'no-store',
@@ -1934,9 +1968,11 @@ async function route(
   // reasoning that puts "sign and approve" and erasure here (spec 5.1).
   const oauthStartMatch = OAUTH_START_PATH.exec(pathname);
   if (method === 'GET' && oauthStartMatch) {
-    const system = oauthStartMatch[1];
-    if (system !== undefined) {
-      return handleOAuthStart(res, businessId, session, decodeURIComponent(system), oauthOptions);
+    const raw = oauthStartMatch[1];
+    if (raw !== undefined) {
+      const system = decodePathSegment(raw);
+      if (system === null) return sendHtml(res, 404, renderNotFound());
+      return handleOAuthStart(res, businessId, session, system, oauthOptions);
     }
   }
   if (method === 'GET' && pathname === '/oauth/callback') {
@@ -1944,9 +1980,11 @@ async function route(
   }
   const oauthRevokeMatch = OAUTH_REVOKE_PATH.exec(pathname);
   if (method === 'POST' && oauthRevokeMatch) {
-    const system = oauthRevokeMatch[1];
-    if (system !== undefined) {
-      return handleOAuthRevoke(req, res, businessId, session, decodeURIComponent(system), oauthOptions);
+    const raw = oauthRevokeMatch[1];
+    if (raw !== undefined) {
+      const system = decodePathSegment(raw);
+      if (system === null) return sendHtml(res, 404, renderNotFound());
+      return handleOAuthRevoke(req, res, businessId, session, system, oauthOptions);
     }
   }
 

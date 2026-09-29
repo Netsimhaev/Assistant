@@ -2208,6 +2208,11 @@ describe('tenant isolation', () => {
 });
 
 describe('session cookie', () => {
+  // `SameSite=Lax`, not `Strict` — see `sessionCookie`'s own docblock in
+  // `server.ts`. A `Strict` cookie is withheld on the cross-site top-level
+  // navigation Google uses to return the owner to `/oauth/callback`, which
+  // would silently discard every authorisation code before the ceremony
+  // could ever complete in a real browser.
   it('locks the session cookie down', async () => {
     const baseUrl = await startServer(BUSINESS);
     const res = await fetch(`${baseUrl}/login`, {
@@ -2218,7 +2223,7 @@ describe('session cookie', () => {
     const setCookie = res.headers.get('set-cookie') ?? '';
     expect(setCookie).toContain('HttpOnly');
     expect(setCookie).toContain('Secure');
-    expect(setCookie).toContain('SameSite=Strict');
+    expect(setCookie).toContain('SameSite=Lax');
   });
 });
 

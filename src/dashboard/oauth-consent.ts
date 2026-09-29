@@ -126,15 +126,24 @@ export type ExchangeCodeOutcome =
       accessToken: string;
       /** `null` when the provider did not return one -- see `buildConsentUrl`'s docblock for when that happens even with `access_type=offline` requested. The caller must treat this as a failure to connect, not a partial success. */
       refreshToken: string | null;
-      expiresInSeconds: number;
       /** What the provider actually GRANTED, from its own `scope` field -- never what was requested. A provider may hand back fewer scopes than asked for; recording the request instead would be a lie about what the assistant can actually do. */
       grantedScopes: string[];
     }
   | { ok: false; kind: 'misconfigured' | 'rejected' | 'transient'; message: string };
 
+/**
+ * `expires_in` is deliberately NOT a field here. This grant's access token is
+ * never kept past this one request (the caller reads it once, to fetch the
+ * account label, and discards it -- `oauth-token.ts`'s own long-lived access
+ * token cache is a separate, later concern), so an expiry nobody reads would
+ * be dead data with a sharp edge: requiring it would turn a genuinely
+ * successful exchange into a manufactured `transient` failure the moment a
+ * provider ever omits it -- AFTER the one-use `state` has already been
+ * consumed, so the owner would have to restart the whole ceremony over a
+ * field this module never uses.
+ */
 const GoogleAuthCodeSuccessBody = z.object({
   access_token: z.string().min(1),
-  expires_in: z.number().positive(),
   refresh_token: z.string().min(1).optional(),
   scope: z.string().optional(),
 });
@@ -207,7 +216,6 @@ export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCo
       ok: true,
       accessToken: parsed.data.access_token,
       refreshToken: parsed.data.refresh_token ?? null,
-      expiresInSeconds: parsed.data.expires_in,
       grantedScopes: (parsed.data.scope ?? '')
         .split(/\s+/)
         .filter((scope) => scope.length > 0),

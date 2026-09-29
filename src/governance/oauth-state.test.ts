@@ -40,7 +40,7 @@ describe('oauth-state: the anti-forgery gate for the consent ceremony', () => {
     });
   });
 
-  it('refuses a state from another business, and an expired one', async () => {
+  it('refuses a state from another business, WITHOUT consuming it', async () => {
     const state = await createState({
       businessId: BUSINESS,
       system: 'office-calendar',
@@ -48,10 +48,29 @@ describe('oauth-state: the anti-forgery gate for the consent ceremony', () => {
       codeVerifier: 'v1',
     });
     expect(await consumeState(state, OTHER_BUSINESS)).toBeNull();
-    // The wrong-business attempt above must not have consumed it either --
-    // otherwise a probe from any business would burn every other business's
-    // states, a denial-of-service against the ceremony itself.
-    await getPool().query(`UPDATE oauth_states SET expires_at = now() - interval '1 minute'`);
+    // The load-bearing half of this test: an implementation that filtered
+    // by `business_id` in JavaScript instead of in the `WHERE` clause (or
+    // dropped it from the predicate entirely and only checked it on the
+    // returned row) would ALSO return `null` above -- but it would have
+    // already consumed the row doing so, which `consumeState`'s own
+    // docblock names as exactly the alternative shape it rejects. Proving
+    // the wrong-business attempt refuses is not enough; it must refuse
+    // *without spending the state*, or a probe from any business would burn
+    // every other business's states -- a denial-of-service against the
+    // ceremony itself. The correct business must still be able to consume it.
+    expect((await consumeState(state, BUSINESS))?.system).toBe('office-calendar');
+  });
+
+  it('refuses an expired state', async () => {
+    const state = await createState({
+      businessId: BUSINESS,
+      system: 'office-calendar',
+      sessionId: 's1',
+      codeVerifier: 'v1',
+    });
+    await getPool().query(`UPDATE oauth_states SET expires_at = now() - interval '1 minute' WHERE state = $1`, [
+      state,
+    ]);
     expect(await consumeState(state, BUSINESS)).toBeNull();
   });
 
