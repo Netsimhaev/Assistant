@@ -73,13 +73,23 @@ const SMTP_KEYS = [
  * needs to see what `SmtpConfig` and per-send credential actually reached
  * nodemailer, the same seam `SmtpConfig.createTransport` documents for
  * `createSmtpTransport` itself. `overrides.tokenHttp` and
- * `overrides.calendarHttp` are the same seam one layer over, for a test that
+ * `overrides.calendarHttp` are the same seam one layer over — a test that
  * needs to see what reached the OAuth token exchange or the calendar API
- * without a real Google account behind it. No production caller ever passes
- * any of them — every real call site calls `buildRuntime()` with zero
- * arguments: `run-scheduler.ts`, `run-due.ts` and `scheduler.ts` in the
- * product, plus the two operator scripts `scripts/live-thread-status.ts` and
- * `scripts/probe-smtp.ts`.
+ * without a real Google account behind it — and **no test in this
+ * sub-project uses either one yet**. They exist for two NAMED future
+ * consumers: Task 5's consent-flow tests (which need to drive a fake token
+ * exchange through a `buildRuntime`-assembled runtime end to end, the way
+ * this sub-project's own tests drive `createTransport`) and a future
+ * live-run script test for the calendar chain, the sibling of
+ * `probe-smtp.ts`. Naming the expected consumer here is deliberate: a seam
+ * with no reader and no stated owner is exactly the "field nobody reads"
+ * class this project has paid for more than once (fix round 2, minor 7) —
+ * until one of those two lands, this stays a documented gap, not a claim
+ * that something already exercises it. No production caller ever passes
+ * any of the three overrides — every real call site calls `buildRuntime()`
+ * with zero arguments: `run-scheduler.ts`, `run-due.ts` and `scheduler.ts`
+ * in the product, plus the two operator scripts
+ * `scripts/live-thread-status.ts` and `scripts/probe-smtp.ts`.
  *
  * **The credential source is a composition, not a single store.**
  * `oauthCredentials` wraps `storedCredentials(key)` rather than replacing

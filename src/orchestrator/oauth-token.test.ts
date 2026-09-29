@@ -15,6 +15,7 @@ import type { CredentialSource } from './credentials.js';
 import {
   AmbiguousCredentialRefError,
   OAuthGrantRevokedError,
+  OAuthMisconfiguredError,
   OAuthRefreshRejectedError,
   OAuthRefreshTransientError,
   oauthCredentials,
@@ -75,6 +76,17 @@ const NEVER_CALLED_HTTP: TokenHttp = {
 const REJECTING_HTTP: TokenHttp = {
   async exchangeRefresh(): Promise<RefreshOutcome> {
     return { ok: false, kind: 'rejected', message: 'invalid_grant' };
+  },
+};
+
+/**
+ * A `TokenHttp` that always reports this INSTALLATION never provisioned its
+ * own app configuration (the OAuth client id/secret) -- the provider was
+ * never reached, unlike `REJECTING_HTTP` above.
+ */
+const MISCONFIGURED_HTTP: TokenHttp = {
+  async exchangeRefresh(): Promise<RefreshOutcome> {
+    return { ok: false, kind: 'misconfigured', message: 'GOOGLE_OAUTH_CLIENT_SECRET not provisioned' };
   },
 };
 
@@ -186,6 +198,53 @@ describe('oauthCredentials', () => {
     expect(caught).toBeInstanceOf(OAuthRefreshRejectedError);
     expect((caught as Error).message).toContain('invalid_grant');
     expect((await listGrants(BUSINESS))[0]?.needsReauthAt).not.toBeNull();
+  });
+
+  /**
+   * The direct contrast to the 'rejected' test just above (fix round 2,
+   * finding I2 — not addressed in round 1, because this test did not exist
+   * yet). Same grant, same call shape, same assertions in the same order —
+   * only the `TokenHttp` outcome's `kind` differs. Read the two side by
+   * side: 'rejected' writes an audit row naming the provider AND flags
+   * `needsReauthAt`; 'misconfigured' does NEITHER, because the provider was
+   * never reached and there is nothing true to say about it, and
+   * re-consenting cannot fix a local secret nobody provisioned.
+   */
+  it('reports a missing local configuration as terminal, WITHOUT the audit row or the re-auth flag a real rejection gets', async () => {
+    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http: MISCONFIGURED_HTTP });
+
+    const before = await getPool().query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM audit_log WHERE business_id = $1`,
+      [BUSINESS],
+    );
+
+    // Positive half FIRST: the call actually reached the refresh path and
+    // threw the RIGHT class. Everything below is meaningless on a resolve
+    // that never got there.
+    let caught: unknown;
+    try {
+      await source.resolve(GRANT.credentialRef, BUSINESS);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(OAuthMisconfiguredError);
+    expect((caught as Error).message).toContain('GOOGLE_OAUTH_CLIENT_SECRET not provisioned');
+
+    // No audit row was written at all — contrast with the 'rejected' test
+    // above, which asserts exactly one new `credential_change` row naming
+    // the provider and the system.
+    const after = await getPool().query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM audit_log WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
+
+    // `needsReauthAt` is still null — this is the assertion that separates
+    // "terminal" from "the provider refused you", and the one an owner's
+    // actual experience depends on: a grant flagged here would tell them to
+    // re-consent, which does nothing for a secret nobody put in the store.
+    expect((await listGrants(BUSINESS))[0]?.needsReauthAt).toBeNull();
   });
 
   it('reports a transient failure as retryable, distinct from a rejection, and does not flag re-auth', async () => {
