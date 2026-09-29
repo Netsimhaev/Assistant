@@ -197,22 +197,37 @@ describe('an OAuth refresh token leaves no trace outside its own ciphertext', ()
   /**
    * Seed a grant carrying the sentinel as its refresh token, then drive a
    * FULL resolve through `oauthCredentials` — the token service every real
-   * adapter call goes through. **What that actually exercises, precisely:**
-   * the sentinel is decrypted out of the grant row, passes the ambiguity
-   * check against the fallback source, and reaches `recordRefresh` (which
-   * re-seals it, unchanged, back into `oauth_grants`). What lands in the
-   * cache and in the handle returned to the caller is a SEPARATE, freshly
-   * issued access token — the stub `TokenHttp`'s own `'issued-access-token-
-   * value'`, asserted on the line above this comment — never the sentinel
-   * itself. `oauthCredentials`'s own module docblock states the same thing
-   * as a design rule ("the REFRESH token... is never cached"); this test
-   * does not exercise a different path than that rule describes, and an
-   * earlier draft of this comment wrongly claimed the sentinel reaches "the
-   * cache write" — it does not, and the assertion below would have caught it
-   * if it had. What this scan actually proves is the stronger, true claim:
-   * the long-lived secret does not land in any text/JSON/array column
-   * anywhere in the schema on the path a real resolve takes, cache miss
-   * included. Then pull every `text`/`character varying`/`json`/`jsonb`/
+   * adapter call goes through. **What that actually exercises, precisely —
+   * this is the third rewrite of this paragraph, and this time every clause
+   * is traced against the code, not described from memory of what the shape
+   * "should" do:**
+   *   - `readGrantByRef` decrypts the sentinel out of the grant row, so it
+   *     exists in process memory on the real resolve path.
+   *   - It reaches the outbound boundary: it is handed to
+   *     `options.http.exchangeRefresh(...)` (the `TokenHttp` call) as
+   *     `refreshToken` — the furthest any code in this system ever carries
+   *     it.
+   *   - `recordRefresh` is called afterwards, but NOT with the sentinel: it
+   *     is called with `outcome.rotatedRefreshToken`, the PROVIDER's own
+   *     token, which the stub `TokenHttp` below returns as `null`.
+   *     `recordRefresh`'s `null` branch never touches `ciphertext`/`nonce`
+   *     at all — it only advances `last_refreshed_at`/`refresh_count` — so
+   *     nothing is re-sealed on this path; the row's original ciphertext is
+   *     simply left untouched, which is a different fact from "re-sealed
+   *     unchanged" (an earlier draft of this paragraph claimed exactly that,
+   *     wrongly).
+   *   - A SEPARATE, freshly issued access token — the stub's own
+   *     `'issued-access-token-value'`, asserted on the line above this
+   *     comment — is what lands in the cache and in the handle returned to
+   *     the caller. `oauthCredentials`'s own module docblock states the same
+   *     thing as a design rule ("the REFRESH token... is never cached"); an
+   *     earlier draft of this paragraph also wrongly claimed the sentinel
+   *     reaches "the cache write" — it does not.
+   *
+   * What the scan below actually proves, and it is the strongest true claim
+   * available: after a complete resolve has run the sentinel all the way to
+   * the outbound boundary, it appears in NO plaintext column of any table in
+   * the schema. Then pull every `text`/`character varying`/`json`/`jsonb`/
    * `ARRAY` column of every table from `information_schema.columns` — never
    * a list written by hand, for the identical reason
    * `erasure-invariants.test.ts` reads the schema instead of a fixed list —
