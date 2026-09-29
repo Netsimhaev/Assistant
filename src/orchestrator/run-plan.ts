@@ -16,7 +16,7 @@ import { delegationProblems } from '../governance/delegation.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import type { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
-import { loadBindings } from './bindings.js';
+import { loadBindings, recordBindingOutcome } from './bindings.js';
 import { deriveTargetId, resolveChannel } from './channels.js';
 import type { CredentialSource } from './credentials.js';
 import { executeStep, type StepEffect, type StepOutcome } from './execute.js';
@@ -663,6 +663,25 @@ async function performStep(
     },
     request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS,
   );
+
+  // The binding's health, after the fact rather than before it. `last_ok_at`
+  // and `last_error` have had no writer since the table was created — see
+  // `recordBindingOutcome`'s own docblock for the full reasoning, including
+  // why a failure here never touches `status`. `errorCode`/`errorMessage`
+  // come from `result` alone, the adapter's own classification of what just
+  // happened — never from `credential` or anything else in this closure that
+  // might carry a secret. `.catch` and not a bare `await`: this is display,
+  // not control, and a bookkeeping UPDATE that fails must not turn a step
+  // that actually succeeded (or failed for its own, already-handled reason)
+  // into something this function reports differently.
+  await recordBindingOutcome({
+    businessId: request.job.businessId,
+    system: resolution.system,
+    ok: result.ok,
+    ...(result.ok ? {} : { errorCode: result.code, errorMessage: result.message }),
+  }).catch(() => {
+    /* display, not control — see recordBindingOutcome's docblock */
+  });
 
   // Acting on the result is the whole point. Ignoring it would record an
   // unimplemented browser call as an order placed, and send the confirmation.

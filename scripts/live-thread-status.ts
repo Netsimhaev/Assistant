@@ -9,13 +9,14 @@
  */
 import { config } from '../src/config.js';
 import { closePool, getPool } from '../src/db/pool.js';
-import { activeCharterVersion } from '../src/charter/store.js';
+import { activeCharterVersion, loadActiveCharter } from '../src/charter/store.js';
 import { DEFAULT_DASHBOARD_BASE_URL, redirectUriFor } from '../src/dashboard/oauth-routes.js';
 import { loadBindings } from '../src/orchestrator/bindings.js';
 import {
   GOOGLE_CLIENT_ID_REF,
   GOOGLE_CLIENT_SECRET_REF,
 } from '../src/orchestrator/adapters/google-token-http.js';
+import { listGrants } from '../src/governance/oauth-grants.js';
 import { loadRampLevel } from '../src/orchestrator/ramp.js';
 import { buildRuntime } from '../src/orchestrator/runtime.js';
 
@@ -112,6 +113,51 @@ if (runtime !== null) {
 // Google mid-consent.
 const dashboardBaseUrlForOAuth = process.env['DASHBOARD_BASE_URL'] ?? DEFAULT_DASHBOARD_BASE_URL;
 console.log(`\noauth redirect_uri: ${redirectUriFor(dashboardBaseUrlForOAuth)}`);
+
+// One line per connection the CHARTER declares — not per binding, and not
+// per grant: a connection the owner signed but never authorised is exactly
+// the state an operator needs to see before a run, not discover as
+// `credential_unavailable` mid-run. `listGrants` returns `OAuthGrantSummary`,
+// which carries no refresh token at all (see `governance/oauth-grants.ts`) —
+// it cannot leak one here even by a future mistake in this script.
+//
+// Caught rather than left to reject, same discipline as the `buildRuntime`
+// call above and for the identical reason: a stored charter whose
+// schemaVersion the running code no longer understands is a real, nameable
+// state (`loadActiveCharter`'s own error says exactly which way to fix it),
+// and a readiness script whose whole job is printing MISS lines must print
+// one for this too, not stop with a stack trace before the remaining checks
+// run.
+let active: Awaited<ReturnType<typeof loadActiveCharter>> | null = null;
+try {
+  active = await loadActiveCharter(businessId);
+} catch (error) {
+  line(false, 'declared connections', error instanceof Error ? error.message : String(error));
+}
+if (active !== null) {
+  const grants = await listGrants(businessId);
+  const grantBySystem = new Map(grants.map((g) => [g.system, g] as const));
+  console.log('\ndeclared connections:');
+  for (const conn of active.bundle.connections) {
+    const grant = grantBySystem.get(conn.system);
+    const detail =
+      grant === undefined
+        ? 'no grant — connect it from /connections'
+        : grant.revokedAt !== null
+          ? `revoked at ${grant.revokedAt} — reconnect from /connections`
+          : grant.needsReauthAt !== null
+            ? `needs re-authorisation since ${grant.needsReauthAt} — reconnect from /connections`
+            : `granted to ${grant.account} (${grant.provider})`;
+    line(
+      grant !== undefined && grant.revokedAt === null && grant.needsReauthAt === null,
+      `connection ${conn.system}`,
+      detail,
+    );
+  }
+  if (active.bundle.connections.length === 0) {
+    console.log('      (none declared in the charter)');
+  }
+}
 
 const ramp = await loadRampLevel('email.initiate', { businessId });
 line(true, 'ramp email.initiate', `${ramp} (job:seed raises it to approve_required)`);
