@@ -6,6 +6,7 @@ import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
 import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
 import type { PolicyBundle } from '../domain/policy.js';
+import { OAuthGrantError } from '../governance/oauth-grants.js';
 import { createJob, transition, loadJob } from './jobs.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterCall, AdapterResult, ExternalAdapter } from './adapters/types.js';
@@ -244,5 +245,164 @@ describe('the binding health fields get a writer', () => {
     // connection. That is `status`'s question, and only a human or an
     // explicit health check answers it.
     expect(row.status).toBe('live');
+  });
+});
+
+/**
+ * Final fix wave, item 12 — spec §3.4 row 5's "one refresh and one retry".
+ * `oauthCredentials` (`oauth-token.ts`) keeps a short-lived access token in
+ * memory and trusts its own recorded expiry; a 401 from the RESOURCE call
+ * (not the refresh call) is the one signal that proves the provider already
+ * invalidated a token this module still thinks is good. `performStep`
+ * (`run-plan.ts`) is the one place that sees both the classified result and
+ * the `credentialRef` that produced it, so it is the one place that can call
+ * `credentials.invalidate?.(ref, businessId)` — proven here through a real
+ * `runPlan` call, the same discipline the describe block above uses, not by
+ * calling the private helper directly.
+ */
+describe('a 401 from the resource call invalidates the cached credential', () => {
+  it('calls credentials.invalidate with the resolved ref and business id on an "unauthorized" failure', async () => {
+    const bundle = await installCharter(
+      buildCharter({ connections: [CRM_CONNECTION], autonomyBase: { 'crm.write': 'auto' } }),
+      { businessId: BUSINESS },
+    );
+    await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    const job = await jobInExecute(bundle);
+
+    const invalidated: Array<{ ref: string; businessId: string }> = [];
+    const credentials: CredentialSource = {
+      async resolve(ref: string, _businessId: string) {
+        return createCredentialHandle(ref, 'irrelevant-secret');
+      },
+      invalidate(ref: string, businessId: string) {
+        invalidated.push({ ref, businessId });
+      },
+    };
+
+    const result = await runPlan({
+      job,
+      bundle,
+      plan: writePlan(),
+      registry: new AdapterRegistry([
+        // `google-calendar.ts`'s own code for a 401 from the resource call
+        // (`classifyCalendarFailure`) — the concrete shape this stub stands
+        // in for.
+        stubAdapter('crm-system', ['crm.write'], {
+          ok: false,
+          retryable: true,
+          code: 'unauthorized',
+          message: 'Google דחה את האסימון (401)',
+        }),
+      ]),
+      bindings: [LIVE],
+      credentials,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(result.status).toBe('halted');
+    // Positive half: the failure genuinely reached `performStep` and the
+    // binding's own ref (`LIVE.credentialRef`) is what got invalidated —
+    // never some other value from the same closure.
+    expect(invalidated).toEqual([{ ref: 'CRM_SECRET', businessId: BUSINESS }]);
+  });
+
+  it('does not call invalidate for a failure code other than "unauthorized"', async () => {
+    const bundle = await installCharter(
+      buildCharter({ connections: [CRM_CONNECTION], autonomyBase: { 'crm.write': 'auto' } }),
+      { businessId: BUSINESS },
+    );
+    await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    const job = await jobInExecute(bundle);
+
+    const invalidated: Array<{ ref: string; businessId: string }> = [];
+    const credentials: CredentialSource = {
+      async resolve(ref: string, _businessId: string) {
+        return createCredentialHandle(ref, 'irrelevant-secret');
+      },
+      invalidate(ref: string, businessId: string) {
+        invalidated.push({ ref, businessId });
+      },
+    };
+
+    const result = await runPlan({
+      job,
+      bundle,
+      plan: writePlan(),
+      registry: new AdapterRegistry([
+        stubAdapter('crm-system', ['crm.write'], {
+          ok: false,
+          retryable: true,
+          code: 'adapter_unreachable',
+          message: 'timed out talking to the far end',
+        }),
+      ]),
+      bindings: [LIVE],
+      credentials,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(result.status).toBe('halted');
+    expect(invalidated).toEqual([]);
+  });
+});
+
+/**
+ * Final fix wave, item 3's "Also": `OAuthGrantError` (`governance/
+ * oauth-grants.ts`) is thrown by `recordRefresh`/`markNeedsReauth` when a
+ * concurrent revoke lands between `oauthCredentials` reading a live grant
+ * and its own write landing a moment later. Before this fix it was not one
+ * of the classes `mapOAuthTokenError` (`run-plan.ts`) recognised, so it fell
+ * through to `return error` unchanged and reached `execute.ts`'s bare catch
+ * as a plain `Error`: `adapter_threw`, and — unlike a genuinely revoked
+ * grant one line above it in the same function — NON-retryable for no
+ * reason connected to whether retrying makes sense. Driven through a real
+ * `runPlan` call (a `credentials.resolve` that throws the class directly)
+ * rather than by calling `mapOAuthTokenError` in isolation, since it is not
+ * exported and the thing worth proving is that `performStep`'s `.catch`
+ * actually reaches it.
+ */
+describe('a concurrent-revoke race during a refresh gets a readable, correctly-terminal code', () => {
+  it('classifies OAuthGrantError as oauth_grant_revoked, not adapter_threw', async () => {
+    const bundle = await installCharter(
+      buildCharter({ connections: [CRM_CONNECTION], autonomyBase: { 'crm.write': 'auto' } }),
+      { businessId: BUSINESS },
+    );
+    await upsertBinding(LIVE, { businessId: BUSINESS, by: 'p_boss' });
+    const job = await jobInExecute(bundle);
+
+    const credentials: CredentialSource = {
+      async resolve(): Promise<never> {
+        throw new OAuthGrantError('לא נמצאה הרשאה פעילה למערכת — לא ניתן לרשום ריענון');
+      },
+    };
+
+    const result = await runPlan({
+      job,
+      bundle,
+      plan: writePlan(),
+      // Never reached: `resolve` throws before any adapter call happens.
+      registry: new AdapterRegistry([
+        stubAdapter('crm-system', ['crm.write'], { ok: true, output: {}, externalId: null }),
+      ]),
+      bindings: [LIVE],
+      credentials,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+
+    expect(result.status).toBe('halted');
+    if (result.status !== 'halted') throw new Error('unreachable — asserted above');
+    // The load-bearing assertion: `oauth_grant_revoked`, the SAME readable
+    // code an actually-revoked grant gets — never the generic `adapter_threw`
+    // a plain, unmapped `Error` would have produced.
+    expect(result.reason).toBe('oauth_grant_revoked');
+
+    const job2 = await loadJob(job.jobId, { businessId: BUSINESS });
+    expect(job2?.phase).toBe('failed');
   });
 });

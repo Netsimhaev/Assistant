@@ -13,6 +13,7 @@ import {
 import { canonicalHash } from '../util/canonical.js';
 import { unspentApprovalFor } from '../governance/approvals.js';
 import { delegationProblems } from '../governance/delegation.js';
+import { OAuthGrantError } from '../governance/oauth-grants.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import type { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
@@ -498,10 +499,29 @@ export async function runPlanForJob(request: RunPlanForJobRequest): Promise<RunP
  * (`withOAuthDeadline` in `oauth-token.ts` throws the identical class for
  * both) — is retryable, matching §3.4's "network fault or 5xx on refresh".
  *
+ * `OAuthGrantError` (`governance/oauth-grants.ts`) is a sixth class, not one
+ * of `oauthCredentials`'s own five: `recordRefresh` and `markNeedsReauth`
+ * both throw it when their own `UPDATE ... WHERE revoked_at IS NULL` touches
+ * no row — the shape a concurrent revoke lands in, between `oauthCredentials`
+ * reading a live grant and its own write landing a moment later. Left
+ * unmapped it fell through to `return error` below and reached
+ * `execute.ts`'s bare catch as a plain `Error`: `adapter_threw` — the generic
+ * bucket every unrecognised throw lands in, indistinguishable there from a
+ * genuine bug. `adapter_threw` happens to be non-retryable, which is the
+ * RIGHT answer here by accident, not by design: the grant is gone by the
+ * time this fires (the owner revoked it mid-refresh), so retrying cannot
+ * help either way. What was actually missing is the READABLE code — the
+ * audit trail and the job's `failed` reason said `adapter_threw` for a race
+ * that has a name, instead of the same `oauth_grant_revoked` a plain revoked
+ * grant already gets one branch up (final fix wave, item 3).
+ *
  * Fix-round 1, finding I5.
  */
 function mapOAuthTokenError(error: unknown): unknown {
   if (error instanceof OAuthGrantRevokedError) {
+    return new StepChannelError('oauth_grant_revoked', error.message, false);
+  }
+  if (error instanceof OAuthGrantError) {
     return new StepChannelError('oauth_grant_revoked', error.message, false);
   }
   if (error instanceof OAuthRefreshRejectedError) {
@@ -607,19 +627,31 @@ async function performStep(
   const binding = request.bindings.find((b) => b.system === resolution.system);
   const credentialRef = binding?.credentialRef ?? null;
   // `.catch` here, not a bare `await`: `oauthCredentials.resolve`
-  // (`oauth-token.ts`) throws five error classes of its own on top of
-  // whatever the fallback can throw, and `executeStep` catches only
-  // `StepChannelError` — an uncaught OAuth throw escapes into
-  // `runDueJobs`'s `errored` bucket and leaves the job in `execute` with a
-  // frozen `updated_at`, starving the `LIMIT` window `run-scheduler.ts`
-  // documents at length (fix-round 1, finding I5; spec §4.4 was narrowed to
-  // permit this one change to `performStep`). `mapOAuthTokenError` rethrows
-  // anything it does not recognise unchanged, so a genuine infrastructure
-  // failure (the fallback's own DB blip, say) still propagates as before —
-  // only the five named OAuth classes are converted. Every branch below is
-  // UNREACHABLE for a static secret: `storedCredentials.resolve` never
-  // throws any of these five classes, so the mail path's behaviour is
-  // unchanged.
+  // (`oauth-token.ts`) throws five error classes of its own — plus
+  // `OAuthGrantError` (`governance/oauth-grants.ts`) when a concurrent
+  // revoke lands between its read and its own write — on top of whatever
+  // the fallback can throw.
+  //
+  // **What this mapping actually buys is classification, not containment.**
+  // `execute.ts`'s `executeStep` already catches every throw here with a
+  // BARE `catch` around `perform` (this function is `perform`) — nothing
+  // escapes uncaught, and no job is left frozen in `execute`. Without this
+  // mapping, that bare catch sees an ordinary `Error`, records it as
+  // `adapter_threw`, and treats it as NON-retryable — which TERMINALLY FAILS
+  // the job. The mapping exists so an `OAuthRefreshTransientError` (a
+  // network blip, a provider 5xx, or this module's own deadline firing)
+  // instead becomes a *retryable* `StepChannelError`, so the job sleeps to
+  // `followup` and gets another try, rather than failing for good over
+  // something that may simply work on the next scheduler pass (fix-round 1,
+  // finding I5; spec §4.4 was narrowed to permit this one change to
+  // `performStep`; corrected in the final fix wave, item 3 — three places
+  // claimed this throw would go uncaught, and none of them do).
+  // `mapOAuthTokenError` rethrows anything it does not recognise unchanged,
+  // so a genuine infrastructure failure (the fallback's own DB blip, say)
+  // still propagates as before — only the six named classes are converted.
+  // Every branch below is UNREACHABLE for a static secret:
+  // `storedCredentials.resolve` never throws any of them, so the mail path's
+  // behaviour is unchanged.
   const credential =
     credentialRef === null
       ? null
@@ -663,6 +695,25 @@ async function performStep(
     },
     request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS,
   );
+
+  // A 401 from the RESOURCE call — not the refresh call `oauth-token.ts`
+  // already handles — is the one signal that proves a still-unexpired
+  // cached access token is already bad at the provider. Without this, the
+  // scheduler's retry (this same job, sleeping to `followup` and waking up
+  // again) replays the identical stale token from the cache until its own
+  // recorded expiry catches up on its own, failing every attempt in between
+  // for a reason a fresh token would not have had (spec §3.4 row 5, "one
+  // refresh and one retry"; final fix wave, item 12). `'unauthorized'` is
+  // `google-calendar.ts`'s own code for exactly this response — the only
+  // adapter today that resolves an OAuth-backed credential at all; a second
+  // one would need adding here too, or this would need to become a declared
+  // field on `AdapterResult` instead of a code string match.
+  // `credentials.invalidate` is OPTIONAL on `CredentialSource` (most
+  // implementations have nothing cached to forget) and synchronous — see
+  // that interface's own docblock.
+  if (!result.ok && result.code === 'unauthorized' && credentialRef !== null) {
+    request.credentials.invalidate?.(credentialRef, request.job.businessId);
+  }
 
   // The binding's health, after the fact rather than before it. `last_ok_at`
   // and `last_error` have had no writer since the table was created — see

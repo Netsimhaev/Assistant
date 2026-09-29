@@ -34,6 +34,13 @@
  *   3. The cache is cleared the moment an authentication failure is
  *      observed (a rejected refresh), so a stale entry never survives past
  *      the failure that proved it should not be trusted.
+ *   4. `invalidate(ref, businessId)` — see `CredentialSource.invalidate`'s
+ *      own docblock — lets a CALLER clear an entry too, for the one failure
+ *      point 3 does not cover: a 401 from the RESOURCE call, not the refresh
+ *      call. A token this module still considers unexpired can already have
+ *      been invalidated at the provider (spec §3.4 row 5's "one refresh and
+ *      one retry"; final fix wave, item 12) — `run-plan.ts`'s `performStep`
+ *      is the one caller that sees that 401 and calls this.
  * The cache lives in the closure of `oauthCredentials` (a plain `Map`
  * captured by the returned object), never as a module-level variable: two
  * instances — two tests, or a real one alongside a test double — must not be
@@ -86,11 +93,27 @@
  * provision it" — turning a five-second blip into a terminal failure for
  * every credential in the installation once this source is wired into
  * `buildRuntime`. `resolve` here is therefore contractually allowed to
- * throw — a caller that wants a `{ ok: false }` shape instead of an
- * exception already has to handle that for every OTHER `CredentialSource`
- * too, and this one is no different. (It throws four of its own error
- * classes already, on top of whatever the fallback or the grant store can
- * raise.)
+ * throw, exactly as every other `CredentialSource` implementation already
+ * is.
+ *
+ * **Where "no different" stops being true (final fix wave, item 3, correcting
+ * a claim that used to overstate this): a caller CANNOT treat every one of
+ * this module's own throws as an ordinary, uncategorised failure the way it
+ * can an infrastructure blip from the fallback.** Five of this module's own
+ * classes are each a specific outcome with a DIFFERENT correct retryability —
+ * a revoked grant and a rejected refresh are terminal, a transient failure is
+ * not — and `execute.ts`'s `executeStep` (a bare `catch` around every step's
+ * `perform`, `run-plan.ts`'s own comment on `mapOAuthTokenError` traces the
+ * exact line numbers) cannot tell them apart on its own: anything that is not
+ * a `StepChannelError` becomes `adapter_threw`, unconditionally
+ * NON-retryable. `mapOAuthTokenError` is what translates these five classes
+ * (plus governance's own `OAuthGrantError`, a sixth, on a concurrent revoke)
+ * into a `StepChannelError` carrying the right flag before that bare catch
+ * ever sees them — without it, `OAuthRefreshTransientError` would terminally
+ * fail a job that a five-minute retry might simply have fixed. Genuinely
+ * uncategorised throws (the fallback's or the grant store's own
+ * infrastructure failures) still propagate as ordinary errors and still need
+ * no special handling — that much of "no different" still holds.
  *
  * **The refresh's time budget is enforced by a race, not by `AbortSignal`
  * alone.** A signal is advisory: nothing forces a component to check it, so
@@ -225,8 +248,19 @@ interface CachedToken {
   expiresAtMs: number;
 }
 
-function cacheKey(businessId: string, system: string): string {
-  return `${businessId}\u0000${system}`;
+/**
+ * Keyed by `(businessId, ref)`, not `(businessId, system)` (final fix wave,
+ * item 12). A `system` requires a successful grant read to even learn — the
+ * very thing `invalidate` below must NOT require, because it exists for the
+ * one caller (`run-plan.ts`'s `performStep`) that only has the `ref` it
+ * already resolved and a 401 it wants to act on immediately, not a reason to
+ * make another round trip through `readGrantByRef` first. In practice this
+ * is a distinction without a difference: one grant row has exactly one
+ * `credential_ref`, so keying by either value partitions the cache
+ * identically.
+ */
+function cacheKey(businessId: string, ref: string): string {
+  return `${businessId}\u0000${ref}`;
 }
 
 /**
@@ -348,7 +382,7 @@ export function oauthCredentials(options: {
         return options.fallback.resolve(ref, businessId);
       }
 
-      const key = cacheKey(businessId, grant.system);
+      const key = cacheKey(businessId, ref);
       const cached = cache.get(key);
       if (cached !== undefined && cached.expiresAtMs > nowMs() + SKEW_MS) {
         return createCredentialHandle(ref, cached.accessToken);
@@ -415,6 +449,19 @@ export function oauthCredentials(options: {
         expiresAtMs: nowMs() + outcome.expiresInSeconds * 1000,
       });
       return createCredentialHandle(ref, outcome.accessToken);
+    },
+
+    /**
+     * See `CredentialSource.invalidate`'s own docblock for why this exists
+     * and why it is optional there. Synchronous and best-effort: it only
+     * ever removes a `Map` entry, never touches the database or the
+     * provider, so there is nothing here that can fail. A `ref` with
+     * nothing cached (never resolved yet, or already evicted) is a silent
+     * no-op — the next `resolve` was always going to mint fresh in that
+     * case regardless.
+     */
+    invalidate(ref: string, businessId: string): void {
+      cache.delete(cacheKey(businessId, ref));
     },
   };
 }

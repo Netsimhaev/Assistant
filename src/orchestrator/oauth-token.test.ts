@@ -271,13 +271,41 @@ describe('oauthCredentials', () => {
     expect((await listGrants(BUSINESS))[0]?.needsReauthAt).toBeNull();
   });
 
-  it('stores a rotated refresh token, so the next call uses the new one', async () => {
+  /**
+   * Final fix wave, item 13. Before this fix, the title promised "so the
+   * next call uses the new one" but the test made only ONE call and asserted
+   * the DB row directly — it proved rotation is PERSISTED, never that a
+   * SUBSEQUENT resolve actually reads the rotated token back and sends it to
+   * the provider. The injected `clock()` was decorative for the same reason:
+   * nothing in the test ever needed the time to pass, because there was no
+   * second call for a cache decision to apply to.
+   *
+   * `expiresInSeconds: 1` combined with a clock fixed at `0` is what makes
+   * the SECOND call below skip the cache rather than hit it: `SKEW_MS` (60s)
+   * is larger than the 1-second lifetime, so `cached.expiresAtMs (1000) >
+   * nowMs() + SKEW_MS (60000)` is false on every subsequent check regardless
+   * of how long the clock claims to have run — the cache never looks fresh,
+   * so the second `resolve` genuinely re-reads the (by then rotated) grant
+   * from the database and exchanges IT, not a memoised value from the first
+   * call.
+   */
+  it('reads the rotated refresh token back on the next call, not just persists it', async () => {
     await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
     const http = recordingHttp({ accessToken: 'a', expiresInSeconds: 1, rotatedRefreshToken: 'refresh-2' });
     const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http, now: clock() });
 
     await source.resolve(GRANT.credentialRef, BUSINESS);
+    // Positive half: rotation really was persisted before the second call
+    // depends on it.
     expect((await readGrantBySystem(GRANT.system, BUSINESS, KEY))?.refreshToken).toBe('refresh-2');
+
+    await source.resolve(GRANT.credentialRef, BUSINESS);
+    // The load-bearing assertion the old title promised and never checked:
+    // the SECOND exchange call carried the rotated token, not the original
+    // one the grant was created with.
+    expect(http.calls).toHaveLength(2);
+    expect(http.calls[0]?.refreshToken).toBe(GRANT.refreshToken);
+    expect(http.calls[1]?.refreshToken).toBe('refresh-2');
   });
 
   it('writes one audit row when the provider rejects the refresh token', async () => {
@@ -316,5 +344,38 @@ describe('oauthCredentials', () => {
     expect(http.calls).toHaveLength(2);
     expect(http.calls[0]?.refreshToken).toBe(GRANT.refreshToken);
     expect(http.calls[1]?.refreshToken).toBe('refresh-token-value-B');
+  });
+
+  /**
+   * Final fix wave, item 12 — the unit-level half. `binding-health.test.ts`
+   * proves the WIRING (a real `runPlan` call, on a 401 from the resource
+   * call, reaches this method with the right `ref`/`businessId`); this
+   * proves the MECHANISM itself: that calling `invalidate` genuinely forces
+   * a fresh mint rather than merely existing as a method that compiles.
+   * `expiresInSeconds: 3600` with the clock fixed at `0` means the cache
+   * would otherwise still read as fresh — the only thing that can explain a
+   * SECOND exchange call below is `invalidate` actually having removed the
+   * entry.
+   */
+  it('invalidate forces the next resolve to mint a fresh token, even though the cached one has not expired', async () => {
+    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    const http = recordingHttp({ accessToken: 'access-1', expiresInSeconds: 3600 });
+    const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http, now: clock() });
+
+    expect((await source.resolve(GRANT.credentialRef, BUSINESS))?.value).toBe('access-1');
+    // Positive half: without invalidation, the cache genuinely does hold —
+    // a second resolve here would NOT re-exchange (the sibling test above
+    // already proves this for the same fixture shape).
+    expect(http.calls).toHaveLength(1);
+
+    source.invalidate?.(GRANT.credentialRef, BUSINESS);
+    await source.resolve(GRANT.credentialRef, BUSINESS);
+
+    expect(http.calls).toHaveLength(2);
+  });
+
+  it('invalidate on a ref with nothing cached is a silent no-op', async () => {
+    const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http: NEVER_CALLED_HTTP });
+    expect(() => source.invalidate?.('NEVER_RESOLVED', BUSINESS)).not.toThrow();
   });
 });

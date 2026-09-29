@@ -173,17 +173,29 @@ export interface DashboardOptions {
  *
  * **The trade this makes, named rather than hidden:** under `Lax`, a
  * cross-site top-level navigation DOES still carry the session cookie to a
- * GET. `GET /oauth/:system/start` is the one GET route in this file that
- * writes anything, so it is reachable that way — a page an attacker
- * controls can navigate the owner's browser to it. What it writes is a
- * pending, session-bound, SINGLE-USE `state` row (`createState`), never a
- * grant and never a binding. That gains an attacker nothing: finishing the
- * ceremony still requires the VICTIM to approve at Google's own consent
- * screen, and the callback then binds the VICTIM's own account to the
- * business, never the attacker's — the forged navigation just creates an
- * inert row that expires unused. Every other route that mutates something
- * the owner would actually care about is a POST, which `Lax` withholds the
- * cookie from cross-site regardless — see `SECURITY_HEADERS`'s own docblock.
+ * GET. `GET /oauth/:system/start` is **the one GET a cross-site navigation
+ * can USEFULLY reach this way** — not, as an earlier version of this
+ * paragraph claimed, "the one GET route in this file that writes anything".
+ * `GET /oauth/callback` writes MORE than `/start` does — the grant, the
+ * binding and the audit row, all in one transaction (see
+ * `handleOAuthCallback`'s own docblock) — so calling it read-only here was
+ * false (final fix wave, item 3). What actually stops a forged navigation
+ * from doing anything USEFUL there is that the callback additionally needs
+ * a single-use `state` row bound to the CALLER'S OWN SESSION (`consumeState`)
+ * plus a real authorisation `code` Google only ever hands the browser that
+ * completed its consent screen — neither of which an attacker's own
+ * navigation can supply for a victim it does not control. `/start` has no
+ * such requirement: a bare cross-site navigation to it is enough on its own
+ * to mint a state row, which is exactly what makes it the route worth
+ * naming here. What that navigation writes is a pending, session-bound,
+ * SINGLE-USE `state` row (`createState`), never a grant and never a
+ * binding. That gains an attacker nothing: finishing the ceremony still
+ * requires the VICTIM to approve at Google's own consent screen, and the
+ * callback then binds the VICTIM's own account to the business, never the
+ * attacker's — the forged navigation just creates an inert row that expires
+ * unused. Every other route that mutates something the owner would actually
+ * care about is a POST, which `Lax` withholds the cookie from cross-site
+ * regardless — see `SECURITY_HEADERS`'s own docblock.
  */
 function sessionCookie(token: string): string {
   return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`;
