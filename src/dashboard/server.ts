@@ -163,12 +163,21 @@ export interface DashboardOptions {
  * by a cross-site TOP-LEVEL NAVIGATION (a real browser redirect after the
  * owner clicks "allow"), and a `Strict` cookie is withheld on exactly that —
  * the callback would see no session, redirect to `/login` without preserving
- * the query string, and silently discard the authorisation code. `Lax` still
- * withholds the cookie on a cross-site POST, which is every state-changing
- * route this dashboard has; the one cross-site GET this adds
- * (`/oauth/:system/start`'s eventual redirect target, and the callback
- * itself) is not exploitable in the harmful direction — see the
- * `SECURITY_HEADERS` docblock below for why.
+ * the query string, and silently discard the authorisation code.
+ *
+ * **The trade this makes, named rather than hidden:** under `Lax`, a
+ * cross-site top-level navigation DOES still carry the session cookie to a
+ * GET. `GET /oauth/:system/start` is the one GET route in this file that
+ * writes anything, so it is reachable that way — a page an attacker
+ * controls can navigate the owner's browser to it. What it writes is a
+ * pending, session-bound, SINGLE-USE `state` row (`createState`), never a
+ * grant and never a binding. That gains an attacker nothing: finishing the
+ * ceremony still requires the VICTIM to approve at Google's own consent
+ * screen, and the callback then binds the VICTIM's own account to the
+ * business, never the attacker's — the forged navigation just creates an
+ * inert row that expires unused. Every other route that mutates something
+ * the owner would actually care about is a POST, which `Lax` withholds the
+ * cookie from cross-site regardless — see `SECURITY_HEADERS`'s own docblock.
  */
 function sessionCookie(token: string): string {
   return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`;
@@ -289,12 +298,14 @@ async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
  *
  * `X-Frame-Options: DENY` is defence in depth, not a hole being closed. The
  * session cookie is `SameSite=Lax`, not `Strict` (see `sessionCookie`'s own
- * docblock for why the OAuth callback needs that) — so what actually keeps
- * the approve/deny buttons from being clickjacked is that every
- * state-changing route on this dashboard is a POST, which `Lax` withholds
- * the cookie from cross-site regardless of framing, not the cookie's
- * SameSite mode on its own. `X-Frame-Options` is cheap insurance on top of
- * that, not the control itself.
+ * docblock for why the OAuth callback needs that, and for the one named GET
+ * that trade accepts). Every route here that mutates something the owner
+ * would actually care about — approve, deny, sign, erase, change a
+ * password, revoke a grant — is a POST carrying its own CSRF token, and
+ * `Lax` withholds the session cookie from a cross-site POST regardless of
+ * framing; THAT is what keeps those buttons from being clickjacked, not the
+ * cookie's SameSite mode standing alone. `X-Frame-Options` is cheap
+ * insurance on top of that, not the control itself.
  */
 const SECURITY_HEADERS = {
   'Cache-Control': 'no-store',
