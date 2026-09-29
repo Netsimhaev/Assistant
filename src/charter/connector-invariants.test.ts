@@ -103,14 +103,24 @@ function classifyGrantImport(source: string): 'none' | 'writer' | 'reader-only' 
 
 describe('the grant writer stays behind two files', () => {
   /**
-   * Recursive walk over all of `src/`, in the pattern
+   * Recursive walk over all of `src/` **and** `scripts/`, in the pattern
    * `erasure-invariants.test.ts` already uses for "is imported by nothing
    * outside erasure.ts itself and the dashboard" — NOT a hand-written
    * directory or file list. That file's own header explains why: a manual
    * `roots` list once covered five directories and silently skipped six
-   * others. Walking the whole tree and excluding only by filename suffix
-   * means a directory added next year is scanned by default, not skipped by
-   * default.
+   * others. Walking each tree and excluding only by filename suffix means a
+   * directory added next year is scanned by default, not skipped by default.
+   *
+   * **`scripts/` joined the walk in the final fix wave (item 11).** The
+   * invariant this test names — "only the token service and the dashboard
+   * import the grant writer" — was only ever checked against `src/`.
+   * `scripts/` holds standalone operator entry points
+   * (`live-thread-status.ts`, `connector-calendar.ts`, `seed-charter*.ts`,
+   * `probe-smtp.ts`) that are never imported BY anything under `src/`, so a
+   * scan of `src/` alone cannot see one of them reaching into
+   * `writeGrant`/`recordRefresh`/`markNeedsReauth`/`revokeGrant` — the write
+   * path would in fact be three files, with the invariant still reporting
+   * two and staying green.
    */
   it('only the token service and the dashboard import the grant writer', async () => {
     const scanned: string[] = [];
@@ -143,6 +153,7 @@ describe('the grant writer stays behind two files', () => {
     };
 
     await walk('src');
+    await walk('scripts');
 
     // A scan that read zero files would pass with the same empty
     // `importers` a correct scan produces — the same "found nothing" failure
@@ -150,6 +161,12 @@ describe('the grant writer stays behind two files', () => {
     // both guard against. The tree has well over a thousand `.ts` files
     // today; 100 only has to stay comfortably above zero.
     expect(scanned.length).toBeGreaterThan(100);
+    // The floor above alone would pass even if `scripts/` were silently
+    // dropped from the walk — `src/` clears it on its own. Naming a file
+    // that exists ONLY under `scripts/` is the positive proof that root
+    // actually got walked, the same shape `runtime.test.ts` uses to prove
+    // its own SMTP_PASS scan reached `runtime.ts`.
+    expect(scanned).toContain(join('scripts', 'connector-calendar.ts'));
 
     expect(importers.sort()).toEqual([
       'src/dashboard/oauth-routes.ts',
