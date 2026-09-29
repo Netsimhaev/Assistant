@@ -6,13 +6,23 @@
  * business, not per binding. The refresh token is sealed under the same
  * master key as `credentials` (`credential-store.ts`), read through the
  * same `credential_key_state` bookkeeping (`liveKeyId`, exported from that
- * module for exactly this reuse). That buys a shared key-id LABEL today —
- * not a shared rotation loop. `rotate` (`src/cli/secret-key.ts`) selects and
- * re-encrypts `credentials` only; `oauth_grants` does not appear in that
- * file at all. A key rotation as shipped at this commit would leave every
- * existing grant sealed under a key the installation no longer holds —
- * permanently unopenable. Wiring `oauth_grants` into `rotate` is Task 2's
- * job, not this one's. What keeps a grant row and a secret row from ever
+ * module for exactly this reuse). That buys a shared key-id LABEL, and —
+ * as of the task that wired it — a shared rotation loop too: `rotate`
+ * (`src/cli/secret-key.ts`) re-encrypts `credentials` and `oauth_grants` in
+ * the SAME transaction, keyed by `(business_id, system)` instead of
+ * `(business_id, ref)`, and aborts the whole rotation — no row in either
+ * table changes — if a single row in either loop fails to decrypt under the
+ * key on file. A grant that did not go through that loop would be sealed
+ * under a key the installation no longer holds — permanently unopenable,
+ * with nothing throwing until the next refresh tried to open it — which is
+ * exactly why both tables move together in one transaction rather than one
+ * commit for each. (An earlier draft of this paragraph named a future task
+ * as the one that would close this gap; that task landed, and this
+ * paragraph was not updated when it did — a forward reference is only
+ * honest until the thing it points at lands, and this one sat wrong for a
+ * full task cycle. `connector-invariants.test.ts`'s "key rotation names the
+ * grant table" is what keeps this sentence from going stale silently a
+ * second time.) What keeps a grant row and a secret row from ever
  * being opened as each other is the AAD: a secret is sealed under
  * `{ businessId, ref }` where `ref` matches `CREDENTIAL_REF_PATTERN`
  * (`^[A-Z0-9_]+$`); a grant is sealed under `grantAad`, whose `ref` is

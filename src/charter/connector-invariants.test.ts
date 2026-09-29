@@ -40,26 +40,65 @@ import type { CredentialSource } from '../orchestrator/credentials.js';
 const WRITER_EXPORTS = ['writeGrant', 'recordRefresh', 'markNeedsReauth', 'revokeGrant'] as const;
 
 /**
- * True when `source` imports at least one of `WRITER_EXPORTS` from
- * `oauth-grants.js`. Matches the named-import clause specifically (not just
- * "the string `writeGrant` appears somewhere in the file") so a comment or a
- * docblock that merely *mentions* a writer's name — this file's own header
- * does, right above — can never be mistaken for an importer. The character
- * class `[^}]*` spans newlines the way `.` does not, so a braced import
- * spread across several lines is still matched.
+ * Classifies how (if at all) `source` reaches `oauth-grants.js`.
+ *
+ * **Two stages, deliberately, and the order matters: broad first, narrow
+ * second — never the other way round.** A single-stage "parse the named
+ * import clause and check it for a writer name" — what this function used
+ * to do — recognises exactly one import SHAPE and is silently blind to every
+ * other one: `import * as grants from '…/oauth-grants.js'` then
+ * `grants.writeGrant(...)`, `export { writeGrant } from '…/oauth-grants.js'`,
+ * and `const { writeGrant } = await import('…/oauth-grants.js')` all reach a
+ * writer while matching no named-import clause at all — three concrete
+ * bypasses, not a hypothetical one, all demonstrated against this exact
+ * function in review. `erasure-invariants.test.ts`, the file this scan is
+ * explicitly modelled on, already carries the scar of the same mistake: its
+ * own docblock on `ERASURE_MODULE_FILES` records being burned once by a scan
+ * that checked only static `from` imports and missed a dynamic
+ * `import('../governance/erasure.js')` — which is exactly why that file's
+ * regex matches `from` **or** a dynamic `import(...)`, not `from` alone.
+ *
+ * So this function fails CLOSED instead: first a BROAD check for any mention
+ * of the module through `from` or `import(` at all (this catches every
+ * import shape, including the three bypasses above); only once that fires
+ * does a NARROW parse look for the one recognized clause shape
+ * (`import { … } from '…/oauth-grants.js'`, `type` optionally on the
+ * keyword or on any individual name) to decide reader-versus-writer. If the
+ * broad check still finds a mention **after** every recognized narrow clause
+ * has been stripped out of the text, that residue is a form this scan does
+ * not understand — and it is treated exactly like a writer import
+ * (`'unrecognized'`), never silently assumed safe. A scan that trusts what
+ * it cannot parse is not a scan.
  */
-function importsGrantWriter(source: string): boolean {
-  const importClauses = source.matchAll(
+function classifyGrantImport(source: string): 'none' | 'writer' | 'reader-only' | 'unrecognized' {
+  const namedImportClauses = [
+    ...source.matchAll(
+      /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"][^'"]*oauth-grants\.js['"]/g,
+    ),
+  ];
+  const withRecognizedClausesRemoved = source.replace(
     /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"][^'"]*oauth-grants\.js['"]/g,
+    '',
   );
-  for (const match of importClauses) {
+
+  // Anything other than the one recognized clause shape above that still
+  // mentions the module by way of `from` or a dynamic `import(` — a
+  // namespace import, a re-export, `await import(...)` — is a form this
+  // scan cannot classify as reader-only. Fail closed.
+  if (/(?:from|import\s*\()\s*['"][^'"]*oauth-grants\.js['"]/.test(withRecognizedClausesRemoved)) {
+    return 'unrecognized';
+  }
+
+  if (namedImportClauses.length === 0) return 'none';
+
+  for (const match of namedImportClauses) {
     const names = match[1] ?? '';
     for (const writer of WRITER_EXPORTS) {
       const namedPattern = new RegExp(`(?:^|[,{\\s])${writer}(?:\\s*,|\\s*}|\\s|$)`);
-      if (namedPattern.test(names)) return true;
+      if (namedPattern.test(names)) return 'writer';
     }
   }
-  return false;
+  return 'reader-only';
 }
 
 describe('the grant writer stays behind two files', () => {
@@ -93,7 +132,11 @@ describe('the grant writer stays behind two files', () => {
         if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) continue;
         scanned.push(path);
         const source = await readFile(path, 'utf8');
-        if (importsGrantWriter(source)) {
+        const classification = classifyGrantImport(source);
+        // 'unrecognized' fails closed — see `classifyGrantImport`'s own
+        // docblock — and is reported exactly like a genuine writer import,
+        // not as a separate, softer category a maintainer could shrug off.
+        if (classification === 'writer' || classification === 'unrecognized') {
           importers.push(path.split(sep).join('/'));
         }
       }
@@ -154,11 +197,24 @@ describe('an OAuth refresh token leaves no trace outside its own ciphertext', ()
   /**
    * Seed a grant carrying the sentinel as its refresh token, then drive a
    * FULL resolve through `oauthCredentials` — the token service every real
-   * adapter call goes through — so the value passes through every layer
-   * that touches it: decryption, the cache write, and the handle handed
-   * back to a caller. Then pull every `text`/`character varying`/`json`/
-   * `jsonb`/`ARRAY` column of every table from `information_schema.columns`
-   * — never a list written by hand, for the identical reason
+   * adapter call goes through. **What that actually exercises, precisely:**
+   * the sentinel is decrypted out of the grant row, passes the ambiguity
+   * check against the fallback source, and reaches `recordRefresh` (which
+   * re-seals it, unchanged, back into `oauth_grants`). What lands in the
+   * cache and in the handle returned to the caller is a SEPARATE, freshly
+   * issued access token — the stub `TokenHttp`'s own `'issued-access-token-
+   * value'`, asserted on the line above this comment — never the sentinel
+   * itself. `oauthCredentials`'s own module docblock states the same thing
+   * as a design rule ("the REFRESH token... is never cached"); this test
+   * does not exercise a different path than that rule describes, and an
+   * earlier draft of this comment wrongly claimed the sentinel reaches "the
+   * cache write" — it does not, and the assertion below would have caught it
+   * if it had. What this scan actually proves is the stronger, true claim:
+   * the long-lived secret does not land in any text/JSON/array column
+   * anywhere in the schema on the path a real resolve takes, cache miss
+   * included. Then pull every `text`/`character varying`/`json`/`jsonb`/
+   * `ARRAY` column of every table from `information_schema.columns` — never
+   * a list written by hand, for the identical reason
    * `erasure-invariants.test.ts` reads the schema instead of a fixed list —
    * and demand zero occurrences anywhere but the grant's own ciphertext.
    */
