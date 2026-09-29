@@ -36,6 +36,10 @@ import { readForgetCommand } from '../governance/forget-command.js';
 import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
 import { recordCorrection } from '../governance/corrections.js';
 import { listAutonomousActions } from './autonomous-actions.js';
+import { loadActiveCharter } from '../charter/store.js';
+import type { CharterConnection } from '../domain/connection.js';
+import { loadBindings } from '../orchestrator/bindings.js';
+import { listGrants } from '../governance/oauth-grants.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureAnchor, ErasurePlan } from '../governance/erasure-plan.js';
 import {
@@ -80,6 +84,7 @@ import {
   renderApprovalCard,
   renderAutonomousActions,
   renderAutonomy,
+  renderConnections,
   renderErasure,
   renderErasureDone,
   renderForbidden,
@@ -92,6 +97,7 @@ import {
   renderReadings,
   renderServerError,
 } from './views.js';
+import type { CharterReadStatus } from './views.js';
 import type { ErasurePrefill } from './views.js';
 
 const SESSION_COOKIE = 'sid';
@@ -483,6 +489,67 @@ async function handleReadings(res: ServerResponse, businessId: string, session: 
 async function handleMemory(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   const memories = await recallMemories({ limit: MAX_RECALL }, { businessId });
   sendHtml(res, 200, renderMemory(memories, issueCsrfToken(session.sessionId)));
+}
+
+/**
+ * "חיבורים" — one heading per kind of connection (`connection-groups.ts`),
+ * every connection the signed charter declares under it, and whether it is
+ * authorised.
+ *
+ * **This screen is a reader, and must survive a charter it cannot read.**
+ * `loadActiveCharter` (`charter/store.ts`) THROWS on a schema-version
+ * mismatch and returns `null` when nothing is installed — both deliberately
+ * fatal for the gate, which must never run an agent against policy it cannot
+ * parse. A dashboard screen is a different kind of caller: showing the owner
+ * a 500 (or, worse, a silently-empty connections list indistinguishable from
+ * "nothing is declared") when the real problem is an unreadable charter is
+ * strictly worse than the truth. There is no existing helper for "load the
+ * charter, but let a reader survive a throw" — `probeActiveCharter` does not
+ * exist anywhere in this codebase today, despite being named in this task's
+ * own brief; grepping for it (and for every other spelling of "probe" near a
+ * charter) turned up nothing, in this file, in `charter/store.ts`, or in any
+ * other dashboard screen. The catch below is therefore local to this one
+ * route rather than a new shared export: nothing in the brief's own file
+ * list (`connection-groups.ts`, `views.ts`, `server.ts`) asks for a change to
+ * `charter/store.ts`, and inventing a second, more-permissive charter loader
+ * that every future caller could reach for is exactly the kind of
+ * convenience this project's own CLAUDE.md warns about elsewhere ("בקרה
+ * שנכתבת בשלילה"): a shared "safe" charter reader is a bypass waiting for a
+ * caller that should not have been allowed to survive the throw.
+ */
+async function handleConnections(res: ServerResponse, businessId: string, session: Session): Promise<void> {
+  let charterStatus: CharterReadStatus;
+  let connections: CharterConnection[];
+  try {
+    const active = await loadActiveCharter(businessId);
+    if (active === null) {
+      charterStatus = 'none';
+      connections = [];
+    } else {
+      charterStatus = 'ok';
+      connections = active.charter.connections;
+    }
+  } catch {
+    charterStatus = 'unreadable';
+    connections = [];
+  }
+
+  const [bindings, grants] = await Promise.all([
+    loadBindings({ businessId }),
+    listGrants(businessId),
+  ]);
+
+  sendHtml(
+    res,
+    200,
+    renderConnections({
+      charterStatus,
+      connections,
+      bindings,
+      grants,
+      csrf: issueCsrfToken(session.sessionId),
+    }),
+  );
 }
 
 /**
@@ -1962,6 +2029,7 @@ async function route(
   if (method === 'GET' && pathname === '/') return handlePendingList(res, businessId, session);
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
+  if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
 
   if (method === 'GET' && pathname === '/autonomy') return handleAutonomyGet(res, businessId, session);
   if (method === 'POST' && pathname === '/autonomy/mode')

@@ -12,15 +12,24 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { queryAudit } from '../audit/log.js';
+import { installCharter } from '../charter/store.js';
+import type { CharterConnection } from '../domain/connection.js';
 import { putSecret } from '../governance/credential-store.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
-import { readGrantBySystem } from '../governance/oauth-grants.js';
+import {
+  markNeedsReauth,
+  readGrantBySystem,
+  recordRefresh,
+  revokeGrant,
+  writeGrant,
+} from '../governance/oauth-grants.js';
 import {
   GOOGLE_CLIENT_ID_REF,
   GOOGLE_CLIENT_SECRET_REF,
 } from '../orchestrator/adapters/google-token-http.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { closePool, getPool } from '../db/pool.js';
+import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
 import { createOwner } from './auth.js';
 import { issueCsrfToken } from './csrf.js';
@@ -523,5 +532,194 @@ describe('POST /oauth/:system/revoke', () => {
     });
     expect(res.status).toBe(302);
     expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
+  });
+});
+
+describe('GET /connections', () => {
+  const CALENDAR_CONNECTION: CharterConnection = {
+    system: SYSTEM,
+    label: 'יומן המשרד',
+    channel: 'api',
+    serves: ['calendar.read'],
+    target: null,
+    subprocessor: null,
+  };
+
+  /**
+   * A real, known, owned tool (`data.export` — `capabilities.ts` gives it an
+   * agent) whose prefix this screen's grouping simply has no heading for.
+   * The charter schema itself refuses a `serves` entry naming a tool that
+   * does not exist at all (`isKnownToolName`, `domain/charter.ts`'s own
+   * `superRefine`) or one owned by no agent (`isUnownedToolName`) — so
+   * `groupForServes`'s "other" fallback can only ever be exercised by a
+   * connection like this one, never by a literally made-up tool name.
+   */
+  const UNKNOWN_CONNECTION: CharterConnection = {
+    system: 'mystery-system',
+    label: 'מערכת מסתורית',
+    channel: 'api',
+    serves: ['data.export'],
+    target: null,
+    subprocessor: null,
+  };
+
+  it('requires a session, like every other route past login', async () => {
+    const baseUrl = await startServer();
+    const res = await fetch(`${baseUrl}/connections`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  it('shows a declared connection that was never authorised under its group heading, and never hides an unrecognised one', async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION, UNKNOWN_CONNECTION] }), {
+      businessId: BUSINESS,
+    });
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl);
+
+    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+
+    // The brief's own three assertions (task-6-brief.md, Step 1): a
+    // declared-but-unauthorised connection shows its group heading and says
+    // so in words, rather than being indistinguishable from "no such
+    // connection exists at all".
+    expect(body).toContain('חיבור יומן');
+    expect(body).toContain('טרם אושר');
+
+    // A tool family this project has no group for still gets a row, under
+    // "אחר" — never silently dropped from the page.
+    expect(body).toContain('אחר');
+    expect(body).toContain('מערכת מסתורית');
+  });
+
+  it("shows an authorised connection's account and granted scopes, offers a revoke control, and never renders the refresh token itself", async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    const secretToken = 'super-secret-refresh-token-value-should-never-render';
+    await writeGrant(
+      {
+        businessId: BUSINESS,
+        system: SYSTEM,
+        provider: 'google',
+        credentialRef: 'OFFICE_CALENDAR',
+        account: 'owner@example.com',
+        scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
+        refreshToken: secretToken,
+        grantedBy: USERNAME,
+      },
+      key,
+    );
+
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl);
+    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+
+    // The positive half first (superpowers:verification-before-completion,
+    // and this project's own "a negative test must prove the thing it tests
+    // actually ran"): establish the row actually rendered with the grant's
+    // real data before asserting what must be absent from it. An assertion
+    // that a token string is missing from a page that never rendered the
+    // grant at all would pass for the wrong reason.
+    expect(body).toContain('owner@example.com');
+    expect(body).toContain('calendar.readonly');
+    expect(body).toContain('יש הרשאה');
+    expect(body).toContain(`/oauth/${SYSTEM}/revoke`);
+
+    // `listGrants` (the only source this screen reads from) takes no
+    // decryption key and cannot return a token even by mistake — this
+    // proves nothing else on the page smuggled it in either.
+    expect(body).not.toContain(secretToken);
+  });
+
+  it('reads a grant needing reauth as "דורש אישור מחדש", and a revoked grant as not yet authorised again', async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await writeGrant(
+      {
+        businessId: BUSINESS,
+        system: SYSTEM,
+        provider: 'google',
+        credentialRef: 'OFFICE_CALENDAR',
+        account: 'owner@example.com',
+        scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
+        refreshToken: 'refresh-token-value',
+        grantedBy: USERNAME,
+      },
+      key,
+    );
+    await recordRefresh(SYSTEM, BUSINESS, null, key);
+    await markNeedsReauth(SYSTEM, BUSINESS);
+
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl);
+
+    const firstRead = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    const firstBody = await firstRead.text();
+    // Positive half: the authorised row rendered with the account this test
+    // actually wrote, before checking which status label it carries.
+    expect(firstBody).toContain('owner@example.com');
+    expect(firstBody).toContain('דורש אישור מחדש');
+    expect(firstBody).not.toContain('יש הרשאה');
+
+    await revokeGrant(SYSTEM, BUSINESS, USERNAME);
+
+    const secondRead = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    const secondBody = await secondRead.text();
+    expect(secondBody).toContain('טרם אושר');
+    expect(secondBody).not.toContain('דורש אישור מחדש');
+    expect(secondBody).not.toContain('יש הרשאה');
+  });
+
+  it('tells the owner the scheduler only reads connections at process startup', async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl);
+    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    const body = await res.text();
+    // Matches `buildRuntime`'s own docblock and docs/live-thread-runbook.md
+    // word for word on the load-bearing fact: a freshly authorised
+    // connection has no effect until the scheduler process restarts.
+    expect(body).toContain('פעם אחת בלבד, בעת ההפעלה');
+  });
+
+  it('survives a charter it cannot read instead of crashing, and says so', async () => {
+    // A fresh row, not an UPDATE of an existing signed one — `charter_versions`
+    // is append-only by design (001_spine.sql's own comment: "an amendment is
+    // a new row, never an UPDATE"). This simulates a genuinely legacy row
+    // signed under a schema version this code no longer understands, the same
+    // shape `loadActiveCharter` documents as its one throwing case.
+    const legacyVersion = 'legacy-unreadable-1';
+    await getPool().query(
+      `INSERT INTO charter_versions
+         (charter_version, business_id, effective_from, charter, policy_bundle, content_hash, signed_by, signed_at, signature_method)
+       VALUES ($1, $2, now(), $3, $4, $5, 'legacy', now(), 'test')`,
+      [legacyVersion, BUSINESS, JSON.stringify({ schemaVersion: '0.1' }), JSON.stringify({}), 'a'.repeat(64)],
+    );
+    await getPool().query(
+      `INSERT INTO charter_active (business_id, charter_version, activated_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (business_id) DO UPDATE SET charter_version = EXCLUDED.charter_version, activated_at = now()`,
+      [BUSINESS, legacyVersion],
+    );
+
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl);
+    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('לא ניתן לקרוא את התקנון');
+  });
+
+  it('says plainly that no charter is installed at all, rather than an empty page indistinguishable from "nothing declared"', async () => {
+    // No `installCharter` call in this test at all — `charter_active` has no
+    // row for this business.
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl);
+    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('לא הותקן עדיין תקנון פעיל');
   });
 });
