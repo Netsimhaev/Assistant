@@ -105,6 +105,7 @@ describe('schedulerPass', () => {
         status: 'live',
         endpoint: null,
         credentialRef: 'OFFICE_MAIL',
+        provider: null,
         lastOkAt: null,
         lastError: null,
       },
@@ -169,6 +170,7 @@ describe('schedulerPass', () => {
         status: 'live',
         endpoint: null,
         credentialRef: 'OFFICE_MAIL',
+        provider: null,
         lastOkAt: null,
         lastError: null,
       },
@@ -228,6 +230,7 @@ describe('schedulerPass', () => {
         // treats that as a misconfiguration and therefore NOT retryable, so
         // the job lands in `failed` rather than sleeping in `followup`.
         credentialRef: 'OFFICE_MAIL',
+        provider: null,
         lastOkAt: null,
         lastError: null,
       },

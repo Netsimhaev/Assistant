@@ -3,15 +3,30 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { closePool } from '../db/pool.js';
+import type { CharterConnection } from '../domain/connection.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
 import { putSecret } from '../governance/credential-store.js';
 import { KEY_BYTES, MasterKeyError, writeKeyState } from '../governance/master-key.js';
 import type { RiskAssessment } from '../domain/risk.js';
+import { upsertBinding } from './bindings.js';
 import { DEFAULT_CREDENTIAL_ENV_PREFIX } from './credentials.js';
 import { resetDatabase } from '../test/db.js';
+import { buildCharter } from '../test/fixtures.js';
 import { buildRuntime } from './runtime.js';
+
+const BUSINESS = config.businessId;
+
+const CALENDAR_CONNECTION: CharterConnection = {
+  system: 'office-calendar',
+  label: 'יומן המשרד',
+  channel: 'api',
+  serves: ['calendar.read'],
+  target: null,
+  subprocessor: null,
+};
 
 const BASE = {
   MAIL_SYSTEM: 'office-mail',
@@ -332,6 +347,32 @@ describe('buildRuntime', () => {
     // absent fails if it were registered as a system adapter instead.
     expect(runtime.registry.systems()).toContain('channel:browser');
     expect(runtime.registry.systems()).not.toContain('browser');
+  });
+
+  /**
+   * Registration comes from the charter's declared connection and the
+   * binding's `provider` column alone — never from whether an OAuth grant
+   * has actually been stored. A missing authorisation is the adapter's own
+   * runtime failure (`credential_unavailable`), not a missing adapter; see
+   * `runtime.ts`'s own docblock on `buildRuntime`.
+   */
+  it('registers the provider adapter for a declared system even with no grant stored', async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await upsertBinding(
+      {
+        system: 'office-calendar',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OFFICE_CALENDAR',
+        provider: 'google',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { by: 'test' },
+    );
+
+    const runtime = await buildRuntime(FULL);
+    expect(runtime.registry.get('office-calendar')).not.toBeNull();
   });
 
   /**

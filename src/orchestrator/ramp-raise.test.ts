@@ -206,6 +206,7 @@ async function seedReplyJob(plan: Plan = REPLY_PLAN): Promise<{
       status: 'live',
       endpoint: null,
       credentialRef: 'OFFICE_MAIL',
+      provider: null,
       lastOkAt: null,
       lastError: null,
     },

@@ -43,6 +43,7 @@ const OFFICE_LIVE: ConnectionBinding = {
   status: 'live',
   endpoint: null,
   credentialRef: null,
+  provider: null,
   lastOkAt: null,
   lastError: null,
 };

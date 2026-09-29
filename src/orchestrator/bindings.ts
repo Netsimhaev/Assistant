@@ -10,6 +10,7 @@ interface BindingRow {
   status: string;
   endpoint: string | null;
   credential_ref: string | null;
+  provider: string | null;
   last_ok_at: Date | null;
   last_error: string | null;
 }
@@ -20,6 +21,7 @@ function toBinding(row: BindingRow): ConnectionBinding {
     status: row.status,
     endpoint: row.endpoint,
     credentialRef: row.credential_ref,
+    provider: row.provider,
     lastOkAt: row.last_ok_at?.toISOString() ?? null,
     lastError: row.last_error,
   });
@@ -30,7 +32,7 @@ export async function loadBindings(
 ): Promise<ConnectionBinding[]> {
   const db = options.db ?? getPool();
   const { rows } = await db.query<BindingRow>(
-    `SELECT system, status, endpoint, credential_ref, last_ok_at, last_error
+    `SELECT system, status, endpoint, credential_ref, provider, last_ok_at, last_error
        FROM connection_bindings
       WHERE business_id = $1
       ORDER BY system`,
@@ -98,12 +100,13 @@ export async function upsertBinding(
   const write = async (tx: Queryable): Promise<void> => {
     await tx.query(
       `INSERT INTO connection_bindings
-         (business_id, system, status, endpoint, credential_ref, last_ok_at, last_error, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+         (business_id, system, status, endpoint, credential_ref, provider, last_ok_at, last_error, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
        ON CONFLICT (business_id, system) DO UPDATE
          SET status = EXCLUDED.status,
              endpoint = EXCLUDED.endpoint,
              credential_ref = EXCLUDED.credential_ref,
+             provider = EXCLUDED.provider,
              last_ok_at = EXCLUDED.last_ok_at,
              last_error = EXCLUDED.last_error,
              updated_at = now()`,
@@ -113,6 +116,7 @@ export async function upsertBinding(
         parsed.status,
         parsed.endpoint,
         parsed.credentialRef,
+        parsed.provider,
         parsed.lastOkAt,
         parsed.lastError,
       ],

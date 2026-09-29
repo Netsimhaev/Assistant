@@ -23,7 +23,7 @@ const MAIL_CONNECTION: CharterConnection = {
 
 const LIVE: ConnectionBinding = {
   system: 'office-mail', status: 'live', endpoint: null,
-  credentialRef: 'OFFICE_MAIL', lastOkAt: null, lastError: null,
+  credentialRef: 'OFFICE_MAIL', provider: null, lastOkAt: null, lastError: null,
 };
 
 /** One step, to a stranger, with nothing read. The live thread's own plan. */

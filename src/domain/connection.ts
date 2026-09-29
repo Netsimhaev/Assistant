@@ -40,6 +40,16 @@ export const ConnectionBinding = z.object({
    * is missing".
    */
   credentialRef: z.string().regex(CREDENTIAL_REF_PATTERN).nullable(),
+  /**
+   * Which vendor's code runs this system, or `null` for a connection served
+   * by an env-configured adapter (the mail transport) rather than a
+   * registered provider. Operational, like `endpoint` beside it: the
+   * charter decides whether the system exists, on which channel, and which
+   * tools it serves -- this only says whose code runs. `runtime.ts` reads
+   * it, alongside the charter's own `channel` for the same system, to
+   * decide which provider-specific adapter (if any) to register.
+   */
+  provider: z.string().min(1).nullable(),
   lastOkAt: z.string().nullable(),
   lastError: z.string().nullable(),
 });
