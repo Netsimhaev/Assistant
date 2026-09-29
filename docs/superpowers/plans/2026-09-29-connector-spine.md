@@ -731,10 +731,12 @@ it('registers the provider adapter for a declared system even with no grant stor
 
 - [ ] **Step 7: מבחן השרשרת המלאה — הקריאה המוכיחה, במבחן**
 
-מפרט §1.7 קובע קריאה אמיתית אחת. לפני ההרצה החיה, המבחן הזה מוכיח שכל החוליות מחוברות — תקנון, binding, הרשאה, אסימון, מתאם — ולא רק שכל אחת עובדת לבד. הוא המקבילה של המבחן מקצה-לקצה שענף הדואר נסגר עליו.
+**קרא קודם את ההכרעה הזו, כי היא מבטלת גרסה מוקדמת של הצעד הזה.** גרסה קודמת הריצה את הקריאה דרך `runPlanForJob`. **זה לא יכול לעבוד:** `calendar.read` נמצא ב-`READ_ONLY_TOOLS` ואינו ב-`OUTBOUND_TOOLS`, ולכן `needsChannel` שקר ו-`performStep` (`src/orchestrator/run-plan.ts:496`) מנתב את הצעד כ**צעד מקומי** — שום מתאם לא נקרא ושום credential לא נפתר. הרחבת `needsChannel`, או הוספת הכלי לרשימת היוצאים, היא שינוי בפרדיקט מדיניות משותף ש-`crm.read` ו-`memory.recall` נשענים עליו במפורש (ראה ההערה ב-`run-plan.ts:292`), והיא **שייכת לתת-פרויקט 2** ולא לכאן.
+
+לכן השרשרת נבדקת **ישירות**, שכבה אחת מתחת לאורקסטרטור: תקנון → binding → הרשאה → אסימון → מתאם.
 
 ```ts
-it('drives a real chain: declared connection, live binding, stored grant, minted token, events back', async () => {
+it('drives the real chain: declared connection, live binding, stored grant, minted token, events back', async () => {
   await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
   await writeKeyState(KEY, 'KEY-e2e', { businessId: BUSINESS });
   await upsertBinding({ system: 'office-calendar', status: 'live', endpoint: null,
@@ -745,33 +747,105 @@ it('drives a real chain: declared connection, live binding, stored grant, minted
     refreshToken: 'refresh-e2e', grantedBy: 'owner' }, KEY);
 
   const seen: string[] = [];
-  const runtime = await buildRuntime({
-    credentialsKey: KEY,
-    tokenHttp: { exchangeRefresh: async () => ({ ok: true, accessToken: 'access-e2e', expiresInSeconds: 3600, rotatedRefreshToken: null }) },
-    calendarHttp: { listEvents: async (i) => { seen.push(i.accessToken); return { status: 200, body: { items: [{ id: 'e1', summary: 'פגישה אמיתית' }] } }; } },
+  const credentials = oauthCredentials({
+    key: KEY,
+    fallback: { resolve: async () => null },
+    http: { exchangeRefresh: async () => ({ ok: true, accessToken: 'access-e2e', expiresInSeconds: 3600, rotatedRefreshToken: null }) },
+  });
+  const adapter = createGoogleCalendarAdapter({
+    system: 'office-calendar',
+    http: { listEvents: async (i) => { seen.push(i.accessToken); return { status: 200, body: { items: [{ id: 'e1', summary: 'פגישה אמיתית' }] } }; } },
   });
 
-  const outcome = await runPlanForJob(jobWithOneStep('calendar.read'), runtime);
+  // The two halves the spine exists to join: the binding names a ref, and that
+  // ref resolves to a freshly minted access token. Asserted BEFORE the call, so
+  // the assertions below cannot pass on a chain that never started.
+  const bindings = await loadBindings({ businessId: BUSINESS });
+  const ref = bindings.find((b) => b.system === 'office-calendar')?.credentialRef;
+  expect(ref).toBe('OFFICE_CALENDAR');
+  const credential = await credentials.resolve(ref!, BUSINESS);
+  expect(credential?.value).toBe('access-e2e');
 
-  // Positive halves first: the step really ran, and the token really reached
-  // the provider -- so nothing below passes because the chain never started.
-  expect(outcome.status).toBe('done');
+  const result = await adapter.execute({
+    toolName: 'calendar.read', input: {}, credential, endpoint: null,
+    idempotencyKey: 'e2e-1', signal: AbortSignal.timeout(5_000),
+  });
+
+  expect(result.ok).toBe(true);
   expect(seen).toEqual(['access-e2e']);
-  expect(outcome.output).toMatchObject({ events: [{ id: 'e1' }] });
+  if (!result.ok) throw new Error('unreachable');
+  expect(result.output).toMatchObject({ events: [{ id: 'e1' }] });
 });
 ```
 
-`buildRuntime`'s `overrides` already carries a `createTransport` seam; add the three fields above beside it, in the same shape and with the same rule — **production calls `buildRuntime()` with zero arguments at all three sites.**
+- [ ] **Step 8: חווט את שירות האסימונים לתוך ההרכבה**
 
-- [ ] **Step 8: הרץ**
+`oauthCredentials` הוא `CredentialSource`, ו-`buildRuntime` הוא מי שבונה את המקור שעובר ל-`runDueJobs`. בלי החיווט הזה המודול מתקמפל בלי קורא בייצור — הפגם שהפרויקט הזה שילם עליו שש פעמים.
+
+ב-`runtime.ts`, החלף את המקור שנבנה היום ב-**הרכבה**:
+
+```ts
+const credentials = oauthCredentials({
+  key,
+  fallback: storedCredentials(key),
+  http: overrides.tokenHttp ?? defaultTokenHttp(),
+});
+```
+
+`storedCredentials(key)` נשאר בדיוק כפי שהוא ונעשה ה-fallback — כלומר **מתאם הדואר ממשיך לפתור את הסוד שלו באותה דרך בדיוק**, וזו הנקודה: ההרכבה מוסיפה ואינה מחליפה. הוסף `tokenHttp` ו-`calendarHttp` ל-`overrides` לצד התפר הקיים `createTransport`, עם אותו כלל: **הייצור קורא `buildRuntime()` בלי אף ארגומנט בשלושת האתרים.**
+
+- [ ] **Step 9: סקריפט ההרצה החיה**
+
+`scripts/connector-calendar.ts` — מה שההרצה החיה מריצה, במקביל ל-`scripts/live-thread-status.ts`:
+
+```ts
+import { config } from '../src/config.js';
+import { loadMasterKey } from '../src/governance/master-key.js';
+import { storedCredentials } from '../src/governance/credential-store.js';
+import { loadBindings } from '../src/orchestrator/bindings.js';
+import { oauthCredentials, defaultTokenHttp } from '../src/orchestrator/oauth-token.js';
+import { createGoogleCalendarAdapter } from '../src/orchestrator/adapters/google-calendar.js';
+import { closePool } from '../src/db/pool.js';
+
+const businessId = config.businessId;
+const key = await loadMasterKey(config.credentialKeyPath);
+const binding = (await loadBindings({ businessId })).find((b) => b.system === 'office-calendar');
+
+if (binding?.credentialRef == null) {
+  console.log('MISS  office-calendar — הרץ scripts/seed-charter.ts, ואז אשר גישה במסך החיבורים');
+} else {
+  const credentials = oauthCredentials({
+    key,
+    fallback: storedCredentials(key),
+    http: defaultTokenHttp(),
+  });
+  const credential = await credentials.resolve(binding.credentialRef, businessId);
+  const adapter = createGoogleCalendarAdapter({ system: 'office-calendar' });
+  const result = await adapter.execute({
+    toolName: 'calendar.read',
+    input: {},
+    credential,
+    endpoint: binding.endpoint,
+    idempotencyKey: `manual-${Date.now()}`,
+    signal: AbortSignal.timeout(20_000),
+  });
+  console.log(JSON.stringify(result, null, 2));
+}
+await closePool();
+```
+
+הוסף `"connector:calendar": "tsx scripts/connector-calendar.ts"` ל-`package.json`. אם `config` אינו חושף `credentialKeyPath`, קרא את `CREDENTIAL_KEY_PATH` באותה דרך שבה `src/cli/secret.ts` קורא אותו — **אל תמציא שם שדה**.
+
+- [ ] **Step 10: הרץ**
+
 
 Run: `npm run typecheck && npx vitest run src/orchestrator/adapters src/orchestrator/runtime.test.ts`
 Expected: PASS
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add src/db/migrations/033_binding_provider.sql src/domain/connection.ts src/orchestrator/bindings.ts src/orchestrator/adapters/google-calendar.ts src/orchestrator/adapters/google-calendar.test.ts src/orchestrator/runtime.ts src/orchestrator/runtime.test.ts
+git add src/db/migrations/033_binding_provider.sql scripts/connector-calendar.ts package.json src/domain/connection.ts src/orchestrator/bindings.ts src/orchestrator/adapters/google-calendar.ts src/orchestrator/adapters/google-calendar.test.ts src/orchestrator/runtime.ts src/orchestrator/runtime.test.ts
 git commit -m "The provider is operational, not signed: a column on the binding and one adapter"
 ```
 
@@ -1055,7 +1129,7 @@ git add -A && git commit -m "The invariants that hold the write path narrow, and
 
 **אינה משימה בתוכנית ואינה ניתנת לדילוג.** לפי המפרט §7.4, תת-הפרויקט אינו סגור עד שכל שלושת אלה בוצעו **בפועל**:
 
-1. הבעלים פותח את מסך החיבורים, מאשר גישה ליומן, והעוזרת מדפיסה אירועים אמיתיים מהיומן של העסק.
+1. הבעלים פותח את מסך החיבורים, מאשר גישה ליומן, ואז `npm run connector:calendar` מדפיס אירועים אמיתיים מהיומן של העסק. (ראה ההכרעה ב-Task 4 Step 7: השרשרת מוכחת שכבה אחת מתחת ל-runPlan, וחיווט כלי קריאה חיצוני לתוך מריץ התוכניות הוא תת-פרויקט 2.)
 2. **סריקת דליפה** על כל בסיס הנתונים ועל לוגי התהליכים.
 3. **בדיקת ביטול** — ללחוץ ביטול, ולראות שהקריאה הבאה מסרבת.
 
