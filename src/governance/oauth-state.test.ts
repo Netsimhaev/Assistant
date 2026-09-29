@@ -83,4 +83,64 @@ describe('oauth-state: the anti-forgery gate for the consent ceremony', () => {
     const b = await createState({ businessId: BUSINESS, system: 'office-calendar', sessionId: 's1', codeVerifier: 'v1' });
     expect(a).not.toBe(b);
   });
+
+  /**
+   * Final fix wave, item 8. Before this fix nothing ever deleted from this
+   * table: every ceremony start left a row behind forever, consumed or not,
+   * each one holding a `code_verifier` in plaintext. Pruning is
+   * opportunistic — it runs inside `createState` itself, not a scheduler
+   * pass — so the positive half below (dead rows genuinely present right up
+   * until the next start) matters: it is what proves the next `createState`
+   * call is actually what triggers the cleanup, not something that would
+   * have been empty regardless.
+   */
+  it('prunes consumed and expired rows the next time a ceremony starts, and leaves live ones alone', async () => {
+    // Both rows are minted BEFORE either becomes dead, and neither is
+    // touched by a THIRD `createState` call until after the "before" check
+    // below — `createState` itself prunes opportunistically on every call
+    // (see `pruneStaleStates`'s own docblock), so minting the "expired" row
+    // only after consuming the first one would have pruned the first one
+    // right then, and the "before" snapshot would never see it.
+    const consumed = await createState({
+      businessId: BUSINESS,
+      system: 'office-calendar',
+      sessionId: 's1',
+      codeVerifier: 'v1',
+    });
+    const expired = await createState({
+      businessId: OTHER_BUSINESS,
+      system: 'office-mail',
+      sessionId: 's2',
+      codeVerifier: 'v2',
+    });
+
+    await consumeState(consumed, BUSINESS);
+    await getPool().query(
+      `UPDATE oauth_states SET expires_at = now() - interval '1 minute' WHERE state = $1`,
+      [expired],
+    );
+
+    // Positive half: both dead rows genuinely still exist right before the
+    // next ceremony start — pruning is not something SQLite/Postgres did on
+    // its own, and the assertions below are not vacuously true.
+    const before = await getPool().query<{ n: string }>('SELECT count(*)::text AS n FROM oauth_states');
+    expect(before.rows[0]?.n).toBe('2');
+
+    // A third, still-live ceremony starting is what triggers the prune.
+    // Unscoped by business id on purpose (see `pruneStaleStates`'s own
+    // docblock): the expired row belongs to `OTHER_BUSINESS`, and this call
+    // is made under `BUSINESS` — it must still be swept.
+    const live = await createState({
+      businessId: BUSINESS,
+      system: 'office-calendar',
+      sessionId: 's3',
+      codeVerifier: 'v3',
+    });
+
+    const remaining = await getPool().query<{ state: string }>('SELECT state FROM oauth_states');
+    const remainingStates = remaining.rows.map((r) => r.state);
+    expect(remainingStates).not.toContain(consumed);
+    expect(remainingStates).not.toContain(expired);
+    expect(remainingStates).toEqual([live]);
+  });
 });

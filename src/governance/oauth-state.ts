@@ -58,6 +58,12 @@ export async function createState(
   options: { db?: Queryable } = {},
 ): Promise<string> {
   const db = options.db ?? getPool();
+  // Opportunistic, on every ceremony start (final fix wave, item 8): this
+  // table had no pruning anywhere, so every started ceremony left a
+  // PERMANENT row holding a `code_verifier` in plaintext, consumed or not.
+  // See `pruneStaleStates`'s own docblock for why here rather than a
+  // scheduler pass.
+  await pruneStaleStates(db);
   const state = randomBytes(32).toString('base64url');
   const expiresAt = new Date(Date.now() + STATE_TTL_MS).toISOString();
   await db.query(
@@ -66,6 +72,35 @@ export async function createState(
     [state, input.businessId, input.system, input.sessionId, input.codeVerifier, expiresAt],
   );
   return state;
+}
+
+/**
+ * Delete every row that can no longer matter: already consumed, or past its
+ * own TTL and therefore already refused by `consumeState`'s `expires_at`
+ * check regardless. Nothing in this codebase pruned this table at all —
+ * every started ceremony left a row behind forever, consumed or not, each
+ * one holding a `code_verifier` in plaintext, and under `SameSite=Lax` a
+ * cross-site top-level GET can drive a `/oauth/:system/start` navigation, so
+ * an unbounded backlog of these is exposure with no expiry on it, not merely
+ * table bloat.
+ *
+ * **Called from `createState`, opportunistically, not from a scheduler
+ * pass.** A ceremony start is already a write to this table, so piggybacking
+ * the cleanup onto it bounds a row's lifetime even on an installation that
+ * never runs `npm run scheduler` at all — the dashboard process alone is
+ * enough to both start ceremonies and prune after itself, with no second
+ * process required to agree on when.
+ *
+ * **Unscoped by business id, deliberately.** This is housekeeping on rows
+ * that are ALREADY DEAD (consumed, or past `expires_at`) — not a lookup
+ * `consumeState`'s own `WHERE business_id = $2` already guards against
+ * reading cross-tenant. A consumed or expired row from business A is exactly
+ * as safe to delete as one from business B; scoping this query would only
+ * leave every OTHER business's stale rows sitting untouched until one of
+ * their own owners happens to start a ceremony too.
+ */
+async function pruneStaleStates(db: Queryable): Promise<void> {
+  await db.query(`DELETE FROM oauth_states WHERE consumed_at IS NOT NULL OR expires_at <= now()`);
 }
 
 export interface ConsumedState {
