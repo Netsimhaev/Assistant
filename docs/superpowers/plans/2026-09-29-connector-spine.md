@@ -788,9 +788,11 @@ it('drives the real chain: declared connection, live binding, stored grant, mint
 const credentials = oauthCredentials({
   key,
   fallback: storedCredentials(key),
-  http: overrides.tokenHttp ?? defaultTokenHttp(),
+  http: overrides.tokenHttp ?? googleTokenHttp({ credentials: storedCredentials(key), businessId }),
 });
 ```
+
+**והחלק שזז לכאן מ-Task 3, בהכרעה:** המימוש האמיתי של `TokenHttp` נבנה **כאן**, לא בשירות האסימונים, ומטעם אחד — **סוד היישום נפתר מהמאגר הקיים ולא ממשתנה סביבה.** גרסה מוקדמת של Task 3 קראה אותו מ-`process.env`, בענף שכל תכליתו להוציא סודות משם; `master-key.ts` מנמק זאת במפורש ו-`SMTP_PASS` נמחק על אותו טיעון. `googleTokenHttp` מקבל את מקור הסודות הקיים ואת מזהה העסק, ופותר את סוד היישום בכל רענון — בדיוק כפי שמפרט §5.4 דורש. **ותצורה חסרה היא כשל סופי ולא זמני:** קוד שגוי שמסווג אותה `transient` מחזיר את ה-scheduler לנסות שגיאת תצורה כל חמש דקות לנצח.
 
 `storedCredentials(key)` נשאר בדיוק כפי שהוא ונעשה ה-fallback — כלומר **מתאם הדואר ממשיך לפתור את הסוד שלו באותה דרך בדיוק**, וזו הנקודה: ההרכבה מוסיפה ואינה מחליפה. הוסף `tokenHttp` ו-`calendarHttp` ל-`overrides` לצד התפר הקיים `createTransport`, עם אותו כלל: **הייצור קורא `buildRuntime()` בלי אף ארגומנט בשלושת האתרים.**
 
@@ -803,7 +805,8 @@ import { config } from '../src/config.js';
 import { loadMasterKey } from '../src/governance/master-key.js';
 import { storedCredentials } from '../src/governance/credential-store.js';
 import { loadBindings } from '../src/orchestrator/bindings.js';
-import { oauthCredentials, defaultTokenHttp } from '../src/orchestrator/oauth-token.js';
+import { oauthCredentials } from '../src/orchestrator/oauth-token.js';
+import { googleTokenHttp } from '../src/orchestrator/adapters/google-token-http.js';
 import { createGoogleCalendarAdapter } from '../src/orchestrator/adapters/google-calendar.js';
 import { closePool } from '../src/db/pool.js';
 
@@ -817,7 +820,7 @@ if (binding?.credentialRef == null) {
   const credentials = oauthCredentials({
     key,
     fallback: storedCredentials(key),
-    http: defaultTokenHttp(),
+    http: googleTokenHttp({ credentials: storedCredentials(key), businessId }),
   });
   const credential = await credentials.resolve(binding.credentialRef, businessId);
   const adapter = createGoogleCalendarAdapter({ system: 'office-calendar' });
