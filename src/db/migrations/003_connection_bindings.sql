@@ -9,9 +9,15 @@
 -- (endpoint, credential_ref) — that is not "narrow only", it is a real
 -- expansion of what a signed connection does in practice. Those fields are
 -- deliberately outside the charter (rotating a credential must not require
--- the owner's signature), so the mitigation lives elsewhere: every write to
--- this table is audited, in src/orchestrator/bindings.ts, so a redirect is at
--- least as visible as a kill switch trip.
+-- the owner's signature), so the mitigation lives elsewhere: every write that
+-- changes ROUTING or CREDENTIALS (upsertBinding, in
+-- src/orchestrator/bindings.ts) is audited, so a redirect is at least as
+-- visible as a kill switch trip. last_ok_at/last_error are the one exception:
+-- recordBindingOutcome (same file) writes only those two columns, on every
+-- adapter call, and does not audit — a health-bookkeeping fact about whether
+-- a call just landed is not a change in where trust is placed, and auditing
+-- it at that volume would drown the routing/credential changes the trail
+-- exists to make visible.
 --
 -- No foreign key to charter_versions: a connection survives a charter
 -- replacement, and whether it matches a declared system is checked when the

@@ -674,6 +674,21 @@ async function performStep(
   // not control, and a bookkeeping UPDATE that fails must not turn a step
   // that actually succeeded (or failed for its own, already-handled reason)
   // into something this function reports differently.
+  //
+  // FOUR failure paths never reach this call at all, and both fields stay
+  // stale for each of them. Three happen BEFORE this point, because there is
+  // no `AdapterResult` yet to record: `channel_unavailable` (the binding
+  // resolved but is not `live`), `credential_unavailable` (the ref did not
+  // resolve), and the five OAuth-derived `StepChannelError`s `performStep`
+  // throws above via `mapOAuthTokenError` — those last ones already have a
+  // home of their own, the grant's `needsReauthAt`, written by the token
+  // service. The fourth, `adapter_timeout`, is different in kind: it happens
+  // DURING this call — `callWithDeadline`'s own race rejects before `result`
+  // is ever assigned, so a chronically timing-out connection leaves both
+  // health fields stale with nothing here ever running for it. No `finally`
+  // fixes that without also running on the happy path this call already
+  // covers; a connection that only ever times out is a gap this function does
+  // not close.
   await recordBindingOutcome({
     businessId: request.job.businessId,
     system: resolution.system,
