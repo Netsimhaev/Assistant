@@ -14,6 +14,7 @@ import type { CredentialHandle } from './adapters/types.js';
 import type { CredentialSource } from './credentials.js';
 import {
   AmbiguousCredentialRefError,
+  OAuthGrantRevokedError,
   OAuthRefreshRejectedError,
   OAuthRefreshTransientError,
   oauthCredentials,
@@ -21,6 +22,7 @@ import {
 import type { RefreshOutcome, TokenHttp } from './oauth-token.js';
 
 const BUSINESS = 'test-business';
+const OTHER_BUSINESS = 'other-test-business';
 const KEY = randomBytes(32);
 
 const GRANT = {
@@ -34,19 +36,35 @@ const GRANT = {
 } as const;
 
 /**
- * A `CredentialSource` whose `resolve` throws unconditionally. Used wherever
- * a live grant should answer for itself without this module ever needing
- * the fallback's opinion — if `oauthCredentials` called it anyway and let
- * the throw through, the surrounding test would fail loudly instead of
- * silently passing on the wrong path.
+ * A `CredentialSource` backed by a plain map that records every ref it was
+ * asked about. An empty map (`stubSource({})`) is the honest replacement for
+ * a throwing double: it answers `null` truthfully wherever a real
+ * `envCredentials`/`storedCredentials` would, so a test can assert exactly
+ * how many times — and on which refs — the fallback was actually consulted,
+ * which a throwing double cannot distinguish from "never called" (fix round
+ * 1, C1: a bare catch around a genuinely rejecting fallback misreports a
+ * database blip as a permanent misconfiguration).
  */
-const NEVER_CALLED: CredentialSource = {
-  resolve(): Promise<CredentialHandle | null> {
-    throw new Error('fallback.resolve should not have been called');
-  },
-};
+function stubSource(secrets: Record<string, string>): CredentialSource & { calls: string[] } {
+  const calls: string[] = [];
+  return {
+    calls,
+    async resolve(ref: string, _businessId: string): Promise<CredentialHandle | null> {
+      calls.push(ref);
+      if (!Object.hasOwn(secrets, ref)) return null;
+      return createCredentialHandle(ref, secrets[ref] as string);
+    },
+  };
+}
 
-/** Same idea as `NEVER_CALLED`, for the HTTP seam. */
+/**
+ * A `TokenHttp` whose `exchangeRefresh` throws unconditionally. Kept ONLY for
+ * `TokenHttp`, not `CredentialSource`: the sites that use it (a ref that is
+ * not a grant at all, or an ambiguity refusal) are structurally unreachable
+ * before the exchange call regardless of what any double does, so a throw
+ * there proves a real control-flow bug rather than merely disagreeing with a
+ * fallback's honest answer the way C1 found for `CredentialSource`.
+ */
 const NEVER_CALLED_HTTP: TokenHttp = {
   exchangeRefresh(): Promise<RefreshOutcome> {
     throw new Error('http.exchangeRefresh should not have been called');
@@ -59,16 +77,6 @@ const REJECTING_HTTP: TokenHttp = {
     return { ok: false, kind: 'rejected', message: 'invalid_grant' };
   },
 };
-
-/** A `CredentialSource` backed by a plain map, for the non-OAuth fallback path. */
-function stubSource(secrets: Record<string, string>): CredentialSource {
-  return {
-    async resolve(ref: string, _businessId: string): Promise<CredentialHandle | null> {
-      if (!Object.hasOwn(secrets, ref)) return null;
-      return createCredentialHandle(ref, secrets[ref] as string);
-    },
-  };
-}
 
 /** A `TokenHttp` that records every call it received and always succeeds. */
 function recordingHttp(result: {
@@ -106,16 +114,21 @@ describe('oauthCredentials', () => {
     await closePool();
   });
 
-  it('mints an access token from a stored grant', async () => {
+  it('mints an access token from a stored grant, consulting the fallback once to rule out ambiguity', async () => {
     await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    const fallback = stubSource({});
     const http = recordingHttp({ accessToken: 'access-1', expiresInSeconds: 3600 });
-    const source = oauthCredentials({ key: KEY, fallback: NEVER_CALLED, http });
+    const source = oauthCredentials({ key: KEY, fallback, http });
 
     const handle = await source.resolve(GRANT.credentialRef, BUSINESS);
 
     expect(handle?.value).toBe('access-1');
     expect(http.calls).toHaveLength(1);
     expect(http.calls[0]?.refreshToken).toBe(GRANT.refreshToken);
+    // The fallback WAS consulted (to rule out ambiguity) and answered
+    // honestly with "nothing here" -- that is the correct, expected
+    // behaviour now, not something to avoid.
+    expect(fallback.calls).toEqual([GRANT.credentialRef]);
   });
 
   it('falls through to the static store for a ref that is not a grant', async () => {
@@ -133,55 +146,53 @@ describe('oauthCredentials', () => {
     await expect(source.resolve(GRANT.credentialRef, BUSINESS)).rejects.toThrow(
       AmbiguousCredentialRefError,
     );
+    expect(fallback.calls).toEqual([GRANT.credentialRef]);
   });
 
-  it('reuses a cached access token, and still checks revocation every call', async () => {
+  it('reuses a cached access token without re-consulting the fallback, and refuses outright once revoked', async () => {
     await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    const fallback = stubSource({});
     const http = recordingHttp({ accessToken: 'access-1', expiresInSeconds: 3600 });
-    const source = oauthCredentials({ key: KEY, fallback: NEVER_CALLED, http });
+    const source = oauthCredentials({ key: KEY, fallback, http });
 
     expect((await source.resolve(GRANT.credentialRef, BUSINESS))?.value).toBe('access-1');
     expect((await source.resolve(GRANT.credentialRef, BUSINESS))?.value).toBe('access-1');
-    // Positive half: the cache is real -- one exchange, not two.
+    // Positive half: the cache is real -- one exchange, not two, and the
+    // fallback was consulted exactly once (the first call's ambiguity
+    // check) -- the cache hit on the second call skips it entirely.
     expect(http.calls).toHaveLength(1);
+    expect(fallback.calls).toEqual([GRANT.credentialRef]);
 
     await revokeGrant(GRANT.system, BUSINESS, 'owner');
-    // And it is still refused immediately, while that cached token is valid.
-    expect(await source.resolve(GRANT.credentialRef, BUSINESS)).toBeNull();
+    // Fix round 1, I3: a revoked grant refuses outright -- it does not fall
+    // through to the (honest, empty) fallback and does not return null.
+    await expect(source.resolve(GRANT.credentialRef, BUSINESS)).rejects.toThrow(
+      OAuthGrantRevokedError,
+    );
+    // And the refusal did not consult the fallback either.
+    expect(fallback.calls).toEqual([GRANT.credentialRef]);
   });
 
-  it('marks the grant for re-authorisation when the provider rejects the refresh token', async () => {
+  it('marks the grant for re-authorisation when the provider rejects the refresh token, and threads the provider message through', async () => {
     await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-    const source = oauthCredentials({
-      key: KEY,
-      fallback: NEVER_CALLED,
-      http: {
-        async exchangeRefresh(): Promise<RefreshOutcome> {
-          return { ok: false, kind: 'rejected', message: 'invalid_grant' };
-        },
-      },
-    });
+    const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http: REJECTING_HTTP });
 
-    await expect(source.resolve(GRANT.credentialRef, BUSINESS)).rejects.toThrow(
-      OAuthRefreshRejectedError,
-    );
+    let caught: unknown;
+    try {
+      await source.resolve(GRANT.credentialRef, BUSINESS);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(OAuthRefreshRejectedError);
+    expect((caught as Error).message).toContain('invalid_grant');
     expect((await listGrants(BUSINESS))[0]?.needsReauthAt).not.toBeNull();
   });
 
-  it('stores a rotated refresh token, so the next call uses the new one', async () => {
-    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-    const http = recordingHttp({ accessToken: 'a', expiresInSeconds: 1, rotatedRefreshToken: 'refresh-2' });
-    const source = oauthCredentials({ key: KEY, fallback: NEVER_CALLED, http, now: clock() });
-
-    await source.resolve(GRANT.credentialRef, BUSINESS);
-    expect((await readGrantBySystem(GRANT.system, BUSINESS, KEY))?.refreshToken).toBe('refresh-2');
-  });
-
-  it('reports a transient failure as retryable, distinct from a rejection', async () => {
+  it('reports a transient failure as retryable, distinct from a rejection, and does not flag re-auth', async () => {
     await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
     const source = oauthCredentials({
       key: KEY,
-      fallback: NEVER_CALLED,
+      fallback: stubSource({}),
       http: {
         async exchangeRefresh(): Promise<RefreshOutcome> {
           return { ok: false, kind: 'transient', message: 'gateway_timeout' };
@@ -189,16 +200,30 @@ describe('oauthCredentials', () => {
       },
     });
 
-    await expect(source.resolve(GRANT.credentialRef, BUSINESS)).rejects.toThrow(
-      OAuthRefreshTransientError,
-    );
+    let caught: unknown;
+    try {
+      await source.resolve(GRANT.credentialRef, BUSINESS);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(OAuthRefreshTransientError);
+    expect((caught as Error).message).toContain('gateway_timeout');
     // Unlike a rejection, a transient failure does not flag the grant for re-auth.
     expect((await listGrants(BUSINESS))[0]?.needsReauthAt).toBeNull();
   });
 
+  it('stores a rotated refresh token, so the next call uses the new one', async () => {
+    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    const http = recordingHttp({ accessToken: 'a', expiresInSeconds: 1, rotatedRefreshToken: 'refresh-2' });
+    const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http, now: clock() });
+
+    await source.resolve(GRANT.credentialRef, BUSINESS);
+    expect((await readGrantBySystem(GRANT.system, BUSINESS, KEY))?.refreshToken).toBe('refresh-2');
+  });
+
   it('writes one audit row when the provider rejects the refresh token', async () => {
     await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
-    const source = oauthCredentials({ key: KEY, fallback: NEVER_CALLED, http: REJECTING_HTTP });
+    const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http: REJECTING_HTTP });
 
     await expect(source.resolve(GRANT.credentialRef, BUSINESS)).rejects.toThrow(
       OAuthRefreshRejectedError,
@@ -210,7 +235,27 @@ describe('oauthCredentials', () => {
     );
     expect(rows[0]?.kind).toBe('credential_change');
     expect(rows[0]?.reason).toContain(GRANT.system);
+    expect(rows[0]?.reason).toContain('invalid_grant');
     // The token is never in the reason, and neither is the provider's raw body.
     expect(rows[0]?.reason).not.toContain(GRANT.refreshToken);
+  });
+
+  it('gives each business its own cached access token under the same ref and system', async () => {
+    await writeGrant({ businessId: BUSINESS, ...GRANT }, KEY);
+    await writeGrant(
+      { businessId: OTHER_BUSINESS, ...GRANT, refreshToken: 'refresh-token-value-B' },
+      KEY,
+    );
+    const http = recordingHttp({ accessToken: 'access-for-a', expiresInSeconds: 3600 });
+    const source = oauthCredentials({ key: KEY, fallback: stubSource({}), http, now: clock() });
+
+    const first = await source.resolve(GRANT.credentialRef, BUSINESS);
+    const second = await source.resolve(GRANT.credentialRef, OTHER_BUSINESS);
+
+    expect(first?.value).toBe('access-for-a');
+    expect(second?.value).toBe('access-for-a'); // same stub response, different call
+    expect(http.calls).toHaveLength(2);
+    expect(http.calls[0]?.refreshToken).toBe(GRANT.refreshToken);
+    expect(http.calls[1]?.refreshToken).toBe('refresh-token-value-B');
   });
 });

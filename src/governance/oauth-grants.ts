@@ -245,6 +245,35 @@ export async function readGrantByRef(
   return openGrant(row, businessId, key);
 }
 
+/**
+ * Whether a ref names a grant at all, live or revoked — WITHOUT the master
+ * key, so this function is structurally incapable of returning a token, the
+ * same guarantee `listGrants` already gives for the same reason.
+ *
+ * Exists because `readGrantByRef` filters `revoked_at IS NULL` in its own
+ * `WHERE` clause, so "there was never a grant under this ref" and "there was
+ * one and the owner revoked it" both come back as `null` and cannot be told
+ * apart from that call alone. `oauthCredentials`
+ * (`src/orchestrator/oauth-token.ts`) needs to tell them apart: a revoked
+ * grant must refuse outright (spec §3.4), never fall through to a static
+ * secret configured under the same ref — the same ambiguity §3.1א already
+ * refuses by name, reappearing through the one door revocation opens.
+ */
+export async function grantStatusByRef(
+  credentialRef: string,
+  businessId: string,
+  options: GrantOptions = {},
+): Promise<'none' | 'live' | 'revoked'> {
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<{ revoked_at: Date | null }>(
+    'SELECT revoked_at FROM oauth_grants WHERE business_id = $1 AND credential_ref = $2',
+    [businessId, credentialRef],
+  );
+  const row = rows[0];
+  if (row === undefined) return 'none';
+  return row.revoked_at === null ? 'live' : 'revoked';
+}
+
 export async function readGrantBySystem(
   system: string,
   businessId: string,
