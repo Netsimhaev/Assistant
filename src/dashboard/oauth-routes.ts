@@ -165,8 +165,28 @@ function assertValidOAuthSystemName(system: string): void {
  * `AmbiguousCredentialRefError`, non-retryably, forever (see
  * `oauth-eligibility.ts`'s module docblock for the full chain). Item 1a's
  * gate stops `office-mail` specifically from reaching this function at all;
- * the `OAUTH_` prefix is what makes the collision structurally impossible
- * for every system name, including ones no gate was ever written to name.
+ * the `OAUTH_` prefix is what keeps the collision out of reach for every
+ * OTHER system name too, including ones no gate was ever written to name.
+ *
+ * **"Out of reach", not "structurally impossible" -- the stronger word stood
+ * here until 29/09 and was wrong.** Nothing reserves this prefix. `putSecret`
+ * (`governance/credential-store.ts`) accepts any ref satisfying
+ * `CREDENTIAL_REF_PATTERN` (`/^[A-Z0-9_]+$/`), and `OAUTH_OFFICE_CALENDAR`
+ * satisfies it -- so an operator who ran `npm run secret put
+ * OAUTH_OFFICE_CALENDAR` by hand would recreate precisely the ambiguity this
+ * prefix moves aside. That is convention-strong, not structural. Contrast
+ * `grantAad`'s `grant:<system>` one module over
+ * (`governance/oauth-grants.ts`), which really is structural: it is lowercase
+ * and carries a colon, so no ref that pattern admits can ever equal it, and
+ * no operator discipline is being relied on. No documented ref uses `OAUTH_`
+ * and nothing in this codebase writes one, so the exposure is nil.
+ *
+ * **The claim was narrowed rather than the code hardened, on purpose.**
+ * Reserving the prefix inside `putSecret` would put an OAuth concern into the
+ * generic secret writer, and `putSecret` keeping its single CLI writer is a
+ * property this project holds deliberately. Of the two defects, the
+ * overstated docblock was the more dangerous one anyway: it is what the next
+ * reader trusts instead of checking.
  *
  * **Injective, not merely deterministic.** The bare mapping also collapsed
  * `office-calendar`, `office.calendar` and `office_calendar` onto the

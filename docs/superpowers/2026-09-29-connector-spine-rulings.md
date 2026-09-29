@@ -613,3 +613,66 @@ tree that is offered for merge. `npm run typecheck` clean. No leftover mutation 
 restored from the backup.
 
 Started from 1884 tests on `main`; 130 net new. Twenty-four commits plus eight in the final fix wave.
+
+---
+
+## Post-merge residual sweep, 29/09 — three of five parked items closed, one found
+
+Run after the merge to `main` (`ca440fa`) and the merge-obligation cleanup (`d4b0cf6`), at the owner's
+request. Documentation and comments only, plus one `console.warn` in a dev script; no policy code touched,
+no behaviour changed on any production path.
+
+**CLOSED — the two runbook inaccuracies (parked item 3).** §10.0 told the operator to hand-write a calendar
+charter variant "just with `system: 'office-calendar'`" while `scripts/seed-charter.ts` had already declared
+it since item 7; the prerequisite now says so and names step 3. §10.1 and the §10 intro said the link reads
+"התחבר" where `views.ts` renders "לחיבור"; both corrected, and the old wording named so a reader comparing
+an older copy is not left guessing.
+
+**CLOSED — `credentialRefForSystem`'s overclaim (parked item 4).** "The `OAUTH_` prefix is what makes the
+collision structurally impossible" is now "keeps the collision out of reach", with the reason written out:
+nothing reserves the prefix — `putSecret` accepts any ref matching `CREDENTIAL_REF_PATTERN`
+(`/^[A-Z0-9_]+$/`), which `OAUTH_OFFICE_CALENDAR` satisfies, so a hand-provisioned secret under that exact
+name would recreate the ambiguity. The docblock now contrasts it with `grantAad`'s `grant:<system>`, which
+*is* structural (lowercase plus a colon, so no admissible ref can equal it). **Ruling: narrow the claim, do
+not harden the code.** Reserving the prefix inside `putSecret` would put an OAuth concern into the generic
+secret writer, and `putSecret` keeping its single CLI writer is a property held on purpose. Exposure is nil
+either way — no documented ref uses the prefix and nothing in the codebase writes one — so the defect that
+was actually costing something was the sentence, which is what the next reader trusts instead of checking.
+
+**CLOSED, differently than the parked note suggested — `seed-charter-live.ts` (parked item 2).** The note
+implied the fix was item 7's skip condition. **Ruling: a skip condition is the wrong fix here, and the
+silence is the right target.** `seed-charter.ts` installs the ordinary charter, so declining to replace one
+that already declares both systems costs nothing; `seed-charter-live.ts` exists precisely to replace
+whatever is active with a deliberately permissive charter (`email.initiate: auto`), and a skip condition
+would make the live run it exists to set up impossible to prepare. Nor should it carry the previous
+charter's connections forward: this script's whole value is that ninety readable lines tell you exactly what
+gets installed, and inheriting declarations from the charter it exists to replace would make the permissive
+live-run charter's contents depend on unread state. So the drop stays and the silence goes — it now names
+every connection it dropped and the one command that restores them. Cost if wrong: an operator still loses
+the calendar declaration, but can no longer do so without being told.
+
+**FOUND and closed, not previously parked — runbook §3 pasted a stale, no-longer-compiling source listing.**
+§3 told the operator to save the following file as `scripts/seed-charter.ts`, wording that predated the
+script's existence in the repo and stayed after it. The pasted listing had drifted twice over: it omitted
+`ConnectionBinding.provider`, required (nullable, not optional) since migration 033, so copying it would not
+typecheck; and it declared `office-mail` only, so an operator who followed §3 literally lost the
+`office-calendar` declaration that §10 depends on. Replaced with the command plus what the script does, what
+it deliberately does not do (no calendar binding — the ceremony writes that), and why re-running is safe.
+Found while fixing the §10.0 pointer, and worth naming: three of the five items in this sweep are the same
+class as the four "comment cites a precedent that does not say what it claims" defects this branch already
+recorded — documentation asserting something nobody re-checked.
+
+**STILL OPEN — parked items 1 and 5, unchanged and deliberately so.** Path C (a hand-authored charter
+declaring one system serving both `mail.send` and `calendar.read` can still let the ceremony replace the
+mail binding's ref) and the callback's missing eligibility re-check are behaviour changes on the OAuth path,
+not documentation. Both belong with a live run that has actually exercised the ceremony, which has still
+never happened.
+
+**MEASURED, not assumed — and one finding about the check itself.** `npm test`: 153 files, 2024 passed,
+1 skipped, real exit code 0 by redirection. `npm run typecheck`: clean — **but it does not cover
+`scripts/`**, whose `include` is `src/**/*.ts` only, so the edit to `seed-charter-live.ts` was verified by a
+separate run with `rootDir` widened to the repo root (also clean, then the temporary tsconfig removed).
+Worth recording rather than fixing: `connector-invariants.test.ts`'s writer-import scan already walks
+`scripts/`, so that directory is inside the security perimeter while sitting outside the typecheck one.
+Widening `include` would force `rootDir` wider and change where `npm run build` emits, which is not a change
+to make in a documentation sweep.

@@ -23,6 +23,13 @@
  * the signature is dropped, the window replaced, and the whole thing re-signed
  * — the hash must cover what is actually installed.
  *
+ * **It also drops any connection the previous charter declared other than
+ * `office-mail`** -- `office-calendar`, in an installation that followed
+ * runbook section 10. That is a consequence of superseding with a
+ * single-connection charter rather than a fourth deliberate difference, and
+ * it is warned about rather than prevented; the comment beside the warning
+ * itself says why a skip condition is not the fix here.
+ *
  *   npx tsx scripts/seed-charter-live.ts
  */
 import { installCharter, probeActiveCharter } from '../src/charter/store.js';
@@ -75,6 +82,34 @@ console.log(
     : `superseded ${previous.charter.charterVersion} with ${bundle.charterVersion}`,
 );
 console.log('quiet hours:', charter.operations.quietHours);
+
+// The charter installed above declares `office-mail` ONLY, and it supersedes
+// unconditionally -- that is this script's purpose, not an oversight: the
+// three differences named at the top are what the run proves.
+//
+// But both `scripts/seed-charter.ts` and the consent ceremony in runbook
+// section 10 leave `office-calendar` declared, and dropping a declaration
+// puts the grant the owner authorised out of reach: the `oauth_grants` row
+// survives untouched, and every later `calendar.read` step is refused at
+// `no_channel_for_tool`, because the registry can only narrow (`CLAUDE.md`).
+//
+// Skipping the install the way `seed-charter.ts` does is NOT available here.
+// That script installs the ordinary charter, so declining to replace a
+// charter which already declares both systems costs nothing; this one exists
+// to replace whatever is active with a deliberately permissive charter
+// (`email.initiate: auto`), and a skip condition would make the live run it
+// exists for impossible to set up. So the drop stays and the silence goes:
+// name what was dropped, and name the one command that restores it.
+const dropped = (previous?.charter.connections ?? [])
+  .map((c) => c.system)
+  .filter((system) => system !== MAIL_CONNECTION.system);
+if (dropped.length > 0) {
+  console.warn(
+    `warning: the previous charter declared ${dropped.join(', ')} and this one does not — ` +
+      'any OAuth grant authorised for those systems is now unreachable (no_channel_for_tool). ' +
+      'Restore both declarations with: npx tsx scripts/seed-charter.ts',
+  );
+}
 
 await upsertBinding(
   {

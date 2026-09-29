@@ -181,48 +181,37 @@ npm run secret put OFFICE_MAIL <המפעיל שלך>
 ## 3. תקנון והחיבור
 
 אין עדיין כלי CLI שמתקין תקנון או קובע חיבור למצב `live` — שניהם ייבנו עם
-המתכנן. עד אז מריצים סקריפט חד-פעמי עם `tsx`. שמור את הקובץ הבא כ-
-`scripts/seed-charter.ts` (או בכל נתיב זמני), הרץ אותו פעם אחת, ואפשר למחוק
-אחר כך:
-
-```ts
-import { installCharter } from '../src/charter/store.js';
-import { buildCharter } from '../src/test/fixtures.js';
-import { upsertBinding } from '../src/orchestrator/bindings.js';
-import { closePool } from '../src/db/pool.js';
-import type { CharterConnection } from '../src/domain/connection.js';
-
-const MAIL_CONNECTION: CharterConnection = {
-  system: 'office-mail',
-  label: 'תיבת המשרד',
-  channel: 'api',
-  serves: ['mail.send'],
-  target: null,
-  subprocessor: null,
-};
-
-const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }));
-console.log(`charter installed: ${bundle.charterVersion}`);
-
-await upsertBinding(
-  {
-    system: 'office-mail',
-    status: 'live',
-    endpoint: null,
-    credentialRef: 'OFFICE_MAIL',
-    lastOkAt: null,
-    lastError: null,
-  },
-  { by: 'runbook' },
-);
-console.log('binding office-mail set to live');
-
-await closePool();
-```
+המתכנן. עד אז מריצים את הסקריפט שכבר נמצא במאגר:
 
 ```bash
 npx tsx scripts/seed-charter.ts
 ```
+
+**הסקריפט נמצא במאגר ואין לכתוב אותו מחדש ביד.** עד סבב הניקוי של 29/09 הפרק
+הזה הדביק כאן את קוד המקור שלו וביקש לשמור אותו כקובץ חדש — ניסוח שקדם
+לקיומו של הסקריפט ונשאר במקומו אחריו. ההעתקה ההיא כבר לא הייתה מתקמפלת:
+`ConnectionBinding.provider` הוא שדה **חובה** מאז מיגרציה 033
+(`z.string().min(1).nullable()` — כלומר מותר לו להיות `null` אבל אסור לו
+להיעדר), והוא נעדר מהרשימה שהודבקה כאן; והיא גם הצהירה על `office-mail`
+בלבד, כך שמי שהעתיק אותה איבד את ההצהרה על `office-calendar` שפרק 10 נשען
+עליה.
+
+**מה הסקריפט עושה:** מתקין תקנון שמצהיר על **שתי** מערכות — `office-mail`
+(ערוץ `api`, `serves: ['mail.send']`) ו-`office-calendar`
+(`serves: ['calendar.read']`) — וקובע את החיבור `office-mail` ל-`live` עם
+`credentialRef: 'OFFICE_MAIL'`.
+
+**ומה הוא במפורש אינו עושה:** הוא **אינו** כותב שורת binding ל-`office-calendar`.
+זו לא שכחה — היומן מקבל את ה-binding שלו מטקס ההרשאה בפרק 10, ששם נקבעים
+גם ה-`provider` וגם ה-`credentialRef` שלו; שורה שהייתה נכתבת כאן מראש הייתה
+נדרסת שם בכל מקרה.
+
+**הרצה חוזרת בטוחה, ולא תדרוס הצהרה קיימת.** הסקריפט קורא את התקנון הפעיל
+דרך `probeActiveCharter` ולא דרך `loadActiveCharter` — כלומר גם תקנון שאי
+אפשר לפרסר אינו עוצר אותו, וזה מה שהופך אותו לנתיב ההתאוששות בטבלת הכשלים
+למטה — ומדלג על ההתקנה רק אם התקנון הפעיל מצהיר על **שתי** המערכות. תקנון
+שמצהיר על אחת מהן בלבד מוחלף בגרסה חדשה שמצהירה על שתיהן, ולעולם לא בגרסה
+שמצהירה רק על האחרת.
 
 `installCharter` בלי `{ businessId }` פועל על `config.businessId` (`BUSINESS_ID`
 מה-`.env`) — אותו עסק שכל שאר הפקודות במדריך הזה פועלות עליו כברירת מחדל.
@@ -319,7 +308,7 @@ SELECT seq, kind, actor, action_class, reason FROM audit_log
 ## 10. חוט חי שני: טקס ההרשאה (OAuth) ל-Google Calendar
 
 חוט נפרד מהחוט שלמעלה — לא מייל, ולא צריך scheduler רץ כדי להוכיח שהוא
-עובד. מה שהוא מוכיח: שלחיצה של הבעלים על "התחבר" במסך `/connections`
+עובד. מה שהוא מוכיח: שלחיצה של הבעלים על "לחיבור" במסך `/connections`
 מסתיימת בהרשאה אמיתית שמורה מוצפנת, ושדרכה `npm run connector:calendar`
 קורא אירועים אמיתיים מהיומן של העסק — לא רק שהקוד מתקמפל.
 
@@ -327,9 +316,12 @@ SELECT seq, kind, actor, action_class, reason FROM audit_log
 
 - מפתח אב קיים (`npm run secret:key create <מפעיל>`, פעם אחת להתקנה — ראה
   שלב 2 למעלה אם עוד לא נוצר).
-- תקנון פעיל שמצהיר על מערכת בשם `office-calendar` עם `serves:
-  ['calendar.read']` — אותה תבנית בדיוק כמו `scripts/seed-charter.ts` לעיל,
-  רק עם `system: 'office-calendar'`. **המרשם יכול רק לצמצם** (ראה
+- תקנון פעיל שמצהיר על מערכת בשם `office-calendar` עם
+  `serves: ['calendar.read']`. **`scripts/seed-charter.ts` משלב 3 מצהיר עליה
+  כבר**, כך שאם שלב 3 הורץ הדרישה הזו מסופקת ואין מה לכתוב ביד. (עד סבב
+  הניקוי של 29/09 נאמר כאן להעתיק את התבנית של אותו סקריפט "רק עם
+  `system: 'office-calendar'`" — בזמן שהסקריפט עצמו כבר כלל אותה, כלומר
+  עבודה כפולה שגם מסתיימת באותו תקנון בדיוק.) **המרשם יכול רק לצמצם** (ראה
   `CLAUDE.md`): שורת `connection_bindings` בלבד, בלי הצהרה תואמת בתקנון,
   עדיין נדחית ב-`no_channel_for_tool`.
 - שתי הפניות סוד — לא אחת — מוקצות במאגר **לפני** שמתחילים:
@@ -365,7 +357,8 @@ SELECT seq, kind, actor, action_class, reason FROM audit_log
 ### 10.1 החיבור
 
 1. `npm run dashboard`, היכנס עם חשבון הבעלים.
-2. פתח `/connections`. המערכת `office-calendar` מופיעה עם קישור "התחבר".
+2. פתח `/connections`. המערכת `office-calendar` מופיעה עם קישור "לחיבור"
+   (כך `views.ts` מרנדר אותו; הפרק הזה כתב "התחבר" עד 29/09).
 3. לחיצה מפנה ל-`GET /oauth/office-calendar/start` — הדשבורד מנפיק PKCE
    ו-`state` חד-פעמי (`createState`, [src/governance/oauth-state.ts](../src/governance/oauth-state.ts))
    ומפנה לעמוד ההסכמה של Google.
