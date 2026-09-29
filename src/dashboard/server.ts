@@ -516,6 +516,22 @@ async function handleMemory(res: ServerResponse, businessId: string, session: Se
  * convenience this project's own CLAUDE.md warns about elsewhere ("בקרה
  * שנכתבת בשלילה"): a shared "safe" charter reader is a bypass waiting for a
  * caller that should not have been allowed to survive the throw.
+ *
+ * **The catch below is the only silent one in this file, and it must not
+ * stay silent.** A screen degrading readably for the owner and a failure
+ * being invisible to the operator are two different things, and this catch
+ * used to conflate them: a schema-version mismatch, a transient Postgres
+ * failure on this one query, and a `ZodError` from a genuinely corrupt row
+ * all produced the identical fixed Hebrew message with no trace anywhere in
+ * the logs. Every OTHER unexpected failure in this file reaches the
+ * route-level handler at the bottom (`createServer`'s `route(...).catch(...)`),
+ * which logs `dashboard request failed:` before rendering a 500 — this
+ * route's whole point is to avoid that 500, but avoiding the 500 must not
+ * also mean avoiding the log line an operator debugging a real database
+ * hiccup would find for every other screen (`/readings`, `/memory`, ...) and
+ * not for this one. `console.error` here, matching that same shape, is what
+ * keeps "readable to the owner" from silently becoming "invisible to the
+ * operator".
  */
 async function handleConnections(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   let charterStatus: CharterReadStatus;
@@ -529,7 +545,11 @@ async function handleConnections(res: ServerResponse, businessId: string, sessio
       charterStatus = 'ok';
       connections = active.charter.connections;
     }
-  } catch {
+  } catch (err) {
+    console.error(
+      'connections screen: could not read the active charter:',
+      err instanceof Error ? err.message : err,
+    );
     charterStatus = 'unreadable';
     connections = [];
   }
