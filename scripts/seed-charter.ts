@@ -1,5 +1,6 @@
 /**
- * Install a charter and mark the mail connection `live`, once, by hand.
+ * Install a charter declaring both connections the live thread needs — mail
+ * and calendar — and mark the mail binding `live`, once, by hand.
  *
  * There is no charter-authoring CLI yet, so this uses `buildCharter` from the
  * test fixtures — not because it is a test, but because it is currently the
@@ -32,7 +33,24 @@ const MAIL_CONNECTION: CharterConnection = {
 };
 
 /**
- * An active charter is not enough — it has to DECLARE the mail connection.
+ * Added in the final fix wave (item 7). Before this, this script declared
+ * `MAIL_CONNECTION` alone, so the connections screen showed only "חיבור
+ * דואר" — no calendar row, no calendar link — and the runbook had to ask the
+ * operator to hand-write a variant script to get one. `channel: 'api'`,
+ * matching `MAIL_CONNECTION`: both are real API connections, never the
+ * browser channel.
+ */
+const CALENDAR_CONNECTION: CharterConnection = {
+  system: 'office-calendar',
+  label: 'יומן המשרד',
+  channel: 'api',
+  serves: ['calendar.read'],
+  target: null,
+  subprocessor: null,
+};
+
+/**
+ * An active charter is not enough — it has to DECLARE both connections.
  *
  * The registry can only narrow: a `connection_bindings` row cannot grant a
  * channel the charter never named, so a charter with `connections: []` plus a
@@ -41,9 +59,21 @@ const MAIL_CONNECTION: CharterConnection = {
  * state — an earlier session had installed the fixture charter with no
  * connections at all.
  *
+ * **The skip condition requires BOTH connections, not just mail (final fix
+ * wave, item 7) — this is the fix, not a strengthening for its own sake.**
+ * The old condition (`declaresMail` alone) meant: an operator who had
+ * hand-installed a charter declaring `office-calendar` ONLY would see
+ * `declaresMail === false`, and this script would supersede that charter
+ * with one declaring `office-mail` only — DROPPING the calendar declaration
+ * the operator had just set up, silently, because nothing here looked at it.
+ * Requiring both before skipping means this script can install a charter
+ * missing either connection, but can never REPLACE a charter that already
+ * declares one of them with a charter that declares only the other.
+ *
  * Re-installing under the same version string is impossible
  * (`charter_versions.charter_version` is the primary key on its own), so a
- * charter that lacks the connection is superseded by a new version instead.
+ * charter missing either connection is superseded by a new version that
+ * declares both, instead.
  */
 /**
  * Probed rather than loaded, because this script IS the recovery path.
@@ -61,22 +91,27 @@ if (!probe.ok) {
 }
 const active = probe.ok ? probe.active : null;
 const declaresMail = active?.charter.connections.some((c) => c.system === MAIL_CONNECTION.system) === true;
+const declaresCalendar =
+  active?.charter.connections.some((c) => c.system === CALENDAR_CONNECTION.system) === true;
 
-if (declaresMail) {
+if (declaresMail && declaresCalendar) {
   console.log(
-    `charter already active and declares ${MAIL_CONNECTION.system}: ${active?.charter.charterVersion} — install skipped`,
+    `charter already active and declares ${MAIL_CONNECTION.system} and ${CALENDAR_CONNECTION.system}: ` +
+      `${active?.charter.charterVersion} — install skipped`,
   );
 } else {
   // A version string that is unique per run, so this never collides with a
   // version some earlier session already inserted.
   const version = `live-thread-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}`;
   const bundle = await installCharter(
-    buildCharter({ version, connections: [MAIL_CONNECTION] }),
+    buildCharter({ version, connections: [MAIL_CONNECTION, CALENDAR_CONNECTION] }),
   );
   console.log(
     active === null
       ? `charter installed for ${config.businessId}: ${bundle.charterVersion}`
-      : `previous charter ${active.charter.charterVersion} declared no connections; installed ${bundle.charterVersion} which declares ${MAIL_CONNECTION.system}`,
+      : `previous charter ${active.charter.charterVersion} did not declare both connections; ` +
+          `installed ${bundle.charterVersion} which declares ${MAIL_CONNECTION.system} and ` +
+          `${CALENDAR_CONNECTION.system}`,
   );
 }
 
@@ -94,11 +129,21 @@ await upsertBinding(
     status: 'live',
     endpoint: null,
     credentialRef: 'OFFICE_MAIL',
+    provider: null,
     lastOkAt: null,
     lastError: null,
   },
   { by: 'runbook' },
 );
 console.log('binding office-mail set to live (credentialRef OFFICE_MAIL)');
+
+// No binding write for `office-calendar` here, deliberately: unlike mail's
+// static secret, the calendar connection is OAuth-backed, and its binding
+// (`provider: 'google'`, `credentialRef`) is written by `handleOAuthCallback`
+// (`src/dashboard/oauth-routes.ts`) only once the owner actually completes
+// the consent ceremony at `/oauth/office-calendar/start`. Writing a binding
+// row here, ahead of that, would claim a connection is live when nobody has
+// authorised anything yet.
+console.log('office-calendar declared in the charter — authorise it from the /connections screen');
 
 await closePool();

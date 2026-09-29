@@ -43,6 +43,7 @@ import {
   verifyKeyState,
   writeKeyState,
 } from '../governance/master-key.js';
+import { grantAad } from '../governance/oauth-grants.js';
 import { decryptSecret, encryptSecret } from '../governance/secret-cipher.js';
 import { canonicalHash } from '../util/canonical.js';
 import { nodePromptIo } from './node-prompt-io.js';
@@ -66,18 +67,26 @@ const RECOVERY_AAD_REF = 'key-recovery';
  * What a rotation did, carried on `RotationAuditUnrecordedError` so an
  * operator can reconstruct the record by hand.
  *
- * Deliberately only identifiers and a count. **Never the key and never a
+ * Deliberately only identifiers and counts. **Never the key and never a
  * secret** — the same rule every message in this file and in `secret.ts`
  * follows, and an error object is no more exempt from it than a log line is.
  * `previousKeyId` is `string | null` because a rotation on an installation
  * whose key-state row was somehow absent has no earlier id to name, and
  * inventing one would be worse than admitting it.
+ *
+ * `secretsReEncrypted` and `grantsReEncrypted` are two counts, not one merged
+ * total — the same reason the printed summary keeps them apart: an operator
+ * reconstructing this row by hand needs to know how many `credentials` rows
+ * and how many `oauth_grants` rows moved, because they are two different
+ * tables with two different re-encryption loops, and "14 rows" does not say
+ * which loop stalled if only one of them actually ran.
  */
 export interface RotationOutcome {
   businessId: string;
   previousKeyId: string | null;
   newKeyId: string;
   secretsReEncrypted: number;
+  grantsReEncrypted: number;
 }
 
 /**
@@ -112,7 +121,8 @@ export class RotationAuditUnrecordedError extends Error {
   constructor(outcome: RotationOutcome, cause: unknown) {
     super(
       `החלפת המפתח בוצעה במלואה ורשומת הביקורת עליה נכשלה. ההחלפה בתוקף: ` +
-        `${outcome.secretsReEncrypted} סודות הוצפנו מחדש עבור "${outcome.businessId}", ` +
+        `${outcome.secretsReEncrypted} סודות ו-${outcome.grantsReEncrypted} הרשאות הוצפנו ` +
+        `מחדש עבור "${outcome.businessId}", ` +
         `מהמפתח ${outcome.previousKeyId ?? '(לא ידוע)'} אל המפתח ${outcome.newKeyId}, ` +
         `וקובץ המפתח ועותק השחזור כבר נכתבו — אל תריץ rotate שוב. מה שחסר הוא רק ` +
         `הרישום, ויש להשלים אותו ידנית.`,
@@ -489,6 +499,13 @@ interface CredentialRow {
   nonce: Buffer;
 }
 
+interface GrantRow {
+  business_id: string;
+  system: string;
+  ciphertext: Buffer;
+  nonce: Buffer;
+}
+
 /**
  * Spec §4.5 — re-encrypts every stored secret under a brand new key and
  * leaves none behind. A partial rotation is worse than none: some rows
@@ -502,6 +519,18 @@ interface CredentialRow {
  * `ROTATION_LOCK_SCOPE`, the identical advisory lock `putSecret`
  * (`credential-store.ts`) takes — a lock held on only one side is not a
  * lock, and this is the side Task 4's review named as rotation's to close.
+ *
+ * **`oauth_grants` is re-encrypted in the same transaction, right after
+ * `credentials`.** A key rotation that only knew about `credentials` would
+ * leave every stored grant sealed under a key the installation no longer
+ * holds — silently, since nothing throws until the next refresh reads a row
+ * that no longer opens. That is the same defect class erasure was burned by
+ * twice (`job_plans`, `job_authorizations` — a new content-bearing table
+ * that is not wired to the thing that must reach every row). The grant loop
+ * follows the credentials loop's shape exactly, keyed by `(business_id,
+ * system)` instead of `(business_id, ref)`, and aborts the whole rotation
+ * the same way on a row that fails to decrypt — no row changes if any one
+ * of them can't be opened with the key on file today.
  */
 async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   const businessId = deps.businessId ?? config.businessId;
@@ -527,7 +556,7 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   const passphrase = await readNewPassphrase(deps);
   const recovery = await sealRecoveryCopy(newKey, passphrase, businessId);
 
-  const { rotated, previousKeyId } = await withTransaction(async (tx: Queryable) => {
+  const { rotated, grantsRotated, previousKeyId } = await withTransaction(async (tx: Queryable) => {
     await acquireAdvisoryLock(tx, ROTATION_LOCK_SCOPE);
 
     // Read BEFORE `writeKeyState` overwrites it. The id of the key being
@@ -562,8 +591,37 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
       );
     }
 
+    // The same loop for grants. A new table that is not wired here means a key
+    // rotation silently kills every connection: the row stays sealed under the
+    // old key while `credential_key_state` says otherwise, and nothing throws
+    // until the next refresh. This is the defect class erasure was burned by
+    // twice, and `connector-invariants.test.ts` is what keeps it closed.
+    const { rows: grantRows } = await tx.query<GrantRow>(
+      'SELECT business_id, system, ciphertext, nonce FROM oauth_grants FOR UPDATE',
+    );
+
+    for (const row of grantRows) {
+      const plain = decryptSecret(
+        { ciphertext: row.ciphertext, nonce: row.nonce },
+        oldKey,
+        grantAad(row.business_id, row.system),
+      );
+      if (plain === null) {
+        throw new Error(
+          `החלפת המפתח בוטלה: הרשאת ה-OAuth (${row.business_id}, ${row.system}) אינה ` +
+            'נפתחת במפתח הנוכחי — שום שורה לא שונתה.',
+        );
+      }
+      const sealed = encryptSecret(plain, newKey, grantAad(row.business_id, row.system));
+      await tx.query(
+        `UPDATE oauth_grants SET ciphertext = $1, nonce = $2, key_id = $3
+           WHERE business_id = $4 AND system = $5`,
+        [sealed.ciphertext, sealed.nonce, newKeyId, row.business_id, row.system],
+      );
+    }
+
     await writeKeyState(newKey, newKeyId, { businessId, db: tx });
-    return { rotated: rows.length, previousKeyId: previous };
+    return { rotated: rows.length, grantsRotated: grantRows.length, previousKeyId: previous };
   });
 
   // The database is committed and atomic by this point: every row now opens
@@ -606,16 +664,26 @@ async function rotate(deps: SecretKeyCliDeps, operator: string): Promise<void> {
       businessId,
       operator,
       action: 'rotate',
-      reason: `המפתח הוחלף (${newKeyId}) עבור ${businessId} על ידי ${operator} — ${rotated} סודות הוצפנו מחדש`,
+      reason:
+        `המפתח הוחלף (${newKeyId}) עבור ${businessId} על ידי ${operator} — ` +
+        `${rotated} סודות ו-${grantsRotated} הרשאות הוצפנו מחדש`,
     });
   } catch (error) {
     throw new RotationAuditUnrecordedError(
-      { businessId, previousKeyId, newKeyId, secretsReEncrypted: rotated },
+      {
+        businessId,
+        previousKeyId,
+        newKeyId,
+        secretsReEncrypted: rotated,
+        grantsReEncrypted: grantsRotated,
+      },
       error,
     );
   }
 
-  deps.log(`המפתח הוחלף בהצלחה. ${rotated} סודות הוצפנו מחדש תחת המפתח החדש.`);
+  deps.log(
+    `המפתח הוחלף בהצלחה. ${rotated} סודות ו-${grantsRotated} הרשאות הוצפנו מחדש תחת המפתח החדש.`,
+  );
 }
 
 export async function runSecretKeyCli(argv: string[], deps: SecretKeyCliDeps): Promise<void> {

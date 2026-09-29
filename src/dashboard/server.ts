@@ -36,6 +36,10 @@ import { readForgetCommand } from '../governance/forget-command.js';
 import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
 import { recordCorrection } from '../governance/corrections.js';
 import { listAutonomousActions } from './autonomous-actions.js';
+import { loadActiveCharter } from '../charter/store.js';
+import type { CharterConnection } from '../domain/connection.js';
+import { loadBindings } from '../orchestrator/bindings.js';
+import { listGrants } from '../governance/oauth-grants.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureAnchor, ErasurePlan } from '../governance/erasure-plan.js';
 import {
@@ -52,6 +56,13 @@ import {
   type Verdict,
 } from '../governance/verdict-store.js';
 import { documentForApproval } from './document-for-approval.js';
+import {
+  DEFAULT_DASHBOARD_BASE_URL,
+  handleOAuthCallback,
+  handleOAuthRevoke,
+  handleOAuthStart,
+} from './oauth-routes.js';
+import type { OAuthRouteOptions } from './oauth-routes.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { MAX_RECALL, recallMemories } from '../memory/store.js';
@@ -73,6 +84,7 @@ import {
   renderApprovalCard,
   renderAutonomousActions,
   renderAutonomy,
+  renderConnections,
   renderErasure,
   renderErasureDone,
   renderForbidden,
@@ -85,6 +97,7 @@ import {
   renderReadings,
   renderServerError,
 } from './views.js';
+import type { CharterReadStatus } from './views.js';
 import type { ErasurePrefill } from './views.js';
 
 const SESSION_COOKIE = 'sid';
@@ -124,14 +137,72 @@ export interface DashboardOptions {
    * directory instead of the real deployment's document store.
    */
   documentRoot?: string;
+  /**
+   * Path to the master key file the OAuth consent ceremony (`oauth-routes.ts`)
+   * needs to resolve the Google app's own client id/secret and to seal a
+   * freshly-granted refresh token. Defaults to `process.env['CREDENTIAL_KEY_PATH']`
+   * when unset — the same env var `buildRuntime` and `secret.ts` read, so an
+   * installation only ever has one key file to point at. Tests pass an
+   * isolated one, the same way `documentRoot` lets them isolate the document
+   * store above.
+   */
+  credentialKeyPath?: string;
+  /**
+   * The externally-reachable base URL the OAuth redirect_uri is built from —
+   * the SAME base URL `buildRuntime` already uses for approval links
+   * (`DASHBOARD_BASE_URL`), never this process's own bind host/port, which
+   * may sit behind a tunnel with a different public name. Defaults to
+   * `process.env['DASHBOARD_BASE_URL']`, then the same fallback `runtime.ts`
+   * uses.
+   */
+  dashboardBaseUrl?: string;
+  /**
+   * Test seam for the OAuth code exchange and account lookup — the same
+   * discipline `buildRuntime`'s `overrides.tokenHttp`/`overrides.calendarHttp`
+   * keep. No production caller ever passes it.
+   */
+  oauthFetch?: typeof fetch;
 }
 
+/**
+ * `SameSite=Lax`, not `Strict`. Google returns the owner to `/oauth/callback`
+ * by a cross-site TOP-LEVEL NAVIGATION (a real browser redirect after the
+ * owner clicks "allow"), and a `Strict` cookie is withheld on exactly that —
+ * the callback would see no session, redirect to `/login` without preserving
+ * the query string, and silently discard the authorisation code.
+ *
+ * **The trade this makes, named rather than hidden:** under `Lax`, a
+ * cross-site top-level navigation DOES still carry the session cookie to a
+ * GET. `GET /oauth/:system/start` is **the one GET a cross-site navigation
+ * can USEFULLY reach this way** — not, as an earlier version of this
+ * paragraph claimed, "the one GET route in this file that writes anything".
+ * `GET /oauth/callback` writes MORE than `/start` does — the grant, the
+ * binding and the audit row, all in one transaction (see
+ * `handleOAuthCallback`'s own docblock) — so calling it read-only here was
+ * false (final fix wave, item 3). What actually stops a forged navigation
+ * from doing anything USEFUL there is that the callback additionally needs
+ * a single-use `state` row bound to the CALLER'S OWN SESSION (`consumeState`)
+ * plus a real authorisation `code` Google only ever hands the browser that
+ * completed its consent screen — neither of which an attacker's own
+ * navigation can supply for a victim it does not control. `/start` has no
+ * such requirement: a bare cross-site navigation to it is enough on its own
+ * to mint a state row, which is exactly what makes it the route worth
+ * naming here. What that navigation writes is a pending, session-bound,
+ * SINGLE-USE `state` row (`createState`), never a grant and never a
+ * binding. That gains an attacker nothing: finishing the ceremony still
+ * requires the VICTIM to approve at Google's own consent screen, and the
+ * callback then binds the VICTIM's own account to the business, never the
+ * attacker's — the forged navigation just creates an inert row that expires
+ * unused. Every other route that mutates something the owner would actually
+ * care about is a POST, which `Lax` withholds the cookie from cross-site
+ * regardless — see `SECURITY_HEADERS`'s own docblock.
+ */
 function sessionCookie(token: string): string {
-  return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`;
+  return `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`;
 }
 
 function clearedCookie(): string {
-  return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`;
+  return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
 }
 
 /** An audited address is never longer than this. A header is attacker-supplied text even when the proxy is trusted. */
@@ -159,6 +230,24 @@ const MAX_ADDRESS_LENGTH = 64;
  *     its left may have been sent by the client. Reading the leftmost entry
  *     — the usual mistake — is reading whatever an attacker typed.
  */
+/**
+ * `decodeURIComponent` on a path segment, refused rather than thrown.
+ *
+ * Mirrors `parseCookies`'s own handling of the identical hazard eighteen
+ * lines below this file's cookie parsing (a malformed `%` escape must mean
+ * "not this", never a 500): a system name in an OAuth route's path is
+ * attacker-reachable text (anyone who can get the owner to click a link, or
+ * who is probing directly), and a hand-crafted `%` escape must read as a
+ * readable refusal, not a crash.
+ */
+function decodePathSegment(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
 function clientAddress(req: IncomingMessage, trustProxy: boolean): string {
   const socketAddress = req.socket.remoteAddress ?? 'unknown';
   if (!trustProxy) return `${socketAddress} (proxy hop; not the client address)`;
@@ -225,10 +314,16 @@ async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
  * rule, a corporate proxy), and a cached approval card is an email body, a
  * counterparty and an amount served to whoever asks next.
  *
- * `X-Frame-Options: DENY` is defence in depth, not a hole being closed —
- * `SameSite=Strict` already keeps the session cookie out of a cross-site
- * iframe, so the approve/deny buttons cannot be clickjacked today. This is
- * cheap insurance against that assumption ever changing.
+ * `X-Frame-Options: DENY` is defence in depth, not a hole being closed. The
+ * session cookie is `SameSite=Lax`, not `Strict` (see `sessionCookie`'s own
+ * docblock for why the OAuth callback needs that, and for the one named GET
+ * that trade accepts). Every route here that mutates something the owner
+ * would actually care about — approve, deny, sign, erase, change a
+ * password, revoke a grant — is a POST carrying its own CSRF token, and
+ * `Lax` withholds the session cookie from a cross-site POST regardless of
+ * framing; THAT is what keeps those buttons from being clickjacked, not the
+ * cookie's SameSite mode standing alone. `X-Frame-Options` is cheap
+ * insurance on top of that, not the control itself.
  */
 const SECURITY_HEADERS = {
   'Cache-Control': 'no-store',
@@ -406,6 +501,87 @@ async function handleReadings(res: ServerResponse, businessId: string, session: 
 async function handleMemory(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   const memories = await recallMemories({ limit: MAX_RECALL }, { businessId });
   sendHtml(res, 200, renderMemory(memories, issueCsrfToken(session.sessionId)));
+}
+
+/**
+ * "חיבורים" — one heading per kind of connection (`connection-groups.ts`),
+ * every connection the signed charter declares under it, and whether it is
+ * authorised.
+ *
+ * **This screen is a reader, and must survive a charter it cannot read.**
+ * `loadActiveCharter` (`charter/store.ts`) THROWS on a schema-version
+ * mismatch and returns `null` when nothing is installed — both deliberately
+ * fatal for the gate, which must never run an agent against policy it cannot
+ * parse. A dashboard screen is a different kind of caller: showing the owner
+ * a 500 (or, worse, a silently-empty connections list indistinguishable from
+ * "nothing is declared") when the real problem is an unreadable charter is
+ * strictly worse than the truth. There is no existing helper for "load the
+ * charter, but let a reader survive a throw" — `probeActiveCharter` does not
+ * exist anywhere in this codebase today, despite being named in this task's
+ * own brief; grepping for it (and for every other spelling of "probe" near a
+ * charter) turned up nothing, in this file, in `charter/store.ts`, or in any
+ * other dashboard screen. The catch below is therefore local to this one
+ * route rather than a new shared export: nothing in the brief's own file
+ * list (`connection-groups.ts`, `views.ts`, `server.ts`) asks for a change to
+ * `charter/store.ts`, and inventing a second, more-permissive charter loader
+ * that every future caller could reach for is exactly the kind of
+ * convenience this project's own CLAUDE.md warns about elsewhere ("בקרה
+ * שנכתבת בשלילה"): a shared "safe" charter reader is a bypass waiting for a
+ * caller that should not have been allowed to survive the throw.
+ *
+ * **The catch below is the only silent one in this file, and it must not
+ * stay silent.** A screen degrading readably for the owner and a failure
+ * being invisible to the operator are two different things, and this catch
+ * used to conflate them: a schema-version mismatch, a transient Postgres
+ * failure on this one query, and a `ZodError` from a genuinely corrupt row
+ * all produced the identical fixed Hebrew message with no trace anywhere in
+ * the logs. Every OTHER unexpected failure in this file reaches the
+ * route-level handler at the bottom (`createServer`'s `route(...).catch(...)`),
+ * which logs `dashboard request failed:` before rendering a 500 — this
+ * route's whole point is to avoid that 500, but avoiding the 500 must not
+ * also mean avoiding the log line an operator debugging a real database
+ * hiccup would find for every other screen (`/readings`, `/memory`, ...) and
+ * not for this one. `console.error` here, matching that same shape, is what
+ * keeps "readable to the owner" from silently becoming "invisible to the
+ * operator".
+ */
+async function handleConnections(res: ServerResponse, businessId: string, session: Session): Promise<void> {
+  let charterStatus: CharterReadStatus;
+  let connections: CharterConnection[];
+  try {
+    const active = await loadActiveCharter(businessId);
+    if (active === null) {
+      charterStatus = 'none';
+      connections = [];
+    } else {
+      charterStatus = 'ok';
+      connections = active.charter.connections;
+    }
+  } catch (err) {
+    console.error(
+      'connections screen: could not read the active charter:',
+      err instanceof Error ? err.message : err,
+    );
+    charterStatus = 'unreadable';
+    connections = [];
+  }
+
+  const [bindings, grants] = await Promise.all([
+    loadBindings({ businessId }),
+    listGrants(businessId),
+  ]);
+
+  sendHtml(
+    res,
+    200,
+    renderConnections({
+      charterStatus,
+      connections,
+      bindings,
+      grants,
+      csrf: issueCsrfToken(session.sessionId),
+    }),
+  );
 }
 
 /**
@@ -1832,6 +2008,8 @@ const CARD_PATH = /^\/a\/([^/]+)$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
 const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
 const AUTONOMOUS_ACTION_MARK_PATH = /^\/autonomy\/actions\/([^/]+)\/([^/]+)\/mark$/;
+const OAUTH_START_PATH = /^\/oauth\/([^/]+)\/start$/;
+const OAUTH_REVOKE_PATH = /^\/oauth\/([^/]+)\/revoke$/;
 
 /** The outcome `handleDecision` records for each `DECISION_PATH` action. */
 const OUTCOME_FOR_ACTION = {
@@ -1846,6 +2024,7 @@ async function route(
   businessId: string,
   trustProxy: boolean,
   documentRoot: string | undefined,
+  oauthOptions: OAuthRouteOptions,
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const pathname = new URL(req.url ?? '/', 'http://dashboard.local').pathname;
@@ -1882,6 +2061,7 @@ async function route(
   if (method === 'GET' && pathname === '/') return handlePendingList(res, businessId, session);
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
+  if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
 
   if (method === 'GET' && pathname === '/autonomy') return handleAutonomyGet(res, businessId, session);
   if (method === 'POST' && pathname === '/autonomy/mode')
@@ -1892,6 +2072,32 @@ async function route(
   if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
   if (method === 'POST' && pathname === '/instruct')
     return handleInstructPost(req, res, businessId, session, documentRoot);
+
+  // The OAuth consent ceremony (oauth-routes.ts): the dashboard is the only
+  // place behind the owner's session, with CSRF and loopback binding, where
+  // handing a provider access to a business system belongs — the same
+  // reasoning that puts "sign and approve" and erasure here (spec 5.1).
+  const oauthStartMatch = OAUTH_START_PATH.exec(pathname);
+  if (method === 'GET' && oauthStartMatch) {
+    const raw = oauthStartMatch[1];
+    if (raw !== undefined) {
+      const system = decodePathSegment(raw);
+      if (system === null) return sendHtml(res, 404, renderNotFound());
+      return handleOAuthStart(res, businessId, session, system, oauthOptions);
+    }
+  }
+  if (method === 'GET' && pathname === '/oauth/callback') {
+    return handleOAuthCallback(req, res, businessId, session, oauthOptions);
+  }
+  const oauthRevokeMatch = OAUTH_REVOKE_PATH.exec(pathname);
+  if (method === 'POST' && oauthRevokeMatch) {
+    const raw = oauthRevokeMatch[1];
+    if (raw !== undefined) {
+      const system = decodePathSegment(raw);
+      if (system === null) return sendHtml(res, 404, renderNotFound());
+      return handleOAuthRevoke(req, res, businessId, session, system, oauthOptions);
+    }
+  }
 
   if (method === 'GET' && pathname === '/erase') return handleEraseGet(req, res, businessId, session, documentRoot);
   if (method === 'POST' && pathname === '/erase/preview') return handleErasePreview(req, res, businessId, session, documentRoot);
@@ -1982,8 +2188,15 @@ export function createServer(options: DashboardOptions = {}): Server {
   const host = options.host ?? '127.0.0.1';
   assertBindableHost(host, options.allowNonLoopbackBind ?? false);
 
+  const oauthOptions: OAuthRouteOptions = {
+    credentialKeyPath: options.credentialKeyPath ?? process.env['CREDENTIAL_KEY_PATH'],
+    dashboardBaseUrl:
+      options.dashboardBaseUrl ?? process.env['DASHBOARD_BASE_URL'] ?? DEFAULT_DASHBOARD_BASE_URL,
+    ...(options.oauthFetch !== undefined ? { fetchImpl: options.oauthFetch } : {}),
+  };
+
   const server = createHttpServer((req, res) => {
-    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot).catch((err: unknown) => {
+    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {
         sendHtml(res, 500, renderServerError());

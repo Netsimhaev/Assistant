@@ -48,6 +48,7 @@ const MAIL_LIVE: ConnectionBinding = {
   status: 'live',
   endpoint: null,
   credentialRef: 'OFFICE_MAIL',
+  provider: null,
   lastOkAt: null,
   lastError: null,
 };
@@ -57,6 +58,7 @@ const WA_LIVE: ConnectionBinding = {
   status: 'live',
   endpoint: null,
   credentialRef: null,
+  provider: null,
   lastOkAt: null,
   lastError: null,
 };

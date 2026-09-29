@@ -111,6 +111,7 @@ async function installFixture(): Promise<PolicyBundle> {
       status: 'live',
       endpoint: null,
       credentialRef: 'OFFICE_MAIL',
+      provider: null,
       lastOkAt: null,
       lastError: null,
     },

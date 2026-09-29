@@ -21,6 +21,26 @@ export interface CredentialSource {
    * rather than a wrong lookup at run time.
    */
   resolve(ref: string, businessId: string): Promise<CredentialHandle | null>;
+
+  /**
+   * Forget any cached value for `ref`, so the next `resolve` mints a fresh
+   * one instead of returning something the caller has reason to believe is
+   * already bad.
+   *
+   * **Optional, and a no-op for a source with nothing to forget.**
+   * `envCredentials` and `storedCredentials` resolve fresh from their
+   * backing store on every call already — there is no cache for either of
+   * them to clear, so neither implements this. `oauthCredentials`
+   * (`orchestrator/oauth-token.ts`) is the one real implementation: it keeps
+   * a short-lived access token in memory precisely because minting one is a
+   * network round trip (see that module's own docblock on the cache), and a
+   * 401 from the RESOURCE call — not the refresh call — is the one signal
+   * that proves the cached token is bad before its own recorded expiry says
+   * so (spec §3.4 row 5, "one refresh and one retry"; final fix wave, item
+   * 12). Without this, a stale cached token survives until its own TTL, and
+   * every retry in between replays the exact same rejected token.
+   */
+  invalidate?(ref: string, businessId: string): void;
 }
 
 /**

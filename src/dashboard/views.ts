@@ -13,14 +13,18 @@
  */
 import type { ApprovalRequest } from '../governance/approvals.js';
 import type { DocumentRecord } from '../documents/types.js';
+import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
 import type { ErasureAnchor, ErasureItem, ErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
 import type { KeptItem } from '../governance/kept-items.js';
+import type { OAuthGrantSummary } from '../governance/oauth-grants.js';
 import type { NotJudgedReason, Verdict } from '../governance/verdict-store.js';
 import type { IntentName } from '../domain/reading.js';
 import type { MemoryRecord } from '../memory/store.js';
 import { AutonomyMode } from '../governance/autonomy-mode.js';
 import type { AutonomousAction } from './autonomous-actions.js';
+import { CONNECTION_GROUP_ORDER, GROUP_LABELS, groupForServes } from './connection-groups.js';
+import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { formatMinor } from '../util/money.js';
@@ -211,7 +215,7 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/instruct">מה לעשות</a> · <a href="/readings">מה קראתי</a> · <a href="/autonomy">כמה חופש לתת</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/readings">מה קראתי</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a></p>
 ${list}`,
   );
 }
@@ -497,6 +501,251 @@ ${
     ? '<p>עדיין לא בוצעה אף פעולה מיוזמת העוזרת.</p>'
     : `<table><tr><th>מתי</th><th>משימה</th><th>סוג פעולה</th><th>כלי</th><th>נמען</th><th>נושא</th><th></th></tr>${rows}</table>`
 }`,
+  );
+}
+
+/** The three states a declared connection can be in — never a fourth silently folded into one of these. */
+type ConnectionStatus = 'authorised' | 'unauthorised' | 'needs_reauth';
+
+const CONNECTION_STATUS_LABEL: Record<ConnectionStatus, string> = {
+  authorised: 'יש הרשאה',
+  unauthorised: 'טרם אושר',
+  needs_reauth: 'דורש אישור מחדש',
+};
+
+/**
+ * A grant the owner revoked reads the same as one that was never made: both
+ * are "nothing to show as authorised right now," and the only action either
+ * state offers the owner is the same "start the ceremony again" link. Only a
+ * LIVE grant (`revokedAt === null`) can be `needs_reauth` — the connector
+ * marks that on a row it still considers active, never on one the owner
+ * already tore down.
+ */
+function connectionStatus(grant: OAuthGrantSummary | null): ConnectionStatus {
+  if (grant === null || grant.revokedAt !== null) return 'unauthorised';
+  if (grant.needsReauthAt !== null) return 'needs_reauth';
+  return 'authorised';
+}
+
+const CHARTER_UNREADABLE_NOTICE =
+  'לא ניתן לקרוא את התקנון הפעיל של העסק — יש לפנות למי שמחזיק את ההתקנה. ' +
+  'כדי לא להראות רשימת חיבורים שגויה, המסך אינו מציג חיבורים עד שהתקנון ייקרא בהצלחה.';
+const CHARTER_MISSING_NOTICE = 'לא הותקן עדיין תקנון פעיל לעסק הזה, ולכן אין חיבורים להציג.';
+
+/**
+ * Whether a broken or missing charter should look like an empty list of
+ * connections, or say so.
+ *
+ * `loadActiveCharter` (`charter/store.ts`) THROWS on a charter this code
+ * cannot read (a schema-version mismatch), and returns `null` when none is
+ * installed at all — it treats both as fatal on purpose, because the gate
+ * must never run an agent against policy it cannot parse. A screen is a
+ * reader, not the gate: it must survive both cases and say which one
+ * happened, rather than 500 on the first and render a silently-empty page on
+ * the second. `server.ts`'s `handleConnections` catches the throw and passes
+ * `'unreadable'`; a `null` charter passes `'none'`; a real one passes `'ok'`
+ * together with its `connections`.
+ */
+export type CharterReadStatus = 'ok' | 'none' | 'unreadable';
+
+/** Hebrew label for `ConnectionBinding.status` — the operational half, distinct from whether a grant was ever authorised. */
+const BINDING_STATUS_LABEL: Record<ConnectionBinding['status'], string> = {
+  live: 'פעיל',
+  disconnected: 'מנותק',
+  error: 'שגיאה',
+};
+
+/** One connection, fully merged: its charter declaration plus whatever operational/grant data lines up with its `system`. */
+interface ConnectionRow {
+  connection: CharterConnection;
+  group: ReturnType<typeof groupForServes>;
+  status: ConnectionStatus;
+  grant: OAuthGrantSummary | null;
+  binding: ConnectionBinding | null;
+}
+
+function buildConnectionRows(
+  connections: readonly CharterConnection[],
+  bindings: readonly ConnectionBinding[],
+  grants: readonly OAuthGrantSummary[],
+): ConnectionRow[] {
+  const grantBySystem = new Map(grants.map((g) => [g.system, g]));
+  const bindingBySystem = new Map(bindings.map((b) => [b.system, b]));
+  return connections.map((connection) => {
+    const grant = grantBySystem.get(connection.system) ?? null;
+    return {
+      connection,
+      group: groupForServes(connection.serves),
+      status: connectionStatus(grant),
+      grant,
+      binding: bindingBySystem.get(connection.system) ?? null,
+    };
+  });
+}
+
+function connectionRowHtml(row: ConnectionRow, csrf: string): string {
+  const { connection, status, grant, binding } = row;
+  // `label` is owner-authored (part of the signed charter this business
+  // signed) — `esc` alone. `account` and `scopes` are provider-sourced (the
+  // consent screen's own account lookup, and whatever Google actually
+  // granted) and go through `escLabel`, the same category `escLabel`'s own
+  // docblock names for `original_name` and a memory `chunk`'s body: text
+  // that did not originate with the owner, on an RTL page, must not be able
+  // to carry a bidirectional override into how its own row reads. A
+  // binding's `lastError` is classified by this codebase's own adapter code
+  // (`classifyTransportFailure` and siblings), but the message text inside
+  // it can still echo whatever the remote server said back — the same
+  // caution, so `escLabel` again.
+  const label = esc(connection.label);
+  const account = grant === null ? '—' : escLabel(grant.account);
+  const scopes = grant === null || grant.scopes.length === 0 ? '—' : escLabel(grant.scopes.join(', '));
+  const lastRefreshed =
+    grant === null || grant.lastRefreshedAt === null ? '—' : esc(grant.lastRefreshedAt);
+  const statusLabel = esc(CONNECTION_STATUS_LABEL[status]);
+  // `binding.status` never actually becomes `'error'` in production —
+  // `recordBindingOutcome` guarantees it never moves `status` at all (its own
+  // docblock, `binding-health.test.ts`), and the OAuth consent callback
+  // always writes `status: 'live'`. Gating the error message on
+  // `status === 'error'` therefore meant `lastError` was written on every
+  // failed adapter call and rendered never (final fix wave, item 4). Shown
+  // whenever it is non-null, regardless of `status`.
+  const operational =
+    binding === null
+      ? '<span class="muted">אין מידע תפעולי</span>'
+      : binding.lastError !== null
+        ? `${esc(BINDING_STATUS_LABEL[binding.status])} — ${escLabel(binding.lastError)}`
+        : esc(BINDING_STATUS_LABEL[binding.status]);
+  // `lastOkAt` had zero readers anywhere before this (final fix wave, item
+  // 4) — the "רוענן לאחרונה" column above shows the GRANT's own
+  // `lastRefreshedAt`, a different field entirely (when the OAuth token was
+  // last refreshed, not when the connection last actually worked).
+  const lastOk = binding === null || binding.lastOkAt === null ? '—' : esc(binding.lastOkAt);
+  const revokePath = `/oauth/${esc(connection.system)}/revoke`;
+  const startPath = `/oauth/${esc(connection.system)}/start`;
+
+  // Derived from the SAME predicate `handleOAuthStart` gates on and
+  // `buildRuntime` uses to decide whether an adapter will ever run for this
+  // system (`connectionAcceptsOAuthCeremony`, `oauth-eligibility.ts`) — final
+  // fix wave, item 1b. Before this, the link was shown for EVERY
+  // unauthorised connection, `office-mail` included: a link the server
+  // refuses is a worse experience than no link, and two independent checks
+  // of the same rule (one here, one in the route) is exactly how they
+  // diverge. Revoking is not gated the same way: a grant that already
+  // exists must always be revocable, even if the charter later stopped
+  // declaring the connection as calendar-eligible.
+  const action =
+    status === 'authorised' || status === 'needs_reauth'
+      ? `<form method="post" action="${revokePath}">
+           <input type="hidden" name="csrf" value="${esc(csrf)}">
+           <button type="submit">ביטול החיבור</button>
+         </form>`
+      : connectionAcceptsOAuthCeremony(connection)
+        ? `<a href="${startPath}">לחיבור</a>`
+        : '<span class="muted">לא ניתן לחבר אוטומטית דרך המסך הזה</span>';
+
+  return `<tr>
+    <td>${label} <span class="muted">(${esc(connection.system)})</span></td>
+    <td>${statusLabel}</td>
+    <td>${account}</td>
+    <td>${scopes}</td>
+    <td>${lastRefreshed}</td>
+    <td>${lastOk}</td>
+    <td>${operational}</td>
+    <td>${action}</td>
+  </tr>`;
+}
+
+/**
+ * The screen the owner actually looks at for every external system: one
+ * heading per kind of connection, and under each heading, every connection
+ * the SIGNED CHARTER declares for it — whether or not it has ever been
+ * authorised.
+ *
+ * **Grouping is display only.** `groupForServes` (`connection-groups.ts`)
+ * derives a heading from `serves`; nothing about what is authorised, what
+ * channel is used, or what a plan may do changes because of which heading a
+ * connection happens to render under. See that module's own docblock for why
+ * that boundary must never move.
+ *
+ * **A declared connection with no grant is shown, not hidden**, and reads
+ * "טרם אושר" rather than being absent from the page. Hiding it would make
+ * "there is no CRM connection" and "there is a CRM connection nobody has
+ * authorised yet" look identical — exactly the ambiguity this screen exists
+ * to remove. A heading itself is rendered only when the charter declares at
+ * least one connection for it: charter is the source of truth for what is
+ * declared at all, so a group with nothing declared under it is not a
+ * question this screen needs to answer.
+ *
+ * **No token value ever reaches this function.** `OAuthGrantSummary`
+ * (`governance/oauth-grants.ts`) is structurally incapable of carrying one —
+ * `listGrants` takes no decryption key — so there is nothing here for a
+ * template literal to leak even by mistake.
+ *
+ * **The restart notice is not optional, and it is one-directional — say so
+ * (final fix wave, item 5).** `buildRuntime`'s own docblock and
+ * `docs/live-thread-runbook.md` both say the same thing: the scheduler reads
+ * `connection_bindings` once, at process startup, and AUTHORISING a
+ * connection here — including a freshly authorised grant this same screen
+ * just wrote — has no effect until that process restarts, because the
+ * adapter registry itself is only built once. An owner who authorises a
+ * connection and then wonders why nothing happened has no way to discover
+ * that fact by reading code; it must be on the page. REVOKING is the
+ * opposite, and the page must not say the same thing about both:
+ * `revoked_at` is checked on every resolve (`oauth-token.ts`'s own docblock,
+ * point 2) precisely so a revocation beats an approval the owner gave a
+ * moment earlier — the very next call fails, restart or not, exactly as
+ * `docs/live-thread-runbook.md` §10.3 already tells the operator. Telling an
+ * owner cutting off access in an emergency that it "takes effect after a
+ * restart" is not a rounding error; it is the one place on this page an
+ * owner reads under pressure, and it used to say the false half.
+ */
+export function renderConnections(options: {
+  charterStatus: CharterReadStatus;
+  connections: readonly CharterConnection[];
+  bindings: readonly ConnectionBinding[];
+  grants: readonly OAuthGrantSummary[];
+  csrf: string;
+}): string {
+  const notice =
+    options.charterStatus === 'unreadable'
+      ? `<p class="error">${esc(CHARTER_UNREADABLE_NOTICE)}</p>`
+      : options.charterStatus === 'none'
+        ? `<p class="muted">${esc(CHARTER_MISSING_NOTICE)}</p>`
+        : '';
+
+  const rows =
+    options.charterStatus === 'ok'
+      ? buildConnectionRows(options.connections, options.bindings, options.grants)
+      : [];
+
+  const sections = CONNECTION_GROUP_ORDER.map((group) => {
+    const inGroup = rows.filter((r) => r.group === group);
+    if (inGroup.length === 0) return '';
+    const tableRows = inGroup.map((r) => connectionRowHtml(r, options.csrf)).join('');
+    return `<section>
+      <h2>${esc(GROUP_LABELS[group])}</h2>
+      <table>
+        <tr><th>מערכת</th><th>סטטוס</th><th>חשבון</th><th>היקפים שנענו</th><th>רוענן לאחרונה</th><th>קריאה מוצלחת אחרונה</th><th>מצב תפעולי</th><th></th></tr>
+        ${tableRows}
+      </table>
+    </section>`;
+  }).join('');
+
+  return page(
+    'חיבורים',
+    `<header>
+  <h1>חיבורים</h1>
+  ${logoutForm(options.csrf)}
+</header>
+<p><a href="/">&rarr; חזרה לרשימה</a></p>
+<p class="muted">
+  תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו —
+  ולכן חיבור חדש שאושר כאן ייכנס לתוקף רק אחרי שהתהליך יופעל מחדש.
+  ביטול חיבור הוא ההפך: כל קריאה בודקת אותו מחדש, ולכן ביטול נכנס לתוקף באותו רגע —
+  הקריאה הבאה, גם אם ה-scheduler רץ כבר, כבר נכשלת.
+</p>
+${notice}
+${sections === '' && notice === '' ? '<p>התקנון הפעיל אינו מצהיר על אף חיבור.</p>' : sections}`,
   );
 }
 
@@ -961,7 +1210,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }

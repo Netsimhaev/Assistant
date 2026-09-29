@@ -13,14 +13,22 @@ import {
 import { canonicalHash } from '../util/canonical.js';
 import { unspentApprovalFor } from '../governance/approvals.js';
 import { delegationProblems } from '../governance/delegation.js';
+import { OAuthGrantError } from '../governance/oauth-grants.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
 import type { AdapterRegistry } from './adapters/registry.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
-import { loadBindings } from './bindings.js';
+import { loadBindings, recordBindingOutcome } from './bindings.js';
 import { deriveTargetId, resolveChannel } from './channels.js';
 import type { CredentialSource } from './credentials.js';
 import { executeStep, type StepEffect, type StepOutcome } from './execute.js';
 import { loadJob, transition } from './jobs.js';
+import {
+  AmbiguousCredentialRefError,
+  OAuthGrantRevokedError,
+  OAuthMisconfiguredError,
+  OAuthRefreshRejectedError,
+  OAuthRefreshTransientError,
+} from './oauth-token.js';
 import { bindPlanToJob, completedSteps } from './plan-store.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { StepChannelError } from './step-error.js';
@@ -476,6 +484,62 @@ export async function runPlanForJob(request: RunPlanForJobRequest): Promise<RunP
 }
 
 /**
+ * Turn one of `oauthCredentials.resolve`'s own thrown error classes into a
+ * `StepChannelError` with the retryability spec §3.4's classification table
+ * assigns it. Anything else — a generic error from the fallback's own DB
+ * read, say — is returned UNCHANGED, so it still propagates as a genuine,
+ * uncategorised failure rather than being silently absorbed here.
+ *
+ * Revoked, a rejected refresh, an ambiguous ref, and a missing local
+ * configuration are all terminal: none of them self-heals on a retry, and
+ * §3.4 groups "no grant row, or revoked" with "provider rejects the
+ * refresh" under the same verdict as a static secret that was never
+ * provisioned (`credential_unavailable`). A transient refresh failure —
+ * network trouble, a provider 5xx, or this module's own deadline racing out
+ * (`withOAuthDeadline` in `oauth-token.ts` throws the identical class for
+ * both) — is retryable, matching §3.4's "network fault or 5xx on refresh".
+ *
+ * `OAuthGrantError` (`governance/oauth-grants.ts`) is a sixth class, not one
+ * of `oauthCredentials`'s own five: `recordRefresh` and `markNeedsReauth`
+ * both throw it when their own `UPDATE ... WHERE revoked_at IS NULL` touches
+ * no row — the shape a concurrent revoke lands in, between `oauthCredentials`
+ * reading a live grant and its own write landing a moment later. Left
+ * unmapped it fell through to `return error` below and reached
+ * `execute.ts`'s bare catch as a plain `Error`: `adapter_threw` — the generic
+ * bucket every unrecognised throw lands in, indistinguishable there from a
+ * genuine bug. `adapter_threw` happens to be non-retryable, which is the
+ * RIGHT answer here by accident, not by design: the grant is gone by the
+ * time this fires (the owner revoked it mid-refresh), so retrying cannot
+ * help either way. What was actually missing is the READABLE code — the
+ * audit trail and the job's `failed` reason said `adapter_threw` for a race
+ * that has a name, instead of the same `oauth_grant_revoked` a plain revoked
+ * grant already gets one branch up (final fix wave, item 3).
+ *
+ * Fix-round 1, finding I5.
+ */
+function mapOAuthTokenError(error: unknown): unknown {
+  if (error instanceof OAuthGrantRevokedError) {
+    return new StepChannelError('oauth_grant_revoked', error.message, false);
+  }
+  if (error instanceof OAuthGrantError) {
+    return new StepChannelError('oauth_grant_revoked', error.message, false);
+  }
+  if (error instanceof OAuthRefreshRejectedError) {
+    return new StepChannelError('oauth_refresh_rejected', error.message, false);
+  }
+  if (error instanceof OAuthMisconfiguredError) {
+    return new StepChannelError('oauth_misconfigured', error.message, false);
+  }
+  if (error instanceof AmbiguousCredentialRefError) {
+    return new StepChannelError('oauth_ambiguous_ref', error.message, false);
+  }
+  if (error instanceof OAuthRefreshTransientError) {
+    return new StepChannelError('oauth_refresh_transient', error.message, true);
+  }
+  return error;
+}
+
+/**
  * Perform one step's side effect against the system that serves it.
  *
  * The SECOND resolution, and it runs *after* `evaluateToolCall` has permitted
@@ -562,10 +626,40 @@ async function performStep(
 
   const binding = request.bindings.find((b) => b.system === resolution.system);
   const credentialRef = binding?.credentialRef ?? null;
+  // `.catch` here, not a bare `await`: `oauthCredentials.resolve`
+  // (`oauth-token.ts`) throws five error classes of its own — plus
+  // `OAuthGrantError` (`governance/oauth-grants.ts`) when a concurrent
+  // revoke lands between its read and its own write — on top of whatever
+  // the fallback can throw.
+  //
+  // **What this mapping actually buys is classification, not containment.**
+  // `execute.ts`'s `executeStep` already catches every throw here with a
+  // BARE `catch` around `perform` (this function is `perform`) — nothing
+  // escapes uncaught, and no job is left frozen in `execute`. Without this
+  // mapping, that bare catch sees an ordinary `Error`, records it as
+  // `adapter_threw`, and treats it as NON-retryable — which TERMINALLY FAILS
+  // the job. The mapping exists so an `OAuthRefreshTransientError` (a
+  // network blip, a provider 5xx, or this module's own deadline firing)
+  // instead becomes a *retryable* `StepChannelError`, so the job sleeps to
+  // `followup` and gets another try, rather than failing for good over
+  // something that may simply work on the next scheduler pass (fix-round 1,
+  // finding I5; spec §4.4 was narrowed to permit this one change to
+  // `performStep`; corrected in the final fix wave, item 3 — three places
+  // claimed this throw would go uncaught, and none of them do).
+  // `mapOAuthTokenError` rethrows anything it does not recognise unchanged,
+  // so a genuine infrastructure failure (the fallback's own DB blip, say)
+  // still propagates as before — only the six named classes are converted.
+  // Every branch below is UNREACHABLE for a static secret:
+  // `storedCredentials.resolve` never throws any of them, so the mail path's
+  // behaviour is unchanged.
   const credential =
     credentialRef === null
       ? null
-      : await request.credentials.resolve(credentialRef, request.job.businessId);
+      : await request.credentials
+          .resolve(credentialRef, request.job.businessId)
+          .catch((error: unknown) => {
+            throw mapOAuthTokenError(error);
+          });
   if (credentialRef !== null && credential === null) {
     // NOT retryable, unlike `channel_unavailable` above. A ref that does not
     // resolve is a misconfiguration — a misspelling, or a secret that was
@@ -601,6 +695,59 @@ async function performStep(
     },
     request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS,
   );
+
+  // A 401 from the RESOURCE call — not the refresh call `oauth-token.ts`
+  // already handles — is the one signal that proves a still-unexpired
+  // cached access token is already bad at the provider. Without this, the
+  // scheduler's retry (this same job, sleeping to `followup` and waking up
+  // again) replays the identical stale token from the cache until its own
+  // recorded expiry catches up on its own, failing every attempt in between
+  // for a reason a fresh token would not have had (spec §3.4 row 5, "one
+  // refresh and one retry"; final fix wave, item 12). `'unauthorized'` is
+  // `google-calendar.ts`'s own code for exactly this response — the only
+  // adapter today that resolves an OAuth-backed credential at all; a second
+  // one would need adding here too, or this would need to become a declared
+  // field on `AdapterResult` instead of a code string match.
+  // `credentials.invalidate` is OPTIONAL on `CredentialSource` (most
+  // implementations have nothing cached to forget) and synchronous — see
+  // that interface's own docblock.
+  if (!result.ok && result.code === 'unauthorized' && credentialRef !== null) {
+    request.credentials.invalidate?.(credentialRef, request.job.businessId);
+  }
+
+  // The binding's health, after the fact rather than before it. `last_ok_at`
+  // and `last_error` have had no writer since the table was created — see
+  // `recordBindingOutcome`'s own docblock for the full reasoning, including
+  // why a failure here never touches `status`. `errorCode`/`errorMessage`
+  // come from `result` alone, the adapter's own classification of what just
+  // happened — never from `credential` or anything else in this closure that
+  // might carry a secret. `.catch` and not a bare `await`: this is display,
+  // not control, and a bookkeeping UPDATE that fails must not turn a step
+  // that actually succeeded (or failed for its own, already-handled reason)
+  // into something this function reports differently.
+  //
+  // FOUR failure paths never reach this call at all, and both fields stay
+  // stale for each of them. Three happen BEFORE this point, because there is
+  // no `AdapterResult` yet to record: `channel_unavailable` (the binding
+  // resolved but is not `live`), `credential_unavailable` (the ref did not
+  // resolve), and the five OAuth-derived `StepChannelError`s `performStep`
+  // throws above via `mapOAuthTokenError` — those last ones already have a
+  // home of their own, the grant's `needsReauthAt`, written by the token
+  // service. The fourth, `adapter_timeout`, is different in kind: it happens
+  // DURING this call — `callWithDeadline`'s own race rejects before `result`
+  // is ever assigned, so a chronically timing-out connection leaves both
+  // health fields stale with nothing here ever running for it. No `finally`
+  // fixes that without also running on the happy path this call already
+  // covers; a connection that only ever times out is a gap this function does
+  // not close.
+  await recordBindingOutcome({
+    businessId: request.job.businessId,
+    system: resolution.system,
+    ok: result.ok,
+    ...(result.ok ? {} : { errorCode: result.code, errorMessage: result.message }),
+  }).catch(() => {
+    /* display, not control — see recordBindingOutcome's docblock */
+  });
 
   // Acting on the result is the whole point. Ignoring it would record an
   // unimplemented browser call as an order placed, and send the confirmation.

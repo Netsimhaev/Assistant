@@ -113,6 +113,7 @@ describe('runPlan and delegationProblems', () => {
     status: 'live',
     endpoint: null,
     credentialRef: 'OFFICE_MAIL',
+    provider: null,
     lastOkAt: null,
     lastError: null,
   };

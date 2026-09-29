@@ -10,7 +10,13 @@
 import { config } from '../src/config.js';
 import { closePool, getPool } from '../src/db/pool.js';
 import { activeCharterVersion, probeActiveCharter } from '../src/charter/store.js';
+import { DEFAULT_DASHBOARD_BASE_URL, redirectUriFor } from '../src/dashboard/oauth-routes.js';
 import { loadBindings } from '../src/orchestrator/bindings.js';
+import {
+  GOOGLE_CLIENT_ID_REF,
+  GOOGLE_CLIENT_SECRET_REF,
+} from '../src/orchestrator/adapters/google-token-http.js';
+import { listGrants } from '../src/governance/oauth-grants.js';
 import { loadRampLevel } from '../src/orchestrator/ramp.js';
 import { buildRuntime } from '../src/orchestrator/runtime.js';
 
@@ -99,16 +105,93 @@ if (runtime !== null) {
   if (mail?.credentialRef) refs.add(mail.credentialRef);
   const notifyRef = process.env['NOTIFY_CREDENTIAL_REF'];
   if (notifyRef !== undefined && notifyRef.length > 0) refs.add(notifyRef);
+  // The OAuth consent ceremony's own app secret (oauth-routes.ts,
+  // oauth-consent.ts) — resolved unconditionally, not only when a Google
+  // binding already exists, because the FIRST thing an operator needs to
+  // know before clicking "connect" on the dashboard is whether these are
+  // provisioned at all.
+  refs.add(GOOGLE_CLIENT_ID_REF);
+  refs.add(GOOGLE_CLIENT_SECRET_REF);
   for (const ref of refs) {
-    const handle = await runtime.credentials.resolve(ref, businessId);
-    line(
-      handle !== null,
-      `secret ${ref}`,
-      handle === null ? `not provisioned — run \`npm run secret put ${ref} <operator>\`` : 'provisioned',
-    );
+    // `resolve` can THROW, not just return `null` — `oauthCredentials.resolve`
+    // (`oauth-token.ts`) throws five error classes of its own (a revoked
+    // grant, a rejected refresh, an ambiguous ref, a missing local app
+    // secret, or a transient failure) on top of whatever the fallback can
+    // throw. `AmbiguousCredentialRefError` in particular is exactly the C1
+    // state this readiness script most needs to diagnose (`OFFICE_MAIL`
+    // resolving through both a grant and the static SMTP secret), and this
+    // loop used to call `resolve` unguarded and die with a stack trace on
+    // that exact ref instead of printing a MISS line for it. Guarded the same
+    // way `connector-calendar.ts` already guards its own `resolve` call
+    // (final fix wave, item 10).
+    try {
+      const handle = await runtime.credentials.resolve(ref, businessId);
+      line(
+        handle !== null,
+        `secret ${ref}`,
+        handle === null ? `not provisioned — run \`npm run secret put ${ref} <operator>\`` : 'provisioned',
+      );
+    } catch (error) {
+      line(false, `secret ${ref}`, error instanceof Error ? error.message : String(error));
+    }
   }
 
   for (const warning of runtime.warnings) console.log(`      warning: ${warning}`);
+}
+
+// The single most common installation failure for the OAuth consent
+// ceremony (spec 5.5): the redirect_uri registered at the provider must
+// match this, character for character. Printed unconditionally, before a
+// run, rather than surfacing as an opaque `redirect_uri_mismatch` from
+// Google mid-consent.
+const dashboardBaseUrlForOAuth = process.env['DASHBOARD_BASE_URL'] ?? DEFAULT_DASHBOARD_BASE_URL;
+console.log(`\noauth redirect_uri: ${redirectUriFor(dashboardBaseUrlForOAuth)}`);
+
+// One line per connection the CHARTER declares — not per binding, and not
+// per grant: a connection the owner signed but never authorised is exactly
+// the state an operator needs to see before a run, not discover as
+// `credential_unavailable` mid-run. `listGrants` returns `OAuthGrantSummary`,
+// which carries no refresh token at all (see `governance/oauth-grants.ts`) —
+// it cannot leak one here even by a future mistake in this script.
+//
+// `probeActiveCharter`, not `loadActiveCharter` wrapped in a `try`. Both
+// branches that met here wanted the same thing — a readiness script whose
+// whole job is printing MISS lines must print one for an unreadable charter
+// too, rather than stopping with a stack trace before the remaining checks
+// run — and each solved it with what it had. This script was written on a
+// branch where the shared helper did not exist yet, so it caught the throw
+// locally; `probeActiveCharter` was built on the other branch for exactly
+// this caller shape, and its docblock names the readiness report as one of
+// the two places allowed to ask. The merge is where the local catch stops
+// being the honest answer.
+const declaredProbe = await probeActiveCharter(businessId);
+if (!declaredProbe.ok) {
+  line(false, 'declared connections', declaredProbe.reason);
+}
+const active = declaredProbe.ok ? declaredProbe.active : null;
+if (active !== null) {
+  const grants = await listGrants(businessId);
+  const grantBySystem = new Map(grants.map((g) => [g.system, g] as const));
+  console.log('\ndeclared connections:');
+  for (const conn of active.bundle.connections) {
+    const grant = grantBySystem.get(conn.system);
+    const detail =
+      grant === undefined
+        ? 'no grant — connect it from /connections'
+        : grant.revokedAt !== null
+          ? `revoked at ${grant.revokedAt} — reconnect from /connections`
+          : grant.needsReauthAt !== null
+            ? `needs re-authorisation since ${grant.needsReauthAt} — reconnect from /connections`
+            : `granted to ${grant.account} (${grant.provider})`;
+    line(
+      grant !== undefined && grant.revokedAt === null && grant.needsReauthAt === null,
+      `connection ${conn.system}`,
+      detail,
+    );
+  }
+  if (active.bundle.connections.length === 0) {
+    console.log('      (none declared in the charter)');
+  }
 }
 
 const ramp = await loadRampLevel('email.initiate', { businessId });

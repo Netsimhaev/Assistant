@@ -1,3 +1,4 @@
+import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { storedCredentials } from '../governance/credential-store.js';
 import { loadMasterKey, MasterKeyError, verifyKeyState } from '../governance/master-key.js';
@@ -6,10 +7,20 @@ import type { ApprovalNotifier } from '../governance/notify.js';
 import { createSmtpTransport } from '../mail/transport.js';
 import type { SmtpConfig } from '../mail/transport.js';
 import { browserAdapter } from './adapters/browser.js';
+import { createGoogleCalendarAdapter } from './adapters/google-calendar.js';
+import type { CalendarHttp } from './adapters/google-calendar.js';
+import { googleTokenHttp } from './adapters/google-token-http.js';
 import { createMailAdapter } from './adapters/mail.js';
 import { AdapterRegistry } from './adapters/registry.js';
+import { loadBindings } from './bindings.js';
 import { CREDENTIAL_REF_PATTERN } from './credentials.js';
 import type { CredentialSource } from './credentials.js';
+import { connectionAcceptsOAuthCeremony } from './oauth-eligibility.js';
+import { oauthCredentials } from './oauth-token.js';
+import type { TokenHttp } from './oauth-token.js';
+
+/** Which vendor's code serves a binding's system. Matches `ConnectionBinding.provider`. */
+const GOOGLE_PROVIDER = 'google';
 
 /**
  * Everything a production run needs that is not per-job.
@@ -62,15 +73,68 @@ const SMTP_KEYS = [
  * `overrides.createTransport` exists for exactly one caller: a test that
  * needs to see what `SmtpConfig` and per-send credential actually reached
  * nodemailer, the same seam `SmtpConfig.createTransport` documents for
- * `createSmtpTransport` itself. No production caller ever passes it — every
- * real call site calls `buildRuntime()` with zero arguments:
- * `run-scheduler.ts`, `run-due.ts` and `scheduler.ts` in the product, plus the
- * two operator scripts `scripts/live-thread-status.ts` and
- * `scripts/probe-smtp.ts`.
+ * `createSmtpTransport` itself. `overrides.tokenHttp` and
+ * `overrides.calendarHttp` are the same seam one layer over — a test that
+ * needs to see what reached the OAuth token exchange or the calendar API
+ * without a real Google account behind it — and **no test in this
+ * sub-project uses either one yet**. They exist for two NAMED future
+ * consumers: Task 5's consent-flow tests (which need to drive a fake token
+ * exchange through a `buildRuntime`-assembled runtime end to end, the way
+ * this sub-project's own tests drive `createTransport`) and a future
+ * live-run script test for the calendar chain, the sibling of
+ * `probe-smtp.ts`. Naming the expected consumer here is deliberate: a seam
+ * with no reader and no stated owner is exactly the "field nobody reads"
+ * class this project has paid for more than once (fix round 2, minor 7) —
+ * until one of those two lands, this stays a documented gap, not a claim
+ * that something already exercises it. No production caller ever passes
+ * any of the three overrides — every real call site calls `buildRuntime()`
+ * with zero arguments: `run-scheduler.ts`, `run-due.ts` and `scheduler.ts`
+ * in the product, plus the two operator scripts
+ * `scripts/live-thread-status.ts` and `scripts/probe-smtp.ts`.
+ *
+ * **The credential source is a composition, not a single store.**
+ * `oauthCredentials` wraps `storedCredentials(key)` rather than replacing
+ * it: a ref that is not a stored OAuth grant — every ref the mail adapter
+ * has ever resolved — falls straight through to the same encrypted store as
+ * before, unchanged in behaviour. What is added is a ref that names a
+ * Google grant: the composed source mints a live access token for it,
+ * refreshing through `googleTokenHttp`, which resolves the app's OWN OAuth
+ * client id/secret through that identical encrypted store, never through
+ * `process.env` (see `google-token-http.ts`'s own docblock — this is the
+ * piece Task 3 originally sketched as reading `process.env` and was
+ * reverted for that exact reason).
+ *
+ * **Provider adapters register from the charter and the bindings, not from
+ * a grant.** A system whose binding names `provider: 'google'`, and whose
+ * charter-declared connection for that same system BOTH uses the `api`
+ * channel AND serves `calendar.read`, gets `createGoogleCalendarAdapter`
+ * registered under its system name — even when no grant has been stored for
+ * it yet. A missing authorisation is a RUNTIME failure the adapter itself
+ * reports (`credential_unavailable`, from `oauthCredentials` resolving to
+ * `null`), not a missing adapter — the same distinction §6.2 of the design
+ * spec draws between a connectivity failure and a policy decision. The
+ * `serves` half of that check is load-bearing: see the registration loop's
+ * own comment (fix-round 1, finding I1) for the collision it prevents.
+ *
+ * **This reads the charter and the bindings exactly ONCE, at the moment
+ * `buildRuntime` is called — not continuously.** Every real caller
+ * (`run-scheduler.ts` chief among them) builds one `Runtime` at process
+ * start and reuses it for every scheduler pass thereafter. A `provider`
+ * column an owner sets through Task 5's dashboard AFTER the scheduler is
+ * already running therefore has NO EFFECT until the process is restarted —
+ * this is a known limitation, not an oversight: re-deriving the adapter
+ * registry on every pass would mean re-reading the charter and the master
+ * key every 30 seconds, and that trade-off belongs to a later task, not this
+ * fix round. `docs/live-thread-runbook.md` states the restart requirement
+ * for an operator to actually find.
  */
 export async function buildRuntime(
   env: Record<string, string | undefined> = process.env,
-  overrides: { createTransport?: SmtpConfig['createTransport'] } = {},
+  overrides: {
+    createTransport?: SmtpConfig['createTransport'];
+    tokenHttp?: TokenHttp;
+    calendarHttp?: CalendarHttp;
+  } = {},
 ): Promise<Runtime> {
   const warnings: string[] = [];
 
@@ -85,7 +149,17 @@ export async function buildRuntime(
   }
   const key = await loadMasterKey(keyPath);
   await verifyKeyState(key);
-  const credentials = storedCredentials(key);
+  // COMPOSED, not the bare store: a ref that resolves through
+  // `storedCredentials` still resolves the same way (the mail adapter is
+  // untouched); a ref that names a stored OAuth grant instead mints a live
+  // access token. See the docblock above.
+  const credentials = oauthCredentials({
+    key,
+    fallback: storedCredentials(key),
+    http:
+      overrides.tokenHttp ??
+      googleTokenHttp({ credentials: storedCredentials(key) }),
+  });
 
   // A missing ref is a warning below, in the same place APPROVAL_NOTIFY_TO's
   // absence already is — the notifier simply does not get built. A *present*
@@ -199,6 +273,95 @@ export async function buildRuntime(
     warnings.push(
       `no curation: ANTHROPIC_API_KEY not set — jobs will close normally, ` +
         `but the assistant will not learn anything from them`,
+    );
+  }
+
+  // Additive, on top of the mail adapter above: every system whose binding
+  // carries `provider: 'google'`, and whose charter-declared connection for
+  // that same system BOTH uses the `api` channel AND serves `calendar.read`,
+  // gets a Google Calendar adapter registered under its system name.
+  //
+  // The `serves` check is load-bearing, not decorative (fix-round 1, finding
+  // I1). The charter decides WHICH TOOLS a connection serves; the binding's
+  // `provider` column decides WHOSE CODE runs a system that already has one.
+  // Checking only `provider` and `channel` -- without `serves` -- let a
+  // binding whose SYSTEM NAME already has an adapter (`office-mail`, whose
+  // charter connection is also `channel: 'api'`) collide with it: an owner
+  // setting `provider: 'google'` on the `office-mail` row -- the natural
+  // thing to do when authorising Gmail through Task 5's consent screen --
+  // made `AdapterRegistry`'s constructor throw `adapter for system
+  // "office-mail" is already registered`, which is not a failed step but
+  // `buildRuntime` itself throwing: the scheduler, `run-due`,
+  // `live-thread-status` and `probe-smtp` all refuse to start, and nothing
+  // recovers until someone edits the row by hand. A row a dashboard writes
+  // must never be able to stop the process from booting. Requiring BOTH the
+  // binding's `provider` and the charter's `serves` is the column's own
+  // division of labour, not a redundant belt-and-braces check.
+  //
+  // The `serves` check closes THAT case, but not the general one -- see the
+  // `systemAdapters.some(...)` check inside the loop below for the charter
+  // shape it still misses and how that is closed.
+  //
+  // Registered even with no grant stored, and even when the binding's own
+  // `status` is not `live` — that status is what `resolveChannel` later
+  // reports as `unavailable`, at plan-execution time; it is not a reason for
+  // the adapter itself not to exist, the same way the mail adapter above is
+  // registered from env configuration alone with no binding-status check at
+  // all. A missing authorisation is likewise the adapter's own runtime
+  // failure, not a missing adapter — see this function's own docblock. No
+  // charter installed, or no matching binding, is simply zero adapters
+  // registered here; neither is an error.
+  //
+  // **Known limitation, documented rather than fixed here:** the charter and
+  // the bindings are read exactly once, at process start — `run-scheduler.ts`
+  // builds one `Runtime` and passes it into every pass. A `provider` column
+  // written by Task 5's dashboard after this process started therefore has
+  // no effect until the scheduler is RESTARTED; re-deriving the registry on
+  // every pass would mean re-reading the charter and the master key every
+  // 30 seconds, which is an architecture decision for a later task, not a
+  // line in this fix round. See `docs/live-thread-runbook.md`.
+  const charter = await loadActiveCharter();
+  const bindings = await loadBindings();
+  const connectionBySystem = new Map(
+    (charter?.charter.connections ?? []).map((connection) => [connection.system, connection] as const),
+  );
+  for (const binding of bindings) {
+    if (binding.provider !== GOOGLE_PROVIDER) continue;
+    const connection = connectionBySystem.get(binding.system);
+    // `connectionAcceptsOAuthCeremony` (`oauth-eligibility.ts`) is this same
+    // channel-and-serves check, extracted (final fix wave, item 1) so the
+    // OAuth ceremony (`oauth-routes.ts`'s `handleOAuthStart`) and the
+    // connections screen (`views.ts`) answer this exact question with the
+    // same function, not a second copy that can drift.
+    if (!connectionAcceptsOAuthCeremony(connection)) continue;
+    // The `serves` check above closes the SEEDED case (a charter that
+    // declares `office-mail` for `mail.send` only, so it never reaches
+    // here at all) but not the general one (fix-round 2, finding I3): a
+    // signed charter is free to declare ONE system that serves BOTH
+    // `mail.send` and `calendar.read` -- the natural single-connection
+    // modelling of Google Workspace -- with `MAIL_SYSTEM` pointing at it
+    // and `provider: 'google'` on its binding. The mail adapter above is
+    // already registered under that system name by the time this loop
+    // runs, so pushing a second adapter under the identical name would
+    // still hit `AdapterRegistry`'s constructor throwing on the
+    // duplicate -- the exact "a row a dashboard writes must never be able
+    // to stop the process from booting" failure the `serves` check was
+    // ruled on to prevent, just reached through a charter shape the
+    // seeded case does not cover. Skip and warn instead of registering,
+    // the same shape every other assembly failure in this function takes.
+    if (systemAdapters.some((a) => a.system === binding.system)) {
+      warnings.push(
+        `no calendar adapter for "${binding.system}": an adapter is already ` +
+          `registered under this system name (most likely the mail adapter) ` +
+          `— one system cannot serve both mail and calendar today`,
+      );
+      continue;
+    }
+    systemAdapters.push(
+      createGoogleCalendarAdapter({
+        system: binding.system,
+        ...(overrides.calendarHttp !== undefined ? { http: overrides.calendarHttp } : {}),
+      }),
     );
   }
 

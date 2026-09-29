@@ -129,6 +129,7 @@ async function jobReadyToRun(charterVersion: string): Promise<string> {
       status: 'live',
       endpoint: null,
       credentialRef: 'OFFICE_MAIL',
+      provider: null,
       lastOkAt: null,
       lastError: null,
     },

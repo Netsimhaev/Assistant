@@ -10,6 +10,7 @@ interface BindingRow {
   status: string;
   endpoint: string | null;
   credential_ref: string | null;
+  provider: string | null;
   last_ok_at: Date | null;
   last_error: string | null;
 }
@@ -20,6 +21,7 @@ function toBinding(row: BindingRow): ConnectionBinding {
     status: row.status,
     endpoint: row.endpoint,
     credentialRef: row.credential_ref,
+    provider: row.provider,
     lastOkAt: row.last_ok_at?.toISOString() ?? null,
     lastError: row.last_error,
   });
@@ -30,7 +32,7 @@ export async function loadBindings(
 ): Promise<ConnectionBinding[]> {
   const db = options.db ?? getPool();
   const { rows } = await db.query<BindingRow>(
-    `SELECT system, status, endpoint, credential_ref, last_ok_at, last_error
+    `SELECT system, status, endpoint, credential_ref, provider, last_ok_at, last_error
        FROM connection_bindings
       WHERE business_id = $1
       ORDER BY system`,
@@ -98,12 +100,13 @@ export async function upsertBinding(
   const write = async (tx: Queryable): Promise<void> => {
     await tx.query(
       `INSERT INTO connection_bindings
-         (business_id, system, status, endpoint, credential_ref, last_ok_at, last_error, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+         (business_id, system, status, endpoint, credential_ref, provider, last_ok_at, last_error, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
        ON CONFLICT (business_id, system) DO UPDATE
          SET status = EXCLUDED.status,
              endpoint = EXCLUDED.endpoint,
              credential_ref = EXCLUDED.credential_ref,
+             provider = EXCLUDED.provider,
              last_ok_at = EXCLUDED.last_ok_at,
              last_error = EXCLUDED.last_error,
              updated_at = now()`,
@@ -113,6 +116,7 @@ export async function upsertBinding(
         parsed.status,
         parsed.endpoint,
         parsed.credentialRef,
+        parsed.provider,
         parsed.lastOkAt,
         parsed.lastError,
       ],
@@ -126,7 +130,24 @@ export async function upsertBinding(
         charterVersion: options.charterVersion ?? 'unknown',
         provenance: 'boss',
         inputHash: canonicalHash(parsed),
-        reason: `connection binding for "${parsed.system}" set to status "${parsed.status}" by ${options.by}`,
+        // `status` alone used to be the whole reason (final fix wave, item
+        // 1d) — but this docblock's own promise, two paragraphs up, is that
+        // `endpoint` AND `credentialRef` changing must be "at least as
+        // visible as a kill switch trip", because either one can redirect a
+        // permitted connection to a different host or secret. The OAuth
+        // consent callback (`handleOAuthCallback`) is exactly the write that
+        // exposed this: it changes `credentialRef` and `provider` on an
+        // EXISTING row, and the audit trail said only that `status` became
+        // "live" — silent about the two fields that actually moved trust.
+        // `provider` is named for the identical reason `endpoint` already
+        // is in the docblock above. `endpoint` itself is omitted here
+        // deliberately: it is free-form and can be arbitrarily long, while
+        // `canonicalHash(parsed)` on the same row already covers it for
+        // anyone who needs to prove what changed, not just read a summary.
+        reason:
+          `connection binding for "${parsed.system}" set to status "${parsed.status}" ` +
+          `(credentialRef=${parsed.credentialRef ?? 'null'}, provider=${parsed.provider ?? 'null'}) ` +
+          `by ${options.by}`,
       },
       { businessId, tx },
     );
@@ -137,4 +158,75 @@ export async function upsertBinding(
   } else {
     await withTransaction((client) => write(client));
   }
+}
+
+/**
+ * Record whether one system's connection just worked or just failed.
+ *
+ * `last_ok_at` and `last_error` have existed on this table since it was
+ * created, validated by `ConnectionBinding` and returned by `loadBindings`,
+ * with no production writer at all — the two seed scripts that touched them
+ * only ever wrote `null`. This is that writer, and `performStep`
+ * (`run-plan.ts`), which calls it right after `callWithDeadline` resolves,
+ * is its reader-in-waiting: the connector layer is exactly what knows
+ * whether a call just landed or just failed, and nowhere else does.
+ *
+ * **Unlike `upsertBinding` above, this is a partial two-column UPDATE, not a
+ * validated whole-row replace, and it does not call `appendAudit`.** That is
+ * deliberate, not an oversight of the pattern above it — see the docblock on
+ * `upsertBinding` for what a *routing* or *credential* change owes the audit
+ * trail, and the comment beside migration 003's `connection_bindings` table
+ * for why a health-bookkeeping write is exempt from that.
+ *
+ * **Display, not control.** This function must never be able to fail the
+ * step that just ran — a bookkeeping UPDATE losing its connection to the
+ * pool must not turn a step that actually succeeded into one reported as
+ * failed. The caller wraps this in its own `.catch`; nothing here throws
+ * past that boundary on purpose, but the caller does not rely on this
+ * function being silent — it guards regardless.
+ *
+ * **`last_error` carries only what the ADAPTER classified.** `errorCode`
+ * and `errorMessage` are `AdapterResult`'s own failure fields — never a
+ * provider's raw response body, and never anything derived from a
+ * credential. This is a plain `text` column, so the rule an audit row's
+ * `reason` already holds applies here without exception: a secret written
+ * to a text column is a secret leaked to every future reader of it, forever
+ * (`audit_log` is append-only; this column is not, but nothing here assumes
+ * that as a safety net).
+ *
+ * **A failure never moves `status`.** `status` answers "does the owner (or
+ * an explicit health check) currently trust this connection" — a question
+ * with a human or an operator behind it. One call's outcome is not that
+ * answer: a transient network fault may clear itself in five minutes, the
+ * exact loop the scheduler already runs, and a *terminal* authentication
+ * failure is a fact about the GRANT, not the connection — the token service
+ * already marks the grant as needing re-authorisation, and that is where it
+ * belongs. Loading `status` with a second meaning here would make one field
+ * answer two different questions that disagree in exactly the cases that
+ * matter. Only `upsertBinding`, driven by a human or a health check, moves
+ * `status`.
+ *
+ * `businessId` is required, with no default, for the same reason
+ * `CredentialSource.resolve` requires it: a caller that could omit it would
+ * read the omission as "the business in the configuration," which is
+ * exactly how one customer's connection history ends up recorded against
+ * another's. `upsertBinding` a few lines above is *not* a second precedent
+ * for this — it defaults to `config.businessId` when its caller omits one
+ * (`options.businessId ?? config.businessId`). This function deliberately
+ * does not follow that fallback; it is stricter than the pattern beside it,
+ * not consistent with it.
+ */
+export async function recordBindingOutcome(
+  input: { businessId: string; system: string; ok: boolean; errorCode?: string; errorMessage?: string },
+  options: { db?: Queryable } = {},
+): Promise<void> {
+  const db = options.db ?? getPool();
+  const detail = input.ok ? null : `${input.errorCode ?? 'unknown'} — ${input.errorMessage ?? ''}`.trim();
+  await db.query(
+    `UPDATE connection_bindings
+        SET last_ok_at = CASE WHEN $3 THEN now() ELSE last_ok_at END,
+            last_error = $4
+      WHERE business_id = $1 AND system = $2`,
+    [input.businessId, input.system, input.ok, detail],
+  );
 }

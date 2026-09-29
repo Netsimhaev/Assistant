@@ -47,6 +47,7 @@ const LIVE: ConnectionBinding = {
   status: 'live',
   endpoint: null,
   credentialRef: 'OFFICE_MAIL',
+  provider: null,
   lastOkAt: null,
   lastError: null,
 };
@@ -647,6 +648,7 @@ describe('a failed adapter is a failed step, not a completed one', () => {
     status: 'live',
     endpoint: null,
     credentialRef: null,
+    provider: null,
     lastOkAt: null,
     lastError: null,
   };
@@ -745,6 +747,7 @@ describe('a failed adapter is a failed step, not a completed one', () => {
           status: 'live',
           endpoint: null,
           credentialRef: null,
+          provider: null,
           lastOkAt: null,
           lastError: null,
         },

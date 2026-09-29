@@ -43,6 +43,8 @@ export async function resetDatabase(): Promise<void> {
       -- table by hand or one test's memories leak into the next.
       memories,
       kept_items,
+      oauth_grants,
+      oauth_states,
       credentials,
       credential_key_state,
       proposals,
