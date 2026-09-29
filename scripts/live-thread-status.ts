@@ -10,7 +10,12 @@
 import { config } from '../src/config.js';
 import { closePool, getPool } from '../src/db/pool.js';
 import { activeCharterVersion } from '../src/charter/store.js';
+import { DEFAULT_DASHBOARD_BASE_URL, redirectUriFor } from '../src/dashboard/oauth-routes.js';
 import { loadBindings } from '../src/orchestrator/bindings.js';
+import {
+  GOOGLE_CLIENT_ID_REF,
+  GOOGLE_CLIENT_SECRET_REF,
+} from '../src/orchestrator/adapters/google-token-http.js';
 import { loadRampLevel } from '../src/orchestrator/ramp.js';
 import { buildRuntime } from '../src/orchestrator/runtime.js';
 
@@ -81,6 +86,13 @@ if (runtime !== null) {
   if (mail?.credentialRef) refs.add(mail.credentialRef);
   const notifyRef = process.env['NOTIFY_CREDENTIAL_REF'];
   if (notifyRef !== undefined && notifyRef.length > 0) refs.add(notifyRef);
+  // The OAuth consent ceremony's own app secret (oauth-routes.ts,
+  // oauth-consent.ts) — resolved unconditionally, not only when a Google
+  // binding already exists, because the FIRST thing an operator needs to
+  // know before clicking "connect" on the dashboard is whether these are
+  // provisioned at all.
+  refs.add(GOOGLE_CLIENT_ID_REF);
+  refs.add(GOOGLE_CLIENT_SECRET_REF);
   for (const ref of refs) {
     const handle = await runtime.credentials.resolve(ref, businessId);
     line(
@@ -92,6 +104,14 @@ if (runtime !== null) {
 
   for (const warning of runtime.warnings) console.log(`      warning: ${warning}`);
 }
+
+// The single most common installation failure for the OAuth consent
+// ceremony (spec 5.5): the redirect_uri registered at the provider must
+// match this, character for character. Printed unconditionally, before a
+// run, rather than surfacing as an opaque `redirect_uri_mismatch` from
+// Google mid-consent.
+const dashboardBaseUrlForOAuth = process.env['DASHBOARD_BASE_URL'] ?? DEFAULT_DASHBOARD_BASE_URL;
+console.log(`\noauth redirect_uri: ${redirectUriFor(dashboardBaseUrlForOAuth)}`);
 
 const ramp = await loadRampLevel('email.initiate', { businessId });
 line(true, 'ramp email.initiate', `${ramp} (job:seed raises it to approve_required)`);

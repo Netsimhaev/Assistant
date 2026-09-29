@@ -52,6 +52,13 @@ import {
   type Verdict,
 } from '../governance/verdict-store.js';
 import { documentForApproval } from './document-for-approval.js';
+import {
+  DEFAULT_DASHBOARD_BASE_URL,
+  handleOAuthCallback,
+  handleOAuthRevoke,
+  handleOAuthStart,
+} from './oauth-routes.js';
+import type { OAuthRouteOptions } from './oauth-routes.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { MAX_RECALL, recallMemories } from '../memory/store.js';
@@ -124,6 +131,31 @@ export interface DashboardOptions {
    * directory instead of the real deployment's document store.
    */
   documentRoot?: string;
+  /**
+   * Path to the master key file the OAuth consent ceremony (`oauth-routes.ts`)
+   * needs to resolve the Google app's own client id/secret and to seal a
+   * freshly-granted refresh token. Defaults to `process.env['CREDENTIAL_KEY_PATH']`
+   * when unset — the same env var `buildRuntime` and `secret.ts` read, so an
+   * installation only ever has one key file to point at. Tests pass an
+   * isolated one, the same way `documentRoot` lets them isolate the document
+   * store above.
+   */
+  credentialKeyPath?: string;
+  /**
+   * The externally-reachable base URL the OAuth redirect_uri is built from —
+   * the SAME base URL `buildRuntime` already uses for approval links
+   * (`DASHBOARD_BASE_URL`), never this process's own bind host/port, which
+   * may sit behind a tunnel with a different public name. Defaults to
+   * `process.env['DASHBOARD_BASE_URL']`, then the same fallback `runtime.ts`
+   * uses.
+   */
+  dashboardBaseUrl?: string;
+  /**
+   * Test seam for the OAuth code exchange and account lookup — the same
+   * discipline `buildRuntime`'s `overrides.tokenHttp`/`overrides.calendarHttp`
+   * keep. No production caller ever passes it.
+   */
+  oauthFetch?: typeof fetch;
 }
 
 function sessionCookie(token: string): string {
@@ -1832,6 +1864,8 @@ const CARD_PATH = /^\/a\/([^/]+)$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
 const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
 const AUTONOMOUS_ACTION_MARK_PATH = /^\/autonomy\/actions\/([^/]+)\/([^/]+)\/mark$/;
+const OAUTH_START_PATH = /^\/oauth\/([^/]+)\/start$/;
+const OAUTH_REVOKE_PATH = /^\/oauth\/([^/]+)\/revoke$/;
 
 /** The outcome `handleDecision` records for each `DECISION_PATH` action. */
 const OUTCOME_FOR_ACTION = {
@@ -1846,6 +1880,7 @@ async function route(
   businessId: string,
   trustProxy: boolean,
   documentRoot: string | undefined,
+  oauthOptions: OAuthRouteOptions,
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const pathname = new URL(req.url ?? '/', 'http://dashboard.local').pathname;
@@ -1892,6 +1927,28 @@ async function route(
   if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
   if (method === 'POST' && pathname === '/instruct')
     return handleInstructPost(req, res, businessId, session, documentRoot);
+
+  // The OAuth consent ceremony (oauth-routes.ts): the dashboard is the only
+  // place behind the owner's session, with CSRF and loopback binding, where
+  // handing a provider access to a business system belongs — the same
+  // reasoning that puts "sign and approve" and erasure here (spec 5.1).
+  const oauthStartMatch = OAUTH_START_PATH.exec(pathname);
+  if (method === 'GET' && oauthStartMatch) {
+    const system = oauthStartMatch[1];
+    if (system !== undefined) {
+      return handleOAuthStart(res, businessId, session, decodeURIComponent(system), oauthOptions);
+    }
+  }
+  if (method === 'GET' && pathname === '/oauth/callback') {
+    return handleOAuthCallback(req, res, businessId, session, oauthOptions);
+  }
+  const oauthRevokeMatch = OAUTH_REVOKE_PATH.exec(pathname);
+  if (method === 'POST' && oauthRevokeMatch) {
+    const system = oauthRevokeMatch[1];
+    if (system !== undefined) {
+      return handleOAuthRevoke(req, res, businessId, session, decodeURIComponent(system), oauthOptions);
+    }
+  }
 
   if (method === 'GET' && pathname === '/erase') return handleEraseGet(req, res, businessId, session, documentRoot);
   if (method === 'POST' && pathname === '/erase/preview') return handleErasePreview(req, res, businessId, session, documentRoot);
@@ -1982,8 +2039,15 @@ export function createServer(options: DashboardOptions = {}): Server {
   const host = options.host ?? '127.0.0.1';
   assertBindableHost(host, options.allowNonLoopbackBind ?? false);
 
+  const oauthOptions: OAuthRouteOptions = {
+    credentialKeyPath: options.credentialKeyPath ?? process.env['CREDENTIAL_KEY_PATH'],
+    dashboardBaseUrl:
+      options.dashboardBaseUrl ?? process.env['DASHBOARD_BASE_URL'] ?? DEFAULT_DASHBOARD_BASE_URL,
+    ...(options.oauthFetch !== undefined ? { fetchImpl: options.oauthFetch } : {}),
+  };
+
   const server = createHttpServer((req, res) => {
-    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot).catch((err: unknown) => {
+    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {
         sendHtml(res, 500, renderServerError());

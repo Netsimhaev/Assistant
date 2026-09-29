@@ -44,6 +44,7 @@ export async function resetDatabase(): Promise<void> {
       memories,
       kept_items,
       oauth_grants,
+      oauth_states,
       credentials,
       credential_key_state,
       proposals,
