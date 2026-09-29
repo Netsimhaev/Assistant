@@ -32,14 +32,19 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { appendAudit } from '../audit/log.js';
+import { loadActiveCharter } from '../charter/store.js';
 import { withTransaction } from '../db/pool.js';
 import { canonicalHash } from '../util/canonical.js';
 import { storedCredentials } from '../governance/credential-store.js';
 import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
 import { readGrantBySystem, revokeGrant, writeGrant } from '../governance/oauth-grants.js';
 import { consumeState, createState } from '../governance/oauth-state.js';
-import { GOOGLE_CLIENT_ID_REF } from '../orchestrator/adapters/google-token-http.js';
+import {
+  GOOGLE_CLIENT_ID_REF,
+  GOOGLE_CLIENT_SECRET_REF,
+} from '../orchestrator/adapters/google-token-http.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
+import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import { verifyCsrfToken } from './csrf.js';
 import { escapeHtml } from './views.js';
 import {
@@ -110,9 +115,75 @@ export function redirectUriFor(dashboardBaseUrl: string): string {
   return `${dashboardBaseUrl.replace(/\/+$/, '')}/oauth/callback`;
 }
 
-/** A `credential_ref` this ceremony can name deterministically from a system, and that satisfies `CREDENTIAL_REF_PATTERN`. `office-calendar` -> `OFFICE_CALENDAR`, matching the fixture `oauth-grants.test.ts` already uses. */
+/**
+ * Thrown when a `system` name cannot be turned into a `credential_ref`
+ * injectively — see `assertValidOAuthSystemName`'s own docblock.
+ */
+export class UnmappableOAuthSystemNameError extends Error {}
+
+/**
+ * Legal shape for a `system` name this ceremony can turn into a
+ * `credential_ref` reversibly: lowercase letters, digits and hyphens only,
+ * starting with a letter — `office-mail`, `office-calendar`,
+ * `supplier-a-api`, every real example in this codebase.
+ *
+ * **Narrower than what the charter schema allows for `system`, on
+ * purpose.** `CharterConnection.system` is `z.string().min(1)` — any
+ * non-empty string — because the charter's own concerns (does the system
+ * exist, on which channel, serving which tools) never needed a stricter
+ * shape. This ceremony does, because `-` is the ONLY character the mapping
+ * below may fold into `_`: allowing `.`  or an existing `_` in the input
+ * would let two DIFFERENT legal system names produce the SAME ref (final fix
+ * wave, item 1c — see `credentialRefForSystem`'s own docblock for the
+ * concrete collision this closes).
+ */
+const OAUTH_SYSTEM_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
+
+function assertValidOAuthSystemName(system: string): void {
+  if (!OAUTH_SYSTEM_NAME_PATTERN.test(system)) {
+    throw new UnmappableOAuthSystemNameError(
+      `שם המערכת "${system}" אינו ניתן למיפוי חד-חד-ערכי להפניית credential — ` +
+        'מותרות רק אותיות לועזיות קטנות, ספרות ומקף (-), החל באות',
+    );
+  }
+}
+
+/**
+ * A `credential_ref` this ceremony can name deterministically AND
+ * INJECTIVELY from a system name, and that satisfies `CREDENTIAL_REF_PATTERN`.
+ * `office-calendar` -> `OAUTH_OFFICE_CALENDAR`.
+ *
+ * **Namespaced under `OAUTH_`, not bare (final fix wave, item 1c).** The
+ * bare mapping this function used to compute
+ * (`system.toUpperCase().replace(/[^A-Z0-9_]/g, '_')`) produced `OFFICE_MAIL`
+ * for `office-mail` — BYTE-IDENTICAL to the static SMTP secret ref the
+ * runbook provisions under that exact name (`OFFICE_MAIL`,
+ * `scripts/seed-charter.ts`). `upsertBinding` is a whole-row replace, so
+ * completing this ceremony against `office-mail` rewrote `credentialRef` to
+ * a value the static secret already owned, and every later `mail.send`
+ * resolved a ref that existed as BOTH a grant and a static secret —
+ * `AmbiguousCredentialRefError`, non-retryably, forever (see
+ * `oauth-eligibility.ts`'s module docblock for the full chain). Item 1a's
+ * gate stops `office-mail` specifically from reaching this function at all;
+ * the `OAUTH_` prefix is what makes the collision structurally impossible
+ * for every system name, including ones no gate was ever written to name.
+ *
+ * **Injective, not merely deterministic.** The bare mapping also collapsed
+ * `office-calendar`, `office.calendar` and `office_calendar` onto the
+ * identical ref — `-`, `.` and an already-present `_` all folded to `_`
+ * alike — so two charter connections with genuinely distinct names could
+ * silently share one `credential_ref`, colliding on migration 035's partial
+ * unique index (one ref per business, across `credentials` and
+ * `oauth_grants` together) and surfacing as a raw 500 AFTER this ceremony's
+ * single-use `state` was already consumed. `assertValidOAuthSystemName`
+ * restricts the INPUT alphabet to the one character (`-`) this function
+ * folds, so two different legal inputs can never fold to the same output; a
+ * system name outside that alphabet is refused, with a readable reason,
+ * rather than silently mapped into a collision.
+ */
 function credentialRefForSystem(system: string): string {
-  return system.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  assertValidOAuthSystemName(system);
+  return `OAUTH_${system.toUpperCase().replace(/-/g, '_')}`;
 }
 
 /**
@@ -186,6 +257,23 @@ function redirect(res: ServerResponse, location: string): void {
  * unconsumed `state` row that expires on its own -- the callback still
  * requires the SAME browser session to complete Google's own consent screen
  * before anything is written.
+ *
+ * **Gates which `system` it will even start on (final fix wave, item 1a) --
+ * two independent, readable refusals, never a 500.** Before this fix nothing
+ * here validated `system` at all: it walked the owner to Google's consent
+ * screen for ANY path segment, including `office-mail`, which the seeded
+ * charter declares for `mail.send` only. Completing that ceremony poisoned
+ * the mail path permanently -- see `oauth-eligibility.ts`'s module docblock
+ * for the full chain this closes.
+ *   1. The system name's own SHAPE must be one `credentialRefForSystem` can
+ *      map injectively (`assertValidOAuthSystemName`) -- checked first,
+ *      before any database read, because it needs none.
+ *   2. The active charter must declare a connection for `system` that this
+ *      ceremony (and the Google Calendar adapter it authorises) can actually
+ *      serve -- `connectionAcceptsOAuthCeremony`, the SAME predicate
+ *      `buildRuntime` already applies when deciding whether to register that
+ *      adapter. An unreadable charter is treated exactly like no matching
+ *      connection: refuse, rather than guess.
  */
 export async function handleOAuthStart(
   res: ServerResponse,
@@ -194,6 +282,43 @@ export async function handleOAuthStart(
   system: string,
   options: OAuthRouteOptions,
 ): Promise<void> {
+  try {
+    assertValidOAuthSystemName(system);
+  } catch (error) {
+    return sendHtml(
+      res,
+      400,
+      page(
+        'שם מערכת לא תקין',
+        errorBlock(error instanceof Error ? error.message : String(error)),
+      ),
+    );
+  }
+
+  let active: Awaited<ReturnType<typeof loadActiveCharter>>;
+  try {
+    active = await loadActiveCharter(businessId);
+  } catch {
+    // An unreadable charter is refused exactly like no matching connection
+    // below -- this ceremony is not the place to diagnose WHY the charter
+    // cannot be read; `/connections` already says so on its own screen.
+    active = null;
+  }
+  const connection = active?.charter.connections.find((c) => c.system === system);
+  if (!connectionAcceptsOAuthCeremony(connection)) {
+    return sendHtml(
+      res,
+      400,
+      page(
+        'מערכת לא נתמכת',
+        errorBlock(
+          `המערכת "${system}" אינה מוגדרת בתקנון החתום כחיבור שתהליך ההרשאה הזה יכול לשרת — ` +
+            'נדרש חיבור בערוץ API שמשרת קריאת יומן. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
+        ),
+      ),
+    );
+  }
+
   let key: Buffer;
   try {
     key = await loadKeyForRequest(options.credentialKeyPath);
@@ -208,15 +333,26 @@ export async function handleOAuthStart(
     );
   }
 
-  const clientId = await storedCredentials(key).resolve(GOOGLE_CLIENT_ID_REF, businessId);
-  if (clientId === null) {
+  // Both refs, not only the client id (final fix wave, item 9). An install
+  // holding one but not the other used to sail through this check, walk the
+  // owner all the way to Google's consent screen, and only fail at the
+  // exchange in `handleOAuthCallback` -- AFTER the state was burned, so the
+  // owner has to start the whole ceremony over having learned nothing they
+  // could not have been told up front.
+  const credentials = storedCredentials(key);
+  const [clientId, clientSecret] = await Promise.all([
+    credentials.resolve(GOOGLE_CLIENT_ID_REF, businessId),
+    credentials.resolve(GOOGLE_CLIENT_SECRET_REF, businessId),
+  ]);
+  if (clientId === null || clientSecret === null) {
     return sendHtml(
       res,
       500,
       page(
         'תצורה חסרה',
         errorBlock(
-          `תצורת ה-OAuth של Google חסרה — יש להקציב ${GOOGLE_CLIENT_ID_REF} במאגר הסודות לפני שאפשר להתחיל.`,
+          `תצורת ה-OAuth של Google חסרה — יש להקציב ${GOOGLE_CLIENT_ID_REF} ו-${GOOGLE_CLIENT_SECRET_REF} ` +
+            'במאגר הסודות לפני שאפשר להתחיל.',
         ),
       ),
     );

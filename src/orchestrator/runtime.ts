@@ -7,7 +7,7 @@ import type { ApprovalNotifier } from '../governance/notify.js';
 import { createSmtpTransport } from '../mail/transport.js';
 import type { SmtpConfig } from '../mail/transport.js';
 import { browserAdapter } from './adapters/browser.js';
-import { createGoogleCalendarAdapter, GOOGLE_CALENDAR_SERVED_TOOLS } from './adapters/google-calendar.js';
+import { createGoogleCalendarAdapter } from './adapters/google-calendar.js';
 import type { CalendarHttp } from './adapters/google-calendar.js';
 import { googleTokenHttp } from './adapters/google-token-http.js';
 import { createMailAdapter } from './adapters/mail.js';
@@ -15,6 +15,7 @@ import { AdapterRegistry } from './adapters/registry.js';
 import { loadBindings } from './bindings.js';
 import { CREDENTIAL_REF_PATTERN } from './credentials.js';
 import type { CredentialSource } from './credentials.js';
+import { connectionAcceptsOAuthCeremony } from './oauth-eligibility.js';
 import { oauthCredentials } from './oauth-token.js';
 import type { TokenHttp } from './oauth-token.js';
 
@@ -297,6 +298,10 @@ export async function buildRuntime(
   // binding's `provider` and the charter's `serves` is the column's own
   // division of labour, not a redundant belt-and-braces check.
   //
+  // The `serves` check closes THAT case, but not the general one -- see the
+  // `systemAdapters.some(...)` check inside the loop below for the charter
+  // shape it still misses and how that is closed.
+  //
   // Registered even with no grant stored, and even when the binding's own
   // `status` is not `live` — that status is what `resolveChannel` later
   // reports as `unavailable`, at plan-execution time; it is not a reason for
@@ -323,8 +328,35 @@ export async function buildRuntime(
   for (const binding of bindings) {
     if (binding.provider !== GOOGLE_PROVIDER) continue;
     const connection = connectionBySystem.get(binding.system);
-    if (connection === undefined || connection.channel !== 'api') continue;
-    if (!GOOGLE_CALENDAR_SERVED_TOOLS.some((tool) => connection.serves.includes(tool))) continue;
+    // `connectionAcceptsOAuthCeremony` (`oauth-eligibility.ts`) is this same
+    // channel-and-serves check, extracted (final fix wave, item 1) so the
+    // OAuth ceremony (`oauth-routes.ts`'s `handleOAuthStart`) and the
+    // connections screen (`views.ts`) answer this exact question with the
+    // same function, not a second copy that can drift.
+    if (!connectionAcceptsOAuthCeremony(connection)) continue;
+    // The `serves` check above closes the SEEDED case (a charter that
+    // declares `office-mail` for `mail.send` only, so it never reaches
+    // here at all) but not the general one (fix-round 2, finding I3): a
+    // signed charter is free to declare ONE system that serves BOTH
+    // `mail.send` and `calendar.read` -- the natural single-connection
+    // modelling of Google Workspace -- with `MAIL_SYSTEM` pointing at it
+    // and `provider: 'google'` on its binding. The mail adapter above is
+    // already registered under that system name by the time this loop
+    // runs, so pushing a second adapter under the identical name would
+    // still hit `AdapterRegistry`'s constructor throwing on the
+    // duplicate -- the exact "a row a dashboard writes must never be able
+    // to stop the process from booting" failure the `serves` check was
+    // ruled on to prevent, just reached through a charter shape the
+    // seeded case does not cover. Skip and warn instead of registering,
+    // the same shape every other assembly failure in this function takes.
+    if (systemAdapters.some((a) => a.system === binding.system)) {
+      warnings.push(
+        `no calendar adapter for "${binding.system}": an adapter is already ` +
+          `registered under this system name (most likely the mail adapter) ` +
+          `— one system cannot serve both mail and calendar today`,
+      );
+      continue;
+    }
     systemAdapters.push(
       createGoogleCalendarAdapter({
         system: binding.system,

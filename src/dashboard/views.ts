@@ -24,6 +24,7 @@ import type { MemoryRecord } from '../memory/store.js';
 import { AutonomyMode } from '../governance/autonomy-mode.js';
 import type { AutonomousAction } from './autonomous-actions.js';
 import { CONNECTION_GROUP_ORDER, GROUP_LABELS, groupForServes } from './connection-groups.js';
+import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { formatMinor } from '../util/money.js';
@@ -601,22 +602,46 @@ function connectionRowHtml(row: ConnectionRow, csrf: string): string {
   const lastRefreshed =
     grant === null || grant.lastRefreshedAt === null ? '—' : esc(grant.lastRefreshedAt);
   const statusLabel = esc(CONNECTION_STATUS_LABEL[status]);
+  // `binding.status` never actually becomes `'error'` in production —
+  // `recordBindingOutcome` guarantees it never moves `status` at all (its own
+  // docblock, `binding-health.test.ts`), and the OAuth consent callback
+  // always writes `status: 'live'`. Gating the error message on
+  // `status === 'error'` therefore meant `lastError` was written on every
+  // failed adapter call and rendered never (final fix wave, item 4). Shown
+  // whenever it is non-null, regardless of `status`.
   const operational =
     binding === null
       ? '<span class="muted">אין מידע תפעולי</span>'
-      : binding.status === 'error' && binding.lastError !== null
+      : binding.lastError !== null
         ? `${esc(BINDING_STATUS_LABEL[binding.status])} — ${escLabel(binding.lastError)}`
         : esc(BINDING_STATUS_LABEL[binding.status]);
+  // `lastOkAt` had zero readers anywhere before this (final fix wave, item
+  // 4) — the "רוענן לאחרונה" column above shows the GRANT's own
+  // `lastRefreshedAt`, a different field entirely (when the OAuth token was
+  // last refreshed, not when the connection last actually worked).
+  const lastOk = binding === null || binding.lastOkAt === null ? '—' : esc(binding.lastOkAt);
   const revokePath = `/oauth/${esc(connection.system)}/revoke`;
   const startPath = `/oauth/${esc(connection.system)}/start`;
 
+  // Derived from the SAME predicate `handleOAuthStart` gates on and
+  // `buildRuntime` uses to decide whether an adapter will ever run for this
+  // system (`connectionAcceptsOAuthCeremony`, `oauth-eligibility.ts`) — final
+  // fix wave, item 1b. Before this, the link was shown for EVERY
+  // unauthorised connection, `office-mail` included: a link the server
+  // refuses is a worse experience than no link, and two independent checks
+  // of the same rule (one here, one in the route) is exactly how they
+  // diverge. Revoking is not gated the same way: a grant that already
+  // exists must always be revocable, even if the charter later stopped
+  // declaring the connection as calendar-eligible.
   const action =
     status === 'authorised' || status === 'needs_reauth'
       ? `<form method="post" action="${revokePath}">
            <input type="hidden" name="csrf" value="${esc(csrf)}">
            <button type="submit">ביטול החיבור</button>
          </form>`
-      : `<a href="${startPath}">לחיבור</a>`;
+      : connectionAcceptsOAuthCeremony(connection)
+        ? `<a href="${startPath}">לחיבור</a>`
+        : '<span class="muted">לא ניתן לחבר אוטומטית דרך המסך הזה</span>';
 
   return `<tr>
     <td>${label} <span class="muted">(${esc(connection.system)})</span></td>
@@ -624,6 +649,7 @@ function connectionRowHtml(row: ConnectionRow, csrf: string): string {
     <td>${account}</td>
     <td>${scopes}</td>
     <td>${lastRefreshed}</td>
+    <td>${lastOk}</td>
     <td>${operational}</td>
     <td>${action}</td>
   </tr>`;
@@ -655,13 +681,23 @@ function connectionRowHtml(row: ConnectionRow, csrf: string): string {
  * `listGrants` takes no decryption key — so there is nothing here for a
  * template literal to leak even by mistake.
  *
- * **The restart notice is not optional.** `buildRuntime`'s own docblock and
+ * **The restart notice is not optional, and it is one-directional — say so
+ * (final fix wave, item 5).** `buildRuntime`'s own docblock and
  * `docs/live-thread-runbook.md` both say the same thing: the scheduler reads
- * `connection_bindings` once, at process startup, and a change made here —
- * including a freshly authorised grant this same screen just wrote — has no
- * effect until that process restarts. An owner who authorises a connection
- * and then wonders why nothing happened has no way to discover that fact by
- * reading code; it must be on the page.
+ * `connection_bindings` once, at process startup, and AUTHORISING a
+ * connection here — including a freshly authorised grant this same screen
+ * just wrote — has no effect until that process restarts, because the
+ * adapter registry itself is only built once. An owner who authorises a
+ * connection and then wonders why nothing happened has no way to discover
+ * that fact by reading code; it must be on the page. REVOKING is the
+ * opposite, and the page must not say the same thing about both:
+ * `revoked_at` is checked on every resolve (`oauth-token.ts`'s own docblock,
+ * point 2) precisely so a revocation beats an approval the owner gave a
+ * moment earlier — the very next call fails, restart or not, exactly as
+ * `docs/live-thread-runbook.md` §10.3 already tells the operator. Telling an
+ * owner cutting off access in an emergency that it "takes effect after a
+ * restart" is not a rounding error; it is the one place on this page an
+ * owner reads under pressure, and it used to say the false half.
  */
 export function renderConnections(options: {
   charterStatus: CharterReadStatus;
@@ -689,7 +725,7 @@ export function renderConnections(options: {
     return `<section>
       <h2>${esc(GROUP_LABELS[group])}</h2>
       <table>
-        <tr><th>מערכת</th><th>סטטוס</th><th>חשבון</th><th>היקפים שנענו</th><th>רוענן לאחרונה</th><th>מצב תפעולי</th><th></th></tr>
+        <tr><th>מערכת</th><th>סטטוס</th><th>חשבון</th><th>היקפים שנענו</th><th>רוענן לאחרונה</th><th>קריאה מוצלחת אחרונה</th><th>מצב תפעולי</th><th></th></tr>
         ${tableRows}
       </table>
     </section>`;
@@ -703,8 +739,10 @@ export function renderConnections(options: {
 </header>
 <p><a href="/">&rarr; חזרה לרשימה</a></p>
 <p class="muted">
-  תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו.
-  חיבור שאושר או בוטל כאן ייכנס לתוקף רק אחרי שהתהליך יופעל מחדש.
+  תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו —
+  ולכן חיבור חדש שאושר כאן ייכנס לתוקף רק אחרי שהתהליך יופעל מחדש.
+  ביטול חיבור הוא ההפך: כל קריאה בודקת אותו מחדש, ולכן ביטול נכנס לתוקף באותו רגע —
+  הקריאה הבאה, גם אם ה-scheduler רץ כבר, כבר נכשלת.
 </p>
 ${notice}
 ${sections === '' && notice === '' ? '<p>התקנון הפעיל אינו מצהיר על אף חיבור.</p>' : sections}`,

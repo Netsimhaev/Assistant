@@ -439,6 +439,62 @@ describe('buildRuntime', () => {
   });
 
   /**
+   * Final fix wave, item 6 (fix-round 2, finding I3) — the general case the
+   * test above does not cover. There, `office-mail`'s charter connection
+   * declares only `mail.send`, so the calendar loop's own `serves` check
+   * already skips it before registration is ever attempted; the collision
+   * guard added for I1 is never exercised. Here ONE charter connection
+   * declares BOTH `mail.send` and `calendar.read` — the natural single-
+   * connection modelling of Google Workspace the ruling names — so the
+   * `serves` check is satisfied and the loop would try to register a second
+   * adapter under a system name the mail adapter already claimed, which is
+   * exactly what makes `AdapterRegistry`'s constructor throw. `buildRuntime`
+   * must still not throw: a row a dashboard writes (`provider: 'google'` on
+   * an existing binding) must never be able to stop the process from
+   * booting, for any charter shape.
+   */
+  it('does not collide with the mail adapter when one charter connection serves both mail and calendar', async () => {
+    await installCharter(
+      buildCharter({
+        connections: [
+          {
+            system: 'office-mail',
+            label: 'תיבת המשרד',
+            channel: 'api',
+            serves: ['mail.send', 'calendar.read'],
+            target: null,
+            subprocessor: null,
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    await upsertBinding(
+      {
+        system: 'office-mail',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OFFICE_MAIL',
+        provider: 'google',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { by: 'test' },
+    );
+
+    // Must not throw.
+    const runtime = await buildRuntime(FULL);
+    // The mail adapter still serves `mail.send` under `office-mail` —
+    // nothing about the skipped calendar registration touched it.
+    expect(runtime.registry.resolve('office-mail', 'api', 'mail.send')).not.toBeNull();
+    // No SECOND adapter was registered under the same name, so the tool the
+    // charter also declares for it resolves to nothing rather than to
+    // whichever adapter happened to register first.
+    expect(runtime.registry.resolve('office-mail', 'api', 'calendar.read')).toBeNull();
+    expect(runtime.warnings.join(' ')).toMatch(/no calendar adapter for "office-mail"/);
+  });
+
+  /**
    * Spec §3.4/§9.5 — a POSITIVE control that the source production assembles
    * is the encrypted store and not the tests' `envCredentials`.
    *

@@ -14,7 +14,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { queryAudit } from '../audit/log.js';
 import { installCharter } from '../charter/store.js';
 import type { CharterConnection } from '../domain/connection.js';
-import { putSecret } from '../governance/credential-store.js';
+import { putSecret, removeSecret } from '../governance/credential-store.js';
 import { KEY_BYTES, writeKeyState } from '../governance/master-key.js';
 import {
   markNeedsReauth,
@@ -27,7 +27,7 @@ import {
   GOOGLE_CLIENT_ID_REF,
   GOOGLE_CLIENT_SECRET_REF,
 } from '../orchestrator/adapters/google-token-http.js';
-import { loadBindings } from '../orchestrator/bindings.js';
+import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
 import { closePool, getPool } from '../db/pool.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
@@ -40,6 +40,34 @@ const USERNAME = 'owner';
 const PASSWORD = 'correct horse battery staple';
 const SYSTEM = 'office-calendar';
 const DASHBOARD_BASE_URL = 'http://127.0.0.1:4173';
+
+/**
+ * The charter connection that makes `SYSTEM` eligible for the ceremony at
+ * all (final fix wave, item 1a): `channel: 'api'` and `serves: ['calendar.
+ * read']`, the exact shape `connectionAcceptsOAuthCeremony` requires.
+ * Installed by a `beforeEach` in every describe block below that drives
+ * `/start`, `/callback` or `/revoke` for `SYSTEM` — before item 1, none of
+ * them needed a charter at all, because `handleOAuthStart` validated
+ * nothing about `system`.
+ */
+const CALENDAR_CONNECTION: CharterConnection = {
+  system: SYSTEM,
+  label: 'יומן המשרד',
+  channel: 'api',
+  serves: ['calendar.read'],
+  target: null,
+  subprocessor: null,
+};
+
+/** A connection the ceremony must now refuse (final fix wave, item 1a): it serves `mail.send`, not a Google-calendar tool. */
+const MAIL_ONLY_CONNECTION: CharterConnection = {
+  system: 'office-mail',
+  label: 'תיבת המשרד',
+  channel: 'api',
+  serves: ['mail.send'],
+  target: null,
+  subprocessor: null,
+};
 
 let server: Server | null = null;
 let keyDir: string;
@@ -162,6 +190,10 @@ async function beginConsent(baseUrl: string, cookie: string, system = SYSTEM): P
 }
 
 describe('GET /oauth/:system/start', () => {
+  beforeEach(async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+  });
+
   it('redirects to Google carrying a fresh state and PKCE challenge, and requires a session', async () => {
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
@@ -181,9 +213,159 @@ describe('GET /oauth/:system/start', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
   });
+
+  /**
+   * Final fix wave, item 9. Before this fix, `handleOAuthStart` resolved only
+   * `GOOGLE_CLIENT_ID_REF` and walked straight to Google's consent screen
+   * once it found a value — an install holding the id but not the secret
+   * sailed through this check, and only failed at the token exchange in
+   * `handleOAuthCallback`, AFTER `state` was already consumed and burned. The
+   * owner would have to start the whole ceremony over having learned nothing
+   * they could not have been told up front. Both refs must be checked before
+   * any redirect happens.
+   */
+  it('refuses to start when the client secret is not provisioned, even though the client id is', async () => {
+    await removeSecret(GOOGLE_CLIENT_SECRET_REF, BUSINESS);
+    const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
+    const cookie = await loginWithPassword(baseUrl);
+
+    const res = await fetch(`${baseUrl}/oauth/${SYSTEM}/start`, { headers: { cookie }, redirect: 'manual' });
+    expect(res.status).toBe(500);
+    const body = await res.text();
+    expect(body).toContain(GOOGLE_CLIENT_SECRET_REF);
+    // No state row was written for a ceremony that never actually started —
+    // nothing here for a later request to "resume" into a half-configured
+    // exchange.
+    const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
+    expect(rows[0]?.['n']).toBe('0');
+  });
+
+  it('refuses to start when the client id is not provisioned, even though the secret is', async () => {
+    await removeSecret(GOOGLE_CLIENT_ID_REF, BUSINESS);
+    const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
+    const cookie = await loginWithPassword(baseUrl);
+
+    const res = await fetch(`${baseUrl}/oauth/${SYSTEM}/start`, { headers: { cookie }, redirect: 'manual' });
+    expect(res.status).toBe(500);
+    const body = await res.text();
+    expect(body).toContain(GOOGLE_CLIENT_ID_REF);
+  });
+
+  /**
+   * Final fix wave, item 1 (CRITICAL) — the trace: `renderConnections`
+   * computed the row action from `status` alone, so `office-mail` (declared
+   * by the seeded charter, never touched by any grant) got the same "לחיבור"
+   * link as `office-calendar`; `handleOAuthStart` validated nothing about
+   * `system` and walked the owner to Google for ANY path segment; the
+   * callback then wrote `provider: 'google'` and a credential ref onto the
+   * `office-mail` BINDING (`upsertBinding` is a whole-row replace) that
+   * collided byte-for-byte with the static SMTP secret ref — poisoning
+   * `mail.send` with `AmbiguousCredentialRefError`, permanently, since
+   * revoking the grant does not restore the static secret. This test proves
+   * the (a) half of the four-part fix: the ceremony itself refuses.
+   */
+  it('refuses to start the ceremony on a connection that does not serve a calendar tool (item 1a) — no state, no grant, no binding write', async () => {
+    await installCharter(
+      buildCharter({
+        version: '2026-08-15.2-item1a',
+        connections: [CALENDAR_CONNECTION, MAIL_ONLY_CONNECTION],
+      }),
+      { businessId: BUSINESS },
+    );
+    const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
+    const cookie = await loginWithPassword(baseUrl);
+
+    const res = await fetch(`${baseUrl}/oauth/office-mail/start`, {
+      headers: { cookie },
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(400);
+    const body = await res.text();
+    expect(body).toContain('office-mail');
+
+    // Nothing happened at all: no state row minted, no grant, no binding
+    // write — a refused ceremony must leave exactly the state it found.
+    const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
+    expect(rows[0]?.['n']).toBe('0');
+    expect(await readGrantBySystem('office-mail', BUSINESS, key)).toBeNull();
+    const bindings = await loadBindings({ businessId: BUSINESS });
+    expect(bindings.find((b) => b.system === 'office-mail')).toBeUndefined();
+  });
+
+  /**
+   * The eligible system (`office-calendar`) must still work under the exact
+   * same charter that just refused the mail one — otherwise the gate could
+   * be "fixed" by refusing everything.
+   */
+  it('still starts the ceremony on a connection that does serve a calendar tool, under the same charter that refuses mail', async () => {
+    await installCharter(
+      buildCharter({
+        version: '2026-08-15.2-item1a-positive',
+        connections: [CALENDAR_CONNECTION, MAIL_ONLY_CONNECTION],
+      }),
+      { businessId: BUSINESS },
+    );
+    const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
+    const cookie = await loginWithPassword(baseUrl);
+
+    const res = await fetch(`${baseUrl}/oauth/${SYSTEM}/start`, {
+      headers: { cookie },
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(new URL(res.headers.get('location') ?? '').hostname).toBe('accounts.google.com');
+  });
+
+  /**
+   * Final fix wave, item 1c — the derived ref must be INJECTIVE, not merely
+   * deterministic. A system name outside the shape `credentialRefForSystem`
+   * can fold reversibly (lowercase letters, digits, hyphen) is refused here,
+   * before any state row is minted — not silently mapped into a ref that
+   * could collide with another system's.
+   */
+  it('refuses a system name that cannot be mapped to a credential ref injectively', async () => {
+    // `CALENDAR_CONNECTION` is deliberately NOT also declared here: the
+    // charter schema itself refuses two connections both serving
+    // `calendar.read` for the same (catch-all) target, so this connection
+    // alone both satisfies eligibility (channel `api`, serves
+    // `calendar.read`) and isolates the SHAPE refusal this test is about.
+    await installCharter(
+      buildCharter({
+        version: '2026-08-15.2-item1c',
+        connections: [
+          {
+            system: 'office.calendar',
+            label: 'יומן עם נקודה בשם',
+            channel: 'api',
+            serves: ['calendar.read'],
+            target: null,
+            subprocessor: null,
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
+    const cookie = await loginWithPassword(baseUrl);
+
+    const res = await fetch(`${baseUrl}/oauth/office.calendar/start`, {
+      headers: { cookie },
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(400);
+    const body = await res.text();
+    expect(body).toContain('office.calendar');
+
+    const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
+    expect(rows[0]?.['n']).toBe('0');
+  });
 });
 
 describe('GET /oauth/callback', () => {
+  beforeEach(async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+  });
+
   it('writes a grant and the binding provider on a correct state, and shows the restart note', async () => {
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
@@ -213,7 +395,10 @@ describe('GET /oauth/callback', () => {
     const binding = bindings.find((b) => b.system === SYSTEM);
     expect(binding?.provider).toBe('google');
     expect(binding?.status).toBe('live');
-    expect(binding?.credentialRef).toBe('OFFICE_CALENDAR');
+    // `OAUTH_OFFICE_CALENDAR`, not the bare `OFFICE_CALENDAR` this used to be
+    // (final fix wave, item 1c) — namespaced so it can never collide with an
+    // operator-provisioned secret ref of the same shape.
+    expect(binding?.credentialRef).toBe('OAUTH_OFFICE_CALENDAR');
 
     const audit = await queryAudit({ businessId: BUSINESS, kind: 'credential_change' });
     expect(audit.some((row) => row.reason.includes(SYSTEM))).toBe(true);
@@ -388,6 +573,10 @@ describe('GET /oauth/callback', () => {
 });
 
 describe('POST /oauth/:system/revoke', () => {
+  beforeEach(async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+  });
+
   async function grantedSystem(baseUrl: string, cookie: string): Promise<void> {
     const state = await beginConsent(baseUrl, cookie);
     const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=auth-code-value`, {
@@ -536,14 +725,10 @@ describe('POST /oauth/:system/revoke', () => {
 });
 
 describe('GET /connections', () => {
-  const CALENDAR_CONNECTION: CharterConnection = {
-    system: SYSTEM,
-    label: 'יומן המשרד',
-    channel: 'api',
-    serves: ['calendar.read'],
-    target: null,
-    subprocessor: null,
-  };
+  // `CALENDAR_CONNECTION` is the file-level constant declared near `SYSTEM`
+  // above — reused here rather than redeclared, so this screen's tests and
+  // the ceremony's own tests can never drift into asserting against two
+  // different connection shapes for the same system.
 
   /**
    * A real, known, owned tool (`data.export` — `capabilities.ts` gives it an
@@ -592,6 +777,32 @@ describe('GET /connections', () => {
     // "אחר" — never silently dropped from the page.
     expect(body).toContain('אחר');
     expect(body).toContain('מערכת מסתורית');
+  });
+
+  /**
+   * Final fix wave, item 1b. Before this fix the link was computed from
+   * `status` alone, so `office-mail` — declared, never authorised — got the
+   * identical "לחיבור" link `office-calendar` did, even though the server
+   * would have refused the ceremony for it (item 1a). A link the server
+   * refuses is a worse experience than no link.
+   */
+  it('hides the connect link for a connection that does not serve a calendar tool, while showing it for one that does', async () => {
+    await installCharter(
+      buildCharter({ connections: [CALENDAR_CONNECTION, MAIL_ONLY_CONNECTION] }),
+      { businessId: BUSINESS },
+    );
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl);
+    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+
+    // Positive half: both rows genuinely rendered, under their own labels.
+    expect(body).toContain('חיבור יומן');
+    expect(body).toContain('תיבת המשרד');
+
+    expect(body).toContain(`/oauth/${SYSTEM}/start`);
+    expect(body).not.toContain('/oauth/office-mail/start');
   });
 
   it("shows an authorised connection's account and granted scopes, offers a revoke control, and never renders the refresh token itself", async () => {
@@ -682,6 +893,73 @@ describe('GET /connections', () => {
     // word for word on the load-bearing fact: a freshly authorised
     // connection has no effect until the scheduler process restarts.
     expect(body).toContain('פעם אחת בלבד, בעת ההפעלה');
+  });
+
+  /**
+   * Final fix wave, item 5. Before this fix the page said a SINGLE sentence
+   * covering both authorising and revoking a connection: both "take effect
+   * only after the process restarts". That is true for authorising (the
+   * adapter registry is built once) and FALSE for revoking — `revoked_at` is
+   * checked on every resolve precisely so a revocation beats an approval the
+   * owner gave a moment earlier, and the runbook (§10.3) already tells the
+   * operator the very next call fails. This is the one place an owner reads
+   * under pressure — cutting off access in an emergency — so the page must
+   * say both halves, not the false one.
+   */
+  it('says authorising needs a restart AND that revoking takes effect immediately, not one sentence covering both', async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl);
+    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    const body = await res.text();
+    // The authorising half — unchanged from the test above, restated here so
+    // this test alone proves BOTH halves without relying on test order.
+    expect(body).toContain('פעם אחת בלבד, בעת ההפעלה');
+    expect(body).toMatch(/אושר.*יופעל מחדש|restart/);
+    // The corrected half: revoking is NOT described the same way.
+    expect(body).toMatch(/ביטול.*(מיד|באותו רגע)|revok.*immediat/);
+  });
+
+  /**
+   * Final fix wave, item 4. `last_ok_at` had zero readers anywhere; `last_error`
+   * had exactly one, gated on `binding.status === 'error'` — a status
+   * `recordBindingOutcome` guarantees it never writes (its own docblock,
+   * `binding-health.test.ts`) and the OAuth consent callback always sets to
+   * `'live'`. So `lastError` was written on every failed adapter call and
+   * rendered never. Both fields must show up on the page now, unconditionally
+   * on `lastError` being non-null.
+   */
+  it('shows a recorded operational error even though the binding status is still "live", and shows the last successful call', async () => {
+    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await upsertBinding(
+      {
+        system: SYSTEM,
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OFFICE_CALENDAR',
+        provider: 'google',
+        lastOkAt: '2026-09-20T08:00:00.000Z',
+        lastError: 'ERROR-SENTINEL — הספק דחה את האסימון (401)',
+      },
+      { businessId: BUSINESS, by: USERNAME },
+    );
+
+    const baseUrl = await startServer();
+    const cookie = await loginWithPassword(baseUrl);
+    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+
+    // Positive half: the binding row that carries these two fields actually
+    // rendered at all, under its real status label.
+    expect(body).toContain('פעיל');
+    // The load-bearing assertion for item 4's `last_error` half: the message
+    // renders even though `status` is `live`, not `error`.
+    expect(body).toContain('ERROR-SENTINEL');
+    // And the `last_ok_at` half: some rendering of the timestamp appears —
+    // asserted as the ISO string `bindings.ts` produces via `esc`, not
+    // reformatted.
+    expect(body).toContain('2026-09-20T08:00:00.000Z');
   });
 
   it('survives a charter it cannot read instead of crashing, and says so', async () => {

@@ -130,7 +130,24 @@ export async function upsertBinding(
         charterVersion: options.charterVersion ?? 'unknown',
         provenance: 'boss',
         inputHash: canonicalHash(parsed),
-        reason: `connection binding for "${parsed.system}" set to status "${parsed.status}" by ${options.by}`,
+        // `status` alone used to be the whole reason (final fix wave, item
+        // 1d) — but this docblock's own promise, two paragraphs up, is that
+        // `endpoint` AND `credentialRef` changing must be "at least as
+        // visible as a kill switch trip", because either one can redirect a
+        // permitted connection to a different host or secret. The OAuth
+        // consent callback (`handleOAuthCallback`) is exactly the write that
+        // exposed this: it changes `credentialRef` and `provider` on an
+        // EXISTING row, and the audit trail said only that `status` became
+        // "live" — silent about the two fields that actually moved trust.
+        // `provider` is named for the identical reason `endpoint` already
+        // is in the docblock above. `endpoint` itself is omitted here
+        // deliberately: it is free-form and can be arbitrarily long, while
+        // `canonicalHash(parsed)` on the same row already covers it for
+        // anyone who needs to prove what changed, not just read a summary.
+        reason:
+          `connection binding for "${parsed.system}" set to status "${parsed.status}" ` +
+          `(credentialRef=${parsed.credentialRef ?? 'null'}, provider=${parsed.provider ?? 'null'}) ` +
+          `by ${options.by}`,
       },
       { businessId, tx },
     );

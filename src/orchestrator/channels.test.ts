@@ -167,6 +167,41 @@ describe('connection bindings', () => {
     expect(entries[0]?.onBehalfOf).toBe(BY);
   });
 
+  /**
+   * Final fix wave, item 1d. Before this fix the reason named only `status`
+   * ("connection binding for ... set to status \"live\" by ..."), even
+   * though `credentialRef` and `provider` are the two fields this same
+   * docblock (`upsertBinding`, above the write) calls out as able to
+   * "redirect a permitted connection to a different host or secret" and
+   * requires visibility "at least as visible as a kill switch trip". The
+   * OAuth consent callback (`handleOAuthCallback`) is exactly the write that
+   * exposed this: it rewrites BOTH fields on an existing `office-mail` row
+   * and the audit trail said only that `status` became "live" — silent
+   * about the two fields that actually moved trust.
+   */
+  it('names both credentialRef and provider in the audit reason, not only status', async () => {
+    await upsertBinding(
+      {
+        system: 'office-mail',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OAUTH_OFFICE_MAIL',
+        provider: 'google',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { businessId: BUSINESS, by: BY },
+    );
+
+    const entries = await queryAudit({ businessId: BUSINESS, kind: 'connection_binding' });
+    expect(entries).toHaveLength(1);
+    // Positive half: `status` is still named (unchanged behaviour) ...
+    expect(entries[0]?.reason).toContain('status "live"');
+    // ... and now so are the two fields that can redirect trust.
+    expect(entries[0]?.reason).toContain('OAUTH_OFFICE_MAIL');
+    expect(entries[0]?.reason).toContain('google');
+  });
+
   it('rejects an empty "by" and writes nothing', async () => {
     await expect(
       upsertBinding(
