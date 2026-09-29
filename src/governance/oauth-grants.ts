@@ -6,8 +6,13 @@
  * business, not per binding. The refresh token is sealed under the same
  * master key as `credentials` (`credential-store.ts`), read through the
  * same `credential_key_state` bookkeeping (`liveKeyId`, exported from that
- * module for exactly this reuse) so a grant and a static secret share one
- * key-rotation story. What keeps a grant row and a secret row from ever
+ * module for exactly this reuse). That buys a shared key-id LABEL today —
+ * not a shared rotation loop. `rotate` (`src/cli/secret-key.ts`) selects and
+ * re-encrypts `credentials` only; `oauth_grants` does not appear in that
+ * file at all. A key rotation as shipped at this commit would leave every
+ * existing grant sealed under a key the installation no longer holds —
+ * permanently unopenable. Wiring `oauth_grants` into `rotate` is Task 2's
+ * job, not this one's. What keeps a grant row and a secret row from ever
  * being opened as each other is the AAD: a secret is sealed under
  * `{ businessId, ref }` where `ref` matches `CREDENTIAL_REF_PATTERN`
  * (`^[A-Z0-9_]+$`); a grant is sealed under `grantAad`, whose `ref` is
@@ -28,8 +33,18 @@ import { verifyKeyState } from './master-key.js';
 import { decryptSecret, encryptSecret } from './secret-cipher.js';
 import type { SecretAad } from './secret-cipher.js';
 
-/** A refusal by this store: a malformed input, or a write before the
- *  installation has a key. Never carries the refresh token's value. */
+/**
+ * A refusal by this store: `recordRefresh` or `markNeedsReauth` matched no
+ * live row — a wrong `system`/`businessId`, or a grant that was revoked.
+ * Thrown rather than returned as a silent no-op, because both callers are
+ * connector housekeeping with no human reading the return value; a `void`
+ * that quietly did nothing would leave, for `markNeedsReauth`, the connector
+ * believing it flagged the grant for re-consent while the owner is never
+ * asked and the connection keeps failing in silence. `readDocument` draws
+ * the same line against `markContentIngested`'s UPDATE, on the same ground:
+ * an unresolved id is not a property of the row, and the caller must learn
+ * that now. Never carries the refresh token's value.
+ */
 export class OAuthGrantError extends Error {}
 
 /**
@@ -141,7 +156,12 @@ export async function writeGrant(
 ): Promise<void> {
   const write = async (db: Queryable): Promise<void> => {
     await acquireAdvisoryLock(db, ROTATION_LOCK_SCOPE);
-    await verifyKeyState(key, { businessId: input.businessId, db });
+    // Install-wide, exactly like `putSecret` — not `{ businessId: input.businessId, db }`.
+    // The key is per-installation (see `liveKeyId`'s own docblock); checking
+    // it against one row while `liveKeyId` reads another is the very
+    // opens-for-nobody hazard both docblocks describe, just with the mismatch
+    // moved one level up.
+    await verifyKeyState(key, { db });
     const keyId = await liveKeyId(db);
     const sealed = encryptSecret(input.refreshToken, key, grantAad(input.businessId, input.system));
 
@@ -270,6 +290,19 @@ export async function listGrants(
  * non-null) — most providers reuse the same refresh token across access-
  * token refreshes, and re-sealing an unchanged value would just spend a
  * nonce for nothing.
+ *
+ * Both branches filter on `revoked_at IS NULL` and throw `OAuthGrantError`
+ * when the `UPDATE` touches no row — a wrong `system`/`businessId`, or a
+ * grant the owner already revoked. Without the filter, a refresh landing
+ * after a revocation would re-seal a live provider token into a row both
+ * read paths already refuse, and keep advancing `refreshCount` on a grant
+ * nothing can ever read again. Without the `rowCount` check, that same
+ * "no such row" would be silently indistinguishable from success.
+ *
+ * Key check is install-wide (`verifyKeyState(key, { db })`, no `businessId`)
+ * — exactly `putSecret`'s call, and for the same reason `writeGrant`'s does:
+ * it must ask the same question `liveKeyId` answers, not a different row of
+ * `credential_key_state`.
  */
 export async function recordRefresh(
   system: string,
@@ -280,25 +313,35 @@ export async function recordRefresh(
 ): Promise<void> {
   const write = async (db: Queryable): Promise<void> => {
     if (rotatedRefreshToken === null) {
-      await db.query(
+      const result = await db.query(
         `UPDATE oauth_grants
             SET last_refreshed_at = now(), refresh_count = refresh_count + 1
-          WHERE business_id = $1 AND system = $2`,
+          WHERE business_id = $1 AND system = $2 AND revoked_at IS NULL`,
         [businessId, system],
       );
+      if ((result.rowCount ?? 0) === 0) {
+        throw new OAuthGrantError(
+          `לא נמצאה הרשאה פעילה למערכת (${system}) — לא ניתן לרשום ריענון`,
+        );
+      }
       return;
     }
     await acquireAdvisoryLock(db, ROTATION_LOCK_SCOPE);
-    await verifyKeyState(key, { businessId, db });
+    await verifyKeyState(key, { db });
     const keyId = await liveKeyId(db);
     const sealed = encryptSecret(rotatedRefreshToken, key, grantAad(businessId, system));
-    await db.query(
+    const result = await db.query(
       `UPDATE oauth_grants
           SET ciphertext = $3, nonce = $4, key_id = $5,
               last_refreshed_at = now(), refresh_count = refresh_count + 1
-        WHERE business_id = $1 AND system = $2`,
+        WHERE business_id = $1 AND system = $2 AND revoked_at IS NULL`,
       [businessId, system, sealed.ciphertext, sealed.nonce, keyId],
     );
+    if ((result.rowCount ?? 0) === 0) {
+      throw new OAuthGrantError(
+        `לא נמצאה הרשאה פעילה למערכת (${system}) — לא ניתן לרשום ריענון`,
+      );
+    }
   };
   if (options.db) {
     await write(options.db);
@@ -339,6 +382,13 @@ export async function revokeGrant(
  * The provider refused the refresh token: the owner must consent again.
  * Distinct from `revokeGrant`, which is the owner's own act — this is set
  * by the connector, not by a person, and does not touch `revoked_at`.
+ *
+ * Filters on `revoked_at IS NULL` and throws `OAuthGrantError` when the
+ * `UPDATE` touches no row. This is the sharpest edge in the file: without
+ * the check, a wrong `system`/`businessId` writes zero rows and returns
+ * exactly like success — the connector believes it flagged the grant for
+ * re-consent, the owner is never asked, and the connection keeps failing in
+ * silence with nothing pointing at why.
  */
 export async function markNeedsReauth(
   system: string,
@@ -346,9 +396,14 @@ export async function markNeedsReauth(
   options: GrantOptions = {},
 ): Promise<void> {
   const db = options.db ?? getPool();
-  await db.query(
+  const result = await db.query(
     `UPDATE oauth_grants SET needs_reauth_at = now()
-       WHERE business_id = $1 AND system = $2`,
+       WHERE business_id = $1 AND system = $2 AND revoked_at IS NULL`,
     [businessId, system],
   );
+  if ((result.rowCount ?? 0) === 0) {
+    throw new OAuthGrantError(
+      `לא נמצאה הרשאה פעילה למערכת (${system}) — לא ניתן לסמן לחידוש הרשאה`,
+    );
+  }
 }

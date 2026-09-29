@@ -4,6 +4,17 @@
 -- can never equal, because `credentials.ref` is constrained to
 -- ^[A-Z0-9_]+$. That is what makes a grant and a secret structurally
 -- unopenable as one another, with no blocklist to maintain.
+--
+-- Erasure decision (spec 2.6), recorded here per the convention migration 026
+-- set: a new content-bearing table is either wired into `erasure-plan.ts` or
+-- excluded WITH A WRITTEN REASON. This one is excluded, deliberately. `account`
+-- is the business's OWN provider login (e.g. which Google account the
+-- business connected), not a counterparty's; `granted_by` is an internal
+-- actor. A grant is a fact about the system's own permissions, not about any
+-- person or business the assistant deals with -- the same category
+-- `autonomy_mode` and `autonomy_events` already sit in, and neither of those
+-- is wired to erasure either. There is nothing here for a "forget me" request
+-- to reach.
 CREATE TABLE oauth_grants (
     business_id       TEXT NOT NULL,
     system            TEXT NOT NULL,
