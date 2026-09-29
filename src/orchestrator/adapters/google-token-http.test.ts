@@ -152,6 +152,38 @@ describe('googleTokenHttp', () => {
     }
   });
 
+  /**
+   * Final fix wave, item 2. Before this fix, 401 fell into the generic
+   * "any other 4xx" branch and came back `'rejected'` — the same kind a
+   * genuine `invalid_grant` gets — which writes an audit row asserting the
+   * provider rejected the *authorisation* and sends the owner through
+   * re-consent. Google answers a wrong `client_secret` with 401
+   * `invalid_client` without ever looking at the refresh token, and
+   * re-consenting resubmits the same broken secret, so that loop can never
+   * fix the actual cause. Both signals are checked — the status code alone
+   * (`401`) and the provider's own error code (`invalid_client`), since a
+   * provider might report either without the other.
+   */
+  it('classifies a 401 (or invalid_client) as misconfigured, not rejected', async () => {
+    for (const [status, body] of [
+      [401, { error: 'invalid_client' }],
+      [401, {}],
+      [400, { error: 'invalid_client' }],
+    ] as const) {
+      const http = googleTokenHttp({
+        credentials: configured(),
+        fetchImpl: async () => jsonResponse(status, body),
+      });
+      const outcome = await http.exchangeRefresh({
+        provider: 'google',
+        refreshToken: 'rt',
+        businessId: BUSINESS,
+        signal: new AbortController().signal,
+      });
+      expect(outcome).toMatchObject({ ok: false, kind: 'misconfigured' });
+    }
+  });
+
   it('treats a network failure as transient', async () => {
     const http = googleTokenHttp({
       credentials: configured(),

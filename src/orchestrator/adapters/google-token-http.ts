@@ -37,7 +37,14 @@
  * The same reasoning applies to a `provider` this implementation was never
  * wired to serve (a routing mistake, not something Google said) — see the
  * `SUPPORTED_PROVIDER` check below, reclassified from `'rejected'` to
- * `'misconfigured'` in the same fix round for the identical reason.
+ * `'misconfigured'` in the same fix round for the identical reason. A 401
+ * `invalid_client` response — a wrong or revoked CLIENT SECRET — is the same
+ * mistake one status code over (final fix wave, item 2): the provider never
+ * looked at the refresh token, it rejected the caller's own app credentials,
+ * and re-consenting cannot fix a broken client secret because re-consent
+ * resubmits the same one. `exchangeRefresh` checks `response.status === 401`
+ * OR `errorCode === 'invalid_client'` before falling into the generic 4xx
+ * branch, since a provider may report either signal without the other.
  *
  * A `CredentialSource.resolve` that THROWS (a database blip resolving the
  * client secret, not an absent one) is a different failure mode again and
@@ -197,6 +204,26 @@ export function googleTokenHttp(options: GoogleTokenHttpOptions): TokenHttp {
           ok: false,
           kind: 'transient',
           message: `כשל זמני מול Google — סטטוס ${response.status}${suffix}`,
+        };
+      }
+
+      // A wrong (or revoked) client secret answers 401 `invalid_client` --
+      // Google never looked at the refresh token at all, it rejected the
+      // caller's own app credentials before getting that far. Reporting this
+      // as `'rejected'` told the owner "Google rejected your authorisation"
+      // and sent them through a re-consent loop that cannot fix the actual
+      // cause, because re-consenting resubmits the SAME broken client
+      // secret. This is a fact about what THIS INSTALLATION provisioned, not
+      // about the grant or the provider's opinion of it -- `'misconfigured'`,
+      // matching the missing-secret branch above for the identical reason
+      // (fix-round 2, finding I2 restated one status code over: the mistake
+      // ruling I2 was written to prevent, recurring at 401 instead of at "no
+      // secret configured at all").
+      if (response.status === 401 || errorCode === 'invalid_client') {
+        return {
+          ok: false,
+          kind: 'misconfigured',
+          message: `תצורת ה-OAuth של Google שגויה — הספק דחה את פרטי האפליקציה${suffix}`,
         };
       }
 
