@@ -316,6 +316,98 @@ SELECT seq, kind, actor, action_class, reason FROM audit_log
 
 ---
 
+## 10. חוט חי שני: טקס ההרשאה (OAuth) ל-Google Calendar
+
+חוט נפרד מהחוט שלמעלה — לא מייל, ולא צריך scheduler רץ כדי להוכיח שהוא
+עובד. מה שהוא מוכיח: שלחיצה של הבעלים על "התחבר" במסך `/connections`
+מסתיימת בהרשאה אמיתית שמורה מוצפנת, ושדרכה `npm run connector:calendar`
+קורא אירועים אמיתיים מהיומן של העסק — לא רק שהקוד מתקמפל.
+
+### 10.0 דרישות מוקדמות
+
+- מפתח אב קיים (`npm run secret:key create <מפעיל>`, פעם אחת להתקנה — ראה
+  שלב 2 למעלה אם עוד לא נוצר).
+- תקנון פעיל שמצהיר על מערכת בשם `office-calendar` עם `serves:
+  ['calendar.read']` — אותה תבנית בדיוק כמו `scripts/seed-charter.ts` לעיל,
+  רק עם `system: 'office-calendar'`. **המרשם יכול רק לצמצם** (ראה
+  `CLAUDE.md`): שורת `connection_bindings` בלבד, בלי הצהרה תואמת בתקנון,
+  עדיין נדחית ב-`no_channel_for_tool`.
+- שתי הפניות סוד — לא אחת — מוקצות במאגר **לפני** שמתחילים:
+
+  ```bash
+  npm run secret put GOOGLE_OAUTH_CLIENT_ID <המפעיל שלך>
+  npm run secret put GOOGLE_OAUTH_CLIENT_SECRET <המפעיל שלך>
+  ```
+
+  אלה זהות ה-OAuth client של האפליקציה עצמה מול Google (Google Cloud
+  Console — OAuth client ID מסוג "Web application"), **לא** הרשאה של עסק
+  בודד — שורה אחת משרתת כל עסק שההתקנה הזו מריצה. בלעדיהן `handleOAuthStart`
+  מסרב מיד ב"תצורה חסרה", לפני שהבעלים בכלל מגיע למסך ההסכמה של Google.
+- `DASHBOARD_BASE_URL` מוגדר ותואם לכתובת שבה הדשבורד באמת מאזין (ראה שלב 2
+  למעלה) — Google מפנה חזרה בדיוק ל-`<DASHBOARD_BASE_URL>/oauth/callback`,
+  ואי-התאמה כאן היא תקלת ההתקנה הנפוצה ביותר (spec 5.5).
+- ב-Google Cloud Console: ה-redirect URI הרשום ל-client זהה בייט-לבייט
+  לערך שהפקודה למעלה מחשבת.
+
+### 10.1 החיבור
+
+1. `npm run dashboard`, היכנס עם חשבון הבעלים.
+2. פתח `/connections`. המערכת `office-calendar` מופיעה עם קישור "התחבר".
+3. לחיצה מפנה ל-`GET /oauth/office-calendar/start` — הדשבורד מנפיק PKCE
+   ו-`state` חד-פעמי (`createState`, [src/governance/oauth-state.ts](../src/governance/oauth-state.ts))
+   ומפנה לעמוד ההסכמה של Google.
+4. אשר גישה **read-only** ליומן (ה-scope היחיד שהטקס הזה מבקש:
+   `https://www.googleapis.com/auth/calendar.readonly`).
+5. Google מפנה בחזרה ל-`/oauth/callback` עם `code`. `handleOAuthCallback`
+   ([src/dashboard/oauth-routes.ts](../src/dashboard/oauth-routes.ts)) צורך
+   את ה-`state` (סירוב זהה אם הוא לא קיים, כבר נוצל, או שייך לסשן אחר —
+   ראה 10.2 למטה), מחליף את הקוד, וכותב **בטרנזקציה אחת**: הרשאת ה-OAuth
+   (`oauth_grants`, מוצפנת), שורת ביקורת, ואת `connection_bindings.provider
+   = 'google'`.
+6. עמוד ההצלחה מציג את החשבון ואת ההיקפים שאושרו בפועל.
+
+**אם ה-scheduler כבר רץ, הפעל אותו מחדש** — הוא קורא bindings ותקנון פעם
+אחת בעלייה, בדיוק כמו האזהרה למעלה על `office-mail`.
+
+### 10.2 ההוכחה: קריאה אמיתית
+
+```bash
+npx tsx scripts/connector-calendar.ts
+```
+
+(מוגדר גם כ-`npm run connector:calendar`.) פותר את ה-credential
+(`oauthCredentials`), מרענן אסימון גישה מול Google בפועל דרך
+`googleTokenHttp`, וקורא `calendar.read` על ה-adapter האמיתי. תוצאה
+תקינה מדפיסה JSON עם אירועים אמיתיים מהיומן של העסק — לא נתון בדוי, לא
+שורה שמדמה תשובה.
+
+### 10.3 הביטול
+
+במסך `/connections`, "בטל" ליד `office-calendar` — `POST
+/oauth/office-calendar/revoke`, מוגן CSRF. `handleOAuthRevoke` מסמן
+`revoked_at` **מקומית קודם** (ראה `CLAUDE.md`, "הביטול המקומי הוא
+הסמכותי"), ורק אז מנסה גם לבטל אצל הספק. הרץ שוב את שלב 10.2 מיד אחרי —
+הקריאה הבאה **חייבת** להיכשל: `readGrantByRef` מסנן `revoked_at IS NOT
+NULL`, `grantStatusByRef` מחזיר `'revoked'`, ו-`oauthCredentials` זורק
+`OAuthGrantRevokedError` **לפני** שהיא נופלת לאחור לשום סוד סטטי אחר תחת
+אותה הפניה. `connector-calendar.ts` תופס את זה ומדפיס `MISS` — לא stack
+trace — עם ההודעה בעברית של החריגה.
+
+### כשלי ה-OAuth, אחד לכל מחלקה ש-`oauthCredentials` באמת זורקת
+
+חמש המחלקות ב-[src/orchestrator/oauth-token.ts](../src/orchestrator/oauth-token.ts),
+כולן מעל מה שהפולבק (`CredentialSource`) עצמו יכול לזרוק:
+
+| מחלקה | מה קרה | סופי או ניתן לניסיון חוזר | מה רואים |
+|---|---|---|---|
+| `OAuthGrantRevokedError` | הבעלים ביטל את ההרשאה (10.3), או שהיא לא הייתה קיימת מעולם וה-ref *כן* קיים כרשומה מבוטלת — `readGrantByRef` מחזיר `null` בשני המקרים, ו-`grantStatusByRef` הוא מה שמבחין ביניהם. **לעולם לא נופל אחורה** לסוד סטטי תחת אותו ref, גם אם אחד קיים — זו בדיוק העמימות ש-`AmbiguousCredentialRefError` מסרבת לה משורה למטה. | סופי — נדרשת הרשאה מחדש דרך 10.1 | `connector-calendar.ts` מדפיס `MISS` עם הודעת "ההרשאה ... בוטלה על ידי הבעלים". אין שורת ביקורת נוספת מעבר לזו ש-`handleOAuthRevoke` כבר כתב בשלב 10.3. |
+| `OAuthRefreshRejectedError` | הספק עצמו הסתכל על אסימון הרענון וסירב (`invalid_grant` וכדומה) — לרוב כי הבעלים ביטל **אצל Google** ישירות, לא דרך הדשבורד. | סופי — נדרשת הרשאה מחדש | נכתבת שורת `audit_log` מסוג `credential_change` בשם הספק (`auditRefreshRejection`), ו-`markNeedsReauth` מסמן את ההרשאה. |
+| `OAuthMisconfiguredError` | ההתקנה עצמה לא סיפקה מה שנדרש — `GOOGLE_OAUTH_CLIENT_ID`/`_SECRET` לא הוקצו (ראה 10.0), או ש-`provider` הרשום ב-binding אינו `google`. הספק **מעולם לא נענה** — זו עובדת תצורה, לא תשובה שלו. | סופי, אבל **לא** אותה משמעות כמו למעלה: אינה כותבת שורת `credential_change` (זו לא הייתה תגובה של הספק) ואינה מסמנת `needsReauth` (הרשאה מחדש לא מתקנת סוד מקומי חסר). | הודעה מפורשת שנוקבת בשם ה-ref החסר. |
+| `OAuthRefreshTransientError` | כשל רשת, 5xx/429 מהספק, או שהקריאה חרגה מ-`TOKEN_EXCHANGE_TIMEOUT_MS` (15 שניות) — כולל תשובת 2xx עם גוף שלא ניתן לפענח. | **ניתן לניסיון חוזר** — הריצה הבאה (או קריאת `connector:calendar` נוספת) עשויה להצליח בלי שום פעולה מהבעלים. | הודעה בעברית שמתארת את הכשל הזמני; אין שורת ביקורת (אין מה לרשום על משהו שעשוי להסתדר לבד). |
+| `AmbiguousCredentialRefError` | ההפניה קיימת גם כהרשאת OAuth שמורה **וגם** כסוד סטטי תחת אותו שם (`credentials`) — תצורה שגויה, לא כשל ריצה. | סופי עד שמישהו מסיר את אחת השתיים | הודעה מפורשת שקוראת לזה בשם ומבקשת "להסיר אחת מהן". נבדק רק במקרה של פספוס-מטמון (מינוי/רענון אמיתי) — פגיעת מטמון לא בודקת את זה מחדש, ראה `CLAUDE.md`. |
+
+---
+
 ## מה לא יעבוד ולמה
 
 | מצב | מה קורה | איך רואים את זה |
