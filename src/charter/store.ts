@@ -178,7 +178,8 @@ export type ActiveCharterProbe =
  * nor be repaired. That was measured on a real installation, not imagined;
  * see `CURRENT_SCHEMA_VERSION`'s docblock.
  *
- * So: the install path and the readiness report may ask this question, and
+ * So: the install path, the readiness report, and the dashboard's connections
+ * screen may ask this question, and
  * nothing else may. A `false` here means "there is something stored and this
  * code cannot read it" — which, for an installer, is the same instruction as
  * "no charter is installed": go ahead and install one. It is never a reason

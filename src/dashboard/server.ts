@@ -36,7 +36,7 @@ import { readForgetCommand } from '../governance/forget-command.js';
 import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
 import { recordCorrection } from '../governance/corrections.js';
 import { listAutonomousActions } from './autonomous-actions.js';
-import { loadActiveCharter } from '../charter/store.js';
+import { probeActiveCharter } from '../charter/store.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { listGrants } from '../governance/oauth-grants.js';
@@ -513,57 +513,48 @@ async function handleMemory(res: ServerResponse, businessId: string, session: Se
  * mismatch and returns `null` when nothing is installed — both deliberately
  * fatal for the gate, which must never run an agent against policy it cannot
  * parse. A dashboard screen is a different kind of caller: showing the owner
- * a 500 (or, worse, a silently-empty connections list indistinguishable from
- * "nothing is declared") when the real problem is an unreadable charter is
- * strictly worse than the truth. There is no existing helper for "load the
- * charter, but let a reader survive a throw" — `probeActiveCharter` does not
- * exist anywhere in this codebase today, despite being named in this task's
- * own brief; grepping for it (and for every other spelling of "probe" near a
- * charter) turned up nothing, in this file, in `charter/store.ts`, or in any
- * other dashboard screen. The catch below is therefore local to this one
- * route rather than a new shared export: nothing in the brief's own file
- * list (`connection-groups.ts`, `views.ts`, `server.ts`) asks for a change to
- * `charter/store.ts`, and inventing a second, more-permissive charter loader
- * that every future caller could reach for is exactly the kind of
- * convenience this project's own CLAUDE.md warns about elsewhere ("בקרה
- * שנכתבת בשלילה"): a shared "safe" charter reader is a bypass waiting for a
- * caller that should not have been allowed to survive the throw.
+ * a 500, or worse a silently-empty connections list indistinguishable from
+ * "nothing is declared", when the real problem is an unreadable charter is
+ * strictly worse than the truth.
  *
- * **The catch below is the only silent one in this file, and it must not
- * stay silent.** A screen degrading readably for the owner and a failure
- * being invisible to the operator are two different things, and this catch
- * used to conflate them: a schema-version mismatch, a transient Postgres
- * failure on this one query, and a `ZodError` from a genuinely corrupt row
- * all produced the identical fixed Hebrew message with no trace anywhere in
- * the logs. Every OTHER unexpected failure in this file reaches the
- * route-level handler at the bottom (`createServer`'s `route(...).catch(...)`),
- * which logs `dashboard request failed:` before rendering a 500 — this
- * route's whole point is to avoid that 500, but avoiding the 500 must not
- * also mean avoiding the log line an operator debugging a real database
- * hiccup would find for every other screen (`/readings`, `/memory`, ...) and
- * not for this one. `console.error` here, matching that same shape, is what
- * keeps "readable to the owner" from silently becoming "invisible to the
- * operator".
+ * **This route used to catch the throw locally, and that was right at the
+ * time.** It was written on a branch where `probeActiveCharter` did not exist
+ * — an earlier note here recorded grepping for it and finding nothing, which
+ * was accurate: it was built on a parallel branch that had not merged. Both
+ * branches had reached the same conclusion independently and each solved it
+ * with what it had. This is the merge, so the local catch stops being the
+ * honest answer: two different answers to one question, in one codebase, is
+ * the drift the invariants elsewhere in this project exist to prevent.
+ *
+ * `probeActiveCharter` returns the failure instead of throwing it, and its
+ * own docblock names the callers allowed to ask — the install path, the
+ * readiness report, and now this screen. That list is deliberately short:
+ * every production reader must keep failing loudly, because work running
+ * against a policy nobody can parse is work running against no policy.
+ *
+ * **What has not changed is the log line.** A screen degrading readably for
+ * the owner and a failure being invisible to the operator are two different
+ * things. A schema-version mismatch, a transient Postgres failure and a
+ * corrupt row all produce the same fixed Hebrew message here, and every
+ * OTHER unexpected failure in this file reaches the route-level handler that
+ * logs `dashboard request failed:` before rendering a 500. Avoiding that 500
+ * must not also mean avoiding the log line an operator would find for
+ * `/readings` or `/memory` and not for this one.
  */
 async function handleConnections(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   let charterStatus: CharterReadStatus;
   let connections: CharterConnection[];
-  try {
-    const active = await loadActiveCharter(businessId);
-    if (active === null) {
-      charterStatus = 'none';
-      connections = [];
-    } else {
-      charterStatus = 'ok';
-      connections = active.charter.connections;
-    }
-  } catch (err) {
-    console.error(
-      'connections screen: could not read the active charter:',
-      err instanceof Error ? err.message : err,
-    );
+  const probe = await probeActiveCharter(businessId);
+  if (!probe.ok) {
+    console.error('connections screen: could not read the active charter:', probe.reason);
     charterStatus = 'unreadable';
     connections = [];
+  } else if (probe.active === null) {
+    charterStatus = 'none';
+    connections = [];
+  } else {
+    charterStatus = 'ok';
+    connections = probe.active.charter.connections;
   }
 
   const [bindings, grants] = await Promise.all([
