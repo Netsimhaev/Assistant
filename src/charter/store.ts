@@ -157,6 +157,51 @@ export async function loadActiveCharter(
 }
 
 /**
+ * What `probeActiveCharter` found, for the one caller shape that must survive
+ * an unreadable charter.
+ */
+export type ActiveCharterProbe =
+  | { readonly ok: true; readonly active: ActiveCharter | null }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * `loadActiveCharter`, but handing back a failure instead of throwing it.
+ *
+ * **This exists for exactly one caller shape, and widening it would undo the
+ * control it sits beside.** `loadActiveCharter` throws on a charter this code
+ * cannot read, and every production caller must keep failing that way: a job
+ * that runs against a policy nobody can parse is a job running against no
+ * policy at all. What throwing also did, until this function existed, was
+ * close the only door out — installing a replacement charter reads the active
+ * one first (to avoid superseding a charter that is already correct), so an
+ * installation whose charter had fallen behind the schema could neither run
+ * nor be repaired. That was measured on a real installation, not imagined;
+ * see `CURRENT_SCHEMA_VERSION`'s docblock.
+ *
+ * So: the install path and the readiness report may ask this question, and
+ * nothing else may. A `false` here means "there is something stored and this
+ * code cannot read it" — which, for an installer, is the same instruction as
+ * "no charter is installed": go ahead and install one. It is never a reason
+ * to let work proceed.
+ *
+ * The failure is returned as a message rather than a code because the caller's
+ * whole job is to show it to a person: `loadActiveCharter` already composes a
+ * direction-aware remedy ("signed under an older schema and must be re-signed"
+ * versus "roll the code forward"), and flattening that to an enum would throw
+ * away the half that says which way to move.
+ */
+export async function probeActiveCharter(
+  businessId: string = config.businessId,
+  db: Queryable = getPool(),
+): Promise<ActiveCharterProbe> {
+  try {
+    return { ok: true, active: await loadActiveCharter(businessId, db) };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * The version the gate must be running against.
  *
  * A run holding a stale bundle is denied rather than allowed — a mid-flight
