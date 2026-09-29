@@ -20,18 +20,41 @@
  * very next token refresh with no process restart, the same property
  * `createEmailNotifier` already has for `NOTIFY_CREDENTIAL_REF`.
  *
- * **Missing configuration is a TERMINAL failure, not a transient one.** A
- * business that never provisioned the client id/secret refs gets `kind:
- * 'rejected'` here, never `'transient'` -- classifying a configuration
- * error as transient sends `oauthCredentials`' caller, and ultimately the
- * scheduler, back to retry the exact same missing configuration every five
- * minutes forever. A `CredentialSource.resolve` that THROWS (a database
- * blip resolving the client secret, not an absent one) is a different
- * failure mode and is deliberately left to propagate uncaught: catching it
- * and reporting `'rejected'` would send a perfectly live grant into
- * needs-reauth over a transient store failure that has nothing to do with
- * the grant itself. `oauthCredentials`'s own docblock states the same rule
- * for its `fallback` for the same reason.
+ * **Missing configuration is a TERMINAL failure, and it is `'misconfigured'`,
+ * never `'rejected'` and never `'transient'`.** A business that never
+ * provisioned the client id/secret refs gets `kind: 'misconfigured'` here.
+ * Fix-round 1 (finding I2) is why this is its own kind and not folded into
+ * `'rejected'`: `oauthCredentials` treats `'rejected'` as the PROVIDER
+ * having looked at the refresh token and refused it — that branch writes an
+ * audit row naming the provider and flags the grant for re-consent. An
+ * install that simply never ran `secret put GOOGLE_OAUTH_CLIENT_SECRET`
+ * never reached Google at all; reporting `'rejected'` for it wrote a false
+ * audit row ("Google rejected your refresh") and flagged a grant that
+ * re-consenting cannot fix, because the problem was never on Google's side.
+ * Nor is it `'transient'`: classifying a configuration error as transient
+ * sends `oauthCredentials`' caller, and ultimately the scheduler, back to
+ * retry the exact same missing configuration every five minutes forever.
+ * The same reasoning applies to a `provider` this implementation was never
+ * wired to serve (a routing mistake, not something Google said) — see the
+ * `SUPPORTED_PROVIDER` check below, reclassified from `'rejected'` to
+ * `'misconfigured'` in the same fix round for the identical reason.
+ *
+ * A `CredentialSource.resolve` that THROWS (a database blip resolving the
+ * client secret, not an absent one) is a different failure mode again and
+ * is deliberately left to propagate uncaught: catching it and reporting
+ * `'misconfigured'` or `'rejected'` would send a perfectly live grant into
+ * a false terminal state over a transient store failure that has nothing to
+ * do with the grant itself. `oauthCredentials`'s own docblock states the
+ * same rule for its `fallback` for the same reason.
+ *
+ * **`businessId` arrives on every call, from `input`, never from an option
+ * this factory closes over.** An earlier version took `businessId` as a
+ * `GoogleTokenHttpOptions` field and used it for both refs on every call —
+ * harmless in a one-business-per-install product, but it reintroduced,
+ * inside this one implementation, exactly the "which business is this
+ * really for" ambiguity `CredentialSource`'s mandatory, undefaulted
+ * `businessId` exists to make unreachable (fix-round 1, finding I6). See
+ * `TokenHttp`'s own docblock in `oauth-token.ts`.
  *
  * **No token value -- access token, refresh token, or client secret --
  * ever reaches a `RefreshOutcome.message`.** A failure message is built
@@ -46,7 +69,11 @@ import { z } from 'zod';
 import type { CredentialSource } from '../credentials.js';
 import type { RefreshOutcome, TokenHttp } from '../oauth-token.js';
 
-/** Google's own token endpoint. Overridable only for tests. */
+/**
+ * Google's own token endpoint. Not overridable -- there is exactly one, and
+ * `tokenEndpoint` as a constructor option was removed in fix-round 1 (M2):
+ * an invented seam with no reader anywhere, not even a test.
+ */
 const DEFAULT_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 
 /**
@@ -70,14 +97,12 @@ const GoogleTokenSuccessBody = z.object({
 
 export interface GoogleTokenHttpOptions {
   credentials: CredentialSource;
-  businessId: string;
   /**
    * Test seam only. Unreachable from env or config -- the same discipline
    * `buildRuntime`'s `overrides.createTransport` already keeps: no
    * production caller ever passes it.
    */
   fetchImpl?: typeof fetch;
-  tokenEndpoint?: string;
 }
 
 /**
@@ -85,32 +110,33 @@ export interface GoogleTokenHttpOptions {
  * Google access token.
  */
 export function googleTokenHttp(options: GoogleTokenHttpOptions): TokenHttp {
-  const endpoint = options.tokenEndpoint ?? DEFAULT_TOKEN_ENDPOINT;
   const doFetch = options.fetchImpl ?? fetch;
 
   return {
     async exchangeRefresh(input): Promise<RefreshOutcome> {
       if (input.provider !== SUPPORTED_PROVIDER) {
         // A routing mistake -- this http implementation was wired for a
-        // grant it does not know how to serve. Not something a retry in
-        // five minutes fixes.
+        // grant it does not know how to serve. Google was never reached, so
+        // this is a configuration fact about the wiring, not something
+        // Google said -- 'misconfigured', not 'rejected'. See module docblock.
         return {
           ok: false,
-          kind: 'rejected',
+          kind: 'misconfigured',
           message: `googleTokenHttp אינו תומך בספק "${input.provider}"`,
         };
       }
 
-      // Resolved fresh on every call -- see module docblock. A throw here
-      // (a store failure, not an absent secret) is left to propagate.
+      // Resolved fresh on every call, for the business THIS CALL names --
+      // see module docblock. A throw here (a store failure, not an absent
+      // secret) is left to propagate.
       const [clientId, clientSecret] = await Promise.all([
-        options.credentials.resolve(GOOGLE_CLIENT_ID_REF, options.businessId),
-        options.credentials.resolve(GOOGLE_CLIENT_SECRET_REF, options.businessId),
+        options.credentials.resolve(GOOGLE_CLIENT_ID_REF, input.businessId),
+        options.credentials.resolve(GOOGLE_CLIENT_SECRET_REF, input.businessId),
       ]);
       if (clientId === null || clientSecret === null) {
         return {
           ok: false,
-          kind: 'rejected',
+          kind: 'misconfigured',
           message:
             'תצורת ה-OAuth של Google חסרה — יש להקציב ' +
             `${GOOGLE_CLIENT_ID_REF} ו-${GOOGLE_CLIENT_SECRET_REF} במאגר הסודות`,
@@ -126,7 +152,7 @@ export function googleTokenHttp(options: GoogleTokenHttpOptions): TokenHttp {
 
       let response: Response;
       try {
-        response = await doFetch(endpoint, {
+        response = await doFetch(DEFAULT_TOKEN_ENDPOINT, {
           method: 'POST',
           headers: { 'content-type': 'application/x-www-form-urlencoded' },
           body: body.toString(),

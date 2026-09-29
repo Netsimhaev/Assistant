@@ -35,43 +35,65 @@ describe('googleTokenHttp', () => {
         return null;
       },
     };
-    const http = googleTokenHttp({ credentials, businessId: BUSINESS });
+    const http = googleTokenHttp({ credentials });
     const outcome = await http.exchangeRefresh({
       provider: 'microsoft',
       refreshToken: 'rt',
+      businessId: BUSINESS,
       signal: new AbortController().signal,
     });
-    expect(outcome).toMatchObject({ ok: false, kind: 'rejected' });
+    // A routing mistake -- Google was never reached, so this is a
+    // configuration fact, not something the provider said. Not 'rejected'
+    // (fix-round 1, finding I2's reasoning applies here too).
+    expect(outcome).toMatchObject({ ok: false, kind: 'misconfigured' });
     expect(resolved).toBe(false);
   });
 
-  it('reports missing app configuration as a TERMINAL failure, not transient', async () => {
-    const http = googleTokenHttp({ credentials: credentialsFrom({}), businessId: BUSINESS });
+  it('reports missing app configuration as a TERMINAL failure, and specifically "misconfigured"', async () => {
+    const http = googleTokenHttp({ credentials: credentialsFrom({}) });
     const outcome = await http.exchangeRefresh({
       provider: 'google',
       refreshToken: 'rt',
+      businessId: BUSINESS,
       signal: new AbortController().signal,
     });
     // Positive half: the refusal actually happened and named a reason.
     expect(outcome.ok).toBe(false);
     if (outcome.ok) throw new Error('unreachable');
     expect(outcome.message.length).toBeGreaterThan(0);
-    // The classification itself: 'rejected', never 'transient' — a
-    // misclassification here sends the scheduler back to retry a config
-    // error every five minutes forever.
-    expect(outcome.kind).toBe('rejected');
+    // 'misconfigured', never 'rejected' (that would falsely tell the owner
+    // Google refused the grant) and never 'transient' (that sends the
+    // scheduler back to retry a config error every five minutes forever).
+    expect(outcome.kind).toBe('misconfigured');
+  });
+
+  it('reports a client id present with the secret still absent as misconfigured too', async () => {
+    // `credentialsFrom({})` above proves neither ref resolving is terminal.
+    // This proves the secret missing ON ITS OWN — the more likely real
+    // mistake, since an operator provisions the id first — is caught too,
+    // not just the "nothing at all provisioned" case.
+    const http = googleTokenHttp({
+      credentials: credentialsFrom({ [GOOGLE_CLIENT_ID_REF]: 'client-id-123' }),
+    });
+    const outcome = await http.exchangeRefresh({
+      provider: 'google',
+      refreshToken: 'rt',
+      businessId: BUSINESS,
+      signal: new AbortController().signal,
+    });
+    expect(outcome).toMatchObject({ ok: false, kind: 'misconfigured' });
   });
 
   it('mints an access token on a successful exchange', async () => {
     const http = googleTokenHttp({
       credentials: configured(),
-      businessId: BUSINESS,
       fetchImpl: async () =>
         jsonResponse(200, { access_token: 'access-1', expires_in: 3600, refresh_token: 'rotated-1' }),
     });
     const outcome = await http.exchangeRefresh({
       provider: 'google',
       refreshToken: 'rt',
+      businessId: BUSINESS,
       signal: new AbortController().signal,
     });
     expect(outcome).toEqual({
@@ -85,12 +107,12 @@ describe('googleTokenHttp', () => {
   it('treats an unrotated refresh token as null, not absent', async () => {
     const http = googleTokenHttp({
       credentials: configured(),
-      businessId: BUSINESS,
       fetchImpl: async () => jsonResponse(200, { access_token: 'access-1', expires_in: 3600 }),
     });
     const outcome = await http.exchangeRefresh({
       provider: 'google',
       refreshToken: 'rt',
+      businessId: BUSINESS,
       signal: new AbortController().signal,
     });
     expect(outcome).toMatchObject({ ok: true, rotatedRefreshToken: null });
@@ -99,12 +121,12 @@ describe('googleTokenHttp', () => {
   it('treats a 2xx with an unreadable body as transient, not as a refusal', async () => {
     const http = googleTokenHttp({
       credentials: configured(),
-      businessId: BUSINESS,
       fetchImpl: async () => jsonResponse(200, { nonsense: true }),
     });
     const outcome = await http.exchangeRefresh({
       provider: 'google',
       refreshToken: 'rt',
+      businessId: BUSINESS,
       signal: new AbortController().signal,
     });
     expect(outcome).toMatchObject({ ok: false, kind: 'transient' });
@@ -118,12 +140,12 @@ describe('googleTokenHttp', () => {
     ] as const) {
       const http = googleTokenHttp({
         credentials: configured(),
-        businessId: BUSINESS,
         fetchImpl: async () => jsonResponse(status, { error: 'invalid_grant' }),
       });
       const outcome = await http.exchangeRefresh({
         provider: 'google',
         refreshToken: 'rt',
+        businessId: BUSINESS,
         signal: new AbortController().signal,
       });
       expect(outcome).toMatchObject({ ok: false, kind: expectedKind });
@@ -133,7 +155,6 @@ describe('googleTokenHttp', () => {
   it('treats a network failure as transient', async () => {
     const http = googleTokenHttp({
       credentials: configured(),
-      businessId: BUSINESS,
       fetchImpl: async () => {
         throw new Error('ECONNREFUSED');
       },
@@ -141,6 +162,7 @@ describe('googleTokenHttp', () => {
     const outcome = await http.exchangeRefresh({
       provider: 'google',
       refreshToken: 'rt',
+      businessId: BUSINESS,
       signal: new AbortController().signal,
     });
     expect(outcome).toMatchObject({ ok: false, kind: 'transient' });
@@ -152,21 +174,26 @@ describe('googleTokenHttp', () => {
         throw new Error('database blip');
       },
     };
-    const http = googleTokenHttp({ credentials, businessId: BUSINESS });
+    const http = googleTokenHttp({ credentials });
     await expect(
-      http.exchangeRefresh({ provider: 'google', refreshToken: 'rt', signal: new AbortController().signal }),
+      http.exchangeRefresh({
+        provider: 'google',
+        refreshToken: 'rt',
+        businessId: BUSINESS,
+        signal: new AbortController().signal,
+      }),
     ).rejects.toThrow('database blip');
   });
 
   it('never puts the client secret or the refresh token in a failure message', async () => {
     const http = googleTokenHttp({
       credentials: configured(),
-      businessId: BUSINESS,
       fetchImpl: async () => jsonResponse(400, { error: 'invalid_grant', error_description: 'the full request body, echoed back' }),
     });
     const outcome = await http.exchangeRefresh({
       provider: 'google',
       refreshToken: 'REFRESH-SENTINEL',
+      businessId: BUSINESS,
       signal: new AbortController().signal,
     });
     expect(outcome.ok).toBe(false);
@@ -176,21 +203,56 @@ describe('googleTokenHttp', () => {
     expect(outcome.message).not.toContain('client-secret-SENTINEL');
   });
 
-  it('sends the resolved client id and secret as form fields, never as query parameters', async () => {
+  /**
+   * Fix-round 1, finding I3: the original version of this test asserted the
+   * secret was NOT in the URL and never asserted it WAS in the body —
+   * deleting `client_secret` from the `URLSearchParams` in the
+   * implementation left every test in this file green. The positive
+   * assertion below is the one that would have caught that.
+   */
+  it('sends the resolved client id AND secret as form fields, never as query parameters', async () => {
     let capturedBody: string | undefined;
     let capturedUrl: string | undefined;
     const http = googleTokenHttp({
       credentials: configured(),
-      businessId: BUSINESS,
       fetchImpl: async (input, init) => {
         capturedUrl = String(input);
         capturedBody = typeof init?.body === 'string' ? init.body : undefined;
         return jsonResponse(200, { access_token: 'a', expires_in: 10 });
       },
     });
-    await http.exchangeRefresh({ provider: 'google', refreshToken: 'rt-1', signal: new AbortController().signal });
-    expect(capturedUrl).not.toContain('client-secret-SENTINEL');
+    await http.exchangeRefresh({
+      provider: 'google',
+      refreshToken: 'rt-1',
+      businessId: BUSINESS,
+      signal: new AbortController().signal,
+    });
     expect(capturedBody).toContain('client_id=client-id-123');
+    expect(capturedBody).toContain('client_secret=client-secret-SENTINEL'); // positive half
     expect(capturedBody).toContain('refresh_token=rt-1');
+    expect(capturedUrl).not.toContain('client-secret-SENTINEL');
+  });
+
+  it('resolves the client id and secret for the business named in the call, not a business baked into construction', async () => {
+    const seenBusinessIds: string[] = [];
+    const credentials: CredentialSource = {
+      async resolve(ref, businessId) {
+        seenBusinessIds.push(businessId);
+        if (ref === GOOGLE_CLIENT_ID_REF) return createCredentialHandle(ref, 'cid');
+        if (ref === GOOGLE_CLIENT_SECRET_REF) return createCredentialHandle(ref, 'csecret');
+        return null;
+      },
+    };
+    const http = googleTokenHttp({
+      credentials,
+      fetchImpl: async () => jsonResponse(200, { access_token: 'a', expires_in: 10 }),
+    });
+    await http.exchangeRefresh({
+      provider: 'google',
+      refreshToken: 'rt',
+      businessId: 'business-b',
+      signal: new AbortController().signal,
+    });
+    expect(seenBusinessIds).toEqual(['business-b', 'business-b']);
   });
 });

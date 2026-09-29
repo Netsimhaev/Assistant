@@ -7,7 +7,7 @@ import type { ApprovalNotifier } from '../governance/notify.js';
 import { createSmtpTransport } from '../mail/transport.js';
 import type { SmtpConfig } from '../mail/transport.js';
 import { browserAdapter } from './adapters/browser.js';
-import { createGoogleCalendarAdapter } from './adapters/google-calendar.js';
+import { createGoogleCalendarAdapter, GOOGLE_CALENDAR_SERVED_TOOLS } from './adapters/google-calendar.js';
 import type { CalendarHttp } from './adapters/google-calendar.js';
 import { googleTokenHttp } from './adapters/google-token-http.js';
 import { createMailAdapter } from './adapters/mail.js';
@@ -94,14 +94,28 @@ const SMTP_KEYS = [
  * reverted for that exact reason).
  *
  * **Provider adapters register from the charter and the bindings, not from
- * a grant.** A system whose live binding names `provider: 'google'`, and
- * whose charter-declared connection for that same system uses the `api`
- * channel, gets `createGoogleCalendarAdapter` registered under its system
- * name — even when no grant has been stored for it yet. A missing
- * authorisation is a RUNTIME failure the adapter itself reports
- * (`credential_unavailable`, from `oauthCredentials` resolving to `null`),
- * not a missing adapter — the same distinction §6.2 of the design spec
- * draws between a connectivity failure and a policy decision.
+ * a grant.** A system whose binding names `provider: 'google'`, and whose
+ * charter-declared connection for that same system BOTH uses the `api`
+ * channel AND serves `calendar.read`, gets `createGoogleCalendarAdapter`
+ * registered under its system name — even when no grant has been stored for
+ * it yet. A missing authorisation is a RUNTIME failure the adapter itself
+ * reports (`credential_unavailable`, from `oauthCredentials` resolving to
+ * `null`), not a missing adapter — the same distinction §6.2 of the design
+ * spec draws between a connectivity failure and a policy decision. The
+ * `serves` half of that check is load-bearing: see the registration loop's
+ * own comment (fix-round 1, finding I1) for the collision it prevents.
+ *
+ * **This reads the charter and the bindings exactly ONCE, at the moment
+ * `buildRuntime` is called — not continuously.** Every real caller
+ * (`run-scheduler.ts` chief among them) builds one `Runtime` at process
+ * start and reuses it for every scheduler pass thereafter. A `provider`
+ * column an owner sets through Task 5's dashboard AFTER the scheduler is
+ * already running therefore has NO EFFECT until the process is restarted —
+ * this is a known limitation, not an oversight: re-deriving the adapter
+ * registry on every pass would mean re-reading the charter and the master
+ * key every 30 seconds, and that trade-off belongs to a later task, not this
+ * fix round. `docs/live-thread-runbook.md` states the restart requirement
+ * for an operator to actually find.
  */
 export async function buildRuntime(
   env: Record<string, string | undefined> = process.env,
@@ -133,7 +147,7 @@ export async function buildRuntime(
     fallback: storedCredentials(key),
     http:
       overrides.tokenHttp ??
-      googleTokenHttp({ credentials: storedCredentials(key), businessId: config.businessId }),
+      googleTokenHttp({ credentials: storedCredentials(key) }),
   });
 
   // A missing ref is a warning below, in the same place APPROVAL_NOTIFY_TO's
@@ -253,16 +267,44 @@ export async function buildRuntime(
 
   // Additive, on top of the mail adapter above: every system whose binding
   // carries `provider: 'google'`, and whose charter-declared connection for
-  // that same system uses the `api` channel, gets a Google Calendar adapter
-  // registered under its system name. Registered even with no grant stored,
-  // and even when the binding's own `status` is not `live` — that status is
-  // what `resolveChannel` later reports as `unavailable`, at plan-execution
-  // time; it is not a reason for the adapter itself not to exist, the same
-  // way the mail adapter above is registered from env configuration alone
-  // with no binding-status check at all. A missing authorisation is
-  // likewise the adapter's own runtime failure, not a missing adapter — see
-  // this function's own docblock. No charter installed, or no matching
-  // binding, is simply zero adapters registered here; neither is an error.
+  // that same system BOTH uses the `api` channel AND serves `calendar.read`,
+  // gets a Google Calendar adapter registered under its system name.
+  //
+  // The `serves` check is load-bearing, not decorative (fix-round 1, finding
+  // I1). The charter decides WHICH TOOLS a connection serves; the binding's
+  // `provider` column decides WHOSE CODE runs a system that already has one.
+  // Checking only `provider` and `channel` -- without `serves` -- let a
+  // binding whose SYSTEM NAME already has an adapter (`office-mail`, whose
+  // charter connection is also `channel: 'api'`) collide with it: an owner
+  // setting `provider: 'google'` on the `office-mail` row -- the natural
+  // thing to do when authorising Gmail through Task 5's consent screen --
+  // made `AdapterRegistry`'s constructor throw `adapter for system
+  // "office-mail" is already registered`, which is not a failed step but
+  // `buildRuntime` itself throwing: the scheduler, `run-due`,
+  // `live-thread-status` and `probe-smtp` all refuse to start, and nothing
+  // recovers until someone edits the row by hand. A row a dashboard writes
+  // must never be able to stop the process from booting. Requiring BOTH the
+  // binding's `provider` and the charter's `serves` is the column's own
+  // division of labour, not a redundant belt-and-braces check.
+  //
+  // Registered even with no grant stored, and even when the binding's own
+  // `status` is not `live` — that status is what `resolveChannel` later
+  // reports as `unavailable`, at plan-execution time; it is not a reason for
+  // the adapter itself not to exist, the same way the mail adapter above is
+  // registered from env configuration alone with no binding-status check at
+  // all. A missing authorisation is likewise the adapter's own runtime
+  // failure, not a missing adapter — see this function's own docblock. No
+  // charter installed, or no matching binding, is simply zero adapters
+  // registered here; neither is an error.
+  //
+  // **Known limitation, documented rather than fixed here:** the charter and
+  // the bindings are read exactly once, at process start — `run-scheduler.ts`
+  // builds one `Runtime` and passes it into every pass. A `provider` column
+  // written by Task 5's dashboard after this process started therefore has
+  // no effect until the scheduler is RESTARTED; re-deriving the registry on
+  // every pass would mean re-reading the charter and the master key every
+  // 30 seconds, which is an architecture decision for a later task, not a
+  // line in this fix round. See `docs/live-thread-runbook.md`.
   const charter = await loadActiveCharter();
   const bindings = await loadBindings();
   const connectionBySystem = new Map(
@@ -272,6 +314,7 @@ export async function buildRuntime(
     if (binding.provider !== GOOGLE_PROVIDER) continue;
     const connection = connectionBySystem.get(binding.system);
     if (connection === undefined || connection.channel !== 'api') continue;
+    if (!GOOGLE_CALENDAR_SERVED_TOOLS.some((tool) => connection.serves.includes(tool))) continue;
     systemAdapters.push(
       createGoogleCalendarAdapter({
         system: binding.system,

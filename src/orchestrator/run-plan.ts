@@ -21,6 +21,13 @@ import { deriveTargetId, resolveChannel } from './channels.js';
 import type { CredentialSource } from './credentials.js';
 import { executeStep, type StepEffect, type StepOutcome } from './execute.js';
 import { loadJob, transition } from './jobs.js';
+import {
+  AmbiguousCredentialRefError,
+  OAuthGrantRevokedError,
+  OAuthMisconfiguredError,
+  OAuthRefreshRejectedError,
+  OAuthRefreshTransientError,
+} from './oauth-token.js';
 import { bindPlanToJob, completedSteps } from './plan-store.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { StepChannelError } from './step-error.js';
@@ -476,6 +483,43 @@ export async function runPlanForJob(request: RunPlanForJobRequest): Promise<RunP
 }
 
 /**
+ * Turn one of `oauthCredentials.resolve`'s own thrown error classes into a
+ * `StepChannelError` with the retryability spec §3.4's classification table
+ * assigns it. Anything else — a generic error from the fallback's own DB
+ * read, say — is returned UNCHANGED, so it still propagates as a genuine,
+ * uncategorised failure rather than being silently absorbed here.
+ *
+ * Revoked, a rejected refresh, an ambiguous ref, and a missing local
+ * configuration are all terminal: none of them self-heals on a retry, and
+ * §3.4 groups "no grant row, or revoked" with "provider rejects the
+ * refresh" under the same verdict as a static secret that was never
+ * provisioned (`credential_unavailable`). A transient refresh failure —
+ * network trouble, a provider 5xx, or this module's own deadline racing out
+ * (`withOAuthDeadline` in `oauth-token.ts` throws the identical class for
+ * both) — is retryable, matching §3.4's "network fault or 5xx on refresh".
+ *
+ * Fix-round 1, finding I5.
+ */
+function mapOAuthTokenError(error: unknown): unknown {
+  if (error instanceof OAuthGrantRevokedError) {
+    return new StepChannelError('oauth_grant_revoked', error.message, false);
+  }
+  if (error instanceof OAuthRefreshRejectedError) {
+    return new StepChannelError('oauth_refresh_rejected', error.message, false);
+  }
+  if (error instanceof OAuthMisconfiguredError) {
+    return new StepChannelError('oauth_misconfigured', error.message, false);
+  }
+  if (error instanceof AmbiguousCredentialRefError) {
+    return new StepChannelError('oauth_ambiguous_ref', error.message, false);
+  }
+  if (error instanceof OAuthRefreshTransientError) {
+    return new StepChannelError('oauth_refresh_transient', error.message, true);
+  }
+  return error;
+}
+
+/**
  * Perform one step's side effect against the system that serves it.
  *
  * The SECOND resolution, and it runs *after* `evaluateToolCall` has permitted
@@ -562,10 +606,28 @@ async function performStep(
 
   const binding = request.bindings.find((b) => b.system === resolution.system);
   const credentialRef = binding?.credentialRef ?? null;
+  // `.catch` here, not a bare `await`: `oauthCredentials.resolve`
+  // (`oauth-token.ts`) throws five error classes of its own on top of
+  // whatever the fallback can throw, and `executeStep` catches only
+  // `StepChannelError` — an uncaught OAuth throw escapes into
+  // `runDueJobs`'s `errored` bucket and leaves the job in `execute` with a
+  // frozen `updated_at`, starving the `LIMIT` window `run-scheduler.ts`
+  // documents at length (fix-round 1, finding I5; spec §4.4 was narrowed to
+  // permit this one change to `performStep`). `mapOAuthTokenError` rethrows
+  // anything it does not recognise unchanged, so a genuine infrastructure
+  // failure (the fallback's own DB blip, say) still propagates as before —
+  // only the five named OAuth classes are converted. Every branch below is
+  // UNREACHABLE for a static secret: `storedCredentials.resolve` never
+  // throws any of these five classes, so the mail path's behaviour is
+  // unchanged.
   const credential =
     credentialRef === null
       ? null
-      : await request.credentials.resolve(credentialRef, request.job.businessId);
+      : await request.credentials
+          .resolve(credentialRef, request.job.businessId)
+          .catch((error: unknown) => {
+            throw mapOAuthTokenError(error);
+          });
   if (credentialRef !== null && credential === null) {
     // NOT retryable, unlike `channel_unavailable` above. A ref that does not
     // resolve is a misconfiguration — a misspelling, or a secret that was

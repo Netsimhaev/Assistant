@@ -20,34 +20,65 @@ import { loadMasterKey } from '../src/governance/master-key.js';
 
 const businessId = config.businessId;
 
-const keyPath = process.env['CREDENTIAL_KEY_PATH'];
-if (keyPath === undefined || keyPath.length === 0) {
-  console.log('MISS  CREDENTIAL_KEY_PATH — אין מפתח לפתוח בו את הסודות');
+// `closePool()` in a `finally` below covers every exit from this point on,
+// including a credential resolution that throws (fix-round 1, finding I5):
+// this script's whole job is printing a readable line, not a stack trace,
+// and a script that leaks the pool on the very first failure an
+// unprovisioned install is expected to hit is not a readiness check.
+try {
+  const keyPath = process.env['CREDENTIAL_KEY_PATH'];
+  if (keyPath === undefined || keyPath.length === 0) {
+    console.log('MISS  CREDENTIAL_KEY_PATH — אין מפתח לפתוח בו את הסודות');
+    process.exitCode = 1;
+  } else {
+    const key = await loadMasterKey(keyPath);
+    const binding = (await loadBindings({ businessId })).find((b) => b.system === 'office-calendar');
+
+    if (binding?.credentialRef == null) {
+      console.log('MISS  office-calendar — הרץ scripts/seed-charter.ts, ואז אשר גישה במסך החיבורים');
+    } else {
+      const credentials = oauthCredentials({
+        key,
+        fallback: storedCredentials(key),
+        http: googleTokenHttp({ credentials: storedCredentials(key) }),
+      });
+
+      // `oauthCredentials.resolve` throws five error classes of its own
+      // (`oauth-token.ts`) — a revoked grant, a rejected refresh, an
+      // ambiguous ref, a missing local app secret, or a transient failure —
+      // on top of whatever the fallback can throw. `live-thread-status.ts`
+      // is the sibling to this: a readiness check whose whole job is
+      // printing MISS lines should print one for this too, not stop with a
+      // stack trace.
+      let credential;
+      try {
+        credential = await credentials.resolve(binding.credentialRef, businessId);
+      } catch (error) {
+        console.log(
+          `MISS  office-calendar — פתירת ההרשאה נכשלה: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        process.exitCode = 1;
+        credential = undefined;
+      }
+
+      if (credential !== undefined) {
+        const adapter = createGoogleCalendarAdapter({ system: 'office-calendar' });
+        const result = await adapter.execute({
+          toolName: 'calendar.read',
+          input: {},
+          credential,
+          endpoint: binding.endpoint,
+          idempotencyKey: `manual-${Date.now()}`,
+          signal: AbortSignal.timeout(20_000),
+        });
+        console.log(JSON.stringify(result, null, 2));
+        if (!result.ok) process.exitCode = 1;
+      }
+    }
+  }
+} catch (error) {
+  console.log(`MISS  connector:calendar — ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
+} finally {
   await closePool();
-  process.exit(1);
 }
-const key = await loadMasterKey(keyPath);
-
-const binding = (await loadBindings({ businessId })).find((b) => b.system === 'office-calendar');
-
-if (binding?.credentialRef == null) {
-  console.log('MISS  office-calendar — הרץ scripts/seed-charter.ts, ואז אשר גישה במסך החיבורים');
-} else {
-  const credentials = oauthCredentials({
-    key,
-    fallback: storedCredentials(key),
-    http: googleTokenHttp({ credentials: storedCredentials(key), businessId }),
-  });
-  const credential = await credentials.resolve(binding.credentialRef, businessId);
-  const adapter = createGoogleCalendarAdapter({ system: 'office-calendar' });
-  const result = await adapter.execute({
-    toolName: 'calendar.read',
-    input: {},
-    credential,
-    endpoint: binding.endpoint,
-    idempotencyKey: `manual-${Date.now()}`,
-    signal: AbortSignal.timeout(20_000),
-  });
-  console.log(JSON.stringify(result, null, 2));
-}
-await closePool();

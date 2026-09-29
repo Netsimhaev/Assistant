@@ -373,6 +373,69 @@ describe('buildRuntime', () => {
 
     const runtime = await buildRuntime(FULL);
     expect(runtime.registry.get('office-calendar')).not.toBeNull();
+    // `.resolve(...)`, not only `.get(...)` (fix-round 1, finding M3): this
+    // is what actually proves the registered adapter serves the RIGHT
+    // channel and tool, not merely that something got registered under the
+    // system name. This is also the assertion that would have caught I1 —
+    // a registration keyed on `provider`/`channel` alone, with no `serves`
+    // check, still returns non-null from `.get`, but a `resolve` for a tool
+    // the connection does not declare would not.
+    expect(runtime.registry.resolve('office-calendar', 'api', 'calendar.read')).not.toBeNull();
+  });
+
+  /**
+   * Fix-round 1, finding I1 — the sharpest finding of the round. Before the
+   * fix, registration keyed on `provider === 'google'` and `channel: 'api'`
+   * alone, never consulting the charter's own `serves` list. `office-mail`'s
+   * charter connection is ALSO `channel: 'api'`, so an owner setting
+   * `provider: 'google'` on the `office-mail` binding — the natural thing to
+   * do when authorising Gmail through a future consent screen — collided
+   * with the mail adapter already registered under that same system name:
+   * `AdapterRegistry`'s constructor throws on the duplicate, so `buildRuntime`
+   * itself threw and the whole scheduler refused to boot. A row a dashboard
+   * writes must never be able to stop the process from starting.
+   */
+  it('does not collide with the mail adapter when its own binding also carries provider: "google"', async () => {
+    // The charter connection matters here, not just the binding: without one
+    // declared for `office-mail`, the registration loop's own
+    // `connection === undefined` check already skips it, and this test would
+    // pass without ever exercising the bug it is named for.
+    await installCharter(
+      buildCharter({
+        connections: [
+          {
+            system: 'office-mail',
+            label: 'תיבת המשרד',
+            channel: 'api',
+            serves: ['mail.send'],
+            target: null,
+            subprocessor: null,
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    await upsertBinding(
+      {
+        system: 'office-mail',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OFFICE_MAIL',
+        provider: 'google',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { by: 'test' },
+    );
+
+    // Must not throw.
+    const runtime = await buildRuntime(FULL);
+    // The mail adapter is still the one serving `office-mail`, and it still
+    // serves `mail.send` — nothing here silently swapped it out.
+    expect(runtime.registry.resolve('office-mail', 'api', 'mail.send')).not.toBeNull();
+    // And `office-mail`'s connection does not declare `calendar.read`, so no
+    // calendar adapter should have been registered for it either.
+    expect(runtime.registry.resolve('office-mail', 'api', 'calendar.read')).toBeNull();
   });
 
   /**

@@ -218,6 +218,15 @@ describe('createGoogleCalendarAdapter', () => {
   it('drives the real chain: declared connection, live binding, stored grant, minted token, events back', async () => {
     const KEY = randomBytes(KEY_BYTES);
 
+    // The `installCharter` call below is NOT exercised by anything else in
+    // this test (fix-round 1, finding M4): the adapter here is built
+    // directly with `createGoogleCalendarAdapter`, not resolved out of a
+    // `buildRuntime`-assembled registry, so nothing downstream reads the
+    // charter at all. It stays for parity with the brief's own Step 7
+    // snippet and as a readable stand-in for "a connection like this is
+    // declared" — the charter -> registry link itself (does a declared
+    // `serves: ['calendar.read']` connection actually cause registration)
+    // is proven separately, by `runtime.test.ts`'s two registration tests.
     await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
     await writeKeyState(KEY, 'KEY-e2e', { businessId: BUSINESS });
     await upsertBinding(

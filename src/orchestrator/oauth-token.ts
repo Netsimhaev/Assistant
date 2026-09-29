@@ -134,29 +134,71 @@ import type { CredentialSource } from './credentials.js';
  * client secret through the existing secret store, never `process.env` —
  * see `master-key.ts` for why a secret never lives in the environment).
  *
- * A future `TokenHttp`'s `message` on either failure branch of
- * `RefreshOutcome` must be built from HTTP status codes and the provider's
- * own error *codes* (e.g. `invalid_grant`), never from the raw response
- * body: a provider that echoes request content back in an error body would
- * otherwise let that content reach whatever reads `message` — the audit row
- * and the thrown error's own text.
+ * `businessId` is threaded through the input rather than captured by a
+ * concrete `TokenHttp` at construction — see this module's own docblock on
+ * why `businessId` is mandatory everywhere on this path with no default.
+ * `oauthCredentials.resolve` already receives the caller's business; a
+ * concrete implementation that instead bakes one in at construction (an
+ * options field, a closure variable) reintroduces exactly the "whose
+ * business is this really for" ambiguity this interface exists to make
+ * unreachable — a refresh for business B would resolve B's grant against
+ * business A's client secret. (Task 4's fix-round 1, finding I6: an earlier
+ * `googleTokenHttp` did exactly this, harmlessly in a one-business-per-
+ * install product, but the docblock claiming the pattern unreachable would
+ * have been a lie.)
+ *
+ * A future `TokenHttp`'s `message` on any failure branch of `RefreshOutcome`
+ * must be built from HTTP status codes and the provider's own error *codes*
+ * (e.g. `invalid_grant`), never from the raw response body: a provider that
+ * echoes request content back in an error body would otherwise let that
+ * content reach whatever reads `message` — the audit row and the thrown
+ * error's own text.
+ *
+ * **Three failure kinds, not two, and they are not interchangeable.**
+ * - `'rejected'`: the PROVIDER looked at the refresh token itself and said
+ *   no (`invalid_grant` and the like). Terminal, and specifically means
+ *   "the owner must re-consent" — `oauthCredentials` writes an audit row
+ *   naming the provider and calls `markNeedsReauth` on this branch.
+ * - `'misconfigured'`: this INSTALLATION never provisioned what the
+ *   implementation needs to even attempt the call (an app client id/secret
+ *   never `secret put`, most likely) — the provider was never reached and
+ *   said nothing. Terminal for the same reason a config error never
+ *   self-heals on a retry, but it is not a claim about the grant or the
+ *   provider, so it must not produce a provider-rejection audit row or
+ *   flag the grant for re-consent: re-consenting cannot fix a missing
+ *   local secret, and the false audit row would misdescribe what happened.
+ * - `'transient'`: the attempt may succeed if tried again (network trouble,
+ *   the provider's own 5xx/429). Retryable.
+ *
+ * Conflating `'misconfigured'` into `'rejected'` (Task 4's original mistake,
+ * fix-round 1 finding I2) tells the owner "Google revoked your
+ * authorisation" for an install that simply never ran `secret put`.
  */
 export interface TokenHttp {
   exchangeRefresh(input: {
     provider: string;
     refreshToken: string;
+    businessId: string;
     signal: AbortSignal;
   }): Promise<RefreshOutcome>;
 }
 
 export type RefreshOutcome =
   | { ok: true; accessToken: string; expiresInSeconds: number; rotatedRefreshToken: string | null }
-  | { ok: false; kind: 'rejected' | 'transient'; message: string };
+  | { ok: false; kind: 'rejected' | 'misconfigured' | 'transient'; message: string };
 
 /** A `credential_ref` resolves through both a stored grant and a static secret. */
 export class AmbiguousCredentialRefError extends Error {}
 /** The provider refused the refresh token outright. Terminal — re-consent is required. */
 export class OAuthRefreshRejectedError extends Error {}
+/**
+ * This installation never provisioned what the `TokenHttp` implementation
+ * needs (an app client id/secret, most likely) — the provider was never
+ * reached. Terminal, like a rejection, but deliberately a DIFFERENT class:
+ * `oauth-token.ts`'s docblock on `TokenHttp` states why conflating the two
+ * is a real defect, not a simplification.
+ */
+export class OAuthMisconfiguredError extends Error {}
 /** The refresh attempt failed in a way that may succeed if tried again. Retryable. */
 export class OAuthRefreshTransientError extends Error {}
 /** The owner revoked this grant. Terminal — never a silent handoff to a static secret. */
@@ -326,6 +368,7 @@ export function oauthCredentials(options: {
         options.http.exchangeRefresh({
           provider: grant.provider,
           refreshToken: grant.refreshToken,
+          businessId,
           signal: AbortSignal.timeout(TOKEN_EXCHANGE_TIMEOUT_MS),
         }),
         'ריענון ההרשאה',
@@ -347,6 +390,17 @@ export function oauthCredentials(options: {
         throw new OAuthRefreshRejectedError(
           `הספק (${grant.provider}) דחה את ריענון ההרשאה למערכת "${grant.system}" — ` +
             `נדרשת הרשאה מחדש (${outcome.message})`,
+        );
+      }
+      if (!outcome.ok && outcome.kind === 'misconfigured') {
+        // Deliberately NEITHER the audit row NOR `markNeedsReauth` above:
+        // the provider was never reached, so there is nothing to say about
+        // it, and re-consenting cannot fix a local secret nobody
+        // provisioned. See `TokenHttp`'s own docblock for the full ruling
+        // (fix-round 1, finding I2).
+        throw new OAuthMisconfiguredError(
+          `תצורת ההתקנה למערכת "${grant.system}" (ספק: ${grant.provider}) חסרה — ` +
+            `${outcome.message}`,
         );
       }
       if (!outcome.ok) {

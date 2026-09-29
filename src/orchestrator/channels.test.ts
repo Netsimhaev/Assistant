@@ -29,7 +29,11 @@ describe('connection bindings', () => {
         status: 'live',
         endpoint: 'smtp.example.com:587',
         credentialRef: 'OFFICE_MAIL',
-        provider: null,
+        // A real value here, not `null` — this is the one place in this
+        // file that proves the column round-trips a non-null value and not
+        // only the "unset" case every other literal below carries
+        // (fix-round 1, finding M5).
+        provider: 'google',
         lastOkAt: null,
         lastError: null,
       },
@@ -40,6 +44,7 @@ describe('connection bindings', () => {
     expect(bindings).toHaveLength(1);
     expect(bindings[0]?.status).toBe('live');
     expect(bindings[0]?.credentialRef).toBe('OFFICE_MAIL');
+    expect(bindings[0]?.provider).toBe('google');
   });
 
   it('reads back a non-null lastOkAt as an ISO string', async () => {
