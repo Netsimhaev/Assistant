@@ -145,8 +145,11 @@ function assertLegalRef(ref: string): void {
  * is bookkeeping rather than an authorisation decision. The read path above
  * is where an omitted business would hand one customer another's secret, and
  * that path has no default at all.
+ *
+ * Exported for `oauth-grants.ts`, which seals rows under the same live key id
+ * and must not read the key-state table a second way.
  */
-async function liveKeyId(db: Queryable): Promise<string> {
+export async function liveKeyId(db: Queryable): Promise<string> {
   const { rows } = await db.query<{ key_id: string }>(
     'SELECT key_id FROM credential_key_state WHERE business_id = $1',
     [config.businessId],
