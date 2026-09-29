@@ -8,9 +8,15 @@
  * as evidence for the question the owner actually asks: *if I raise a ramp on
  * my install, does anything happen?*
  *
- * Here the charter is `buildCharter` unmodified — the same call
- * `scripts/seed-charter.ts` makes, and therefore the same ceilings the dev
- * install carries today. Under it, exactly one action class can move from
+ * Here the charter is `buildCharter` with only its own connection declared
+ * (`MAIL_CONNECTION`, below) — the same shape `scripts/seed-charter.ts` made
+ * before the final fix wave. That script now ALSO declares
+ * `office-calendar` (item 7), so the two are no longer byte-identical; this
+ * file limits itself to `office-mail` because the mail path is the only one
+ * this suite's plan (`REPLY_PLAN`, below) ever touches, and the ceilings that
+ * matter here come from `buildCharter`'s own defaults, unaffected by which
+ * OTHER connections are also declared. Under it, exactly one action class
+ * can move from
  * "the owner is asked and nothing leaves" to "a real message goes out" on the
  * strength of a ramp row alone:
  *

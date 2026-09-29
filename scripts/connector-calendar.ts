@@ -35,7 +35,22 @@ try {
     const binding = (await loadBindings({ businessId })).find((b) => b.system === 'office-calendar');
 
     if (binding?.credentialRef == null) {
-      console.log('MISS  office-calendar — הרץ scripts/seed-charter.ts, ואז אשר גישה במסך החיבורים');
+      // Final fix wave, item 7: this used to say "run scripts/seed-charter.ts"
+      // with no further qualification, and that recovery step used to be
+      // ACTIVELY DESTRUCTIVE — the old seed script declared `office-mail`
+      // alone, so running it on an instance that already had a hand-installed
+      // charter declaring `office-calendar` would supersede that charter with
+      // one that dropped the calendar declaration entirely. `seed-charter.ts`
+      // now declares BOTH connections and only ever supersedes a charter that
+      // is missing one of them, so it is safe to name again — but the message
+      // now says what a MISS here actually means (no binding row yet, i.e.
+      // nobody has completed the consent ceremony) rather than implying the
+      // charter itself is the thing missing.
+      console.log(
+        'MISS  office-calendar — טרם אושר: אין שורת binding עבור המערכת. ' +
+          'ודא/י שהתקנון מצהיר עליה (scripts/seed-charter.ts — בטוח להרצה חוזרת, ' +
+          'לא דורס חיבור קיים), ואז אשר/י גישה במסך /connections.',
+      );
     } else {
       const credentials = oauthCredentials({
         key,
