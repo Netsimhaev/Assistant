@@ -33,6 +33,7 @@
     "sdk:curator": "tsx src/sdk/run-curator.ts",
     "sdk:contact-resolver": "tsx src/sdk/run-contact-resolver.ts",
     "sdk:delegate": "tsx src/sdk/run-delegate.ts",
+    "sdk:judge": "tsx src/sdk/run-judge.ts",
     "connector:calendar": "tsx scripts/connector-calendar.ts"
   },
   "dependencies": {
