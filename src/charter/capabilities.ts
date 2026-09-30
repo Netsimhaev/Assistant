@@ -125,8 +125,11 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
 
   // --- Production ---------------------------------------------------------
   // Produces an artifact; delivery is a separate gated action owned by comms.*
+  // `code_execution` was removed from this allowlist on 30/09 and moved to
+  // `UNOWNED_TOOLS` below — see that list's docblock for the reasoning. This
+  // agent keeps `file.write`, which is what producing a deliverable actually
+  // needs.
   'prod.docs': [
-    'code_execution',
     'file.write',
     'memory.recall',
     'template.load',
@@ -150,19 +153,59 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
 };
 
 /**
- * Deliberately owned by no agent: `contract.sign`, `payment.charge` and
- * `charter.apply_amendment`.
+ * Deliberately owned by no agent: `contract.sign`, `payment.charge`,
+ * `charter.apply_amendment` and `code_execution`.
  *
  * These are unreachable by construction — there is no allowlist to remove them
  * from, so no charter edit, prompt, or approval can make them callable. A
  * charter `forbidden` rule naming one of them is therefore belt-and-braces
  * rather than the control: the capability layer denies first, which is why the
  * gate reports `tool_not_allowlisted` and not `forbidden` for them.
+ *
+ * **`code_execution` joined this list on 30/09, closing the second of the two
+ * findings the 28/08 security review left open on purpose.** That review moved
+ * it out of `READ_ONLY_TOOLS` and classified it `artifact.write`, and said in
+ * as many words that the calibration was not right and the decision was still
+ * open: `artifact.write` is calibrated for writing a file — reversible,
+ * `internal`, no redaction, no quiet hours — and arbitrary code execution is
+ * none of those reliably. It can reach the network, read whatever the process
+ * can read, and write outside whatever directory anyone had in mind.
+ *
+ * **Two ways to close it, and why this one.** The principled alternative is a
+ * new `ActionClass` member (`code.execute`) with `NEVER_FULLY_AUTONOMOUS:
+ * true`, so it exists, carries its own ceiling, and always needs a person.
+ * That became *possible* only on 27/09, when `CURRENT_SCHEMA_VERSION` made
+ * growing these exhaustive enums a supported operation instead of a silent
+ * break — `CharterAutonomy.base` is `z.record(ActionClass, AutonomyLevel)`,
+ * so a new member invalidates every charter already signed until it is
+ * re-signed.
+ *
+ * It was not taken, because it buys graded authority for a capability nothing
+ * implements. `runLocalTool` (`src/orchestrator/local-tools.ts`) has no handler
+ * for `code_execution`: `prod.docs` held a tool that returns
+ * `not_implemented`. And Stage 2's actual deliverable — producing Excel and
+ * Word files — will be built on `exceljs` and the docx writer in process,
+ * both already dependencies, not on a generic execute-anything tool. So the
+ * choice was between graded authority over nothing and no reach at all, and
+ * no reach is strictly safer and three lines.
+ *
+ * **What this is not: a permanent refusal to ever run code.** If Stage 2
+ * genuinely needs it, the path is written down rather than left to whoever
+ * hits it: give it its own `ActionClass`, mark it `NEVER_FULLY_AUTONOMOUS`,
+ * bump `CURRENT_SCHEMA_VERSION`, re-sign. What must NOT happen is the cheap
+ * move — putting it back in an allowlist under `artifact.write`, where a file
+ * write's calibration silently becomes code execution's.
+ *
+ * It stays in `TOOL_ACTION_CLASS` (`src/policy/classify.ts`) while unowned,
+ * exactly as the other three do. An unowned tool that is also unclassified
+ * would be treated as read-only the moment anyone re-added it to an
+ * allowlist — which is the precise state the 28/08 review found it in.
  */
 export const UNOWNED_TOOLS: readonly string[] = [
   'contract.sign',
   'payment.charge',
   'charter.apply_amendment',
+  'code_execution',
 ];
 
 /**

@@ -12,9 +12,9 @@ import { AgentId } from '../domain/audit.js';
  * an owner does it against a red test, in the open.
  */
 describe('the deliberately unowned tools', () => {
-  it('names exactly the three the capability layer documents', () => {
+  it('names exactly the four the capability layer documents', () => {
     expect([...UNOWNED_TOOLS].sort()).toEqual(
-      ['charter.apply_amendment', 'contract.sign', 'payment.charge'].sort(),
+      ['charter.apply_amendment', 'code_execution', 'contract.sign', 'payment.charge'].sort(),
     );
   });
 

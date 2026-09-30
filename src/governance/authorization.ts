@@ -162,13 +162,21 @@ export async function loadAuthorization(
  * by anything a standing instruction says.
  *
  * `artifact.write` was on this list and came off after review: `classify.ts`
- * maps BOTH `file.write` and `code_execution` to `artifact.write`
- * (`capabilities.ts` grants `prod.docs` both tools), so leaving it in meant a
- * standing grant of `{ actionClass: 'email.reply', recipients:
+ * maps BOTH `file.write` and `code_execution` to `artifact.write`, so leaving
+ * it in meant a standing grant of `{ actionClass: 'email.reply', recipients:
  * ['dana@example.com'] }` — "reply to Dana" — covered arbitrary code
  * execution and arbitrary filesystem writes. Worse than one bad entry: the
  * entailed shortcut never consults `auth.actionClass` or `auth.recipients`,
  * so the narrowest possible grant bought the same coverage as the broadest.
+ *
+ * **One fact in that paragraph changed on 30/09 and the conclusion did not.**
+ * It used to add that `capabilities.ts` grants `prod.docs` both tools;
+ * `code_execution` is now in `UNOWNED_TOOLS` and no agent holds it. So the
+ * code-execution half of the reasoning above is historical, and the
+ * filesystem-write half is still live: `prod.docs` keeps `file.write`, which
+ * maps to this same class, so `artifact.write` must stay off this list on its
+ * own merits. Restoring it would still hand "reply to Dana" arbitrary writes
+ * under the assistant's own uid.
  *
  * `accounting.write` came off too, for an unrelated reason: it is one of
  * `AMOUNT_REQUIRED_CLASSES` (`src/domain/action.ts`), so the gate already

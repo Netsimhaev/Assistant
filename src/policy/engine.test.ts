@@ -5,6 +5,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { queryAudit, verifyChain } from '../audit/log.js';
 import { decide, getApproval, pendingApprovals } from '../governance/approvals.js';
+import { approvalStreak } from '../governance/agreement.js';
 import { release, trip } from '../governance/killswitch.js';
 import { evaluateToolCall, type GateContext } from './engine.js';
 import { refineActionClass } from './classify.js';
@@ -276,6 +277,50 @@ describe('exit criterion: approval', () => {
 
     expect(edited.state).toBe('approved_with_edit');
     expect(edited.editedInput).toMatchObject({ qty: 40 });
+  });
+
+  /**
+   * The other half of the test above, and the close of the second finding the
+   * 28/08 review left open: a payload handed back UNCHANGED is not an edit,
+   * and `decide` decides that by comparing rather than by the field being
+   * present.
+   *
+   * The pair matters more than either test alone. `approvalStreak`
+   * (`src/governance/agreement.ts`) advances only on `approved`, so a
+   * mislabel here does not fail loudly — it silently stops an owner who
+   * approves ten cards unchanged from ever earning the autonomy raise, with
+   * nothing to read that explains it.
+   *
+   * The reordered-keys case is the one a caller actually produces: a payload
+   * that round-tripped through JSON with its keys in a different order is
+   * byte-different and hash-identical, and `canonicalHash` is what makes the
+   * second fact the one that counts.
+   */
+  it('does not call an unchanged payload an edit, however its keys are ordered', async () => {
+    const bundle = await install();
+    const original = { supplierId: 'supplier_a', amountMinor: 210_000, qty: 50 };
+    const decision = await evaluateToolCall('browser.submit_order', original, ctx(bundle, { agent: 'ops.web' }));
+    if (decision.outcome !== 'queue_approval') throw new Error('expected a queued approval');
+
+    const unchanged = await decide(
+      decision.approvalId,
+      'approved',
+      {
+        by: 'p_boss',
+        channel: 'dashboard',
+        // Same facts, different key order — what a textarea round-trip yields.
+        editedInput: { qty: 50, amountMinor: 210_000, supplierId: 'supplier_a' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    expect(unchanged.state).toBe('approved');
+    // Nothing is stored as an edit either, so `execute.ts`'s substitution
+    // guard has nothing to act on and the original input runs — which is the
+    // same bytes anyway.
+    expect(unchanged.editedInput).toBeNull();
+    // And the streak this would otherwise have broken keeps counting.
+    expect(await approvalStreak('purchase.place', { businessId: BUSINESS })).toBe(1);
   });
 
   it('refuses to decide the same approval twice', async () => {

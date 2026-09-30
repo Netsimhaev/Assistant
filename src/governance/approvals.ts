@@ -277,7 +277,42 @@ export async function decide(
     );
   }
 
-  const edited = decision.editedInput !== undefined;
+  // **`edited` is a comparison, not the presence of a field** — and this was
+  // the last of the two findings the 28/08 security review left open on
+  // purpose. It used to be `decision.editedInput !== undefined`, so ANY
+  // caller that passed the payload back unchanged stamped
+  // `approved_with_edit` on an approval nobody touched.
+  //
+  // The dashboard happens not to: `parseEditedInput`
+  // (`src/dashboard/server.ts`) hashes the owner's text against the original
+  // and omits the field when they match, precisely so a round-trip through
+  // the textarea that changed only key order is not read as an edit. But
+  // that put the whole control in ONE caller, one layer above the statement
+  // that writes the label — and this project's rule is that a boundary
+  // documented as a control has to be the control. A second caller (the SDK
+  // path, a future approval channel, a test helper copied from the wrong
+  // place) reintroduces the bug with nothing to catch it.
+  //
+  // **What the mislabel actually costs, which is why it is a security item
+  // and not a cosmetic one.** `approvalStreak`
+  // (`src/governance/agreement.ts`) counts only `approved` — `break` on
+  // anything else, deliberately, since an edit means the owner did not
+  // accept what was proposed. So a mislabelled row silently resets the run
+  // toward promotion: an owner who approved ten cards unchanged would never
+  // earn the raise, `evaluateAutonomy` would report no streak, and nothing
+  // anywhere would say why. That is the autonomy mechanism quietly not
+  // working, which is worse than it refusing out loud. Beyond that, the
+  // audit trail would assert that a human edited something they did not.
+  //
+  // Comparing against `existing.inputHash` and not against
+  // `decision.editedInput === undefined` also keeps `boundHash` below
+  // honest: an equivalent payload leaves the approval bound to the hash it
+  // was raised with, rather than rebinding it to a recomputation of the same
+  // bytes. The dashboard's own check stays where it is — two layers, the way
+  // this file's `expires_at` guard is checked in JS and again in SQL.
+  const edited =
+    decision.editedInput !== undefined &&
+    canonicalHash(decision.editedInput) !== existing.inputHash;
   const state: ApprovalState =
     outcome === 'denied' ? 'denied' : edited ? 'approved_with_edit' : 'approved';
 

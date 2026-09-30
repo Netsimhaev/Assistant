@@ -185,6 +185,12 @@ export const UNOWNED_TOOL_NAMES: ReadonlySet<string> = new Set([
   'contract.sign',
   'payment.charge',
   'charter.apply_amendment',
+  // Added 30/09 with `code_execution`'s move into `UNOWNED_TOOLS` — and this
+  // line is here because the invariant in `sign.test.ts` caught its absence,
+  // not because anyone remembered the mirror existed. Which is the whole
+  // point of that test: the capability layer was edited, the suite went red
+  // on this file, and the drift lasted one test run.
+  'code_execution',
 ]);
 
 /**

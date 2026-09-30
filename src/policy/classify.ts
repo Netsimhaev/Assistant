@@ -42,6 +42,16 @@ const TOOL_ACTION_CLASS: Record<string, ActionClass> = {
   // input is untrusted by construction; the quarantine invariant passed only
   // because an unclassified tool is invisible to it. Classified here and
   // removed from that allowlist, so the invariant now actually covers it.
+  //
+  // **The calibration that the 28/08 review flagged as open is resolved, and
+  // not by changing this line (30/09).** `artifact.write` is still the wrong
+  // shape for running code — it is calibrated for a reversible internal file
+  // write — so the tool was moved to `UNOWNED_TOOLS`
+  // (`src/charter/capabilities.ts`) and no agent holds it. The mapping stays
+  // because an unowned tool that is ALSO unclassified reverts to read-only the
+  // moment anyone re-adds it to an allowlist, which is exactly the state that
+  // review found. Read that list's docblock before re-owning this: it costs a
+  // new `ActionClass` and a schema-version bump, deliberately.
   'code_execution': 'artifact.write',
   'doc.deliver': 'doc.deliver',
   'memory.write_entity': 'memory.write_longterm',
