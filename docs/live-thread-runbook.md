@@ -333,8 +333,24 @@ SELECT seq, kind, actor, action_class, reason FROM audit_log
 
   אלה זהות ה-OAuth client של האפליקציה עצמה מול Google (Google Cloud
   Console — OAuth client ID מסוג "Web application"), **לא** הרשאה של עסק
-  בודד — שורה אחת משרתת כל עסק שההתקנה הזו מריצה. בלעדיהן `handleOAuthStart`
-  מסרב מיד ב"תצורה חסרה", לפני שהבעלים בכלל מגיע למסך ההסכמה של Google.
+  בודד: את ה-client יוצרים ב-Cloud Console **פעם אחת לכל המוצר**, ואותם שני
+  ערכים בדיוק מוקצים בכל התקנה. בלעדיהן `handleOAuthStart` מסרב מיד
+  ב"תצורה חסרה", לפני שהבעלים בכלל מגיע למסך ההסכמה של Google.
+
+  **אבל השורה במאגר היא לכל עסק, ולא אחת לכולם — המשפט הזה טען את ההפוך עד
+  30/09 וזה היה שגוי.** נאמר כאן ש"שורה אחת משרתת כל עסק שההתקנה הזו מריצה",
+  ואין מנגנון שמאפשר זאת: `googleTokenHttp`
+  ([src/orchestrator/adapters/google-token-http.ts](../src/orchestrator/adapters/google-token-http.ts))
+  פותר את שתי ההפניות דרך `credentials.resolve(ref, input.businessId)`, ו-
+  `storedCredentials` מסנן ב-`WHERE business_id = $1` **וגם** קושר את מזהה
+  העסק כ-AAD להצפנה עצמה — כלומר שורה שנכתבה תחת עסק א' אינה נקראת על ידי
+  עסק ב', לא בשאילתה ולא בצופן, וזו בקרה מכוונת (ראה `CLAUDE.md`, "שתי בקרות
+  בלתי-תלויות עומדות על אותו גבול"). בפועל אין כאן סתירה תפעולית, כי הפרויקט
+  מריץ **התקנה אחת לכל עסק** (`config.businessId` מ-`BUSINESS_ID` — כתוב
+  בדוקבלוק של [src/cli/secret.ts](../src/cli/secret.ts)), ולכן "שורה לכל
+  התקנה" ו"שורה לכל עסק" הם אותו דבר. מי שיארח שני עסקים בהתקנה אחת חייב
+  להקצות את שתי ההפניות **תחת כל אחד מהם בנפרד**; אחרת העסק השני נדחה
+  ב"תצורה חסרה" בלי שדבר יצביע על הסיבה.
 - `DASHBOARD_BASE_URL` מוגדר ותואם לכתובת שבה הדשבורד באמת מאזין (ראה שלב 2
   למעלה) — Google מפנה חזרה בדיוק ל-`<DASHBOARD_BASE_URL>/oauth/callback`,
   ואי-התאמה כאן היא תקלת ההתקנה הנפוצה ביותר (spec 5.5).
