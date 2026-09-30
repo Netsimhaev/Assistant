@@ -340,6 +340,21 @@ SELECT seq, kind, actor, action_class, reason FROM audit_log
   ואי-התאמה כאן היא תקלת ההתקנה הנפוצה ביותר (spec 5.5).
 - ב-Google Cloud Console: ה-redirect URI הרשום ל-client זהה בייט-לבייט
   לערך שהפקודה למעלה מחשבת.
+- **Google Calendar API מופעל בפרויקט** (Cloud Console → APIs & Services →
+  Library → Google Calendar API → Enable). זה **אינו** נגזר מההסכמה: חילופי
+  האסימון מדברים עם `oauth2.googleapis.com`, שאינו תלוי בכך, בזמן שקריאת
+  היומן עצמה מדברת עם `www.googleapis.com/calendar/v3`, שכן. לכן בלי ההפעלה
+  הזו **הטקס מצליח במלואו** — הרשאה נכתבת, ה-binding עובר ל-`provider:
+  'google'`, ומסך ההצלחה מוצג — ורק שלב 10.2 נכשל. שני תסמינים שנראים
+  מנותקים זה מזה ושניהם נובעים מכאן: מסך ההצלחה מציג את החשבון **ריק**, כי
+  `fetchGoogleAccount` ([src/dashboard/oauth-consent.ts](../src/dashboard/oauth-consent.ts))
+  קורא לאותו API כדי להביא את התווית, מחזיר `null` על כל כשל, ובמפורש אינו
+  מפיל את כתיבת ההרשאה בגללו; ו-`npm run connector:calendar` מחזיר
+  `forbidden` — **כשל סופי, לא לניסיון חוזר** — עם הודעת Google עצמה
+  מצורפת (`הגישה ליומן נדחתה (403) — Google Calendar API has not been used in
+  project ...`). ההודעה הזו כן אומרת מה לעשות, כך שהמחיר הוא סבב מבולבל אחד
+  ולא תעלומה; הבולט הזה נוסף ב-30/09 אחרי שהחסר הזה נמצא בתנאים המוקדמים
+  בזמן הכנת ההרצה החיה.
 - **מצב הפרסום (Publishing status) של מסך ההסכמה ב-Google Cloud Console.**
   `calendar.readonly` הוא scope רגיש, ו-client שנשאר במצב **"Testing"**
   (במקום "In production", אחרי אימות של Google או כמפיץ פנימי) מנפיק
