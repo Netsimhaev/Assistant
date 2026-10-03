@@ -1,0 +1,39 @@
+-- An approval-gated WhatsApp instruction needs two outbound reports, not one.
+--
+-- 037's `reportWhatsAppJobs` treated `await_approval` as a candidate phase
+-- (so the owner is told a card is waiting) and then claimed the opening
+-- message straight to `'reported'` for every outcome alike — the same
+-- terminal marker a genuinely closed job earns. `await_approval` is NOT
+-- terminal (`jobs.ts`'s `terminal = to IN ('closed','failed','halted')`
+-- excludes it; `resumeAfterDecision` moves an approved job on to `execute`),
+-- so the claim fired a full task early: the owner heard "waiting for your
+-- approval" once, approved it from the dashboard, the job ran and closed —
+-- and `reportCandidates`'s own `m.state IN ('handled','failed')` filter
+-- (before this migration) now excludes the row forever, because it already
+-- reads `'reported'`. He never hears what actually happened. For any
+-- instruction that costs money — the case this channel exists for — the one
+-- sentence he permanently gets is the interim one. This is the exact silence
+-- the whole report exists to prevent, one state later than migration 036/037
+-- closed it.
+--
+-- `'reported_interim'` says "the owner has been told once, and a second,
+-- real report is still owed" — distinct from `'reported'`, which says the
+-- report is done. `claimForReport` (`src/whatsapp/store.ts`) is
+-- parameterised on which claim is being made: an INTERIM claim only succeeds
+-- from `'handled'`/`'failed'` (so the interim notice fires exactly once, the
+-- same report-once discipline `'reported'` already had), and a TERMINAL
+-- claim succeeds from `'handled'`/`'failed'`/`'reported_interim'` (so a job
+-- that already got an interim notice still gets its real answer once it
+-- actually reaches a terminal phase). `reportCandidates`'s own phase filter
+-- is untouched by this migration — it decides which JOBS are worth looking
+-- at; this decides what the MESSAGE'S own state is allowed to say about
+-- itself along the way.
+--
+-- New file, never an edit to 036 or 037: the migration runner tracks applied
+-- migrations by filename, so editing 036's CHECK in place would leave any
+-- database that already ran 036 without the new value while the file on
+-- disk claimed otherwise — the same reasoning 037's own docblock already
+-- gives for not editing 036 to add its column.
+ALTER TABLE whatsapp_messages DROP CONSTRAINT whatsapp_messages_state_check;
+ALTER TABLE whatsapp_messages ADD CONSTRAINT whatsapp_messages_state_check
+    CHECK (state IN ('received', 'claimed', 'handled', 'failed', 'reported_interim', 'reported'));

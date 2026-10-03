@@ -123,8 +123,24 @@ export interface LocalToolContext {
   agent?: AgentId;
 }
 
-/** What a local handler returns — the value that lands in the step's record. */
-export type LocalToolResult = Record<string, unknown>;
+/**
+ * What a local handler returns — the value that lands in the step's record.
+ *
+ * `performed` is required at the TYPE level, not left to convention — fix
+ * round 1, Important 5. `performStep` (`run-plan.ts`) reads
+ * `output['performed'] === true` to set `StepEffect.performed`, which is what
+ * `job_step_results.performed` (migration 037) ends up holding and what the
+ * WhatsApp report classifies on. Before this, `LocalToolResult` was a bare
+ * `Record<string, unknown>`, so a future handler that forgot to state the
+ * field would compile clean — and every step it genuinely performed would be
+ * reported to the owner as `not_implemented`, because the read has no
+ * permissive default (correctly: an unreadable value is never a permissive
+ * one). The intersection makes the omission a compile error instead, at the
+ * one seam every handler already passes through — the alternative, an
+ * invariant test enumerating handlers, is exactly the "list written by hand"
+ * shape this codebase keeps paying for.
+ */
+export type LocalToolResult = Record<string, unknown> & { performed: boolean };
 
 type LocalHandler = (
   input: Record<string, unknown>,

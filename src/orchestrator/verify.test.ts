@@ -261,4 +261,55 @@ describe('closeVerifiedJobs', () => {
     expect(result.closed).toEqual([mine.jobId]);
     expect((await loadJob(theirs.jobId, { businessId: 'other-business' }))?.phase).toBe('verify');
   });
+
+  /**
+   * Task 8, fix round 1 — one of the four extra mutations the review asked
+   * for (ruling 5, promote-never-demote, applied to `performed` specifically
+   * rather than only to `status`). `recordStepCompletion`'s own docblock
+   * states the rule; this is the direct proof, including the half no
+   * existing test reached: a THIRD write that disagrees with an
+   * already-`completed` row must not be able to flip `performed` back,
+   * because the `WHERE` already refuses to touch `status` on such a row and
+   * `performed` rides the identical `WHERE`.
+   */
+  it('promotes performed from null to the real boolean, and never demotes it afterwards', async () => {
+    const { jobId, planHash } = await jobInVerify();
+
+    await withTransaction(async (tx) => {
+      await recordStepCompletion(tx, {
+        jobId, businessId: BUSINESS, planHash, stepId: 's1',
+        externalId: null, status: 'unknown', performed: null,
+      });
+    });
+    expect(await readPerformed(jobId, planHash)).toBeNull();
+
+    // The resume re-runs the step and it genuinely succeeds this time.
+    await withTransaction(async (tx) => {
+      await recordStepCompletion(tx, {
+        jobId, businessId: BUSINESS, planHash, stepId: 's1',
+        externalId: '<MSG-2@example.com>', status: 'completed', performed: true,
+      });
+    });
+    expect(await readPerformed(jobId, planHash)).toBe(true);
+
+    // A later write that disagrees must not be able to flip it back — the
+    // `WHERE` already refuses once `status` is `completed`.
+    await withTransaction(async (tx) => {
+      await recordStepCompletion(tx, {
+        jobId, businessId: BUSINESS, planHash, stepId: 's1',
+        externalId: '<MSG-3@example.com>', status: 'completed', performed: false,
+      });
+    });
+    expect(await readPerformed(jobId, planHash)).toBe(true);
+  });
 });
+
+async function readPerformed(jobId: string, planHash: string): Promise<boolean | null> {
+  const { rows } = await getPool().query<{ performed: boolean | null }>(
+    'SELECT performed FROM job_step_results WHERE job_id = $1 AND plan_hash = $2 AND step_id = $3',
+    [jobId, planHash, 's1'],
+  );
+  const row = rows[0];
+  if (row === undefined) throw new Error('expected a job_step_results row');
+  return row.performed;
+}

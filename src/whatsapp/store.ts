@@ -23,11 +23,21 @@ import { canonicalHash } from '../util/canonical.js';
 export type MessageDirection = 'inbound' | 'outbound';
 export type SenderKind = 'principal' | 'other';
 /**
- * Five states. `'reported'` is terminal and means the owner has been told
- * what came of the instruction this message opened — a later task writes it,
- * once the report-back exists; nothing in this module does.
+ * Six states (migration 038 added the fifth; `'reported'` was already the
+ * sixth position, unchanged). `'reported'` is terminal and means the owner
+ * has been told the real outcome of the instruction this message opened.
+ * `'reported_interim'` means he has been told something ONCE but the job has
+ * not reached a terminal phase yet — an approval card is still open — so a
+ * second, real report is still owed. Both are written by
+ * `claimForReport` below, never by anything else in this module.
  */
-export type MessageState = 'received' | 'claimed' | 'handled' | 'failed' | 'reported';
+export type MessageState =
+  | 'received'
+  | 'claimed'
+  | 'handled'
+  | 'failed'
+  | 'reported_interim'
+  | 'reported';
 
 export interface StoredMessage {
   id: string;
@@ -196,29 +206,56 @@ export async function settleMessage(
 }
 
 /**
- * Moves `'handled'` or `'failed'` to `'reported'` — the report-once claim.
+ * The report-once claim, parameterised by which report is being made.
+ *
+ * `'interim'` moves `'handled'`/`'failed'` → `'reported_interim'` — the
+ * owner has been told something once, but the job has not reached a
+ * terminal phase yet (an approval card is open), so a real report is still
+ * owed. `'terminal'` moves `'handled'`/`'failed'`/`'reported_interim'` →
+ * `'reported'` — the real, final outcome. The two claims are what task 8's
+ * fix round 1 added (migration 038) once an `await_approval` interim notice
+ * was found to be consuming the SAME claim a closed job needed later: a
+ * money-moving instruction got told "waiting for your approval" once,
+ * approved, ran, closed — and nothing ever told the owner that it closed,
+ * because the opening message already read `'reported'`.
+ *
+ * `'terminal'` deliberately also accepts `'reported_interim'` as a starting
+ * state — that is the whole mechanism: a job that already earned an interim
+ * notice is exactly the one that must still earn a terminal one. `'interim'`
+ * deliberately does NOT accept `'reported_interim'` as a starting state —
+ * that is report-once for the interim notice itself: a second pass that
+ * finds the job still in `await_approval` must not repeat it.
  *
  * The same single-`UPDATE ... WHERE` shape as `claimMessage` above, and for
  * the identical reason: `reportWhatsAppJobs` (`src/orchestrator/whatsapp-report.ts`)
- * must send the owner exactly one message per instruction, and a read-then-write
- * would let two overlapping passes both see an unreported row and both send.
+ * must send the owner exactly one message per claim, and a read-then-write
+ * would let two overlapping passes both see an unclaimed row and both send.
  * Returns `false` rather than throwing on a zero-row match — unlike
  * `settleMessage` — because a miss here is not a bug to surface: it is
- * "another pass already reported this", the ordinary outcome of losing the
+ * "another pass already made this claim", the ordinary outcome of losing the
  * race, and the caller's answer to it is to send nothing, not to fail.
  */
 export async function claimForReport(
   id: string,
+  kind: 'interim' | 'terminal',
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<boolean> {
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
 
-  const { rowCount } = await db.query(
-    `UPDATE whatsapp_messages SET state = 'reported'
-      WHERE id = $1 AND business_id = $2 AND state IN ('handled', 'failed')`,
-    [id, businessId],
-  );
+  const { rowCount } =
+    kind === 'interim'
+      ? await db.query(
+          `UPDATE whatsapp_messages SET state = 'reported_interim'
+            WHERE id = $1 AND business_id = $2 AND state IN ('handled', 'failed')`,
+          [id, businessId],
+        )
+      : await db.query(
+          `UPDATE whatsapp_messages SET state = 'reported'
+            WHERE id = $1 AND business_id = $2
+              AND state IN ('handled', 'failed', 'reported_interim')`,
+          [id, businessId],
+        );
   return rowCount === 1;
 }
 

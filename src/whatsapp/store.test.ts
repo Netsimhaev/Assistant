@@ -1,8 +1,9 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
-  claimMessage, conversation, recordInbound, recordOutbound, settleMessage, unclaimedInbound,
+  claimForReport, claimMessage, conversation, recordInbound, recordOutbound, settleMessage,
+  unclaimedInbound,
 } from './store.js';
 
 const BUSINESS = 'test-business';
@@ -99,5 +100,89 @@ describe('whatsapp store', () => {
     await recordInbound({ ...base, providerMessageId: 'w.4' }, { businessId: BUSINESS });
     expect(await conversation({ businessId: 'other-business' })).toEqual([]);
     expect(await unclaimedInbound({ businessId: 'other-business' })).toEqual([]);
+  });
+});
+
+/**
+ * Task 8, fix round 1 — `claimForReport` had no unit test of its own before
+ * this (the review's finding 4: exercised only indirectly through
+ * `whatsapp-report.test.ts`'s report-once test). These pin the two claim
+ * kinds directly, including the state-guard mutation the review named as the
+ * fourth extra mutation: widen either `WHERE ... state IN (...)` and the
+ * first test below starts passing a message it should refuse.
+ */
+describe('claimForReport', () => {
+  beforeEach(async () => { await resetDatabase(); });
+  afterAll(async () => { await closePool(); });
+
+  async function stateOf(id: string): Promise<string> {
+    const { rows } = await getPool().query<{ state: string }>(
+      'SELECT state FROM whatsapp_messages WHERE id = $1',
+      [id],
+    );
+    const row = rows[0];
+    if (row === undefined) throw new Error('expected a whatsapp_messages row');
+    return row.state;
+  }
+
+  it('refuses to claim a message that has not been settled yet — still received or claimed', async () => {
+    const received = await recordInbound({ ...base, providerMessageId: 'w.5' }, { businessId: BUSINESS });
+    if (received === null) throw new Error('unreachable');
+    expect(await claimForReport(received.id, 'interim', { businessId: BUSINESS })).toBe(false);
+    expect(await claimForReport(received.id, 'terminal', { businessId: BUSINESS })).toBe(false);
+    expect(await stateOf(received.id)).toBe('received');
+
+    await claimMessage(received.id, { businessId: BUSINESS });
+    expect(await claimForReport(received.id, 'interim', { businessId: BUSINESS })).toBe(false);
+    expect(await claimForReport(received.id, 'terminal', { businessId: BUSINESS })).toBe(false);
+    expect(await stateOf(received.id)).toBe('claimed');
+  });
+
+  it('moves handled/failed to reported_interim on an interim claim, exactly once', async () => {
+    const msg = await recordInbound({ ...base, providerMessageId: 'w.6' }, { businessId: BUSINESS });
+    if (msg === null) throw new Error('unreachable');
+    await claimMessage(msg.id, { businessId: BUSINESS });
+    await settleMessage(msg.id, 'handled', {}, { businessId: BUSINESS });
+
+    expect(await claimForReport(msg.id, 'interim', { businessId: BUSINESS })).toBe(true);
+    expect(await stateOf(msg.id)).toBe('reported_interim');
+
+    // Report-once for the interim notice itself: a second interim claim on
+    // the same message must not succeed a second time.
+    expect(await claimForReport(msg.id, 'interim', { businessId: BUSINESS })).toBe(false);
+    expect(await stateOf(msg.id)).toBe('reported_interim');
+  });
+
+  it('moves reported_interim to reported on a terminal claim — the owed second report', async () => {
+    const msg = await recordInbound({ ...base, providerMessageId: 'w.7' }, { businessId: BUSINESS });
+    if (msg === null) throw new Error('unreachable');
+    await claimMessage(msg.id, { businessId: BUSINESS });
+    await settleMessage(msg.id, 'handled', {}, { businessId: BUSINESS });
+    await claimForReport(msg.id, 'interim', { businessId: BUSINESS });
+
+    expect(await claimForReport(msg.id, 'terminal', { businessId: BUSINESS })).toBe(true);
+    expect(await stateOf(msg.id)).toBe('reported');
+  });
+
+  it('moves handled/failed straight to reported on a terminal claim, skipping the interim state', async () => {
+    const msg = await recordInbound({ ...base, providerMessageId: 'w.8' }, { businessId: BUSINESS });
+    if (msg === null) throw new Error('unreachable');
+    await claimMessage(msg.id, { businessId: BUSINESS });
+    await settleMessage(msg.id, 'failed', {}, { businessId: BUSINESS });
+
+    expect(await claimForReport(msg.id, 'terminal', { businessId: BUSINESS })).toBe(true);
+    expect(await stateOf(msg.id)).toBe('reported');
+  });
+
+  it('refuses every further claim once a message is reported — the final state', async () => {
+    const msg = await recordInbound({ ...base, providerMessageId: 'w.9' }, { businessId: BUSINESS });
+    if (msg === null) throw new Error('unreachable');
+    await claimMessage(msg.id, { businessId: BUSINESS });
+    await settleMessage(msg.id, 'handled', {}, { businessId: BUSINESS });
+    await claimForReport(msg.id, 'terminal', { businessId: BUSINESS });
+
+    expect(await claimForReport(msg.id, 'interim', { businessId: BUSINESS })).toBe(false);
+    expect(await claimForReport(msg.id, 'terminal', { businessId: BUSINESS })).toBe(false);
+    expect(await stateOf(msg.id)).toBe('reported');
   });
 });
