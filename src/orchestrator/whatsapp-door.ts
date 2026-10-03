@@ -18,31 +18,68 @@
  * sender against — worse than not running. Loading it throws on a stale
  * schema (`loadActiveCharter`'s own docblock) and that throw is left to
  * propagate out of this module rather than caught here, before a single
- * message is ever recorded.
+ * message is ever recorded. **A missing charter is fatal for a sharper
+ * reason than staleness, fix round 1's review caught this:** with no charter
+ * there is no principal number at all, so `principalWhatsAppKey` returns
+ * `null` and `isPrincipalSender` returns `false` for *everyone*, including
+ * the owner — the door would record the owner's own messages as a
+ * stranger's, settle them `'handled'`, and reply to no one, permanently and
+ * without a trace. Throwing before the first message is recorded is the only
+ * safe response to that, not merely a policy preference.
  *
- * **A message is claimed before it costs anything irreversible, never
- * before.** `claimMessage` runs immediately before the one call that can
- * open a job and spend a planner call — never earlier. A crash between the
- * two loses one instruction rather than risking a second one being planned
- * for the same inbound message on a retry; the same direction
- * `markContentIngested` (`src/documents/read.ts`) already chose for the same
- * reason. A throw anywhere after that point settles the message `'failed'`
- * and does not stop the rest of the batch — one poison message must not
- * block the queue, the same isolation `runDueJobs` gives each job it runs.
+ * **A message is claimed before it costs anything that can open a job, never
+ * before.** `claimMessage` runs immediately before the daily instruction cap
+ * check and `runInstruction` — never earlier. A crash between the two loses
+ * one instruction rather than risking a second one being planned for the
+ * same inbound message on a retry; the same direction `markContentIngested`
+ * (`src/documents/read.ts`) already chose for the same reason. This is
+ * narrower than "nothing above the claim spends anything" — fix round 1's
+ * Minor 9 caught an earlier version of this docblock overstating it:
+ * transcription runs above the claim, on purpose (the brief's own ordering),
+ * calls a paid provider, and writes its own daily-budget audit row; what the
+ * claim actually guards is the one thing that can *open a job*.
+ *
+ * **Every throw inside a message's own processing is caught, settles the row,
+ * and — once the sender is positively known to be the principal — tells the
+ * owner, rather than leaving silence in every direction.** Fix round 1's
+ * Important 2–4: the whole per-message body sits inside one `try`, not just
+ * the tail end after the claim, because `pollOnce` has already drained the
+ * message out of the provider's queue by the time this runs — a throw from
+ * `recordInbound`, from the transcription call (which awaits
+ * `downloadAudio()` before any claim exists), or from anything after the
+ * claim must not abandon the rest of an already-collected batch, the same
+ * isolation `runDueJobs` gives each job it runs. The notify-on-failure is
+ * gated **positively**, not merely wrapped in a flag that defaults safe: a
+ * throw before the sender is established as the principal (a `recordInbound`
+ * failure, or the stranger branch's own `settleMessage` failing) stays
+ * silent on purpose — Decision 4 says a customer feels no change, and
+ * "we crashed, so we replied to a customer" is the one exception that rule
+ * cannot survive.
  *
  * **This module never decides anyone's trust level for anything it hands
  * onward.** The one instruction pipeline it drives (`runInstruction`,
  * `./instruct.js`) already fixes that on its own, as a literal, and takes no
  * parameter that could override it — a caller able to aim that value would be
- * a caller able to forge an instruction. This module has no business logic of
- * its own that needs to state it either, and does not; see
- * `whatsapp-invariants.test.ts`.
+ * a caller able to forge an instruction. `whatsapp-invariants.test.ts` pins
+ * this positively: the only thing that crosses into `runInstruction` is
+ * `{ text }`.
  *
  * **The transcript rides the acknowledgement — one outbound message, never
  * two.** A mistranscription is a mistaken instruction (spec §6.3), and the
  * gap between what the owner said and what the assistant heard must be
  * visible in the same breath as what the assistant is about to do about it,
  * not in a message the owner might never connect to the one that follows it.
+ *
+ * **The acknowledgment is sent before the job is linked to the message, not
+ * after.** Fix round 1's Important 5: ruling 2 requires `linkWhatsAppMessage`
+ * before `settleMessage`, and that ordering is kept, but a link write sitting
+ * between the ack and the settle meant a link failure threw *before* the
+ * owner ever heard anything — for a job that `runDueJobs` would really go on
+ * to execute. The order is `runInstruction` → the budget audit row → the ack
+ * → the link → the settle: a crash between the ack and the link leaves an
+ * unlinked job the owner already knows exists (a dashboard lookup gap), which
+ * is recoverable; a crash before the ack leaves the owner in the dark about
+ * an instruction that is about to run, which is not.
  *
  * **Messages are collected, then sorted, then processed — never handled
  * inline from inside the gateway's own delivery callback.** `pollOnce` drives
@@ -54,7 +91,10 @@
  * the same shape `unclaimedInbound` and `conversation`
  * (`src/whatsapp/store.ts`) already use for the same reason: two instructions
  * arriving in the same second must still come out in one reconstructible
- * order, not whichever order this pass happened to see them.
+ * order, not whichever order this pass happened to see them. A
+ * `providerTimestamp` that fails to parse (`NaN`) never wins a comparison —
+ * fix round 1's Minor 10 — the tie-break is what decides instead, because a
+ * value this door could not read is never a permissive "sort wherever".
  */
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
@@ -69,6 +109,7 @@ import {
   settleMessage,
   whatsappInstructionsToday,
   type SenderKind,
+  type StoredMessage,
 } from '../whatsapp/store.js';
 import { transcribeInbound, type TranscriptionProvider } from '../whatsapp/transcribe.js';
 import { runInstruction, type InstructionOutcome, type RunInstructionOptions } from './instruct.js';
@@ -81,7 +122,7 @@ export interface DoorResult {
   instructed: number;
   /** From anyone but the one authorised sender. Stored, answered to no one. */
   recordedOnly: number;
-  /** From the authorised sender, but no job resulted — a cap, a transcription problem, or `runInstruction` itself declining. */
+  /** From the authorised sender, but no job resulted — a cap, a transcription problem, a thrown error, or `runInstruction` itself declining. */
   refused: number;
 }
 
@@ -98,6 +139,15 @@ const INSTRUCTION_CAP_REACHED =
   'הגעתי היום למכסת ההוראות המותרת. אפשר לנסות שוב מחר.';
 /** No ready-made sentence exists on a `'planned'` outcome — see `composeAck` below. */
 const PLANNED_ACK = 'קיבלתי, אני מטפלת בזה.';
+/**
+ * Told to the owner, and only the owner (see the module docblock's positive
+ * notify gate), when something throws after the sender is already known to
+ * be the principal. Deliberately generic — the real cause belongs in logs
+ * and the audit trail, never guessed at out loud to a human who cannot act
+ * on a stack trace.
+ */
+const SOMETHING_WENT_WRONG =
+  'קרתה תקלה אצלי בטיפול בהודעה הזו. אפשר לנסות לשלוח אותה שוב?';
 
 function tooLongMessage(seconds: number): string {
   return `ההקלטה ארוכה מדי (${seconds} שניות). אפשר לכתוב את ההודעה בטקסט?`;
@@ -127,10 +177,17 @@ function withTranscriptEcho(isAudio: boolean, transcript: string, rest: string):
 
 /**
  * Oldest first by the provider's own clock, the provider's own message id as
- * the tie-break — see the module docblock.
+ * the tie-break — see the module docblock. A `providerTimestamp` that does
+ * not parse yields `NaN` from `getTime()`, and `NaN !== 0` is true — left
+ * unguarded, that would hand back `NaN` itself as the comparison result and
+ * put this pair in an unspecified order instead of falling through to the
+ * tie-break. Fix round 1's Minor 10: a value this door could not read must
+ * never behave as a looser rule than a value it could.
  */
 function compareInbound(a: NormalizedInboundMessage, b: NormalizedInboundMessage): number {
-  const byTime = new Date(a.providerTimestamp).getTime() - new Date(b.providerTimestamp).getTime();
+  const aTime = new Date(a.providerTimestamp).getTime();
+  const bTime = new Date(b.providerTimestamp).getTime();
+  const byTime = Number.isNaN(aTime) || Number.isNaN(bTime) ? 0 : aTime - bTime;
   if (byTime !== 0) return byTime;
   return a.providerMessageId.localeCompare(b.providerMessageId);
 }
@@ -163,39 +220,73 @@ async function tellOwnerAndSettle(
   await settleMessage(messageId, 'failed', {}, { businessId: ctx.businessId });
 }
 
+/**
+ * One message, start to finish. Never throws — every exit is a `return`,
+ * including from the `catch` — so a poison message cannot abort the batch
+ * `runWhatsAppDoor` collected it into; see the module docblock on isolation.
+ *
+ * `stored`, `established`, `attemptedInstruction` and `instructionRecorded`
+ * are declared outside the `try` on purpose: the `catch` needs to know how
+ * far processing got — is there a row to settle, is this positively the
+ * principal (so telling them something is safe), had an instruction attempt
+ * already begun (so the daily budget must still count it), was that attempt
+ * already recorded (so the `catch` does not double-count the one
+ * `runInstruction` call this message ever makes) — and a variable assigned
+ * only inside the `try` would not survive into the `catch` that needs to
+ * read it.
+ */
 async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): Promise<ProcessOutcome> {
-  const senderKind: SenderKind = isPrincipalSender(ctx.charter, msg.senderNumber)
-    ? 'principal'
-    : 'other';
+  let stored: StoredMessage | null = null;
+  // Set only once this message is positively known to be the principal's own
+  // — never on a guess, never by default. Gates the owner-facing notify in
+  // the `catch` below; see the module docblock's "positive notify gate".
+  let established = false;
+  // Set only once a `runInstruction` call has actually begun — a throw past
+  // this point may already have been billed (a planner call), so the daily
+  // budget must still count it (fix round 1, Important 7).
+  let attemptedInstruction = false;
+  // Set only once the normal-flow write below actually ran. Without this,
+  // a throw AFTER that write (the link, the final settle) would make the
+  // `catch` write a second `whatsapp_instruction` row for the same single
+  // attempt — a different bug in the opposite direction from the one this
+  // fix round closes.
+  let instructionRecorded = false;
+  let text = '';
 
-  const stored = await recordInbound(
-    {
-      providerMessageId: msg.providerMessageId,
-      senderNumber: msg.senderNumber,
-      senderKind,
-      body: msg.body,
-      mediaKind: msg.mediaKind,
-      providerTimestamp: msg.providerTimestamp,
-    },
-    { businessId: ctx.businessId },
-  );
-  // A redelivery of a message already recorded — the unique index decided,
-  // not a prior read (`recordInbound`'s own docblock). Nothing to settle:
-  // whatever happened on the first delivery already closed it out, or is
-  // still in flight on the pass that is handling it.
-  if (stored === null) return 'skipped';
-
-  if (senderKind === 'other') {
-    // Decision 4. Recorded for the conversation screen and closed out
-    // immediately — no claim, because nothing on this branch will ever plan
-    // or spend anything, and no reply, ever.
-    await settleMessage(stored.id, 'handled', {}, { businessId: ctx.businessId });
-    return 'recordedOnly';
-  }
-
-  let claimed = false;
   try {
-    let text: string;
+    const senderKind: SenderKind = isPrincipalSender(ctx.charter, msg.senderNumber)
+      ? 'principal'
+      : 'other';
+
+    stored = await recordInbound(
+      {
+        providerMessageId: msg.providerMessageId,
+        senderNumber: msg.senderNumber,
+        senderKind,
+        body: msg.body,
+        mediaKind: msg.mediaKind,
+        providerTimestamp: msg.providerTimestamp,
+      },
+      { businessId: ctx.businessId },
+    );
+    // A redelivery of a message already recorded — the unique index decided,
+    // not a prior read (`recordInbound`'s own docblock). Nothing to settle:
+    // whatever happened on the first delivery already closed it out, or is
+    // still in flight on the pass that is handling it.
+    if (stored === null) return 'skipped';
+
+    if (senderKind === 'other') {
+      // Decision 4. Recorded for the conversation screen and closed out
+      // immediately — no claim, because nothing on this branch will ever plan
+      // or spend anything, and no reply, ever. `established` stays `false`:
+      // even if the settle below throws, a stranger gets no message from
+      // this assistant, full stop.
+      await settleMessage(stored.id, 'handled', {}, { businessId: ctx.businessId });
+      return 'recordedOnly';
+    }
+
+    established = true;
+
     const isAudio = msg.mediaKind === 'audio';
 
     if (isAudio) {
@@ -228,13 +319,12 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       text = msg.body;
     }
 
-    // The one line that matters for crash safety — see the module docblock.
-    // Nothing above this spends anything irreversible; everything below it
-    // can.
-    claimed = await claimMessage(stored.id, { businessId: ctx.businessId });
+    // The line that matters for crash safety — see the module docblock.
+    // Nothing above this can open a job; everything below it can.
+    const claimed = await claimMessage(stored.id, { businessId: ctx.businessId });
     if (!claimed) return 'skipped'; // raced by another runner on this message.
 
-    const usedToday = await whatsappInstructionsToday({ businessId: ctx.businessId });
+    const usedToday = await whatsappInstructionsToday(ctx.businessId);
     if (usedToday >= config.whatsappInstructionsPerDay) {
       await ctx.messenger.send({
         text: withTranscriptEcho(isAudio, text, INSTRUCTION_CAP_REACHED),
@@ -249,6 +339,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       return 'refused';
     }
 
+    attemptedInstruction = true;
     const outcome = await runInstruction(
       { text },
       {
@@ -259,22 +350,37 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
 
     // Every attempt this door makes, whatever came of it — see
     // `recordWhatsAppInstructionAttempt`'s own docblock on why a refusal
-    // still has to spend a slot.
-    await recordWhatsAppInstructionAttempt({ status: outcome.status, textLength: text.length });
+    // still has to spend a slot. `businessId` is positional and required on
+    // both of these calls (fix round 1, Critical 1): the read above and this
+    // write must agree on which business's ledger they touch, or the cap
+    // this pair exists to enforce means nothing for any business this door
+    // is explicitly given.
+    await recordWhatsAppInstructionAttempt(ctx.businessId, {
+      status: outcome.status,
+      textLength: text.length,
+    });
+    // Marks the row as already written, so a throw further down this same
+    // function (the link write, the final settle, the ack) does NOT make the
+    // `catch` write a second row for the one attempt `runInstruction` just
+    // made — see the `catch` block's own comment on why it checks this flag.
+    instructionRecorded = true;
 
     const ack = composeAck(outcome);
     const fullText = withTranscriptEcho(isAudio, text, ack);
     const jobId = outcome.status === 'refused' ? null : outcome.jobId;
 
+    // Ack BEFORE the link write — fix round 1, Important 5. A link failure
+    // below must not leave the owner silent about a job that will really
+    // run; ruling 2's own requirement (link before settle) is unaffected,
+    // since the link still lands before the settle three lines down.
+    await ctx.messenger.send({ text: fullText, jobId });
+
     if (jobId !== null) {
-      // Written first, then the settle that follows carries the same id —
-      // two commits, not one transaction. A crash between them loses the
-      // link, never a second job: the message is already claimed, and
-      // nothing re-offers a claimed message for planning again.
+      // A crash here loses the link, never a second job: the message is
+      // already claimed, and nothing re-offers a claimed message for
+      // planning again.
       await linkWhatsAppMessage(jobId, stored.id, { businessId: ctx.businessId });
     }
-
-    await ctx.messenger.send({ text: fullText, jobId });
 
     // 'handled' for a job that now exists (`planned`/`needs_answer`),
     // 'failed' for a plain `'refused'` — the instruction did not succeed,
@@ -294,16 +400,44 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     return jobId !== null ? 'instructed' : 'refused';
   } catch {
     // One poison message must not block the queue — the same isolation
-    // `runDueJobs` gives each job. Only settled `'failed'` when it was
-    // claimed: an error before that point spent nothing irreversible, and
-    // the row is simply left `'received'` rather than marked as a failure it
-    // never truly reached.
-    if (claimed) {
+    // `runDueJobs` gives each job. Three things, each gated on how far
+    // processing actually got before it threw (fix round 1, Important 2–4,
+    // 7):
+    //
+    //   1. If an instruction attempt had begun AND was not already recorded
+    //      by the normal flow, the daily budget still counts it — a planner
+    //      call may already have been billed, and losing the row would let
+    //      that spend go uncounted. `instructionRecorded` guards the other
+    //      direction: a throw AFTER the normal-flow write (the link, the
+    //      final settle) must not count the same attempt twice.
+    //   2. If a row exists for this message, it is settled `'failed'` —
+    //      whether the throw landed before or after the claim. Nothing in
+    //      production reads `unclaimedInbound` today, so leaving a row
+    //      `'received'` forever is not "will be retried", it is "lost, with
+    //      no trace" — worse than an honest `'failed'`.
+    //   3. The owner is told, in Hebrew, but **only** once this message was
+    //      positively established as the principal's own. A throw before
+    //      that point (a `recordInbound` failure, or the stranger branch's
+    //      own settle failing) stays silent — Decision 4 again: a stranger
+    //      gets no reply, ever, not even an apology for a crash.
+    if (attemptedInstruction && !instructionRecorded) {
+      await recordWhatsAppInstructionAttempt(ctx.businessId, {
+        status: 'refused',
+        textLength: text.length,
+      });
+    }
+    if (stored !== null) {
       await settleMessage(stored.id, 'failed', {}, { businessId: ctx.businessId }).catch(() => {
         // Best-effort: the message is already unrecoverable from this pass's
         // point of view, and a second failure here must not take the rest of
         // the batch down with it.
       });
+    }
+    if (established) {
+      // `messenger.send` never throws by contract (`BossMessenger`'s own
+      // docblock) — nothing further to guard here.
+      await ctx.messenger.send({ text: SOMETHING_WENT_WRONG, jobId: null });
+      return 'refused';
     }
     return 'skipped';
   }
@@ -322,10 +456,9 @@ export async function runWhatsAppDoor(options: {
   const { gateway, messenger } = options;
 
   // Loaded once, before the queue is touched at all — see the module
-  // docblock. Left to throw on a stale schema rather than caught here: a
-  // door that cannot parse its own policy has nothing to check a sender
-  // against, and recording a message under a guessed trust level is worse
-  // than not running at all.
+  // docblock. Left to throw on a stale schema rather than caught here, and
+  // treated the same way when no charter is installed at all: either way,
+  // this door has no principal number to check a sender against.
   const active = await loadActiveCharter(businessId);
   if (active === null) {
     throw new Error(
@@ -355,7 +488,18 @@ export async function runWhatsAppDoor(options: {
   };
 
   for (const msg of ordered) {
-    const outcome = await processOne(msg, ctx);
+    // `processOne` never throws — see its own docblock — so this `try` is a
+    // last-resort safety net, not the primary mechanism. Belt and braces:
+    // the same isolation `runDueJobs` gives each job it runs is given here
+    // twice, once inside `processOne` (which actually settles and notifies)
+    // and once here (which merely ensures a genuinely unexpected throw
+    // cannot take the rest of the batch down with it).
+    let outcome: ProcessOutcome;
+    try {
+      outcome = await processOne(msg, ctx);
+    } catch {
+      continue;
+    }
     if (outcome === 'recordedOnly') result.recordedOnly += 1;
     else if (outcome === 'instructed') result.instructed += 1;
     else if (outcome === 'refused') result.refused += 1;

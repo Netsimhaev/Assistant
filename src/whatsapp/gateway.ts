@@ -47,7 +47,13 @@ export interface WhatsAppGateway {
     contactId: string; body: string; idempotencyKey: string;
   }): Promise<{ messageId: string; state: 'sent' | 'queued' | 'rejected' }>;
   health(): Promise<GatewayHealth>;
-  /** Registers the handler. Push and pull implementations both satisfy this. */
+  /**
+   * Registers the handler. Push and pull implementations both satisfy this.
+   * Replaces any previous handler — fix round 1 (task 7), Minor 14: a caller
+   * that registers on every pass (the door does, once per `runWhatsAppDoor`
+   * call) must not accumulate one closure per pass against an
+   * EventEmitter-backed implementation.
+   */
   onInbound(handler: (msg: NormalizedInboundMessage) => Promise<void>): void;
   /**
    * Drains whatever is waiting and returns how many messages it delivered to

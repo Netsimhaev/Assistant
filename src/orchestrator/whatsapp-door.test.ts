@@ -216,7 +216,11 @@ describe('runWhatsAppDoor', () => {
     expect(result.recordedOnly).toBe(1);
     expect(result.instructed).toBe(0);
     expect(messenger.sentTexts).toEqual([]); // no auto-reply, ever
-    expect(await openJobs(BUSINESS)).toHaveLength(0);
+    // `allJobs`, not `openJobs` — fix round 1, Important 8. `openJobs` only
+    // excludes terminal phases, so it cannot tell "no job was ever created"
+    // apart from "a job was created and then failed out" — the one property
+    // this test is meant to carry.
+    expect(await allJobs(BUSINESS)).toHaveLength(0);
   });
 
   it('acknowledges a needs_answer outcome with the question itself', async () => {
@@ -257,6 +261,49 @@ describe('runWhatsAppDoor', () => {
     // planner — but it was failed out, so it no longer counts as "open".
     expect(await allJobs(BUSINESS)).toHaveLength(1);
     expect(await openJobs(BUSINESS)).toHaveLength(0);
+  });
+
+  /**
+   * Fix round 1, Critical 1 + Important 6. Before the fix,
+   * `recordWhatsAppInstructionAttempt` was called with no `businessId`
+   * argument at all, so the write silently fell back to `config.businessId`
+   * while the daily-cap *read* correctly used `ctx.businessId` — the cap
+   * never filled for any business this door was explicitly given, and
+   * `audit_log` (append-only) accumulated rows under the wrong business
+   * forever. No test caught it, because the cap test below seeds its own
+   * rows directly rather than ever observing the door write one. This test
+   * closes both gaps at once, exactly as the review suggested: it asserts a
+   * `whatsapp_instruction` row exists under the business the door was given
+   * — which also pins "every outcome, including `refused`, counts" — and
+   * that none landed under `config.businessId` instead.
+   */
+  it('writes the instruction audit row under the business it was given, never the default', async () => {
+    // Sanity: if these were ever equal, the two counts below could not tell
+    // a misattributed row apart from a correctly-attributed one.
+    expect(config.businessId).not.toBe(BUSINESS);
+
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'ג׳יבריש לא מובן' }));
+
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async () => ({ status: 'unparseable', raw: 'not json', reason: 'bad model output' }),
+    });
+
+    const underGivenBusiness = await getPool().query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM audit_log WHERE business_id = $1 AND kind = 'whatsapp_instruction'`,
+      [BUSINESS],
+    );
+    expect(underGivenBusiness.rows[0]?.n).toBe('1');
+
+    const underDefaultBusiness = await getPool().query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM audit_log WHERE business_id = $1 AND kind = 'whatsapp_instruction'`,
+      [config.businessId],
+    );
+    expect(underDefaultBusiness.rows[0]?.n).toBe('0');
   });
 
   /**
@@ -307,6 +354,11 @@ describe('runWhatsAppDoor', () => {
     });
 
     expect(result.instructed).toBe(1);
+    // Fix round 1, Important 6: without `toHaveLength(1)`, a two-message
+    // split (transcript first, ack second) would satisfy both `toContain`
+    // checks below just as well, leaving ruling 4's "one message, never two"
+    // completely unlocked.
+    expect(messenger.sentTexts).toHaveLength(1);
     expect(messenger.sentTexts[0]).toContain('שמעתי:');
     expect(messenger.sentTexts[0]).toContain('תשלחי למוטי');
   });
@@ -332,6 +384,42 @@ describe('runWhatsAppDoor', () => {
     expect(await openJobs(BUSINESS)).toHaveLength(0);
   });
 
+  /**
+   * Fix round 1, Important 2–4. `transcribeInbound` awaits
+   * `msg.downloadAudio()` outside its own try (`transcribe.ts`'s own
+   * docblock calls this out), so a failed download throws all the way out of
+   * `transcribeInbound` — the realistic trigger the review identified, not a
+   * contrived one. Before this fix round, the door's `catch` settled the row
+   * `'failed'` but told the owner nothing and returned `'skipped'`, which
+   * counts toward none of `DoorResult`'s three buckets: a pass that destroyed
+   * every instruction this way was indistinguishable from a pass of pure
+   * redeliveries. Now it notifies (because the sender was already
+   * established as the principal before this throw), settles `'failed'`,
+   * and counts as `'refused'`.
+   */
+  it('tells the owner and settles failed when downloading the recording itself throws', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    const msg = audioMsg({ senderNumber: PRINCIPAL_NUMBER });
+    msg.downloadAudio = async () => {
+      throw new Error('network died mid-download');
+    };
+    gateway.enqueue(msg);
+
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      provider: async () => ({ text: 'should never be reached' }),
+      planner: neverCalled,
+    });
+
+    expect(result.refused).toBe(1);
+    expect(messenger.sentTexts).toHaveLength(1);
+    expect(messenger.sentTexts[0]).not.toBe('');
+    expect(await stateOf(msg.providerMessageId)).toBe('failed');
+  });
+
   it('tells the owner rather than staying silent when no transcription provider is configured', async () => {
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
@@ -346,7 +434,12 @@ describe('runWhatsAppDoor', () => {
 
     expect(result.refused).toBe(1);
     expect(messenger.sentTexts).toHaveLength(1);
-    expect(messenger.sentTexts[0]).not.toBe('');
+    // Fix round 1, Minor 12: `not.toBe('')` cannot tell this branch apart
+    // from the transcription-FAILED branch, which also sends a non-empty
+    // Hebrew sentence. `'לתמלל'` ("to transcribe") appears only in the
+    // no-transcriber sentence, never in `CANNOT_UNDERSTAND`
+    // (`transcribe.ts`), so this actually pins which branch ran.
+    expect(messenger.sentTexts[0]).toContain('לתמלל');
   });
 
   it('stops instructing once the daily instruction cap is reached, and says so', async () => {

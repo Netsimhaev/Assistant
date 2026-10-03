@@ -264,16 +264,32 @@ export async function conversation(
  * own docblock in `src/domain/audit.ts` for why a shared kind would spend one
  * budget against the other.
  *
+ * **`businessId` is a required positional parameter, not `options.businessId
+ * ?? config.businessId`** — fix round 1, Critical 1. This pair's sibling read
+ * (`whatsappTranscriptionsToday`, above) does default, but that default is
+ * safe only because nothing here writes under it; the moment a cap's
+ * *count* and its *write* can silently disagree about which business they
+ * mean, a caller that forgets the argument reads one business's rows while
+ * writing another's — exactly the gap that let the cap for an
+ * explicitly-named business stay permanently empty. `recordWhatsAppInstructionAttempt`
+ * below carries the same requirement for the same reason, and the two must
+ * be called with the same value or the cap this pair exists to enforce means
+ * nothing.
+ *
  * Lives here, beside the rest of the WhatsApp message lifecycle, rather than
- * in the door itself — the door's own module must never need to state the
- * trust level an audit row carries (see that file's own invariant test), and
- * every attempt this counts is, by construction, an attempt the door made on
- * the owner's behalf.
+ * in `transcribe.ts` (which spends the *sibling* budget) or a small module of
+ * its own. Fix round 1 confirmed this is no longer forced by the invariant
+ * test (see `whatsapp-invariants.test.ts`'s narrower replacement) — it is now
+ * a real design choice, not a workaround, and the choice made is: `store.ts`
+ * already owns `whatsapp_messages` and the dedupe/claim mechanics for this
+ * exact channel, and `transcribe.ts`'s own precedent (reading and writing
+ * `audit_log` from a module that does not own that table either) is the
+ * established shape for a channel-scoped budget, not an exception to it.
  */
 export async function whatsappInstructionsToday(
-  options: { businessId?: string; db?: Queryable } = {},
+  businessId: string,
+  options: { db?: Queryable } = {},
 ): Promise<number> {
-  const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM audit_log
@@ -286,10 +302,19 @@ export async function whatsappInstructionsToday(
 
 /**
  * The one audit row an instruction attempt produces, whatever `runInstruction`
- * returned. Carries counts (the instruction's character length) and the
- * outcome status only — never the instruction text and never the sender's
- * number. See `'whatsapp_instruction'`'s own docblock in `src/domain/audit.ts`
- * for the full reasoning.
+ * returned (or a thrown rejection — the door also calls this from its own
+ * catch when an attempt had already begun). Carries counts (the
+ * instruction's character length) and the outcome status only — never the
+ * instruction text and never the sender's number. See
+ * `'whatsapp_instruction'`'s own docblock in `src/domain/audit.ts` for the
+ * full reasoning.
+ *
+ * `businessId` is a required positional parameter, exactly like `recordAttempt`
+ * (`transcribe.ts`) and for the identical reason stated on
+ * `whatsappInstructionsToday` above — fix round 1, Critical 1. The one call
+ * site that existed before this fix omitted it entirely, which is exactly
+ * the shape `options.businessId ?? config.businessId` makes easy to do by
+ * accident and a required positional argument makes a compile error instead.
  *
  * Every row this writes carries a fixed trust level: only a message from the
  * principal ever reaches this far (`src/orchestrator/whatsapp-door.ts` calls
@@ -302,10 +327,9 @@ export async function whatsappInstructionsToday(
  * failed to write a moment later.
  */
 export async function recordWhatsAppInstructionAttempt(
+  businessId: string,
   counts: { status: 'planned' | 'needs_answer' | 'refused'; textLength: number },
-  options: { businessId?: string } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
   try {
     await appendAudit(
       {
