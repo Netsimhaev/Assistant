@@ -202,8 +202,7 @@ function withTranscriptEcho(isAudio: boolean, transcript: string, rest: string):
  * mixes unreadable and readable timestamps directly against this function
  * (see its own export docblock), and fails under the `return 0` form this
  * replaced.
- */
-/**
+ *
  * Exported for `whatsapp-door.test.ts` alone, to unit-test the comparator's
  * ordering directly — including an unreadable-timestamp case that cannot be
  * driven through `runWhatsAppDoor` at all, because `providerTimestamp` also
