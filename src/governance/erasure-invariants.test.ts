@@ -103,6 +103,28 @@ describe('what an erasure leaves behind', () => {
        VALUES ('INS-probe', $1, $2, $3)`,
       [BUSINESS, job.jobId, `תשלחי אל ${PROBE}`],
     );
+    // Migration 036's table. Tied to the job (the `job_id` arm of
+    // `WHATSAPP_MESSAGES_ERASED_PREDICATE`), with the probe in all three
+    // content columns the contact arm also matches directly — so this row
+    // alone cannot tell the two arms apart; the orphan row below does that.
+    await db.query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, provider_message_id, direction, sender_number,
+          sender_kind, body, transcript, provider_timestamp, state, job_id)
+       VALUES ('WA-probe', $1, 'wamid-probe', 'inbound', $2, 'principal', $3, $4, now(), 'handled', $5)`,
+      [BUSINESS, PROBE, `שלח אל ${PROBE}`, `תמלול: שלח אל ${PROBE}`, job.jobId],
+    );
+    // An ORPHAN message — no job at all, exactly the shape `job_id = ANY($2)`
+    // alone cannot reach (the same gap `approval_requests`'s orphan card
+    // closes for its own table). Only the contact arm's direct column match
+    // finds this row.
+    await db.query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, provider_message_id, direction, sender_number,
+          sender_kind, body, provider_timestamp, state, job_id)
+       VALUES ('WA-probe-orphan', $1, 'wamid-probe-orphan', 'inbound', $2, 'other', $3, now(), 'received', NULL)`,
+      [BUSINESS, PROBE, `פנייה לא קשורה ממספר של ${PROBE}`],
+    );
     await writeMemory(
       { jobId: job.jobId, kind: 'entity', subjectKey: PROBE, body: { email: PROBE } },
       { businessId: BUSINESS },

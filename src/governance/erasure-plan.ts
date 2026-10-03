@@ -89,6 +89,22 @@
  * sitting in `job_plans.plan`. The `job_plans` query added to the document
  * branch below is the closure, written the same positive way the contact
  * anchor's is.
+ *
+ * **Migration 036 added `whatsapp_messages`, and it is wired in below.**
+ * `.sender_number`, `.body` and `.transcript` are content about a person in
+ * exactly the sense `boss_instructions.text` already is. It is NOT scoped by
+ * `job_id` alone the way `boss_instructions` is, because `whatsapp_messages
+ * .job_id` is nullable where `boss_instructions.job_id` is `NOT NULL UNIQUE`:
+ * an unclaimed inbound message (still `received`) or a message from a number
+ * the business never opened a job for carries no job at all, and
+ * `job_id = ANY($2)` alone would leave such a row as unreachable as the
+ * orphan `approval_requests` card already was (N1, above). So the predicate
+ * has the same three arms that card's does: `job_id = ANY($2)` for a message
+ * tied to a job the anchor already found, a contact arm matching
+ * `sender_number`/`body`/`transcript` directly for a message with none, and a
+ * window arm matching `created_at` for the same reason — a window anchor
+ * erases everything CREATED in it, claimed or not. See
+ * `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s own docblock.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -289,6 +305,59 @@ export const APPROVAL_REQUESTS_SCRUB_SET = `summary = 'נמחק בהוראת ה�
  * way or the fix reintroduces the defect it closes one layer up.
  */
 export function approvalRequestParams(
+  businessId: string,
+  jobIds: readonly string[],
+  anchor: ErasureAnchor,
+): unknown[] {
+  return [
+    businessId,
+    jobIds,
+    anchor.kind === 'contact' ? `%${likeLiteral(anchor.identifier)}%` : null,
+    anchor.kind === 'window' ? anchor.fromIso : null,
+    anchor.kind === 'window' ? anchor.toIso : null,
+  ];
+}
+
+/**
+ * The `whatsapp_messages` rows an erasure destroys, as ONE predicate.
+ *
+ * Three arms, for the reason this module's header spells out: unlike
+ * `boss_instructions` (`job_id NOT NULL UNIQUE` — every instruction belongs
+ * to exactly one job), a WhatsApp message can exist with no job at all. The
+ * job arm reaches everything the anchor already tied to a job, the same way
+ * `boss_instructions` is reached; the other two arms reach a jobless message
+ * directly, the same way `APPROVAL_REQUESTS_MATCHED`'s second arm reaches an
+ * orphan approval card.
+ *
+ * Content columns only: `sender_number`, `body` and `transcript` — never
+ * `provider_message_id` (the provider's own id, not a person) and never
+ * `direction`/`state`/`job_id` (structure, not content).
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds, `$3` the contact
+ * LIKE pattern or NULL, `$4`/`$5` the window bounds or NULL — the same
+ * convention `approvalRequestParams` already established, reused via
+ * `whatsappMessageParams` below so the preview and the destruction cannot
+ * differ in values any more than in text.
+ */
+export const WHATSAPP_MESSAGES_ERASED_PREDICATE = `business_id = $1
+  AND (job_id = ANY ($2)
+    OR ($3::text IS NOT NULL
+        AND (coalesce(sender_number, '') ILIKE $3 ${LIKE_ESCAPE}
+          OR coalesce(body, '')          ILIKE $3 ${LIKE_ESCAPE}
+          OR coalesce(transcript, '')    ILIKE $3 ${LIKE_ESCAPE}))
+    OR ($4::timestamptz IS NOT NULL
+        AND created_at >= $4::timestamptz
+        AND created_at <  $5::timestamptz))`;
+
+/**
+ * The five parameters `WHATSAPP_MESSAGES_ERASED_PREDICATE` takes, derived
+ * from the anchor the plan already carries — the same shape as
+ * `approvalRequestParams`, kept as its own function rather than reused
+ * because the two tables' predicates are independent text that must not
+ * drift together by sharing one parameter builder that happens to look
+ * identical today.
+ */
+export function whatsappMessageParams(
   businessId: string,
   jobIds: readonly string[],
   anchor: ErasureAnchor,
@@ -926,6 +995,14 @@ async function countItems(
       `SELECT count(*)::text AS n FROM boss_instructions
         WHERE business_id = $1 AND job_id = ANY ($2)`,
       [businessId, jobIds],
+    ),
+    // See `WHATSAPP_MESSAGES_ERASED_PREDICATE` above for why this is three
+    // arms rather than `job_id = ANY($2)` alone.
+    await one(
+      'whatsapp_messages',
+      'delete',
+      `SELECT count(*)::text AS n FROM whatsapp_messages WHERE ${WHATSAPP_MESSAGES_ERASED_PREDICATE}`,
+      whatsappMessageParams(businessId, jobIds, anchor),
     ),
     // See this module's header for why `autonomy_marks` and not its two
     // migration-026 siblings. Deleted by `job_id` membership exactly like

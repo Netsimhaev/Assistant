@@ -1271,6 +1271,9 @@ export const TABLE_LABELS: Record<string, string> = {
   jobs: 'כותרות משימה',
   job_steps: 'שורות מעבר',
   job_step_results: 'מזהי הודעה מהספק',
+  // Migration 036: the WhatsApp conversation (sender number, message body,
+  // transcript).
+  whatsapp_messages: 'הודעות וואטסאפ',
 };
 
 /**

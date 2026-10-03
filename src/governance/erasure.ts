@@ -43,7 +43,9 @@ import {
   PROPOSALS_ERASED_PREDICATE,
   STRANDED_PARENT_PREDICATE,
   VERIFICATION_VERDICTS_ERASED_PREDICATE,
+  WHATSAPP_MESSAGES_ERASED_PREDICATE,
   approvalRequestParams,
+  whatsappMessageParams,
 } from './erasure-plan.js';
 
 /** Thrown when a plan carrying a refusal is handed to the executor, or when a
@@ -244,6 +246,23 @@ export async function executeErasure(
       approvalRequestParams(businessId, jobIds, plan.anchor),
     );
     await del('boss_instructions', 'DELETE FROM boss_instructions WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
+    // `whatsapp_messages` can hold the counterparty's own number and message
+    // text with no job at all (an unclaimed inbound message, or one from a
+    // number the business never opened a job for) — see
+    // `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s docblock in `erasure-plan.ts` for
+    // why that is three arms rather than `job_id = ANY($2)` alone. Same
+    // predicate, same parameters, as `countItems` there.
+    // `whatsapp_messages` can hold the counterparty's own number and message
+    // text with no job at all (an unclaimed inbound message, or one from a
+    // number the business never opened a job for) — see
+    // `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s docblock in `erasure-plan.ts` for
+    // why that is three arms rather than `job_id = ANY($2)` alone. Same
+    // predicate, same parameters, as `countItems` there.
+    await del(
+      'whatsapp_messages',
+      `DELETE FROM whatsapp_messages WHERE ${WHATSAPP_MESSAGES_ERASED_PREDICATE}`,
+      whatsappMessageParams(businessId, jobIds, plan.anchor),
+    );
     // `autonomy_marks.note` is owner-written content about a corrected step
     // and is not restricted to naming the counterparty the step happened to
     // be addressed to — see `erasure-plan.ts`'s header for why this is the
