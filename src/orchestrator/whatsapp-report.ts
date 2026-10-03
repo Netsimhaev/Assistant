@@ -10,25 +10,54 @@
  * returns `{ performed: false, reason: 'not_implemented' }`; `performStep`
  * reports that as a successful step outcome; the step is recorded
  * `completed`; the job closes. `phase === 'closed' ? 'performed' : 'failed'`
- * would tell the owner a CRM order was entered when nothing was. The first
- * classifier branch below exists only to refuse that shortcut — see
- * migration 037 and `StepEffect.performed` (`execute.ts`) for where the fact
- * this branch reads is actually written down.
+ * would tell the owner a CRM order was entered when nothing was. The
+ * `recorded.some(performed === false)` check below exists only to refuse
+ * that shortcut — see migration 037 and `StepEffect.performed` (`execute.ts`)
+ * for where the fact it reads is actually written down.
  *
  * **Two claims, not one — fix round 1, Critical 1.** `await_approval` is NOT
  * terminal (`jobs.ts`'s `terminal` is `closed`/`failed`/`halted` only;
  * `resumeAfterDecision` moves an approved job on to `execute`), but the first
  * version of this module reported it anyway and burned the SAME claim a
- * genuinely closed job needed later: an approval-gated instruction — the
- * common case for anything that costs money — got told "waiting for your
- * approval" once, approved, ran, closed, and the owner never heard the real
- * outcome, because the opening message already read `'reported'`. Migration
- * 038 adds `'reported_interim'`: `claimForReport` (`whatsapp/store.ts`) now
- * takes a `kind`, and `reportWhatsAppJobs` below decides it from the
- * candidate's own PHASE — `await_approval` claims `'interim'`,
- * every terminal phase claims `'terminal'` — never from the classified
- * `ReportOutcome`, so a job that is still genuinely waiting always leaves a
- * terminal report owed, whatever the current sentence happens to say.
+ * genuinely closed job needed later. Migration 038 adds `'reported_interim'`:
+ * `claimForReport` (`whatsapp/store.ts`) takes a `kind`, and
+ * `reportWhatsAppJobs` below decides it from the candidate's own PHASE —
+ * `await_approval` claims `'interim'`, every terminal phase claims
+ * `'terminal'` — never from the classified `ReportOutcome`.
+ *
+ * **The CLAIM following the phase is not enough on its own — fix round 2,
+ * item 1.** The claim kind was already phase-driven, but the TEXT still came
+ * from the classifier alone, and the two could disagree: a job sitting in
+ * `await_approval` with an earlier step's `performed: false` row produced
+ * `NOT_IMPLEMENTED_TEXT` — a final-sounding "I finished, but…" sentence —
+ * while a card was still silently waiting, with no link, followed later by a
+ * second, different final sentence once the job actually closed. Two
+ * final-sounding sentences for one instruction is exactly the dishonesty this
+ * whole report exists to prevent, one level up from where round 1 found it.
+ * **`classifyJob` therefore decides `await_approval` FIRST, unconditionally —
+ * before the `performed: false` check — and that decision is binary:** a live
+ * `pending` row → `awaiting_approval` with the link (`JobVerdict.status ===
+ * 'report'`); no live row → `JobVerdict.status === 'defer'`, meaning send
+ * NOTHING this pass. The normal cause of "no live row while the phase still
+ * reads `await_approval`" is a decided-but-not-yet-resumed race
+ * (`decide` commits, `resumeAfterDecision` has not run yet) or an
+ * expired-but-not-yet-swept one (`expireOverdue` has not run yet) — both
+ * transient by construction, both resolved by the next scheduler pass. A
+ * deferral is therefore the honest answer: there is nothing true to say about
+ * this job RIGHT NOW. `ReportResult.deferred` counts it, so a job that is
+ * deferred because the cause is pathological instead — a resume that crashed
+ * for good — is counted rather than silently never reported, which is the
+ * one outcome this task may not produce.
+ *
+ * **A gate denial is not a failure — fix round 2, item 2.** Every action
+ * class sits at `draft_only` today, so `evaluateToolCall`'s own `deny(...)`
+ * (`policy/engine.ts`) — not an adapter throwing, not a timeout — is the
+ * DOMINANT way a WhatsApp-opened job reaches `failed`. `"נכשל"` ("it failed")
+ * is the wrong sentence for that: the assistant did not break, she is not yet
+ * PERMITTED to act on this without a person. `classifyJob`'s `failed`-phase
+ * branch recognises the gate's own fixed deny codes (`isGateDenialCode`,
+ * below) and reports `'not_permitted'` with its own Hebrew sentence instead
+ * of folding it into the generic failure path.
  *
  * **Report-once reuses `whatsapp_messages.state`, never a second ledger.**
  * Both markers are migration 036/038's states, and `claimForReport` is the
@@ -72,11 +101,25 @@ import { claimForReport } from '../whatsapp/store.js';
 import { jobHistory } from './jobs.js';
 import { loadPlanBody, stepResults } from './plan-store.js';
 
-export type ReportOutcome = 'performed' | 'not_implemented' | 'failed' | 'awaiting_approval';
+export type ReportOutcome =
+  | 'performed'
+  | 'not_implemented'
+  | 'failed'
+  | 'not_permitted'
+  | 'awaiting_approval';
 
 export interface ReportResult {
   /** Opening messages claimed and sent this pass — interim and terminal alike. */
   reported: number;
+  /**
+   * Candidates read but deliberately NOT sent this pass — fix round 2, item
+   * 1. Always a job read as `await_approval` with no live `pending` row: a
+   * transient race (decided-not-yet-resumed, or expired-not-yet-swept) that
+   * the next pass resolves on its own. Counted, never silent, so a resume
+   * that crashed for good is visible rather than indistinguishable from
+   * nothing having happened.
+   */
+  deferred: number;
   /** Job ids whose own processing threw, isolated so they cost nothing else this pass. */
   errored: string[];
 }
@@ -99,68 +142,197 @@ export const PERFORMED_TEXT = 'סיימתי — מה שביקשת בוצע בה�
 
 export const FAILED_GENERIC_TEXT = 'הניסיון לבצע את ההוראה נכשל. אפשר לראות פרטים בדשבורד.';
 
+/**
+ * Fix round 2, item 2. A gate denial is not a failure — `evaluateToolCall`
+ * refused on purpose, under a policy the owner himself signed (or has not yet
+ * raised), and saying "נכשל" ("it failed") claims the assistant broke when
+ * she did exactly what she was told to do: not act without more permission.
+ * One sentence for the whole class, not a translation per code — see
+ * `isGateDenialCode`'s own docblock for why a per-code sentence is not
+ * attempted here.
+ */
+export const NOT_PERMITTED_TEXT =
+  'לא ביצעתי את הפעולה הזו: היא מחייבת הרשאה שעדיין לא ניתנה לי לפעול בה לבד. ' +
+  'אפשר לבדוק את ההרשאות בדשבורד, או לאשר אותה שם.';
+
 const AWAITING_APPROVAL_GENERIC_TEXT =
   'הפעולה הזו דורשת את האישור שלך לפני שהיא תבוצע. אפשר לאשר אותה מהדשבורד.';
+
+/**
+ * `policy/engine.ts`'s own `deny(...)` codes (`domain/policy.ts`'s
+ * `DENY_CODES`) — fixed strings a charter cannot change, as opposed to
+ * `forbidden.id`, which is a charter author's own rule name and therefore
+ * cannot be enumerated here at all. A job whose `failed` reason carries one
+ * of these codes was stopped by the GATE, not by a breakage — see
+ * `NOT_PERMITTED_TEXT`.
+ *
+ * `'quiet_hours'` is deliberately absent: that denial moves a job to
+ * `followup`, never to `failed` (`execute.ts`'s own branch for it), so it
+ * never reaches this classifier at all.
+ *
+ * Three entries are prefixes rather than exact codes, because the gate
+ * appends a dynamic suffix to them: `budget_exceeded` (`:discount`,
+ * `:per_action_class:<class>`, `:single_action`, `:supplier:<id>`, `:daily`,
+ * `:monthly` — `policy/budget.ts`) and `risk_blocked:<actionId>`
+ * (`policy/engine.ts`). `startsWith` is deliberately NOT used for the exact
+ * codes below it: a prefix check there would silently swallow any future
+ * code that happens to share a prefix with one of them.
+ *
+ * **Not exhaustive, and cannot be made so.** `forbidden.id` is the one gate
+ * denial this set structurally cannot name: `deny(forbidden.id, …)`
+ * (`policy/engine.ts`) uses the CHARTER's own rule id as the code, with no
+ * fixed prefix at all, so a forbidden-rule denial reads as `FAILED_GENERIC_TEXT`
+ * rather than `NOT_PERMITTED_TEXT` today — a known, recorded gap, not an
+ * oversight: closing it would require this classifier to load the active
+ * charter and match rule ids, which is a materially bigger change than this
+ * table.
+ */
+const GATE_DENY_CODES: ReadonlySet<string> = new Set([
+  'kill_switch_active',
+  'stale_policy',
+  'autonomy_forbidden',
+  'draft_only:persist_as_draft',
+  'do_not_contact',
+  'amount_unreadable',
+  'recipient_unreadable',
+  'tool_not_allowlisted',
+  'delegation_not_permitted',
+]);
+
+function isGateDenialCode(code: string): boolean {
+  return (
+    GATE_DENY_CODES.has(code) ||
+    code.startsWith('budget_exceeded') ||
+    code.startsWith('risk_blocked:')
+  );
+}
 
 /**
  * Known engine failure codes, mapped to a Hebrew sentence fragment — never
  * the raw English that follows them.
  *
  * `job_steps.reason` is built as `${code} — ${message}` by `execute.ts`'s own
- * transitions (`adapter_threw`, `credential_unavailable`, the five
- * OAuth-derived codes, …), where `message` is frequently English — an error
- * class's own `.message`, raw SMTP text, a credential ref. `verify.ts`'s two
- * disqualifying predicates write a full ENGLISH SENTENCE outright
- * (`outcome unknown for … — the call went out and no authoritative answer
- * came back; nothing confirms it happened`), with no code prefix at all.
- * Fix round 1, Important 4: the first version of this module interpolated
- * `job_steps.reason` into the owner's one sentence verbatim, and its own test
- * passed only because it hand-wrote a Hebrew reason production never emits —
- * "green for the wrong reason", exactly the class CLAUDE.md documents.
+ * transitions, where `message` is frequently English — an error class's own
+ * `.message`, raw SMTP text, a credential ref. `verify.ts`'s two
+ * disqualifying predicates write a full ENGLISH SENTENCE outright, with no
+ * code prefix at all. Fix round 1, Important 4: the first version of this
+ * module interpolated `job_steps.reason` into the owner's one sentence
+ * verbatim, and its own test passed only because it hand-wrote a Hebrew
+ * reason production never emits — "green for the wrong reason".
  *
- * Deliberately NOT exhaustive. A code missing from this table falls through
- * to `FAILED_GENERIC_TEXT`, which still tells the owner it failed and points
- * at the dashboard — never the raw code or message. That is the positive
- * rule this report already applies everywhere else: an unmapped value is
- * never read as permission to paste it in front of a human.
+ * **Fix round 2, item 3 — three groups, named by where they actually come
+ * from, because the review checked this table against what the engine
+ * actually emits rather than against itself:**
+ *
+ * 1. `execute.ts`'s own classification codes, as before (14 entries). Three
+ *    are marked `retryable` in `StepChannelError` and therefore move the job
+ *    to `followup`/`unknown` rather than `failed` — they rarely reach this
+ *    branch, and are kept (not removed) because `unknown` → `failed` is the
+ *    terminal path once such a step's own idempotent resume gives up for
+ *    good at some later point, however that comes to pass.
+ * 2. The one wired outbound adapter's own eight codes
+ *    (`adapters/mail.ts:124-256`, raised at `run-plan.ts:762` via
+ *    `StepChannelError`, reaching `job_steps.reason` through the identical
+ *    `${code} — ${message}` shape). `aborted` and `transport_error` are the
+ *    two retryable ones here, same caveat as above.
+ * 3. `run-due.ts`'s own plan-level rejections, keyed under an explicit
+ *    `run_due:` namespace that `leadingCode` manufactures — see its own
+ *    docblock for why `run_due: ${code}` cannot be split on `' — '` at all.
+ *
+ * `delegation_refused:<code>` (`local-tools.ts`'s `agent.request_help`) is
+ * handled separately in `failedText`, as a PREFIX match rather than a table
+ * entry: the code after the colon is `requestHelp`'s own refusal reason
+ * (eight distinct values, `delegate.ts`), and none of them change what the
+ * owner needs to hear — a helper agent declined, full stop.
+ *
+ * Deliberately NOT exhaustive even within these three groups. A code missing
+ * from this table falls through to `FAILED_GENERIC_TEXT`, which still tells
+ * the owner it failed and points at the dashboard — never the raw code or
+ * message.
  */
 const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
-  adapter_timeout: 'השירות החיצוני לא הגיב בזמן',
+  // execute.ts's own adapter/channel classification.
+  adapter_timeout: 'השירות החיצוני לא הגיב בזמן', // retryable
   adapter_threw: 'אירעה שגיאה טכנית בביצוע הפעולה',
-  channel_unavailable: 'החיבור למערכת החיצונית לא היה זמין',
+  channel_unavailable: 'החיבור למערכת החיצונית לא היה זמין', // retryable
   credential_unavailable: 'חסרים פרטי התחברות תקינים לביצוע הפעולה',
   oauth_grant_revoked: 'ההרשאה לחיבור בוטלה',
   oauth_refresh_rejected: 'חידוש ההרשאה לחיבור נדחה',
   oauth_misconfigured: 'החיבור אינו מוגדר כראוי',
   oauth_ambiguous_ref: 'הגדרת החיבור אינה חד-משמעית',
-  oauth_refresh_transient: 'חידוש ההרשאה לחיבור נכשל זמנית',
+  oauth_refresh_transient: 'חידוש ההרשאה לחיבור נכשל זמנית', // retryable
   no_adapter_for_system: 'אין חיבור פעיל למערכת הנדרשת',
   delegation_orphaned: 'הבקשה לעזרה מסוכן אחר לא הושלמה',
   delegation_result_corrupted: 'התשובה שהתקבלה מסוכן אחר הייתה פגומה',
   verification_delegated_again: 'תהליך האימות לא הסתיים כראוי',
   verification_answer_missing: 'לא התקבלה תשובה לבדיקה שהתבצעה',
   local_tool_bad_input: 'הנתונים שהועברו לפעולה לא היו תקינים',
+
+  // The one wired outbound adapter's own eight codes (adapters/mail.ts).
+  unsupported_tool: 'הכלי שנבחר לא מתאים לחיבור הזה',
+  aborted: 'השליחה בוטלה לפני שהושלמה', // retryable
+  credential_missing: 'אין פרטי התחברות לחיבור — ההודעה לא נשלחה',
+  no_recipient: 'לא נמצאה כתובת תקינה לשליחה',
+  message_incomplete: 'להודעה חסר נושא או תוכן',
+  send_rejected: 'השרת החיצוני דחה את ההודעה',
+  transport_error: 'אירעה תקלת תקשורת בשליחה', // retryable
+  delivery_unknown: 'לא ניתן לאשר אם ההודעה נשלחה בהצלחה',
+
+  // run-due.ts's own plan-level rejections, under the `run_due:` namespace
+  // `leadingCode` manufactures.
+  'run_due:no_plan_bound': 'לא נמצאה תוכנית פעולה למשימה',
+  'run_due:malformed_plan': 'התוכנית שנבנתה לא הייתה תקינה',
+  'run_due:tool_not_allowlisted': 'הפעולה המתוכננת אינה מורשית לסוכן שתכנן אותה',
+  'run_due:action_class_mismatch': 'הפעולה בפועל לא תאמה את מה שתוכנן',
+  'run_due:no_channel_for_tool': 'אין חיבור מוגדר לפעולה הזו',
+  'run_due:ambiguous_channel': 'יש יותר מחיבור אחד אפשרי לפעולה הזו',
+  'run_due:no_adapter_for_system': 'אין חיבור פעיל למערכת הנדרשת',
+  'run_due:plan_changed_mid_flight': 'התוכנית השתנתה באמצע הביצוע',
+  'run_due:job_not_executable': 'המשימה לא הייתה במצב שמאפשר ביצוע',
 };
 
 /**
- * The leading machine code off a `job_steps.reason` string built as
- * `${code} — ${message}` — or `null` when the separator is absent, which
- * `FAILURE_REASON_HE` is guaranteed never to have a key matching anyway.
+ * The leading machine code off a `job_steps.reason` string, across the two
+ * shapes this codebase actually writes it in.
+ *
+ * `run-due.ts`'s own rejections are the SPECIAL case, checked first: the
+ * whole reason IS `run_due: ${code}` — colon-space, and nothing else ever
+ * follows it, so `indexOf(' — ')` below would find no dash at all and this
+ * would (and once did) silently return `null`, sending every `run_due:`
+ * failure to the generic text with no chance of a mapping. The namespaced
+ * key this returns (`run_due:${code}`, no space) is what `FAILURE_REASON_HE`
+ * is keyed under for that group.
+ *
+ * Everything else — `execute.ts`'s own transitions, and
+ * `delegation_refused:<code>` riding inside one of them as the `code` itself
+ * — uses `${code} — ${message}`, split on the em dash.
  */
 function leadingCode(reason: string): string | null {
-  const separator = reason.indexOf(' — ');
-  return separator === -1 ? null : reason.slice(0, separator);
+  const RUN_DUE_PREFIX = 'run_due: ';
+  if (reason.startsWith(RUN_DUE_PREFIX)) {
+    return `run_due:${reason.slice(RUN_DUE_PREFIX.length)}`;
+  }
+  const dash = reason.indexOf(' — ');
+  return dash === -1 ? null : reason.slice(0, dash);
 }
 
 /**
- * Branch 2's text only — see `classifyJob`. Never called for branch 5: a
- * non-failure reason (`'closed after the curator pass'`, say) is not this
- * function's to describe as a failure cause (fix round 1, Minor 6).
+ * Branch "failed" text only — see `classifyJob`. Never called for the
+ * catch-all branch: a non-failure reason (`'closed after the curator pass'`,
+ * say) is not this function's to describe as a failure cause (fix round 1,
+ * Minor 6). Never called when `isGateDenialCode` already matched — that
+ * outcome is `'not_permitted'`, not `'failed'`, and carries no reason at all.
  */
 export function failedText(reason: string | null): string {
   if (reason === null) return FAILED_GENERIC_TEXT;
   const code = leadingCode(reason);
-  const mapped = code === null ? undefined : FAILURE_REASON_HE[code];
+  if (code === null) return FAILED_GENERIC_TEXT;
+  // `delegation_refused:<code>` — a prefix, not a table entry; see
+  // `FAILURE_REASON_HE`'s own docblock for why.
+  if (code.startsWith('delegation_refused:')) {
+    return `הניסיון לבצע את ההוראה נכשל: הבקשה לעזרה מסוכן אחר נדחתה.`;
+  }
+  const mapped = FAILURE_REASON_HE[code];
   return mapped === undefined ? FAILED_GENERIC_TEXT : `הניסיון לבצע את ההוראה נכשל: ${mapped}.`;
 }
 
@@ -246,36 +418,46 @@ async function lastReason(jobId: string): Promise<string | null> {
   return history[history.length - 1]?.reason ?? null;
 }
 
-export interface JobVerdict {
-  outcome: ReportOutcome;
-  /** Branch 2 only. `null` everywhere else — see `failedText`'s own docblock on branch 5. */
-  failReason: string | null;
-  /** Branch 3 only — the live approval this job is actually waiting behind. */
-  approvalId: string | null;
-}
+/**
+ * What one job's candidacy resolved to.
+ *
+ * `'defer'` — fix round 2, item 1 — means exactly one thing: a job read as
+ * `await_approval` with no live `pending` approval row right now. Nothing is
+ * sent, nothing is claimed, and the candidate is read again next pass; see
+ * the module docblock for why that is the honest answer rather than a guess.
+ * Every other case is `'report'`, carrying the sentence to send.
+ */
+export type JobVerdict =
+  | { status: 'report'; outcome: ReportOutcome; failReason: string | null; approvalId: string | null }
+  | { status: 'defer' };
 
 /**
  * What actually happened to one job, classified in the order that makes the
  * report honest. Exported so a test can assert the `ReportOutcome` directly
  * rather than scraping prose (fix round 1, item 7).
  *
+ * 0. `await_approval` phase, checked FIRST and UNCONDITIONALLY — fix round 2,
+ *    item 1. A live `pending` row → `awaiting_approval` with the link. No
+ *    live row → `defer`. Nothing below this point ever runs for such a job:
+ *    neither "not performed" nor "finished" nor "failed" may describe a job
+ *    that has not reached a phase those words apply to, however the record
+ *    looks otherwise. This is what keeps round 1's own rule — "waiting for
+ *    approval" must not describe a wait that already passed — from
+ *    colliding with its mirror: "finished"/"failed" must not describe a wait
+ *    that has not happened yet.
  * 1. Any recorded step carrying `performed: false` → `not_implemented`,
- *    regardless of what the phase says. A plan that drafted or recalled
- *    before it ever reached the step that mattered still has that step's own
- *    honest `false` sitting in the record, and that fact outranks whatever
- *    the job did afterwards.
- * 2. `failed` phase → `failed`, with the last `job_steps.reason` (mapped to
- *    Hebrew by `failedText`, never forwarded raw).
- * 3. `await_approval` phase WITH a live `pending` approval row →
- *    `awaiting_approval`. **Fix round 1, Important 3:** a `await_approval`
- *    phase with NO live row (the approval was decided or expired between the
- *    candidate read and this lookup — `pendingApprovalForJob`'s own docblock)
- *    is NOT reported as awaiting anything: that wait has already passed, and
- *    continuing to say so would describe a state the job is no longer in.
- *    Falls through to 4/5 instead, same as any other phase would.
- * 4. A bound plan whose every declared step has a `completed` row →
+ *    regardless of what the phase says otherwise. A plan that drafted or
+ *    recalled before it ever reached the step that mattered still has that
+ *    step's own honest `false` sitting in the record, and that fact outranks
+ *    whatever the job did afterwards — for every phase except `await_approval`,
+ *    which branch 0 above already took off the table.
+ * 2. `failed` phase → either `not_permitted` (the reason's leading code is
+ *    one of `policy/engine.ts`'s own gate-denial codes — fix round 2, item 2)
+ *    or `failed` with the last `job_steps.reason` (mapped to Hebrew by
+ *    `failedText`, never forwarded raw).
+ * 3. A bound plan whose every declared step has a `completed` row →
  *    `performed`.
- * 5. Anything else → `failed`, with `failReason: null` (generic text) —
+ * 4. Anything else → `failed`, with `failReason: null` (generic text) —
  *    never the last `job_steps.reason`: for a `closed`/`halted` job that
  *    reason is routinely a non-failure sentence (`'closed after the curator
  *    pass'`), and attributing it as a failure cause would be its own
@@ -289,25 +471,32 @@ export async function classifyJob(
   phase: JobPhase,
   businessId: string,
 ): Promise<JobVerdict> {
+  if (phase === 'await_approval') {
+    const approvalId = await pendingApprovalForJob(jobId, { businessId });
+    if (approvalId !== null) {
+      return { status: 'report', outcome: 'awaiting_approval', failReason: null, approvalId };
+    }
+    // No live row: the wait this phase describes has either already passed
+    // (decided, not yet resumed) or is about to be swept (expired, not yet
+    // reaped) — both transient, both resolved by the next pass. Nothing
+    // true to say about this job right now.
+    return { status: 'defer' };
+  }
+
   const stored = await loadPlanBody(jobId, { businessId });
   const recorded = stored === null ? [] : await stepResults(jobId, stored.planHash, { businessId });
 
   if (recorded.some((step) => step.performed === false)) {
-    return { outcome: 'not_implemented', failReason: null, approvalId: null };
+    return { status: 'report', outcome: 'not_implemented', failReason: null, approvalId: null };
   }
 
   if (phase === 'failed') {
-    return { outcome: 'failed', failReason: await lastReason(jobId), approvalId: null };
-  }
-
-  if (phase === 'await_approval') {
-    const approvalId = await pendingApprovalForJob(jobId, { businessId });
-    if (approvalId !== null) {
-      return { outcome: 'awaiting_approval', failReason: null, approvalId };
+    const reason = await lastReason(jobId);
+    const code = reason === null ? null : leadingCode(reason);
+    if (code !== null && isGateDenialCode(code)) {
+      return { status: 'report', outcome: 'not_permitted', failReason: null, approvalId: null };
     }
-    // No live row: the wait this phase describes has already passed one way
-    // or another. Fall through to the positive check below rather than
-    // reporting a state that is no longer true.
+    return { status: 'report', outcome: 'failed', failReason: reason, approvalId: null };
   }
 
   if (stored !== null) {
@@ -328,20 +517,25 @@ export async function classifyJob(
       (step) => byStep.get(step.id)?.status === 'completed',
     );
     if (everyStepCompleted) {
-      return { outcome: 'performed', failReason: null, approvalId: null };
+      return { status: 'report', outcome: 'performed', failReason: null, approvalId: null };
     }
   }
 
-  return { outcome: 'failed', failReason: null, approvalId: null };
+  return { status: 'report', outcome: 'failed', failReason: null, approvalId: null };
 }
 
-/** The text of one report, given what `classifyJob` decided. */
-function composeText(verdict: JobVerdict, dashboardBaseUrl: string): string {
+/** The text of one report, given what `classifyJob` decided — the `'report'` status only. */
+function composeText(
+  verdict: Extract<JobVerdict, { status: 'report' }>,
+  dashboardBaseUrl: string,
+): string {
   switch (verdict.outcome) {
     case 'not_implemented':
       return NOT_IMPLEMENTED_TEXT;
     case 'performed':
       return PERFORMED_TEXT;
+    case 'not_permitted':
+      return NOT_PERMITTED_TEXT;
     case 'failed':
       return failedText(verdict.failReason);
     case 'awaiting_approval': {
@@ -371,6 +565,7 @@ export async function reportWhatsAppJobs(options: {
 
   const candidates = await reportCandidates(businessId, db);
   let reported = 0;
+  let deferred = 0;
   const errored: string[] = [];
 
   for (const candidate of candidates) {
@@ -381,15 +576,20 @@ export async function reportWhatsAppJobs(options: {
     // starve every WhatsApp job behind it.
     try {
       const verdict = await classifyJob(candidate.jobId, candidate.phase, businessId);
+      if (verdict.status === 'defer') {
+        deferred += 1;
+        continue;
+      }
       const text = composeText(verdict, dashboardBaseUrl);
 
       // The claim's KIND follows the candidate's own PHASE, never the
       // classified outcome — fix round 1, Critical 1. A job read as
       // `await_approval` has not reached a terminal phase regardless of what
-      // today's sentence says (branch 1 can still fire "not_implemented" on
-      // a plan that is simultaneously parked on a later step's approval
-      // card), so it must leave a terminal report owed; every terminal phase
-      // claims the real, final one.
+      // today's sentence says, so it must leave a terminal report owed;
+      // every terminal phase claims the real, final one. (A `defer`
+      // verdict never reaches here at all — see above — so this candidate
+      // is always either awaiting-approval-with-a-link or genuinely
+      // terminal by the time a claim is attempted.)
       const claimKind = candidate.phase === 'await_approval' ? 'interim' : 'terminal';
 
       // Claimed right before the send — see the module docblock on why
@@ -405,5 +605,5 @@ export async function reportWhatsAppJobs(options: {
     }
   }
 
-  return { reported, errored };
+  return { reported, deferred, errored };
 }

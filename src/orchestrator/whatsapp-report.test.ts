@@ -24,9 +24,12 @@ import {
   failedText,
   FAILED_GENERIC_TEXT,
   NOT_IMPLEMENTED_TEXT,
+  NOT_PERMITTED_TEXT,
   PERFORMED_TEXT,
   reportWhatsAppJobs,
+  type JobVerdict,
 } from './whatsapp-report.js';
+import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
 
 const BUSINESS = 'test-business';
 /** 12:00 Asia/Jerusalem — outside the fixture's 20:00–07:00 quiet window. */
@@ -119,6 +122,33 @@ async function messageState(messageId: string): Promise<string> {
   const row = rows[0];
   if (row === undefined) throw new Error('expected a whatsapp_messages row');
   return row.state;
+}
+
+/** Narrows a `JobVerdict` to its `'report'` arm, failing loudly on `'defer'`. */
+function asReport(verdict: JobVerdict): Extract<JobVerdict, { status: 'report' }> {
+  if (verdict.status !== 'report') throw new Error(`expected a report verdict, got '${verdict.status}'`);
+  return verdict;
+}
+
+/**
+ * A stalling adapter that never settles — the same shape
+ * `resume-plan.test.ts`'s own `stalling()` uses, reproduced here (not
+ * imported: it is one small object literal, and importing a test-only helper
+ * across files is more coupling than the four lines are worth) so this file
+ * can drive a REAL `adapter_timeout` → `unknown`/`performed: null` row
+ * through `execute.ts` itself, rather than hand-writing one.
+ */
+function stallingMailAdapter(): ExternalAdapter {
+  return {
+    system: 'office-mail',
+    channel: 'api',
+    serves: ['mail.send'],
+    async execute(): Promise<AdapterResult> {
+      return new Promise<AdapterResult>(() => {
+        /* never settles */
+      });
+    },
+  };
 }
 
 function fakeMessenger(): BossMessenger & {
@@ -491,14 +521,18 @@ describe('reportWhatsAppJobs', () => {
   });
 
   /**
-   * Fix round 1, Important 3 (review's numbering) — `pendingApprovalForJob`'s
-   * not-found branch. The approval was decided (by `decide` alone, without
-   * `resumeAfterDecision` — simulating the race where the job's own phase
-   * read still says `await_approval` a moment before the scheduler moves it
-   * on). The wait this phase describes has already passed; reporting
-   * "waiting for your approval" would describe a state that is over.
+   * Fix round 2, item 1 (supersedes fix round 1's version of this test, which
+   * sent `FAILED_GENERIC_TEXT` and claimed `'interim'` — a final-sounding
+   * sentence for a job that had not reached a terminal phase). The approval
+   * was decided (by `decide` alone, without `resumeAfterDecision` —
+   * simulating the race where the job's own phase read still says
+   * `await_approval` a moment before the scheduler moves it on). Round 1
+   * already ruled that "waiting for approval" must not describe a wait that
+   * has passed; round 2 adds that NOTHING else may speak for this job either
+   * — so the pass sends nothing, claims nothing, and counts the candidate as
+   * `deferred` rather than inventing an answer.
    */
-  it('does not report awaiting-approval once the approval has already been decided', async () => {
+  it('defers — sends and claims nothing — once the approval has already been decided', async () => {
     const bundle = await install({
       connections: [MAIL_CONNECTION],
       knownCounterpartyEmailDomain: 'b.com',
@@ -554,13 +588,261 @@ describe('reportWhatsAppJobs', () => {
     const messenger = fakeMessenger();
     const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
 
+    expect(report.reported).toBe(0);
+    expect(report.deferred).toBe(1);
+    expect(report.errored).toEqual([]);
+    expect(messenger.sentTexts).toHaveLength(0);
+    // No claim at all — not even the interim one. The message is exactly as
+    // `linkToWhatsApp` left it, untouched, so the next pass sees it again.
+    expect(await messageState(messageId)).toBe('handled');
+  });
+
+  /**
+   * The pre-existing item fix round 2 folded in by adjacency:
+   * `pendingApprovalForJob` now filters `expires_at > now()`, mirroring
+   * `unspentApprovalFor`'s own reasoning — an unswept EXPIRED card is a
+   * different reachable cause of "no live row" from the decided-race above,
+   * and must defer the same way rather than handing the owner a link to a
+   * card he can no longer action.
+   */
+  it('defers when the approval has expired but the sweep has not run yet', async () => {
+    const bundle = await install({
+      connections: [MAIL_CONNECTION],
+      knownCounterpartyEmailDomain: 'b.com',
+    });
+    const job = await jobInExecute(bundle);
+    const { messageId } = await linkToWhatsApp(job.jobId);
+
+    const mail = createMailAdapter({
+      system: 'office-mail',
+      transport: {
+        async send() {
+          throw new Error('perform must not run in this test');
+        },
+      },
+    });
+
+    const plan = Plan.parse({
+      goal: 'לפתוח פנייה חדשה',
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'first contact',
+          toolName: 'mail.send',
+          input: { to: 'a@b.com', counterpartyId: 'c_812', subject: 'שלום', body: 'פנייה ראשונה' },
+        },
+      ],
+    });
+
+    const run = await runPlan({
+      job, bundle, plan,
+      registry: new AdapterRegistry([mail]),
+      bindings: [MAIL_LIVE],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+    expect(run.status).toBe('halted');
+
+    const { rows } = await getPool().query<{ approval_id: string }>(
+      'SELECT approval_id FROM approval_requests WHERE job_id = $1',
+      [job.jobId],
+    );
+    const approvalId = rows[0]?.approval_id;
+    if (approvalId === undefined) throw new Error('expected a queued approval');
+
+    // The fuse burned out, but `expireOverdue` has not swept it yet — still
+    // `state = 'pending'`, just past its own `expires_at`.
+    await getPool().query(
+      `UPDATE approval_requests SET expires_at = now() - interval '1 hour' WHERE approval_id = $1`,
+      [approvalId],
+    );
+
+    const messenger = fakeMessenger();
+    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+
+    expect(report.reported).toBe(0);
+    expect(report.deferred).toBe(1);
+    expect(messenger.sentTexts).toHaveLength(0);
+    expect(await messageState(messageId)).toBe('handled');
+  });
+
+  /**
+   * Fix round 2, item 1 — the compound case round 1's review named as
+   * "the same shape, worse". A job in `await_approval` whose EARLIER step
+   * already recorded `performed: false` must still get the waiting sentence
+   * with the link, not `NOT_IMPLEMENTED_TEXT` with no link at all: the phase
+   * check runs unconditionally, before branch 1 ever looks at `recorded`.
+   */
+  it('reports awaiting-approval, not not_implemented, when an earlier step already recorded performed:false', async () => {
+    const bundle = await install({
+      connections: [MAIL_CONNECTION],
+      knownCounterpartyEmailDomain: 'b.com',
+    });
+    const job = await jobInExecute(bundle);
+    const { messageId } = await linkToWhatsApp(job.jobId);
+
+    const mail = createMailAdapter({
+      system: 'office-mail',
+      transport: {
+        async send() {
+          throw new Error('perform must not run — s2 should queue before s3 would ever send');
+        },
+      },
+    });
+
+    // s1 (local, not_implemented) → s2 (first contact, queues approval).
+    const plan = Plan.parse({
+      goal: 'ליצור קובץ ואז לפתוח פנייה חדשה',
+      steps: [
+        {
+          id: 's1',
+          agent: 'prod.docs',
+          intent: 'write a file',
+          toolName: 'file.write',
+          input: { path: 'x.txt', content: 'x' },
+        },
+        {
+          id: 's2',
+          agent: 'comms.email',
+          intent: 'first contact',
+          toolName: 'mail.send',
+          input: { to: 'a@b.com', counterpartyId: 'c_812', subject: 'שלום', body: 'פנייה ראשונה' },
+          dependsOn: ['s1'],
+        },
+      ],
+    });
+
+    const run = await runPlan({
+      job, bundle, plan,
+      registry: new AdapterRegistry([mail]),
+      bindings: [MAIL_LIVE],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+    expect(run.status).toBe('halted');
+    expect((await reload(job.jobId)).phase).toBe('await_approval');
+
+    const { rows } = await getPool().query<{ approval_id: string }>(
+      'SELECT approval_id FROM approval_requests WHERE job_id = $1',
+      [job.jobId],
+    );
+    const approvalId = rows[0]?.approval_id;
+    if (approvalId === undefined) throw new Error('expected a queued approval');
+
+    const messenger = fakeMessenger();
+    const report = await reportWhatsAppJobs({
+      messenger, businessId: BUSINESS, dashboardBaseUrl: 'http://127.0.0.1:9999',
+    });
+
     expect(report.reported).toBe(1);
-    expect(messenger.sentTexts[0]).not.toContain('/a/');
-    expect(messenger.sentTexts[0]).toBe(FAILED_GENERIC_TEXT);
-    // The claim's KIND still follows the PHASE (`await_approval`), not the
-    // outcome this pass happened to render — so a real terminal report is
-    // still owed once the job actually reaches one.
+    expect(report.deferred).toBe(0);
+    expect(messenger.sentTexts[0]).toBe(awaitingApprovalText(`http://127.0.0.1:9999/a/${approvalId}`));
+    expect(messenger.sentTexts[0]).not.toContain(NOT_IMPLEMENTED_TEXT);
     expect(await messageState(messageId)).toBe('reported_interim');
+  });
+
+  /**
+   * Fix round 2, item 2. Every action class sits at `draft_only` today, so a
+   * gate denial — not an adapter throwing, not a timeout — is the DOMINANT
+   * way a WhatsApp job reaches `failed`. Driven through the real gate
+   * (`rampLevel: 'draft_only'`, exactly as `evaluateAutonomy` would compute it
+   * before any class has earned a promotion) so the reason string is the
+   * real `draft_only:persist_as_draft — …` the engine actually writes.
+   */
+  it('reports "not permitted", not "failed", for a real gate denial', async () => {
+    const bundle = await install();
+    const job = await jobInExecute(bundle);
+    const { messageId } = await linkToWhatsApp(job.jobId);
+
+    const plan = Plan.parse({
+      goal: 'ליצור קובץ',
+      steps: [{ id: 's1', agent: 'prod.docs', intent: 'x', toolName: 'file.write', input: { path: 'x', content: 'x' } }],
+    });
+
+    const run = await runPlan({
+      job, bundle, plan,
+      registry: new AdapterRegistry([]),
+      bindings: [],
+      credentials: envCredentials({}, 'NONE_'),
+      counterpartyTags: [],
+      rampLevel: 'draft_only',
+      now: NOON,
+    });
+    expect(run.status).toBe('halted');
+    expect((await reload(job.jobId)).phase).toBe('failed');
+
+    const messenger = fakeMessenger();
+    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+
+    expect(report.reported).toBe(1);
+    expect(messenger.sentTexts[0]).toBe(NOT_PERMITTED_TEXT);
+    expect(messenger.sentTexts[0]).not.toBe(FAILED_GENERIC_TEXT);
+    expect(messenger.sentTexts[0]).not.toMatch(/[A-Za-z]/);
+    expect(await messageState(messageId)).toBe('reported');
+  });
+
+  /**
+   * Fix round 2, item 4(a). The round-1 version of this proof lived ONLY as
+   * a raw-row assertion in `resume-plan.test.ts` — it pinned the WRITER
+   * (`execute.ts`), never the owner-facing READ. This drives the identical
+   * real `adapter_timeout` → `unknown` row through `execute.ts`, then reads
+   * it back through `classifyJob` — the function that actually decides what
+   * the owner hears — and asserts the outcome is NOT `not_implemented`.
+   * Mutating `execute.ts`'s `performed: null` to `performed: false` (see the
+   * task report's mutation transcript) flips this test's own outcome.
+   */
+  it('reads an honestly-unknown row as failed, never not_implemented, through the classifier the owner’s text comes from', async () => {
+    const bundle = await install({
+      connections: [MAIL_CONNECTION],
+      knownCounterpartyEmailDomain: 'b.com',
+    });
+    const job = await jobInExecute(bundle);
+    await linkToWhatsApp(job.jobId);
+
+    const plan = Plan.parse({
+      goal: 'להזמין מהספק',
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'reply',
+          toolName: 'mail.send',
+          input: { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812', subject: 'הזמנה', body: 'x' },
+        },
+      ],
+    });
+
+    const run = await runPlan({
+      job, bundle, plan,
+      registry: new AdapterRegistry([stallingMailAdapter()]),
+      bindings: [MAIL_LIVE],
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+      adapterTimeoutMs: 25,
+    });
+    expect(run.status).toBe('halted');
+    if (run.status !== 'halted') throw new Error('unreachable');
+    expect(run.reason).toBe('deferred');
+
+    const { rows } = await getPool().query<{ status: string; performed: boolean | null }>(
+      'SELECT status, performed FROM job_step_results WHERE job_id = $1',
+      [job.jobId],
+    );
+    expect(rows).toEqual([{ status: 'unknown', performed: null }]);
+
+    // `classifyJob` takes `phase` as a plain argument — simulating the job
+    // having reached `failed` (as `closeVerifiedJobs` would eventually leave
+    // it) without needing to actually resolve the hang first.
+    const verdict = asReport(await classifyJob(job.jobId, 'failed', BUSINESS));
+    expect(verdict.outcome).toBe('failed');
+    expect(verdict.outcome).not.toBe('not_implemented');
   });
 
   it('reports a job once and never again', async () => {
@@ -725,14 +1007,14 @@ describe('classifyJob', () => {
     // re-reads the row itself, so passing `'closed'` here exercises branch 1
     // against the phase branch 4 would otherwise have claimed, without
     // needing the job to actually be there.
-    const verdict = await classifyJob(jobId, 'closed', BUSINESS);
+    const verdict = asReport(await classifyJob(jobId, 'closed', BUSINESS));
     expect(verdict.outcome).toBe('not_implemented');
   });
 
   it('branch 4 requires every declared step to have a completed row, not just some', async () => {
     const { jobId, planHash } = await jobWithBoundPlan();
     // No row at all for 's1' — the only declared step.
-    const verdict = await classifyJob(jobId, 'closed', BUSINESS);
+    const verdict = asReport(await classifyJob(jobId, 'closed', BUSINESS));
     expect(verdict.outcome).toBe('failed');
     expect(verdict.failReason).toBeNull();
 
@@ -742,30 +1024,95 @@ describe('classifyJob', () => {
         externalId: null, status: 'completed', performed: true,
       });
     });
-    const second = await classifyJob(jobId, 'closed', BUSINESS);
+    const second = asReport(await classifyJob(jobId, 'closed', BUSINESS));
     expect(second.outcome).toBe('performed');
   });
 
   /**
-   * Ruling 4, direct: a `null`-performed `unknown` row must never satisfy
-   * branch 1 — only a recorded `false` does. Mutating `execute.ts`'s
-   * `adapter_timeout` branch from `performed: null` to `performed: false`
-   * flips this test's outcome from `failed` to `not_implemented` (see the
-   * task report's mutation transcript).
+   * Fix round 2, item 4(b). The round-1 version of this test constructed
+   * ONLY the `performed: null` row and asserted `outcome === 'failed'` —
+   * which passes via branch 2 (`phase === 'failed'`) regardless of whether
+   * branch 1 exists at all, because `null === false` is false either way.
+   * Deleting branch 1 entirely left that test green. Pairing it with the
+   * `performed: false` case closes the gap: THAT case can only reach
+   * `not_implemented` through branch 1 — delete branch 1 and it falls to
+   * branch 4 instead (`status === 'completed'` alone), flipping the outcome
+   * to `'performed'` and failing this test for real.
    */
-  it('never classifies an honestly-unknown row as not_implemented', async () => {
-    const { jobId, planHash } = await jobWithBoundPlan();
+  it('treats an honestly-unknown row differently from a genuinely not-performed one', async () => {
+    // Case A: performed: false, status: completed — must trigger branch 1.
+    const a = await jobWithBoundPlan();
     await withTransaction(async (tx) => {
       await recordStepCompletion(tx, {
-        jobId, businessId: BUSINESS, planHash, stepId: 's1',
+        jobId: a.jobId, businessId: BUSINESS, planHash: a.planHash, stepId: 's1',
+        externalId: null, status: 'completed', performed: false,
+      });
+    });
+    const verdictA = asReport(await classifyJob(a.jobId, 'failed', BUSINESS));
+    expect(verdictA.outcome).toBe('not_implemented');
+
+    // Case B: performed: null, status: unknown — must NOT trigger branch 1,
+    // and must not be mistaken for "not implemented" either (ruling 4).
+    const b = await jobWithBoundPlan();
+    await withTransaction(async (tx) => {
+      await recordStepCompletion(tx, {
+        jobId: b.jobId, businessId: BUSINESS, planHash: b.planHash, stepId: 's1',
         externalId: null, status: 'unknown', performed: null,
       });
     });
-    await transition(jobId, {
-      to: 'failed', actor: 'orchestrator', reason: 'outcome unknown for s1 — timed out', businessId: BUSINESS,
+    const verdictB = asReport(await classifyJob(b.jobId, 'failed', BUSINESS));
+    expect(verdictB.outcome).toBe('failed');
+  });
+
+  /**
+   * Fix round 2, item 1, as a direct unit test rather than the full
+   * end-to-end flow the `reportWhatsAppJobs` describe block above exercises:
+   * `await_approval` with no live `pending` row defers, full stop — no
+   * `performed: false` row, no bound plan at all, nothing else in the record
+   * can override it.
+   */
+  it('defers an await_approval job with no live approval row, regardless of any recorded step', async () => {
+    const { jobId } = await jobWithBoundPlan();
+    await withTransaction(async (tx) => {
+      await recordStepCompletion(tx, {
+        jobId, businessId: BUSINESS, planHash: planHashOf(PLAN), stepId: 's1',
+        externalId: null, status: 'completed', performed: false,
+      });
     });
 
-    const verdict = await classifyJob(jobId, 'failed', BUSINESS);
-    expect(verdict.outcome).toBe('failed');
+    const verdict = await classifyJob(jobId, 'await_approval', BUSINESS);
+    expect(verdict.status).toBe('defer');
+  });
+});
+
+/**
+ * `failedText` is a pure function — no DB, no async — so its mapping table
+ * (fix round 2, item 3) is tested directly rather than only through a full
+ * `reportWhatsAppJobs` flow for every one of the three reason shapes it has
+ * to parse.
+ */
+describe('failedText', () => {
+  it('maps the run-due namespace, whose own shape has no " — " to split on', () => {
+    expect(failedText('run_due: no_plan_bound')).toContain('תוכנית פעולה');
+    expect(failedText('run_due: no_plan_bound')).not.toContain('run_due');
+    expect(failedText('run_due: plan_changed_mid_flight')).toContain('באמצע הביצוע');
+  });
+
+  it('maps delegation_refused:<code> as a prefix, regardless of the inner code', () => {
+    expect(failedText('delegation_refused:not_permitted — she said no')).toContain('נדחתה');
+    expect(failedText('delegation_refused:unknown_intent — she said no')).toContain('נדחתה');
+    expect(failedText('delegation_refused:not_permitted — she said no')).not.toContain('she said no');
+  });
+
+  it('maps the one wired adapter’s own codes', () => {
+    expect(failedText('no_recipient — אין נמען')).toContain('כתובת תקינה');
+    expect(failedText('delivery_unknown — ambiguous')).toContain('לאשר אם ההודעה');
+  });
+
+  it('falls through to the generic text for anything unmapped, in every shape', () => {
+    expect(failedText(null)).toBe(FAILED_GENERIC_TEXT);
+    expect(failedText('some_future_code — details')).toBe(FAILED_GENERIC_TEXT);
+    expect(failedText('a sentence with no code shape at all')).toBe(FAILED_GENERIC_TEXT);
+    expect(failedText('run_due: some_future_run_due_code')).toBe(FAILED_GENERIC_TEXT);
   });
 });

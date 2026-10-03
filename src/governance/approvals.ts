@@ -229,6 +229,15 @@ export async function pendingApprovals(
  * phase is the fact being reported, and a stale approval row is not required
  * to report it.
  *
+ * **`expires_at > now()` — fix round 2.** `expireOverdue` only sweeps rows
+ * still `pending` on its own schedule; between a fuse burning out and that
+ * sweep running, an expired-but-still-`pending` row is exactly the shape
+ * `unspentApprovalFor`'s own docblock already warns about, and for the
+ * identical reason: without this predicate, the owner would be handed a
+ * link to a card he can no longer action. The filter belongs in the query,
+ * not in the caller, for the same reason it belongs in `unspentApprovalFor`
+ * rather than in each of ITS callers.
+ *
  * `LIMIT 1` ordered newest-first: `executeStep` only ever parks a job behind
  * one live approval at a time, so more than one `pending` row for the same
  * job would itself be a different bug — this function is not the place that
@@ -242,6 +251,7 @@ export async function pendingApprovalForJob(
   const { rows } = await db.query<{ approval_id: string }>(
     `SELECT approval_id FROM approval_requests
       WHERE business_id = $1 AND job_id = $2 AND state = 'pending'
+        AND expires_at > now()
       ORDER BY created_at DESC
       LIMIT 1`,
     [options.businessId ?? config.businessId, jobId],
