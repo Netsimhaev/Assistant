@@ -29,15 +29,16 @@ function audioMsg(overrides: { seconds?: number } = {}): NormalizedInboundMessag
 }
 
 /**
- * Writes a `whatsapp` audit row directly, bypassing `transcribeInbound`
- * entirely — this is what proves the daily cap is read from `audit_log`
- * itself rather than from any counter `transcribeInbound` might keep.
+ * Writes a `whatsapp_transcription` audit row directly, bypassing
+ * `transcribeInbound` entirely — this is what proves the daily cap is read
+ * from `audit_log` itself rather than from any counter `transcribeInbound`
+ * might keep.
  */
 async function seedWhatsappAuditRow(businessId: string, senderKind: SenderKind): Promise<void> {
   await appendAudit(
     {
       actor: 'orchestrator',
-      kind: 'whatsapp',
+      kind: 'whatsapp_transcription',
       charterVersion: 'n/a',
       provenance: senderKind === 'principal' ? 'boss' : 'unknown_external',
       inputHash: canonicalHash({ seeded: true, senderKind }),
@@ -81,11 +82,61 @@ describe('transcribeInbound', () => {
     expect(outcome.status).toBe('capped');
   });
 
+  /**
+   * Fix round 1, Minor 2. Seeding 40 principal rows (above) exceeds BOTH the
+   * real boss cap (40) and a wrongly-merged "same cap as other" (20), so
+   * that test alone cannot tell the two apart. This seeds 21 — over the
+   * other-sender cap, still under the real boss cap — so a regression that
+   * quietly reused `whatsappTranscribeOtherPerDay` for the principal would
+   * turn this `'transcribed'` into `'capped'`.
+   */
+  it('reserves the principal a budget larger than the other-sender cap', async () => {
+    for (let i = 0; i < 21; i += 1) await seedWhatsappAuditRow(BUSINESS, 'principal');
+    const outcome = await transcribeInbound(audioMsg(), 'principal', { businessId: BUSINESS, provider: ok });
+    expect(outcome.status).toBe('transcribed');
+  });
+
+  /**
+   * Fix round 1, Important 2. The count is scoped to
+   * `kind = 'whatsapp_transcription'` specifically, not to every row that
+   * happens to share the sender's provenance. This stands in for the exact
+   * collision the review named: a future WhatsApp-instruction audit row
+   * would also carry `provenance: 'boss'` for the owner's own messages, and
+   * must not spend his transcription budget. The real instruction kind
+   * doesn't exist yet (a later task's job), so an existing, unrelated kind
+   * (`tool_call`) stands in for "some other boss-provenance event" here —
+   * the property under test is the kind filter, not what that future kind
+   * will be named.
+   */
+  it('does not count an audit row of a different kind toward the transcription budget', async () => {
+    await appendAudit(
+      {
+        actor: 'orchestrator',
+        kind: 'tool_call',
+        charterVersion: 'n/a',
+        provenance: 'boss',
+        inputHash: canonicalHash({ unrelated: true }),
+        artifacts: [],
+        costMinor: null,
+        tokens: null,
+        reason: 'some other boss-provenance event, not a transcription',
+      },
+      { businessId: BUSINESS },
+    );
+    expect(await whatsappTranscriptionsToday('principal', { businessId: BUSINESS })).toBe(0);
+  });
+
+  /**
+   * Fix round 1, Minor 1. `maxSeconds` previously appeared in no test: the
+   * default (180) alone would have passed this with `seconds: 200` even if
+   * the override were deleted. Here `seconds: 10` only exceeds the cap
+   * because `maxSeconds: 5` is actually read.
+   */
   it('refuses audio longer than the cap, and says how long it was', async () => {
-    const outcome = await transcribeInbound(audioMsg({ seconds: 200 }), 'principal', {
-      businessId: BUSINESS, provider: ok,
+    const outcome = await transcribeInbound(audioMsg({ seconds: 10 }), 'principal', {
+      businessId: BUSINESS, provider: ok, maxSeconds: 5,
     });
-    expect(outcome).toEqual({ status: 'too_long', seconds: 200 });
+    expect(outcome).toEqual({ status: 'too_long', seconds: 10 });
   });
 
   /** Never guesses. A failed transcription is a failure, not a best-effort string. */
@@ -120,21 +171,55 @@ describe('transcribeInbound', () => {
     expect(await whatsappTranscriptionsToday('principal', { businessId: BUSINESS })).toBe(1);
   });
 
-  /** No secret, no audio, no transcript in the audit row. */
-  it('writes an audit row carrying counts and the sender kind only', async () => {
-    const outcome = await transcribeInbound(audioMsg(), 'principal', { businessId: BUSINESS, provider: ok });
-    expect(outcome.status).toBe('transcribed');
+  /**
+   * Fix round 1, Important 1. `transcribeInbound` runs inside
+   * `schedulerPass` in production (spec §7.8) — a provider that never
+   * settles must not hang the whole pass, which also expires overdue
+   * approvals and runs every other due plan. `timeoutMs` stands in for
+   * `TRANSCRIBE_TIMEOUT_MS` (60s in production) so this proves the race
+   * without waiting out a real 60-second timer — the same pattern
+   * `adapterTimeoutMs` already uses in `src/orchestrator/external.test.ts`.
+   */
+  it('gives up on a provider that never settles, within the deadline, instead of hanging forever', async () => {
+    const outcome = await transcribeInbound(audioMsg(), 'principal', {
+      businessId: BUSINESS,
+      provider: () => new Promise(() => { /* never settles */ }),
+      timeoutMs: 25,
+    });
+    expect(outcome.status).toBe('failed');
+  });
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'whatsapp' });
+  /**
+   * No secret, no audio, no transcript, and no identifying detail in the
+   * audit row. Fix round 1, Minor 3: the previous version only asserted
+   * what the row lacks — an empty `reason` would have passed it — and never
+   * checked the sender's phone number, which is exactly the kind of
+   * identifier `erasure-invariants.test.ts` depends on `audit_log` never
+   * carrying, since that table is one of only three an erasure cannot
+   * reach. This now also asserts the counts are actually present, and that
+   * the sender's number is actually absent.
+   */
+  it('writes an audit row carrying counts and the sender kind only', async () => {
+    const msg = audioMsg({ seconds: 10 });
+    const outcome = await transcribeInbound(msg, 'principal', { businessId: BUSINESS, provider: ok });
+    expect(outcome.status).toBe('transcribed');
+    if (outcome.status !== 'transcribed') throw new Error('unreachable');
+
+    const entries = await queryAudit({ businessId: BUSINESS, kind: 'whatsapp_transcription' });
     expect(entries).toHaveLength(1);
     const entry = entries[0];
     expect(entry?.provenance).toBe('boss');
     expect(entry?.actionClass).toBeNull();
 
+    // The counts are genuinely present, not just "nothing bad is present".
+    expect(entry?.reason).toContain('10');
+    expect(entry?.reason).toContain(String(outcome.text.length));
+
     const serialised = JSON.stringify(entry, (_key, value) =>
       typeof value === 'bigint' ? value.toString() : value);
     expect(serialised).not.toContain('שלח לדנה');
     expect(serialised).not.toContain('fake-audio-bytes');
+    expect(serialised).not.toContain('972541234567');
   });
 
   /** The two budgets are independent per business, same as every other cap here. */

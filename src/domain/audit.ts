@@ -104,8 +104,19 @@ export const AuditKind = z.enum([
    * transcription budgets count, for the same reason `curation` rows are:
    * the only record that a billed call happened at all, including one that
    * charged and then failed.
+   *
+   * Named after the EVENT, not the channel — fix round 1 (Important 2). A
+   * future WhatsApp feature that also writes an audit row (an instruction
+   * count, per `whatsappInstructionsPerDay` in `src/config.ts`) must use a
+   * kind of its own, not this one: `provenance` alone cannot tell the two
+   * apart, since an owner's typed instruction and an owner's voice note both
+   * carry `provenance: 'boss'`. A generic `'whatsapp'` kind would have let
+   * that future row silently count against the transcription budget it was
+   * never spent against. Every other entry in this enum already follows
+   * this rule — none of them name a channel, each names the specific thing
+   * that happened.
    */
-  'whatsapp',
+  'whatsapp_transcription',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 

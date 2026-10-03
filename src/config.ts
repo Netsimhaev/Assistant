@@ -104,6 +104,9 @@ export const config = {
   whatsappMaxAudioSeconds: positiveInt('WHATSAPP_MAX_AUDIO_SECONDS', 180),
   // Every instruction spends a planner call, same shape as curationRunsPerDay/
   // delegationsPerDay above. Read by the triage task that wires instructions
-  // to the planner, not by transcribe.ts.
+  // to the planner, not by transcribe.ts. MUST be counted off its own
+  // AuditKind (not 'whatsapp_transcription') — see that kind's docblock in
+  // src/domain/audit.ts for why a shared kind would double-count against
+  // the wrong budget.
   whatsappInstructionsPerDay: positiveInt('WHATSAPP_INSTRUCTIONS_PER_DAY', 50),
 } as const;

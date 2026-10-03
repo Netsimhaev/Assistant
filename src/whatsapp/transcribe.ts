@@ -23,6 +23,21 @@
  * (`boss` vs `unknown_external`), so the count query reads it instead of
  * adding a second field that could say something different.
  *
+ * The count query also filters on `kind = 'whatsapp_transcription'`, not a
+ * generic `'whatsapp'` — fix round 1's Important 2. A bucket named after the
+ * *channel* rather than the *event* invites every future WhatsApp feature
+ * that writes an audit row (an instruction count, per `whatsappInstructionsPerDay`
+ * in `src/config.ts`, is already planned) to land in the same count this
+ * module reads as "a transcription happened". `provenance` alone cannot
+ * rescue that: an owner dictating instructions by typed text would still
+ * carry `provenance: 'boss'`, so a generic kind would have silently spent
+ * his transcription budget on something that never touched the transcription
+ * provider at all. Naming the kind after the specific event — matching
+ * `curation`, `delegation`, `credential_change` and every other entry in
+ * `AuditKind`, none of which name a channel — closes that off structurally:
+ * a future `whatsapp_instruction` kind (or whatever that task calls it) is a
+ * different string, and this query simply never sees it.
+ *
  * NEVER GUESSES. A provider that throws, returns nothing, or returns
  * whitespace produces `{ status: 'failed' }` — never a string this module
  * invented or a partial reading. On a channel that can spend money or make a
@@ -33,6 +48,24 @@
  * The audit row is written on the failure path too, success or not, because
  * a provider that charged and then failed still charged — the same
  * reasoning `recordCurationFailure` (`src/memory/curate.ts`) is built on.
+ *
+ * The provider call is raced against a deadline, not awaited directly — fix
+ * round 1's Important 1. `TranscriptionProvider` takes no `AbortSignal`, same
+ * as `WhatsAppGateway.sendMessage` and `MailTransport.send` before it, and an
+ * `AbortSignal` would be advisory even if it existed: nothing forces a real
+ * provider, or a test double, to check it. This is the fourth call site in
+ * this project with that exact shape (`callWithDeadline` in
+ * `src/orchestrator/run-plan.ts`, `withDeadline` in `src/governance/
+ * notify.ts`, a second `withDeadline` in `src/whatsapp/messenger.ts`), so a
+ * fourth local copy rather than a shared import — the same choice each prior
+ * site made, because each one wraps a different promise with a different
+ * fallback and there is nothing to factor out beyond a few lines of shape.
+ * What makes this one load-bearing rather than cosmetic: production calls
+ * this from inside `schedulerPass` (spec §7.8) — one sequential await chain
+ * that also runs `expireOverdue` and every due plan. An unbounded await here
+ * does not delay one voice note; it stalls the owner's entire approval queue
+ * for as long as the provider hangs, for exactly as long as a stranger's
+ * voice note sits with a wedged endpoint.
  */
 import type { Queryable } from '../db/pool.js';
 import { getPool } from '../db/pool.js';
@@ -63,6 +96,41 @@ const SENDER_LABEL: Record<SenderKind, string> = {
 };
 
 /**
+ * How long `transcribeInbound` waits for the provider before giving up.
+ *
+ * Matches `ADAPTER_TIMEOUT_MS` in `src/orchestrator/run-plan.ts` rather than
+ * the much shorter `SEND_TIMEOUT_MS`/`NOTIFY_TIMEOUT_MS` (5s) in
+ * `messenger.ts`/`notify.ts`: those two are courtesy acknowledgements to a
+ * channel that is either up or down, while this call, like an adapter call,
+ * is the real work — an external service actually processing audio, which
+ * can legitimately take tens of seconds against a healthy provider.
+ */
+const TRANSCRIBE_TIMEOUT_MS = 60_000;
+
+/**
+ * Bound a promise the provider might never settle.
+ *
+ * Mirrors `withDeadline` in `src/governance/notify.ts` and
+ * `src/whatsapp/messenger.ts` (itself mirroring `callWithDeadline` in
+ * `src/orchestrator/run-plan.ts`) — same bug, same fix, fourth call site. An
+ * `AbortSignal` is advisory only: nothing forces a provider implementation,
+ * or a test double, to check it, so racing the call itself against an
+ * independent timer is what actually binds the wait.
+ */
+function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`transcription provider did not finish within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+/**
  * The trust level a transcript from this sender kind inherits — spec §6.1.
  * Doubles as the cap's discriminator: `provenance` is a column every audit
  * row already carries, so the two daily budgets are told apart by reading
@@ -74,9 +142,23 @@ function provenanceOf(senderKind: SenderKind): TrustLevel {
 }
 
 /**
+ * Each sender kind's own daily ceiling — one table, so the budget a sender
+ * draws from and the provenance that silos its count (`provenanceOf` above)
+ * can never be updated one without the other. Fix round 1's Important 2
+ * flagged a `senderKind === 'principal' ? … : …` ternary living apart from
+ * `provenanceOf`'s own as exactly the kind of two-places-that-must-agree
+ * this project has been burned by before.
+ */
+const DAILY_CAP: Record<SenderKind, () => number> = {
+  principal: () => config.whatsappTranscribeBossPerDay,
+  other: () => config.whatsappTranscribeOtherPerDay,
+};
+
+/**
  * How many transcription attempts this sender kind has made today —
  * successful or failed, because a failed attempt still called the provider.
- * Counts `audit_log` rows; see this module's own docblock for why.
+ * Counts `audit_log` rows; see this module's own docblock for why, and for
+ * why the kind filter is `whatsapp_transcription` specifically.
  */
 export async function whatsappTranscriptionsToday(
   senderKind: SenderKind,
@@ -86,7 +168,7 @@ export async function whatsappTranscriptionsToday(
   const db = options.db ?? getPool();
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM audit_log
-      WHERE business_id = $1 AND kind = 'whatsapp' AND provenance = $2
+      WHERE business_id = $1 AND kind = 'whatsapp_transcription' AND provenance = $2
         AND at >= date_trunc('day', now())`,
     [businessId, provenanceOf(senderKind)],
   );
@@ -96,7 +178,19 @@ export async function whatsappTranscriptionsToday(
 export async function transcribeInbound(
   msg: NormalizedInboundMessage,
   senderKind: SenderKind,
-  options: { businessId: string; provider: TranscriptionProvider; maxSeconds?: number },
+  options: {
+    businessId: string;
+    provider: TranscriptionProvider;
+    maxSeconds?: number;
+    /**
+     * Overrides `TRANSCRIBE_TIMEOUT_MS` for one call. Production never
+     * passes this; it exists so a test can prove the race without waiting
+     * out a real 60s timer — the same escape hatch `adapterTimeoutMs`
+     * (`src/orchestrator/run-plan.ts`) already gives `ADAPTER_TIMEOUT_MS`,
+     * same order of magnitude, same reason.
+     */
+    timeoutMs?: number;
+  },
 ): Promise<TranscribeOutcome> {
   const { businessId, provider } = options;
 
@@ -121,17 +215,17 @@ export async function transcribeInbound(
     return { status: 'too_long', seconds };
   }
 
-  const perDay =
-    senderKind === 'principal'
-      ? config.whatsappTranscribeBossPerDay
-      : config.whatsappTranscribeOtherPerDay;
+  const perDay = DAILY_CAP[senderKind]();
   const usedToday = await whatsappTranscriptionsToday(senderKind, { businessId });
   if (usedToday >= perDay) {
     return { status: 'capped' };
   }
 
   try {
-    const result = await provider({ bytes, mimeType });
+    const result = await withDeadline(
+      provider({ bytes, mimeType }),
+      options.timeoutMs ?? TRANSCRIBE_TIMEOUT_MS,
+    );
     const text = result.text.trim();
     if (text === '') {
       await recordAttempt(businessId, senderKind, { succeeded: false, seconds, textLength: 0 });
@@ -141,9 +235,10 @@ export async function transcribeInbound(
     return { status: 'transcribed', text };
   } catch {
     // The error itself is never recorded or surfaced — see the module
-    // docblock on never guessing and `src/domain/audit.ts`'s `whatsapp`
-    // entry on never carrying anything but counts and the sender kind. An
-    // upstream error message is neither.
+    // docblock on never guessing and `src/domain/audit.ts`'s
+    // `whatsapp_transcription` entry on never carrying anything but counts
+    // and the sender kind. An upstream error message (or a timeout message
+    // naming nothing sensitive, but still just noise to a human) is neither.
     await recordAttempt(businessId, senderKind, { succeeded: false, seconds, textLength: 0 });
     return { status: 'failed', reason: CANNOT_UNDERSTAND };
   }
@@ -153,27 +248,45 @@ export async function transcribeInbound(
  * The one audit row a transcription attempt produces, success or failure
  * alike. Carries counts (duration, character count) and the sender kind —
  * via `provenance`, not the message body, not the transcript. See
- * `src/domain/audit.ts`'s `whatsapp` entry for the full reasoning.
+ * `src/domain/audit.ts`'s `whatsapp_transcription` entry for the full
+ * reasoning.
+ *
+ * The write itself is wrapped and swallowed on failure, matching
+ * `recordCurationFailure` (`src/memory/curate.ts`) rather than `trip()`'s
+ * throw-with-the-outcome pattern (`src/governance/killswitch.ts`) — fix
+ * round 1's Minor 4. The two precedents exist for different stakes:
+ * `trip()` is a binary safety switch where a caller catching a dedicated
+ * error can still act on the fact that the trip itself landed. Here, the
+ * value this function's caller needs most is the transcript (or the honest
+ * failure) already sitting in hand from the provider call above — an owner's
+ * dictated instruction must not be thrown away because a transient write to
+ * `audit_log` failed a moment later. The cost of swallowing is a budget
+ * under-count for exactly this one call, which a human can still see and
+ * correct; the cost of not swallowing is losing the instruction outright.
  */
 async function recordAttempt(
   businessId: string,
   senderKind: SenderKind,
   counts: { succeeded: boolean; seconds: number; textLength: number },
 ): Promise<void> {
-  await appendAudit(
-    {
-      actor: 'orchestrator',
-      kind: 'whatsapp',
-      charterVersion: 'n/a',
-      provenance: provenanceOf(senderKind),
-      inputHash: canonicalHash(counts),
-      artifacts: [],
-      costMinor: null,
-      tokens: null,
-      reason: counts.succeeded
-        ? `תמלול הודעת וואטסאפ · ${SENDER_LABEL[senderKind]} · הצליח · ${counts.seconds} שניות · ${counts.textLength} תווים`
-        : `תמלול הודעת וואטסאפ · ${SENDER_LABEL[senderKind]} · נכשל · ${counts.seconds} שניות`,
-    },
-    { businessId },
-  );
+  try {
+    await appendAudit(
+      {
+        actor: 'orchestrator',
+        kind: 'whatsapp_transcription',
+        charterVersion: 'n/a',
+        provenance: provenanceOf(senderKind),
+        inputHash: canonicalHash(counts),
+        artifacts: [],
+        costMinor: null,
+        tokens: null,
+        reason: counts.succeeded
+          ? `תמלול הודעת וואטסאפ · ${SENDER_LABEL[senderKind]} · הצליח · ${counts.seconds} שניות · ${counts.textLength} תווים`
+          : `תמלול הודעת וואטסאפ · ${SENDER_LABEL[senderKind]} · נכשל · ${counts.seconds} שניות`,
+      },
+      { businessId },
+    );
+  } catch {
+    // Swallowed on purpose — see the docblock above.
+  }
 }
