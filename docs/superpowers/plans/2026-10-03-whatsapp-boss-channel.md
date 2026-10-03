@@ -24,6 +24,7 @@
 - **`provenance: 'boss'` is a literal in the call body**, never a parameter a caller can aim. Locked by `src/orchestrator/instruction-invariants.test.ts`.
 - **No secret value in any log, error, audit row, returned summary, or rendered page.** GREEN-API credentials and the transcription key are resolved from the encrypted store at point of use.
 - **`businessId` is mandatory with no default on every credential path.** `options.businessId ?? config.businessId` is forbidden there.
+- **One GREEN-API instance per business, under two fixed ref names:** `GREEN_API_INSTANCE_ID` and `GREEN_API_TOKEN`. Both satisfy `CREDENTIAL_REF_PATTERN` (`^[A-Z0-9_]+$`). **The same two names serve every business without collision**, because `storedCredentials` is keyed by `(business_id, ref)` and the cipher binds the business id as AAD — so a row written for one business cannot be read by another, by the query or by the cipher. Onboarding a business is therefore: provision those two refs for it, and declare the principal's `channels.whatsapp` in its signed charter. Nothing else.
 - **The project's completion ritual** after anything changes: `npm run typecheck` and `npm test`. `/security-review` additionally when the change touches `policy/engine.ts`, `charter/capabilities.ts`, `policy/classify.ts`, `util/canonical.ts`, `audit/log.ts`, or a migration file — **Task 2 touches a migration, so it needs one.**
 
 ---
@@ -1172,7 +1173,20 @@ git commit -m "Wiring: the door before the plans, the report after the close, an
 
 **Interfaces:**
 - Consumes: `WhatsAppGateway` (Task 4), `CredentialSource` from `src/orchestrator/credentials.js`.
-- Produces: `export function createGreenApiGateway(options: { credentials: CredentialSource; businessId: string; http?: typeof fetch }): WhatsAppGateway;`
+- Produces:
+```ts
+export const GREEN_API_INSTANCE_REF = 'GREEN_API_INSTANCE_ID';
+export const GREEN_API_TOKEN_REF = 'GREEN_API_TOKEN';
+
+export function createGreenApiGateway(options: {
+  credentials: CredentialSource;
+  /** Mandatory, no default. An omission reading as "the configured business" is how one customer reads another's secret. */
+  businessId: string;
+  http?: typeof fetch;
+}): WhatsAppGateway;
+```
+
+**One instance per business, and the multi-business shape is already handled by the store rather than by this file.** GREEN-API's unit is an instance per linked number, so each business has its own pair. Both refs keep the SAME names across every business: `storedCredentials` is keyed by `(business_id, ref)` and `secret-cipher.ts` binds the business id as authenticated data, so a row written for one business will not open for another — not by the query and not by the cipher. That is why this file needs no per-business naming scheme and must not invent one.
 
 - [ ] **Step 1: Write the failing tests against an injected `fetch`**
 
@@ -1203,6 +1217,14 @@ git commit -m "The GREEN-API gateway, built from what the spike measured"
 Send a real instruction from the principal's phone. Confirm: the ack arrives; the job runs; the report matches what actually happened; `/conversation` shows all three. Then send one from a non-principal number and confirm it is recorded and **unanswered**.
 
 Every live run in this project so far has revealed something the tests missed. Expect that, and write down what it was.
+
+---
+
+## Out of scope, stated because the surrounding product implies it
+
+**The operator panel that provisions a business is not built here.** The product's shape is one installation per business with central operator management, and onboarding a business means provisioning two secret refs and signing a charter that declares the principal's number. Today the door a credential enters through is `npm run secret put <REF> <operator>` — the CLI — and that is deliberate: `putSecret` keeping a single writer is a property this project holds, and the `credential_change` audit kind exists because this design concentrates every customer's secrets in one operator's hands, so each use of that power has to leave a record nobody can edit.
+
+**A panel that writes credentials is therefore its own decision, not a detail of this plan.** It would be a second writer to `putSecret`, and it would be a web surface holding many businesses' secrets rather than a command run on one machine. Both are real changes to the threat model and belong in their own spec. This plan assumes the refs are already provisioned by whatever the operator uses, and fails loudly with a named warning when they are not (Task 10).
 
 ---
 
