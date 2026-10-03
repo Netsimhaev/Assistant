@@ -91,6 +91,21 @@ export const AuditKind = z.enum([
    * subject survives.
    */
   'delegation',
+  /**
+   * A voice note arrived on WhatsApp and was, or was not, transcribed.
+   * Carries counts — the recording's length, the transcript's character
+   * count — and the sender kind, carried through `provenance` itself
+   * (`boss` for the principal, `unknown_external` for anyone else) rather
+   * than a second column that could drift from it. Never the message body
+   * and never the transcript: `audit_log` is append-only at the database
+   * level, so a row carrying the words would make it the one place an
+   * erased person's words survive — exactly what the owner's erasure
+   * command exists to prevent. This row is also what the two daily
+   * transcription budgets count, for the same reason `curation` rows are:
+   * the only record that a billed call happened at all, including one that
+   * charged and then failed.
+   */
+  'whatsapp',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 

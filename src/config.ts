@@ -91,4 +91,19 @@ export const config = {
   // with a daily count off `audit_log`, not with a token budget — and a second,
   // unproven cost mechanism beside the one that works is how two readers drift.
   delegationsPerDay: positiveInt('DELEGATIONS_PER_DAY', 50),
+  // Two budgets, not one — docs/superpowers/specs/2026-10-01-whatsapp-boss-channel-design.md
+  // §6.2. Shared, a customer sending fifty voice notes exhausts the budget and
+  // then the OWNER'S OWN recording goes untranscribed: a stranger degrading
+  // the owner's channel. Both are counted off `audit_log`, same reasoning as
+  // `curationRunsPerDay` above — see `whatsappTranscriptionsToday` in
+  // `src/whatsapp/transcribe.ts`.
+  whatsappTranscribeBossPerDay: positiveInt('WHATSAPP_TRANSCRIBE_BOSS_PER_DAY', 40),
+  whatsappTranscribeOtherPerDay: positiveInt('WHATSAPP_TRANSCRIBE_OTHER_PER_DAY', 20),
+  // A single recording longer than this is never sent to the provider at all
+  // — see transcribe.ts, checked before either daily budget.
+  whatsappMaxAudioSeconds: positiveInt('WHATSAPP_MAX_AUDIO_SECONDS', 180),
+  // Every instruction spends a planner call, same shape as curationRunsPerDay/
+  // delegationsPerDay above. Read by the triage task that wires instructions
+  // to the planner, not by transcribe.ts.
+  whatsappInstructionsPerDay: positiveInt('WHATSAPP_INSTRUCTIONS_PER_DAY', 50),
 } as const;
