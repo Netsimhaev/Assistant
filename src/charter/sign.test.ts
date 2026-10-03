@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildCharter } from '../test/fixtures.js';
 import { compileCharter } from './compile.js';
-import { verifyCharterSignature } from './sign.js';
+import { signCharter, verifyCharterSignature } from './sign.js';
 import {
   BusinessCharter,
   KNOWN_TOOL_NAMES,
@@ -50,6 +50,19 @@ describe('charter signing', () => {
     };
 
     expect(() => compileCharter(tampered)).toThrow(/refusing to compile an unverified charter/);
+  });
+
+  it('refuses to sign a principal WhatsApp number that is not a full international form', () => {
+    const base = buildCharter();
+    // `buildCharter()` returns an already-signed charter; `signCharter` takes
+    // an unsigned one, so the signature is dropped the same way
+    // `scripts/seed-charter-live.ts` drops it before re-signing.
+    const { signature: _dropped, ...unsigned } = base;
+    const people = unsigned.people.map((p, i) =>
+      i === 0 ? { ...p, isPrincipal: true, channels: { whatsapp: '0541234567' } } : p,
+    );
+    expect(() => signCharter({ ...unsigned, people }, { signedByPersonId: 'owner', method: 'dashboard_click' }))
+      .toThrow(/\+972/);
   });
 });
 
