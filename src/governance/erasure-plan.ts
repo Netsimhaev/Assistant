@@ -103,7 +103,12 @@
  * tied to a job the anchor already found, a contact arm matching
  * `sender_number`/`body`/`transcript` directly for a message with none, and a
  * window arm matching `created_at` for the same reason — a window anchor
- * erases everything CREATED in it, claimed or not. See
+ * erases everything CREATED in it, claimed or not. The latter two arms are
+ * gated on `job_id IS NULL` (fix round 1, Critical 1) — exactly like
+ * `APPROVAL_REQUESTS_MATCHED`'s own second arm — because a message that DOES
+ * have a job must be reached only through that job, or a kept job's own
+ * message would be deleted directly and a live job outside `jobList` could
+ * lose its message with no refusal. See
  * `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s own docblock.
  */
 import { join } from 'node:path';
@@ -329,6 +334,28 @@ export function approvalRequestParams(
  * directly, the same way `APPROVAL_REQUESTS_MATCHED`'s second arm reaches an
  * orphan approval card.
  *
+ * **The content and window arms are gated on `job_id IS NULL`, and that is a
+ * positive condition, not a leftover** — the same shape
+ * `APPROVAL_REQUESTS_MATCHED` already uses for its own second arm (fix
+ * round 1, Critical 1). A message that HAS a job is already reached through
+ * that job: `jobIds` (and, downstream of it, `jobList`) is where a kept job
+ * is removed before deletion runs, so a message reached only via `job_id =
+ * ANY($2)` is correctly skipped when its job was kept. Without the gate, a
+ * message belonging to a KEPT job would still be deleted directly by its own
+ * `sender_number`/`body`/`transcript` or its own `created_at` — the preview
+ * would report "job J kept" while destroying J's own opening message, which
+ * is exactly the over-deletion the `agent_envelopes` `child_job_id` arm was
+ * tried and reverted for (see that predicate's own docblock above: "in this
+ * codebase over-deletion is exactly as serious as under-deletion"). It would
+ * also widen the live-job window: the plan-time refusal and the executor's
+ * `FOR UPDATE` re-check both only cover `jobList`, so a message naming the
+ * contact only in its own WhatsApp text — with the job's `job_plans`,
+ * `boss_instructions` and `jobs.title` all silent on it — belongs to a job
+ * that is neither refused nor locked, and an ungated arm would delete that
+ * job's message out from under it even while the job sits in `execute` right
+ * now. `job_id IS NULL` closes both: there is no job to undermine and
+ * nothing live to race.
+ *
  * Content columns only: `sender_number`, `body` and `transcript` — never
  * `provider_message_id` (the provider's own id, not a person) and never
  * `direction`/`state`/`job_id` (structure, not content).
@@ -341,13 +368,14 @@ export function approvalRequestParams(
  */
 export const WHATSAPP_MESSAGES_ERASED_PREDICATE = `business_id = $1
   AND (job_id = ANY ($2)
-    OR ($3::text IS NOT NULL
-        AND (coalesce(sender_number, '') ILIKE $3 ${LIKE_ESCAPE}
-          OR coalesce(body, '')          ILIKE $3 ${LIKE_ESCAPE}
-          OR coalesce(transcript, '')    ILIKE $3 ${LIKE_ESCAPE}))
-    OR ($4::timestamptz IS NOT NULL
-        AND created_at >= $4::timestamptz
-        AND created_at <  $5::timestamptz))`;
+    OR (job_id IS NULL
+        AND (($3::text IS NOT NULL
+              AND (coalesce(sender_number, '') ILIKE $3 ${LIKE_ESCAPE}
+                OR coalesce(body, '')          ILIKE $3 ${LIKE_ESCAPE}
+                OR coalesce(transcript, '')    ILIKE $3 ${LIKE_ESCAPE}))
+          OR ($4::timestamptz IS NOT NULL
+              AND created_at >= $4::timestamptz
+              AND created_at <  $5::timestamptz))))`;
 
 /**
  * The five parameters `WHATSAPP_MESSAGES_ERASED_PREDICATE` takes, derived

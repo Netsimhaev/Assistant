@@ -7,6 +7,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { writeMemory } from '../memory/store.js';
+import { keepItem } from './kept-items.js';
 import { buildErasurePlan } from './erasure-plan.js';
 import { executeErasure } from './erasure.js';
 
@@ -472,7 +473,17 @@ describe('what an erasure leaves behind', () => {
 
   /**
    * And the other direction, without which the scan above is satisfied
-   * perfectly by an erasure that deletes the whole database.
+   * perfectly by an erasure that deletes the whole database. Each job also
+   * gets its own job-tied `whatsapp_messages` row, so this doubles as the
+   * mutation-check target for Important 2: a bare `business_id = $1` for
+   * `WHATSAPP_MESSAGES_ERASED_PREDICATE` cannot even run (it stops consuming
+   * `$2`–`$5`, and `whatsappMessageParams` still supplies all five), so the
+   * query itself fails rather than deleting too much — see the fix round 1
+   * report for the exact error text that mutation produces.
+   *
+   * This test's two jobs are two DIFFERENT contacts, neither one kept — it
+   * is not the `kept_items` case. That case, where the SAME job the anchor
+   * found is explicitly kept, is the next test below (Critical 1).
    */
   it('leaves a second contact entirely intact', async () => {
     const bundle = await installCharter(buildCharter({ version: 'two' }), { businessId: BUSINESS });
@@ -492,10 +503,17 @@ describe('what an erasure leaves behind', () => {
         { jobId: job.jobId, kind: 'entity', subjectKey: identifier, body: { email: identifier } },
         { businessId: BUSINESS },
       );
+      await getPool().query(
+        `INSERT INTO whatsapp_messages
+           (id, business_id, provider_message_id, direction, sender_number,
+            sender_kind, body, provider_timestamp, state, job_id)
+         VALUES ($1, $2, $3, 'inbound', $4, 'principal', $5, now(), 'handled', $6)`,
+        [`WA-${job.jobId}`, BUSINESS, `wamid-${job.jobId}`, identifier, `הודעה מ-${identifier}`, job.jobId],
+      );
       return job.jobId;
     };
 
-    await mk(PROBE, 'probe');
+    const probeJob = await mk(PROBE, 'probe');
     const keptJob = await mk('keeper@nowhere.example', 'keeper');
 
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
@@ -509,6 +527,97 @@ describe('what an erasure leaves behind', () => {
 
     const auth = await getPool().query('SELECT 1 FROM job_authorizations WHERE job_id=$1', [keptJob]);
     expect(auth.rows).toHaveLength(1);
+
+    const probeMessage = await getPool().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [probeJob]);
+    expect(probeMessage.rows).toHaveLength(0);
+
+    const keptMessage = await getPool().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [keptJob]);
+    expect(keptMessage.rows).toHaveLength(1);
+  });
+
+  /**
+   * Fix round 1, Critical 1. The job the anchor itself finds — not a second,
+   * unrelated contact — explicitly KEPT via `kept_items`. The job's own
+   * `whatsapp_messages` row names the same identifier the anchor is erasing,
+   * exactly the shape that defeats a keep if the content arm is not gated on
+   * `job_id IS NULL`: `job_id = ANY($2)` correctly skips it once `jobList`
+   * drops the kept job, but an UNGATED content arm would still match the
+   * message directly by its own `sender_number`/`body`, deleting the kept
+   * job's opening message while the preview reports it as kept.
+   */
+  it('leaves a kept job’s own WhatsApp message alone', async () => {
+    const bundle = await installCharter(buildCharter({ version: 'wa-kept' }), { businessId: BUSINESS });
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'kept-job-with-whatsapp',
+    });
+    await getPool().query(
+      `INSERT INTO job_authorizations (business_id, job_id, action_class, recipients)
+       VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
+      [BUSINESS, job.jobId, PROBE],
+    );
+    await getPool().query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, provider_message_id, direction, sender_number,
+          sender_kind, body, provider_timestamp, state, job_id)
+       VALUES ('WA-kept-job', $1, 'wamid-kept-job', 'inbound', $2, 'principal', $3, now(), 'handled', $4)`,
+      [BUSINESS, PROBE, `הודעה מ-${PROBE}`, job.jobId],
+    );
+    await keepItem({ kind: 'job', itemId: job.jobId, note: 'לשימור' }, { businessId: BUSINESS });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
+    expect(plan.jobIds).not.toContain(job.jobId);
+
+    await executeErasure(plan, { businessId: BUSINESS });
+
+    const rows = await getPool().query('SELECT 1 FROM whatsapp_messages WHERE job_id=$1', [job.jobId]);
+    expect(rows.rows).toHaveLength(1);
+  });
+
+  /**
+   * The window arm, which the sweep above never exercises (it is
+   * contact-anchored): an orphan message — no job at all — created inside
+   * the window is destroyed, and one created outside it, naming the exact
+   * same identifier, survives untouched. Fix round 1, Important 2.
+   */
+  it('reaches an orphan whatsapp message by window, and leaves one outside the window alone', async () => {
+    await installCharter(buildCharter({ version: 'wa-window' }), { businessId: BUSINESS });
+
+    // The window arm matches `created_at` (when the row was WRITTEN), not
+    // `provider_timestamp` (what GREEN-API says about when the message was
+    // sent) — same as the `jobs` window search above it. `created_at` has a
+    // `DEFAULT now()`, so both rows get it set explicitly here rather than
+    // relying on insertion order to land one inside the window and one out.
+    await getPool().query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, provider_message_id, direction, sender_number,
+          sender_kind, body, provider_timestamp, state, job_id, created_at)
+       VALUES ('WA-in-window', $1, 'wamid-in-window', 'inbound', $2, 'other', $3,
+               '2026-01-01T12:00:00.000Z', 'received', NULL, '2026-01-01T12:00:00.000Z')`,
+      [BUSINESS, PROBE, `הודעה מ-${PROBE} בחלון`],
+    );
+    await getPool().query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, provider_message_id, direction, sender_number,
+          sender_kind, body, provider_timestamp, state, job_id, created_at)
+       VALUES ('WA-outside-window', $1, 'wamid-outside-window', 'inbound', $2, 'other', $3,
+               '2027-06-01T12:00:00.000Z', 'received', NULL, '2027-06-01T12:00:00.000Z')`,
+      [BUSINESS, PROBE, `הודעה מ-${PROBE} מחוץ לחלון`],
+    );
+
+    const plan = await buildErasurePlan(
+      { kind: 'window', fromIso: '2026-01-01T00:00:00.000Z', toIso: '2026-01-02T00:00:00.000Z' },
+      { businessId: BUSINESS },
+    );
+    await executeErasure(plan, { businessId: BUSINESS });
+
+    const remaining = await getPool().query<{ id: string }>(
+      'SELECT id FROM whatsapp_messages WHERE business_id=$1',
+      [BUSINESS],
+    );
+    expect(remaining.rows.map((r) => r.id)).toEqual(['WA-outside-window']);
   });
 
   /**

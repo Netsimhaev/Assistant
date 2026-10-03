@@ -162,6 +162,15 @@ export async function claimMessage(
   return rowCount === 1;
 }
 
+/**
+ * Throws when `id` (under `businessId`) matches no row. A silent miss would
+ * leave the message `claimed` forever — `unclaimedInbound` only ever offers
+ * `received`, so nothing would re-offer it and no caller would know the
+ * instruction was never recorded as settled. Same reasoning
+ * `markContentIngested` (`src/documents/read.ts`) already applies to its own
+ * `UPDATE`: an unresolved id is not a property of the message, it is a bug
+ * that must surface here rather than downstream as silence.
+ */
 export async function settleMessage(
   id: string,
   state: 'handled' | 'failed',
@@ -171,7 +180,7 @@ export async function settleMessage(
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
 
-  await db.query(
+  const { rowCount } = await db.query(
     `UPDATE whatsapp_messages
         SET state = $1,
             transcript = coalesce($2, transcript),
@@ -179,9 +188,19 @@ export async function settleMessage(
       WHERE id = $4 AND business_id = $5`,
     [state, patch.transcript ?? null, patch.jobId ?? null, id, businessId],
   );
+  if (rowCount !== 1) {
+    throw new Error(`settleMessage: no whatsapp_messages row for id=${id}, businessId=${businessId}`);
+  }
 }
 
-/** Oldest first, by the provider's own timestamp. */
+/**
+ * Oldest first, by the provider's own timestamp — with `id` as a
+ * deterministic tie-break. GREEN-API timestamps are second-granularity, so
+ * two instructions arriving in the same second would otherwise come out in
+ * an order that cannot be reconstructed from the audit trail afterwards; ids
+ * are monotonic ULIDs, so ordering by them resolves a tie the same way every
+ * time this is read.
+ */
 export async function unclaimedInbound(
   options: { businessId?: string; limit?: number; db?: Queryable } = {},
 ): Promise<StoredMessage[]> {
@@ -192,14 +211,19 @@ export async function unclaimedInbound(
   const { rows } = await db.query<MessageRow>(
     `SELECT ${COLUMNS} FROM whatsapp_messages
       WHERE business_id = $1 AND direction = 'inbound' AND state = 'received'
-      ORDER BY provider_timestamp ASC
+      ORDER BY provider_timestamp ASC, id ASC
       LIMIT $2`,
     [businessId, limit],
   );
   return rows.map(toStoredMessage);
 }
 
-/** Newest last, for the conversation screen. */
+/**
+ * Newest last, for the conversation screen. Same tie-break as
+ * `unclaimedInbound`, applied in both the inner "most recent N" selection and
+ * the outer re-sort, so a same-second pair lands in one deterministic order
+ * rather than whichever order Postgres happens to return them in.
+ */
 export async function conversation(
   options: { businessId?: string; limit?: number; db?: Queryable } = {},
 ): Promise<StoredMessage[]> {
@@ -211,10 +235,10 @@ export async function conversation(
     `SELECT * FROM (
        SELECT ${COLUMNS} FROM whatsapp_messages
         WHERE business_id = $1
-        ORDER BY provider_timestamp DESC
+        ORDER BY provider_timestamp DESC, id DESC
         LIMIT $2
      ) recent
-     ORDER BY provider_timestamp ASC`,
+     ORDER BY provider_timestamp ASC, id ASC`,
     [businessId, limit],
   );
   return rows.map(toStoredMessage);

@@ -58,7 +58,17 @@ describe('whatsapp store', () => {
   });
 
   it('settles a message with its transcript and job, and keeps outbound in the conversation', async () => {
-    const msg = await recordInbound({ ...base, providerMessageId: 'w.3', body: null, mediaKind: 'audio' }, { businessId: BUSINESS });
+    // `recordOutbound` stamps `provider_timestamp` with `now()` (the brief's
+    // own interface has no field to pass one in), so the inbound half has to
+    // be seeded relative to the wall clock rather than at a fixed past
+    // instant — otherwise the ordering assertion below is only true while
+    // the suite happens to run after 09:00 UTC on 2026-10-03 (fix round 1,
+    // Minor 9).
+    const past = new Date(Date.now() - 60_000).toISOString();
+    const msg = await recordInbound(
+      { ...base, providerMessageId: 'w.3', body: null, mediaKind: 'audio', providerTimestamp: past },
+      { businessId: BUSINESS },
+    );
     if (msg === null) throw new Error('unreachable');
     await claimMessage(msg.id, { businessId: BUSINESS });
     await settleMessage(msg.id, 'handled', { transcript: 'שלח לדנה', jobId: 'J-1' }, { businessId: BUSINESS });
@@ -69,6 +79,19 @@ describe('whatsapp store', () => {
     expect(convo[0]?.transcript).toBe('שלח לדנה');
     expect(convo[0]?.state).toBe('handled');
     expect(convo[1]?.direction).toBe('outbound');
+  });
+
+  /**
+   * Fix round 1, Important 3. A silent miss would leave the message
+   * `claimed` forever: `unclaimedInbound` only ever offers `received`, so
+   * nothing re-offers it, no retry path exists, and nothing logs. Same
+   * reasoning `markContentIngested` (`src/documents/read.ts`) already
+   * applies to its own `UPDATE`.
+   */
+  it('throws when settling an id that matches no row', async () => {
+    await expect(
+      settleMessage('WA-does-not-exist', 'handled', {}, { businessId: BUSINESS }),
+    ).rejects.toThrow();
   });
 
   /** One business must never read another's conversation. */
