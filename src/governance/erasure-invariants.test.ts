@@ -126,6 +126,23 @@ describe('what an erasure leaves behind', () => {
        VALUES ('WA-probe-orphan', $1, 'wamid-probe-orphan', 'inbound', $2, 'other', $3, now(), 'received', NULL)`,
       [BUSINESS, PROBE, `פנייה לא קשורה ממספר של ${PROBE}`],
     );
+    // Fix round 2, Finding 2. A second orphan — `job_id` NULL, same as
+    // `WA-probe-orphan` above — but with NO trace of the probe anywhere in
+    // `sender_number`/`body`/`transcript`. Under a CONTACT anchor,
+    // `whatsappMessageParams` sets `$3` to the probe's LIKE pattern, so this
+    // row is the one thing in this sweep that can tell "the content arm
+    // actually checks the content" apart from "the content arm is true
+    // whenever `$3` is non-null" — a widening that would still pass every
+    // other assertion in this file, because every other orphan or job-tied
+    // row here either carries the probe or is protected by the job arm
+    // instead. Asserted to survive, below, after the erasure runs.
+    await db.query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, provider_message_id, direction, sender_number,
+          sender_kind, body, transcript, provider_timestamp, state, job_id)
+       VALUES ('WA-unrelated-orphan', $1, 'wamid-unrelated-orphan', 'inbound', $2, 'other', $3, $4, now(), 'received', NULL)`,
+      [BUSINESS, '+972500000000', 'מתי אפשר לקבוע תור לספר?', 'תמלול: מתי אפשר לקבוע תור לספר?'],
+    );
     await writeMemory(
       { jobId: job.jobId, kind: 'entity', subjectKey: PROBE, body: { email: PROBE } },
       { businessId: BUSINESS },
@@ -278,6 +295,13 @@ describe('what an erasure leaves behind', () => {
 
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
     await executeErasure(plan, { businessId: BUSINESS });
+
+    // The row the content arm's narrowness is for (fix round 2, Finding 2):
+    // job-less, under the same contact anchor as everything else in this
+    // sweep, naming nothing that matches the probe. A content arm widened to
+    // "true whenever $3 is non-null" deletes this row; the real one does not.
+    const unrelated = await db.query('SELECT 1 FROM whatsapp_messages WHERE id = $1', ['WA-unrelated-orphan']);
+    expect(unrelated.rows).toHaveLength(1);
 
     const { rows: columns } = await db.query<{ table_name: string; column_name: string }>(
       `SELECT c.table_name, c.column_name

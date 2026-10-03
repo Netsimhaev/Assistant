@@ -252,12 +252,6 @@ export async function executeErasure(
     // `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s docblock in `erasure-plan.ts` for
     // why that is three arms rather than `job_id = ANY($2)` alone. Same
     // predicate, same parameters, as `countItems` there.
-    // `whatsapp_messages` can hold the counterparty's own number and message
-    // text with no job at all (an unclaimed inbound message, or one from a
-    // number the business never opened a job for) — see
-    // `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s docblock in `erasure-plan.ts` for
-    // why that is three arms rather than `job_id = ANY($2)` alone. Same
-    // predicate, same parameters, as `countItems` there.
     await del(
       'whatsapp_messages',
       `DELETE FROM whatsapp_messages WHERE ${WHATSAPP_MESSAGES_ERASED_PREDICATE}`,
