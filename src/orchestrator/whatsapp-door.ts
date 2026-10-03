@@ -177,17 +177,51 @@ function withTranscriptEcho(isAudio: boolean, transcript: string, rest: string):
 
 /**
  * Oldest first by the provider's own clock, the provider's own message id as
- * the tie-break — see the module docblock. A `providerTimestamp` that does
- * not parse yields `NaN` from `getTime()`, and `NaN !== 0` is true — left
- * unguarded, that would hand back `NaN` itself as the comparison result and
- * put this pair in an unspecified order instead of falling through to the
- * tie-break. Fix round 1's Minor 10: a value this door could not read must
- * never behave as a looser rule than a value it could.
+ * the tie-break — see the module docblock. Every message with an unreadable
+ * `providerTimestamp` (one that does not parse, so `getTime()` yields `NaN`)
+ * sorts strictly **after** every message with a readable one, and ties among
+ * unreadable timestamps are broken by id exactly like ties among readable
+ * ones — a value this door could not read is never ranked ahead of one it
+ * could, and never merely "wherever".
+ *
+ * **Fix round 2 replaced an earlier version that returned `0` for any pair
+ * involving a `NaN`, and that was not a genuine total order — the fourth
+ * instance in this project of a comment claiming a property the code did not
+ * have.** Treating a `NaN` pair as "equal under time" does not give the
+ * unreadable message one consistent place in the order: it ties with *every*
+ * message it is compared against, readable or not, so it interleaves by id
+ * with the whole batch rather than sorting consistently last. That breaks
+ * transitivity — a worked counter-example: `a = (NaN, id "b")`,
+ * `b = (t 100, id "a")`, `c = (t 1, id "c")` gives `compare(c, b) < 0`,
+ * `compare(b, a) < 0`, and `compare(a, c) < 0`, a cycle no total order can
+ * produce. `Array.prototype.sort` has no obligation to behave predictably
+ * under a comparator that is not a total order, so the one property this
+ * function exists to guarantee — a burst processed in one reconstructible
+ * order — was exactly what an inconsistent comparator could silently defeat.
+ * `whatsapp-door.test.ts` pins the exact resulting order for a batch that
+ * mixes unreadable and readable timestamps directly against this function
+ * (see its own export docblock), and fails under the `return 0` form this
+ * replaced.
  */
-function compareInbound(a: NormalizedInboundMessage, b: NormalizedInboundMessage): number {
+/**
+ * Exported for `whatsapp-door.test.ts` alone, to unit-test the comparator's
+ * ordering directly — including an unreadable-timestamp case that cannot be
+ * driven through `runWhatsAppDoor` at all, because `providerTimestamp` also
+ * has to survive `recordInbound`'s `TIMESTAMPTZ` column, and a string this
+ * comparator treats as unreadable (`NaN` from `getTime()`) is typically one
+ * Postgres rejects outright rather than storing. No other production code
+ * calls this directly; `runWhatsAppDoor`'s own `[...collected].sort(...)` is
+ * still the only real caller.
+ */
+export function compareInbound(a: NormalizedInboundMessage, b: NormalizedInboundMessage): number {
   const aTime = new Date(a.providerTimestamp).getTime();
   const bTime = new Date(b.providerTimestamp).getTime();
-  const byTime = Number.isNaN(aTime) || Number.isNaN(bTime) ? 0 : aTime - bTime;
+  const aUnreadable = Number.isNaN(aTime);
+  const bUnreadable = Number.isNaN(bTime);
+  if (aUnreadable && bUnreadable) return a.providerMessageId.localeCompare(b.providerMessageId);
+  if (aUnreadable) return 1; // unreadable sorts after readable — never "wherever".
+  if (bUnreadable) return -1;
+  const byTime = aTime - bTime;
   if (byTime !== 0) return byTime;
   return a.providerMessageId.localeCompare(b.providerMessageId);
 }

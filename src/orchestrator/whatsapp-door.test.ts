@@ -11,7 +11,7 @@ import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
 import type { NormalizedInboundMessage } from '../whatsapp/gateway.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { createFakeMessenger } from '../whatsapp/fake-messenger.js';
-import { runWhatsAppDoor } from './whatsapp-door.js';
+import { compareInbound, runWhatsAppDoor } from './whatsapp-door.js';
 
 const BUSINESS = 'test-business';
 // `buildCharter`'s default principal (`src/test/fixtures.ts`) carries this
@@ -487,6 +487,67 @@ describe('runWhatsAppDoor', () => {
 
     expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0 });
     expect(seenInstructions).toEqual(['ראשונה (מוקדמת)', 'שנייה (מאוחרת)']);
+  });
+
+  /**
+   * Fix round 2, item 1. Unit-tested directly against the exported
+   * `compareInbound`, not driven through `runWhatsAppDoor` — a
+   * `providerTimestamp` unreadable enough to make `getTime()` return `NaN`
+   * is typically one `recordInbound`'s `TIMESTAMPTZ` column rejects outright
+   * (confirmed: routing this case through the full door throws inside
+   * `recordInbound` and the message never reaches the planner at all, which
+   * would test the wrong thing — DB rejection, not sort order).
+   *
+   * An earlier version of `compareInbound` returned `0` for any pair where
+   * either side's timestamp failed to parse — not a genuine total order,
+   * since the `NaN` side then ties with *every* message it is compared
+   * against, readable or not, rather than occupying one consistent place.
+   * That is non-transitive: the coordinator's worked counter-example is
+   * `a = (NaN, id "b")`, `b = (t 100, id "a")`, `c = (t 1, id "c")`, whose
+   * pairwise comparisons form a cycle (`c < b`, `b < a`, `a < c`).
+   * `Array.prototype.sort` has no obligation to behave predictably under a
+   * comparator that is not a total order — and empirically does not, for
+   * this exact triple: **array order matters**. `[a, b, c]` happens to come
+   * out correct under the buggy comparator anyway (confirmed by running it);
+   * `[a, c, b]` does not (confirmed the same way — it comes out
+   * `a, c, b`, unreadable *first*, the opposite of what fix round 2
+   * requires). The array below is `[a, c, b]` for exactly that reason: a
+   * comparator that merely "doesn't crash" on an arbitrarily-chosen input
+   * order is not evidence of anything, and a prior version of this test
+   * (fix round 2's own first draft) used `[a, b, c]` and passed even with the
+   * bug still in place.
+   */
+  it('sorts a message with an unreadable timestamp after every readable one, never interleaved', () => {
+    const a: NormalizedInboundMessage = {
+      providerMessageId: 'b',
+      senderNumber: PRINCIPAL_NUMBER,
+      body: 'a (unreadable timestamp)',
+      mediaKind: null,
+      providerTimestamp: 'not-a-real-timestamp',
+    };
+    const b: NormalizedInboundMessage = {
+      providerMessageId: 'a',
+      senderNumber: PRINCIPAL_NUMBER,
+      body: 'b (t=100)',
+      mediaKind: null,
+      providerTimestamp: new Date(100).toISOString(),
+    };
+    const c: NormalizedInboundMessage = {
+      providerMessageId: 'c',
+      senderNumber: PRINCIPAL_NUMBER,
+      body: 'c (t=1)',
+      mediaKind: null,
+      providerTimestamp: new Date(1).toISOString(),
+    };
+
+    // Input order [a, c, b] — not [a, b, c] — see this test's own docblock
+    // for why the order itself had to be chosen empirically.
+    const ordered = [a, c, b].sort(compareInbound).map((m) => m.body);
+
+    // Readable timestamps chronologically first (c before b), the
+    // unreadable one strictly last — a genuine total order, not merely "a
+    // comparator that happened not to crash" on this input.
+    expect(ordered).toEqual(['c (t=1)', 'b (t=100)', 'a (unreadable timestamp)']);
   });
 
   it('throws before touching the queue when no active charter is installed', async () => {
