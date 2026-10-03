@@ -296,3 +296,36 @@ export async function markContentIngested(
   );
   return result.rowCount ?? 0;
 }
+
+/**
+ * Records which inbound WhatsApp message opened this job — migration 036's
+ * `jobs.whatsapp_message_id`. Several messages can carry the same job (a
+ * clarifying answer reuses it), and only the one that opened it should ever
+ * be linked, so this is written once, by the caller that just created the
+ * job from that message — never derived from `whatsapp_messages` itself,
+ * which has no column the other direction could read it back from.
+ *
+ * Throws when the UPDATE matches no row — the same rule `settleMessage`
+ * (`src/whatsapp/store.ts`) and `markContentIngested` above already carry: a
+ * silent miss here would leave a job that looks linked to nothing, and the
+ * caller (the WhatsApp door) needs to know its own id or business id was
+ * wrong rather than finding out later, downstream, as silence.
+ */
+export async function linkWhatsAppMessage(
+  jobId: string,
+  whatsappMessageId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<void> {
+  const db = options.db ?? getPool();
+  const businessId = options.businessId ?? config.businessId;
+  const { rowCount } = await db.query(
+    `UPDATE jobs SET whatsapp_message_id = $1, updated_at = now()
+      WHERE job_id = $2 AND business_id = $3`,
+    [whatsappMessageId, jobId, businessId],
+  );
+  if (rowCount !== 1) {
+    throw new Error(
+      `linkWhatsAppMessage: no jobs row for jobId=${jobId}, businessId=${businessId}`,
+    );
+  }
+}

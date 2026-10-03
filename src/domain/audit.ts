@@ -117,6 +117,25 @@ export const AuditKind = z.enum([
    * that happened.
    */
   'whatsapp_transcription',
+  /**
+   * An instruction arrived from the owner over WhatsApp and was attempted —
+   * whatever `runInstruction` returned: `planned`, `needs_answer` or
+   * `refused`. Carries counts (the instruction's character length) and the
+   * outcome status only — never the instruction text and never the sender's
+   * number, for the same reason `whatsapp_transcription` above carries
+   * neither: `audit_log` is append-only at the database level, so a row
+   * carrying either would make it the one place an erased person's words
+   * survive.
+   *
+   * This is also what `whatsappInstructionsPerDay` (`src/config.ts`) counts,
+   * and it is its own kind rather than folded into `whatsapp_transcription` —
+   * see that kind's own docblock above. A typed instruction and a
+   * transcribed voice note both carry `provenance: 'boss'`, so a shared kind
+   * would let one budget silently spend against the other; every entry in
+   * this enum already names the specific event rather than the channel, and
+   * this one is no exception.
+   */
+  'whatsapp_instruction',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 

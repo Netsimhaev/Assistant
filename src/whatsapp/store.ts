@@ -17,6 +17,8 @@
 import { ulid } from 'ulid';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
+import { appendAudit } from '../audit/log.js';
+import { canonicalHash } from '../util/canonical.js';
 
 export type MessageDirection = 'inbound' | 'outbound';
 export type SenderKind = 'principal' | 'other';
@@ -242,4 +244,84 @@ export async function conversation(
     [businessId, limit],
   );
   return rows.map(toStoredMessage);
+}
+
+/**
+ * How many WhatsApp instruction attempts this business has made today —
+ * whatever `runInstruction` returned, not only the ones that reached
+ * `'planned'`. A caller cannot see which branch the planner took from the
+ * outside, and a cap that only counted successes would let a flood of
+ * over-length or malformed messages run unbounded; over-counting a refusal
+ * costs one slot out of fifty, under-counting is unbounded (see
+ * `src/orchestrator/whatsapp-door.ts`, the one production caller).
+ *
+ * Counts `audit_log` rows, not a maintained counter — the same reasoning
+ * `curationRunsToday` (`src/memory/curate.ts`) and `whatsappTranscriptionsToday`
+ * (`src/whatsapp/transcribe.ts`) already apply: a counter kept beside the
+ * source can drift from it with nobody noticing. The kind filter is
+ * `'whatsapp_instruction'` specifically, never the generic `'whatsapp'` or
+ * the sibling `'whatsapp_transcription'` kind — see `'whatsapp_instruction'`'s
+ * own docblock in `src/domain/audit.ts` for why a shared kind would spend one
+ * budget against the other.
+ *
+ * Lives here, beside the rest of the WhatsApp message lifecycle, rather than
+ * in the door itself — the door's own module must never need to state the
+ * trust level an audit row carries (see that file's own invariant test), and
+ * every attempt this counts is, by construction, an attempt the door made on
+ * the owner's behalf.
+ */
+export async function whatsappInstructionsToday(
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<number> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<{ n: string }>(
+    `SELECT count(*)::text AS n FROM audit_log
+      WHERE business_id = $1 AND kind = 'whatsapp_instruction'
+        AND at >= date_trunc('day', now())`,
+    [businessId],
+  );
+  return Number(rows[0]?.n ?? '0');
+}
+
+/**
+ * The one audit row an instruction attempt produces, whatever `runInstruction`
+ * returned. Carries counts (the instruction's character length) and the
+ * outcome status only — never the instruction text and never the sender's
+ * number. See `'whatsapp_instruction'`'s own docblock in `src/domain/audit.ts`
+ * for the full reasoning.
+ *
+ * Every row this writes carries a fixed trust level: only a message from the
+ * principal ever reaches this far (`src/orchestrator/whatsapp-door.ts` calls
+ * `runInstruction` for no one else), so there is nothing here to compute —
+ * the value is as fixed as `runInstruction`'s own, stated once, in the one
+ * module built to state it.
+ *
+ * Swallowed on failure, matching `recordAttempt` (`transcribe.ts`): an
+ * instruction that already ran must not be lost because this budget row
+ * failed to write a moment later.
+ */
+export async function recordWhatsAppInstructionAttempt(
+  counts: { status: 'planned' | 'needs_answer' | 'refused'; textLength: number },
+  options: { businessId?: string } = {},
+): Promise<void> {
+  const businessId = options.businessId ?? config.businessId;
+  try {
+    await appendAudit(
+      {
+        actor: 'orchestrator',
+        kind: 'whatsapp_instruction',
+        charterVersion: 'n/a',
+        provenance: 'boss',
+        inputHash: canonicalHash(counts),
+        artifacts: [],
+        costMinor: null,
+        tokens: null,
+        reason: `הוראת וואטסאפ · ${counts.status} · ${counts.textLength} תווים`,
+      },
+      { businessId },
+    );
+  } catch {
+    // Swallowed on purpose — see this function's docblock.
+  }
 }
