@@ -70,6 +70,9 @@ async function recordStep(
       stepId: 's1',
       externalId: status === 'completed' ? '<MSG-1@example.com>' : null,
       status,
+      // `unknown` honestly does not know; `completed` here always means the
+      // mail really went out — see `StepCompletion.performed`'s own docblock.
+      performed: status === 'completed' ? true : null,
     });
   });
 }

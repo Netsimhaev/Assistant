@@ -263,6 +263,9 @@ function parseOrFail<T>(schema: z.ZodType<T>, input: unknown, toolName: string):
  */
 function renderRecalled(memories: MemoryRecord[]): LocalToolResult {
   return {
+    // The read genuinely ran — zero results is a true answer, not a
+    // non-event. Shared by both `memory.recall` and `memory.recall_shallow`.
+    performed: true,
     count: memories.length,
     memories: memories.map((m) => ({
       kind: m.kind,
@@ -294,7 +297,13 @@ async function write(
   );
   // The provenance is echoed back so the step's own record shows the trust
   // level this memory will carry forever after.
+  //
+  // `performed: true` — `writeMemory` either wrote the row or threw, and this
+  // line is only reached on the former. `performStep` (`run-plan.ts`) reads
+  // this field verbatim into `StepEffect.performed`, which is what
+  // `job_step_results.performed` (migration 037) ends up holding.
   return {
+    performed: true,
     recorded: true,
     memoryId: written.memoryId,
     kind: written.kind,
@@ -350,7 +359,9 @@ const HANDLERS: Record<string, LocalHandler> = {
     // Zero is a result, not a failure: "there was nothing to retire" is a true
     // answer to the question asked, and reporting it as an error would make
     // the step fail for having found the world already in the desired state.
-    return { retired };
+    // `performed: true` either way — the retirement query ran either way, and
+    // zero rows retired is a true answer, not a thing that did not happen.
+    return { performed: true, retired };
   },
 
   'memory.recall': async (input, ctx) => {

@@ -17,7 +17,7 @@ import { executeStep } from './execute.js';
  * completion, which is what lets a resumed run skip the step instead of
  * repeating it.
  */
-const NOTHING = { output: null, externalId: null };
+const NOTHING = { output: null, externalId: null, performed: true };
 
 
 const BUSINESS = 'test-business';
@@ -288,7 +288,7 @@ describe('spend accounting', () => {
       rampLevel: 'auto' as const,
       toolName: 'quote.issue',
       toolInput: { counterpartyId: 'c_812', amountMinor: 120_000, inReplyTo: 'm1' },
-      perform: async () => ({ output: { ok: true }, externalId: null }),
+      perform: async () => ({ output: { ok: true }, externalId: null, performed: true }),
       now: NOON,
     });
 
@@ -314,7 +314,7 @@ describe('spend accounting', () => {
       rampLevel: 'auto' as const,
       toolName: 'accounting.write',
       toolInput: { entityId: 'c_812', amountMinor: 50_000 },
-      perform: async () => ({ output: { ok: true }, externalId: null }),
+      perform: async () => ({ output: { ok: true }, externalId: null, performed: true }),
       now: NOON,
     };
 

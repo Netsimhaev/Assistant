@@ -15,7 +15,7 @@ import { getApproval } from '../governance/approvals.js';
  * back. The shape is `StepEffect`: the output, and the provider's handle on
  * whatever was created.
  */
-const NOTHING = { output: null, externalId: null };
+const NOTHING = { output: null, externalId: null, performed: true };
 
 const BUSINESS = 'test-business';
 /** 12:00 Asia/Jerusalem — outside the fixture's quiet window. */

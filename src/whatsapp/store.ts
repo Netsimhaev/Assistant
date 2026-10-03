@@ -196,6 +196,33 @@ export async function settleMessage(
 }
 
 /**
+ * Moves `'handled'` or `'failed'` to `'reported'` — the report-once claim.
+ *
+ * The same single-`UPDATE ... WHERE` shape as `claimMessage` above, and for
+ * the identical reason: `reportWhatsAppJobs` (`src/orchestrator/whatsapp-report.ts`)
+ * must send the owner exactly one message per instruction, and a read-then-write
+ * would let two overlapping passes both see an unreported row and both send.
+ * Returns `false` rather than throwing on a zero-row match — unlike
+ * `settleMessage` — because a miss here is not a bug to surface: it is
+ * "another pass already reported this", the ordinary outcome of losing the
+ * race, and the caller's answer to it is to send nothing, not to fail.
+ */
+export async function claimForReport(
+  id: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<boolean> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+
+  const { rowCount } = await db.query(
+    `UPDATE whatsapp_messages SET state = 'reported'
+      WHERE id = $1 AND business_id = $2 AND state IN ('handled', 'failed')`,
+    [id, businessId],
+  );
+  return rowCount === 1;
+}
+
+/**
  * Oldest first, by the provider's own timestamp — with `id` as a
  * deterministic tie-break. GREEN-API timestamps are second-granularity, so
  * two instructions arriving in the same second would otherwise come out in

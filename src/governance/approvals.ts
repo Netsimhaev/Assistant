@@ -217,6 +217,39 @@ export async function pendingApprovals(
 }
 
 /**
+ * The pending approval a job is parked behind, if any — the id a report to
+ * the owner can link to.
+ *
+ * `null` is a real outcome, not a bug: between the caller reading
+ * `jobs.phase = 'await_approval'` and this query running, the one row that
+ * explains it may have moved — decided (`decide`) or timed out
+ * (`expireOverdue`), both of which take it out of `pending`. The caller (the
+ * WhatsApp report, `src/orchestrator/whatsapp-report.ts`) treats that as
+ * "nothing to link to today", never as a reason to throw: the job's own
+ * phase is the fact being reported, and a stale approval row is not required
+ * to report it.
+ *
+ * `LIMIT 1` ordered newest-first: `executeStep` only ever parks a job behind
+ * one live approval at a time, so more than one `pending` row for the same
+ * job would itself be a different bug — this function is not the place that
+ * surfaces it.
+ */
+export async function pendingApprovalForJob(
+  jobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<string | null> {
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<{ approval_id: string }>(
+    `SELECT approval_id FROM approval_requests
+      WHERE business_id = $1 AND job_id = $2 AND state = 'pending'
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [options.businessId ?? config.businessId, jobId],
+  );
+  return rows[0]?.approval_id ?? null;
+}
+
+/**
  * Thrown when an approval cannot be decided: it is not `pending` any more, its
  * fuse has burned out, or another statement claimed it between this call's
  * read and its own `UPDATE`.
