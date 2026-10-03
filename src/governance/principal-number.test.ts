@@ -39,11 +39,14 @@ describe('isPrincipalSender', () => {
   });
 
   /**
-   * THE TRAP THIS MODULE EXISTS FOR. `phoneKey` in `src/charter/compile.ts`
-   * compares the last NINE digits, and it is right where it sits: for a
-   * do-not-contact list a coarse match errs safe, because it blocks more. For
-   * an AUTHORITY list the same coarseness errs the other way — a different
-   * number sharing nine trailing digits would be read as the owner.
+   * THE TRAP THIS MODULE EXISTS FOR. `phoneKey` in
+   * `src/governance/typed-recipients.ts` compares the last NINE digits, and
+   * it is right where it sits: both sides it compares are charter data the
+   * owner curated (its own docblock says so), and its call site
+   * (`knownToCharter`) is itself an authority-granting check that accepts
+   * that cost on purpose. That justification does not transfer to an inbound
+   * WhatsApp sender number, which nobody curated — a different number
+   * sharing nine trailing digits would be read as the owner.
    */
   it('does not resolve a different number that shares its last nine digits', () => {
     const charter = charterWithPrincipalNumber('+972541234567');

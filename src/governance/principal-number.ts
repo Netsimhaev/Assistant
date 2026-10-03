@@ -15,11 +15,14 @@
  * the business.
  *
  * **Exact match, and not the nine-digit key.** `phoneKey`
- * (`src/charter/compile.ts`) compares the last nine digits, which is correct
- * where it lives: on a do-not-contact list a coarse match errs safe because it
- * blocks more. On an authority list the identical coarseness errs the other
- * way — two different numbers sharing nine trailing digits would both read as
- * the owner. So this module keeps its own normaliser and compares in full.
+ * (`src/governance/typed-recipients.ts`) compares the last nine digits, and
+ * its own docblock justifies that on the grounds that both sides it compares
+ * are charter data the owner curated — not on any do-not-contact list; its
+ * only call site (`knownToCharter`, feeding `authorisedRecipients`) is itself
+ * an authority-granting check, the same direction as this module. That
+ * justification does not transfer here: an inbound WhatsApp sender number is
+ * not charter data anyone curated, it is a claim an attacker can dial in. So
+ * this module keeps its own normaliser and compares in full.
  */
 import type { BusinessCharter } from '../domain/charter.js';
 
@@ -27,9 +30,19 @@ import type { BusinessCharter } from '../domain/charter.js';
  * Digits only, full international form.
  *
  * A national form (`054…`) is refused rather than guessed at: inferring a
- * country code for an authority check is inventing authority. Minimum length
- * is a country code plus a subscriber number; below that nothing is a real
- * number and a short string must never match by accident.
+ * country code for an authority check is inventing authority.
+ *
+ * **Do not raise `MIN_INTERNATIONAL_DIGITS` above 10.** It is not a claim
+ * that no real E.164 number is shorter — `+683`, `+290` and `+672` reach a
+ * full number in seven total digits, so "below this nothing is a real
+ * number" is not literally true. The reason the floor must stay at or below
+ * 10 is the collision test this module exists for
+ * (`does not resolve a different number that shares its last nine digits`
+ * in `principal-number.test.ts`): at 11 its first probe, `+1541234567` (10
+ * digits), would be rejected on length before the comparison runs at all,
+ * so that assertion would pass for the wrong reason — refused as too short,
+ * not refused as a different number. The second probe is 12 digits and would
+ * still bite, so the test would not go fully hollow, only half of it would.
  */
 const MIN_INTERNATIONAL_DIGITS = 10;
 const MAX_INTERNATIONAL_DIGITS = 15; // E.164
@@ -43,6 +56,14 @@ export function authorityNumberKey(value: string): string | null {
   return digits;
 }
 
+/**
+ * `charter` must be the `charter` field of what `loadActiveCharter`
+ * (`src/charter/store.ts`) returns — the only read path that both parses the
+ * schema and checks the schema version. It does **not** verify the
+ * signature; that happens in `compileCharter`/`installCharter`. A cached or
+ * hand-parsed charter is not a legitimate argument here, the same caution
+ * `compile.ts` states about the bundle it produces.
+ */
 export function principalWhatsAppKey(charter: BusinessCharter): string | null {
   const principal = charter.people.find((p) => p.isPrincipal);
   const declared = principal?.channels['whatsapp'];
