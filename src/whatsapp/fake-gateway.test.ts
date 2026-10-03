@@ -84,7 +84,7 @@ describe('FakeGateway', () => {
     ]);
   });
 
-  it('makes exactly one sendMessage call reject after failNextSend, never throwing', async () => {
+  it('makes exactly one sendMessage call resolve as rejected after failNextSend, never throwing', async () => {
     const gateway = createFakeGateway();
     gateway.failNextSend();
 
@@ -95,6 +95,49 @@ describe('FakeGateway', () => {
     expect(second.state).toBe('sent');
 
     // The rejected call must not have been recorded as sent.
+    expect(gateway.sent).toEqual([{ contactId: 'c1', body: 'retry', idempotencyKey: 'k2' }]);
+  });
+
+  /**
+   * `failNextSend` resolves with a status, it never throws — a distinct
+   * failure shape from a transport that actually rejects (a DNS failure,
+   * `ECONNREFUSED`). `throwNextSend` is that second shape, and affects
+   * exactly one call, same as `failNextSend`.
+   */
+  it('makes exactly one sendMessage call reject after throwNextSend', async () => {
+    const gateway = createFakeGateway();
+    gateway.throwNextSend();
+
+    await expect(
+      gateway.sendMessage({ contactId: 'c1', body: 'hello', idempotencyKey: 'k1' }),
+    ).rejects.toThrow();
+
+    const second = await gateway.sendMessage({ contactId: 'c1', body: 'retry', idempotencyKey: 'k2' });
+    expect(second.state).toBe('sent');
+
+    // The thrown call must not have been recorded as sent.
+    expect(gateway.sent).toEqual([{ contactId: 'c1', body: 'retry', idempotencyKey: 'k2' }]);
+  });
+
+  /**
+   * Neither resolves nor rejects — only a caller's own deadline can end the
+   * wait. Proven here by racing it against a short timer rather than
+   * waiting on it directly, since the point is that it never settles on its
+   * own. Affects exactly one call, same as `failNextSend`.
+   */
+  it('makes exactly one sendMessage call hang forever after hangNextSend', async () => {
+    const gateway = createFakeGateway();
+    gateway.hangNextSend();
+
+    const hung = gateway.sendMessage({ contactId: 'c1', body: 'hello', idempotencyKey: 'k1' });
+    const outcome = await Promise.race([
+      hung.then(() => 'settled' as const),
+      new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 200)),
+    ]);
+    expect(outcome).toBe('timed-out');
+
+    const second = await gateway.sendMessage({ contactId: 'c1', body: 'retry', idempotencyKey: 'k2' });
+    expect(second.state).toBe('sent');
     expect(gateway.sent).toEqual([{ contactId: 'c1', body: 'retry', idempotencyKey: 'k2' }]);
   });
 

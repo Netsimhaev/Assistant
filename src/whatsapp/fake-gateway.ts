@@ -17,8 +17,30 @@ export interface FakeGateway extends WhatsAppGateway {
   /** Everything `sendMessage` was asked to send, in order. */
   readonly sent: Array<{ contactId: string; body: string; idempotencyKey: string }>;
   setHealth(health: GatewayHealth): void;
-  /** Makes the next `sendMessage` reject, so callers can prove they survive it. */
+  /**
+   * Makes the next `sendMessage` call *resolve* with `{ state: 'rejected' }`
+   * — the gateway's own, non-throwing way of saying a message did not go
+   * out (think: the provider's API answered "rejected"). This is **not** a
+   * thrown error; a caller that only catches exceptions and never reads
+   * `result.state` would miss it entirely. For an actual rejected promise —
+   * a DNS failure, `ECONNREFUSED`, anything a transport throws — use
+   * {@link throwNextSend}.
+   */
   failNextSend(): void;
+  /**
+   * Makes the next `sendMessage` call *reject* with an `Error`, the way a
+   * real network failure (DNS, `ECONNREFUSED`, a dropped socket) would — as
+   * opposed to {@link failNextSend}, which resolves normally with a
+   * `'rejected'` status. Affects exactly one call, same as `failNextSend`.
+   */
+  throwNextSend(): void;
+  /**
+   * Makes the next `sendMessage` call return a promise that never settles —
+   * neither resolves nor rejects — so a caller's own deadline is the only
+   * thing that can end the wait. Affects exactly one call, same as
+   * `failNextSend`; the call *after* the hanging one behaves normally.
+   */
+  hangNextSend(): void;
 }
 
 export function createFakeGateway(): FakeGateway {
@@ -27,6 +49,8 @@ export function createFakeGateway(): FakeGateway {
   let handler: ((msg: NormalizedInboundMessage) => Promise<void>) | null = null;
   let health: GatewayHealth = { state: 'connected', since: new Date().toISOString() };
   let failNext = false;
+  let throwNext = false;
+  let hangNext = false;
   let nextMessageId = 0;
 
   return {
@@ -38,6 +62,16 @@ export function createFakeGateway(): FakeGateway {
     },
 
     async sendMessage(input) {
+      if (hangNext) {
+        hangNext = false;
+        return new Promise(() => {
+          // Deliberately never settles — the point of `hangNextSend`.
+        });
+      }
+      if (throwNext) {
+        throwNext = false;
+        throw new Error('fake-gateway: forced transport failure');
+      }
       if (failNext) {
         failNext = false;
         return { messageId: '', state: 'rejected' };
@@ -79,6 +113,14 @@ export function createFakeGateway(): FakeGateway {
 
     failNextSend() {
       failNext = true;
+    },
+
+    throwNextSend() {
+      throwNext = true;
+    },
+
+    hangNextSend() {
+      hangNext = true;
     },
   };
 }
