@@ -108,8 +108,18 @@
  * `APPROVAL_REQUESTS_MATCHED`'s own second arm — because a message that DOES
  * have a job must be reached only through that job, or a kept job's own
  * message would be deleted directly and a live job outside `jobList` could
- * lose its message with no refusal. See
- * `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s own docblock.
+ * lose its message with no refusal. **And because of that gate, a job-tied
+ * message needs the other half `approval_requests` already has: a discovery
+ * query of its own** (fix round 3, the HIGH security-review finding).
+ * `boss_instructions`, `autonomy_marks`, `agent_envelopes` and
+ * `verification_verdicts` are all both a discovery source (by their own
+ * content) and a closure target (by `job_id` membership); `whatsapp_messages`
+ * had only the second half, so a contact named only in a job-tied message's
+ * own content — a non-opening message on an existing job, or an
+ * assistant-authored `recordOutbound` body stored nowhere else — was reached
+ * by neither arm and survived a contact erasure permanently. See the
+ * `whatsapp_messages` discovery query beside `approval_requests`'s, below.
+ * See `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s own docblock for the predicate.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -714,6 +724,37 @@ export async function buildErasurePlan(
             OR coalesce(edited_input::text, '')  ILIKE $2 ${LIKE_ESCAPE}
             OR summary ILIKE $2 ${LIKE_ESCAPE}
             OR detail  ILIKE $2 ${LIKE_ESCAPE})`,
+      [businessId, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // `whatsapp_messages` is reached as a closure target by `job_id`
+    // membership (`WHATSAPP_MESSAGES_ERASED_PREDICATE`'s job arm), so a name
+    // that appears ONLY here — a non-opening message on an existing job
+    // (only the message that OPENED a job is mirrored into
+    // `boss_instructions.text`, which has `job_id NOT NULL UNIQUE`; every
+    // later message on that same job has its text nowhere else), or an
+    // assistant-authored `recordOutbound` body, which is stored in no other
+    // table at all — must be able to put its job into `jobIds` first. The
+    // same pairing `boss_instructions`, `autonomy_marks`, `agent_envelopes`
+    // and `verification_verdicts` above all have: fix round 3's HIGH finding
+    // was exactly this table having the closure half (the content arm inside
+    // `job_id IS NULL`) without this discovery half, so a contact named only
+    // in a job-tied message's own `sender_number`/`body`/`transcript` was
+    // reached by neither the job arm (nothing else discovered that job) nor
+    // the content arm (switched off by the gate the job arm needs to stay
+    // safe) — `countItems` reported zero, the owner was told the row was
+    // gone, and it survived permanently. `job_id IS NOT NULL` because this
+    // query derives JOB ids; the orphan row it skips is matched directly, by
+    // its own content, in `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s own
+    // `job_id IS NULL` arm.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM whatsapp_messages
+        WHERE business_id = $1 AND job_id IS NOT NULL
+          AND (coalesce(sender_number, '') ILIKE $2 ${LIKE_ESCAPE}
+            OR coalesce(body, '')         ILIKE $2 ${LIKE_ESCAPE}
+            OR coalesce(transcript, '')   ILIKE $2 ${LIKE_ESCAPE})`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
