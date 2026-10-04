@@ -147,51 +147,55 @@ async function wakeDueJobs(
 
 /**
  * One business's WhatsApp bridge bookkeeping, as this process has last
- * observed it — §7.4, fix round 2. A single record, not two parallel maps on
- * the same key: all three fields below are read and written together on
- * every call, and splitting any of them into a second `Map` keyed the same
- * way is exactly the drift shape this codebase keeps refusing to
- * reintroduce (the `job_plans`/`job_authorizations` lesson, restated for a
- * `Map` instead of a table).
+ * observed it — §7.4, fix round 2 (fields), fix round 3 (the key). A single
+ * record, not two parallel maps on the same key: all three fields below are
+ * read and written together on every call, and splitting any of them into a
+ * second `Map` keyed the same way is exactly the drift shape this codebase
+ * keeps refusing to reintroduce (the `job_plans`/`job_authorizations`
+ * lesson, restated for a `Map` instead of a table).
  *
- * **Keyed entirely by the gateway's own `since`, never by the state word —
- * this is the one property the whole record exists to get right.** A design
- * that tracked "the last state word we dealt with" instead would read a
- * SECOND, genuinely new outage that happens to report the same word as an
- * earlier one it already delivered (`'reconnecting'` again, say, after the
- * bridge drops a second time) as "nothing new" and silently skip it — the
- * exact failure this record is built to rule out, and the reason it is
- * `since`, read fresh from the gateway on every call, rather than anything
- * this process derives or remembers about the WORD. It also means the
- * record self-corrects even past F6's own gap: if this process's own probe
- * happens to throw during the one pass where the bridge was briefly
- * `'connected'` again (so the reconnect is never actually observed), the
- * NEXT outage still carries a `since` the record has never seen, and is
- * still read as genuinely new — nothing here depends on having witnessed
- * the reconnect itself.
+ * **Keyed by the PAIR `(since, state)`, never by either alone — fix round
+ * 3.** Round 2 keyed by `since` alone, on the theory that two distinct
+ * outages never share one; the re-review found the pair this leaves
+ * unguarded, by trying to break it rather than taking the theory on trust:
+ * a gateway that holds the SAME `since` while the word WORSENS
+ * (`'reconnecting'` → `'banned'`) produced no further row and no further
+ * email, so the owner was never told his bridge reached the single worst
+ * state it can be in. Comparing the pair, not `since` alone, makes a
+ * worsening (or changing) word under an unchanged `since` read as a new
+ * episode in its own right. It also settles the question `since`-alone
+ * left as an argument rather than a fact: a `'connected'` record's `since`
+ * can in principle coincide, to the millisecond, with a later outage's —
+ * but a `'connected'` record and an outage record can never match on BOTH
+ * fields at once, because the `'connected'` branch below always writes
+ * `state: 'connected'` and an outage's `state` is by definition something
+ * else. No separate "is this an outage at all" field is needed; the pair
+ * already answers that question structurally. `since` alone still does the
+ * work the pair cannot: a bridge that drops, recovers unseen, and drops
+ * again reporting the IDENTICAL word is still read as a new episode,
+ * because its `since` differs even though its `state` does not.
  */
 interface WhatsAppHealthRecord {
   /**
-   * The `since` of the outage — or of the `'connected'` period — this
-   * process has most recently finished dealing with: successfully delivered
-   * an alert for, or simply observed as connected. Compared against
-   * `current.since` on every call to decide whether this pass describes the
-   * SAME episode as last time or a new one.
+   * The `since` of the episode — an outage, or a `'connected'` period —
+   * this process has most recently finished dealing with. Compared against
+   * `current.since` on every call, ALWAYS alongside `state` below — see
+   * this interface's own docblock on why the pair, not `since` alone, is
+   * what decides whether this pass describes the SAME episode as last time.
    */
   since: string;
+  /** The state word that went with `since` above, the other half of the pair — fix round 3. */
+  state: GatewayHealth['state'];
   /**
-   * Whether an alert has actually been delivered for THIS `since` — or
-   * whether there is nothing to deliver, because `since` names a connected
-   * period rather than an outage. `false` only while an outage with this
-   * exact `since` is still being retried; fix round 1, F1/F2's rule that
-   * "attempted" and "told him" are not the same fact, now keyed by episode
-   * rather than by the coarser `state !== 'connected'` check round 1 used —
-   * see this interface's own docblock on why that coarser check missed a
-   * genuinely new outage that arrived without an observed reconnect.
+   * Whether an alert has actually been delivered for THIS `(since, state)`
+   * pair — or whether there is nothing to deliver, because the pair names a
+   * connected period rather than an outage. `false` only while an outage
+   * matching this exact pair is still being retried; fix round 1, F1/F2's
+   * rule that "attempted" and "told him" are not the same fact.
    */
   delivered: boolean;
   /**
-   * Whether the one-time `incident` audit row for THIS `since` has already
+   * Whether the one-time `incident` audit row for THIS pair has already
    * been written — fix round 2's ruling: record once per transition, keep
    * retrying, mark observed only on delivery. Independent of `delivered`:
    * the row is written on the FIRST failed attempt, long before delivery
@@ -204,29 +208,26 @@ interface WhatsAppHealthRecord {
  * The last WhatsApp bridge bookkeeping this process has observed, per
  * business — §7.4. In-memory, for the life of the process.
  *
- * **Fix round 1, F8 — the trade-off this docblock used to name was the
- * impossible one.** A restart cannot cause a duplicate email: after a
- * restart the first observation is never a transition (see
- * `checkWhatsAppHealth` below), so there is no "re-sending one it already
- * sent" to be tolerant of. The real, asymmetric cost is the opposite
- * direction: a bridge that is already down when the process boots, and
- * never reconnects before the process is restarted again, is never reported
- * by email AT ALL — not once, across any number of restarts, because the
- * first-observation rule treats "already down" as having nothing to
- * transition FROM. That is accepted here (persisting the last state across
- * restarts, or treating `undefined → not-connected` as reportable once, are
- * both real fixes this task does not take), and it is why the dashboard's
- * own `health()` display (§7.4's first control) is not optional decoration:
- * it is the one surface that is never subject to this gap.
- *
- * **Fix round 2 — the SAME asymmetry applies to the audit row, not only the
- * email.** "Once per transition" is only true PER PROCESS: a crash-loop
- * that restarts this service mid-outage starts a fresh `Map`, so a
- * long-lived outage can still produce more than one `incident` row across
- * the lifetime of the installation — one per restart, never one per
- * thirty-second pass. The `reason` text `checkWhatsAppHealth` writes says
- * this explicitly, because a single row with no tail cannot otherwise tell
- * an operator reading it that the retry behind it is still running.
+ * **Fix round 3 — the FIRST observation ever made for a business DOES
+ * alert, when the bridge is already down.** Rounds 1 and 2 both claimed
+ * that a first observation is never a transition, and both were wrong in
+ * the dangerous direction: an installation that boots — or restarts mid-
+ * outage — with the bridge already down got ZERO emails and ZERO audit
+ * rows for that outage, for as long as it stayed down, across any number
+ * of restarts. That is total, permanent silence about the one state this
+ * whole mechanism exists to surface, and it is strictly worse than the
+ * noise a flapping bridge can cause (see `checkWhatsAppHealth`'s own
+ * docblock for that accepted, opposite-direction cost). The owner's
+ * interest in "the bridge is down, and I am only now finding out because
+ * the process just started" is identical to his interest in "the bridge
+ * JUST went down" — there is no prior state to call this a transition
+ * FROM, but there does not need to be: `checkWhatsAppHealth` alerts
+ * whenever `current.state !== 'connected'`, whether or not a record exists
+ * yet for this business. Nothing is persisted to the database for this —
+ * the fix is behavioural, not a new storage layer — so a crash-loop still
+ * re-alerts on every restart while the SAME outage persists; that cost is
+ * real and is stated honestly below, not hidden the way the false "never a
+ * transition" claim hid the opposite one.
  *
  * Keyed by business rather than a single value, matching every other
  * per-business concern in this module — a single installation may in
@@ -290,40 +291,46 @@ async function recordWhatsAppHealthNotifyFailure(
  * default. A genuine outage already being retried is not forgotten, and a
  * genuine reconnect that this exact probe happened to miss is still caught
  * correctly on the next one — see `WhatsAppHealthRecord`'s own docblock on
- * why keying by `since` rather than the state word is what makes that true
- * even though the reconnect itself was never observed. Nothing here can
- * propagate into the shared `try` in `schedulerPass` that would otherwise
- * skip `runWhatsAppDoor` too.
+ * why keying by the `(since, state)` pair rather than either alone is what
+ * makes that true even though the reconnect itself was never observed.
+ * Nothing here can propagate into the shared `try` in `schedulerPass` that
+ * would otherwise skip `runWhatsAppDoor` too.
  *
  * **Fix round 1, F1/F2 — delivery, not an attempt, is what "handled" means.**
- * `record.delivered` for the CURRENT `since` only becomes `true` after a
+ * `record.delivered` for the CURRENT episode only becomes `true` after a
  * `{ ok: true }` from `sendAlert`; a failure — no `sendAlert` configured, or
  * `sendAlert` itself returning `{ ok: false }` or throwing — leaves it
- * `false`, so the NEXT pass still tries the send again for the same outage.
+ * `false`, so the NEXT pass still tries the send again for the same episode.
  *
  * **Fix round 2 — the AUDIT ROW is a separate concern from the send, and is
- * written at most once per outage, not once per retry pass.** Round 1 wrote
+ * written at most once per OUTAGE, not once per retry pass.** Round 1 wrote
  * an `incident` row on every failed attempt, which meant a sustained outage
  * with a down mail relay wrote one row every thirty seconds — and every one
  * of those rows takes the audit chain's own advisory lock, so a sustained
  * double failure (bridge down AND mail down at once) serialised this
  * business's entire audit-writing path for as long as both stayed broken,
  * precisely while something was already going wrong. `record.audited`
- * tracks whether THIS outage has already earned its one row; later retries
- * for the same `since` keep trying to SEND but skip the audit write. The
+ * tracks whether THIS episode has already earned its one row; later retries
+ * for the same episode keep trying to SEND but skip the audit write. The
  * `reason` text below says so explicitly, because the row itself has no
  * tail: an operator reading one incident cannot otherwise tell whether the
- * retry behind it is still running or gave up after one try. And it is only
- * "once per transition" PER PROCESS — a crash-loop that restarts this
- * service mid-outage starts a fresh `Map`, so one row per restart is real
- * (the same asymmetry `lastWhatsAppHealth`'s own docblock, F8, already
- * accepts for the email itself).
+ * retry behind it is still running or gave up after one try.
  *
- * The FIRST observation ever made for a business is never itself a
- * transition — there is no prior episode to have left — so an installation
- * that boots with the bridge already down sends nothing, and audits
- * nothing, on its first pass; see `lastWhatsAppHealth`'s own docblock (F8)
- * for the asymmetric cost that choice accepts.
+ * **Fix round 3 — the honest claim is "once per OUTAGE", never "once per
+ * pass" in the absolute sense, and two costs follow from that, in opposite
+ * directions.** First: this bound is only as strong as the process it runs
+ * in. A crash-loop that restarts mid-outage starts a fresh `Map`, so the
+ * SAME outage re-alerts once per restart — and, as of this round, correctly
+ * so: see `lastWhatsAppHealth`'s own docblock on why the alternative (a
+ * first observation that stays silent) was the worse, hidden failure round
+ * 2 shipped by mistake. Second, parked rather than fixed here: a bridge
+ * that genuinely flaps — a new `since` on every single pass, never
+ * repeating one this process has already seen — alerts on every pass,
+ * unbounded, because each really is a distinct, never-before-seen episode
+ * by this function's own honest reading of `since`. That is noise, not
+ * silence — the opposite failure from everything else this mechanism
+ * guards against — and bounding it needs a minimum interval between
+ * alerts, a mechanism this task does not add.
  */
 async function checkWhatsAppHealth(
   gateway: { health(): Promise<GatewayHealth> },
@@ -339,37 +346,36 @@ async function checkWhatsAppHealth(
     return;
   }
 
+  if (current.state === 'connected') {
+    // Reconnected (or still connected, including the very first observation
+    // ever made for this business). Nothing pending, whether or not an
+    // earlier outage's alert ever actually went out.
+    lastWhatsAppHealth.set(businessId, { since: current.since, state: 'connected', delivered: true, audited: true });
+    return;
+  }
+
   const record = lastWhatsAppHealth.get(businessId);
 
-  if (record === undefined) {
-    // First observation ever for this business — never itself a
-    // transition, whatever state it reports. See `lastWhatsAppHealth`'s
-    // own docblock, F8.
-    lastWhatsAppHealth.set(businessId, { since: current.since, delivered: true, audited: true });
+  // Fix round 3 — no special case for `record === undefined`. The very
+  // first observation ever made for this business, if the bridge is
+  // already down, falls straight through to the same "new episode" path
+  // below as any other outage — see `lastWhatsAppHealth`'s own docblock on
+  // why a silent first observation was the bug, not the feature.
+  if (record !== undefined && record.since === current.since && record.state === current.state && record.delivered) {
+    // The SAME episode this process has already told the owner about —
+    // matched on BOTH `since` and the state word, not either alone (fix
+    // round 3; see `WhatsAppHealthRecord`'s own docblock) — and nothing has
+    // reconnected since. Nothing new to do.
     return;
   }
 
-  if (current.state === 'connected') {
-    // Reconnected (or still connected). Nothing pending, whether or not an
-    // earlier outage's alert ever actually went out.
-    lastWhatsAppHealth.set(businessId, { since: current.since, delivered: true, audited: true });
-    return;
-  }
-
-  if (record.since === current.since && record.delivered) {
-    // The SAME outage this process has already told the owner about, and
-    // nothing has reconnected since — nothing new to do, even if the state
-    // word changed underneath it (`'reconnecting'` becoming `'banned'`,
-    // say, without ever reconnecting).
-    return;
-  }
-
-  // Either a genuinely new outage — a different `since`, which includes one
-  // that arrived without this process ever observing a `'connected'` state
-  // in between (a reconnect this process's own probe happened to miss, F6)
-  // — or a retry of one that has not yet been delivered.
-  const isSameUndeliveredOutage = record.since === current.since; // implies !record.delivered, from the check above
-  const alreadyAudited = isSameUndeliveredOutage && record.audited;
+  // Either a genuinely new episode — a different `since`, a worsened or
+  // otherwise changed state word under an unchanged `since`, or the very
+  // first observation of an already-down bridge — or a retry of one that
+  // has not yet been delivered.
+  const isSameUndeliveredEpisode =
+    record !== undefined && record.since === current.since && record.state === current.state; // implies !record.delivered, from the check above
+  const alreadyAudited = isSameUndeliveredEpisode && record.audited;
 
   const subject = 'התנתק הגשר לוואטסאפ';
   const body =
@@ -385,7 +391,7 @@ async function checkWhatsAppHealth(
           'This is the only row for this outage; the next scheduler pass will try again silently.',
       );
     }
-    lastWhatsAppHealth.set(businessId, { since: current.since, delivered: false, audited: true });
+    lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: false, audited: true });
     return;
   }
 
@@ -402,12 +408,12 @@ async function checkWhatsAppHealth(
           `the next scheduler pass will try to send again silently.`,
       );
     }
-    lastWhatsAppHealth.set(businessId, { since: current.since, delivered: false, audited: true });
+    lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: false, audited: true });
     return;
   }
 
   // Delivered.
-  lastWhatsAppHealth.set(businessId, { since: current.since, delivered: true, audited: true });
+  lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: true, audited: true });
 }
 
 export interface SchedulerPassResult {
@@ -650,8 +656,9 @@ export async function schedulerPass(
         businessId,
       });
 
-      // §7.4 — never once per pass for as long as the bridge stays down; see
-      // `checkWhatsAppHealth`'s own docblock.
+      // §7.4 — once per outage, not once per pass for a sustained one; see
+      // `checkWhatsAppHealth`'s own docblock for what that bound does and
+      // does not promise.
       await checkWhatsAppHealth(
         runtime.whatsapp.gateway,
         runtime.notify,

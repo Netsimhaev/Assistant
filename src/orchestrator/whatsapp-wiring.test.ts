@@ -40,6 +40,8 @@ const STALE_CHARTER_BUSINESS = 'test-business-no-charter';
 const ONCE_PER_OUTAGE_BUSINESS = 'test-business-health-once-per-outage';
 const NO_SENDALERT_BUSINESS = 'test-business-health-no-sendalert';
 const PROBE_THROW_MID_OUTAGE_BUSINESS = 'test-business-health-probe-throw-mid-outage';
+const DOWN_AT_BOOT_BUSINESS = 'test-business-health-down-at-boot';
+const WORSENING_WORD_BUSINESS = 'test-business-health-worsening-word';
 const PREFIX = 'TEST_CRED_';
 // Fixed clock, matching run-due.test.ts / scheduler-runs-plans.test.ts: an
 // evening wall-clock run of this suite would otherwise fall inside quiet
@@ -625,5 +627,77 @@ describe('schedulerPass — WhatsApp wiring', () => {
     await schedulerPass({ businessId: PROBE_THROW_MID_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
     expect(calls).toHaveLength(2);
     expect(await whatsappHealthIncidents(PROBE_THROW_MID_OUTAGE_BUSINESS)).toHaveLength(1);
+  });
+
+  /**
+   * Fix round 3, item 1 — rounds 1 and 2 both treated the very first
+   * observation ever made for a business as never a transition, on the
+   * theory that there is no prior `'connected'` state to have left. That
+   * theory hid a real silence: an installation that boots — or restarts
+   * mid-outage — with the bridge already down got zero emails and zero
+   * audit rows for that outage, for as long as it stayed down, across any
+   * number of restarts. The owner's interest in "the bridge is down, and
+   * the process just started" is identical to his interest in "the bridge
+   * just went down" — so the very first `health()` this process ever makes
+   * for a business must alert if it is not `'connected'`.
+   */
+  it('alerts on the very first observation ever made, when the bridge is already down', async () => {
+    await installCharter(buildCharter(), { businessId: DOWN_AT_BOOT_BUSINESS });
+    const gateway = createFakeGateway();
+    gateway.setHealth({ state: 'reconnecting', since: NOON.toISOString() });
+    const { calls, notify } = recordingNotifier();
+    const baseRuntime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, PREFIX),
+      warnings: [],
+      whatsapp: { gateway },
+      ...(notify !== undefined ? { notify } : {}),
+    };
+
+    // The VERY FIRST pass this process ever runs for this business — no
+    // prior record exists at all — and the bridge is already down.
+    await schedulerPass({ businessId: DOWN_AT_BOOT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(1);
+  });
+
+  /**
+   * Fix round 3, item 2 — keying by `since` alone left a gap the re-review
+   * found by trying to break it: a gateway that holds the SAME `since`
+   * while the state word WORSENS (`'reconnecting'` → `'banned'`) produced
+   * no further row and no further email under round 2's design, because
+   * `since` alone matched and the "already told, nothing new" shortcut
+   * fired — so the owner was never told his bridge reached `'banned'`, the
+   * single worst state it can be in. Keying by the pair `(since, state)`
+   * instead means ANY change to the word under an unchanged `since` is read
+   * as a new episode in its own right.
+   */
+  it('escalates to a new alert when the state word worsens under an unchanged since, even with no reconnect observed', async () => {
+    await installCharter(buildCharter(), { businessId: WORSENING_WORD_BUSINESS });
+    const gateway = createFakeGateway();
+    const { calls, notify } = recordingNotifier();
+    const baseRuntime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, PREFIX),
+      warnings: [],
+      whatsapp: { gateway },
+      ...(notify !== undefined ? { notify } : {}),
+    };
+
+    // Pass 1 — connected baseline.
+    await schedulerPass({ businessId: WORSENING_WORD_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+
+    // Pass 2 — the outage begins as 'reconnecting' (since = T1), delivered.
+    const since = NOON.toISOString();
+    gateway.setHealth({ state: 'reconnecting', since });
+    await schedulerPass({ businessId: WORSENING_WORD_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(1);
+
+    // Pass 3 — SAME `since`, but the word worsens to 'banned'. Must alert
+    // again — this is a materially different, more serious fact, not a
+    // retry of something already told.
+    gateway.setHealth({ state: 'banned', since });
+    await schedulerPass({ businessId: WORSENING_WORD_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.body).toContain('banned');
   });
 });
