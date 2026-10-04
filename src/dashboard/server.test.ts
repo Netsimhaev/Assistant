@@ -10,6 +10,7 @@ import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
+import { recordInbound, recordOutbound } from '../whatsapp/store.js';
 import { bindPlanToJob } from '../orchestrator/plan-store.js';
 import { Plan } from '../domain/plan.js';
 import { writeMemory } from '../memory/store.js';
@@ -448,6 +449,78 @@ describe('GET /', () => {
     });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
+  });
+});
+
+describe('GET /conversation', () => {
+  it('refuses the conversation screen without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+
+    const res = await fetch(`${baseUrl}/conversation`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  it('shows the full record behind a session, oldest first, labelled by sender', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    await recordInbound(
+      {
+        providerMessageId: 'wamid.owner.1',
+        senderNumber: '+972501111111',
+        senderKind: 'principal',
+        body: 'תזכיר לי להתקשר לדנה',
+        mediaKind: null,
+        providerTimestamp: '2026-10-03T08:00:00.000Z',
+      },
+      { businessId: BUSINESS },
+    );
+    // A bidi override in a stranger's own message, the same class
+    // `conversation-view.test.ts` already proves `escLabel` strips.
+    await recordInbound(
+      {
+        providerMessageId: 'wamid.stranger.1',
+        senderNumber: '+972509999999',
+        senderKind: 'other',
+        body: 'שלום‮גרר',
+        mediaKind: null,
+        providerTimestamp: '2026-10-03T08:05:00.000Z',
+      },
+      { businessId: BUSINESS },
+    );
+    await recordOutbound({ body: 'קיבלתי, אני מטפלת בזה', jobId: null }, { businessId: BUSINESS });
+
+    const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('שיחת הוואטסאפ');
+    expect(body).toContain('תזכיר לי להתקשר לדנה');
+    expect(body).toContain('אתה (בעל העסק)');
+    // The stranger's bidi override is stripped, but the message is shown
+    // and labelled — never hidden, never silently ignored (decision 5).
+    expect(body).not.toContain('‮');
+    expect(body).toContain('שולח אחר');
+    expect(body).toContain('קיבלתי, אני מטפלת בזה');
+    expect(body).toContain('העוזרת');
+    // The owner's own words first (oldest), then the stranger's, then the
+    // assistant's reply last (newest) — chronological order on the page.
+    const ownerIdx = body.indexOf('תזכיר לי להתקשר לדנה');
+    const strangerIdx = body.indexOf('שולח אחר');
+    const assistantIdx = body.indexOf('קיבלתי, אני מטפלת בזה');
+    expect(ownerIdx).toBeLessThan(strangerIdx);
+    expect(strangerIdx).toBeLessThan(assistantIdx);
+    // The compose box posts to the existing /instruct door — no second one.
+    expect(body).toContain('action="/instruct"');
+  });
+
+  it('says there is no conversation yet when nothing has been recorded', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('לא התקבלה אף הודעה');
   });
 });
 

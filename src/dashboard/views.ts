@@ -69,7 +69,7 @@ const esc = escapeHtml;
  */
 const BIDI_CONTROLS = /[؜‎‏‪-‮⁦-⁩]/g;
 
-function escLabel(value: string): string {
+export function escLabel(value: string): string {
   return esc(value.replace(BIDI_CONTROLS, ''));
 }
 
@@ -215,7 +215,7 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/instruct">מה לעשות</a> · <a href="/readings">מה קראתי</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a></p>
 ${list}`,
   );
 }
@@ -1210,7 +1210,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }

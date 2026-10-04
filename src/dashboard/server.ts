@@ -66,6 +66,8 @@ import type { OAuthRouteOptions } from './oauth-routes.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { MAX_RECALL, recallMemories } from '../memory/store.js';
+import { conversation } from '../whatsapp/store.js';
+import { renderConversation } from './conversation-view.js';
 import { verifyDocumentUnchanged } from '../documents/verify.js';
 import type { VerifyOutcome } from '../documents/verify.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -488,6 +490,17 @@ const READINGS_LIST_LIMIT = 50;
 async function handleReadings(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   const rows = await recentReadings(READINGS_LIST_LIMIT, { businessId });
   sendHtml(res, 200, renderReadings(rows, issueCsrfToken(session.sessionId)));
+}
+
+/**
+ * "שיחת הוואטסאפ" — the full record, oldest first (`conversation`'s own
+ * ordering), behind the owner session exactly as `/connections` is. See
+ * `conversation-view.ts`'s own docblock for why the compose box this renders
+ * is a view onto `POST /instruct` and never a second door to the outside.
+ */
+async function handleConversation(res: ServerResponse, businessId: string, session: Session): Promise<void> {
+  const messages = await conversation({ businessId });
+  sendHtml(res, 200, renderConversation({ messages, csrf: issueCsrfToken(session.sessionId) }));
 }
 
 /**
@@ -2053,6 +2066,7 @@ async function route(
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
   if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
+  if (method === 'GET' && pathname === '/conversation') return handleConversation(res, businessId, session);
 
   if (method === 'GET' && pathname === '/autonomy') return handleAutonomyGet(res, businessId, session);
   if (method === 'POST' && pathname === '/autonomy/mode')
