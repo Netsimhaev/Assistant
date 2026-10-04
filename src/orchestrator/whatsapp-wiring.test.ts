@@ -37,6 +37,9 @@ const HEALTH_FAIL_BUSINESS = 'test-business-health-fail';
 const HEALTH_READ_FAIL_BUSINESS = 'test-business-health-read-fail';
 const DOOR_THROWS_BUSINESS = 'test-business-door-throws';
 const STALE_CHARTER_BUSINESS = 'test-business-no-charter';
+const ONCE_PER_OUTAGE_BUSINESS = 'test-business-health-once-per-outage';
+const NO_SENDALERT_BUSINESS = 'test-business-health-no-sendalert';
+const PROBE_THROW_MID_OUTAGE_BUSINESS = 'test-business-health-probe-throw-mid-outage';
 const PREFIX = 'TEST_CRED_';
 // Fixed clock, matching run-due.test.ts / scheduler-runs-plans.test.ts: an
 // evening wall-clock run of this suite would otherwise fall inside quiet
@@ -181,6 +184,15 @@ function controllableNotifier(): {
       },
     },
   };
+}
+
+/** Every `whatsapp_health_notify_failed` incident row for this business, oldest first (`queryAudit`'s own order is newest-first). */
+async function whatsappHealthIncidents(businessId: string): Promise<string[]> {
+  const rows = await queryAudit({ businessId, kind: 'incident' });
+  return rows
+    .filter((row) => row.reason.startsWith('whatsapp_health_notify_failed'))
+    .map((row) => row.reason)
+    .reverse();
 }
 
 describe('schedulerPass — WhatsApp wiring', () => {
@@ -449,5 +461,169 @@ describe('schedulerPass — WhatsApp wiring', () => {
     expect(pass.whatsappError).not.toBeNull();
     expect(pass.whatsappDoor).toBeNull();
     expect(pass.whatsappReport).toBeNull();
+  });
+
+  /**
+   * Fix round 2, item 3 (and the ruling's own failure mode) — the audit row
+   * is written ONCE per outage, not once per retry pass: retries of the
+   * SAME outage (same `since`) must not add a second row. And a genuinely
+   * NEW outage — even one reporting the IDENTICAL state word as the first,
+   * and even one that arrives WITHOUT this process ever observing a
+   * `'connected'` state in between (the realistic shape of F6: this exact
+   * probe missed the brief reconnect) — must still earn a row of its own.
+   * That second half is exactly what discriminating by `health.since`
+   * rather than the state word buys, and it is deliberately tested WITHOUT
+   * an intervening reconnect: a design that cleared its bookkeeping only on
+   * an OBSERVED reconnect would still pass a version of this test that goes
+   * through one, which is why this one does not.
+   */
+  it('writes one incident per outage — not one per retry — and a second outage gets its own row even with the same state word and no observed reconnect in between', async () => {
+    await installCharter(buildCharter(), { businessId: ONCE_PER_OUTAGE_BUSINESS });
+    const gateway = createFakeGateway();
+    const { calls, notify, failNext } = controllableNotifier();
+    const baseRuntime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, PREFIX),
+      warnings: [],
+      whatsapp: { gateway },
+      ...(notify !== undefined ? { notify } : {}),
+    };
+
+    // Pass 1 — connected baseline.
+    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+
+    // Pass 2 — outage 1 begins (since = T1); the send fails.
+    const t1 = NOON.toISOString();
+    gateway.setHealth({ state: 'reconnecting', since: t1 });
+    failNext();
+    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(await whatsappHealthIncidents(ONCE_PER_OUTAGE_BUSINESS)).toHaveLength(1);
+
+    // Pass 3 — still outage 1 (same `since`), the send fails again. Retried,
+    // but NOT a second row.
+    failNext();
+    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(2);
+    expect(await whatsappHealthIncidents(ONCE_PER_OUTAGE_BUSINESS)).toHaveLength(1);
+
+    // Pass 4 — still outage 1, this time delivery succeeds. Still no second row.
+    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(3);
+    expect(await whatsappHealthIncidents(ONCE_PER_OUTAGE_BUSINESS)).toHaveLength(1);
+
+    // Pass 5 — outage 2 begins DIRECTLY (since = T2, DIFFERENT from T1, but
+    // the IDENTICAL state word 'reconnecting') — no `'connected'` state was
+    // ever reported in between. Must still be read as genuinely new.
+    const t2 = new Date(NOON.getTime() + 2).toISOString();
+    gateway.setHealth({ state: 'reconnecting', since: t2 });
+    failNext();
+    await schedulerPass({ businessId: ONCE_PER_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(4);
+    expect(await whatsappHealthIncidents(ONCE_PER_OUTAGE_BUSINESS)).toHaveLength(2);
+  });
+
+  /**
+   * Fix round 2, item 2 — the `sendAlert === undefined` branch (no SMTP
+   * configured at all) must not consume the transition either: the review
+   * named this as the untested half of the same finding the `{ ok: false }`
+   * path already covered in round 1. An operator who configures SMTP mid-
+   * outage must still get told about the outage that was already underway.
+   */
+  it('does not consume the transition when no sendAlert is configured, and sends once one becomes available', async () => {
+    await installCharter(buildCharter(), { businessId: NO_SENDALERT_BUSINESS });
+    const gateway = createFakeGateway();
+    const calls: { subject: string; body: string }[] = [];
+    const notifier: ApprovalNotifier = {
+      channel: 'email',
+      async notify() {
+        return { ok: true };
+      },
+    };
+    // No `sendAlert` key at all — the exact shape of an installation with no
+    // SMTP configured (`buildRuntime` never sets it in that case).
+    const mutableNotify: NonNullable<Runtime['notify']> = {
+      notifier,
+      dashboardBaseUrl: 'http://127.0.0.1:8787',
+    };
+    const baseRuntime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, PREFIX),
+      warnings: [],
+      whatsapp: { gateway },
+      notify: mutableNotify,
+    };
+
+    // Pass 1 — connected baseline.
+    await schedulerPass({ businessId: NO_SENDALERT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+
+    // Pass 2 — the bridge drops; nothing can be sent.
+    gateway.setHealth({ state: 'reconnecting', since: NOON.toISOString() });
+    await schedulerPass({ businessId: NO_SENDALERT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(0);
+    expect(await whatsappHealthIncidents(NO_SENDALERT_BUSINESS)).toHaveLength(1);
+
+    // Pass 3 — still no `sendAlert`, same outage. Must NOT write a second row.
+    await schedulerPass({ businessId: NO_SENDALERT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(await whatsappHealthIncidents(NO_SENDALERT_BUSINESS)).toHaveLength(1);
+
+    // The operator fixes SMTP mid-run — `sendAlert` becomes available on the
+    // SAME `notify` object `baseRuntime` already carries.
+    mutableNotify.sendAlert = async (subject, body) => {
+      calls.push({ subject, body });
+      return { ok: true };
+    };
+
+    // Pass 4 — still the same outage (same `since`). Must now be delivered —
+    // the earlier unconfigured passes must not have been treated as "handled".
+    await schedulerPass({ businessId: NO_SENDALERT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(1);
+    expect(await whatsappHealthIncidents(NO_SENDALERT_BUSINESS)).toHaveLength(1);
+  });
+
+  /**
+   * Fix round 2, item 4 — F6's own test proves the door still runs when
+   * `health()` throws, but not that the health BOOKKEEPING survives
+   * untouched. A catch that cleared `lastWhatsAppHealth` instead of simply
+   * returning would pass that test unchanged while silently resetting the
+   * outage this process already knows about and already wrote one row for
+   * — which would make the NEXT retry of the SAME outage look like a brand
+   * new one and write a second row. This test drives exactly that sequence.
+   */
+  it('leaves the health record untouched when the probe throws mid-outage, so a later retry is not mistaken for a new outage', async () => {
+    await installCharter(buildCharter(), { businessId: PROBE_THROW_MID_OUTAGE_BUSINESS });
+    const gateway = createFakeGateway();
+    const { calls, notify, failNext } = controllableNotifier();
+    const baseRuntime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, PREFIX),
+      warnings: [],
+      whatsapp: { gateway },
+      ...(notify !== undefined ? { notify } : {}),
+    };
+
+    // Pass 1 — connected baseline.
+    await schedulerPass({ businessId: PROBE_THROW_MID_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+
+    // Pass 2 — the outage begins; the send fails. One row.
+    const since = NOON.toISOString();
+    gateway.setHealth({ state: 'reconnecting', since });
+    failNext();
+    await schedulerPass({ businessId: PROBE_THROW_MID_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(await whatsappHealthIncidents(PROBE_THROW_MID_OUTAGE_BUSINESS)).toHaveLength(1);
+
+    // Pass 3 — the PROBE itself throws (not the send). Must be a total no-op.
+    gateway.health = (): Promise<never> => {
+      throw new Error('probe flaked mid-outage');
+    };
+    await schedulerPass({ businessId: PROBE_THROW_MID_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(1); // no send attempt was even made this pass
+
+    // Pass 4 — the probe recovers, SAME outage, and this time delivery
+    // succeeds. If pass 3 had reset the bookkeeping, this would be read as a
+    // brand-new outage and write a SECOND row.
+    gateway.health = async () => ({ state: 'reconnecting', since });
+    await schedulerPass({ businessId: PROBE_THROW_MID_OUTAGE_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(2);
+    expect(await whatsappHealthIncidents(PROBE_THROW_MID_OUTAGE_BUSINESS)).toHaveLength(1);
   });
 });

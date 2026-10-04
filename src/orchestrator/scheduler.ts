@@ -146,8 +146,63 @@ async function wakeDueJobs(
 }
 
 /**
- * The last WhatsApp bridge state this process has SUCCESSFULLY reported on,
- * per business — §7.4. In-memory, for the life of the process.
+ * One business's WhatsApp bridge bookkeeping, as this process has last
+ * observed it — §7.4, fix round 2. A single record, not two parallel maps on
+ * the same key: all three fields below are read and written together on
+ * every call, and splitting any of them into a second `Map` keyed the same
+ * way is exactly the drift shape this codebase keeps refusing to
+ * reintroduce (the `job_plans`/`job_authorizations` lesson, restated for a
+ * `Map` instead of a table).
+ *
+ * **Keyed entirely by the gateway's own `since`, never by the state word —
+ * this is the one property the whole record exists to get right.** A design
+ * that tracked "the last state word we dealt with" instead would read a
+ * SECOND, genuinely new outage that happens to report the same word as an
+ * earlier one it already delivered (`'reconnecting'` again, say, after the
+ * bridge drops a second time) as "nothing new" and silently skip it — the
+ * exact failure this record is built to rule out, and the reason it is
+ * `since`, read fresh from the gateway on every call, rather than anything
+ * this process derives or remembers about the WORD. It also means the
+ * record self-corrects even past F6's own gap: if this process's own probe
+ * happens to throw during the one pass where the bridge was briefly
+ * `'connected'` again (so the reconnect is never actually observed), the
+ * NEXT outage still carries a `since` the record has never seen, and is
+ * still read as genuinely new — nothing here depends on having witnessed
+ * the reconnect itself.
+ */
+interface WhatsAppHealthRecord {
+  /**
+   * The `since` of the outage — or of the `'connected'` period — this
+   * process has most recently finished dealing with: successfully delivered
+   * an alert for, or simply observed as connected. Compared against
+   * `current.since` on every call to decide whether this pass describes the
+   * SAME episode as last time or a new one.
+   */
+  since: string;
+  /**
+   * Whether an alert has actually been delivered for THIS `since` — or
+   * whether there is nothing to deliver, because `since` names a connected
+   * period rather than an outage. `false` only while an outage with this
+   * exact `since` is still being retried; fix round 1, F1/F2's rule that
+   * "attempted" and "told him" are not the same fact, now keyed by episode
+   * rather than by the coarser `state !== 'connected'` check round 1 used —
+   * see this interface's own docblock on why that coarser check missed a
+   * genuinely new outage that arrived without an observed reconnect.
+   */
+  delivered: boolean;
+  /**
+   * Whether the one-time `incident` audit row for THIS `since` has already
+   * been written — fix round 2's ruling: record once per transition, keep
+   * retrying, mark observed only on delivery. Independent of `delivered`:
+   * the row is written on the FIRST failed attempt, long before delivery
+   * ever succeeds, and must not repeat on every retry in between.
+   */
+  audited: boolean;
+}
+
+/**
+ * The last WhatsApp bridge bookkeeping this process has observed, per
+ * business — §7.4. In-memory, for the life of the process.
  *
  * **Fix round 1, F8 — the trade-off this docblock used to name was the
  * impossible one.** A restart cannot cause a duplicate email: after a
@@ -164,11 +219,20 @@ async function wakeDueJobs(
  * own `health()` display (§7.4's first control) is not optional decoration:
  * it is the one surface that is never subject to this gap.
  *
+ * **Fix round 2 — the SAME asymmetry applies to the audit row, not only the
+ * email.** "Once per transition" is only true PER PROCESS: a crash-loop
+ * that restarts this service mid-outage starts a fresh `Map`, so a
+ * long-lived outage can still produce more than one `incident` row across
+ * the lifetime of the installation — one per restart, never one per
+ * thirty-second pass. The `reason` text `checkWhatsAppHealth` writes says
+ * this explicitly, because a single row with no tail cannot otherwise tell
+ * an operator reading it that the retry behind it is still running.
+ *
  * Keyed by business rather than a single value, matching every other
  * per-business concern in this module — a single installation may in
  * principle run the scheduler for more than one `businessId`.
  */
-const lastWhatsAppHealth = new Map<string, GatewayHealth['state']>();
+const lastWhatsAppHealth = new Map<string, WhatsAppHealthRecord>();
 
 /**
  * Writes one `incident` audit row for a health alert that could not be
@@ -178,11 +242,13 @@ const lastWhatsAppHealth = new Map<string, GatewayHealth['state']>();
  * `AuditKind` member (CLAUDE.md's own rule on why adding an `ActionClass` or
  * `TrustLevel` member is dangerous does not apply to a free-text `reason`,
  * and inventing a kind for one caller is the same class of unforced
- * complexity). `provenance: 'boss'` and a placeholder `charterVersion` of
- * `'unknown'` when none was available follow `killswitch.ts`'s identical
+ * complexity). `provenance: 'boss'` follows `killswitch.ts`'s identical
  * choice for the identical reason: this is a fact about the INSTALLATION,
  * not about any one chain of content, and there is no better value to put
- * there.
+ * there. `charterVersion` is a required parameter, not a placeholder — the
+ * sole caller below always has the real value in hand from the same charter
+ * load it used for the messenger's number, so there is no "none available"
+ * branch here the way `killswitch.ts`'s own `?? 'unknown'` fallback has.
  *
  * Never throws: a failure recording a failure must not take the pass down
  * with it, the same discipline every other best-effort write in this
@@ -213,43 +279,51 @@ async function recordWhatsAppHealthNotifyFailure(
 
 /**
  * §7.4 — a bridge that WAS connected and is not must reach the owner by
- * EMAIL, never by WhatsApp (WhatsApp is the very thing that is down), and
- * exactly ONCE per transition, not once per pass for as long as the bridge
- * stays disconnected.
+ * EMAIL, never by WhatsApp (WhatsApp is the very thing that is down).
  *
  * **Fix round 1, F6 — a health READ failure must never take the door down
  * with it.** `gateway.health()` is a real network call against the GREEN-API
  * client once Task 11 lands; a blip there is a diagnostic failure, not a
  * reason to refuse the owner's own instructions this pass. It is wrapped in
  * its own `try` and returns silently on a throw — `lastWhatsAppHealth` is
- * left exactly as it was, so a genuine transition is still caught once the
- * probe itself recovers, and nothing here can propagate into the shared
- * `try` in `schedulerPass` that would otherwise skip `runWhatsAppDoor` too.
+ * left EXACTLY as it was, byte for byte: no read, no write, not even to the
+ * default. A genuine outage already being retried is not forgotten, and a
+ * genuine reconnect that this exact probe happened to miss is still caught
+ * correctly on the next one — see `WhatsAppHealthRecord`'s own docblock on
+ * why keying by `since` rather than the state word is what makes that true
+ * even though the reconnect itself was never observed. Nothing here can
+ * propagate into the shared `try` in `schedulerPass` that would otherwise
+ * skip `runWhatsAppDoor` too.
  *
- * **Fix round 1, F1/F2 — the transition is recorded only once it has
- * actually been told to someone, never merely observed.** The previous
- * version called `lastWhatsAppHealth.set(...)` unconditionally, before
- * checking whether anything could even be sent — so a transition with no
- * `sendAlert` configured, or whose send failed, was marked "handled" and
- * never revisited. Now: `lastWhatsAppHealth` only advances to the new state
- * AFTER a `{ ok: true }` from `sendAlert`. A failure — no `sendAlert`
- * configured, or `sendAlert` itself returning `{ ok: false }` or throwing —
- * writes an `incident` row (`recordWhatsAppHealthNotifyFailure` above) and
- * leaves the map exactly as it was, so the NEXT pass sees the same
- * `previous === 'connected'` and tries again. This is deliberately
- * noisy under a sustained outage (one `incident` row per pass until
- * delivery succeeds or the bridge reconnects) rather than silent even once —
- * see this module's own "a value that failed to send is not a value that
- * was handled" rule.
+ * **Fix round 1, F1/F2 — delivery, not an attempt, is what "handled" means.**
+ * `record.delivered` for the CURRENT `since` only becomes `true` after a
+ * `{ ok: true }` from `sendAlert`; a failure — no `sendAlert` configured, or
+ * `sendAlert` itself returning `{ ok: false }` or throwing — leaves it
+ * `false`, so the NEXT pass still tries the send again for the same outage.
  *
- * Firing only on a transition OUT of `connected` — never on every pass
- * `health()` reports something other than `connected` — is what keeps a
- * bridge that stays down from re-emailing the owner every thirty seconds
- * once delivery does succeed. The FIRST observation ever made for a
- * business is never itself a transition — there is no prior `connected`
- * state to have left — so an installation that boots with the bridge
- * already down sends nothing on its first pass; see `lastWhatsAppHealth`'s
- * own docblock (F8) for the asymmetric cost that choice accepts.
+ * **Fix round 2 — the AUDIT ROW is a separate concern from the send, and is
+ * written at most once per outage, not once per retry pass.** Round 1 wrote
+ * an `incident` row on every failed attempt, which meant a sustained outage
+ * with a down mail relay wrote one row every thirty seconds — and every one
+ * of those rows takes the audit chain's own advisory lock, so a sustained
+ * double failure (bridge down AND mail down at once) serialised this
+ * business's entire audit-writing path for as long as both stayed broken,
+ * precisely while something was already going wrong. `record.audited`
+ * tracks whether THIS outage has already earned its one row; later retries
+ * for the same `since` keep trying to SEND but skip the audit write. The
+ * `reason` text below says so explicitly, because the row itself has no
+ * tail: an operator reading one incident cannot otherwise tell whether the
+ * retry behind it is still running or gave up after one try. And it is only
+ * "once per transition" PER PROCESS — a crash-loop that restarts this
+ * service mid-outage starts a fresh `Map`, so one row per restart is real
+ * (the same asymmetry `lastWhatsAppHealth`'s own docblock, F8, already
+ * accepts for the email itself).
+ *
+ * The FIRST observation ever made for a business is never itself a
+ * transition — there is no prior episode to have left — so an installation
+ * that boots with the bridge already down sends nothing, and audits
+ * nothing, on its first pass; see `lastWhatsAppHealth`'s own docblock (F8)
+ * for the asymmetric cost that choice accepts.
  */
 async function checkWhatsAppHealth(
   gateway: { health(): Promise<GatewayHealth> },
@@ -261,15 +335,41 @@ async function checkWhatsAppHealth(
   try {
     current = await gateway.health();
   } catch {
-    // F6 — diagnostic, not a gate. State is left untouched.
+    // F6 — diagnostic, not a gate. Left exactly as it was; no read, no write.
     return;
   }
 
-  const previous = lastWhatsAppHealth.get(businessId);
-  if (previous !== 'connected' || current.state === 'connected') {
-    lastWhatsAppHealth.set(businessId, current.state);
+  const record = lastWhatsAppHealth.get(businessId);
+
+  if (record === undefined) {
+    // First observation ever for this business — never itself a
+    // transition, whatever state it reports. See `lastWhatsAppHealth`'s
+    // own docblock, F8.
+    lastWhatsAppHealth.set(businessId, { since: current.since, delivered: true, audited: true });
     return;
   }
+
+  if (current.state === 'connected') {
+    // Reconnected (or still connected). Nothing pending, whether or not an
+    // earlier outage's alert ever actually went out.
+    lastWhatsAppHealth.set(businessId, { since: current.since, delivered: true, audited: true });
+    return;
+  }
+
+  if (record.since === current.since && record.delivered) {
+    // The SAME outage this process has already told the owner about, and
+    // nothing has reconnected since — nothing new to do, even if the state
+    // word changed underneath it (`'reconnecting'` becoming `'banned'`,
+    // say, without ever reconnecting).
+    return;
+  }
+
+  // Either a genuinely new outage — a different `since`, which includes one
+  // that arrived without this process ever observing a `'connected'` state
+  // in between (a reconnect this process's own probe happened to miss, F6)
+  // — or a retry of one that has not yet been delivered.
+  const isSameUndeliveredOutage = record.since === current.since; // implies !record.delivered, from the check above
+  const alreadyAudited = isSameUndeliveredOutage && record.audited;
 
   const subject = 'התנתק הגשר לוואטסאפ';
   const body =
@@ -277,12 +377,16 @@ async function checkWhatsAppHealth(
     `הודעות נכנסות בוואטסאפ לא מתקבלות כרגע, ואי אפשר להשתמש בערוץ הזה עד שהחיבור יחזור.`;
 
   if (notify?.sendAlert === undefined) {
-    await recordWhatsAppHealthNotifyFailure(
-      businessId,
-      charterVersion,
-      'no sendAlert configured — SMTP is not set up on this installation',
-    );
-    return; // not recorded as observed — retried next pass.
+    if (!alreadyAudited) {
+      await recordWhatsAppHealthNotifyFailure(
+        businessId,
+        charterVersion,
+        'no sendAlert configured — SMTP is not set up on this installation. ' +
+          'This is the only row for this outage; the next scheduler pass will try again silently.',
+      );
+    }
+    lastWhatsAppHealth.set(businessId, { since: current.since, delivered: false, audited: true });
+    return;
   }
 
   const sent = await notify.sendAlert(subject, body).catch((error: unknown) => ({
@@ -290,13 +394,20 @@ async function checkWhatsAppHealth(
     error: error instanceof Error ? error.message : String(error),
   }));
   if (!sent.ok) {
-    await recordWhatsAppHealthNotifyFailure(businessId, charterVersion, sent.error ?? 'sendAlert returned not-ok');
-    return; // not recorded as observed — retried next pass.
+    if (!alreadyAudited) {
+      await recordWhatsAppHealthNotifyFailure(
+        businessId,
+        charterVersion,
+        `${sent.error ?? 'sendAlert returned not-ok'}. This is the only row for this outage; ` +
+          `the next scheduler pass will try to send again silently.`,
+      );
+    }
+    lastWhatsAppHealth.set(businessId, { since: current.since, delivered: false, audited: true });
+    return;
   }
 
-  // Delivered. Only now does the new state become "the last thing the owner
-  // was successfully told" — ready to detect the NEXT transition fresh.
-  lastWhatsAppHealth.set(businessId, current.state);
+  // Delivered.
+  lastWhatsAppHealth.set(businessId, { since: current.since, delivered: true, audited: true });
 }
 
 export interface SchedulerPassResult {
