@@ -64,8 +64,16 @@ function senderLabel(m: StoredMessage): string {
  * Six states, handled by a positive, exhaustive switch — never a default
  * branch that means "done". `received`, `claimed` and `reported_interim`
  * still owe the owner something (an interim notice is, by its own name, not
- * the real answer — see migration 038's docblock) and render `unfinished:
- * true`; `handled`, `failed` and `reported` do not add a badge of their own.
+ * the real answer — see migration 038's docblock) and carry `unfinished:
+ * true`. **`unfinished` no longer decides whether the label is shown at
+ * all** (fix round 1, Important 1): `failed` is reachable for the owner's
+ * OWN instruction — a daily-cap refusal, a planner refusal, a crash
+ * (`whatsapp-door.ts`) — and rendering it with no state text made it
+ * indistinguishable from an instruction that actually ran. The same
+ * argument that forbids `reported_interim` from reading as finished forbids
+ * `failed` from reading as succeeded, one state over. Every row now shows
+ * its own label, always; `unfinished` only ever meant "the owner is still
+ * owed something", never "worth mentioning".
  *
  * The `default` branch is the exhaustiveness check: if `MessageState` ever
  * grows a seventh member, `state` narrows to a type that is not assignable
@@ -112,10 +120,21 @@ function stateInfo(state: MessageState): { label: string; unfinished: boolean } 
  * class as a message body and arguably wider, since the model can render
  * anything), and a bidi override in it would change what the owner reads
  * rather than merely how it looks.
+ *
+ * A field counts as present only when it is a NON-EMPTY string (fix round
+ * 1, Minor 3) — `refineActionClass`'s own lesson (`policy/classify.ts`):
+ * `'' !== null` is true, so a bare `!== null` check let an empty string
+ * through to a bare `<p></p>`, the exact "empty cell reads as nothing was
+ * said" ruling 4 exists to forbid. `''` is covered by the same sentence as
+ * `null`.
  */
+function hasText(value: string | null): value is string {
+  return value !== null && value !== '';
+}
+
 function contentLine(m: StoredMessage): string {
-  if (m.body !== null) return escLabel(m.body);
-  if (m.transcript !== null) return `<em>תמלול:</em> ${escLabel(m.transcript)}`;
+  if (hasText(m.body)) return escLabel(m.body);
+  if (hasText(m.transcript)) return `<em>תמלול:</em> ${escLabel(m.transcript)}`;
   const kindNote = m.mediaKind !== null ? ` (${esc(m.mediaKind)})` : '';
   return `<span class="muted">הודעה בלי תוכן טקסטואלי לקריאה${kindNote} — ייתכן שההקלטה הייתה ארוכה מדי או שהתמלול נכשל.</span>`;
 }
@@ -126,8 +145,11 @@ function messageRow(m: StoredMessage): string {
   const when = esc(m.providerTimestamp);
   // `escLabel`, not `esc`: the number is provider-supplied, not ours.
   const number = m.senderNumber !== null ? ` <span class="muted">${escLabel(m.senderNumber)}</span>` : '';
+  // Always shown (fix round 1, Important 1) — a `failed` instruction must
+  // not read identically to a `handled` one, and `unfinished` here only ever
+  // meant "the owner is still owed something", not "worth mentioning".
   const info = stateInfo(m.state);
-  const badge = info.unfinished ? ` <span class="muted">· ${esc(info.label)}</span>` : '';
+  const badge = ` <span class="muted">· ${esc(info.label)}</span>`;
 
   return `
     <article class="card">
@@ -136,11 +158,29 @@ function messageRow(m: StoredMessage): string {
     </article>`;
 }
 
-export function renderConversation(options: { messages: readonly StoredMessage[]; csrf: string }): string {
+/**
+ * `truncated` (fix round 1, Important 2): this screen calls itself the
+ * owner's full record, and past the loaded window it quietly stops being
+ * one unless something says so. The decision of WHICH messages were cut —
+ * asking the store for one more row than the limit and checking whether it
+ * came back — belongs to the caller (`handleConversation` in `server.ts`),
+ * which is the only place that knows the limit; this function only renders
+ * the one Hebrew sentence when told to. Optional and defaulted to `false`
+ * so every existing call site that has nothing to report need not pass it.
+ */
+export function renderConversation(options: {
+  messages: readonly StoredMessage[];
+  csrf: string;
+  truncated?: boolean;
+}): string {
+  const truncated = options.truncated ?? false;
   const rows =
     options.messages.length === 0
       ? '<p class="muted">עדיין לא התקבלה אף הודעה בשיחה הזו.</p>'
       : options.messages.map(messageRow).join('\n');
+  const truncationNote = truncated
+    ? '<p class="muted">מוצגות ההודעות האחרונות בלבד — היסטוריה מוקדמת יותר אינה מוצגת כאן.</p>'
+    : '';
 
   return `<!doctype html>
 <html lang="he" dir="rtl">
@@ -156,10 +196,11 @@ export function renderConversation(options: { messages: readonly StoredMessage[]
   <h1>שיחת הוואטסאפ</h1>
 </header>
 <p class="muted">
-  מה שתכתוב בתיבה שבתחתית העמוד נרשם כהוראה שלך לעוזרת — בדיוק כמו הודעת
-  וואטסאפ ששלחת לה. זו אינה דרך לשלוח הודעה לאף אחד אחר בשיחה: היא אינה
-  יכולה לענות מכאן למי ששלח הודעה, רק לקבל הוראה ממך.
+  מה שתכתוב בתיבה שבתחתית העמוד הוא הוראה לעוזרת, באותה סמכות ובאותה דלת
+  כמו הודעת וואטסאפ שהיית שולח לה — אך הוא לא יופיע כהודעה בשיחה שלמעלה.
+  היא אינה יכולה לענות מכאן למי ששלח הודעה; ההוראה הולכת רק לעוזרת.
 </p>
+${truncationNote}
 ${rows}
 <form method="POST" action="/instruct">
   <input type="hidden" name="csrf" value="${esc(options.csrf)}">

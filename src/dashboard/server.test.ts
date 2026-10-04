@@ -522,6 +522,53 @@ describe('GET /conversation', () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('לא התקבלה אף הודעה');
   });
+
+  /**
+   * Fix round 1, Important 2: truncation must be detected honestly —
+   * `fetched.length === CONVERSATION_LIMIT` is ALSO what a history of
+   * exactly 200 messages looks like, so that is not a safe test. Seeding
+   * exactly 200 rows proves the honest check (asking for one more than the
+   * limit) does not false-positive on the boundary itself.
+   */
+  async function seedMessages(businessId: string, count: number): Promise<void> {
+    await getPool().query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, direction, sender_number, sender_kind, body, provider_timestamp, state)
+       SELECT 'WA-SEED-' || lpad(gs::text, 6, '0'), $1, 'inbound', '+972500000000', 'principal',
+              'הודעה ' || gs, now() - (interval '1 second' * ($2 - gs)), 'handled'
+       FROM generate_series(1, $2) AS gs`,
+      [businessId, count],
+    );
+  }
+
+  it('shows no truncation note when the history is exactly at the limit', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    await seedMessages(BUSINESS, 200);
+
+    const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
+    const body = await res.text();
+    expect(body).not.toContain('מוצגות ההודעות האחרונות בלבד');
+    // The single oldest message of exactly 200 is still shown — nothing was
+    // dropped at the boundary itself. `>...<` anchors the match so "הודעה 1"
+    // cannot be satisfied by "הודעה 10"/"הודעה 100" etc.
+    expect(body).toContain('>הודעה 1<');
+  });
+
+  it('shows the truncation note and drops only the single oldest message past the limit', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    await seedMessages(BUSINESS, 201);
+
+    const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
+    const body = await res.text();
+    expect(body).toContain('מוצגות ההודעות האחרונות בלבד');
+    // Message 1 (the oldest of 201) is the one dropped; message 2 (now the
+    // oldest shown) and message 201 (the newest) both remain.
+    expect(body).not.toContain('>הודעה 1<');
+    expect(body).toContain('>הודעה 2<');
+    expect(body).toContain('>הודעה 201<');
+  });
 });
 
 describe('GET /readings', () => {

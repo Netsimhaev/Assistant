@@ -492,15 +492,31 @@ async function handleReadings(res: ServerResponse, businessId: string, session: 
   sendHtml(res, 200, renderReadings(rows, issueCsrfToken(session.sessionId)));
 }
 
+/** How many of the most recent messages "שיחת הוואטסאפ" shows. */
+const CONVERSATION_LIMIT = 200;
+
 /**
  * "שיחת הוואטסאפ" — the full record, oldest first (`conversation`'s own
  * ordering), behind the owner session exactly as `/connections` is. See
  * `conversation-view.ts`'s own docblock for why the compose box this renders
  * is a view onto `POST /instruct` and never a second door to the outside.
+ *
+ * **Truncation is detected, not guessed (fix round 1, Important 2).** This
+ * screen calls itself the full record, and a silent cutoff past
+ * `CONVERSATION_LIMIT` would make that false. Asking for `CONVERSATION_LIMIT
+ * + 1` and checking whether that many came back is the honest test;
+ * `fetched.length === CONVERSATION_LIMIT` is NOT — that is also exactly what
+ * a history of precisely 200 messages looks like, and guessing from it would
+ * tell an owner with no more history that some was hidden. `conversation()`
+ * returns its window newest-last (the N most recent, re-sorted oldest
+ * first), so when there is one row too many the one being dropped is the
+ * single OLDEST of the fetched batch — `fetched.slice(1)` — not the newest.
  */
 async function handleConversation(res: ServerResponse, businessId: string, session: Session): Promise<void> {
-  const messages = await conversation({ businessId });
-  sendHtml(res, 200, renderConversation({ messages, csrf: issueCsrfToken(session.sessionId) }));
+  const fetched = await conversation({ businessId, limit: CONVERSATION_LIMIT + 1 });
+  const truncated = fetched.length > CONVERSATION_LIMIT;
+  const messages = truncated ? fetched.slice(fetched.length - CONVERSATION_LIMIT) : fetched;
+  sendHtml(res, 200, renderConversation({ messages, csrf: issueCsrfToken(session.sessionId), truncated }));
 }
 
 /**
