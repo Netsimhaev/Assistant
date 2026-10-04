@@ -160,32 +160,48 @@ const AWAITING_APPROVAL_GENERIC_TEXT =
 
 /**
  * `policy/engine.ts`'s own `deny(...)` codes (`domain/policy.ts`'s
- * `DENY_CODES`) — fixed strings a charter cannot change, as opposed to
- * `forbidden.id`, which is a charter author's own rule name and therefore
- * cannot be enumerated here at all. A job whose `failed` reason carries one
- * of these codes was stopped by the GATE, not by a breakage — see
- * `NOT_PERMITTED_TEXT`.
+ * `DENY_CODES`) — fixed strings a charter cannot change. A job whose `failed`
+ * reason carries one of these codes was stopped by the GATE, not by a
+ * breakage — see `NOT_PERMITTED_TEXT`.
  *
- * `'quiet_hours'` is deliberately absent: that denial moves a job to
- * `followup`, never to `failed` (`execute.ts`'s own branch for it), so it
- * never reaches this classifier at all.
+ * `'quiet_hours'` is deliberately absent: both of `engine.ts`'s own deny
+ * sites for it additionally require `bundle.quietHours !== null`, and that
+ * denial moves a job to `followup`, never to `failed` (`execute.ts`'s own
+ * branch for it) — so it never reaches this classifier at all.
  *
- * Three entries are prefixes rather than exact codes, because the gate
- * appends a dynamic suffix to them: `budget_exceeded` (`:discount`,
- * `:per_action_class:<class>`, `:single_action`, `:supplier:<id>`, `:daily`,
- * `:monthly` — `policy/budget.ts`) and `risk_blocked:<actionId>`
- * (`policy/engine.ts`). `startsWith` is deliberately NOT used for the exact
- * codes below it: a prefix check there would silently swallow any future
- * code that happens to share a prefix with one of them.
+ * `'recipient_unreadable'` is in this set but `engine.ts` never actually
+ * emits it — `DENY_CODES.recipientUnreadable` is declared in
+ * `domain/policy.ts` with no corresponding `deny(...)` call anywhere. Kept
+ * anyway: a code that never arrives is a dead, harmless, POSITIVE entry —
+ * the failure direction this table cannot have is a code that DOES arrive
+ * and is missing, never the reverse. Recorded here so the next reader does
+ * not mistake the dead entry for a live one and go looking for where it
+ * fires.
  *
- * **Not exhaustive, and cannot be made so.** `forbidden.id` is the one gate
- * denial this set structurally cannot name: `deny(forbidden.id, …)`
- * (`policy/engine.ts`) uses the CHARTER's own rule id as the code, with no
- * fixed prefix at all, so a forbidden-rule denial reads as `FAILED_GENERIC_TEXT`
- * rather than `NOT_PERMITTED_TEXT` today — a known, recorded gap, not an
- * oversight: closing it would require this classifier to load the active
- * charter and match rule ids, which is a materially bigger change than this
- * table.
+ * **Fix round 3 — `forbidden.id` is NOT the exception it looks like, and
+ * fix round 2's docblock here was wrong to say otherwise.** `compile.ts`
+ * writes `` id: `forbidden:${rule.id}` `` for every charter rule
+ * (`compileRules`), and `engine.ts` reaches `deny(forbidden.id, …)` with a
+ * comment, two lines above that call, stating exactly this: *"`forbidden.id`
+ * already carries its namespace: the compiler prefixes every rule id with
+ * its kind … Prefixing again here produced `forbidden:forbidden:<id>`."*
+ * So every forbidden-rule denial DOES carry a fixed prefix — `forbidden:` —
+ * regardless of which rule or which charter fired it, and belongs in the
+ * prefix group below exactly like `budget_exceeded`/`risk_blocked:`. Closing
+ * this needed no charter loading and no rule-id matching, which is what the
+ * previous version of this docblock claimed it would take — a false
+ * "cannot be made so" is worse than the gap it described, because it tells
+ * the next reader to stop looking rather than to open `engine.ts`.
+ *
+ * Three entries below `GATE_DENY_CODES` are prefixes rather than exact
+ * codes, because the gate appends a dynamic suffix to them: `budget_exceeded`
+ * (`:discount`, `:per_action_class:<class>`, `:single_action`,
+ * `:supplier:<id>`, `:daily`, `:monthly` — `policy/budget.ts`),
+ * `risk_blocked:<actionId>` (`policy/engine.ts`), and `forbidden:<ruleId>`
+ * (`charter/compile.ts`, as above). `startsWith` is deliberately NOT used
+ * for the exact codes in `GATE_DENY_CODES` itself: a prefix check there
+ * would silently swallow any future code that happens to share a prefix
+ * with one of them.
  */
 const GATE_DENY_CODES: ReadonlySet<string> = new Set([
   'kill_switch_active',
@@ -194,7 +210,7 @@ const GATE_DENY_CODES: ReadonlySet<string> = new Set([
   'draft_only:persist_as_draft',
   'do_not_contact',
   'amount_unreadable',
-  'recipient_unreadable',
+  'recipient_unreadable', // never actually emitted — see this set's own docblock.
   'tool_not_allowlisted',
   'delegation_not_permitted',
 ]);
@@ -203,7 +219,8 @@ function isGateDenialCode(code: string): boolean {
   return (
     GATE_DENY_CODES.has(code) ||
     code.startsWith('budget_exceeded') ||
-    code.startsWith('risk_blocked:')
+    code.startsWith('risk_blocked:') ||
+    code.startsWith('forbidden:')
   );
 }
 

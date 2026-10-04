@@ -787,6 +787,62 @@ describe('reportWhatsAppJobs', () => {
   });
 
   /**
+   * Fix round 3, item 1. `forbidden.id` is `` `forbidden:${rule.id}` ``
+   * (`charter/compile.ts`'s `compileRules`) — a FIXED prefix, not a charter
+   * author's free-form string, so `deny(forbidden.id, …)` carries exactly
+   * the same shape `budget_exceeded`/`risk_blocked:` already do. This test
+   * drives a REAL charter-defined forbidden rule (not one of the three
+   * built-in ones `buildCharter` ships by default — a fresh one, scoped to
+   * `artifact.write`, so the denial fires on an ordinary local tool with no
+   * connection or adapter needed) through the real gate.
+   */
+  it('reports "not permitted" for a real forbidden-rule denial, under the charter’s own rule id', async () => {
+    const bundle = await install({
+      forbidden: [
+        {
+          id: 'no_file_writes_in_this_test',
+          description: 'לעולם לא לכתוב קבצים בבדיקה הזו.',
+          actionClasses: ['artifact.write'],
+        },
+      ],
+    });
+    const job = await jobInExecute(bundle);
+    const { messageId } = await linkToWhatsApp(job.jobId);
+
+    const plan = Plan.parse({
+      goal: 'ליצור קובץ',
+      steps: [{ id: 's1', agent: 'prod.docs', intent: 'x', toolName: 'file.write', input: { path: 'x', content: 'x' } }],
+    });
+
+    const run = await runPlan({
+      job, bundle, plan,
+      registry: new AdapterRegistry([]),
+      bindings: [],
+      credentials: envCredentials({}, 'NONE_'),
+      counterpartyTags: [],
+      rampLevel: 'auto',
+      now: NOON,
+    });
+    expect(run.status).toBe('halted');
+    if (run.status !== 'halted') throw new Error('unreachable');
+    // Not an autonomy-ramp denial this time — a hard, unconditional
+    // prohibition, which fires regardless of ramp level. `halted.reason` is
+    // `outcome.code` for a `refused` outcome (`run-plan.ts`), i.e. the
+    // gate's own `decision.code` — the forbidden rule's namespaced id.
+    expect(run.reason).toBe('forbidden:no_file_writes_in_this_test');
+    expect((await reload(job.jobId)).phase).toBe('failed');
+
+    const messenger = fakeMessenger();
+    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+
+    expect(report.reported).toBe(1);
+    expect(messenger.sentTexts[0]).toBe(NOT_PERMITTED_TEXT);
+    expect(messenger.sentTexts[0]).not.toBe(FAILED_GENERIC_TEXT);
+    expect(messenger.sentTexts[0]).not.toContain('no_file_writes_in_this_test');
+    expect(await messageState(messageId)).toBe('reported');
+  });
+
+  /**
    * Fix round 2, item 4(a). The round-1 version of this proof lived ONLY as
    * a raw-row assertion in `resume-plan.test.ts` — it pinned the WRITER
    * (`execute.ts`), never the owner-facing READ. This drives the identical
@@ -831,18 +887,22 @@ describe('reportWhatsAppJobs', () => {
     if (run.status !== 'halted') throw new Error('unreachable');
     expect(run.reason).toBe('deferred');
 
-    const { rows } = await getPool().query<{ status: string; performed: boolean | null }>(
-      'SELECT status, performed FROM job_step_results WHERE job_id = $1',
-      [job.jobId],
-    );
-    expect(rows).toEqual([{ status: 'unknown', performed: null }]);
-
+    // THE assertion fix round 3, item 2 exists for: the owner-facing read,
+    // asserted FIRST — not after a fixture-row check that would otherwise
+    // catch the `performed: null → false` mutation before this ever runs.
     // `classifyJob` takes `phase` as a plain argument — simulating the job
     // having reached `failed` (as `closeVerifiedJobs` would eventually leave
     // it) without needing to actually resolve the hang first.
     const verdict = asReport(await classifyJob(job.jobId, 'failed', BUSINESS));
     expect(verdict.outcome).toBe('failed');
     expect(verdict.outcome).not.toBe('not_implemented');
+
+    // The raw row, checked AFTER — corroborating evidence, not the proof.
+    const { rows } = await getPool().query<{ status: string; performed: boolean | null }>(
+      'SELECT status, performed FROM job_step_results WHERE job_id = $1',
+      [job.jobId],
+    );
+    expect(rows).toEqual([{ status: 'unknown', performed: null }]);
   });
 
   it('reports a job once and never again', async () => {
