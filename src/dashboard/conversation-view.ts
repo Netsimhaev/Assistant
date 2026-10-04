@@ -62,18 +62,28 @@ function senderLabel(m: StoredMessage): string {
 
 /**
  * Six states, handled by a positive, exhaustive switch — never a default
- * branch that means "done". `received`, `claimed` and `reported_interim`
- * still owe the owner something (an interim notice is, by its own name, not
- * the real answer — see migration 038's docblock) and carry `unfinished:
- * true`. **`unfinished` no longer decides whether the label is shown at
- * all** (fix round 1, Important 1): `failed` is reachable for the owner's
- * OWN instruction — a daily-cap refusal, a planner refusal, a crash
- * (`whatsapp-door.ts`) — and rendering it with no state text made it
- * indistinguishable from an instruction that actually ran. The same
- * argument that forbids `reported_interim` from reading as finished forbids
- * `failed` from reading as succeeded, one state over. Every row now shows
- * its own label, always; `unfinished` only ever meant "the owner is still
- * owed something", never "worth mentioning".
+ * branch that means "done". Every state renders its own label, always
+ * (fix round 1, Important 1): `failed` is reachable for the owner's OWN
+ * instruction — a daily-cap refusal, a planner refusal, a crash
+ * (`whatsapp-door.ts`) — and a version of this function that skipped the
+ * label for some states made `failed` indistinguishable from `handled`
+ * (succeeded). There is nothing left here that decides whether to show a
+ * label, so there is no field left to carry that decision.
+ *
+ * Prose only, never a field, for which three mean the owner is still owed
+ * something: `received`, `claimed` and `reported_interim` (an interim
+ * notice is, by its own name, not the real answer — see migration 038's
+ * docblock). Fix round 2 deleted the `unfinished: boolean` this function
+ * used to return alongside `label`: it was read nowhere in `src/` once
+ * round 1 stopped branching on it, and "no live reader" is this project's
+ * own named failure class — a field something compiles that nothing reads
+ * (see `CLAUDE.md` on `COLLABORATION_GRAPH` and five others paid for before
+ * this one). It was worse than merely dead: its own docblock said only that
+ * it no longer *decided* the badge, which reads as though it still carried
+ * weight. `noUnusedLocals` does not catch an unused object property, so
+ * nothing would ever have flagged it. If the unfinished/terminal grouping
+ * needs restating later, it belongs in prose like this paragraph, not in a
+ * return value nothing consumes.
  *
  * The `default` branch is the exhaustiveness check: if `MessageState` ever
  * grows a seventh member, `state` narrows to a type that is not assignable
@@ -81,27 +91,27 @@ function senderLabel(m: StoredMessage): string {
  * — not at a call site, and not by passing tests for the wrong reason. The
  * same branch is also the runtime fallback for a value that bypassed the
  * type system (a stored CHECK constraint widened without the TypeScript
- * union keeping pace): it renders as unknown and unfinished, never as
- * silently finished, because a status this code cannot explain is not one it
- * can promise is settled.
+ * union keeping pace): it renders as unknown, never as silently finished,
+ * because a status this code cannot explain is not one it can promise is
+ * settled.
  */
-function stateInfo(state: MessageState): { label: string; unfinished: boolean } {
+function stateLabel(state: MessageState): string {
   switch (state) {
     case 'received':
-      return { label: 'התקבלה — עדיין לא טופלה', unfinished: true };
+      return 'התקבלה — עדיין לא טופלה';
     case 'claimed':
-      return { label: 'בטיפול כרגע', unfinished: true };
+      return 'בטיפול כרגע';
     case 'reported_interim':
-      return { label: 'עודכנת בביניים — התשובה הסופית עדיין בדרך', unfinished: true };
+      return 'עודכנת בביניים — התשובה הסופית עדיין בדרך';
     case 'handled':
-      return { label: 'טופלה', unfinished: false };
+      return 'טופלה';
     case 'failed':
-      return { label: 'נכשלה', unfinished: false };
+      return 'נכשלה';
     case 'reported':
-      return { label: 'דווחה', unfinished: false };
+      return 'דווחה';
     default: {
       const unreachable: never = state;
-      return { label: `מצב לא מוכר (${String(unreachable)})`, unfinished: true };
+      return `מצב לא מוכר (${String(unreachable)})`;
     }
   }
 }
@@ -146,10 +156,8 @@ function messageRow(m: StoredMessage): string {
   // `escLabel`, not `esc`: the number is provider-supplied, not ours.
   const number = m.senderNumber !== null ? ` <span class="muted">${escLabel(m.senderNumber)}</span>` : '';
   // Always shown (fix round 1, Important 1) — a `failed` instruction must
-  // not read identically to a `handled` one, and `unfinished` here only ever
-  // meant "the owner is still owed something", not "worth mentioning".
-  const info = stateInfo(m.state);
-  const badge = ` <span class="muted">· ${esc(info.label)}</span>`;
+  // not read identically to a `handled` one.
+  const badge = ` <span class="muted">· ${esc(stateLabel(m.state))}</span>`;
 
   return `
     <article class="card">

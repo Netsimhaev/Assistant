@@ -33,6 +33,48 @@ function rowsOf(html: string): string[] {
   return [...html.matchAll(/<article class="card">[\s\S]*?<\/article>/g)].map((m) => m[0]);
 }
 
+/**
+ * Fix round 2, item 2: a denylist of forbidden attributes (`onclick`,
+ * `role`, `tabindex`, ...) is exactly the shape this repo's own rule warns
+ * against — "everything that is not X" grows a hole for whatever nobody
+ * listed yet. The positive version asks a different question: what is the
+ * COMPLETE, small set of tags a row is allowed to contain at all? Every
+ * literal opening/closing tag `messageRow` can ever emit is here, once; a
+ * row containing anything outside this set — a new attribute on an
+ * existing tag, a wholly new tag, in any position — fails the check,
+ * including shapes nobody has thought of yet.
+ */
+const ALLOWED_ROW_TAGS = new Set([
+  '<article class="card">',
+  '</article>',
+  '<div class="muted">',
+  '</div>',
+  '<span class="muted">',
+  '</span>',
+  '<p>',
+  '</p>',
+  '<em>',
+  '</em>',
+]);
+
+function tagsIn(html: string): string[] {
+  return [...html.matchAll(/<[^>]+>/g)].map((m) => m[0]);
+}
+
+function disallowedTags(tags: readonly string[], allowed: ReadonlySet<string>): string[] {
+  return tags.filter((t) => !allowed.has(t));
+}
+
+/** Every opening tag named `name`, exactly as rendered (attributes included). */
+function openTags(html: string, name: string): string[] {
+  return [...html.matchAll(new RegExp(`<${name}\\b[^>]*>`, 'g'))].map((m) => m[0]);
+}
+
+/** Every `href` on an `<a>` anywhere in `html`, in document order. */
+function hrefsOf(html: string): string[] {
+  return [...html.matchAll(/<a\b[^>]*\shref="([^"]*)"[^>]*>/g)].map((m) => m[1] ?? '');
+}
+
 describe('renderConversation', () => {
   /**
    * Stranger-authored text on the owner's screen. `escLabel` exists because
@@ -134,24 +176,60 @@ describe('renderConversation', () => {
   // Fix round 1, item 5: the central boundary this task exists to guarantee
   // — no row can be addressed directly — had no test that would catch a
   // per-row control, only a page-wide `<form>` count that an `<a>` or
-  // `<button>` sails past. This isolates each row's own markup.
-  it('renders no interactive control inside any message row, for a stranger or anyone else', () => {
+  // `<button>` sails past. Fix round 2 replaced the denylist shape (a list
+  // of forbidden tags) with a positive whitelist: a row may contain ONLY
+  // the tags in `ALLOWED_ROW_TAGS`, so anything else — known or not yet
+  // thought of — fails this check by construction.
+  it('renders only its own small whitelist of tags inside any message row, never a new one', () => {
     const html = renderConversation({
       messages: [
         msg({ id: 'WA-1', senderKind: 'principal', body: 'הודעה מהבעלים' }),
-        msg({ id: 'WA-2', senderKind: 'other', body: 'הודעה משולח אחר' }),
-        msg({ id: 'WA-3', direction: 'outbound', senderKind: null, senderNumber: null, body: 'תשובת העוזרת' }),
+        msg({ id: 'WA-2', senderKind: 'other', senderNumber: '+972500000000', body: 'הודעה משולח אחר' }),
+        msg({ id: 'WA-3', direction: 'outbound', senderKind: null, senderNumber: null, body: null, transcript: 'תמלול תשובה' }),
+        msg({ id: 'WA-4', body: null, transcript: null, mediaKind: null }),
       ],
       csrf: 'c',
     });
     const rows = rowsOf(html);
-    expect(rows).toHaveLength(3);
-    for (const row of rows) {
-      expect(row).not.toMatch(/<a[\s>]/);
-      expect(row).not.toMatch(/<button/);
-      expect(row).not.toMatch(/<form/);
-      expect(row).not.toMatch(/<input/);
-    }
+    expect(rows).toHaveLength(4);
+    const tagsAcrossRows = rows.flatMap(tagsIn);
+    expect(disallowedTags(tagsAcrossRows, ALLOWED_ROW_TAGS)).toEqual([]);
+  });
+
+  // Fix round 2, item 2's second positive assertion. The row whitelist
+  // above closes what a ROW may contain; it cannot, by definition, see a
+  // control placed just outside a row's `</article>` — the review's own
+  // named realistic regression, where the row count stays unchanged and
+  // nothing in the row check notices. This closes what the PAGE may
+  // contain instead: the one compose form, its own three fields, and the
+  // three fixed nav links — nothing else, anywhere, regardless of how many
+  // rows are rendered or what they contain.
+  it("limits the page's entire interactive inventory to the compose form, its own fields, and the fixed nav links", () => {
+    const csrf = 'tok-123';
+    const html = renderConversation({
+      messages: [
+        msg({ id: 'WA-1', senderKind: 'principal', body: 'הודעה 1' }),
+        msg({ id: 'WA-2', senderKind: 'other', senderNumber: '+972500000000', body: 'הודעה 2' }),
+      ],
+      csrf,
+    });
+
+    expect(openTags(html, 'form')).toEqual(['<form method="POST" action="/instruct">']);
+    expect(openTags(html, 'input')).toEqual([`<input type="hidden" name="csrf" value="${csrf}">`]);
+    expect(openTags(html, 'textarea')).toEqual([
+      '<textarea name="text" rows="3" maxlength="4000" required placeholder="כתוב הוראה לעוזרת, בדיוק כמו בוואטסאפ">',
+    ]);
+    expect(openTags(html, 'button')).toEqual(['<button>']);
+    // Every link on the page, wherever it sits, is one of the three fixed
+    // nav destinations — never a per-row address, and never a fourth link
+    // smuggled in anywhere, including just outside a row.
+    expect(hrefsOf(html)).toEqual(['/', '/instruct', '/readings']);
+    // No other kind of interactive element exists anywhere on the page.
+    expect(openTags(html, 'select')).toEqual([]);
+    expect(openTags(html, 'label')).toEqual([]);
+    expect(openTags(html, 'details')).toEqual([]);
+    expect(openTags(html, 'summary')).toEqual([]);
+    expect(openTags(html, 'area')).toEqual([]);
   });
 
   it('marks a claimed-but-unsettled message as unfinished rather than hiding it', () => {
@@ -229,10 +307,10 @@ describe('renderConversation', () => {
   });
 
   // Ruling 3: a state the type system never anticipated (a widened CHECK
-  // constraint running ahead of this file) must render as unknown and
-  // unfinished, never as silently finished — the runtime half of the
-  // compile-time exhaustiveness check in `stateInfo`.
-  it('renders an unrecognised state as unknown and unfinished, never as silently finished', () => {
+  // constraint running ahead of this file) must render as unknown, never as
+  // silently finished — the runtime half of the compile-time exhaustiveness
+  // check in `stateLabel`.
+  it('renders an unrecognised state as unknown, never as silently finished', () => {
     const html = renderConversation({
       messages: [msg({ state: 'some_future_state' as unknown as StoredMessage['state'], body: 'מצב עתידי' })],
       csrf: 'c',
@@ -268,13 +346,17 @@ describe('renderConversation', () => {
   // one. `renderConversation` itself only renders the sentence when told
   // to — detecting truncation honestly (asking for one more row than the
   // limit) is the caller's job, covered in `server.test.ts`.
-  it('says nothing extra when the conversation was not truncated', () => {
-    const html = renderConversation({ messages: [msg()], csrf: 'c' });
-    expect(html).not.toContain('מוצגות ההודעות האחרונות בלבד');
-  });
-
-  it('tells the owner when the record was cut to the most recent messages', () => {
-    const html = renderConversation({ messages: [msg()], csrf: 'c', truncated: true });
-    expect(html).toContain('מוצגות ההודעות האחרונות בלבד');
+  //
+  // Fix round 2, item 3: the "not truncated" half used to be its own test,
+  // which would survive deletion of the entire truncation feature — nothing
+  // in that half alone depends on the feature existing. Folded into one
+  // test so the "nothing extra by default" half is anchored by its own
+  // paired "something when told to" half: deleting the feature fails the
+  // second assertion, not just leaves the first one vacuously true.
+  it('shows the truncation note only when told the record was cut, never by default', () => {
+    const notTruncated = renderConversation({ messages: [msg()], csrf: 'c' });
+    const truncated = renderConversation({ messages: [msg()], csrf: 'c', truncated: true });
+    expect(notTruncated).not.toContain('מוצגות ההודעות האחרונות בלבד');
+    expect(truncated).toContain('מוצגות ההודעות האחרונות בלבד');
   });
 });
