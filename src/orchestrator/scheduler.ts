@@ -1,9 +1,19 @@
+import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
+import { principalWhatsAppKey } from '../governance/principal-number.js';
 import { conductPendingDocuments } from './conduct.js';
 import type { Judge } from '../sdk/gov-verify.js';
 import type { ConductOptions, ConductResult } from './conduct.js';
+import { createBossMessenger } from '../whatsapp/messenger.js';
+import type { BossMessenger } from '../whatsapp/messenger.js';
+import type { GatewayHealth } from '../whatsapp/gateway.js';
+import { runWhatsAppDoor } from './whatsapp-door.js';
+import type { DoorResult } from './whatsapp-door.js';
+import { reportWhatsAppJobs } from './whatsapp-report.js';
+import type { ReportResult } from './whatsapp-report.js';
+import type { RunInstructionOptions } from './instruct.js';
 import { scanInbox } from './inbox-scan.js';
 import type { ScanResult } from './inbox-scan.js';
 import { loadJob, transition } from './jobs.js';
@@ -133,6 +143,75 @@ async function wakeDueJobs(
   return woken;
 }
 
+/**
+ * The last WhatsApp bridge state this process has observed, per business —
+ * §7.4. In-memory, for the life of the process: a restart re-sending one
+ * email it already sent is a tolerable cost, and a transition this process
+ * never notices because nothing remembered the state before it is not.
+ *
+ * Keyed by business rather than a single value, matching every other
+ * per-business concern in this module — a single installation may in
+ * principle run the scheduler for more than one `businessId`.
+ */
+const lastWhatsAppHealth = new Map<string, GatewayHealth['state']>();
+
+/**
+ * §7.4 — a bridge that WAS connected and is not must reach the owner by
+ * EMAIL, never by WhatsApp (WhatsApp is the very thing that is down), and
+ * exactly ONCE per transition, not once per pass for as long as the bridge
+ * stays disconnected.
+ *
+ * Compares against `lastWhatsAppHealth` above rather than hoping: the state
+ * is recorded on every call, whether or not it changed, so the NEXT call
+ * always compares against what this process actually last saw rather than
+ * re-deriving it from `health()` a second time. Firing only on a transition
+ * OUT of `connected` — never on every pass `health()` reports something other
+ * than `connected` — is what keeps a bridge that stays down from re-emailing
+ * the owner on every scheduler tick (spec §10's own thirty-second interval
+ * would otherwise flood a mailbox). The FIRST observation ever made for a
+ * business is never itself a transition — there is no prior `connected` state
+ * to have left — so an installation that boots with the bridge already down
+ * sends nothing on its first pass; this matches the literal reading of
+ * "a bridge that WAS connected and is not" rather than "a bridge that is not
+ * connected right now".
+ *
+ * `notify` may be `undefined` (no SMTP configured) or may lack `sendAlert`
+ * (a hand-built test `Runtime.notify` fixture, predating this field, per
+ * `Runtime.notify`'s own docblock) — either way there is nothing to send
+ * through, and that is itself an existing, separately-warned-about
+ * installation state, not a new failure this function introduces. A send
+ * failure is swallowed here, never thrown and never surfaced on
+ * `SchedulerPassResult`: the same contract every notification in this
+ * project already keeps (`createEmailNotifier.notify`, `BossMessenger.send`)
+ * — the event already happened and is already recorded elsewhere (the
+ * gateway's own health, visible on the connections screen); the owner's
+ * mailbox not hearing about it is a separate fact that must not take the
+ * pass down with it.
+ */
+async function checkWhatsAppHealth(
+  gateway: { health(): Promise<GatewayHealth> },
+  notify: Runtime['notify'],
+  businessId: string,
+): Promise<void> {
+  const current = await gateway.health();
+  const previous = lastWhatsAppHealth.get(businessId);
+  lastWhatsAppHealth.set(businessId, current.state);
+  if (previous !== 'connected' || current.state === 'connected') return;
+  if (notify?.sendAlert === undefined) return;
+  const subject = 'התנתק הגשר לוואטסאפ';
+  const body =
+    `הגשר לוואטסאפ, שהיה מחובר, התנתק (מצב נוכחי: ${current.state}). ` +
+    `הודעות נכנסות בוואטסאפ לא מתקבלות כרגע, ואי אפשר להשתמש בערוץ הזה עד שהחיבור יחזור.`;
+  try {
+    await notify.sendAlert(subject, body);
+  } catch {
+    // Belt and braces — `sendAlert`'s own contract is "never throws" (same
+    // as `ApprovalNotifier.notify`), but this function must not let a test
+    // double or a future implementation that breaks that contract take the
+    // pass down with it.
+  }
+}
+
 export interface SchedulerPassResult {
   tick: TickResult;
   /** Null when no inbox is configured, or when the scan itself faulted. */
@@ -164,8 +243,36 @@ export interface SchedulerPassResult {
    * docblock makes for `runDueJobs` before `closeVerifiedJobs`.
    */
   delegated: ResumeResult;
+  /**
+   * Null when no WhatsApp gateway is configured (`runtime.whatsapp ===
+   * undefined`) — the same "switch, not fault" shape `scan`/`conduct` already
+   * carry. Run right after `delegated` and before the conductor loops: an
+   * instruction the door plans this pass must reach `execute` before
+   * `runDueJobs` looks, or it costs a full scheduler interval — see this
+   * function's own docblock.
+   */
+  whatsappDoor: DoorResult | null;
   due: RunDueResult;
   verified: CloseVerifiedResult;
+  /**
+   * Null under the same switch as `whatsappDoor` above. Run after
+   * `closeVerifiedJobs`, not before: a job the door opened and this very pass
+   * ran all the way to `closed` must be reportable in the SAME pass, or the
+   * owner waits a full interval to hear the outcome of an instruction he
+   * already knows was received.
+   */
+  whatsappReport: ReportResult | null;
+  /**
+   * The charter failing to load for the WhatsApp loops, or `runWhatsAppDoor`
+   * itself throwing (its own docblock: a missing/stale charter, or no
+   * principal WhatsApp number) — never a per-message or per-job failure,
+   * which `DoorResult`/`ReportResult` already isolate on their own. Null on a
+   * clean pass and null when no gateway is configured; non-null means BOTH
+   * loops were skipped this pass (`scanError`'s own pattern), because a
+   * charter this process cannot parse leaves the door with no policy to check
+   * a sender against and the report with no number to build a messenger from.
+   */
+  whatsappError: string | null;
   /** Which action classes this round moved up, and which moved down. */
   autonomy: AutonomyPassResult;
   /**
@@ -271,8 +378,12 @@ export async function schedulerPass(
      * explicitly below — see `conductOptions`.
      */
     judge?: Judge;
+    /** Test seam only; production leaves it unset and `runInstruction` uses the real planner. */
+    whatsappPlanner?: RunInstructionOptions['planner'];
+    whatsappProvider?: Parameters<typeof runWhatsAppDoor>[0]['provider'];
   } = {},
 ): Promise<SchedulerPassResult> {
+  const businessId = options.businessId ?? config.businessId;
   const tickResult = await tick(options);
 
   // First after the tick, and the order matters: a child that closed on the
@@ -280,6 +391,75 @@ export async function schedulerPass(
   // in this very pass through `runDueJobs` below. Run it after the plans
   // instead and every delegation would cost a full extra interval.
   const delegated = await resumeDelegatedJobs(options);
+
+  // Built once per pass and reused everywhere below — `due` and the
+  // conductor loops need it too, and a second `buildRuntime()` call here
+  // would both waste the work and risk two registries disagreeing.
+  const runtime = options.runtime ?? (await buildRuntime());
+
+  // The door, right after `resumeDelegatedJobs` and before the conductor
+  // loops — see `SchedulerPassResult.whatsappDoor`'s own docblock. Guarded on
+  // `runtime.whatsapp !== undefined`: no GREEN-API gateway configured is a
+  // switch, the same shape `scan`/`conduct` already carry below, not a fault.
+  //
+  // **The charter is loaded here, once, and the messenger is built from it
+  // here, once — never inside `buildRuntime`.** `principalWhatsAppKey` reads
+  // the SIGNED charter, which an owner can change by signing an amendment;
+  // building the messenger at process start (inside `buildRuntime`) would pin
+  // a recipient for the life of the process, so after the owner changes his
+  // number the assistant would keep messaging the old one — which by then may
+  // belong to someone who is not the principal at all. `createBossMessenger`
+  // does no I/O at construction, so doing this every pass costs nothing.
+  //
+  // A charter that will not load (missing, or a stale schema —
+  // `loadActiveCharter`'s own docblock) skips BOTH the door and the report
+  // this pass, never the pass itself: `whatsappError` carries why, the same
+  // `scanError` treatment a broken document inbox already gets, for the same
+  // reason — an escaping throw here would suppress the tick, the plans and
+  // the closes that had all already succeeded. `runWhatsAppDoor` itself can
+  // also throw for the identical reason (its own docblock: no active charter,
+  // or no principal number), so the whole block below shares one `try`.
+  let whatsappDoor: DoorResult | null = null;
+  let whatsappReport: ReportResult | null = null;
+  let whatsappError: string | null = null;
+  let whatsappMessenger: BossMessenger | null = null;
+  if (runtime.whatsapp !== undefined) {
+    try {
+      const active = await loadActiveCharter(businessId);
+      if (active === null) {
+        throw new Error(
+          `schedulerPass: no active charter for business ${businessId} — refusing to run the WhatsApp loops`,
+        );
+      }
+      const principal = principalWhatsAppKey(active.charter);
+      if (principal === null) {
+        throw new Error(
+          `schedulerPass: charter has no principal WhatsApp number for business ${businessId} — refusing to run the WhatsApp loops`,
+        );
+      }
+      whatsappMessenger = createBossMessenger({
+        gateway: runtime.whatsapp.gateway,
+        contactId: principal,
+        businessId,
+      });
+
+      // §7.4 — never once per pass for as long as the bridge stays down; see
+      // `checkWhatsAppHealth`'s own docblock.
+      await checkWhatsAppHealth(runtime.whatsapp.gateway, runtime.notify, businessId);
+
+      whatsappDoor = await runWhatsAppDoor({
+        gateway: runtime.whatsapp.gateway,
+        messenger: whatsappMessenger,
+        businessId,
+        ...(options.whatsappProvider !== undefined ? { provider: options.whatsappProvider } : {}),
+        ...(options.whatsappPlanner !== undefined ? { planner: options.whatsappPlanner } : {}),
+        ...(options.now !== undefined ? { now: options.now } : {}),
+      });
+    } catch (err) {
+      whatsappError = err instanceof Error ? err.message : String(err);
+      whatsappMessenger = null;
+    }
+  }
 
   // Both conductor loops run after the tick's transaction has committed, not
   // inside it — see the docblock above.
@@ -293,7 +473,6 @@ export async function schedulerPass(
   // to declare rather than a statement this function makes.
   const { judge, ...conductOptions } = options;
   const inbox = options.inbox !== undefined ? options.inbox : config.documentInbox;
-  const runtime = options.runtime ?? (await buildRuntime());
   let scan: ScanResult | null = null;
   let scanError: string | null = null;
   let conduct: ConductResult | null = null;
@@ -328,12 +507,33 @@ export async function schedulerPass(
   // on. `verifier` rides along and is ignored — `runDueJobs` declares no such
   // field, and the judging step reads `judge` alone.
   const due = await runDueJobs({ ...options, runtime });
+
   // Last, and the order matters as much as the rest: a job `runDueJobs` just
   // finished is sitting in `verify` by the time this looks, so it closes in
   // the same pass instead of waiting a full interval. Run before the plans
   // instead and every close would trail a pass behind the work that earned
   // it.
   const verified = await closeVerifiedJobs(options);
+
+  // The report, right after `closeVerifiedJobs` — see
+  // `SchedulerPassResult.whatsappReport`'s own docblock. Guarded on
+  // `whatsappMessenger !== null`: that is `null` both when no gateway is
+  // configured and when the charter failed to load above, so a charter this
+  // process cannot parse skips this loop too, never only the door.
+  if (runtime.whatsapp !== undefined && whatsappMessenger !== null) {
+    try {
+      whatsappReport = await reportWhatsAppJobs({
+        messenger: whatsappMessenger,
+        businessId,
+        ...(runtime.notify !== undefined
+          ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl }
+          : {}),
+      });
+    } catch (err) {
+      whatsappError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
   // Last, and for the same reason `closeVerifiedJobs` runs after the plans:
   // this pass reads what this very round produced — an approval just decided,
   // a job just failed. Run it earlier and every evaluation trails a pass
@@ -355,8 +555,11 @@ export async function schedulerPass(
     scanError,
     conduct,
     delegated,
+    whatsappDoor,
     due,
     verified,
+    whatsappReport,
+    whatsappError,
     autonomy,
     autonomyError,
   };

@@ -109,6 +109,29 @@ function logErrored(result: SchedulerPassResult): void {
   for (const job of result.verified.errored) {
     console.error(`job ${job.jobId} errored while closing: ${job.error}`);
   }
+  // The WhatsApp door and report share one bucket because `schedulerPass`
+  // does: a charter that will not load at pass time skips both loops, and
+  // this is the only trace of that an operator would otherwise see. Null
+  // means no GREEN-API gateway is configured — not news, and deliberately
+  // silent, same as `conduct === null` above.
+  if (result.whatsappError !== null) {
+    console.error(`WhatsApp loops skipped this pass: ${result.whatsappError}`);
+  }
+  // Task 8's own report-round ruling: counting `deferred` is what stops a job
+  // permanently stuck on a crashed resume from becoming invisible silence —
+  // but that justification is only true once something actually reads the
+  // counter, which until this file printed it, nothing did. A single pass
+  // with a few deferred candidates is routine (a decided-not-yet-resumed
+  // race, resolved by the next pass); a count that keeps climbing pass after
+  // pass is the pathological case this line exists to surface.
+  if (result.whatsappReport !== null && result.whatsappReport.deferred > 0) {
+    console.log(`${result.whatsappReport.deferred} WhatsApp-opened job(s) deferred this pass`);
+  }
+  if (result.whatsappReport !== null && result.whatsappReport.errored.length > 0) {
+    for (const jobId of result.whatsappReport.errored) {
+      console.error(`WhatsApp report for job ${jobId} errored — its own record could not be read`);
+    }
+  }
   // Same rule one pass further along. A class whose evaluation threw would
   // otherwise look exactly like a class with nothing due — it would simply
   // never promote, every pass, and say nothing. A move itself is not an
