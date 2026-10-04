@@ -567,9 +567,10 @@ function composeText(
  * Send the owner one honest sentence for every WhatsApp-opened job that has
  * reached a reportable phase and still owes a report.
  *
- * Not wired into the scheduler by this task — see the task report for why
- * that wiring is deliberately left to whoever next runs `runWhatsAppDoor`
- * and this function from the same production loop.
+ * Wired into the scheduler by Task 10 (`scheduler.ts`'s `schedulerPass`),
+ * right after `closeVerifiedJobs` — see that call site's own comment, and
+ * `SchedulerPassResult.whatsappReport`, for why that ordering is load-bearing
+ * rather than incidental.
  */
 export async function reportWhatsAppJobs(options: {
   messenger: BossMessenger;

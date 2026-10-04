@@ -272,6 +272,88 @@ describe('buildRuntime', () => {
   });
 
   /**
+   * Fix round 1, F3 — `sendAlert`'s own ~30 production lines (the credential
+   * resolve, the `null`-credential branch, the `transport.send` call, both
+   * deadline races) had no test at all; every caller in the suite used a
+   * hand-built double. Mirrors the notifier test just above, through the
+   * real encrypted store and the real `transport.send` call shape.
+   */
+  it('sendAlert resolves NOTIFY_CREDENTIAL_REF through the real store and reaches the transport', async () => {
+    await putSecret(
+      {
+        businessId: config.businessId,
+        ref: 'NOTIFY_MAIL',
+        value: 'סוד-התראת-הבריאות',
+        updatedBy: 'operator@example.com',
+      },
+      KEY,
+    );
+
+    const captured: Array<{ to: string; subject: string; text: string; auth?: { user?: string; pass?: string } }> = [];
+    const runtime = await buildRuntime(FULL, {
+      createTransport: (opts) => ({
+        sendMail: (mail: { to: string; subject: string; text: string }) => {
+          captured.push({ ...mail, auth: opts.auth });
+          return Promise.resolve({ messageId: 'stub-message-id' });
+        },
+      }),
+    });
+
+    const notify = runtime.notify;
+    expect(notify).toBeDefined();
+    if (notify === undefined) throw new Error('unreachable — asserted above');
+    expect(notify.sendAlert).toBeDefined();
+    if (notify.sendAlert === undefined) throw new Error('unreachable — asserted above');
+
+    const result = await notify.sendAlert('נושא ההתראה', 'גוף ההתראה');
+    expect(result.ok).toBe(true);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.subject).toBe('נושא ההתראה');
+    expect(captured[0]?.text).toBe('גוף ההתראה');
+    expect(captured[0]?.to).toBe(FULL['APPROVAL_NOTIFY_TO']);
+    expect(captured[0]?.auth?.pass).toBe('סוד-התראת-הבריאות');
+  });
+
+  /**
+   * Fix round 1, F3's second half — the property this whole task's design
+   * leans on (resolve fresh per call, never cache across the closure's
+   * lifetime) is asserted by nothing today; a refactor that hoisted the
+   * `resolve` above the closure would break it with every other test still
+   * green. Two calls, the stored secret ROTATED in between, the second call
+   * must carry the new value.
+   */
+  it('sendAlert resolves a fresh credential on every call, so a rotation takes effect on the next alert', async () => {
+    await putSecret(
+      { businessId: config.businessId, ref: 'NOTIFY_MAIL', value: 'סוד-ראשון', updatedBy: 'operator@example.com' },
+      KEY,
+    );
+    const captured: Array<{ pass?: string }> = [];
+    const runtime = await buildRuntime(FULL, {
+      createTransport: (opts) => ({
+        sendMail: () => {
+          captured.push({ pass: opts.auth.pass });
+          return Promise.resolve({ messageId: 'stub-message-id' });
+        },
+      }),
+    });
+    const notify = runtime.notify;
+    if (notify?.sendAlert === undefined) throw new Error('unreachable — asserted above');
+
+    const first = await notify.sendAlert('נושא', 'גוף');
+    expect(first.ok).toBe(true);
+    expect(captured[0]?.pass).toBe('סוד-ראשון');
+
+    await putSecret(
+      { businessId: config.businessId, ref: 'NOTIFY_MAIL', value: 'סוד-שני', updatedBy: 'operator@example.com' },
+      KEY,
+    );
+    const second = await notify.sendAlert('נושא', 'גוף');
+    expect(second.ok).toBe(true);
+    expect(captured[1]?.pass).toBe('סוד-שני');
+    expect(captured[1]?.pass).not.toBe(captured[0]?.pass);
+  });
+
+  /**
    * `SMTP_SECURE=false` is the shipped default and the runbook's value, so the
    * mandatory-STARTTLS path is the one every installation takes. The switch
    * that turns it off exists for a local relay that speaks no TLS at all

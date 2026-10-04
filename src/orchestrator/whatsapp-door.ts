@@ -483,7 +483,20 @@ export async function runWhatsAppDoor(options: {
   provider?: TranscriptionProvider;
   /** Test seam only; production leaves it unset and `runInstruction` uses the real planner. */
   planner?: RunInstructionOptions['planner'];
-  now?: Date;
+  /**
+   * The charter the CALLER already loaded, so this door checks the sender
+   * against the exact same read `scheduler.ts` used to derive the
+   * principal's number for the messenger it is handing in alongside this —
+   * fix round 1, F11. Without this, the door's own `loadActiveCharter` below
+   * ran a SECOND, independently-timed load every pass; an amendment signed
+   * between the two left a pass whose door authorised the NEW principal
+   * number while the messenger (built from the FIRST load) replied to the
+   * OLD one. Optional, and this module still loads its own copy when
+   * omitted — Task 7's property that this door never runs without a charter
+   * holds for every caller, not only the one that happens to have one
+   * already in hand.
+   */
+  charter?: BusinessCharter;
 }): Promise<DoorResult> {
   const businessId = options.businessId ?? config.businessId;
   const { gateway, messenger } = options;
@@ -492,13 +505,22 @@ export async function runWhatsAppDoor(options: {
   // docblock. Left to throw on a stale schema rather than caught here, and
   // treated the same way when no charter is installed at all: either way,
   // this door has no principal number to check a sender against.
-  const active = await loadActiveCharter(businessId);
-  if (active === null) {
-    throw new Error(
-      `runWhatsAppDoor: no active charter for business ${businessId} — refusing to guess who the owner is`,
-    );
+  //
+  // Skipped entirely when the caller already supplies one (`options.charter`
+  // — see that field's own docblock, F11): the caller's read is what this
+  // door checks the sender against, not a second one of its own.
+  let charter: BusinessCharter;
+  if (options.charter !== undefined) {
+    charter = options.charter;
+  } else {
+    const active = await loadActiveCharter(businessId);
+    if (active === null) {
+      throw new Error(
+        `runWhatsAppDoor: no active charter for business ${businessId} — refusing to guess who the owner is`,
+      );
+    }
+    charter = active.charter;
   }
-  const charter = active.charter;
 
   const collected: NormalizedInboundMessage[] = [];
   gateway.onInbound(async (msg) => {

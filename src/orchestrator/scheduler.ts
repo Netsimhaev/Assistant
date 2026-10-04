@@ -1,8 +1,10 @@
+import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
 import { principalWhatsAppKey } from '../governance/principal-number.js';
+import { canonicalHash } from '../util/canonical.js';
 import { conductPendingDocuments } from './conduct.js';
 import type { Judge } from '../sdk/gov-verify.js';
 import type { ConductOptions, ConductResult } from './conduct.js';
@@ -144,10 +146,23 @@ async function wakeDueJobs(
 }
 
 /**
- * The last WhatsApp bridge state this process has observed, per business —
- * §7.4. In-memory, for the life of the process: a restart re-sending one
- * email it already sent is a tolerable cost, and a transition this process
- * never notices because nothing remembered the state before it is not.
+ * The last WhatsApp bridge state this process has SUCCESSFULLY reported on,
+ * per business — §7.4. In-memory, for the life of the process.
+ *
+ * **Fix round 1, F8 — the trade-off this docblock used to name was the
+ * impossible one.** A restart cannot cause a duplicate email: after a
+ * restart the first observation is never a transition (see
+ * `checkWhatsAppHealth` below), so there is no "re-sending one it already
+ * sent" to be tolerant of. The real, asymmetric cost is the opposite
+ * direction: a bridge that is already down when the process boots, and
+ * never reconnects before the process is restarted again, is never reported
+ * by email AT ALL — not once, across any number of restarts, because the
+ * first-observation rule treats "already down" as having nothing to
+ * transition FROM. That is accepted here (persisting the last state across
+ * restarts, or treating `undefined → not-connected` as reportable once, are
+ * both real fixes this task does not take), and it is why the dashboard's
+ * own `health()` display (§7.4's first control) is not optional decoration:
+ * it is the one surface that is never subject to this gap.
  *
  * Keyed by business rather than a single value, matching every other
  * per-business concern in this module — a single installation may in
@@ -156,60 +171,132 @@ async function wakeDueJobs(
 const lastWhatsAppHealth = new Map<string, GatewayHealth['state']>();
 
 /**
+ * Writes one `incident` audit row for a health alert that could not be
+ * delivered — fix round 1, F1. Mirrors `policy/engine.ts`'s own
+ * `approval_notify_failed` pattern exactly: `kind: 'incident'`, the specific
+ * failure folded into `reason` as a stable prefix rather than a dedicated
+ * `AuditKind` member (CLAUDE.md's own rule on why adding an `ActionClass` or
+ * `TrustLevel` member is dangerous does not apply to a free-text `reason`,
+ * and inventing a kind for one caller is the same class of unforced
+ * complexity). `provenance: 'boss'` and a placeholder `charterVersion` of
+ * `'unknown'` when none was available follow `killswitch.ts`'s identical
+ * choice for the identical reason: this is a fact about the INSTALLATION,
+ * not about any one chain of content, and there is no better value to put
+ * there.
+ *
+ * Never throws: a failure recording a failure must not take the pass down
+ * with it, the same discipline every other best-effort write in this
+ * codebase keeps (`recordAttempt` in `whatsapp/messenger.ts`, `transcribe.ts`'s
+ * own `recordAttempt`).
+ */
+async function recordWhatsAppHealthNotifyFailure(
+  businessId: string,
+  charterVersion: string,
+  reason: string,
+): Promise<void> {
+  try {
+    await appendAudit(
+      {
+        actor: 'system',
+        kind: 'incident',
+        charterVersion,
+        provenance: 'boss',
+        inputHash: canonicalHash({ kind: 'whatsapp_health_notify_failed', businessId, reason }),
+        reason: `whatsapp_health_notify_failed: ${reason}`,
+      },
+      { businessId },
+    );
+  } catch {
+    // Best-effort — see this function's own docblock.
+  }
+}
+
+/**
  * §7.4 — a bridge that WAS connected and is not must reach the owner by
  * EMAIL, never by WhatsApp (WhatsApp is the very thing that is down), and
  * exactly ONCE per transition, not once per pass for as long as the bridge
  * stays disconnected.
  *
- * Compares against `lastWhatsAppHealth` above rather than hoping: the state
- * is recorded on every call, whether or not it changed, so the NEXT call
- * always compares against what this process actually last saw rather than
- * re-deriving it from `health()` a second time. Firing only on a transition
- * OUT of `connected` — never on every pass `health()` reports something other
- * than `connected` — is what keeps a bridge that stays down from re-emailing
- * the owner on every scheduler tick (spec §10's own thirty-second interval
- * would otherwise flood a mailbox). The FIRST observation ever made for a
- * business is never itself a transition — there is no prior `connected` state
- * to have left — so an installation that boots with the bridge already down
- * sends nothing on its first pass; this matches the literal reading of
- * "a bridge that WAS connected and is not" rather than "a bridge that is not
- * connected right now".
+ * **Fix round 1, F6 — a health READ failure must never take the door down
+ * with it.** `gateway.health()` is a real network call against the GREEN-API
+ * client once Task 11 lands; a blip there is a diagnostic failure, not a
+ * reason to refuse the owner's own instructions this pass. It is wrapped in
+ * its own `try` and returns silently on a throw — `lastWhatsAppHealth` is
+ * left exactly as it was, so a genuine transition is still caught once the
+ * probe itself recovers, and nothing here can propagate into the shared
+ * `try` in `schedulerPass` that would otherwise skip `runWhatsAppDoor` too.
  *
- * `notify` may be `undefined` (no SMTP configured) or may lack `sendAlert`
- * (a hand-built test `Runtime.notify` fixture, predating this field, per
- * `Runtime.notify`'s own docblock) — either way there is nothing to send
- * through, and that is itself an existing, separately-warned-about
- * installation state, not a new failure this function introduces. A send
- * failure is swallowed here, never thrown and never surfaced on
- * `SchedulerPassResult`: the same contract every notification in this
- * project already keeps (`createEmailNotifier.notify`, `BossMessenger.send`)
- * — the event already happened and is already recorded elsewhere (the
- * gateway's own health, visible on the connections screen); the owner's
- * mailbox not hearing about it is a separate fact that must not take the
- * pass down with it.
+ * **Fix round 1, F1/F2 — the transition is recorded only once it has
+ * actually been told to someone, never merely observed.** The previous
+ * version called `lastWhatsAppHealth.set(...)` unconditionally, before
+ * checking whether anything could even be sent — so a transition with no
+ * `sendAlert` configured, or whose send failed, was marked "handled" and
+ * never revisited. Now: `lastWhatsAppHealth` only advances to the new state
+ * AFTER a `{ ok: true }` from `sendAlert`. A failure — no `sendAlert`
+ * configured, or `sendAlert` itself returning `{ ok: false }` or throwing —
+ * writes an `incident` row (`recordWhatsAppHealthNotifyFailure` above) and
+ * leaves the map exactly as it was, so the NEXT pass sees the same
+ * `previous === 'connected'` and tries again. This is deliberately
+ * noisy under a sustained outage (one `incident` row per pass until
+ * delivery succeeds or the bridge reconnects) rather than silent even once —
+ * see this module's own "a value that failed to send is not a value that
+ * was handled" rule.
+ *
+ * Firing only on a transition OUT of `connected` — never on every pass
+ * `health()` reports something other than `connected` — is what keeps a
+ * bridge that stays down from re-emailing the owner every thirty seconds
+ * once delivery does succeed. The FIRST observation ever made for a
+ * business is never itself a transition — there is no prior `connected`
+ * state to have left — so an installation that boots with the bridge
+ * already down sends nothing on its first pass; see `lastWhatsAppHealth`'s
+ * own docblock (F8) for the asymmetric cost that choice accepts.
  */
 async function checkWhatsAppHealth(
   gateway: { health(): Promise<GatewayHealth> },
   notify: Runtime['notify'],
   businessId: string,
+  charterVersion: string,
 ): Promise<void> {
-  const current = await gateway.health();
+  let current: GatewayHealth;
+  try {
+    current = await gateway.health();
+  } catch {
+    // F6 — diagnostic, not a gate. State is left untouched.
+    return;
+  }
+
   const previous = lastWhatsAppHealth.get(businessId);
-  lastWhatsAppHealth.set(businessId, current.state);
-  if (previous !== 'connected' || current.state === 'connected') return;
-  if (notify?.sendAlert === undefined) return;
+  if (previous !== 'connected' || current.state === 'connected') {
+    lastWhatsAppHealth.set(businessId, current.state);
+    return;
+  }
+
   const subject = 'התנתק הגשר לוואטסאפ';
   const body =
     `הגשר לוואטסאפ, שהיה מחובר, התנתק (מצב נוכחי: ${current.state}). ` +
     `הודעות נכנסות בוואטסאפ לא מתקבלות כרגע, ואי אפשר להשתמש בערוץ הזה עד שהחיבור יחזור.`;
-  try {
-    await notify.sendAlert(subject, body);
-  } catch {
-    // Belt and braces — `sendAlert`'s own contract is "never throws" (same
-    // as `ApprovalNotifier.notify`), but this function must not let a test
-    // double or a future implementation that breaks that contract take the
-    // pass down with it.
+
+  if (notify?.sendAlert === undefined) {
+    await recordWhatsAppHealthNotifyFailure(
+      businessId,
+      charterVersion,
+      'no sendAlert configured — SMTP is not set up on this installation',
+    );
+    return; // not recorded as observed — retried next pass.
   }
+
+  const sent = await notify.sendAlert(subject, body).catch((error: unknown) => ({
+    ok: false as const,
+    error: error instanceof Error ? error.message : String(error),
+  }));
+  if (!sent.ok) {
+    await recordWhatsAppHealthNotifyFailure(businessId, charterVersion, sent.error ?? 'sendAlert returned not-ok');
+    return; // not recorded as observed — retried next pass.
+  }
+
+  // Delivered. Only now does the new state become "the last thing the owner
+  // was successfully told" — ready to detect the NEXT transition fresh.
+  lastWhatsAppHealth.set(businessId, current.state);
 }
 
 export interface SchedulerPassResult {
@@ -263,14 +350,23 @@ export interface SchedulerPassResult {
    */
   whatsappReport: ReportResult | null;
   /**
-   * The charter failing to load for the WhatsApp loops, or `runWhatsAppDoor`
+   * The charter failing to load for the WhatsApp loops, `runWhatsAppDoor`
    * itself throwing (its own docblock: a missing/stale charter, or no
-   * principal WhatsApp number) — never a per-message or per-job failure,
-   * which `DoorResult`/`ReportResult` already isolate on their own. Null on a
-   * clean pass and null when no gateway is configured; non-null means BOTH
-   * loops were skipped this pass (`scanError`'s own pattern), because a
-   * charter this process cannot parse leaves the door with no policy to check
-   * a sender against and the report with no number to build a messenger from.
+   * principal WhatsApp number), or `reportWhatsAppJobs`' own candidate query
+   * rejecting — never a per-message or per-job failure, which
+   * `DoorResult`/`ReportResult` already isolate on their own. Null on a
+   * clean pass and null when no gateway is configured.
+   *
+   * **Fix round 1, F2 — non-null does NOT always mean both loops were
+   * skipped, and the field cannot be read alone.** Check `whatsappDoor`
+   * too: `whatsappDoor === null` means the charter/messenger/door step
+   * itself failed and BOTH loops were skipped (`scanError`'s own pattern —
+   * a charter this process cannot parse leaves the door with no policy to
+   * check a sender against and the report with no number to build a
+   * messenger from); `whatsappDoor !== null` means the door ran to
+   * completion and only the REPORT'S own candidate query failed afterward.
+   * `scheduler-log.ts`'s `logErrored` is the canonical reader that tells
+   * the two apart.
    */
   whatsappError: string | null;
   /** Which action classes this round moved up, and which moved down. */
@@ -445,15 +541,28 @@ export async function schedulerPass(
 
       // §7.4 — never once per pass for as long as the bridge stays down; see
       // `checkWhatsAppHealth`'s own docblock.
-      await checkWhatsAppHealth(runtime.whatsapp.gateway, runtime.notify, businessId);
+      await checkWhatsAppHealth(
+        runtime.whatsapp.gateway,
+        runtime.notify,
+        businessId,
+        active.charter.charterVersion,
+      );
 
       whatsappDoor = await runWhatsAppDoor({
         gateway: runtime.whatsapp.gateway,
         messenger: whatsappMessenger,
         businessId,
+        // Fix round 1, F11 — the SAME charter load this block already did
+        // for the messenger's number, handed to the door so it checks the
+        // sender against it rather than loading a second, independently
+        // timed copy. Without this, an amendment signed between the two
+        // loads leaves a pass whose door authorises the NEW number while
+        // the messenger replies with the OLD one — the exact one-pass
+        // window Override B exists to close, one level deeper than Override
+        // B itself reaches alone.
+        charter: active.charter,
         ...(options.whatsappProvider !== undefined ? { provider: options.whatsappProvider } : {}),
         ...(options.whatsappPlanner !== undefined ? { planner: options.whatsappPlanner } : {}),
-        ...(options.now !== undefined ? { now: options.now } : {}),
       });
     } catch (err) {
       whatsappError = err instanceof Error ? err.message : String(err);
@@ -507,7 +616,6 @@ export async function schedulerPass(
   // on. `verifier` rides along and is ignored — `runDueJobs` declares no such
   // field, and the judging step reads `judge` alone.
   const due = await runDueJobs({ ...options, runtime });
-
   // Last, and the order matters as much as the rest: a job `runDueJobs` just
   // finished is sitting in `verify` by the time this looks, so it closes in
   // the same pass instead of waiting a full interval. Run before the plans

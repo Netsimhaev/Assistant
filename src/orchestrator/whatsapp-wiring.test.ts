@@ -10,6 +10,7 @@
  * interval for no reason.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { queryAudit } from '../audit/log.js';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -19,7 +20,7 @@ import type { ApprovalNotifier } from '../governance/notify.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import type { Plan } from '../domain/plan.js';
 import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
-import type { NormalizedInboundMessage } from '../whatsapp/gateway.js';
+import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
@@ -32,6 +33,9 @@ import type { Runtime } from './runtime.js';
 
 const BUSINESS = 'test-business';
 const HEALTH_BUSINESS = 'test-business-health';
+const HEALTH_FAIL_BUSINESS = 'test-business-health-fail';
+const HEALTH_READ_FAIL_BUSINESS = 'test-business-health-read-fail';
+const DOOR_THROWS_BUSINESS = 'test-business-door-throws';
 const STALE_CHARTER_BUSINESS = 'test-business-no-charter';
 const PREFIX = 'TEST_CRED_';
 // Fixed clock, matching run-due.test.ts / scheduler-runs-plans.test.ts: an
@@ -135,6 +139,44 @@ function recordingNotifier(): {
       dashboardBaseUrl: 'http://127.0.0.1:8787',
       async sendAlert(subject, body) {
         calls.push({ subject, body });
+        return { ok: true };
+      },
+    },
+  };
+}
+
+/**
+ * Like `recordingNotifier`, but `failNext()` makes the NEXT `sendAlert` call
+ * resolve `{ ok: false }` instead of `{ ok: true }` — for fix round 1's F1
+ * (a failed send must be recorded, and must not consume the transition).
+ */
+function controllableNotifier(): {
+  calls: { subject: string; body: string }[];
+  notify: Runtime['notify'];
+  failNext: () => void;
+} {
+  const calls: { subject: string; body: string }[] = [];
+  let shouldFail = false;
+  const notifier: ApprovalNotifier = {
+    channel: 'email',
+    async notify() {
+      return { ok: true };
+    },
+  };
+  return {
+    calls,
+    failNext() {
+      shouldFail = true;
+    },
+    notify: {
+      notifier,
+      dashboardBaseUrl: 'http://127.0.0.1:8787',
+      async sendAlert(subject, body) {
+        calls.push({ subject, body });
+        if (shouldFail) {
+          shouldFail = false;
+          return { ok: false, error: 'fake SMTP outage' };
+        }
         return { ok: true };
       },
     },
@@ -293,5 +335,119 @@ describe('schedulerPass — WhatsApp wiring', () => {
     // Pass 3 — still disconnected. No second email for the same outage.
     await schedulerPass({ businessId: HEALTH_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
     expect(calls).toHaveLength(1);
+  });
+
+  /**
+   * Fix round 1, F1 — a failed send must be RECORDED (an `incident` audit
+   * row), and the transition must NOT be marked handled just because an
+   * attempt was made. Both are checked: the failed pass writes exactly one
+   * row naming the failure, and the very next pass — still disconnected —
+   * tries again rather than treating the outage as already reported.
+   */
+  it('records a failed health-alert send as an incident, and retries the next pass', async () => {
+    await installCharter(buildCharter(), { businessId: HEALTH_FAIL_BUSINESS });
+    const gateway = createFakeGateway();
+    const { calls, notify, failNext } = controllableNotifier();
+    const baseRuntime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, PREFIX),
+      warnings: [],
+      whatsapp: { gateway },
+      ...(notify !== undefined ? { notify } : {}),
+    };
+
+    // Pass 1 — connected baseline, no transition yet.
+    await schedulerPass({ businessId: HEALTH_FAIL_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+
+    // Pass 2 — the bridge drops, and the send fails.
+    gateway.setHealth({ state: 'reconnecting', since: NOON.toISOString() });
+    failNext();
+    await schedulerPass({ businessId: HEALTH_FAIL_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(1); // the attempt was made
+
+    const incidents = (await queryAudit({ businessId: HEALTH_FAIL_BUSINESS, kind: 'incident' })).filter((row) =>
+      row.reason.startsWith('whatsapp_health_notify_failed'),
+    );
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]?.reason).toContain('fake SMTP outage');
+
+    // Pass 3 — still disconnected, and this time delivery succeeds. If the
+    // failed attempt had been treated as "handled", this would stay at 1.
+    await schedulerPass({ businessId: HEALTH_FAIL_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(2); // retried, not swallowed
+  });
+
+  /** Fix round 1, F6 — a flaky health PROBE must not refuse the owner's own instruction. */
+  it('runs the door even when gateway.health() itself throws', async () => {
+    await installCharter(buildCharter(), { businessId: DOOR_THROWS_BUSINESS });
+    const gateway = createFakeGateway();
+    gateway.health = (): Promise<never> => {
+      throw new Error('health probe timed out');
+    };
+    gateway.enqueue(principalMessage('תשלחי לדנה'));
+
+    const pass = await schedulerPass({
+      businessId: DOOR_THROWS_BUSINESS,
+      now: NOON,
+      inbox: null,
+      runtime: {
+        registry: new AdapterRegistry([]),
+        credentials: envCredentials({}, PREFIX),
+        warnings: [],
+        whatsapp: { gateway },
+      },
+      whatsappPlanner: plannedWithMailPlan,
+    });
+
+    expect(pass.whatsappError).toBeNull();
+    expect(pass.whatsappDoor?.instructed).toBe(1);
+  });
+
+  /**
+   * Fix round 1, F5 — `whatsappMessenger = null` in the catch is what makes
+   * a door failure skip the report too. This is the one path the earlier
+   * "no active charter" test could not cover: here the charter loads fine
+   * and the messenger IS built, but `runWhatsAppDoor` itself throws
+   * (`pollOnce` rejecting, the same shape a real gateway's HTTP poll can
+   * fail with). Deleting the `= null` line leaves `whatsappReport` non-null
+   * here, because the report guard would then see a stale, already-built
+   * messenger as proof the door succeeded.
+   */
+  it('skips the report too when runWhatsAppDoor itself throws after the messenger was built', async () => {
+    await installCharter(buildCharter(), { businessId: HEALTH_READ_FAIL_BUSINESS });
+    const throwingGateway: WhatsAppGateway = {
+      async canSendFreeform() {
+        return true;
+      },
+      async sendMessage() {
+        return { messageId: 'x', state: 'sent' };
+      },
+      async health() {
+        return { state: 'connected', since: NOON.toISOString() };
+      },
+      onInbound() {
+        // Never actually registered against, because `pollOnce` throws
+        // before using it.
+      },
+      async pollOnce(): Promise<number> {
+        throw new Error('pollOnce exploded');
+      },
+    };
+
+    const pass = await schedulerPass({
+      businessId: HEALTH_READ_FAIL_BUSINESS,
+      now: NOON,
+      inbox: null,
+      runtime: {
+        registry: new AdapterRegistry([]),
+        credentials: envCredentials({}, PREFIX),
+        warnings: [],
+        whatsapp: { gateway: throwingGateway },
+      },
+    });
+
+    expect(pass.whatsappError).not.toBeNull();
+    expect(pass.whatsappDoor).toBeNull();
+    expect(pass.whatsappReport).toBeNull();
   });
 });

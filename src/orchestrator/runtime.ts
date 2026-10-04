@@ -20,6 +20,7 @@ import { oauthCredentials } from './oauth-token.js';
 import type { TokenHttp } from './oauth-token.js';
 import type { CredentialHandle } from './adapters/types.js';
 import type { WhatsAppGateway } from '../whatsapp/gateway.js';
+import { canonicalHash } from '../util/canonical.js';
 
 /** Which vendor's code serves a binding's system. Matches `ConnectionBinding.provider`. */
 const GOOGLE_PROVIDER = 'google';
@@ -384,7 +385,14 @@ export async function buildRuntime(
                   {
                     endpoint: null,
                     credential,
-                    idempotencyKey: `whatsapp-health-alert:${Date.now()}`,
+                    // Content-derived, not clock-derived (review F3 note):
+                    // `Date.now()` here gave every call its own key, which
+                    // dedupes nothing. The same subject+body hashes the same
+                    // way whether this is a fresh alert or a retry of one
+                    // that failed to send a pass ago — exactly the case
+                    // `checkWhatsAppHealth` produces when it leaves the
+                    // transition unrecorded and tries again next pass.
+                    idempotencyKey: `whatsapp-health-alert:${canonicalHash({ subject, body })}`,
                     signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
                   },
                 ),
