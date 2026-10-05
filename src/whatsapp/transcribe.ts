@@ -81,7 +81,7 @@
  * `seconds` is known, every byte has already been pulled into memory. A
  * provider that reports a short `seconds` for a large payload (lying,
  * miscounting, or simply serving the wrong resource) is not caught by the
- * duration check at all. `MAX_AUDIO_DOWNLOAD_BYTES` checks the thing that is
+ * duration check at all. `MAX_TRANSCRIBABLE_AUDIO_BYTES` checks the thing that is
  * actually true the instant the download resolves — how large it really
  * was — before anything downstream (the paid provider call, holding the
  * buffer any longer than necessary) happens.
@@ -99,7 +99,7 @@ export type TranscribeOutcome =
   | { status: 'transcribed'; text: string }
   | { status: 'too_long'; seconds: number }
   /**
-   * The downloaded media exceeded `MAX_AUDIO_DOWNLOAD_BYTES` — see this
+   * The downloaded media exceeded `MAX_TRANSCRIBABLE_AUDIO_BYTES` — see this
    * module's own docblock on why the duration check cannot catch this.
    * Separate from `'too_long'` on purpose: the two are independent signals
    * (a provider can misreport one without the other), and conflating them
@@ -143,30 +143,53 @@ const TRANSCRIBE_TIMEOUT_MS = 60_000;
  * to a channel that is simply up or down, so it sits with the 60s class
  * (`ADAPTER_TIMEOUT_MS`, `TRANSCRIBE_TIMEOUT_MS`) rather than the 5s one
  * (`SEND_TIMEOUT_MS`/`NOTIFY_TIMEOUT_MS`/`ALERT_TIMEOUT_MS`). It is the
- * worst-case bound on TIME; `MAX_AUDIO_DOWNLOAD_BYTES` below is the
+ * worst-case bound on TIME; `MAX_TRANSCRIBABLE_AUDIO_BYTES` below is the
  * independent bound on SIZE that this deadline alone cannot provide, since
  * a fast connection can deliver an oversized file well within 60s.
+ *
+ * **This deadline does NOT bound transfer size or peak memory either** —
+ * `msg.downloadAudio()` returns the whole buffer in one resolve, so by the
+ * time this promise settles the bytes are already fully in memory. Nothing
+ * in this module can change that without the gateway interface itself
+ * growing a streaming/incremental-size contract, which is out of this
+ * round's scope; `MAX_TRANSCRIBABLE_AUDIO_BYTES` below is a POST-download
+ * refusal, not a transfer-time cap, and its name says so.
  */
 const DOWNLOAD_TIMEOUT_MS = 60_000;
 
 /**
- * The largest download `transcribeInbound` accepts from `msg.downloadAudio()`
- * before refusing it outright — fix round A, finding 5.
+ * The largest downloaded payload `transcribeInbound` will actually spend
+ * anything further on — fix round A, finding 5; renamed and re-derived in
+ * fix round B, finding 1.
  *
- * Derived from `config.whatsappMaxAudioSeconds` (default 180s), not invented
- * independently: a WhatsApp voice note is opus-encoded at tens of kbps, so
- * even a generously high estimate — an order of magnitude above typical
- * voice bitrates — comes nowhere near this figure for a legitimate
- * recording at the length cap. This bound exists for the case the length
- * cap cannot reach at all: `seconds` is read FROM the already-downloaded
- * result, so a provider that misreports it (or serves the wrong resource
- * under the `audio` kind) is caught here, by what is actually true the
- * instant the bytes arrive, not by a number the provider chose to report.
- * 20 MB matches the order of magnitude this project already accepts for an
- * uploaded document (`MAX_ORIGINAL_BYTES`, `src/documents/ingest.ts`, 25 MB)
- * rather than inventing a new scale for one more kind of untrusted payload.
+ * **What this gates, named honestly:** nothing about the download itself —
+ * by the time this check runs, `msg.downloadAudio()` has already resolved
+ * and every byte is already in memory (see `DOWNLOAD_TIMEOUT_MS`'s own
+ * docblock). What it actually gates is everything AFTER that: the paid
+ * provider call, the `whatsapp_transcription` audit row, and whether this
+ * buffer is kept around at all. `MAX_AUDIO_DOWNLOAD_BYTES` — this
+ * constant's name before this round — claimed to bound the download, which
+ * was false of the code even though the docblock above it was honest about
+ * the same fact; the rename closes that gap between the name and the code.
+ *
+ * **The derivation, spelled out so the next reader can check the
+ * arithmetic rather than trust it.** `config.whatsappMaxAudioSeconds`
+ * defaults to 180s. A WhatsApp voice note is opus-encoded at roughly
+ * 20–32 kbps. At a GENEROUS 128 kbps — four to six times that, to cover
+ * audio sent under the `audio` kind that is not a typical voice note —
+ * 180 seconds caps at `180 * 128_000 / 8` = 2,880,000 bytes, about 2.7 MB.
+ * The constant below rounds that up to 3 MB. The PREVIOUS value, 20 MB, was
+ * 30–50× this derivation and matched only the unrelated order of magnitude
+ * of `MAX_ORIGINAL_BYTES` (`src/documents/ingest.ts`, 25 MB, a DOCUMENT
+ * limit with no audio bitrate behind it at all) — nothing real audio could
+ * ever reach it, so it refused nothing a provider could actually produce.
+ * A limit that cannot be hit is a limit that does not exist. 3 MB is tight
+ * enough to actually refuse a provider that misreports `seconds` or serves
+ * the wrong resource under the `audio` kind — which is the entire reason
+ * this check exists, since `seconds` is read FROM the already-downloaded
+ * result and cannot gate the download that already happened.
  */
-const MAX_AUDIO_DOWNLOAD_BYTES = 20 * 1024 * 1024;
+const MAX_TRANSCRIBABLE_AUDIO_BYTES = 3 * 1024 * 1024;
 
 /**
  * Bound a promise the callee might never settle.
@@ -248,10 +271,10 @@ export async function transcribeInbound(
     provider: TranscriptionProvider;
     maxSeconds?: number;
     /**
-     * Overrides `MAX_AUDIO_DOWNLOAD_BYTES` for one call. Production never
-     * passes this; same test-only escape hatch as `maxSeconds`, for the
-     * same reason — a test proves the refusal without building a 20 MB
-     * fixture.
+     * Overrides `MAX_TRANSCRIBABLE_AUDIO_BYTES` for one call. Production
+     * never passes this; same test-only escape hatch as `maxSeconds`, for
+     * the same reason — a test proves the refusal without building a
+     * multi-megabyte fixture.
      */
     maxBytes?: number;
     /**
@@ -289,17 +312,19 @@ export async function transcribeInbound(
   // resolves, before the length check, because it is the cheaper and more
   // fundamental refusal — a payload this project will not hold onto a
   // moment longer than it takes to measure it, independent of what the
-  // provider claims about its duration (see `MAX_AUDIO_DOWNLOAD_BYTES`'s own
-  // docblock on why the length check cannot substitute for it). The daily
-  // cap still runs before the provider call, because that call is the one
-  // that spends money.
+  // provider claims about its duration (see `MAX_TRANSCRIBABLE_AUDIO_BYTES`'s
+  // own docblock on why the length check cannot substitute for it, and on
+  // what this refusal actually gates — not the download itself, which has
+  // already finished by the time this runs). The daily cap still runs
+  // before the provider call, because that call is the one that spends
+  // money.
   const { bytes, mimeType, seconds } = await withDeadline(
     msg.downloadAudio(),
     options.downloadTimeoutMs ?? DOWNLOAD_TIMEOUT_MS,
     'audio download',
   );
 
-  const maxBytes = options.maxBytes ?? MAX_AUDIO_DOWNLOAD_BYTES;
+  const maxBytes = options.maxBytes ?? MAX_TRANSCRIBABLE_AUDIO_BYTES;
   if (bytes.length > maxBytes) {
     return { status: 'too_large', bytes: bytes.length };
   }

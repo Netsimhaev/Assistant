@@ -140,20 +140,43 @@ describe('transcribeInbound', () => {
   });
 
   /**
-   * Fix round A, finding 5. The duration check alone cannot catch an
-   * oversized download: `seconds` is read FROM the already-downloaded
-   * result, so a provider reporting a short duration for a large payload
-   * sails past `maxSeconds` entirely. `maxBytes: 5` stands in for
-   * `MAX_AUDIO_DOWNLOAD_BYTES` (20 MB in production) so this proves the
-   * refusal is genuinely keyed on the byte count — `audioMsg`'s fixed
-   * `'fake-audio-bytes'` payload (17 bytes) exceeds it — not on `seconds`,
-   * which here reports a perfectly ordinary 10.
+   * Fix round A, finding 5 (renamed and re-derived, fix round B, finding 1).
+   * The duration check alone cannot catch an oversized download: `seconds`
+   * is read FROM the already-downloaded result, so a provider reporting a
+   * short duration for a large payload sails past `maxSeconds` entirely.
+   * `maxBytes: 5` stands in for `MAX_TRANSCRIBABLE_AUDIO_BYTES` (3 MB in
+   * production) so this proves the refusal is genuinely keyed on the byte
+   * count — `audioMsg`'s fixed `'fake-audio-bytes'` payload (17 bytes)
+   * exceeds it — not on `seconds`, which here reports a perfectly
+   * ordinary 10.
    */
   it('refuses audio whose download exceeds the byte cap, independent of its reported duration', async () => {
     const outcome = await transcribeInbound(audioMsg({ seconds: 10 }), 'principal', {
       businessId: BUSINESS, provider: ok, maxBytes: 5,
     });
     expect(outcome).toEqual({ status: 'too_large', bytes: 'fake-audio-bytes'.length });
+  });
+
+  /**
+   * Fix round B, finding 1 — pins the PRODUCTION default itself, not an
+   * override. Every other byte-cap test above injects `maxBytes` so the
+   * fixture need not be multi-megabyte; this one deliberately omits it to
+   * prove `MAX_TRANSCRIBABLE_AUDIO_BYTES` (3 MB) actually bites at
+   * production scale — the review's own finding was that the PREVIOUS
+   * value (20 MB, named `MAX_AUDIO_DOWNLOAD_BYTES`) was 30-50x the
+   * derivation it cited and nothing real audio could ever reach, so a
+   * test that only ever overrode the constant could not have caught that.
+   * 3.5 MB sits just above the new cap and nowhere near the old one.
+   */
+  it('refuses a 3.5 MB download under the real production byte cap, which the old 20 MB value never would have', async () => {
+    const msg = audioMsg({ seconds: 10 });
+    msg.downloadAudio = async () => ({
+      bytes: Buffer.alloc(Math.ceil(3.5 * 1024 * 1024), 0x61),
+      mimeType: 'audio/ogg',
+      seconds: 10,
+    });
+    const outcome = await transcribeInbound(msg, 'principal', { businessId: BUSINESS, provider: ok });
+    expect(outcome.status).toBe('too_large');
   });
 
   /**

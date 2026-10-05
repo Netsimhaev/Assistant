@@ -182,7 +182,7 @@ describe('runWhatsAppDoor', () => {
       planner: plannedWith(mailPlan()),
     });
 
-    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0 });
+    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, malformedSenderCount: 0 });
     expect(messenger.sentTexts).toHaveLength(1);
     expect(messenger.sentTexts[0]).toContain('קיבלתי');
 
@@ -220,12 +220,66 @@ describe('runWhatsAppDoor', () => {
 
     expect(result.recordedOnly).toBe(1);
     expect(result.instructed).toBe(0);
+    // A well-formed stranger's number is NOT a gateway contract violation —
+    // fix round B, finding 3's own negative half: this must stay 0 for the
+    // ordinary case this test already covers, or the new counter would be
+    // indistinguishable noise on every pass with real customer traffic.
+    expect(result.malformedSenderCount).toBe(0);
     expect(messenger.sentTexts).toEqual([]); // no auto-reply, ever
     // `allJobs`, not `openJobs` — fix round 1, Important 8. `openJobs` only
     // excludes terminal phases, so it cannot tell "no job was ever created"
     // apart from "a job was created and then failed out" — the one property
     // this test is meant to carry.
     expect(await allJobs(BUSINESS)).toHaveLength(0);
+  });
+
+  /**
+   * Fix round B, finding 3. A `senderNumber` the gateway hands up in a
+   * shape `authorityNumberKey` cannot parse (here: the national form, no
+   * `+`) is a GATEWAY CONTRACT VIOLATION — exactly the class of mismatch
+   * round A's wrong "bare international form" ledger instruction would
+   * have produced for every message from the owner's OWN number. Before
+   * this counter existed, this was byte-for-byte indistinguishable from
+   * `STRANGER_NUMBER` above: same `recordedOnly`, same silence. Nothing
+   * about the message's OWN handling changes — it still settles exactly as
+   * a stranger's does (Decision 4: no reply, ever) — only this counter
+   * tells the two apart for whoever reads `DoorResult.malformedSenderCount`.
+   */
+  it('counts a malformed senderNumber apart from an ordinary stranger, without changing how the message is handled', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(textMsg({ senderNumber: '0549999999', body: 'מה המחיר שלכם?' }));
+
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: neverCalled,
+    });
+
+    expect(result.recordedOnly).toBe(1); // handled identically to a stranger
+    expect(result.malformedSenderCount).toBe(1); // but counted apart
+    expect(messenger.sentTexts).toEqual([]); // still no auto-reply, ever
+  });
+
+  /**
+   * A redelivery of the SAME malformed message must not inflate the count
+   * a second time — `recordInbound`'s unique index decides a redelivery is
+   * a no-op (`'skipped'`), and the positive check sits AFTER that guard for
+   * exactly this reason.
+   */
+  it('does not count a redelivered malformed message twice', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    const msg = textMsg({ senderNumber: '0549999999', body: 'מה המחיר שלכם?' });
+    gateway.enqueue(msg);
+
+    await runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, planner: neverCalled });
+
+    gateway.enqueue(msg); // identical providerMessageId — a redelivery
+    const second = await runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, planner: neverCalled });
+
+    expect(second.malformedSenderCount).toBe(0);
   });
 
   it('acknowledges a needs_answer outcome with the question itself', async () => {
@@ -427,19 +481,20 @@ describe('runWhatsAppDoor', () => {
 
   /**
    * Fix round A, finding 5 — `transcribeInbound`'s `'too_large'` outcome,
-   * wired through the door. 21 MB mirrors the production byte cap
-   * (`MAX_AUDIO_DOWNLOAD_BYTES`, 20 MB in `transcribe.ts`) the same way
-   * `ingest.test.ts` mirrors `MAX_ORIGINAL_BYTES` — not imported, since the
-   * constant is module-private, but matched in order of magnitude so this
-   * test fails honestly if that constant ever changes without this one
-   * being revisited.
+   * wired through the door. 4 MB mirrors the production byte cap
+   * (`MAX_TRANSCRIBABLE_AUDIO_BYTES`, 3 MB in `transcribe.ts` — renamed and
+   * re-derived in fix round B, finding 1) the same way `ingest.test.ts`
+   * mirrors `MAX_ORIGINAL_BYTES` — not imported, since the constant is
+   * module-private, but matched in order of magnitude so this test fails
+   * honestly if that constant ever changes without this one being
+   * revisited.
    */
   it('tells the owner when the recording exceeds the byte cap, independent of the provider', async () => {
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
     const msg = audioMsg({ senderNumber: PRINCIPAL_NUMBER });
     msg.downloadAudio = async () => ({
-      bytes: Buffer.alloc(21 * 1024 * 1024, 0x61),
+      bytes: Buffer.alloc(4 * 1024 * 1024, 0x61),
       mimeType: 'audio/ogg',
       seconds: 10,
     });
@@ -524,7 +579,7 @@ describe('runWhatsAppDoor', () => {
       },
     });
 
-    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0 });
+    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, malformedSenderCount: 0 });
     expect(seenInstructions).toEqual(['ראשונה (מוקדמת)', 'שנייה (מאוחרת)']);
   });
 

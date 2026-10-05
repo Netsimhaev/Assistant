@@ -44,6 +44,7 @@ const DOWN_AT_BOOT_BUSINESS = 'test-business-health-down-at-boot';
 const WORSENING_WORD_BUSINESS = 'test-business-health-worsening-word';
 const HEALTH_HANG_BUSINESS = 'test-business-health-hang';
 const DISTINCT_BODY_BUSINESS = 'test-business-health-distinct-body';
+const SAME_INSTANT_BUSINESS = 'test-business-health-same-instant';
 const PREFIX = 'TEST_CRED_';
 // Fixed clock, matching run-due.test.ts / scheduler-runs-plans.test.ts: an
 // evening wall-clock run of this suite would otherwise fall inside quiet
@@ -803,5 +804,52 @@ describe('schedulerPass — WhatsApp wiring', () => {
     await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
     expect(calls).toHaveLength(3);
     expect(calls[2]?.body).not.toBe(calls[0]?.body);
+  });
+
+  /**
+   * Fix round B, finding 2. The health RECORD keyed on the raw `since`
+   * string the gateway returned; the alert BODY formatted it through
+   * `new Date(...)`, which normalises its input for display only. Two ISO
+   * spellings of the SAME instant (`…T09:00:00.000Z` and
+   * `…T12:00:00.000+03:00`, three hours and two milliseconds apart in
+   * clock-face terms, zero apart in wall-clock terms) therefore disagreed
+   * with themselves: the raw-string record comparison read the second
+   * spelling as a genuinely NEW episode (strings differ) and tried to send
+   * a second alert, while the DISPLAY — built from the same underlying
+   * instant — rendered byte-identical to the first alert's. A real SMTP
+   * transport, hashing that identical body into the identical Message-ID,
+   * would have dropped the "new" alert as a duplicate of the first — this
+   * process believing it told the owner about a second outage that the
+   * mailer silently never delivered. Normalising `since` once, before
+   * either consumer touches it, means the two can no longer disagree: this
+   * must read as the SAME episode on both sides, producing no second call
+   * at all — not a second call with a colliding body.
+   */
+  it('reads two ISO spellings of the identical instant as the same episode, not a new one with a colliding body', async () => {
+    await installCharter(buildCharter(), { businessId: SAME_INSTANT_BUSINESS });
+    const gateway = createFakeGateway();
+    const { calls, notify } = recordingNotifier();
+    const baseRuntime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, PREFIX),
+      warnings: [],
+      whatsapp: { gateway },
+      ...(notify !== undefined ? { notify } : {}),
+    };
+
+    // Pass 1 — connected baseline.
+    await schedulerPass({ businessId: SAME_INSTANT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+
+    // Pass 2 — the outage begins, `since` spelled in UTC `Z` form.
+    gateway.setHealth({ state: 'reconnecting', since: '2026-08-18T09:00:00.000Z' });
+    await schedulerPass({ businessId: SAME_INSTANT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(1);
+
+    // Pass 3 — the SAME outage, same literal instant, spelled with an
+    // explicit `+03:00` offset instead of `Z`. Must be read as the SAME
+    // episode — no second call, not a second call with a duplicate body.
+    gateway.setHealth({ state: 'reconnecting', since: '2026-08-18T12:00:00.000+03:00' });
+    await schedulerPass({ businessId: SAME_INSTANT_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(1);
   });
 });

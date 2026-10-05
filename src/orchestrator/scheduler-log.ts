@@ -111,6 +111,20 @@ export function logErrored(result: SchedulerPassResult): void {
       console.error(`WhatsApp report failed after the door ran this pass: ${result.whatsappError}`);
     }
   }
+  // Fix round B, finding 3 — `DoorResult.malformedSenderCount`'s own
+  // docblock on why this is counted apart from `recordedOnly`: a
+  // `senderNumber` the gateway handed up in a shape `authorityNumberKey`
+  // cannot parse is a GATEWAY CONTRACT VIOLATION, not a stranger, and round
+  // A's own finding (the wrong "bare international form" ledger
+  // instruction) is exactly the drift this line exists to surface the
+  // moment it happens, rather than on the day the owner wonders why he
+  // never hears back.
+  if (result.whatsappDoor !== null && result.whatsappDoor.malformedSenderCount > 0) {
+    console.error(
+      `${result.whatsappDoor.malformedSenderCount} WhatsApp message(s) this pass arrived with a ` +
+        `senderNumber the gateway contract does not allow — check the gateway, not the sender`,
+    );
+  }
   // Task 8's own report-round ruling: counting `deferred` is what stops a job
   // permanently stuck on a crashed resume from becoming invisible silence —
   // but that justification is only true once something actually reads the

@@ -179,9 +179,13 @@ interface WhatsAppHealthRecord {
   /**
    * The `since` of the episode — an outage, or a `'connected'` period —
    * this process has most recently finished dealing with. Compared against
-   * `current.since` on every call, ALWAYS alongside `state` below — see
+   * the CURRENT call's own `since`, ALWAYS alongside `state` below — see
    * this interface's own docblock on why the pair, not `since` alone, is
    * what decides whether this pass describes the SAME episode as last time.
+   * Both sides of every comparison are normalised to canonical ISO form
+   * before comparing — fix round B, finding 2 — never `current.since` raw,
+   * so two differently-spelled strings naming the identical instant cannot
+   * be read as two different episodes.
    */
   since: string;
   /** The state word that went with `since` above, the other half of the pair — fix round 3. */
@@ -407,6 +411,7 @@ async function checkWhatsAppHealth(
   charterVersion: string,
 ): Promise<void> {
   let current: GatewayHealth;
+  let since: string;
   try {
     // Raced against `HEALTH_CHECK_TIMEOUT_MS`, not awaited directly — fix
     // round A, finding 3. F6 above already explains why a throw here is
@@ -421,6 +426,25 @@ async function checkWhatsAppHealth(
     // every due plan for as long as the probe hangs — on the exact call
     // whose entire job is to notice the bridge is unhealthy.
     current = await withHealthCheckDeadline(gateway.health(), HEALTH_CHECK_TIMEOUT_MS);
+    // Fix round B, finding 2 — normalised ONCE, here, into canonical ISO
+    // form, before EITHER of its two downstream uses touches it. Before
+    // this round, the record-keying comparisons below used `current.since`
+    // raw (whatever spelling the gateway returned), while the alert body
+    // formatted it through `new Date(...)` — which normalises its OWN
+    // input, but only for display. Two ISO spellings of the identical
+    // instant (`…T09:00:00.000Z` and `…T12:00:00.000+03:00`, say) would
+    // then disagree with themselves: the record comparison reads them as a
+    // brand-new episode (raw strings differ), while the formatted body it
+    // composes for that "new" episode is byte-identical to an EARLIER
+    // episode's body that happened to normalise to the same display — so
+    // the mailer's own dedupe (keyed on that body) silently drops an alert
+    // this process believes it just sent for the first time. Doing this
+    // once, here, means the comparison and the display can never disagree
+    // about what instant `since` names — thrown on an unparseable value,
+    // which `catch` below treats exactly like a flaky probe (F6): a
+    // `since` this process cannot even read is not a safer value to key on
+    // than skipping the pass.
+    since = new Date(current.since).toISOString();
   } catch {
     // F6 — diagnostic, not a gate. Left exactly as it was; no read, no write.
     return;
@@ -431,7 +455,7 @@ async function checkWhatsAppHealth(
     // ever made for this business). Nothing pending, whether or not an
     // earlier outage's alert ever actually went out.
     lastWhatsAppHealth.set(businessId, {
-      since: current.since,
+      since,
       state: 'connected',
       delivered: true,
       audited: true,
@@ -447,7 +471,7 @@ async function checkWhatsAppHealth(
   // already down, falls straight through to the same "new episode" path
   // below as any other outage — see `lastWhatsAppHealth`'s own docblock on
   // why a silent first observation was the bug, not the feature.
-  if (record !== undefined && record.since === current.since && record.state === current.state && record.delivered) {
+  if (record !== undefined && record.since === since && record.state === current.state && record.delivered) {
     // The SAME episode this process has already told the owner about —
     // matched on BOTH `since` and the state word, not either alone (fix
     // round 3; see `WhatsAppHealthRecord`'s own docblock) — and nothing has
@@ -460,7 +484,7 @@ async function checkWhatsAppHealth(
   // first observation of an already-down bridge — or a retry of one that
   // has not yet been delivered.
   const isSameUndeliveredEpisode =
-    record !== undefined && record.since === current.since && record.state === current.state; // implies !record.delivered, from the check above
+    record !== undefined && record.since === since && record.state === current.state; // implies !record.delivered, from the check above
   const alreadyAudited = isSameUndeliveredEpisode && record.audited;
 
   // Fix round A, finding 1 — decided ONCE, when this `(since, state)` pair
@@ -481,18 +505,18 @@ async function checkWhatsAppHealth(
     ? record.followedConnected
     : record !== undefined && record.state === 'connected';
 
-  // Formatted with second-level precision, not `dateStyle`/`timeStyle`'s
-  // usual minute granularity — fix round A's own mutation caught this: two
-  // outages a few milliseconds apart (an unlikely but real shape; see
-  // `WhatsAppHealthRecord`'s own docblock on why `since` alone, at full
-  // precision, is what tells two episodes apart) rounded to the SAME
-  // displayed minute, which would have reintroduced the identical-body
-  // collision this whole fix exists to close, one layer up from where the
-  // first version of it lived.
-  const since = new Intl.DateTimeFormat('he-IL', {
+  // Formatted FROM the already-normalised `since` above, with second-level
+  // precision, not `dateStyle`/`timeStyle`'s usual minute granularity — fix
+  // round A's own mutation caught this: two outages a few milliseconds
+  // apart (an unlikely but real shape; see `WhatsAppHealthRecord`'s own
+  // docblock on why `since` alone, at full precision, is what tells two
+  // episodes apart) rounded to the SAME displayed minute, which would have
+  // reintroduced the identical-body collision this whole fix exists to
+  // close, one layer up from where the first version of it lived.
+  const sinceDisplay = new Intl.DateTimeFormat('he-IL', {
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3,
-  }).format(new Date(current.since));
+  }).format(new Date(since));
   const subject = followedConnected ? 'התנתק הגשר לוואטסאפ' : 'הגשר לוואטסאפ אינו מחובר';
   const body =
     (followedConnected
@@ -508,8 +532,11 @@ async function checkWhatsAppHealth(
     // the owner never hears about it. A retry of the SAME outage must still
     // produce the identical body — and does, since `since` and `state`
     // together are exactly the pair this episode is keyed on throughout
-    // this module (`WhatsAppHealthRecord`'s own docblock).
-    ` (מצב נוכחי: ${current.state}, מאז: ${since}). ` +
+    // this module (`WhatsAppHealthRecord`'s own docblock). `sinceDisplay`
+    // is formatted from the SAME normalised `since` the record above keys
+    // on (fix round B, finding 2) — not from `current.since` raw — so the
+    // two can never disagree about which instant this episode names.
+    ` (מצב נוכחי: ${current.state}, מאז: ${sinceDisplay}). ` +
     `הודעות נכנסות בוואטסאפ לא מתקבלות כרגע, ואי אפשר להשתמש בערוץ הזה עד שהחיבור יחזור.`;
 
   if (notify?.sendAlert === undefined) {
@@ -521,7 +548,7 @@ async function checkWhatsAppHealth(
           'This is the only row for this outage; the next scheduler pass will try again silently.',
       );
     }
-    lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: false, audited: true, followedConnected });
+    lastWhatsAppHealth.set(businessId, { since, state: current.state, delivered: false, audited: true, followedConnected });
     return;
   }
 
@@ -538,12 +565,12 @@ async function checkWhatsAppHealth(
           `the next scheduler pass will try to send again silently.`,
       );
     }
-    lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: false, audited: true, followedConnected });
+    lastWhatsAppHealth.set(businessId, { since, state: current.state, delivered: false, audited: true, followedConnected });
     return;
   }
 
   // Delivered.
-  lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: true, audited: true, followedConnected });
+  lastWhatsAppHealth.set(businessId, { since, state: current.state, delivered: true, audited: true, followedConnected });
 }
 
 export interface SchedulerPassResult {

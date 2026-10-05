@@ -112,7 +112,7 @@
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessCharter } from '../domain/charter.js';
-import { isPrincipalSender } from '../governance/principal-number.js';
+import { authorityNumberKey, isPrincipalSender } from '../governance/principal-number.js';
 import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import {
@@ -137,6 +137,22 @@ export interface DoorResult {
   recordedOnly: number;
   /** From the authorised sender, but no job resulted — a cap, a transcription problem, a thrown error, or `runInstruction` itself declining. */
   refused: number;
+  /**
+   * Counted separately from `recordedOnly` — fix round B, finding 3. A
+   * `senderNumber` that fails `authorityNumberKey` outright is a GATEWAY
+   * CONTRACT VIOLATION (`NormalizedInboundMessage.senderNumber`'s own
+   * docblock states the required form), not evidence that a stranger
+   * messaged the business. Before this field existed, both cases produced
+   * the identical `'recordedOnly'` outcome, which is exactly how the
+   * round-A finding — a gateway handing `senderNumber` up in the wrong
+   * format — would have gone unnoticed in production: the owner's own
+   * messages filed as a stranger's, silently, with nothing to distinguish
+   * it from genuine customer traffic. This count is nonzero only when the
+   * NUMBER ITSELF could not be parsed; it says nothing about whether the
+   * sender is the principal, and a well-formed stranger's number still
+   * counts only toward `recordedOnly`, unchanged.
+   */
+  malformedSenderCount: number;
 }
 
 /** Shown to the owner's own recording, quoted back verbatim, ahead of whatever happened next. */
@@ -283,6 +299,16 @@ interface ProcessContext {
   messenger: BossMessenger;
   provider?: TranscriptionProvider;
   planner?: RunInstructionOptions['planner'];
+  /**
+   * Called once per message whose `senderNumber` fails `authorityNumberKey`
+   * — fix round B, finding 3. A callback into `runWhatsAppDoor`'s own
+   * `result.malformedSenderCount`, not a new field on `ProcessOutcome`:
+   * `ProcessOutcome` names which BUCKET a message landed in, and this is
+   * orthogonal to every bucket (a malformed number still settles exactly
+   * as a stranger's message would) — widening the enum's shape for one
+   * side-channel signal would touch every `return` in this function.
+   */
+  reportMalformedSender: () => void;
 }
 
 type ProcessOutcome = 'recordedOnly' | 'instructed' | 'refused' | 'skipped';
@@ -359,6 +385,19 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // whatever happened on the first delivery already closed it out, or is
     // still in flight on the pass that is handling it.
     if (stored === null) return 'skipped';
+
+    // Fix round B, finding 3 — positive check, reported AFTER the dedup
+    // guard above so a redelivered duplicate of the same malformed message
+    // is not counted twice. `isPrincipalSender` already fails closed on a
+    // number `authorityNumberKey` cannot parse (it returns `false`, the
+    // exact same outcome a genuine stranger produces), so this changes
+    // NOTHING about how the message is handled below — it only tells the
+    // two cases apart for whoever reads `DoorResult.malformedSenderCount`.
+    // `senderKind === 'other'` for a genuine stranger's well-formed number
+    // does not trip this at all.
+    if (authorityNumberKey(msg.senderNumber) === null) {
+      ctx.reportMalformedSender();
+    }
 
     if (senderKind === 'other') {
       // Decision 4. Recorded for the conversation screen and closed out
@@ -595,12 +634,20 @@ export async function runWhatsAppDoor(options: {
   const polled = await withPollDeadline(gateway.pollOnce(), options.pollTimeoutMs ?? POLL_TIMEOUT_MS);
   const ordered = [...collected].sort(compareInbound);
 
-  const result: DoorResult = { polled, instructed: 0, recordedOnly: 0, refused: 0 };
+  const result: DoorResult = {
+    polled, instructed: 0, recordedOnly: 0, refused: 0, malformedSenderCount: 0,
+  };
 
   const ctx: ProcessContext = {
     businessId,
     charter,
     messenger,
+    // Mutates `result` directly rather than a second accumulator — see
+    // `ProcessContext.reportMalformedSender`'s own docblock on why this is
+    // a callback rather than a field on `ProcessOutcome`.
+    reportMalformedSender: () => {
+      result.malformedSenderCount += 1;
+    },
     ...(options.provider !== undefined ? { provider: options.provider } : {}),
     ...(options.planner !== undefined ? { planner: options.planner } : {}),
   };
