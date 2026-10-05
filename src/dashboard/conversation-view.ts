@@ -29,7 +29,7 @@
  * `views.ts` is exporting `escLabel`) — `views.ts` is already 1,667 lines and
  * this screen does not need to grow it further.
  */
-import type { MessageState, StoredMessage } from '../whatsapp/store.js';
+import type { StoredMessage } from '../whatsapp/store.js';
 import { escapeHtml, escLabel } from './views.js';
 
 const esc = escapeHtml;
@@ -70,10 +70,11 @@ function senderLabel(m: StoredMessage): string {
  * (succeeded). There is nothing left here that decides whether to show a
  * label, so there is no field left to carry that decision.
  *
- * Prose only, never a field, for which three mean the owner is still owed
- * something: `received`, `claimed` and `reported_interim` (an interim
- * notice is, by its own name, not the real answer — see migration 038's
- * docblock). Fix round 2 deleted the `unfinished: boolean` this function
+ * Prose only, never a field, for which four mean the owner is still owed
+ * something: `received`, `claimed`, `reported_interim` (an interim notice
+ * is, by its own name, not the real answer — see migration 038's docblock)
+ * and `handled` ON A MESSAGE THAT OPENED A JOB — see the `handled` case
+ * below. Fix round 2 deleted the `unfinished: boolean` this function
  * used to return alongside `label`: it was read nowhere in `src/` once
  * round 1 stopped branching on it, and "no live reader" is this project's
  * own named failure class — a field something compiles that nothing reads
@@ -95,8 +96,8 @@ function senderLabel(m: StoredMessage): string {
  * because a status this code cannot explain is not one it can promise is
  * settled.
  */
-function stateLabel(state: MessageState): string {
-  switch (state) {
+function stateLabel(m: StoredMessage): string {
+  switch (m.state) {
     case 'received':
       return 'התקבלה — עדיין לא טופלה';
     case 'claimed':
@@ -104,13 +105,42 @@ function stateLabel(state: MessageState): string {
     case 'reported_interim':
       return 'עודכנת בביניים — התשובה הסופית עדיין בדרך';
     case 'handled':
-      return 'טופלה';
+      // `'handled'` means the door finished with the MESSAGE, and that is
+      // two different facts depending on whether a job came out of it —
+      // which is why this is the one case that reads a second field (task
+      // 12; the final review's Minor 11).
+      //
+      // With a job: the instruction was received and a job was opened, and
+      // this state says NOTHING about what became of that job. It may still
+      // be planning, executing, or waiting on an approval card. Labelling it
+      // 'טופלה' claimed an outcome the record does not carry — a false
+      // statement of closure, which is the one thing the owner's own rule
+      // ("ההוראה לא נסגרה עד שאחד הצדדים אמר במפורש") exists to forbid. The
+      // honest statement is the one the record actually supports: a job
+      // exists and no report has gone out yet. `'reported'` and
+      // `'reported_interim'` are the only states that say the owner was told
+      // anything, and only `'reported'` says he was told the real outcome.
+      //
+      // Without a job: nothing further is owed and nothing is running — a
+      // stranger's message, recorded and closed out under Decision 4, or one
+      // of the owner's own messages that was answered on the spot (a closure
+      // word). That genuinely is finished.
+      //
+      // **The job's own phase is deliberately NOT read here.** It would
+      // sharpen "still running" into "closed, report pending", but this
+      // renderer is given `StoredMessage` rows and nothing else, and the
+      // sentence below is already true for every phase the job can be in —
+      // a label that needs a second query to stop being wrong is a different
+      // and worse thing from one that is merely less specific.
+      return m.jobId !== null
+        ? 'קיבלתי ופתחתי משימה — טרם דיווחתי מה יצא ממנה'
+        : 'טופלה';
     case 'failed':
       return 'נכשלה';
     case 'reported':
       return 'דווחה';
     default: {
-      const unreachable: never = state;
+      const unreachable: never = m.state;
       return `מצב לא מוכר (${String(unreachable)})`;
     }
   }
@@ -157,7 +187,7 @@ function messageRow(m: StoredMessage): string {
   const number = m.senderNumber !== null ? ` <span class="muted">${escLabel(m.senderNumber)}</span>` : '';
   // Always shown (fix round 1, Important 1) — a `failed` instruction must
   // not read identically to a `handled` one.
-  const badge = ` <span class="muted">· ${esc(stateLabel(m.state))}</span>`;
+  const badge = ` <span class="muted">· ${esc(stateLabel(m))}</span>`;
 
   return `
     <article class="card">

@@ -147,12 +147,28 @@ export async function recordQuestion(
  * every instruction that never asked anything at all.
  *
  * Newest first, so a fresh question is not buried under old ones.
+ *
+ * **`channel: 'whatsapp'` narrows, and it is the one query — never a second
+ * copy of this predicate.** The WhatsApp door has to know what is open on
+ * ITS own channel: a question raised from the dashboard was never put to the
+ * owner over WhatsApp, so reading his next WhatsApp message as its answer
+ * would swallow a message he had no reason to think was being asked for.
+ * The narrowing condition is positive and derived from a column that already
+ * exists for exactly this fact — `jobs.whatsapp_message_id`, whose only
+ * writer is `linkWhatsAppMessage`, called only for a job the door itself
+ * opened (`whatsapp-door.ts`, for `needs_answer` as well as `planned`). No
+ * new table, no new column, no second "what is open" to drift from this one.
  */
 export async function pendingQuestions(
-  options: { businessId?: string; db?: Queryable } = {},
+  options: { businessId?: string; db?: Queryable; channel?: 'whatsapp' } = {},
 ): Promise<InstructionRecord[]> {
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
+  // Positive narrowing: the clause is added only when the caller asks for
+  // the WhatsApp channel, and the unnarrowed form is byte-identical to what
+  // the dashboard's `GET /instruct` has always run.
+  const channelClause =
+    options.channel === 'whatsapp' ? 'AND j.whatsapp_message_id IS NOT NULL' : '';
 
   const { rows } = await db.query<InstructionRow>(
     `SELECT i.instruction_id, i.business_id, i.job_id, i.text, i.question, i.answer,
@@ -162,10 +178,49 @@ export async function pendingQuestions(
       WHERE i.business_id = $1
         AND j.phase = 'understand'
         AND i.answer IS NULL
+        ${channelClause}
       ORDER BY i.created_at DESC`,
     [businessId],
   );
   return rows.map(toInstruction);
+}
+
+/**
+ * Records an answer only if nobody has recorded one yet — a single
+ * `UPDATE ... WHERE answer IS NULL` whose row count says whether this caller
+ * won.
+ *
+ * **Separate from `recordAnswer` above, and deliberately not a replacement
+ * for it.** The dashboard's answer route depends on `recordAnswer`
+ * overwriting: when its re-run refuses (a join that crosses the 4,000-char
+ * cap only together), the parked job is left exactly where it was so the
+ * owner can shorten his answer and resubmit from the same page — a second
+ * submission that `answer IS NULL` would refuse. The dashboard does not need
+ * a claim because it already holds an advisory lock on the job
+ * (`withJobClaim`, `src/dashboard/server.ts`) for the whole call. The
+ * WhatsApp door has no lock on the parked job and no form to resubmit from:
+ * two routes reaching the same open question — a dashboard answer racing a
+ * WhatsApp message — would otherwise both re-run the planner and both
+ * supersede, and the second `transition` would hit `LEGAL_TRANSITIONS`'s
+ * empty entry for an already-`failed` job and throw. One winner, decided in
+ * SQL, is the same shape `claimMessage` and `consumeApproval` already use
+ * here, and for the same reason: a read-then-write lets both callers see
+ * `NULL` and both proceed.
+ */
+export async function claimAnswer(
+  instructionId: string,
+  answer: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<boolean> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+
+  const { rowCount } = await db.query(
+    `UPDATE boss_instructions SET answer = $3
+      WHERE instruction_id = $1 AND business_id = $2 AND answer IS NULL`,
+    [instructionId, businessId, answer],
+  );
+  return rowCount === 1;
 }
 
 export async function loadInstructionForJob(

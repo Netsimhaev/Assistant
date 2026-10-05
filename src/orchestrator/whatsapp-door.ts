@@ -110,6 +110,7 @@
  * provider hangs.
  */
 import { config } from '../config.js';
+import type { InstructionRecord } from '../governance/instructions.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import { authorityNumberKey, isPrincipalSender } from '../governance/principal-number.js';
@@ -127,6 +128,23 @@ import {
 import { transcribeInbound, type TranscriptionProvider } from '../whatsapp/transcribe.js';
 import { runInstruction, type InstructionOutcome, type RunInstructionOptions } from './instruct.js';
 import { linkWhatsAppMessage } from './jobs.js';
+import {
+  ambiguousQuestion,
+  claimAsAnswer,
+  closureConfirmation,
+  decideWhatsAppRoute,
+  reasonForSupersededByWhatsAppAnswer,
+  retireOpenInstruction,
+  routedAsAnswer,
+  staleOpenNotice,
+  CLOSED_AFTER_REFUSAL,
+  NOTHING_OPEN_TO_CLOSE,
+  REASON_ANSWER_REFUSED,
+  REASON_CLOSED_BY_OWNER,
+  ROUTED_AS_NEW,
+  STILL_NEEDS_ANSWER_HINT,
+  type WhatsAppRoute,
+} from './whatsapp-routing.js';
 
 export interface DoorResult {
   /** However many messages `pollOnce` delivered to this pass, redeliveries included. */
@@ -137,6 +155,20 @@ export interface DoorResult {
   recordedOnly: number;
   /** From the authorised sender, but no job resulted — a cap, a transcription problem, a thrown error, or `runInstruction` itself declining. */
   refused: number;
+  /**
+   * The owner closed open work with a closure word (task 12) — no job, no
+   * planner call, nothing refused.
+   *
+   * Counted apart from `refused` for the reason `malformedSenderCount`'s own
+   * docblock gives: `refused` means "the authorised sender asked for
+   * something and got nothing", and a closure got exactly what it asked for.
+   * Folding a success into the refusal count is how a real refusal rate
+   * stops being readable — the same conflation fix round B had to undo for
+   * malformed sender numbers. A message whose closure word found nothing
+   * open still counts here, not under `refused`: "there is nothing open" is
+   * an honest, complete answer to what was asked, not a denial of it.
+   */
+  closed: number;
   /**
    * Counted separately from `recordedOnly` — fix round B, finding 3. A
    * `senderNumber` that fails `authorityNumberKey` outright is a GATEWAY
@@ -309,9 +341,17 @@ interface ProcessContext {
    * side-channel signal would touch every `return` in this function.
    */
   reportMalformedSender: () => void;
+  /**
+   * Overrides `config.whatsappQuestionWindowMinutes` for one call. Production
+   * leaves it unset — the same escape hatch `pollTimeoutMs` and
+   * `transcribeInbound`'s `timeoutMs` already give their own bounds, and for
+   * the same reason: a test must be able to prove both sides of a window
+   * without waiting one out.
+   */
+  questionWindowMinutes?: number;
 }
 
-type ProcessOutcome = 'recordedOnly' | 'instructed' | 'refused' | 'skipped';
+type ProcessOutcome = 'recordedOnly' | 'instructed' | 'refused' | 'closed' | 'skipped';
 
 /**
  * Tells the owner something and closes the message out — no job involved, no
@@ -362,6 +402,20 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
   // attempt — a different bug in the opposite direction from the one this
   // fix round closes.
   let instructionRecorded = false;
+  // What the owner actually said: the message body, or the transcript of his
+  // recording. This is what gets echoed back to him and stored on the
+  // message row — never the joined text below.
+  let heard = '';
+  // What `runInstruction` receives. The same thing as `heard` for a new
+  // instruction, and `previous instruction + heard` when this message is the
+  // answer to an open question (task 12). Kept as a separate variable rather
+  // than computed at the call site, so the one call below still passes
+  // `{ text }` and nothing else: `whatsapp-invariants.test.ts` pins that
+  // argument's exact shape, and an answer must not be able to smuggle a
+  // second field in beside it any more than a sender identifier could.
+  // (The literal call spelling is deliberately not written in this comment —
+  // that same invariant counts call sites by matching the name followed by an
+  // open paren, and a mention in prose would read as a second one.)
   let text = '';
 
   try {
@@ -438,13 +492,13 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         await tellOwnerAndSettle(ctx, stored.id, transcribed.reason);
         return 'refused';
       }
-      text = transcribed.text;
+      heard = transcribed.text;
     } else {
       if (msg.body === null || msg.body.trim() === '') {
         await tellOwnerAndSettle(ctx, stored.id, EMPTY_MESSAGE);
         return 'refused';
       }
-      text = msg.body;
+      heard = msg.body;
     }
 
     // The line that matters for crash safety — see the module docblock.
@@ -452,26 +506,134 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     const claimed = await claimMessage(stored.id, { businessId: ctx.businessId });
     if (!claimed) return 'skipped'; // raced by another runner on this message.
 
-    const usedToday = await whatsappInstructionsToday(ctx.businessId);
-    if (usedToday >= config.whatsappInstructionsPerDay) {
+    // What this message IS — answer, closure, or new instruction (task 12).
+    // Read from the record, never stored a second time; see
+    // `whatsapp-routing.ts`'s own docblock for the derivation and for the
+    // stated cost of the owner's chosen rule.
+    //
+    // Read BEFORE the daily instruction cap below, and that order is
+    // load-bearing in one direction only: a CLOSURE must still work on a day
+    // the cap is spent, because it spends nothing (no planner call, no job)
+    // and refusing it would leave the owner's open work with no way to close
+    // it until tomorrow — the one thing the owner's rule forbids. An ANSWER
+    // is still subject to the cap: it does re-run the planner, and the
+    // refusal leaves the question open (nothing is claimed below), so his
+    // answer works tomorrow.
+    const route: WhatsAppRoute = await decideWhatsAppRoute({
+      text: heard,
+      businessId: ctx.businessId,
+      ...(ctx.questionWindowMinutes !== undefined
+        ? { windowMinutes: ctx.questionWindowMinutes }
+        : {}),
+    });
+
+    if (route.kind === 'closure') {
+      // Settled 'handled', not 'failed': unlike `tellOwnerAndSettle`'s
+      // branches, this one finished exactly what it set out to do. Nothing
+      // links a job to this message, so no report is ever owed for it.
+      // `NOTHING_OPEN_TO_CLOSE` settles the same way for the same reason —
+      // "there is nothing open" is a complete answer, not a denial.
+      //
+      // Closed BEFORE the owner is told, the same departure from Important 5
+      // the refusal path below makes and for the same reason: the sentence
+      // names what was closed, and a message claiming a close that has not
+      // happened yet is worse than a message that never arrived. There is no
+      // running job here for Important 5 to protect.
+      for (const open of route.open) {
+        await retireOpenInstruction(open, {
+          to: 'closed',
+          reason: REASON_CLOSED_BY_OWNER,
+          businessId: ctx.businessId,
+        });
+      }
+      const confirmation =
+        route.open.length === 0 ? NOTHING_OPEN_TO_CLOSE : closureConfirmation(route.open);
       await ctx.messenger.send({
-        text: withTranscriptEcho(isAudio, text, INSTRUCTION_CAP_REACHED),
+        text: withTranscriptEcho(isAudio, heard, confirmation),
+        jobId: null,
+      });
+      await settleMessage(
+        stored.id,
+        'handled',
+        isAudio ? { transcript: heard } : {},
+        { businessId: ctx.businessId },
+      );
+      return 'closed';
+    }
+
+    if (route.kind === 'ambiguous') {
+      // The refusal to guess. No claim, no planner call, nothing closed —
+      // every open question stays exactly where it was, and the sentence the
+      // owner reads names both ways out.
+      await ctx.messenger.send({
+        text: withTranscriptEcho(isAudio, heard, ambiguousQuestion(route.open)),
         jobId: null,
       });
       await settleMessage(
         stored.id,
         'failed',
-        isAudio ? { transcript: text } : {},
+        isAudio ? { transcript: heard } : {},
         { businessId: ctx.businessId },
       );
       return 'refused';
     }
+
+    const usedToday = await whatsappInstructionsToday(ctx.businessId);
+    if (usedToday >= config.whatsappInstructionsPerDay) {
+      await ctx.messenger.send({
+        text: withTranscriptEcho(isAudio, heard, INSTRUCTION_CAP_REACHED),
+        jobId: null,
+      });
+      await settleMessage(
+        stored.id,
+        'failed',
+        isAudio ? { transcript: heard } : {},
+        { businessId: ctx.businessId },
+      );
+      return 'refused';
+    }
+
+    // One winner, decided in SQL (`claimAnswer`). A lost claim means a
+    // dashboard answer reached the same question first, so the question is no
+    // longer open and this message really is a new instruction — the route
+    // narrows from 'answer' to 'new' here rather than failing, and the
+    // acknowledgement below says so, because what the owner is told has to
+    // match what actually happened.
+    let answered: InstructionRecord | null = null;
+    if (route.kind === 'answer') {
+      const won = await claimAsAnswer(route.instruction, heard, { businessId: ctx.businessId });
+      if (won) answered = route.instruction;
+    }
+
+    text = answered !== null ? `${answered.text}\n\n${heard}` : heard;
+
+    // Spec §5.4: the acknowledgement always says which reading was chosen, so
+    // a wrong reading is visible before anything goes out.
+    const routeNotice =
+      answered !== null
+        ? routedAsAnswer(answered)
+        : [
+            ROUTED_AS_NEW,
+            // Only on the 'new' route — 'answer' carries no stale count, and
+            // a lost claim leaves nothing honest to say about what else is
+            // open, since the winner may be closing it as this runs.
+            ...(route.kind === 'new' && route.staleOpen > 0
+              ? [staleOpenNotice(route.staleOpen)]
+              : []),
+          ].join('\n\n');
 
     attemptedInstruction = true;
     const outcome = await runInstruction(
       { text },
       {
         businessId: ctx.businessId,
+        // Spec §7.2, and the same value the dashboard's answer route passes:
+        // this is the second pass over the same chain, so the identity
+        // question is suppressed even if a name is still ambiguous. The
+        // deliberate coarseness of the flag (`instruct.ts`) is what bounds
+        // the loop — it does not remember WHICH name was ambiguous, only that
+        // a second pass is underway.
+        ...(answered !== null ? { identityAsked: true } : {}),
         ...(ctx.planner !== undefined ? { planner: ctx.planner } : {}),
       },
     );
@@ -494,14 +656,62 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     instructionRecorded = true;
 
     const ack = composeAck(outcome);
-    const fullText = withTranscriptEcho(isAudio, text, ack);
     const jobId = outcome.status === 'refused' ? null : outcome.jobId;
+
+    // An answer whose re-run REFUSED closes the previous request before the
+    // owner is told, rather than after — the one place this function departs
+    // from fix round 1's Important 5 ("ack before any further write"), and
+    // only where that rule has nothing to protect: a refusal produced no
+    // replacement job, so there is no running job the owner could be left
+    // silent about. What the rule would cost here is worse than what it
+    // buys: `CLOSED_AFTER_REFUSAL` tells him the previous request is closed,
+    // and a message that claims something which has not happened yet is the
+    // one thing this project refuses to send (see `trip()`'s own
+    // `KillSwitchAuditUnrecordedError` reasoning). Why it is closed at all
+    // rather than left open: see that constant's docblock — left open, the
+    // next message joins it and refuses again, with no exit the owner can
+    // type.
+    const extra: string[] = [];
+    if (answered !== null && outcome.status === 'refused') {
+      await retireOpenInstruction(answered, {
+        to: 'closed',
+        reason: REASON_ANSWER_REFUSED,
+        businessId: ctx.businessId,
+      });
+      extra.push(CLOSED_AFTER_REFUSAL);
+    }
+    // A second question on the joined text is the signal that the message was
+    // probably not an answer at all. Said plainly, with what to do about it.
+    if (answered !== null && outcome.status === 'needs_answer') {
+      extra.push(STILL_NEEDS_ANSWER_HINT);
+    }
+
+    const fullText = withTranscriptEcho(
+      isAudio,
+      heard,
+      [routeNotice, ack, ...extra].join('\n\n'),
+    );
 
     // Ack BEFORE the link write — fix round 1, Important 5. A link failure
     // below must not leave the owner silent about a job that will really
     // run; ruling 2's own requirement (link before settle) is unaffected,
     // since the link still lands before the settle three lines down.
     await ctx.messenger.send({ text: fullText, jobId });
+
+    // The answered question's own job is retired only now, for the
+    // `planned`/`needs_answer` outcomes: a replacement job exists and is
+    // about to run, so Important 5 applies in full — the owner hears about
+    // it before anything else is written. `retireOpenInstruction` also marks
+    // the old opening message `'reported'`, which is what stops the report
+    // pass telling him his answered instruction "failed"; see that
+    // function's own docblock.
+    if (answered !== null && outcome.status !== 'refused') {
+      await retireOpenInstruction(answered, {
+        to: 'failed',
+        reason: reasonForSupersededByWhatsAppAnswer(outcome.jobId),
+        businessId: ctx.businessId,
+      });
+    }
 
     if (jobId !== null) {
       // A crash here loses the link, never a second job: the message is
@@ -519,7 +729,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       stored.id,
       jobId !== null ? 'handled' : 'failed',
       {
-        ...(isAudio ? { transcript: text } : {}),
+        ...(isAudio ? { transcript: heard } : {}),
         ...(jobId !== null ? { jobId } : {}),
       },
       { businessId: ctx.businessId },
@@ -599,6 +809,12 @@ export async function runWhatsAppDoor(options: {
    * `downloadTimeoutMs` already give their own deadlines, same reason.
    */
   pollTimeoutMs?: number;
+  /**
+   * Overrides `config.whatsappQuestionWindowMinutes` for one call — see
+   * `ProcessContext.questionWindowMinutes`. Test seam only; production
+   * leaves it unset.
+   */
+  questionWindowMinutes?: number;
 }): Promise<DoorResult> {
   const businessId = options.businessId ?? config.businessId;
   const { gateway, messenger } = options;
@@ -635,7 +851,7 @@ export async function runWhatsAppDoor(options: {
   const ordered = [...collected].sort(compareInbound);
 
   const result: DoorResult = {
-    polled, instructed: 0, recordedOnly: 0, refused: 0, malformedSenderCount: 0,
+    polled, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, malformedSenderCount: 0,
   };
 
   const ctx: ProcessContext = {
@@ -650,6 +866,9 @@ export async function runWhatsAppDoor(options: {
     },
     ...(options.provider !== undefined ? { provider: options.provider } : {}),
     ...(options.planner !== undefined ? { planner: options.planner } : {}),
+    ...(options.questionWindowMinutes !== undefined
+      ? { questionWindowMinutes: options.questionWindowMinutes }
+      : {}),
   };
 
   for (const msg of ordered) {
@@ -668,6 +887,7 @@ export async function runWhatsAppDoor(options: {
     if (outcome === 'recordedOnly') result.recordedOnly += 1;
     else if (outcome === 'instructed') result.instructed += 1;
     else if (outcome === 'refused') result.refused += 1;
+    else if (outcome === 'closed') result.closed += 1;
     // 'skipped' — a redelivery, a race on the claim, or a failure before the
     // message was ever claimed — adds to none of the three buckets.
   }

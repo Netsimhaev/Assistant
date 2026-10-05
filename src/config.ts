@@ -109,4 +109,21 @@ export const config = {
   // src/domain/audit.ts for why a shared kind would double-count against
   // the wrong budget.
   whatsappInstructionsPerDay: positiveInt('WHATSAPP_INSTRUCTIONS_PER_DAY', 50),
+  // How long a clarifying question stays answerable over WhatsApp — spec
+  // §5.4 and §10.3's own table, which declared this setting before anything
+  // read it. Past the window, the owner's next message is a NEW instruction
+  // rather than an answer to a question he may have forgotten he was asked.
+  //
+  // `positiveInt`, the same shape as the four caps above, for the reason
+  // §10.3 states as the project's own rule: a value that cannot be read is
+  // never a permissive value. A malformed `WHATSAPP_QUESTION_WINDOW_MINUTES`
+  // throws at startup instead of quietly becoming `NaN` — and a `NaN`
+  // window would make `elapsed <= window` false for every message, which
+  // fails CLOSED here (everything routes as a new instruction, swallowing
+  // no answers) but would still be a setting silently not doing its job.
+  //
+  // `0` is a legal value and means something real: no message is ever read
+  // as an answer, so the channel keeps today's behaviour. That is a switch,
+  // not a broken setting.
+  whatsappQuestionWindowMinutes: positiveInt('WHATSAPP_QUESTION_WINDOW_MINUTES', 30),
 } as const;

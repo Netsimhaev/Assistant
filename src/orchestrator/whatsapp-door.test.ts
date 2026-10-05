@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { installCharter } from '../charter/store.js';
+import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -11,12 +11,21 @@ import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
 import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { createFakeMessenger } from '../whatsapp/fake-messenger.js';
+import { writeMemory } from '../memory/store.js';
+import { createJob } from './jobs.js';
 import { compareInbound, runWhatsAppDoor } from './whatsapp-door.js';
 
 const BUSINESS = 'test-business';
 // `buildCharter`'s default principal (`src/test/fixtures.ts`) carries this
 // number on the `whatsapp` channel — the one sender this door ever acts on.
 const PRINCIPAL_NUMBER = '+972500000000';
+/**
+ * What the planner must receive when a message is routed as an answer: the
+ * parked instruction, a blank line, then the answer. Written here with an
+ * explicit escape rather than inline, so the assertion cannot pass on a
+ * literal that merely looks right in a right-to-left editor.
+ */
+const JOINED_ANSWER = ['תשלחי לרונית', 'רונית כהן'].join('\n\n');
 const STRANGER_NUMBER = '+972549999999';
 
 async function withCharter(): Promise<void> {
@@ -182,7 +191,7 @@ describe('runWhatsAppDoor', () => {
       planner: plannedWith(mailPlan()),
     });
 
-    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, malformedSenderCount: 0 });
     expect(messenger.sentTexts).toHaveLength(1);
     expect(messenger.sentTexts[0]).toContain('קיבלתי');
 
@@ -282,6 +291,388 @@ describe('runWhatsAppDoor', () => {
     expect(second.malformedSenderCount).toBe(0);
   });
 
+  // --- Task 12: an answer is routed to its question, not planned afresh. ---
+
+  /**
+   * **The defect this task exists for, end to end.** The owner writes
+   * "תשלחי לרונית", the assistant asks which רונית, he answers "רונית כהן"
+   * — and before this, that answer was handed to the planner as a
+   * standalone command while the original request sat in `understand`
+   * forever, a phase the report deliberately excludes. He asked, was asked
+   * back, answered, and nothing happened, with no error.
+   *
+   * **This test is also the positive control over the window's clock
+   * arithmetic**, and that is why it passes NO `questionWindowMinutes` and no
+   * `now`: it runs on `config.whatsappQuestionWindowMinutes` (30) against a
+   * `boss_instructions.created_at` that Postgres wrote and
+   * `withinQuestionWindow` parsed with `Date.parse`. If that parse ever
+   * stopped working — a `created_at::text` rendering V8 declines, the column
+   * changing shape — the window would silently reject every question and this
+   * routing would quietly never fire again. Every other window assertion
+   * injects both values and would stay green through that.
+   */
+  it('routes the answer to an open question instead of planning it as a new instruction', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    const question = 'לאיזו רונית — רונית כהן או רונית לוי?';
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
+    const first = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan({ clarifyingQuestion: question })),
+    });
+    expect(first.instructed).toBe(1);
+    const parked = (await openJobs(BUSINESS))[0];
+    if (parked === undefined) throw new Error('unreachable');
+
+    const seen: string[] = [];
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'רונית כהן' }));
+    const second = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async (request) => {
+        seen.push(request.instruction ?? '');
+        return { status: 'planned', plan: mailPlan() };
+      },
+    });
+
+    expect(second.instructed).toBe(1);
+    // The planner saw the original request AND the answer, not the answer
+    // alone — the single fact the whole task turns on.
+    expect(seen).toEqual([JOINED_ANSWER]);
+
+    // Spec §5.4: the acknowledgement says which reading was chosen, quoting
+    // the request it joined, so a wrong reading is visible before anything
+    // goes out.
+    const ack = messenger.sentTexts[1] ?? '';
+    expect(ack).toContain('לבקשה הקודמת');
+    expect(ack).toContain('תשלחי לרונית');
+
+    // The answer is on the row, so the question is no longer open and the
+    // next message is a new instruction again.
+    const { rows } = await getPool().query<{ answer: string | null }>(
+      'SELECT answer FROM boss_instructions WHERE job_id = $1',
+      [parked.jobId],
+    );
+    expect(rows[0]?.answer).toBe('רונית כהן');
+
+    // The parked job is superseded, naming its replacement, and its opening
+    // message is claimed `'reported'` — which is what stops the report pass
+    // telling the owner that the instruction he just answered "failed".
+    const jobRow = await getPool().query<{ phase: string; whatsapp_message_id: string | null }>(
+      'SELECT phase, whatsapp_message_id FROM jobs WHERE job_id = $1',
+      [parked.jobId],
+    );
+    expect(jobRow.rows[0]?.phase).toBe('failed');
+    const openingMessage = jobRow.rows[0]?.whatsapp_message_id;
+    const openingRow = await getPool().query<{ state: string }>(
+      'SELECT state FROM whatsapp_messages WHERE id = $1',
+      [openingMessage],
+    );
+    expect(openingRow.rows[0]?.state).toBe('reported');
+  });
+
+  /**
+   * The answer re-run passes `identityAsked: true`, exactly as the
+   * dashboard's answer route does (spec §7.2) — and this is the one path
+   * where that flag is load-bearing rather than incidental.
+   *
+   * Two contacts named רונית make the FIRST pass stop on the identity
+   * question before the planner is ever called (`neverCalled` proves that).
+   * The answer "רונית כהן" does not necessarily disambiguate on its own —
+   * both contacts still match the token רונית — so without the flag the
+   * second pass would ask the very same question again, and the one after
+   * that, forever. The flag's deliberate coarseness (`instruct.ts`: it
+   * remembers only that a second pass is underway, never which name was
+   * ambiguous) is what bounds the loop.
+   */
+  it('suppresses the identity question on the answer pass, so the same name is not asked about forever', async () => {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-cohen-beta-log',
+        body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
+      },
+      { businessId: BUSINESS },
+    );
+    await writeMemory(
+      {
+        jobId: seedJob.jobId,
+        kind: 'entity',
+        subjectKey: 'ronit-levi-gamma',
+        body: { name: 'רונית לוי', company: 'גמא הרמה' },
+      },
+      { businessId: BUSINESS },
+    );
+
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
+    const first = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      // The identity question returns before the planner is reached at all.
+      planner: neverCalled,
+    });
+    expect(first.instructed).toBe(1);
+    expect(messenger.sentTexts[0]).toContain('רונית כהן'); // the question names both
+    expect(messenger.sentTexts[0]).toContain('רונית לוי');
+
+    const seen: string[] = [];
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'רונית כהן' }));
+    const second = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async (request) => {
+        seen.push(request.instruction ?? '');
+        return { status: 'planned', plan: mailPlan() };
+      },
+    });
+
+    // The planner really ran on the joined text — the identity question did
+    // not fire a second time and send the owner round again.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain('תשלחי לרונית');
+    expect(seen[0]).toContain('רונית כהן');
+    expect(second.instructed).toBe(1);
+  });
+
+  /**
+   * The owner's own words close an instruction — the other half of his rule
+   * ("או שהעוזרת האישית מודיעה על 'בוצע'/'נכשל'"). Nothing is planned,
+   * nothing spends a planner call, and nothing later reports the closed
+   * instruction as though it finished on its own.
+   */
+  it('closes the open instruction when the owner says so, and leaves nothing for the report to speak for', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
+    });
+    const parked = (await openJobs(BUSINESS))[0];
+    if (parked === undefined) throw new Error('unreachable');
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'סגרנו' }));
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      // A closure never reaches the planner at all.
+      planner: neverCalled,
+    });
+
+    expect(result.closed).toBe(1);
+    expect(result.instructed).toBe(0);
+    expect(result.refused).toBe(0);
+
+    // Told in Hebrew what was closed, not merely that something was.
+    const confirmation = messenger.sentTexts[1] ?? '';
+    expect(confirmation).toContain('סגרתי');
+    expect(confirmation).toContain('תשלחי לרונית');
+
+    const jobRow = await getPool().query<{ phase: string; whatsapp_message_id: string | null }>(
+      'SELECT phase, whatsapp_message_id FROM jobs WHERE job_id = $1',
+      [parked.jobId],
+    );
+    expect(jobRow.rows[0]?.phase).toBe('closed');
+    const openingRow = await getPool().query<{ state: string }>(
+      'SELECT state FROM whatsapp_messages WHERE id = $1',
+      [jobRow.rows[0]?.whatsapp_message_id],
+    );
+    expect(openingRow.rows[0]?.state).toBe('reported');
+    expect(await openJobs(BUSINESS)).toHaveLength(0);
+  });
+
+  it('says so plainly when a closure word finds nothing open, and plans nothing', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'סגרנו' }));
+
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: neverCalled,
+    });
+
+    expect(result.closed).toBe(1);
+    expect(messenger.sentTexts[0]).toContain('אין לי כרגע בקשה פתוחה');
+    expect(await allJobs(BUSINESS)).toHaveLength(0);
+  });
+
+  /**
+   * The chosen rule's cost, mitigated: when the re-run on the joined text
+   * refuses, the message was probably not an answer. The owner is told so in
+   * Hebrew, and the previous request is CLOSED rather than left open —
+   * otherwise his next message joins it and refuses again, with nothing he
+   * could type to get out.
+   */
+  it('tells the owner plainly when the joined text cannot be planned, and closes the previous request', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
+    });
+    const parked = (await openJobs(BUSINESS))[0];
+    if (parked === undefined) throw new Error('unreachable');
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'משהו אחר לגמרי' }));
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async () => ({ status: 'unparseable', raw: 'not json', reason: 'bad model output' }),
+    });
+
+    expect(result.refused).toBe(1);
+    const told = messenger.sentTexts[1] ?? '';
+    expect(told).toContain('לבקשה הקודמת'); // which reading was chosen
+    expect(told).toContain('סגרתי את הבקשה הקודמת'); // and what happened to it
+
+    const jobRow = await getPool().query<{ phase: string }>(
+      'SELECT phase FROM jobs WHERE job_id = $1',
+      [parked.jobId],
+    );
+    expect(jobRow.rows[0]?.phase).toBe('closed');
+    // Nothing is left open, so the next message is read as a new instruction
+    // rather than joined to the same request and refused again.
+    expect(await openJobs(BUSINESS)).toHaveLength(0);
+  });
+
+  /**
+   * A second question on the joined text is the other signal that the
+   * message was not an answer. Here the previous request IS superseded (a
+   * replacement job exists and carries its own question), so the sentence
+   * says what to do instead of claiming a close that did not happen.
+   */
+  it('tells the owner the message may not have been an answer when it is asked again', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
+    });
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'משהו אחר' }));
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan({ clarifyingQuestion: 'עדיין לא הבנתי — למי?' })),
+    });
+
+    expect(result.instructed).toBe(1);
+    const told = messenger.sentTexts[1] ?? '';
+    expect(told).toContain('עדיין לא הבנתי'); // the new question itself
+    expect(told).toContain('כהוראה נפרדת'); // and the way out
+  });
+
+  /**
+   * A question past the window stops consuming messages — and must not
+   * therefore stop existing on the one surface the owner reads. He is told
+   * it is still waiting, and where to answer it.
+   */
+  it('reads a message as a new instruction past the window, and says the older question is still waiting', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
+      questionWindowMinutes: 0,
+    });
+
+    const seen: string[] = [];
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תזמיני לי ספקים' }));
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async (request) => {
+        seen.push(request.instruction ?? '');
+        return { status: 'planned', plan: mailPlan() };
+      },
+      questionWindowMinutes: 0,
+    });
+
+    // Nothing was joined: the planner saw the new message on its own.
+    expect(seen).toEqual(['תזמיני לי ספקים']);
+    const ack = messenger.sentTexts[1] ?? '';
+    expect(ack).toContain('כהוראה חדשה');
+    expect(ack).toContain('שאלה אחת פתוחה');
+  });
+
+  /**
+   * The daily instruction cap gates the planner, and a closure does not use
+   * it. Were the cap checked first, a spent day would leave the owner's open
+   * work unclosable until tomorrow — the one thing his rule forbids.
+   */
+  it('lets the owner close open work on a day the instruction cap is already spent', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
+    });
+    const parked = (await openJobs(BUSINESS))[0];
+    if (parked === undefined) throw new Error('unreachable');
+
+    for (let i = 0; i < config.whatsappInstructionsPerDay; i += 1) {
+      await seedInstructionAttempt(BUSINESS);
+    }
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'סגרנו' }));
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: neverCalled,
+    });
+
+    expect(result.closed).toBe(1);
+    expect(result.refused).toBe(0);
+    expect(messenger.sentTexts[1]).not.toContain('מכסת ההוראות');
+    const jobRow = await getPool().query<{ phase: string }>(
+      'SELECT phase FROM jobs WHERE job_id = $1',
+      [parked.jobId],
+    );
+    expect(jobRow.rows[0]?.phase).toBe('closed');
+  });
+
   it('acknowledges a needs_answer outcome with the question itself', async () => {
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
@@ -295,7 +686,18 @@ describe('runWhatsAppDoor', () => {
       planner: plannedWith(mailPlan({ clarifyingQuestion: question })),
     });
 
-    expect(messenger.sentTexts).toEqual([question]);
+    // One message, carrying the question verbatim — `composeAck` returns
+    // `runInstruction`'s own sentence unchanged and never paraphrases it.
+    //
+    // No longer an exact equality: task 12 prefixes every acknowledgement
+    // with the reading that was chosen (spec §5.4, "האישור אומר תמיד איזו
+    // פרשנות נבחרה"), so that a message read as an answer to an open
+    // question — or, here, as a new instruction — is visible as such before
+    // anything goes out. Both halves are asserted rather than loosened to
+    // one `toContain`.
+    expect(messenger.sentTexts).toHaveLength(1);
+    expect(messenger.sentTexts[0]).toContain(question);
+    expect(messenger.sentTexts[0]).toContain('כהוראה חדשה');
     expect(result.instructed).toBe(1); // a job exists, parked, waiting for the owner
     expect(result.refused).toBe(0);
   });
@@ -579,7 +981,7 @@ describe('runWhatsAppDoor', () => {
       },
     });
 
-    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, malformedSenderCount: 0 });
     expect(seenInstructions).toEqual(['ראשונה (מוקדמת)', 'שנייה (מאוחרת)']);
   });
 

@@ -27,6 +27,7 @@ import { CONNECTION_GROUP_ORDER, GROUP_LABELS, groupForServes } from './connecti
 import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
+import { stripBidiControls } from '../util/bidi.js';
 import { formatMinor } from '../util/money.js';
 
 /** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
@@ -64,13 +65,18 @@ const esc = escapeHtml;
  * necessarily something the owner typed — and they show the identifier the
  * owner is about to authorise a destruction against.
  *
- * The set: U+061C ALM, U+200E/U+200F LRM/RLM, U+202A-U+202E (the embedding
- * and override family), U+2066-U+2069 (the isolate family).
+ * **The character class itself now lives in `src/util/bidi.ts`, and that is
+ * not a tidying move.** The WhatsApp channel needs the identical strip for
+ * PLAIN text — an instruction snippet echoed back to the owner, which can
+ * originate in a transcription provider's output — and this function cannot
+ * serve it, because it also HTML-escapes and an entity in a WhatsApp message
+ * renders as the literal `&lt;`. A second copy of the class would be the
+ * duplicated control this project already paid for once
+ * (`BROWSER_ADDRESSED_CLASSES`); `stripBidiControls` is the one definition,
+ * and the set it covers is documented there.
  */
-const BIDI_CONTROLS = /[؜‎‏‪-‮⁦-⁩]/g;
-
 export function escLabel(value: string): string {
-  return esc(value.replace(BIDI_CONTROLS, ''));
+  return esc(stripBidiControls(value));
 }
 
 const STYLE = `

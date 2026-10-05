@@ -270,6 +270,9 @@ describe('renderConversation', () => {
   // reading as succeeded.
   it('shows a failed instruction as failed, never identical to one that succeeded', () => {
     const failed = renderConversation({ messages: [msg({ state: 'failed', body: 'ניסיון שליחה' })], csrf: 'c' });
+    // `jobId: null` on the fixture, which is what makes 'טופלה' the right
+    // label here — see the task-12 pair below: `handled` means "finished"
+    // only for a message that opened no job.
     const handled = renderConversation({ messages: [msg({ state: 'handled', body: 'ניסיון שליחה' })], csrf: 'c' });
     expect(failed).toContain('ניסיון שליחה');
     expect(failed).toContain('נכשלה');
@@ -277,6 +280,57 @@ describe('renderConversation', () => {
     expect(handled).toContain('טופלה');
     expect(handled).not.toContain('נכשלה');
     expect(failed).not.toEqual(handled);
+  });
+
+  /**
+   * Task 12 (the final review's Minor 11), and the owner's own rule behind
+   * it: "ההוראה לא נסגרה עד שאחד הצדדים אמר במפורש". `'handled'` means the
+   * door finished with the MESSAGE — for a message that opened a job it says
+   * nothing at all about what became of that job, which may still be
+   * planning, executing or waiting on an approval card. Labelling it 'טופלה'
+   * was a statement of closure the record does not support.
+   *
+   * Both halves in one test, on purpose: a "still running" assertion alone
+   * would survive deleting the distinction entirely if the other label
+   * happened to contain the same words, and a "finished" assertion alone
+   * would survive labelling everything unfinished.
+   */
+  it('distinguishes a message that opened a live job from one that is genuinely finished', () => {
+    const working = renderConversation({
+      messages: [msg({ state: 'handled', jobId: 'JOB-1', body: 'תשלחי לדנה' })],
+      csrf: 'c',
+    });
+    const finished = renderConversation({
+      messages: [msg({ state: 'handled', jobId: null, body: 'תשלחי לדנה' })],
+      csrf: 'c',
+    });
+
+    expect(working).toContain('תשלחי לדנה');
+    expect(working).toContain('טרם דיווחתי');
+    // The claim this label used to make, and must not: `'טופלה'` on its own.
+    expect(working).not.toContain('· טופלה');
+    expect(finished).toContain('· טופלה');
+    expect(finished).not.toContain('טרם דיווחתי');
+    expect(working).not.toEqual(finished);
+  });
+
+  /**
+   * `'reported'` is the only state that says the owner was told the real
+   * outcome, so it must not read the same as a job still running — the
+   * same argument `reported_interim` already carries one state over.
+   */
+  it('does not let a live job read the same as one the owner has already been told about', () => {
+    const working = renderConversation({
+      messages: [msg({ state: 'handled', jobId: 'JOB-1', body: 'תשלחי לדנה' })],
+      csrf: 'c',
+    });
+    const reported = renderConversation({
+      messages: [msg({ state: 'reported', jobId: 'JOB-1', body: 'תשלחי לדנה' })],
+      csrf: 'c',
+    });
+    expect(working).not.toContain('דווחה');
+    expect(reported).toContain('דווחה');
+    expect(reported).not.toContain('טרם דיווחתי');
   });
 
   // Ruling 4: a row can legitimately carry neither body nor transcript

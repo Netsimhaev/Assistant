@@ -63,7 +63,7 @@ describe('logErrored', () => {
     try {
       const result: SchedulerPassResult = {
         ...cleanResult(),
-        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, malformedSenderCount: 0 },
+        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, malformedSenderCount: 0 },
         whatsappReport: { reported: 0, deferred: 2, errored: ['job-a', 'job-b'] },
       };
       logErrored(result);
@@ -101,7 +101,7 @@ describe('logErrored', () => {
     try {
       logErrored({
         ...cleanResult(),
-        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, malformedSenderCount: 0 },
+        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, malformedSenderCount: 0 },
         whatsappError: 'reportCandidates query rejected',
       });
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
