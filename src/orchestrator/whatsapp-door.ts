@@ -889,7 +889,7 @@ export async function runWhatsAppDoor(options: {
     else if (outcome === 'refused') result.refused += 1;
     else if (outcome === 'closed') result.closed += 1;
     // 'skipped' — a redelivery, a race on the claim, or a failure before the
-    // message was ever claimed — adds to none of the three buckets.
+    // message was ever claimed — adds to none of the four buckets.
   }
 
   return result;

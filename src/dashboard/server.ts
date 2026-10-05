@@ -30,7 +30,7 @@ import {
   MAX_INSTRUCTION_CHARS,
   loadInstructionForJob,
   pendingQuestions,
-  recordAnswer,
+  claimAnswer,
 } from '../governance/instructions.js';
 import { readForgetCommand } from '../governance/forget-command.js';
 import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
@@ -790,6 +790,32 @@ async function handleInstructPost(
  * database — producing a genuine `planned` outcome through this HTTP route
  * would need a live model call this route has no way to inject around.
  */
+/**
+ * The `job_steps.reason` recorded when a refused re-run closes the parked job
+ * out — task 12, fix round 1, Important 3. English, like every other reason in
+ * this project, and distinct from `reasonForSupersededJob` above because the
+ * two say different things to whoever reads the trail: that one names a
+ * replacement, this one says there is none.
+ *
+ * Deliberately parallel to, and not imported from, the WhatsApp door's own
+ * `REASON_ANSWER_REFUSED` (`src/orchestrator/whatsapp-routing.ts`): the two
+ * doors should be distinguishable in the audit trail, which is the whole
+ * reason each names itself in its own reason string.
+ */
+export const REASON_ANSWER_REFUSED_HERE =
+  'instruction door: answer could not be planned; closed rather than left parked';
+
+/**
+ * Appended to the refusal the owner reads, so the sentence says what happened
+ * to the previous request and not only that this attempt failed.
+ *
+ * Its own wording rather than the WhatsApp door's, for the same reason the
+ * reason string above is: this one can point at the screen the owner is
+ * already looking at.
+ */
+export const CLOSED_AFTER_REFUSAL_HERE =
+  'סגרתי את הבקשה הקודמת כדי שלא תישאר פתוחה בלי שאף אחד יענה עליה. אפשר לכתוב אותה מחדש בתיבה למטה.';
+
 export function reasonForSupersededJob(
   outcome: Extract<Awaited<ReturnType<typeof runInstruction>>, { jobId: string }>,
 ): string {
@@ -801,12 +827,27 @@ export function reasonForSupersededJob(
  * returns `null` when someone else already holds it (I2).
  *
  * **Why a lock and not a transition.** Claiming by moving the job out of
- * `understand` would work, but it would undo fix round 2's N1: a re-run that
- * refuses — an over-cap join, no active charter — deliberately leaves the
- * parked job exactly where it was, so the owner's obvious next move (shorten
- * the answer, resubmit from the same page) lands on a job still waiting
- * rather than one already `failed`. A lock claims the *work* without
- * changing the job's story.
+ * `understand` would be one-way: `LEGAL_TRANSITIONS` (`src/domain/job.ts`)
+ * names `understand` as a target from `intake` and from nowhere else, so a
+ * claim-by-transition could never be undone — and every path that must leave
+ * the job answerable, or decide what to do with it afterwards, would be
+ * deciding it against a phase the route had already changed for its own
+ * bookkeeping. A lock claims the *work* and is released whatever happens,
+ * leaving the phase to mean only what it says.
+ *
+ * **Task 12, fix round 1, Important 3 rewrote the paragraph that used to sit
+ * here, because the reason it gave had stopped being true.** It said a
+ * refused re-run "deliberately leaves the parked job exactly where it was, so
+ * the owner's obvious next move (shorten the answer, resubmit from the same
+ * page) lands on a job still waiting" — but `recordAnswer` had already run by
+ * then, so the job was no longer in `pendingQuestions` and `GET /instruct`
+ * could not list it; the only route back to that form was the browser's own
+ * Back button, and an owner who navigated away lost the question for good,
+ * permanently parked and invisible. That is the instruction-silently-
+ * disappears class, and the owner's principle is about INSTRUCTIONS, not
+ * about one door. A refused re-run now CLOSES the parked job and says so,
+ * which is what the WhatsApp door already does
+ * (`whatsapp-routing.ts`'s `CLOSED_AFTER_REFUSAL`).
  *
  * **`pg_try_advisory_lock`, not the blocking form**, and for the reason
  * `conduct.ts` and `run-due.ts` give for theirs: the second request must be
@@ -875,12 +916,12 @@ async function withJobClaim<T>(
  * transitioned unconditionally, which broke two ways from the same line:
  *
  *   - A re-run that refuses (an over-length join, no active charter) used to
- *     close the ORIGINAL job out anyway, even though nothing replaced it. The
- *     owner's obvious next move — shorten the answer and resubmit from the
- *     same page — then landed on a job already `failed`, and
- *     `failed → failed` is illegal: `transition` throws, uncaught, straight
- *     to the top-level 500 handler. A retry that used to work stopped
- *     working.
+ *     close the ORIGINAL job out with `transition(… 'failed')` anyway, even
+ *     though nothing replaced it — and then a second POST met a job already
+ *     `failed`, where `failed → failed` is illegal: `transition` threw,
+ *     uncaught, straight to the top-level 500 handler. The phase guard is
+ *     what stops that, and it still does: the second POST is now refused with
+ *     a sentence instead of throwing.
  *   - Nothing scoped this route to a job actually waiting for an answer —
  *     only to "a job in this business with an instruction row", which any
  *     successfully PLANNED instruction has too. A job sitting in `execute`
@@ -888,18 +929,31 @@ async function withJobClaim<T>(
  *     against the wrong job could overwrite its instruction's answer, open a
  *     redundant job, and fail an in-flight, already-authorised plan.
  *
- * The phase guard fixes both at once: refused, the parked job is left
- * exactly where it was (so the retry above lands on a job still in
- * `understand`, not one already `failed`); already resolved into something
- * else, the request is refused before touching anything.
+ * The phase guard fixes both at once: a job already resolved into something
+ * else is refused before anything is touched, and a second POST against a job
+ * this route has already finished with gets a readable sentence rather than
+ * an illegal transition.
  *
  * The re-run itself is always a **new** job, not a resumption of the parked
- * one — `runInstruction` calls `createJob` unconditionally — so the parked
- * job is closed out (`transition` to `failed`, reason from
- * `reasonForSupersededJob`) only on `planned` or `needs_answer`, i.e. only
- * when a replacement actually exists to name. Resuming the parked job itself
- * instead of superseding it would be a larger change than this route
- * carries.
+ * one — `runInstruction` calls `createJob` unconditionally — so the parked job
+ * is always taken out of `understand`, and the two outcomes differ only in
+ * how: `transition` to `failed` with `reasonForSupersededJob` when a
+ * replacement exists to name (`planned`/`needs_answer`), and to `closed` with
+ * `REASON_ANSWER_REFUSED_HERE` when the re-run refused and none does.
+ * Resuming the parked job itself instead of superseding it would be a larger
+ * change than this route carries.
+ *
+ * **Why `closed` on a refusal rather than leaving it parked — task 12, fix
+ * round 1, Important 3.** The answer is recorded before the re-run, so a
+ * parked job left behind is no longer in `pendingQuestions` and
+ * `GET /instruct` cannot list it: the owner would be left with an instruction
+ * that is permanently open, invisible on the screen built to show open ones,
+ * and never reported. The owner's rule — an instruction stays open until one
+ * side says clearly that it is finished — is about instructions, not about
+ * one door, so this door says it, in Hebrew, the same way the WhatsApp door
+ * already does. Closing a parked `understand` job cancels nothing: it has no
+ * plan, spent nothing and never reached a step, so the cost is that the owner
+ * retypes a request he can see he must retype.
  *
  * `loadInstructionForJob` is scoped to `businessId` and returns `null` for a
  * job that belongs to another business — indistinguishable, on purpose, from
@@ -1003,7 +1057,23 @@ async function answerUnderClaim(
     );
   }
 
-  await recordAnswer(instruction.instructionId, answer, { businessId });
+  // `claimAnswer`, not a plain overwrite: a single `UPDATE ... WHERE answer IS
+  // NULL` decides one writer. Redundant under the claim this runs inside, and
+  // kept anyway — it is the only writer of this column left (task 12, fix
+  // round 1), so the guard lives with the function rather than in the
+  // assumption that every caller holds a lock. A `false` here means the row
+  // was answered between the phase read above and this line.
+  const took = await claimAnswer(instruction.instructionId, answer, { businessId });
+  if (!took) {
+    return sendHtml(
+      res,
+      409,
+      renderInstruct({
+        csrf: issueCsrfToken(session.sessionId),
+        error: 'התשובה הזו כבר נרשמה. רענן/י את הדף כדי לראות מה קרה.',
+      }),
+    );
+  }
 
   const outcome = await runInstruction(
     { text: `${instruction.text}\n\n${answer}` },
@@ -1012,17 +1082,33 @@ async function answerUnderClaim(
     { businessId, identityAsked: true },
   );
 
-  // Only when a replacement actually exists — a `refused` re-run leaves the
-  // parked job exactly where it was, so a shortened retry finds it still
-  // waiting in `understand` instead of already `failed`.
-  if (outcome.status !== 'refused') {
+  // The parked job always leaves `understand`; only the destination and the
+  // reason differ. See this route's docblock on why a refusal CLOSES it
+  // rather than leaving it parked — the answer is already recorded, so a job
+  // left behind is open, invisible to `GET /instruct`, and never reported.
+  if (outcome.status === 'refused') {
     await transition(jobId, {
-      to: 'failed',
+      to: 'closed',
       actor: 'human',
-      reason: reasonForSupersededJob(outcome),
+      reason: REASON_ANSWER_REFUSED_HERE,
       businessId,
     });
+    return sendHtml(
+      res,
+      400,
+      renderInstruct({
+        csrf: issueCsrfToken(session.sessionId),
+        error: `${outcome.reason} ${CLOSED_AFTER_REFUSAL_HERE}`,
+      }),
+    );
   }
+
+  await transition(jobId, {
+    to: 'failed',
+    actor: 'human',
+    reason: reasonForSupersededJob(outcome),
+    businessId,
+  });
 
   renderInstructionOutcome(res, session, outcome);
 }

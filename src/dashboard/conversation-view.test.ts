@@ -256,7 +256,15 @@ describe('renderConversation', () => {
     expect(html).toContain('כבר דווח');
     // Fix round 1, Important 1: a terminal state is no longer hidden — it
     // shows its OWN label, not no label at all.
-    expect(html).toContain('דווחה');
+    //
+    // Task 12 fix round 1 changed this label from 'דווחה'. The state has two
+    // writers and only one of them sends a report: `reportWhatsAppJobs` does,
+    // and `retireOpenInstruction` claims it precisely to STOP one being sent,
+    // for an instruction the owner closed or answered himself. The label now
+    // says what is true for both — nothing further is owed — rather than
+    // asserting a report that for one writer never happened.
+    expect(html).toContain('אין לי יותר מה לדווח');
+    expect(html).not.toContain('· דווחה');
     expect(html).not.toContain('עודכנת בביניים');
     expect(html).not.toContain('בטיפול');
     expect(html).not.toContain('עדיין לא טופלה');
@@ -328,8 +336,8 @@ describe('renderConversation', () => {
       messages: [msg({ state: 'reported', jobId: 'JOB-1', body: 'תשלחי לדנה' })],
       csrf: 'c',
     });
-    expect(working).not.toContain('דווחה');
-    expect(reported).toContain('דווחה');
+    expect(working).not.toContain('אין לי יותר מה לדווח');
+    expect(reported).toContain('אין לי יותר מה לדווח');
     expect(reported).not.toContain('טרם דיווחתי');
   });
 

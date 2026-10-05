@@ -138,7 +138,18 @@ function stateLabel(m: StoredMessage): string {
     case 'failed':
       return 'נכשלה';
     case 'reported':
-      return 'דווחה';
+      // **Not 'דווחה' — fix round 1's Minor.** This state has two writers and
+      // only one of them sends a report: `reportWhatsAppJobs` does, and
+      // `retireOpenInstruction` (`whatsapp-routing.ts`) claims it to STOP one
+      // being sent, for a message the owner was told about in the
+      // acknowledgement to his own next message — he closed it, or he
+      // answered it. 'דווחה' asserted the first writer for both, which is
+      // false for every instruction the owner closed himself.
+      //
+      // What is true for BOTH writers is what the state actually means:
+      // nothing further is owed on this message. That is what the label says
+      // now.
+      return 'כבר עדכנתי אותך — אין לי יותר מה לדווח עליה';
     default: {
       const unreachable: never = m.state;
       return `מצב לא מוכר (${String(unreachable)})`;

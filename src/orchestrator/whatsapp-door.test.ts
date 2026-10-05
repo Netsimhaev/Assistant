@@ -501,6 +501,126 @@ describe('runWhatsAppDoor', () => {
     expect(await openJobs(BUSINESS)).toHaveLength(0);
   });
 
+  /**
+   * **Fix round 1, Important 1, end to end.** `זהו` is a closure word and
+   * closure is tested before the answer route, so under a flat token bound
+   * "זהו, רונית כהן" closed the question instead of answering it and the
+   * answer went nowhere — this task's own defect, re-entered through its own
+   * fix.
+   *
+   * The unit test in `closure-command.test.ts` proves the predicate says
+   * `false`; this proves the CONSEQUENCE, which is the thing that was broken:
+   * the planner receives the joined text, and the question is answered rather
+   * than closed.
+   */
+  it('answers a question with a message that opens with a closure word, instead of closing it', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
+    });
+    const parked = (await openJobs(BUSINESS))[0];
+    if (parked === undefined) throw new Error('unreachable');
+
+    const seen: string[] = [];
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'זהו, רונית כהן' }));
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async (request) => {
+        seen.push(request.instruction ?? '');
+        return { status: 'planned', plan: mailPlan() };
+      },
+    });
+
+    // Routed as the ANSWER: the planner ran on the joined text, and nothing
+    // was closed.
+    expect(result.closed).toBe(0);
+    expect(result.instructed).toBe(1);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain('תשלחי לרונית');
+    expect(seen[0]).toContain('זהו, רונית כהן');
+    expect(messenger.sentTexts[1]).toContain('לבקשה הקודמת');
+
+    const { rows } = await getPool().query<{ answer: string | null }>(
+      'SELECT answer FROM boss_instructions WHERE job_id = $1',
+      [parked.jobId],
+    );
+    expect(rows[0]?.answer).toBe('זהו, רונית כהן');
+  });
+
+  /**
+   * The other half of Important 1: the verb still closes on its own, which is
+   * what it is for. Without this, the fix above could have been "remove זהו
+   * from the list" and nothing would have noticed.
+   */
+  it('still closes on a bare closure word that cannot carry anything after it', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית' }));
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })),
+    });
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'זהו' }));
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: neverCalled,
+    });
+
+    expect(result.closed).toBe(1);
+    expect(messenger.sentTexts[1]).toContain('סגרתי');
+    expect(await openJobs(BUSINESS)).toHaveLength(0);
+  });
+
+  /**
+   * **Fix round 1, Important 2, end to end.** A cancellation is a real
+   * instruction: it must reach the planner, not be answered with "everything
+   * is already closed on my side" — a false reassurance about work nobody
+   * did. Nothing is open here, so the only two possible readings are closure
+   * and instruction.
+   *
+   * **Three tokens exactly, and that is the point.** A four-token
+   * cancellation ("תעזבי את הפגישה עם דנה") is excluded by the token bound
+   * alone, so it would pass this test even with `aloneOnly` ignored — a
+   * negative test that holds without the code it claims to cover. At three
+   * tokens the ONLY thing keeping it out of the closure branch is the
+   * per-verb allowance, which is what Important 2 is about.
+   */
+  it('plans a cancellation instead of reporting that there was nothing to close', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תעזבי את הפגישה' }));
+
+    const seen: string[] = [];
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async (request) => {
+        seen.push(request.instruction ?? '');
+        return { status: 'planned', plan: mailPlan() };
+      },
+    });
+
+    expect(result.instructed).toBe(1);
+    expect(result.closed).toBe(0);
+    expect(seen).toEqual(['תעזבי את הפגישה']);
+    expect(messenger.sentTexts[0]).not.toContain('הכול כבר סגור');
+  });
+
   it('says so plainly when a closure word finds nothing open, and plans nothing', async () => {
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
@@ -592,6 +712,66 @@ describe('runWhatsAppDoor', () => {
     const told = messenger.sentTexts[1] ?? '';
     expect(told).toContain('עדיין לא הבנתי'); // the new question itself
     expect(told).toContain('כהוראה נפרדת'); // and the way out
+  });
+
+  /**
+   * **Fix round 1's Minor: the refusal to guess had no door-level test.** The
+   * routing unit test proves the DECISION; this proves what the owner actually
+   * gets — the question, nothing planned, no answer claimed, and both open
+   * questions still open afterwards, which is the property that makes the
+   * refusal a refusal rather than a quiet drop.
+   *
+   * The two open questions are built with the door's window switched off, for
+   * the reason `whatsapp-routing.test.ts`'s own fixture gives: with the window
+   * on, the second message would be routed to the first question instead of
+   * opening its own.
+   */
+  it('asks which question a message answers when more than one is open, and plans nothing', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+
+    for (const body of ['תשלחי לרונית', 'תזמיני ספקים']) {
+      gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body }));
+      await runWhatsAppDoor({
+        gateway,
+        messenger,
+        businessId: BUSINESS,
+        planner: plannedWith(mailPlan({ clarifyingQuestion: `לגבי ${body}?` })),
+        questionWindowMinutes: 0,
+      });
+    }
+    const parkedBefore = await openJobs(BUSINESS);
+    expect(parkedBefore).toHaveLength(2);
+
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'רונית כהן' }));
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      // Nothing is planned on this branch — no planner call at all.
+      planner: neverCalled,
+      questionWindowMinutes: 30,
+    });
+
+    expect(result.refused).toBe(1);
+    expect(result.instructed).toBe(0);
+    expect(result.closed).toBe(0);
+
+    const asked = messenger.sentTexts[2] ?? '';
+    expect(asked).toContain('יותר משאלה פתוחה אחת');
+    expect(asked).toContain('תשלחי לרונית'); // both candidates named
+    expect(asked).toContain('תזמיני ספקים');
+    expect(asked).toContain('סגרנו'); // the exit from WhatsApp itself
+
+    // Nothing was taken: both questions are still open and still answerable,
+    // so the refusal cost the owner nothing but a round trip.
+    expect(await openJobs(BUSINESS)).toHaveLength(2);
+    const { rows } = await getPool().query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM boss_instructions
+        WHERE business_id = $1 AND answer IS NOT NULL`,
+      [BUSINESS],
+    );
+    expect(rows[0]?.n).toBe('0');
   });
 
   /**

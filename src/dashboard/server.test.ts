@@ -31,7 +31,8 @@ import { saveNotJudged, saveVerdict, type NotJudgedReason } from '../governance/
 import { queryAudit } from '../audit/log.js';
 import {
   loadInstructionForJob,
-  recordAnswer,
+  claimAnswer,
+  pendingQuestions,
   recordQuestion,
   saveInstruction,
 } from '../governance/instructions.js';
@@ -847,7 +848,7 @@ describe('GET /instruct, POST /instruct', () => {
     // The answer is recorded but the re-run refused, so the job is still
     // parked in `understand`. Phase alone would keep listing this as an open
     // question the owner has in fact already answered.
-    await recordAnswer(answeredInstruction.instructionId, 'דנה כהן', { businessId: BUSINESS });
+    await claimAnswer(answeredInstruction.instructionId, 'דנה כהן', { businessId: BUSINESS });
 
     // A second, still-open question on a different parked job. Without it,
     // an assertion that the answered question is absent would hold just as
@@ -1126,7 +1127,7 @@ describe('POST /instruct/:jobId/answer', () => {
   // `answer` (unlike `text`) carries no CHECK constraint. An empty answer
   // recorded as-is would overwrite any earlier answer and re-run the pipeline
   // on text byte-identical to the original instruction, so the planner would
-  // ask the very same question again — forever. Refused before `recordAnswer`
+  // ask the very same question again — forever. Refused before `claimAnswer`
   // runs at all: the stored answer stays `null`.
   it('refuses a whitespace-only answer without recording it', async () => {
     const baseUrl = await startServer(BUSINESS);
@@ -1214,19 +1215,32 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(stored?.answer).toBe(answer);
   });
 
-  // Fix round 2, N1: a refused re-run must leave the parked job exactly where
-  // it was, not close it out. Before this fix, `handleInstructAnswer`
-  // transitioned unconditionally: the first refused POST here would have
-  // moved the job to `failed`, and the second POST — the owner's obvious
-  // next move, resubmitting from the same page — would have hit
-  // `transition(jobId, { to: 'failed' })` again on a job already `failed`,
-  // which is an illegal transition that throws uncaught to the top-level 500
-  // handler. Both POSTs below stay under the length cap's live-planner
-  // avoidance strategy (see the note on `anInstructionJob`): each answer
-  // alone is well under `MAX_INSTRUCTION_CHARS`, but joined with the
-  // ~3,990-character original both cross it, so both refuse deterministically
-  // before `createJob` — never reaching the planner.
-  it('lets a second POST retry after a refused re-run instead of 500ing', async () => {
+  /**
+   * **Task 12, fix round 1, Important 3 rewrote this test, and the property it
+   * was protecting still holds.** Fix round 2's N1 made a refused re-run leave
+   * the parked job in `understand` so a second POST would not meet
+   * `failed → failed` — an illegal transition that threw uncaught to the
+   * top-level 500 handler. The no-500 property is what mattered and is
+   * asserted below unchanged; what changed is how it is obtained.
+   *
+   * Leaving the job parked turned out to be the wrong half of the fix: the
+   * answer is recorded BEFORE the re-run, so the parked job was already out of
+   * `pendingQuestions` and `GET /instruct` could not list it. The owner was
+   * left with an instruction permanently open, invisible on the screen built
+   * to show open ones, and never reported — the
+   * instruction-silently-disappears class, and against the owner's own rule
+   * that an instruction stays open only until one side says it is finished.
+   * The route now CLOSES it and says so, exactly as the WhatsApp door does, so
+   * the second POST meets the PHASE GUARD and is refused with a readable
+   * sentence instead of throwing.
+   *
+   * Both POSTs stay under the length cap's live-planner avoidance strategy
+   * (see the note on `anInstructionJob`): each answer alone is well under
+   * `MAX_INSTRUCTION_CHARS`, but joined with the ~3,990-character original
+   * both cross it, so both refuse deterministically before `createJob` —
+   * never reaching the planner.
+   */
+  it('closes the parked job when a re-run refuses, and refuses a second POST instead of 500ing', async () => {
     const baseUrl = await startServer(BUSINESS);
     const originalText = 'א'.repeat(3990);
     const jobId = await anInstructionJob(BUSINESS, originalText);
@@ -1240,24 +1254,33 @@ describe('POST /instruct/:jobId/answer', () => {
       body: new URLSearchParams({ csrf, answer: 'ב'.repeat(20) }),
     });
     expect(firstRes.status).toBe(400);
-    expect(await firstRes.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+    const firstBody = await firstRes.text();
+    // The refusal itself, AND what became of the previous request — the owner
+    // is never left to infer that it is still waiting when it is not.
+    expect(firstBody).toContain('ההוראה ארוכה מ-4000 תווים');
+    expect(firstBody).toContain('סגרתי את הבקשה הקודמת');
 
     const afterFirst = await loadJob(jobId, { businessId: BUSINESS });
-    expect(afterFirst?.phase).toBe('understand');
+    expect(afterFirst?.phase).toBe('closed');
+    // Nothing is left for `GET /instruct` to show, which is the point: it
+    // could not have shown it anyway (the answer is recorded), so the state
+    // now matches what the owner can see.
+    expect(await pendingQuestions({ businessId: BUSINESS })).toEqual([]);
 
     // The retry — same job, a different (still over-cap-when-joined) answer.
-    // Pre-fix this 500s; post-fix it refuses the same clean way the first
-    // POST did, because the job is still `understand`, not `failed`.
+    // The property fix round 2 bought is unchanged: a readable refusal, never
+    // a 500 from an illegal `failed → failed`. It now comes from the phase
+    // guard rather than from the job having been left parked.
     const secondRes = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
       method: 'POST',
       headers: { cookie },
       body: new URLSearchParams({ csrf, answer: 'ג'.repeat(20) }),
     });
     expect(secondRes.status).toBe(400);
-    expect(await secondRes.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+    expect(await secondRes.text()).toContain('כבר אינה ממתינה לתשובה');
 
     const afterSecond = await loadJob(jobId, { businessId: BUSINESS });
-    expect(afterSecond?.phase).toBe('understand');
+    expect(afterSecond?.phase).toBe('closed');
   });
 
   // Fix round 2, N1 (the other side): once a re-run DOES produce a
@@ -1289,7 +1312,7 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('כבר אינה ממתינה לתשובה');
 
-    // The guard fires before `recordAnswer` — the row from the original
+    // The guard fires before `claimAnswer` — the row from the original
     // answer (never set in this test) stays untouched, not overwritten.
     const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
     expect(stored?.answer).toBeNull();
@@ -1363,7 +1386,7 @@ describe('POST /instruct/:jobId/answer', () => {
 
     // Nothing was written: no answer recorded, and no second job opened. The
     // parked job is still the only one. Without the claim this request reaches
-    // `recordAnswer` and `createJob` and both of these go red.
+    // `claimAnswer` and `createJob` and both of these go red.
     const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
     expect(stored?.answer).toBeNull();
     const { rows } = await getPool().query<{ n: string }>(

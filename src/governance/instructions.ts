@@ -91,21 +91,6 @@ export async function saveInstruction(
   return toInstruction(row);
 }
 
-export async function recordAnswer(
-  instructionId: string,
-  answer: string,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
-
-  await db.query(
-    `UPDATE boss_instructions SET answer = $3
-      WHERE instruction_id = $1 AND business_id = $2`,
-    [instructionId, businessId, answer],
-  );
-}
-
 /**
  * Stores the clarifying question the planner asked, so the owner can find it
  * again (I3).
@@ -188,24 +173,27 @@ export async function pendingQuestions(
 /**
  * Records an answer only if nobody has recorded one yet — a single
  * `UPDATE ... WHERE answer IS NULL` whose row count says whether this caller
- * won.
+ * won. **The only writer of this column.**
  *
- * **Separate from `recordAnswer` above, and deliberately not a replacement
- * for it.** The dashboard's answer route depends on `recordAnswer`
- * overwriting: when its re-run refuses (a join that crosses the 4,000-char
- * cap only together), the parked job is left exactly where it was so the
- * owner can shorten his answer and resubmit from the same page — a second
- * submission that `answer IS NULL` would refuse. The dashboard does not need
- * a claim because it already holds an advisory lock on the job
- * (`withJobClaim`, `src/dashboard/server.ts`) for the whole call. The
- * WhatsApp door has no lock on the parked job and no form to resubmit from:
- * two routes reaching the same open question — a dashboard answer racing a
- * WhatsApp message — would otherwise both re-run the planner and both
- * supersede, and the second `transition` would hit `LEGAL_TRANSITIONS`'s
- * empty entry for an already-`failed` job and throw. One winner, decided in
- * SQL, is the same shape `claimMessage` and `consumeApproval` already use
- * here, and for the same reason: a read-then-write lets both callers see
- * `NULL` and both proceed.
+ * One winner decided in SQL, the same shape `claimMessage` and
+ * `consumeApproval` already use here and for the same reason: a
+ * read-then-write lets two callers both see `NULL` and both proceed. What
+ * that costs if it is lost is concrete — two routes reaching the same open
+ * question (a dashboard answer racing a WhatsApp message) would both re-run
+ * the planner and both supersede the parked job, and the second `transition`
+ * would hit `LEGAL_TRANSITIONS`'s empty entry for an already-terminal job and
+ * throw.
+ *
+ * **This replaced a plain overwriting `recordAnswer`, and the reason that one
+ * existed is worth recording because it stopped being true.** The dashboard's
+ * answer route used to depend on the overwrite: a refused re-run left the
+ * parked job in `understand` so the owner could shorten his answer and
+ * resubmit. Task 12's fix round 1 found that path was already broken — the
+ * answer was recorded before the re-run, so the job had left
+ * `pendingQuestions` and `GET /instruct` could not list it — and the route now
+ * CLOSES the parked job on a refusal and says so. With no path left that needs
+ * to write this column twice, two writers with different rules would have
+ * been two rules for one fact.
  */
 export async function claimAnswer(
   instructionId: string,

@@ -7,7 +7,7 @@ import { createJob } from '../orchestrator/jobs.js';
 import {
   MAX_INSTRUCTION_CHARS,
   loadInstructionForJob,
-  recordAnswer,
+  claimAnswer,
   saveInstruction,
 } from './instructions.js';
 
@@ -57,7 +57,7 @@ describe('the instruction record', () => {
       { businessId: BUSINESS },
     );
 
-    await recordAnswer(saved.instructionId, 'דנה כהן, dana@example.com', {
+    await claimAnswer(saved.instructionId, 'דנה כהן, dana@example.com', {
       businessId: BUSINESS,
     });
 

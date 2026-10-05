@@ -144,6 +144,48 @@ describe('decideWhatsAppRoute', () => {
   });
 
   /**
+   * **The boundary itself — fix round 1's Minor.** Every other window test
+   * sits comfortably inside or outside it (now, or 31 minutes on a 30-minute
+   * window), so `<` in place of `<=`, or an off-by-one in the minutes-to-
+   * milliseconds arithmetic, would have gone unnoticed in both directions.
+   *
+   * `now` is computed from the row's OWN stored `created_at`, not from
+   * `Date.now()`: the elapsed time has to be exactly the window and exactly
+   * one millisecond past it, and anything derived from the test's clock would
+   * be off by however long the fixture took to run.
+   */
+  it('answers at exactly the window and refuses one millisecond past it', async () => {
+    await askOverWhatsApp('תשלחי לרונית');
+    const open = (await openQuestions())[0];
+    if (open === undefined) throw new Error('unreachable');
+
+    const askedMs = Date.parse(open.createdAt);
+    // Paired positive check, and the one that matters most in this file: the
+    // stored timestamp is readable at all. An unreadable one makes
+    // `withinQuestionWindow` return `false` for everything, which would make
+    // the "past the window" half below pass for entirely the wrong reason.
+    expect(Number.isNaN(askedMs)).toBe(false);
+    const windowMinutes = 30;
+    const windowMs = windowMinutes * 60_000;
+
+    const atBoundary = await decideWhatsAppRoute({
+      text: 'רונית כהן',
+      businessId: BUSINESS,
+      windowMinutes,
+      now: askedMs + windowMs,
+    });
+    expect(atBoundary.kind).toBe('answer');
+
+    const oneMsPast = await decideWhatsAppRoute({
+      text: 'רונית כהן',
+      businessId: BUSINESS,
+      windowMinutes,
+      now: askedMs + windowMs + 1,
+    });
+    expect(oneMsPast).toEqual({ kind: 'new', staleOpen: 1 });
+  });
+
+  /**
    * `0` is a legal setting and means "no message is ever read as an answer".
    * Without the explicit `windowMinutes <= 0` clause a row created in the
    * same millisecond would satisfy `0 <= 0` and be answered under a

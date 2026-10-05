@@ -181,11 +181,11 @@ export async function decideWhatsAppRoute(input: {
 /**
  * Takes this answer, or reports that somebody else already did.
  *
- * `claimAnswer`, not `recordAnswer`: a single `UPDATE ... WHERE answer IS
- * NULL` decides one winner, so a dashboard answer racing a WhatsApp message
- * on the same parked question cannot both re-run the planner and both
- * supersede the job. See `claimAnswer`'s own docblock for why the dashboard
- * keeps the overwriting form.
+ * `claimAnswer` is a single `UPDATE ... WHERE answer IS NULL`, so a dashboard
+ * answer racing a WhatsApp message on the same parked question cannot both
+ * re-run the planner and both supersede the job. It is the only writer of
+ * that column — see its own docblock, including why the overwriting
+ * `recordAnswer` it replaced is gone.
  */
 export async function claimAsAnswer(
   instruction: InstructionRecord,
