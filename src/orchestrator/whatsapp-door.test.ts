@@ -8,7 +8,7 @@ import { canonicalHash } from '../util/canonical.js';
 import { config } from '../config.js';
 import type { Plan } from '../domain/plan.js';
 import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
-import type { NormalizedInboundMessage } from '../whatsapp/gateway.js';
+import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { createFakeMessenger } from '../whatsapp/fake-messenger.js';
 import { compareInbound, runWhatsAppDoor } from './whatsapp-door.js';
@@ -90,6 +90,11 @@ const plannedWith = (plan: Plan) => async (): Promise<PlanOutcome> => ({ status:
 /** Proves a branch never reaches the planner at all — see `recordInbound`'s dedupe note below. */
 const neverCalled = async (_request: PlanRequest): Promise<PlanOutcome> => {
   throw new Error('planner must not be called for this message');
+};
+
+/** Proves the byte cap refuses BEFORE the paid transcription provider is ever called. */
+const neverCalledProvider = async (): Promise<{ text: string }> => {
+  throw new Error('transcription provider must not be called for this message');
 };
 
 async function stateOf(providerMessageId: string): Promise<string | null> {
@@ -420,6 +425,40 @@ describe('runWhatsAppDoor', () => {
     expect(await stateOf(msg.providerMessageId)).toBe('failed');
   });
 
+  /**
+   * Fix round A, finding 5 — `transcribeInbound`'s `'too_large'` outcome,
+   * wired through the door. 21 MB mirrors the production byte cap
+   * (`MAX_AUDIO_DOWNLOAD_BYTES`, 20 MB in `transcribe.ts`) the same way
+   * `ingest.test.ts` mirrors `MAX_ORIGINAL_BYTES` — not imported, since the
+   * constant is module-private, but matched in order of magnitude so this
+   * test fails honestly if that constant ever changes without this one
+   * being revisited.
+   */
+  it('tells the owner when the recording exceeds the byte cap, independent of the provider', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    const msg = audioMsg({ senderNumber: PRINCIPAL_NUMBER });
+    msg.downloadAudio = async () => ({
+      bytes: Buffer.alloc(21 * 1024 * 1024, 0x61),
+      mimeType: 'audio/ogg',
+      seconds: 10,
+    });
+    gateway.enqueue(msg);
+
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      provider: neverCalledProvider,
+      planner: neverCalled,
+    });
+
+    expect(result.refused).toBe(1);
+    expect(messenger.sentTexts).toHaveLength(1);
+    expect(messenger.sentTexts[0]).toContain('גדולה מדי');
+    expect(await stateOf(msg.providerMessageId)).toBe('failed');
+  });
+
   it('tells the owner rather than staying silent when no transcription provider is configured', async () => {
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
@@ -567,5 +606,48 @@ describe('runWhatsAppDoor', () => {
       [BUSINESS],
     );
     expect(rows[0]?.n).toBe('0');
+  });
+
+  /**
+   * Fix round A, finding 3. `gateway.pollOnce()` is the FIRST thing this
+   * door does on every pass, inside `schedulerPass`'s one sequential await
+   * chain — a wedged provider here freezes the entire pass, not just the
+   * WhatsApp loops. `pollTimeoutMs` stands in for `POLL_TIMEOUT_MS` (60s in
+   * production) so this proves the race without waiting out a real
+   * 60-second timer, the same pattern `transcribeInbound`'s `timeoutMs`
+   * already uses for its own 60s default.
+   */
+  it('gives up on a gateway.pollOnce() that never settles, within the deadline, instead of hanging forever', async () => {
+    const messenger = createFakeMessenger();
+    const hangingGateway: WhatsAppGateway = {
+      async canSendFreeform() {
+        return true;
+      },
+      async sendMessage() {
+        return { messageId: 'x', state: 'sent' };
+      },
+      async health() {
+        return { state: 'connected', since: new Date().toISOString() };
+      },
+      onInbound() {
+        // Never actually registered against — `pollOnce` never resolves to
+        // let anything drive it.
+      },
+      pollOnce(): Promise<number> {
+        return new Promise(() => {
+          /* deliberately never settles */
+        });
+      },
+    };
+
+    await expect(
+      runWhatsAppDoor({
+        gateway: hangingGateway,
+        messenger,
+        businessId: BUSINESS,
+        planner: neverCalled,
+        pollTimeoutMs: 25,
+      }),
+    ).rejects.toThrow(/did not finish within/);
   });
 });

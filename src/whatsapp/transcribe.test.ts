@@ -139,6 +139,53 @@ describe('transcribeInbound', () => {
     expect(outcome).toEqual({ status: 'too_long', seconds: 10 });
   });
 
+  /**
+   * Fix round A, finding 5. The duration check alone cannot catch an
+   * oversized download: `seconds` is read FROM the already-downloaded
+   * result, so a provider reporting a short duration for a large payload
+   * sails past `maxSeconds` entirely. `maxBytes: 5` stands in for
+   * `MAX_AUDIO_DOWNLOAD_BYTES` (20 MB in production) so this proves the
+   * refusal is genuinely keyed on the byte count — `audioMsg`'s fixed
+   * `'fake-audio-bytes'` payload (17 bytes) exceeds it — not on `seconds`,
+   * which here reports a perfectly ordinary 10.
+   */
+  it('refuses audio whose download exceeds the byte cap, independent of its reported duration', async () => {
+    const outcome = await transcribeInbound(audioMsg({ seconds: 10 }), 'principal', {
+      businessId: BUSINESS, provider: ok, maxBytes: 5,
+    });
+    expect(outcome).toEqual({ status: 'too_large', bytes: 'fake-audio-bytes'.length });
+  });
+
+  /**
+   * Fix round A, finding 5. `msg.downloadAudio()` carried the identical
+   * unbounded-await hazard this module's own docblock already named for the
+   * provider call, left unguarded. `downloadTimeoutMs` stands in for
+   * `DOWNLOAD_TIMEOUT_MS` (60s in production) so this proves the race
+   * without waiting out a real 60-second timer — same pattern as the
+   * provider-hang test below.
+   *
+   * This REJECTS rather than returning `{ status: 'failed' }` — the
+   * download call sits outside `transcribeInbound`'s own `try` (same as a
+   * download that throws for any other reason; see
+   * `whatsapp-door.test.ts`'s "tells the owner and settles failed when
+   * downloading the recording itself throws", which already relies on this
+   * propagating as a throw for the DOOR's own `catch` to handle). What
+   * matters here is that it rejects WITHIN the deadline instead of hanging
+   * forever — a media URL that never answers must not freeze the whole
+   * `schedulerPass` sequential await chain this runs inside.
+   */
+  it('gives up on a download that never settles, within the deadline, instead of hanging forever', async () => {
+    const msg = audioMsg();
+    msg.downloadAudio = () => new Promise(() => { /* never settles */ });
+    await expect(
+      transcribeInbound(msg, 'principal', {
+        businessId: BUSINESS,
+        provider: ok,
+        downloadTimeoutMs: 25,
+      }),
+    ).rejects.toThrow(/did not finish within/);
+  });
+
   /** Never guesses. A failed transcription is a failure, not a best-effort string. */
   it('reports failure rather than inventing text when the provider throws', async () => {
     const outcome = await transcribeInbound(audioMsg(), 'principal', {

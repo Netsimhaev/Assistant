@@ -392,6 +392,22 @@ export async function buildRuntime(
                     // that failed to send a pass ago — exactly the case
                     // `checkWhatsAppHealth` produces when it leaves the
                     // transition unrecorded and tries again next pass.
+                    //
+                    // This function never reads `current.since` itself — it
+                    // only hashes whatever `body` the caller built. The
+                    // caller (`checkWhatsAppHealth`, `scheduler.ts`) is
+                    // therefore the one load-bearing fact for this key: fix
+                    // round A found that its `body` carried `current.state`
+                    // but not `current.since`, so two genuinely distinct
+                    // outages reporting the SAME state word hashed to the
+                    // SAME key, and the mail server dropped the second as a
+                    // duplicate of the first — silence, one layer past every
+                    // test, because a test counting `sendAlert` calls cannot
+                    // see a Message-ID collision. `checkWhatsAppHealth` now
+                    // embeds `since` in `body` for exactly this reason: a
+                    // retry of the SAME outage must still hash identically
+                    // (same `since`, same `state`), while two different
+                    // outages — even under the same state word — must not.
                     idempotencyKey: `whatsapp-health-alert:${canonicalHash({ subject, body })}`,
                     signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
                   },

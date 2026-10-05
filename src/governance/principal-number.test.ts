@@ -29,6 +29,19 @@ describe('authorityNumberKey', () => {
     expect(authorityNumberKey('not a number')).toBeNull();
     expect(authorityNumberKey('+972')).toBeNull();
   });
+
+  /**
+   * Fix round A, finding 2 — this exact string, not a stand-in for it. A
+   * carried instruction in the execution ledger told the future gateway
+   * task to hand `NormalizedInboundMessage.senderNumber` up in "the bare
+   * international form", naming `972501234567` as the example — digits
+   * only, no leading `+`. This is that shape. Pinned here so a future
+   * change to this function's `+` requirement cannot silently reopen the
+   * mismatch the ledger correction closed.
+   */
+  it('refuses the bare international form the wrong ledger instruction once named', () => {
+    expect(authorityNumberKey('972541234567')).toBeNull();
+  });
 });
 
 describe('isPrincipalSender', () => {
@@ -66,5 +79,19 @@ describe('isPrincipalSender', () => {
     const charter = charterWithPrincipalNumber('+972541234567');
     expect(isPrincipalSender(charter, '0541234567')).toBe(false);
     expect(isPrincipalSender(charter, '')).toBe(false);
+  });
+
+  /**
+   * Fix round A, finding 2 — the regression this would have been. The
+   * charter stores (and `signCharter` only accepts, `charter/sign.test.ts`)
+   * the principal's WhatsApp number in the leading-`+` form. A gateway
+   * built from the wrong, now-corrected ledger instruction would have
+   * handed `senderNumber` up bare instead — and every message from the
+   * owner's own number would have failed this check, filed as a
+   * stranger's, with no error anywhere to explain why.
+   */
+  it('does not recognise the owner under the bare international form a wrong ledger instruction would have produced', () => {
+    const charter = charterWithPrincipalNumber('+972541234567');
+    expect(isPrincipalSender(charter, '972541234567')).toBe(false);
   });
 });

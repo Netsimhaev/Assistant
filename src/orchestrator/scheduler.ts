@@ -202,6 +202,22 @@ interface WhatsAppHealthRecord {
    * ever succeeds, and must not repeat on every retry in between.
    */
   audited: boolean;
+  /**
+   * Whether this exact `(since, state)` outage was first seen directly
+   * after a record of `state: 'connected'` — fix round A, finding 1.
+   * Decided ONCE, the moment this pair is first observed, and carried
+   * unchanged through every retry via this field — never recomputed from
+   * `state` above on a later call. That distinction matters because a
+   * retry's own write already overwrites `state` with THIS outage's word
+   * (`'reconnecting'`, say), not the `'connected'` period it followed; a
+   * naive `record.state === 'connected'` check would therefore read `true`
+   * on the first attempt and `false` on every retry of the SAME outage —
+   * silently rewriting "the bridge, which had been connected, disconnected"
+   * into "the bridge is not connected" the moment delivery first failed,
+   * for an outage whose history never changed. Meaningless (and unused) on
+   * a `'connected'` record itself.
+   */
+  followedConnected: boolean;
 }
 
 /**
@@ -279,6 +295,41 @@ async function recordWhatsAppHealthNotifyFailure(
 }
 
 /**
+ * How long `checkWhatsAppHealth` waits for `gateway.health()` before giving
+ * up — fix round A, finding 3. A status probe, not real work: the bridge is
+ * either up and answers almost immediately, or it is down, and the whole
+ * point of this call is to find that out fast enough to alert on it. Matches
+ * the "courtesy acknowledgement" class (`SEND_TIMEOUT_MS`/`NOTIFY_TIMEOUT_MS`/
+ * `ALERT_TIMEOUT_MS`, all 5s) rather than the 60s "real external work" class
+ * (`ADAPTER_TIMEOUT_MS`, `TRANSCRIBE_TIMEOUT_MS`) — a health check that takes
+ * tens of seconds to answer is itself evidence of trouble, not a call worth
+ * waiting out.
+ */
+const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+
+/**
+ * Bound a promise `gateway.health()` might never settle.
+ *
+ * A sixth local copy of the pattern `notify.ts`, `messenger.ts`,
+ * `run-plan.ts`, `oauth-token.ts` and `runtime.ts`'s own `withAlertDeadline`
+ * each already carry: an `AbortSignal` is advisory only, and nothing forces
+ * a gateway implementation — or a test double — to check it, so racing the
+ * call itself against an independent timer is what actually binds the wait.
+ */
+function withHealthCheckDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`gateway.health() did not finish within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+/**
  * §7.4 — a bridge that WAS connected and is not must reach the owner by
  * EMAIL, never by WhatsApp (WhatsApp is the very thing that is down).
  *
@@ -331,6 +382,23 @@ async function recordWhatsAppHealthNotifyFailure(
  * silence — the opposite failure from everything else this mechanism
  * guards against — and bounding it needs a minimum interval between
  * alerts, a mechanism this task does not add.
+ *
+ * **Fix round A, finding 1 — the outgoing MESSAGE was still keyed on the
+ * state word alone, even though the health RECORD above has been keyed on
+ * the `(since, state)` pair since round 3.** `sendAlert`'s idempotency key
+ * (`runtime.ts`) hashes `{ subject, body }`, and `body` carried
+ * `current.state` but not `current.since`. Two genuinely distinct outages
+ * reporting the same state word therefore produced the identical
+ * Message-ID; the receiving server read the second as a duplicate of the
+ * first; `sendAlert` returned `{ ok: true }` for a message that never
+ * actually reached the owner's inbox a second time; and this function
+ * recorded `delivered: true` for an outage nobody was told about. `body`
+ * now embeds `since` for exactly this reason. The same fix also corrects a
+ * sentence that was never conditioned on `observedConnectedBefore`: "the
+ * bridge, which had been connected, disconnected" is true only when this
+ * process itself last recorded a `'connected'` episode for this business —
+ * false on the very first observation of an already-down bridge (round 3's
+ * own addition) and false on a worsening between two already-down states.
  */
 async function checkWhatsAppHealth(
   gateway: { health(): Promise<GatewayHealth> },
@@ -340,7 +408,19 @@ async function checkWhatsAppHealth(
 ): Promise<void> {
   let current: GatewayHealth;
   try {
-    current = await gateway.health();
+    // Raced against `HEALTH_CHECK_TIMEOUT_MS`, not awaited directly — fix
+    // round A, finding 3. F6 above already explains why a throw here is
+    // swallowed rather than propagated; before this round, nothing made a
+    // WEDGED health probe throw at all. `health()` takes no `AbortSignal`,
+    // same reason as every other call this project races this way: a
+    // signal is advisory, and nothing forces a real GREEN-API client — or a
+    // test double — to check it. This call sits inside `schedulerPass`'s
+    // one sequential await chain (same as `gateway.pollOnce()` in
+    // `whatsapp-door.ts` and `msg.downloadAudio()`/the provider call in
+    // `transcribe.ts`); an unbounded await here freezes `expireOverdue` and
+    // every due plan for as long as the probe hangs — on the exact call
+    // whose entire job is to notice the bridge is unhealthy.
+    current = await withHealthCheckDeadline(gateway.health(), HEALTH_CHECK_TIMEOUT_MS);
   } catch {
     // F6 — diagnostic, not a gate. Left exactly as it was; no read, no write.
     return;
@@ -350,7 +430,13 @@ async function checkWhatsAppHealth(
     // Reconnected (or still connected, including the very first observation
     // ever made for this business). Nothing pending, whether or not an
     // earlier outage's alert ever actually went out.
-    lastWhatsAppHealth.set(businessId, { since: current.since, state: 'connected', delivered: true, audited: true });
+    lastWhatsAppHealth.set(businessId, {
+      since: current.since,
+      state: 'connected',
+      delivered: true,
+      audited: true,
+      followedConnected: true, // unused on a 'connected' record itself — see the field's own docblock
+    });
     return;
   }
 
@@ -377,9 +463,53 @@ async function checkWhatsAppHealth(
     record !== undefined && record.since === current.since && record.state === current.state; // implies !record.delivered, from the check above
   const alreadyAudited = isSameUndeliveredEpisode && record.audited;
 
-  const subject = 'התנתק הגשר לוואטסאפ';
+  // Fix round A, finding 1 — decided ONCE, when this `(since, state)` pair
+  // is first seen, and carried unchanged through every retry via
+  // `record.followedConnected` (see that field's own docblock on why
+  // recomputing it from `record.state` on a later call would be wrong: a
+  // retry's own earlier write already overwrote `state` with THIS outage's
+  // word, not the `'connected'` period it followed). On first sight of a
+  // pair, true only when THIS process actually recorded a `'connected'`
+  // episode for this business right before it — fix round 3 made the very
+  // first observation ever made for a business alert even when the bridge
+  // is already down (`lastWhatsAppHealth`'s own docblock); for that case,
+  // and for a worsening from one already-down state to another, this
+  // process never actually observed a connected period to have dropped
+  // FROM — so claiming "the bridge, which had been connected, disconnected"
+  // would be a sentence this process cannot back up with anything it saw.
+  const followedConnected = isSameUndeliveredEpisode
+    ? record.followedConnected
+    : record !== undefined && record.state === 'connected';
+
+  // Formatted with second-level precision, not `dateStyle`/`timeStyle`'s
+  // usual minute granularity — fix round A's own mutation caught this: two
+  // outages a few milliseconds apart (an unlikely but real shape; see
+  // `WhatsAppHealthRecord`'s own docblock on why `since` alone, at full
+  // precision, is what tells two episodes apart) rounded to the SAME
+  // displayed minute, which would have reintroduced the identical-body
+  // collision this whole fix exists to close, one layer up from where the
+  // first version of it lived.
+  const since = new Intl.DateTimeFormat('he-IL', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3,
+  }).format(new Date(current.since));
+  const subject = followedConnected ? 'התנתק הגשר לוואטסאפ' : 'הגשר לוואטסאפ אינו מחובר';
   const body =
-    `הגשר לוואטסאפ, שהיה מחובר, התנתק (מצב נוכחי: ${current.state}). ` +
+    (followedConnected
+      ? `הגשר לוואטסאפ, שהיה מחובר, התנתק`
+      : `הגשר לוואטסאפ אינו מחובר`) +
+    // `since` is embedded here, not only in `current.state` above, because
+    // the outgoing Message-ID is derived from this exact text
+    // (`whatsapp-health-alert:${canonicalHash({ subject, body })}` in
+    // `runtime.ts`) — fix round A, finding 1. Without it, two genuinely
+    // distinct outages that happen to report the SAME state word (two
+    // separate `'reconnecting'` episodes, say) hash to the identical key,
+    // the mail server treats the second as a duplicate of the first, and
+    // the owner never hears about it. A retry of the SAME outage must still
+    // produce the identical body — and does, since `since` and `state`
+    // together are exactly the pair this episode is keyed on throughout
+    // this module (`WhatsAppHealthRecord`'s own docblock).
+    ` (מצב נוכחי: ${current.state}, מאז: ${since}). ` +
     `הודעות נכנסות בוואטסאפ לא מתקבלות כרגע, ואי אפשר להשתמש בערוץ הזה עד שהחיבור יחזור.`;
 
   if (notify?.sendAlert === undefined) {
@@ -391,7 +521,7 @@ async function checkWhatsAppHealth(
           'This is the only row for this outage; the next scheduler pass will try again silently.',
       );
     }
-    lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: false, audited: true });
+    lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: false, audited: true, followedConnected });
     return;
   }
 
@@ -408,12 +538,12 @@ async function checkWhatsAppHealth(
           `the next scheduler pass will try to send again silently.`,
       );
     }
-    lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: false, audited: true });
+    lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: false, audited: true, followedConnected });
     return;
   }
 
   // Delivered.
-  lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: true, audited: true });
+  lastWhatsAppHealth.set(businessId, { since: current.since, state: current.state, delivered: true, audited: true, followedConnected });
 }
 
 export interface SchedulerPassResult {

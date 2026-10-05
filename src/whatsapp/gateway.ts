@@ -13,6 +13,35 @@
  */
 export interface NormalizedInboundMessage {
   providerMessageId: string;
+  /**
+   * **Required form: leading `+`, international, digits only after
+   * normalisation — e.g. `+972501234567`, never `972501234567` and never a
+   * national form (`0501234567`).** This is the exact shape
+   * `authorityNumberKey` (`src/governance/principal-number.ts`) accepts and
+   * nothing else: `authorityNumberKey` rejects any value that does not
+   * start with `+`, so a gateway that hands this up bare-digit will make
+   * `isPrincipalSender` return `false` for every message the owner's own
+   * number sends — his instructions filed as a stranger's, nothing ever
+   * answered, no error anywhere to say why. This requirement was carried
+   * as prose in a planning ledger and drifted from the code it described;
+   * it is stated here, on the interface, so a future gateway implementer
+   * reads it where the contract actually lives — see fix round A, finding 2.
+   *
+   * **Two further requirements, both from the security review that caught
+   * the format drift:**
+   * - Must be the individual participant who sent the message, never a
+   *   group-chat id. `isPrincipalSender` compares this against one
+   *   person's number; a group id compared the same way either never
+   *   matches (safe but useless) or, if a provider ever reuses the shape,
+   *   could let a group stand in for a person it is not.
+   * - Must come from a message actually addressed to this assistant's own
+   *   WhatsApp number, never a provider's echo of the owner's OWN outgoing
+   *   messages (some providers surface a device's sent messages through
+   *   the same inbound stream). An echoed outgoing message would carry the
+   *   owner's own number as `senderNumber` by construction — indistinguishable
+   *   from a genuine inbound message from him — and get replayed back at
+   *   him as if he had just sent it.
+   */
   senderNumber: string;
   body: string | null;
   /** `null` for a plain text message. `'audio'` is the only kind Task 6 acts on. */

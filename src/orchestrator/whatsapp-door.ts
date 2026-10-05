@@ -95,6 +95,19 @@
  * `providerTimestamp` that fails to parse (`NaN`) never wins a comparison —
  * fix round 1's Minor 10 — the tie-break is what decides instead, because a
  * value this door could not read is never a permissive "sort wherever".
+ *
+ * **`gateway.pollOnce()` is raced against a deadline, not awaited directly —
+ * fix round A, finding 3.** This is the first thing `runWhatsAppDoor` does
+ * on every pass, inside `schedulerPass`'s one sequential await chain
+ * alongside `expireOverdue` and every due plan. `WhatsAppGateway.pollOnce`
+ * takes no `AbortSignal` — same reason as every other external call this
+ * project races this way (the gateway's own `health` check in
+ * `scheduler.ts`, `msg.downloadAudio()` and the provider call in
+ * `transcribe.ts`): a signal is advisory, and nothing forces a provider
+ * implementation, or a test double, to check it. A wedged provider here
+ * does not delay one message; it freezes the entire pass — approval fuses
+ * stop burning, no due plan runs, nothing closes — for as long as the
+ * provider hangs.
  */
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
@@ -129,6 +142,41 @@ export interface DoorResult {
 /** Shown to the owner's own recording, quoted back verbatim, ahead of whatever happened next. */
 const TRANSCRIPT_PREFIX = 'שמעתי: ';
 
+/**
+ * How long `runWhatsAppDoor` waits for `gateway.pollOnce()` before giving up
+ * — fix round A, finding 3. Matches `ADAPTER_TIMEOUT_MS`
+ * (`src/orchestrator/run-plan.ts`) and `TRANSCRIBE_TIMEOUT_MS`
+ * (`src/whatsapp/transcribe.ts`) rather than the 5s "courtesy
+ * acknowledgement" class: draining a provider's notification queue is real
+ * external work, not a quick up-or-down probe, and a batch of messages can
+ * legitimately take a few seconds against a healthy provider.
+ */
+const POLL_TIMEOUT_MS = 60_000;
+
+/**
+ * Bound a promise `gateway.pollOnce()` might never settle.
+ *
+ * A local copy of the pattern this project already carries at `notify.ts`,
+ * `messenger.ts`, `run-plan.ts`, `oauth-token.ts`, `runtime.ts`'s
+ * `withAlertDeadline`, `scheduler.ts`'s `withHealthCheckDeadline`, and
+ * `transcribe.ts`'s own `withDeadline`: an `AbortSignal` is advisory only,
+ * and nothing forces a gateway implementation — or a test double — to
+ * check it, so racing the call itself against an independent timer is what
+ * actually binds the wait.
+ */
+function withPollDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`gateway.pollOnce() did not finish within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
 const NO_TRANSCRIBER =
   'אין לי כרגע אפשרות לתמלל הקלטות. אפשר לכתוב את ההודעה בטקסט?';
 const TRANSCRIPTION_CAPPED =
@@ -152,6 +200,10 @@ const SOMETHING_WENT_WRONG =
 function tooLongMessage(seconds: number): string {
   return `ההקלטה ארוכה מדי (${seconds} שניות). אפשר לכתוב את ההודעה בטקסט?`;
 }
+
+/** `transcribeInbound`'s `'too_large'` outcome — see its own docblock on why this is a separate check from duration. */
+const RECORDING_TOO_LARGE =
+  'ההקלטה גדולה מדי. אפשר לכתוב את ההודעה בטקסט?';
 
 /**
  * The sentence the owner reads, built from whatever `runInstruction` already
@@ -335,6 +387,10 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         await tellOwnerAndSettle(ctx, stored.id, tooLongMessage(transcribed.seconds));
         return 'refused';
       }
+      if (transcribed.status === 'too_large') {
+        await tellOwnerAndSettle(ctx, stored.id, RECORDING_TOO_LARGE);
+        return 'refused';
+      }
       if (transcribed.status === 'capped') {
         await tellOwnerAndSettle(ctx, stored.id, TRANSCRIPTION_CAPPED);
         return 'refused';
@@ -497,6 +553,13 @@ export async function runWhatsAppDoor(options: {
    * already in hand.
    */
   charter?: BusinessCharter;
+  /**
+   * Overrides `POLL_TIMEOUT_MS` for one call. Production never passes this;
+   * it exists so a test can prove the race without waiting out a real 60s
+   * timer — the same escape hatch `transcribeInbound`'s `timeoutMs` and
+   * `downloadTimeoutMs` already give their own deadlines, same reason.
+   */
+  pollTimeoutMs?: number;
 }): Promise<DoorResult> {
   const businessId = options.businessId ?? config.businessId;
   const { gateway, messenger } = options;
@@ -529,7 +592,7 @@ export async function runWhatsAppDoor(options: {
     collected.push(msg);
   });
 
-  const polled = await gateway.pollOnce();
+  const polled = await withPollDeadline(gateway.pollOnce(), options.pollTimeoutMs ?? POLL_TIMEOUT_MS);
   const ordered = [...collected].sort(compareInbound);
 
   const result: DoorResult = { polled, instructed: 0, recordedOnly: 0, refused: 0 };

@@ -20,7 +20,7 @@ import type { ApprovalNotifier } from '../governance/notify.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import type { Plan } from '../domain/plan.js';
 import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
-import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
+import type { GatewayHealth, NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { createMailAdapter, type MailMessage } from './adapters/mail.js';
@@ -42,6 +42,8 @@ const NO_SENDALERT_BUSINESS = 'test-business-health-no-sendalert';
 const PROBE_THROW_MID_OUTAGE_BUSINESS = 'test-business-health-probe-throw-mid-outage';
 const DOWN_AT_BOOT_BUSINESS = 'test-business-health-down-at-boot';
 const WORSENING_WORD_BUSINESS = 'test-business-health-worsening-word';
+const HEALTH_HANG_BUSINESS = 'test-business-health-hang';
+const DISTINCT_BODY_BUSINESS = 'test-business-health-distinct-body';
 const PREFIX = 'TEST_CRED_';
 // Fixed clock, matching run-due.test.ts / scheduler-runs-plans.test.ts: an
 // evening wall-clock run of this suite would otherwise fall inside quiet
@@ -699,5 +701,107 @@ describe('schedulerPass — WhatsApp wiring', () => {
     await schedulerPass({ businessId: WORSENING_WORD_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
     expect(calls).toHaveLength(2);
     expect(calls[1]?.body).toContain('banned');
+  });
+
+  /**
+   * Fix round A, finding 3. `gateway.health()` is raced against
+   * `HEALTH_CHECK_TIMEOUT_MS` (5s) instead of awaited directly. Before this
+   * round, nothing made a wedged PROBE throw at all — F6's own test above
+   * ("runs the door even when gateway.health() itself throws") proves the
+   * `catch` tolerates a throw, but a probe that never settles never reached
+   * that `catch`, and froze `schedulerPass`'s whole sequential await chain
+   * (the door, every due plan, every close) for as long as it hung.
+   * `HEALTH_CHECK_TIMEOUT_MS` is small enough to wait out for real, the
+   * same way `messenger.test.ts` waits out the 5s `SEND_TIMEOUT_MS` rather
+   * than overriding it — no test-only override exists for this private
+   * function's constant, and none is needed at 5s.
+   */
+  it('does not hang the whole scheduler pass when gateway.health() never settles', async () => {
+    await installCharter(buildCharter(), { businessId: HEALTH_HANG_BUSINESS });
+    const gateway = createFakeGateway();
+    gateway.health = (): Promise<GatewayHealth> => new Promise<never>(() => {
+      /* deliberately never settles */
+    });
+    gateway.enqueue(principalMessage('תשלחי לדנה'));
+
+    const started = Date.now();
+    const pass = await schedulerPass({
+      businessId: HEALTH_HANG_BUSINESS,
+      now: NOON,
+      inbox: null,
+      runtime: {
+        registry: new AdapterRegistry([]),
+        credentials: envCredentials({}, PREFIX),
+        warnings: [],
+        whatsapp: { gateway },
+      },
+      whatsappPlanner: plannedWithMailPlan,
+    });
+    const elapsedMs = Date.now() - started;
+
+    expect(elapsedMs).toBeLessThan(9_000);
+    // The door still ran this pass — a wedged health PROBE must not refuse
+    // the owner's own instruction, the same property F6's throw test
+    // already pins, now proven for a HANG rather than a throw.
+    expect(pass.whatsappError).toBeNull();
+    expect(pass.whatsappDoor?.instructed).toBe(1);
+  }, 15_000);
+
+  /**
+   * Fix round A, finding 1 — the alert BODY, not just the in-memory health
+   * record, must distinguish between two outages that happen to share a
+   * state word. `sendAlert`'s real idempotency key (`runtime.ts`) is
+   * `canonicalHash({ subject, body })`; before this round `body` carried
+   * `current.state` but not `current.since`, so two genuinely distinct
+   * outages under the same word hashed to the IDENTICAL key — the real
+   * transport would mint the same Message-ID twice, the receiving server
+   * would read the second as a duplicate of the first, and `sendAlert`
+   * still returns `{ ok: true }` either way. A test counting `sendAlert`
+   * calls (as every other test in this file does) cannot see that at all —
+   * this asserts on the BODY TEXT a real transport would hash instead.
+   */
+  it('gives two outages sharing a state word different alert bodies, and the same outage retried an identical one', async () => {
+    await installCharter(buildCharter(), { businessId: DISTINCT_BODY_BUSINESS });
+    const gateway = createFakeGateway();
+    const { calls, notify, failNext } = controllableNotifier();
+    const baseRuntime: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, PREFIX),
+      warnings: [],
+      whatsapp: { gateway },
+      ...(notify !== undefined ? { notify } : {}),
+    };
+
+    // Pass 1 — connected baseline.
+    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+
+    // Pass 2 — outage 1 begins (since = T1, state = 'reconnecting'); the
+    // send fails, so a retry of the SAME outage happens on pass 3.
+    const t1 = NOON.toISOString();
+    gateway.setHealth({ state: 'reconnecting', since: t1 });
+    failNext();
+    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(1);
+
+    // Pass 3 — still outage 1 (same `since`, same word), delivery succeeds.
+    // This is a RETRY of the SAME outage — the body must be byte-identical
+    // to pass 2's, or a real transport would (correctly) refuse to treat it
+    // as a duplicate and the owner would get a second email for one outage.
+    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.body).toBe(calls[0]?.body);
+
+    // Pass 4 — reconnect, to close out outage 1 cleanly.
+    gateway.setHealth({ state: 'connected', since: new Date(NOON.getTime() + 1).toISOString() });
+    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+
+    // Pass 5 — outage 2 begins, with the IDENTICAL state word 'reconnecting'
+    // but a DIFFERENT `since`. This must produce a DIFFERENT body than
+    // outage 1's — the exact property that was missing before this fix.
+    const t2 = new Date(NOON.getTime() + 2).toISOString();
+    gateway.setHealth({ state: 'reconnecting', since: t2 });
+    await schedulerPass({ businessId: DISTINCT_BODY_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
+    expect(calls).toHaveLength(3);
+    expect(calls[2]?.body).not.toBe(calls[0]?.body);
   });
 });

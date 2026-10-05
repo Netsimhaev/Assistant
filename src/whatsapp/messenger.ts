@@ -81,7 +81,19 @@ export interface BossMessenger {
  */
 export interface CreateBossMessengerOptions {
   gateway: WhatsAppGateway;
-  /** The principal's number, already validated. From `principalWhatsAppKey`. */
+  /**
+   * The principal's number, already validated. From `principalWhatsAppKey`
+   * (`src/governance/principal-number.ts`), which returns
+   * `authorityNumberKey`'s own output — **digits only, no leading `+`**
+   * (`authorityNumberKey` strips the sigil after validating it is present).
+   * This is deliberately a different shape from
+   * `NormalizedInboundMessage.senderNumber` (leading `+`, see that field's
+   * own docblock): one is the OUTBOUND form this module hands to
+   * `gateway.sendMessage`, the other is the INBOUND form a gateway hands up
+   * for the principal check to read. Fix round A, finding 2 — stated
+   * explicitly, on both interfaces, because the two formats living only in
+   * a planning document is exactly how they drifted apart once already.
+   */
   contactId: string;
   businessId: string;
   now?: () => Date;
