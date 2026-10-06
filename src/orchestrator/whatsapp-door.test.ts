@@ -1004,6 +1004,40 @@ describe('runWhatsAppDoor', () => {
     expect(messenger.sentTexts[0]).toContain('תשלחי למוטי');
   });
 
+  /**
+   * The echo is the one thing the owner reads to check what she heard BEFORE
+   * anything runs, and a right-to-left override inside a transcript
+   * rearranges what he reads while leaving the bytes that will be acted on
+   * untouched — so the sentence he approves of can differ from the one about
+   * to be planned. Same hazard `escLabel` was written for on the dashboard,
+   * same single owner (`util/bidi.ts`).
+   *
+   * The positive half is load-bearing, not decoration: a strip that ate the
+   * whole transcript would satisfy the absence check on its own, and then
+   * this test would be asserting that the owner is told nothing.
+   */
+  it('strips direction overrides from the transcript it quotes back', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER }));
+
+    const provider = async () => ({ text: 'תשלחי למוטי‮000,5 ש"ח' });
+
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      provider,
+      planner: plannedWith(mailPlan()),
+    });
+
+    expect(result.instructed).toBe(1);
+    expect(messenger.sentTexts).toHaveLength(1);
+    expect(messenger.sentTexts[0]).not.toContain('‮');
+    expect(messenger.sentTexts[0]).toContain('תשלחי למוטי');
+    expect(messenger.sentTexts[0]).toContain('000,5');
+  });
+
   it('tells the owner it could not read a recording rather than staying silent', async () => {
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();

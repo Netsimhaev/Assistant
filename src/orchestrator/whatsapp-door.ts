@@ -130,6 +130,7 @@ import type { InstructionRecord } from '../governance/instructions.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import { authorityNumberKey, isPrincipalSender } from '../governance/principal-number.js';
+import { stripBidiControls } from '../util/bidi.js';
 import type { InstructionTextOrigin } from '../governance/typed-recipients.js';
 import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
@@ -295,8 +296,25 @@ function composeAck(outcome: InstructionOutcome): string {
   return parts.join('\n\n');
 }
 
+/**
+ * **The echo is bidi-stripped, and this is the place on the whole path where
+ * that matters most.** `transcript` is model output from a third-party
+ * provider over somebody's audio, and `identityNote` (composed into `rest`)
+ * can carry a contact name that reached memory from a document someone else
+ * wrote. A right-to-left override inside either rearranges what the owner
+ * READS while leaving the bytes that will be ACTED ON untouched — so the echo
+ * he checks before anything runs can show a different instruction from the one
+ * about to be planned. That is exactly the hazard `escLabel` was written for
+ * on the dashboard (`dashboard/views.ts`), and it is the same hazard here:
+ * WhatsApp renders these marks too.
+ *
+ * `stripBidiControls`, never a second copy of the character class — the single
+ * owner is `util/bidi.ts`, extracted in Task 12 precisely so two call sites
+ * cannot drift apart on which codepoints count.
+ */
 function withTranscriptEcho(isAudio: boolean, transcript: string, rest: string): string {
-  return isAudio ? `${TRANSCRIPT_PREFIX}"${transcript}"\n\n${rest}` : rest;
+  if (!isAudio) return stripBidiControls(rest);
+  return `${TRANSCRIPT_PREFIX}"${stripBidiControls(transcript)}"\n\n${stripBidiControls(rest)}`;
 }
 
 /**
