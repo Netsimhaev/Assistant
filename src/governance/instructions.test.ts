@@ -41,7 +41,7 @@ describe('the instruction record', () => {
     // change what counts as "named in the instruction".
     const text = 'תשלחי לדנה  \ndana@example.com את ההצעה';
 
-    const saved = await saveInstruction({ jobId, text }, { businessId: BUSINESS });
+    const saved = await saveInstruction({ textOrigin: 'typed', jobId, text }, { businessId: BUSINESS });
     const read = await loadInstructionForJob(jobId, { businessId: BUSINESS });
 
     expect(saved.text).toBe(text);
@@ -53,7 +53,7 @@ describe('the instruction record', () => {
   it('records an answer beside the instruction, not in place of it', async () => {
     const jobId = await aBossJob();
     const saved = await saveInstruction(
-      { jobId, text: 'תשלחי לדנה את ההצעה' },
+      { textOrigin: 'typed', jobId, text: 'תשלחי לדנה את ההצעה' },
       { businessId: BUSINESS },
     );
 
@@ -73,7 +73,7 @@ describe('the instruction record', () => {
     // only the database CHECK caught it, leaving the owner with a raw
     // Postgres error instead of a Hebrew sentence.
     await expect(
-      saveInstruction({ jobId, text: '   ' }, { businessId: BUSINESS }),
+      saveInstruction({ textOrigin: 'typed', jobId, text: '   ' }, { businessId: BUSINESS }),
     ).rejects.toThrow('ההוראה ריקה');
   });
 
@@ -84,24 +84,24 @@ describe('the instruction record', () => {
     // is what tells the owner where a whole document belongs instead of the
     // instruction box. A Postgres CHECK violation carries neither.
     await expect(
-      saveInstruction({ jobId, text: tooLong }, { businessId: BUSINESS }),
+      saveInstruction({ textOrigin: 'typed', jobId, text: tooLong }, { businessId: BUSINESS }),
     ).rejects.toThrow(/4000/);
     await expect(
-      saveInstruction({ jobId, text: tooLong }, { businessId: BUSINESS }),
+      saveInstruction({ textOrigin: 'typed', jobId, text: tooLong }, { businessId: BUSINESS }),
     ).rejects.toThrow(/תיקיית הקליטה/);
   });
 
   it('never returns another business\'s instruction', async () => {
     const jobId = await aBossJob();
-    await saveInstruction({ jobId, text: 'תשלחי לדנה' }, { businessId: BUSINESS });
+    await saveInstruction({ textOrigin: 'typed', jobId, text: 'תשלחי לדנה' }, { businessId: BUSINESS });
     expect(await loadInstructionForJob(jobId, { businessId: 'someone-else' })).toBeNull();
   });
 
   it('refuses a second instruction on the same job', async () => {
     const jobId = await aBossJob();
-    await saveInstruction({ jobId, text: 'ראשונה' }, { businessId: BUSINESS });
+    await saveInstruction({ textOrigin: 'typed', jobId, text: 'ראשונה' }, { businessId: BUSINESS });
     await expect(
-      saveInstruction({ jobId, text: 'שנייה' }, { businessId: BUSINESS }),
+      saveInstruction({ textOrigin: 'typed', jobId, text: 'שנייה' }, { businessId: BUSINESS }),
     ).rejects.toThrow();
     const { rows } = await getPool().query(`SELECT 1 FROM boss_instructions`);
     expect(rows).toHaveLength(1);

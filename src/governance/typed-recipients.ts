@@ -17,10 +17,43 @@
  * Spec §6 records what it does not protect against — it sees that an address
  * is in the text, not who put it there — and the class allowlist below is the
  * hedge the owner chose alongside it.
+ *
+ * **The second source asks TWO questions, not one, and for a long while it
+ * only asked the first.** "The owner typed this address" is the conjunction
+ * of *these bytes appear in the instruction* (`appearsVerbatimIn`, below) and
+ * *the instruction's bytes are the owner's own typing* (`textOrigin`). The
+ * dashboard's form was the only door when this module was written, so the
+ * second question had one answer everywhere and nobody had to ask it. The
+ * WhatsApp channel added a voice note: its text is produced by a third-party
+ * transcription provider's model, nobody typed it, and this module accepted
+ * it as typed bytes — so a mistranscription, or a compromised provider,
+ * could name a recipient and buy them a standing authorisation with no
+ * approval card shown to the owner. Authority must never be derivable from
+ * content, and a transcript is content.
+ *
+ * The owner's ruling (05/10/2026): a clear transcript authorises **the
+ * action**; an address, name or number that appears **only in a recording**
+ * needs his explicit confirmation. So `textOrigin: 'transcribed'` withholds
+ * the verbatim arm and nothing else — the charter arm still stands, because
+ * a counterparty the signed charter already knows was authorised by the
+ * owner's signature, not by what he typed today.
  */
 import type { ActionClass } from '../domain/action.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { extractAddressCandidate, extractDomain } from '../util/address.js';
+
+/**
+ * Where an instruction's bytes came from. **A closed union, never a boolean**:
+ * `isTranscript: true/false` would absorb a third origin silently, and the
+ * one thing this value decides is whether a recipient can be authorised
+ * without an approval card. A third door tomorrow has to name itself here,
+ * and every reader below asks `=== 'typed'` positively — so an origin nobody
+ * has taught this module about is, by construction, not typed.
+ *
+ * The SQL half of the same closed set is migration 039's
+ * `boss_instructions_text_origin_check`.
+ */
+export type InstructionTextOrigin = 'typed' | 'transcribed';
 
 /**
  * The classes where a recipient can be authorised by an instruction at all.
@@ -318,7 +351,17 @@ export function emailAddressesIn(instruction: string): string[] {
     .map((value) => value.toLowerCase());
 }
 
-function typedInInstruction(candidate: string, instruction: string): boolean {
+/**
+ * Do these exact bytes appear in that text — and **nothing more than that**.
+ *
+ * Renamed from `typedInInstruction` when the origin rule arrived, and the
+ * rename is the point rather than tidying: this predicate never knew who put
+ * the address in the text, and under the old name every call site read as
+ * though it did. "The owner typed it" is this answer AND
+ * `textOrigin === 'typed'`, and the two are asked separately at both call
+ * sites below so neither can be mistaken for the other again.
+ */
+function appearsVerbatimIn(candidate: string, instruction: string): boolean {
   const trimmed = candidate.trim();
   if (trimmed.length === 0) return false;
 
@@ -372,17 +415,77 @@ function knownToCharter(
   return known.entityIds.some((id) => id.toLowerCase() === lower);
 }
 
-export function authorisedRecipients(input: {
+/**
+ * The input both readers below take, so neither can be given one fact and not
+ * the other: a text travels with where it came from, always.
+ */
+export interface RecipientAuthorityInput {
   instruction: string;
+  /**
+   * **Required, with no default anywhere on this path.** The same choice
+   * `CredentialSource.resolve(ref, businessId)` makes
+   * (`src/orchestrator/credentials.ts`) and for the same reason it gives:
+   * an omitted value would read silently as the permissive one, and
+   * "required means an omission is a compile error rather than a wrong
+   * lookup at run time". A door added later cannot forget to say where its
+   * bytes came from; it cannot compile without saying.
+   */
+  textOrigin: InstructionTextOrigin;
   actionClass: ActionClass;
   candidates: string[];
   known: PolicyBundle['knownCounterparties'];
-}): string[] {
+}
+
+export function authorisedRecipients(input: RecipientAuthorityInput): string[] {
   if (!TYPED_RECIPIENT_CLASSES.includes(input.actionClass)) return [];
+
+  // Positive: only the literal `'typed'` opens the verbatim arm. The charter
+  // arm is deliberately outside this condition — see the module docblock on
+  // why a signature outlives today's keyboard.
+  const typedByOwner = input.textOrigin === 'typed';
 
   return input.candidates.filter(
     (candidate) =>
       knownToCharter(candidate, input.known) ||
-      typedInInstruction(candidate, input.instruction),
+      (typedByOwner && appearsVerbatimIn(candidate, input.instruction)),
+  );
+}
+
+/**
+ * The recipients this instruction would have authorised had the owner typed
+ * it, and did not, because its text came from a recording.
+ *
+ * **Why a second function rather than a richer return from the one above.**
+ * `authorisedRecipients` answers "who may be contacted"; this answers "who
+ * was withheld, and because of the recording specifically". They are
+ * different questions and the second one exists only so the owner can be told
+ * a true sentence — `instruct.ts` turns this list into the note he reads, and
+ * a note that fires when nothing was actually withheld teaches him to stop
+ * reading notes. Both arms are computed from the same two private predicates
+ * in this module, so there is one definition of each rule; `typed-recipients.test.ts`
+ * pins the relationship between the two functions directly (withheld = what
+ * typing would have added) rather than trusting that the two stay in step.
+ *
+ * Three positive conditions, each of which makes the sentence false if
+ * dropped:
+ *
+ *   - the origin is not `'typed'` — a typed instruction withholds nothing,
+ *     so there is nothing to explain;
+ *   - the class is one an instruction can authorise at all. `purchase.place`
+ *     from a recording was never going to be authorised by typing either
+ *     (see `TYPED_RECIPIENT_CLASSES`), so naming the recording as the reason
+ *     would be a lie about which rule stopped it;
+ *   - the recipient is NOT already known to the charter. A charter-known
+ *     counterparty is authorised from a recording exactly as from the
+ *     keyboard, so it was not withheld and must not be listed.
+ */
+export function recipientsOnlyInRecording(input: RecipientAuthorityInput): string[] {
+  if (input.textOrigin === 'typed') return [];
+  if (!TYPED_RECIPIENT_CLASSES.includes(input.actionClass)) return [];
+
+  return input.candidates.filter(
+    (candidate) =>
+      !knownToCharter(candidate, input.known) &&
+      appearsVerbatimIn(candidate, input.instruction),
   );
 }

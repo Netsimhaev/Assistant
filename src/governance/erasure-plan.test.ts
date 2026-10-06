@@ -109,8 +109,8 @@ describe('buildErasurePlan', () => {
     it('via boss_instructions.text', async () => {
       const jobId = await bareJob('via-instruction');
       await getPool().query(
-        `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text)
-         VALUES ($1, $2, $3, $4)`,
+        `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
+         VALUES ($1, $2, $3, $4, 'typed')`,
         [`INS-${ulid()}`, BUSINESS, jobId, `תשלחי תזכורת ל-${RONIT}`],
       );
 

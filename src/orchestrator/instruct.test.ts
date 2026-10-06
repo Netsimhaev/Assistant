@@ -62,7 +62,7 @@ describe('runInstruction', () => {
   it('opens a boss job, stores the instruction, binds the plan', async () => {
     const result = await runInstruction(
       { text: 'תשלחי ל-dana@example.com את ההצעה' },
-      { businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
+      { textOrigin: 'typed', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
     );
 
     expect(result.status).toBe('planned');
@@ -83,7 +83,7 @@ describe('runInstruction', () => {
   it('grants a standing authorisation for the address the owner typed', async () => {
     const result = await runInstruction(
       { text: 'תשלחי ל-dana@example.com את ההצעה' },
-      { businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
+      { textOrigin: 'typed', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
     );
     if (result.status !== 'planned') throw new Error('unreachable');
 
@@ -108,7 +108,7 @@ describe('runInstruction', () => {
   it('grants nothing when the owner never named the address', async () => {
     const result = await runInstruction(
       { text: 'תשלחי לדנה את ההצעה' },
-      { businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
+      { textOrigin: 'typed', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
     );
     if (result.status !== 'planned') throw new Error('unreachable');
 
@@ -122,7 +122,7 @@ describe('runInstruction', () => {
     const asking: Plan = { ...mailPlan('x@example.com'), clarifyingQuestion: 'איזו דנה?' };
     const result = await runInstruction(
       { text: 'תשלחי לדנה את ההצעה' },
-      { businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: asking }) },
+      { textOrigin: 'typed', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: asking }) },
     );
 
     expect(result.status).toBe('needs_answer');
@@ -155,6 +155,7 @@ describe('runInstruction', () => {
     const result = await runInstruction(
       { text: 'תשלחי לדנה' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async () => ({ status: 'unparseable', raw: '{{', reason: 'bad json' }),
       },
@@ -181,7 +182,7 @@ describe('runInstruction', () => {
     };
     const result = await runInstruction(
       { text: 'תשלחי לדנה' },
-      { businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: cyclic }) },
+      { textOrigin: 'typed', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: cyclic }) },
     );
 
     expect(result.status).toBe('refused');
@@ -197,7 +198,7 @@ describe('runInstruction', () => {
     await resetDatabase();
     const result = await runInstruction(
       { text: 'תשלחי לדנה' },
-      { businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
+      { textOrigin: 'typed', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }) },
     );
     expect(result.status).toBe('refused');
     if (result.status !== 'refused') throw new Error('unreachable');
@@ -213,6 +214,7 @@ describe('runInstruction', () => {
     const result = await runInstruction(
       { text: '   ' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async () => {
           called = true;
@@ -259,7 +261,7 @@ describe('runInstruction', () => {
 
     const result = await runInstruction(
       { text: 'תשלחי ל-dana@example.com את ההצעה ותקבעי איתה פגישה ביום שלישי' },
-      { businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: twoClassPlan }) },
+      { textOrigin: 'typed', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: twoClassPlan }) },
     );
 
     expect(result.status).toBe('planned');
@@ -307,7 +309,7 @@ describe('runInstruction', () => {
 
     const result = await runInstruction(
       { text: 'תשלחי לה וואטסאפ למספר 0521234567' },
-      { businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: waPlan }) },
+      { textOrigin: 'typed', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: waPlan }) },
     );
 
     expect(result.status).toBe('planned');
@@ -334,6 +336,7 @@ describe('runInstruction', () => {
     const result = await runInstruction(
       { text: 'א'.repeat(4001) },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async () => {
           called = true;
@@ -361,6 +364,7 @@ describe('runInstruction', () => {
     const result = await runInstruction(
       { text: 'תשלחי לדנה' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async () => {
           throw new Error('network is down');
@@ -400,7 +404,7 @@ describe('runInstruction', () => {
 
     const result = await runInstruction(
       { text: 'תעני לדנה' },
-      { businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mismatchedPlan }) },
+      { textOrigin: 'typed', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mismatchedPlan }) },
     );
 
     expect(result.status).toBe('refused');
@@ -443,6 +447,7 @@ describe('runInstruction', () => {
     const result = await runInstruction(
       { text: 'תשיבי לרונית בכתובת ronit@beta-log.example' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async (request) => {
           captured.request = request;
@@ -493,6 +498,7 @@ describe('runInstruction', () => {
     const outcome = await runInstruction(
       { text: 'תשיבי לרונית' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async () => {
           throw new Error('the planner must not be called when the identity is unresolved');
@@ -551,6 +557,7 @@ describe('runInstruction', () => {
     const outcome = await runInstruction(
       { text: 'תשיבי לרונית' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async () => {
           throw new Error('the planner must not be called when the identity is unresolved');
@@ -602,6 +609,7 @@ describe('runInstruction', () => {
     const result = await runInstruction(
       { text: 'תשיבי לרונית' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async (request) => {
           seen = request;
@@ -652,6 +660,7 @@ describe('runInstruction', () => {
     const outcome = await runInstruction(
       { text: 'תשיבי לרונית\n\nאני לא זוכר' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         identityAsked: true,
         planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
@@ -698,6 +707,7 @@ describe('runInstruction', () => {
     const outcome = await runInstruction(
       { text: 'תשיבי לרונית\n\nאני לא זוכר' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         identityAsked: true,
         planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
@@ -721,6 +731,7 @@ describe('runInstruction', () => {
     const outcome = await runInstruction(
       { text: 'תשלחי ל-dana@example.com את ההצעה' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
       },
@@ -749,6 +760,7 @@ describe('runInstruction', () => {
       const outcome = await runInstruction(
         { text: 'תשיבי לרונית' },
         {
+          textOrigin: 'typed',
           businessId: BUSINESS,
           planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
         },
@@ -776,6 +788,7 @@ describe('runInstruction', () => {
       const outcome = await runInstruction(
         { text: 'תשיבי לרונית' },
         {
+          textOrigin: 'typed',
           businessId: BUSINESS,
           planner: async (request) => {
             seen = request;
@@ -847,6 +860,7 @@ describe('saying she went ahead without the memory when the planner asks too', (
     const outcome = await runInstruction(
       { text: 'תשיבי לרונית\n\nאני לא זוכר' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         identityAsked: true,
         planner: async () => ({
@@ -876,6 +890,7 @@ describe('saying she went ahead without the memory when the planner asks too', (
     const outcome = await runInstruction(
       { text: 'תשיבי לרונית' },
       {
+        textOrigin: 'typed',
         businessId: BUSINESS,
         planner: async () => {
           throw new Error('the planner must not be reached on the identity question');
@@ -887,5 +902,138 @@ describe('saying she went ahead without the memory when the planner asks too', (
     if (outcome.status !== 'needs_answer') throw new Error('unreachable');
     expect(outcome.question).toContain('רונית');
     expect(outcome.identityNote).toBeNull();
+  });
+});
+
+/**
+ * Owner's decision 2 (05/10/2026), end to end through the whole door: a clear
+ * transcript authorises the ACTION; an address that appears only in a
+ * recording needs his explicit word, and he is told so.
+ *
+ * `instruct.ts` is where both halves land — the grant is withheld here and
+ * the sentence is composed here — so this is the layer where "the instruction
+ * still runs, only the shortcut is withheld" can actually be observed rather
+ * than inferred from a filter's return value.
+ */
+describe('an instruction whose text came from a recording', () => {
+  const SPOKEN = 'תשלחי ל-dana@example.com את ההצעה';
+
+  beforeEach(async () => {
+    await resetDatabase();
+    await withCharter();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  async function authorisationRows(jobId: string): Promise<Array<{ recipients: string[] }>> {
+    const { rows } = await getPool().query<{ recipients: string[] }>(
+      `SELECT recipients FROM job_authorizations WHERE job_id = $1`,
+      [jobId],
+    );
+    return rows;
+  }
+
+  it('plans the instruction but authorises nobody, and names who needs confirming', async () => {
+    const result = await runInstruction(
+      { text: SPOKEN },
+      {
+        textOrigin: 'transcribed',
+        businessId: BUSINESS,
+        planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
+      },
+    );
+
+    expect(result.status).toBe('planned');
+    if (result.status !== 'planned') throw new Error('unreachable');
+
+    // Withheld — this is the defect itself. The identical call with
+    // `textOrigin: 'typed'` is the first test in this file and it grants.
+    expect(result.granted).toEqual([]);
+    expect(await authorisationRows(result.jobId)).toHaveLength(0);
+
+    // And SAID, which is the owner's other half. A silent withholding is the
+    // branch's own recurring defect: he speaks an instruction, watches it be
+    // planned, and later meets an approval card for a recipient he believes
+    // he already named.
+    expect(result.recordingNote).not.toBeNull();
+    expect(result.recordingNote).toContain('dana@example.com');
+    expect(result.recordingNote).toContain('הקלטה');
+    expect(result.recordingNote).toContain('אישור מפורש');
+
+    // The ACTION is still authorised in the owner's sense: the job was
+    // planned, bound and promoted exactly as a typed one is. Only who may be
+    // contacted changed.
+    const jobs = await getPool().query<{ phase: string }>(
+      `SELECT phase FROM jobs WHERE job_id = $1`,
+      [result.jobId],
+    );
+    expect(jobs.rows[0]?.phase).toBe('execute');
+    expect(await loadPlanBody(result.jobId, { businessId: BUSINESS })).not.toBeNull();
+
+    // Stored on the row, not merely used in passing: the next hop (an answer
+    // joined onto this text) reads it back, and without the column a typed
+    // answer would relabel this instruction as typed.
+    const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
+    expect(stored?.textOrigin).toBe('transcribed');
+  });
+
+  it('says nothing about a recording when the owner typed the instruction', async () => {
+    const result = await runInstruction(
+      { text: SPOKEN },
+      {
+        textOrigin: 'typed',
+        businessId: BUSINESS,
+        planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
+      },
+    );
+
+    expect(result.status).toBe('planned');
+    if (result.status !== 'planned') throw new Error('unreachable');
+    // The paired negative: the note must be absent here, or it says nothing
+    // when it is present. A version that set it unconditionally would pass
+    // the test above and fail this one.
+    expect(result.recordingNote).toBeNull();
+    expect(result.granted).toHaveLength(1);
+    const stored = await loadInstructionForJob(result.jobId, { businessId: BUSINESS });
+    expect(stored?.textOrigin).toBe('typed');
+  });
+
+  it('still authorises a counterparty the charter knows, and says nothing', async () => {
+    // A second charter version, so `knownCounterparties` really carries the
+    // domain the plan addresses. Authority from a signature is not authority
+    // from today's keystrokes: it survives a recording, and over-tightening
+    // here — gating the whole filter on the origin instead of the verbatim
+    // arm — fails this test while the first one above stays green.
+    await installCharter(
+      buildCharter({
+        version: '2026-08-15.2',
+        connections: [MAIL_CONNECTION],
+        knownCounterpartyEmailDomain: 'example.com',
+      }),
+      { businessId: BUSINESS },
+    );
+
+    const result = await runInstruction(
+      // No address in the text at all, so nothing but the charter can
+      // authorise this recipient.
+      { text: 'תשלחי לדנה את ההצעה' },
+      {
+        textOrigin: 'transcribed',
+        businessId: BUSINESS,
+        planner: async () => ({ status: 'planned', plan: mailPlan('dana@example.com') }),
+      },
+    );
+
+    expect(result.status).toBe('planned');
+    if (result.status !== 'planned') throw new Error('unreachable');
+    expect(result.granted).toEqual([
+      { actionClass: 'email.initiate', recipients: ['dana@example.com'] },
+    ]);
+    expect(await authorisationRows(result.jobId)).toHaveLength(1);
+    // Nothing was withheld, so there is nothing to say. A note here would
+    // send the owner looking for a confirmation that is not pending.
+    expect(result.recordingNote).toBeNull();
   });
 });

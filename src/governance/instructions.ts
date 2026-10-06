@@ -1,14 +1,25 @@
 /**
- * What the owner typed, and the answer they gave when asked to clarify.
+ * What the owner said, where it came from, and the answer they gave when
+ * asked to clarify.
  *
  * The text is stored byte-for-byte as submitted. `authorisedRecipients`
  * (`src/governance/typed-recipients.ts`) matches candidate addresses against
  * exactly these bytes, so trimming or normalising here would quietly change
  * which recipients count as named by the owner.
+ *
+ * **"What the owner typed" stopped being the whole truth when the WhatsApp
+ * channel arrived, which is why `textOrigin` is stored beside the text.** A
+ * voice note's text is a transcription provider's model output; nobody typed
+ * it. The row has to carry that fact because the text outlives the message it
+ * arrived in: an answer to a clarifying question is planned over the JOIN of
+ * this stored text and the new answer (`src/dashboard/server.ts`,
+ * `src/orchestrator/whatsapp-door.ts`), and without the stored origin a typed
+ * answer would launder the recorded half into typed bytes one hop later.
  */
 import { ulid } from 'ulid';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
+import type { InstructionTextOrigin } from './typed-recipients.js';
 
 /** Enforced here and by a CHECK constraint, so neither path can drift alone. */
 export const MAX_INSTRUCTION_CHARS = 4000;
@@ -18,6 +29,13 @@ export interface InstructionRecord {
   businessId: string;
   jobId: string;
   text: string;
+  /**
+   * Where `text` came from — the owner's keyboard, or a transcript of his
+   * recording. Written once at insert and never updated: an instruction does
+   * not change origin, and an UPDATE path would be a way to relabel a
+   * recording as typing after the fact.
+   */
+  textOrigin: InstructionTextOrigin;
   /**
    * The clarifying question the planner asked about this instruction, if it
    * asked one.
@@ -39,6 +57,7 @@ interface InstructionRow {
   business_id: string;
   job_id: string;
   text: string;
+  text_origin: string;
   question: string | null;
   answer: string | null;
   created_at: string;
@@ -50,6 +69,13 @@ function toInstruction(row: InstructionRow): InstructionRecord {
     businessId: row.business_id,
     jobId: row.job_id,
     text: row.text,
+    // Positive, and typed as the raw `string` it arrives as rather than cast:
+    // migration 039's CHECK already confines the column to the two values,
+    // and this is the second of the two layers that project keeps wherever a
+    // value decides authority. A stored string this reader does not
+    // recognise — a value written before the CHECK existed, a row restored
+    // from somewhere else — is NOT typed, which is the safe side.
+    textOrigin: row.text_origin === 'typed' ? 'typed' : 'transcribed',
     question: row.question,
     answer: row.answer,
     createdAt: row.created_at,
@@ -57,10 +83,10 @@ function toInstruction(row: InstructionRow): InstructionRecord {
 }
 
 const COLUMNS =
-  'instruction_id, business_id, job_id, text, question, answer, created_at::text AS created_at';
+  'instruction_id, business_id, job_id, text, text_origin, question, answer, created_at::text AS created_at';
 
 export async function saveInstruction(
-  input: { jobId: string; text: string },
+  input: { jobId: string; text: string; textOrigin: InstructionTextOrigin },
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<InstructionRecord> {
   const businessId = options.businessId ?? config.businessId;
@@ -80,10 +106,10 @@ export async function saveInstruction(
   }
 
   const { rows } = await db.query<InstructionRow>(
-    `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
+     VALUES ($1, $2, $3, $4, $5)
      RETURNING ${COLUMNS}`,
-    [`INS-${ulid()}`, businessId, input.jobId, input.text],
+    [`INS-${ulid()}`, businessId, input.jobId, input.text, input.textOrigin],
   );
 
   const row = rows[0];
@@ -156,8 +182,8 @@ export async function pendingQuestions(
     options.channel === 'whatsapp' ? 'AND j.whatsapp_message_id IS NOT NULL' : '';
 
   const { rows } = await db.query<InstructionRow>(
-    `SELECT i.instruction_id, i.business_id, i.job_id, i.text, i.question, i.answer,
-            i.created_at::text AS created_at
+    `SELECT i.instruction_id, i.business_id, i.job_id, i.text, i.text_origin,
+            i.question, i.answer, i.created_at::text AS created_at
        FROM boss_instructions i
        JOIN jobs j ON j.job_id = i.job_id AND j.business_id = i.business_id
       WHERE i.business_id = $1

@@ -1288,3 +1288,148 @@ describe('runWhatsAppDoor', () => {
     ).rejects.toThrow(/did not finish within/);
   });
 });
+
+/**
+ * Owner's decision 2 (05/10/2026), through the channel that is the only
+ * producer of a transcript in the whole system.
+ *
+ * This door is the one caller that can ever hand `runInstruction`
+ * `textOrigin: 'transcribed'`, so it is the only place the end-to-end
+ * property can be measured: a voice note naming an address must not buy that
+ * address a standing authorisation, and the owner must hear why in the same
+ * message that acknowledges his instruction.
+ */
+describe('a recording is not typing', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    await withCharter();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  /** The address the plan addresses, written in the owner's words too. */
+  const SPOKEN = 'תשלחי ל-dana@example.com את ההצעה';
+
+  async function grants(): Promise<Array<{ recipients: string[] }>> {
+    const { rows } = await getPool().query<{ recipients: string[] }>(
+      'SELECT recipients FROM job_authorizations WHERE business_id = $1',
+      [BUSINESS],
+    );
+    return rows;
+  }
+
+  async function storedOrigins(): Promise<string[]> {
+    const { rows } = await getPool().query<{ text_origin: string }>(
+      'SELECT text_origin FROM boss_instructions WHERE business_id = $1 ORDER BY created_at',
+      [BUSINESS],
+    );
+    return rows.map((row) => row.text_origin);
+  }
+
+  it('plans a voice note but authorises nobody from it, and tells the owner why', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER }));
+
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      // The transcription provider is where these bytes come from. Nobody
+      // typed them — which is the whole point: this is a third party's model
+      // output, and before the origin rule it satisfied a check whose
+      // meaning is "the owner typed this address himself".
+      provider: async () => ({ text: SPOKEN }),
+      planner: plannedWith(mailPlan()),
+    });
+
+    expect(result.instructed).toBe(1);
+    expect(await storedOrigins()).toEqual(['transcribed']);
+    // No standing authorisation, so the step takes the ordinary approval
+    // path and the owner sees a card before anything reaches dana.
+    expect(await grants()).toHaveLength(0);
+
+    // One message, as ruling 4 requires — the transcript, the
+    // acknowledgement and this notice all ride together.
+    expect(messenger.sentTexts).toHaveLength(1);
+    const ack = messenger.sentTexts[0] ?? '';
+    expect(ack).toContain('שמעתי:');
+    expect(ack).toContain('הקלטה');
+    expect(ack).toContain('dana@example.com');
+    expect(ack).toContain('אישור מפורש');
+  });
+
+  it('treats a typed WhatsApp message as the owner own bytes', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: SPOKEN }));
+
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan()),
+    });
+
+    // The paired positive, and the reason it matters: a door that simply
+    // declared everything `'transcribed'` would pass the test above and fail
+    // this one. A typed WhatsApp message is the owner's keystrokes exactly as
+    // the dashboard box is, and his instruction is still his own approval.
+    expect(result.instructed).toBe(1);
+    expect(await storedOrigins()).toEqual(['typed']);
+    expect(await grants()).toEqual([{ recipients: ['dana@example.com'] }]);
+    expect(messenger.sentTexts[0] ?? '').not.toContain('הקלטה');
+  });
+
+  /**
+   * The laundering path, which is why the origin is stored on the row rather
+   * than held for the length of one pass.
+   *
+   * A voice note parks on a clarifying question; the owner answers by TYPING.
+   * The re-plan runs over the JOIN of the two (task 12), so if the join were
+   * judged by this message alone it would come out `'typed'` — and the
+   * address the recording named would be authorised one hop later, by a
+   * route that never saw a recording at all.
+   */
+  it('does not let a typed answer launder the recording it is joined to', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+
+    gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER }));
+    const first = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      provider: async () => ({ text: SPOKEN }),
+      planner: plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו דנה?' })),
+    });
+    expect(first.instructed).toBe(1);
+    expect(await storedOrigins()).toEqual(['transcribed']);
+
+    const seen: string[] = [];
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'דנה מהמשרד' }));
+    const second = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async (request) => {
+        seen.push(request.instruction ?? '');
+        return { status: 'planned', plan: mailPlan() };
+      },
+    });
+
+    expect(second.instructed).toBe(1);
+    // The join really happened — without this, the assertions below could
+    // pass because the answer was planned on its own (which names no address
+    // and would authorise nobody for an unrelated reason).
+    expect(seen).toEqual([[SPOKEN, 'דנה מהמשרד'].join('\n\n')]);
+
+    // Both instruction rows: the recorded original, and the join that
+    // inherits its origin because one half of it was never typed.
+    expect(await storedOrigins()).toEqual(['transcribed', 'transcribed']);
+    expect(await grants()).toHaveLength(0);
+    expect(messenger.sentTexts[1] ?? '').toContain('הקלטה');
+  });
+});

@@ -61,8 +61,24 @@
  * `./instruct.js`) already fixes that on its own, as a literal, and takes no
  * parameter that could override it — a caller able to aim that value would be
  * a caller able to forge an instruction. `whatsapp-invariants.test.ts` pins
- * this positively: the only thing that crosses into `runInstruction` is
- * `{ text }`.
+ * this positively: the only thing that crosses into `runInstruction` as its
+ * first argument is `{ text }`.
+ *
+ * **What this module DOES decide, and the one rule that keeps it safe:
+ * whether those bytes were typed.** `runInstruction`'s `textOrigin` is
+ * required and has no default, and this door is the only caller that can
+ * ever hand it `'transcribed'`. The value is derived from `mediaKind` — how
+ * the message arrived — and from the stored origin of the instruction an
+ * answer is joined to, and from **nothing inside the text**. That is the
+ * whole point: a voice note's text is a third-party transcription model's
+ * output, and `authorisedRecipients`'s verbatim arm grants a standing
+ * authorisation on the strength of "the owner typed this address himself".
+ * A mistranscription, or a compromised provider, naming a recipient must not
+ * be able to buy that. Authority is never derivable from content, and a
+ * transcript is content. `whatsapp-invariants.test.ts` pins the derivation
+ * expression itself, because this is the one place in the file where a quiet
+ * edit — reading the flag off `heard`, say — would hand a provider the
+ * owner's own authority.
  *
  * **The transcript rides the acknowledgement — one outbound message, never
  * two.** A mistranscription is a mistaken instruction (spec §6.3), and the
@@ -114,6 +130,7 @@ import type { InstructionRecord } from '../governance/instructions.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import { authorityNumberKey, isPrincipalSender } from '../governance/principal-number.js';
+import type { InstructionTextOrigin } from '../governance/typed-recipients.js';
 import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gateway.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import {
@@ -267,6 +284,13 @@ function composeAck(outcome: InstructionOutcome): string {
   if (outcome.status === 'needs_answer') return outcome.question;
   const parts = [PLANNED_ACK];
   if (outcome.grantNote !== null) parts.push(outcome.grantNote);
+  // The owner's ruling of 05/10/2026, second half: an address that came only
+  // from a recording needs his explicit word, and he has to be TOLD that.
+  // This is the one channel that can produce the note at all — a recording
+  // only ever arrives here — so dropping it here is the whole difference
+  // between "asks him to confirm" and a silent refusal to use the address he
+  // just spoke.
+  if (outcome.recordingNote !== null) parts.push(outcome.recordingNote);
   if (outcome.identityNote !== null) parts.push(outcome.identityNote);
   return parts.join('\n\n');
 }
@@ -607,6 +631,29 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
 
     text = answered !== null ? `${answered.text}\n\n${heard}` : heard;
 
+    // Where those bytes came from, derived from HOW the message arrived and
+    // never from what it says — see the module docblock, and
+    // `whatsapp-invariants.test.ts`, which pins this expression.
+    //
+    // Both conditions are positive and both are necessary. `!isAudio`: a
+    // voice note's text is a transcription provider's model output, which
+    // nobody typed. `answered === null || answered.textOrigin === 'typed'`:
+    // an answer is planned over the JOIN of the parked instruction and this
+    // message (`text`, above), so a typed answer to a question raised by a
+    // voice note must not launder the recorded half — the join is the owner's
+    // own bytes only if BOTH halves are. Reading the stored origin is what
+    // makes that answerable at all, and it is read from the instruction row
+    // (`InstructionRecord.textOrigin`, written once at insert), never guessed
+    // from the message this pass is holding.
+    //
+    // The cost, stated: one origin covers the whole joined text, so a typed
+    // answer that names an address is treated as recorded when the half it
+    // joins was recorded. That withholds a grant the owner's rule would have
+    // allowed — over-tight, never over-permissive — and he is told exactly
+    // that, with the recipient named (`renderRecordingNote`, `instruct.ts`).
+    const textOrigin: InstructionTextOrigin =
+      !isAudio && (answered === null || answered.textOrigin === 'typed') ? 'typed' : 'transcribed';
+
     // Spec §5.4: the acknowledgement always says which reading was chosen, so
     // a wrong reading is visible before anything goes out.
     const routeNotice =
@@ -627,6 +674,10 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       { text },
       {
         businessId: ctx.businessId,
+        // Required, no default — see this module's docblock and the option's
+        // own. Computed above, from the media kind and the joined half's
+        // stored origin.
+        textOrigin,
         // Spec §7.2, and the same value the dashboard's answer route passes:
         // this is the second pass over the same chain, so the identity
         // question is suppressed even if a name is still ambiguous. The

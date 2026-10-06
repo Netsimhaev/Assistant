@@ -32,6 +32,7 @@ import {
   pendingQuestions,
   claimAnswer,
 } from '../governance/instructions.js';
+import type { InstructionTextOrigin } from '../governance/typed-recipients.js';
 import { readForgetCommand } from '../governance/forget-command.js';
 import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
 import { recordCorrection } from '../governance/corrections.js';
@@ -610,8 +611,8 @@ async function handleConnections(res: ServerResponse, businessId: string, sessio
  * pipeline does not care which one produced the text it just planned (or
  * refused, or asked about again).
  *
- * A `planned` outcome carrying either note renders the box instead of
- * redirecting home. `grantNote` is non-null in exactly one case — a plan
+ * A `planned` outcome carrying any of the three notes renders the box instead
+ * of redirecting home. `grantNote` is non-null in exactly one case — a plan
  * spanning more than one action class, which authorises nothing at all (see
  * `grantForPlan` in `instruct.ts`) — and without showing it here the owner is
  * bounced straight to the pending list and later meets an approval card for
@@ -622,8 +623,18 @@ async function handleConnections(res: ServerResponse, businessId: string, sessio
  * already answered once, so the instruction ran with none of that person's
  * memory (spec §7.2's "ומציינת זאת"). Redirecting home on that outcome is
  * what made the silence: an ordinary success page, and an owner who believes
- * their answer worked. Both notes are passed together — they answer
- * different questions and one instruction can raise both.
+ * their answer worked. All three notes are passed together — they answer
+ * different questions and one instruction can raise more than one.
+ *
+ * `recordingNote` is non-null only when the planned text came from a
+ * recording and that is what kept a recipient off the standing authorisation
+ * (`recipientsOnlyInRecording`, `governance/typed-recipients.ts`). **This
+ * screen really can produce it, which is why it renders here and not only in
+ * the WhatsApp ack:** `POST /instruct` states `'typed'` and so can never
+ * raise it, but the answer route below plans the join of a typed answer and
+ * a parked instruction that may itself have arrived as a voice note, and
+ * that join is `'transcribed'`. Leaving it unrendered here would be a note
+ * written for the owner that one of its two producers never shows him.
  *
  * A `needs_answer` outcome carries the same note and renders it beside the
  * question card, which is the case a live run measured: an unresolved name
@@ -661,13 +672,18 @@ export function renderInstructionOutcome(
     );
     return;
   }
-  if (outcome.grantNote !== null || outcome.identityNote !== null) {
+  if (
+    outcome.grantNote !== null ||
+    outcome.recordingNote !== null ||
+    outcome.identityNote !== null
+  ) {
     sendHtml(
       res,
       200,
       renderInstruct({
         csrf,
         grantNote: outcome.grantNote,
+        recordingNote: outcome.recordingNote,
         identityNote: outcome.identityNote,
       }),
     );
@@ -768,7 +784,13 @@ async function handleInstructPost(
     });
   }
 
-  const outcome = await runInstruction({ text }, { businessId });
+  // `'typed'` is a statement of fact about this route, not a default: these
+  // bytes arrived as an HTML form field from an authenticated owner session,
+  // which is the owner's own keystrokes. The option is required precisely so
+  // that every door has to say this out loud — the WhatsApp door is the one
+  // that cannot (`whatsapp-door.ts`), because a voice note's text is a
+  // transcription provider's output and nobody typed it.
+  const outcome = await runInstruction({ text }, { businessId, textOrigin: 'typed' });
   renderInstructionOutcome(res, session, outcome);
 }
 
@@ -1013,7 +1035,12 @@ async function answerUnderClaim(
   businessId: string,
   session: Session,
   jobId: string,
-  instruction: { instructionId: string; text: string },
+  // Named fields rather than the whole `InstructionRecord`, as this
+  // parameter has always been: it says exactly what this function reads off
+  // the row. `textOrigin` joins the list because the re-plan below is over
+  // the JOIN of `text` and `answer`, and a typed answer must not relabel a
+  // recorded instruction as typed — see the call itself.
+  instruction: { instructionId: string; text: string; textOrigin: InstructionTextOrigin },
   answer: string,
 ): Promise<void> {
   // Scoped to a job that is actually waiting on this answer — see
@@ -1077,9 +1104,21 @@ async function answerUnderClaim(
 
   const outcome = await runInstruction(
     { text: `${instruction.text}\n\n${answer}` },
-    // Spec §7.2: asked once per chain — this is the second pass, so the
-    // identity question is suppressed even if a name is still ambiguous.
-    { businessId, identityAsked: true },
+    {
+      businessId,
+      // The answer above was typed into this form, but the text being planned
+      // is the JOIN of it and the parked instruction — and that instruction
+      // can have arrived as a WhatsApp voice note, whose text nobody typed.
+      // Positive, both halves: typed only if the stored half was typed too.
+      // Without this read, a typed answer to a question raised by a recording
+      // would launder the recorded half's addresses into "the owner typed
+      // this himself" one hop later, which is the whole defect the origin
+      // rule closes — reached through the dashboard rather than the door.
+      textOrigin: instruction.textOrigin === 'typed' ? 'typed' : 'transcribed',
+      // Spec §7.2: asked once per chain — this is the second pass, so the
+      // identity question is suppressed even if a name is still ambiguous.
+      identityAsked: true,
+    },
   );
 
   // The parked job always leaves `understand`; only the destination and the

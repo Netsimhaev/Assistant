@@ -269,7 +269,7 @@ describe('decideWhatsAppRoute', () => {
   it('ignores a parked question that was never asked over WhatsApp', async () => {
     const outcome = await runInstruction(
       { text: 'תשלחי לרונית' },
-      { businessId: BUSINESS, planner: asks('למי בדיוק?') },
+      { businessId: BUSINESS, textOrigin: 'typed', planner: asks('למי בדיוק?') },
     );
     expect(outcome.status).toBe('needs_answer');
 
@@ -430,6 +430,10 @@ describe('what the owner reads', () => {
     businessId: BUSINESS,
     jobId: 'JOB-1',
     text,
+    // Typed, because these are the sentences the owner reads about a request
+    // he made — the origin rule's effect on them is nil, and stating it
+    // keeps the fixture honest rather than letting a default decide.
+    textOrigin: 'typed',
     question: 'למי?',
     answer: null,
     createdAt: new Date().toISOString(),

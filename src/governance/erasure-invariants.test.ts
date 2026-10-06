@@ -100,8 +100,11 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, job.jobId, JSON.stringify({ steps: [{ input: { to: [PROBE], body: 'שלום' } }] })],
     );
     await db.query(
-      `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text)
-       VALUES ('INS-probe', $1, $2, $3)`,
+      // `text_origin` is NOT NULL with no default (migration 039), so every
+      // writer states it. 'typed' is what this fixture means: an owner who
+      // typed the probe into the instruction box.
+      `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
+       VALUES ('INS-probe', $1, $2, $3, 'typed')`,
       [BUSINESS, job.jobId, `תשלחי אל ${PROBE}`],
     );
     // Migration 036's table. Tied to the job (the `job_id` arm of

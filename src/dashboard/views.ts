@@ -1125,11 +1125,20 @@ ${signErrorBlock}
  * folded into it, since the two can never occur together (a `grantNote` only
  * ever accompanies a `planned` outcome, an `error` only ever a `refused` one).
  *
- * `identityNote` is the second of the two notes and answers a different
- * question: a name in the instruction still fitted more than one contact
- * after the owner had already been asked once, so the instruction went ahead
- * with none of that person's memory (spec §7.2). Both can be true of one
- * instruction, so both render.
+ * `recordingNote` is the second and answers a third question: the planned
+ * text came from a recording, so an address that appears only there was not
+ * treated as one the owner named himself and needs his explicit word
+ * (`recipientsOnlyInRecording`, `src/governance/typed-recipients.ts`). It can
+ * reach this screen even though `POST /instruct` is always typed — the answer
+ * route plans the join of a typed answer with a parked instruction that may
+ * have arrived as a voice note; see `renderInstructionOutcome`'s own
+ * docblock.
+ *
+ * `identityNote` is the third and answers a different question again: a name
+ * in the instruction still fitted more than one contact after the owner had
+ * already been asked once, so the instruction went ahead with none of that
+ * person's memory (spec §7.2). All three can be true of one instruction, so
+ * all three render.
  *
  * The clarifying question goes through `escLabel`, not `esc`: it is
  * model-composed text reaching an RTL page, the same category `escLabel` was
@@ -1173,6 +1182,7 @@ export function renderInstruct(options: {
   error?: string;
   pending?: PendingQuestion[] | null;
   grantNote?: string | null;
+  recordingNote?: string | null;
   identityNote?: string | null;
 }): string {
   const error =
@@ -1180,6 +1190,19 @@ export function renderInstruct(options: {
 
   const grantNote =
     options.grantNote == null ? '' : `<p class="muted">${esc(options.grantNote)}</p>`;
+
+  // Through `escLabel`, not `esc`, and here the reason is sharper than for
+  // `identityNote` below: this note quotes recipients back at the owner, and
+  // on this path those bytes reached the row through a TRANSCRIPTION
+  // PROVIDER's model — the least trusted text that ever lands on this
+  // screen. `escLabel` is the one escaper that also strips the
+  // bidirectional-control family, which is what stops a quoted address from
+  // reordering the sentence that explains it (see its own docblock, and
+  // `original_name`'s on why the name of a thing is not its identity).
+  const recordingNote =
+    options.recordingNote == null
+      ? ''
+      : `<p class="muted">${escLabel(options.recordingNote)}</p>`;
 
   // Through `escLabel`, not `esc`: this note quotes the owner's own words
   // back at them — the name token exactly as it was typed — and a quoted
@@ -1199,6 +1222,7 @@ export function renderInstruct(options: {
     `<h1>מה לעשות</h1>
      ${error}
      ${grantNote}
+     ${recordingNote}
      ${identityNote}
      ${pending}
      <form method="POST" action="/instruct">

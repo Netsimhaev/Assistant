@@ -802,7 +802,7 @@ describe('GET /instruct, POST /instruct', () => {
       businessId: BUSINESS,
     });
     const instruction = await saveInstruction(
-      { jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
+      { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
       { businessId: BUSINESS },
     );
     await recordQuestion(instruction.instructionId, 'לאיזו דנה — כהן או לוי?', {
@@ -833,7 +833,7 @@ describe('GET /instruct, POST /instruct', () => {
       businessId: BUSINESS,
     });
     const answeredInstruction = await saveInstruction(
-      { jobId: answeredJob.jobId, text: 'תשלחי לדנה את ההצעה' },
+      { textOrigin: 'typed', jobId: answeredJob.jobId, text: 'תשלחי לדנה את ההצעה' },
       { businessId: BUSINESS },
     );
     await recordQuestion(answeredInstruction.instructionId, 'לאיזו דנה?', {
@@ -860,7 +860,7 @@ describe('GET /instruct, POST /instruct', () => {
       businessId: BUSINESS,
     });
     const openInstruction = await saveInstruction(
-      { jobId: openJob.jobId, text: 'תזמיני פגישה עם רואה החשבון' },
+      { textOrigin: 'typed', jobId: openJob.jobId, text: 'תזמיני פגישה עם רואה החשבון' },
       { businessId: BUSINESS },
     );
     await recordQuestion(openInstruction.instructionId, 'איזה יום מתאים?', {
@@ -1006,6 +1006,80 @@ describe('renderInstructionOutcome - the note on a needs_answer outcome', () => 
   });
 });
 
+/**
+ * Owner's decision 2 (05/10/2026), the dashboard half.
+ *
+ * `recordingNote` says an address that came only from a recording was not
+ * treated as one the owner named himself, and needs his explicit word. **This
+ * screen really can raise it**, which is why both halves are tested here and
+ * not left to the WhatsApp ack: `POST /instruct` states `'typed'` and never
+ * can, but the answer route plans the JOIN of a typed answer with a parked
+ * instruction that may have arrived as a voice note, and that join is
+ * `'transcribed'`.
+ *
+ * The pipeline half lives in `instruct.test.ts` and `whatsapp-door.test.ts`,
+ * for the reason the two note tests above already give: this route calls
+ * `runInstruction` without a planner on purpose, so no test here can produce
+ * a real planned outcome.
+ */
+describe('renderInstruct and renderInstructionOutcome - recordingNote', () => {
+  function capture(outcome: Parameters<typeof renderInstructionOutcome>[2]): string {
+    let body = '';
+    const res = {
+      writeHead: () => undefined,
+      end: (chunk?: unknown) => {
+        body = typeof chunk === 'string' ? chunk : '';
+      },
+    } as unknown as ServerResponse;
+
+    renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome);
+    return body;
+  }
+
+  it('renders the recording note, escaped, beside the other two', () => {
+    const html = renderInstruct({
+      csrf: 'tok',
+      grantNote: 'לא ניתנה הרשאה אוטומטית.',
+      recordingNote:
+        'ההוראה הזו כוללת טקסט שהגיע מהקלטה <script>alert(1)</script>, צריך אישור מפורש ממך.',
+      identityNote: 'המשכתי בלי מה שאני זוכרת על אותו אדם.',
+    });
+    expect(html).toContain('כוללת טקסט שהגיע מהקלטה');
+    expect(html).toContain('צריך אישור מפורש ממך');
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;');
+    // None of the three displaces another — they answer different questions
+    // and one instruction can raise all three.
+    expect(html).toContain('לא ניתנה הרשאה אוטומטית');
+    expect(html).toContain('המשכתי בלי מה שאני זוכרת');
+  });
+
+  it('renders no recording note block when there is none', () => {
+    expect(renderInstruct({ csrf: 'tok' })).not.toContain('שהגיע מהקלטה');
+  });
+
+  /**
+   * The wiring half, and the one that would actually have been missed: a
+   * `planned` outcome carrying ONLY this note. Before it was added to the
+   * condition, such an outcome redirected the owner home — a silent
+   * withholding, which is this branch's other recurring defect.
+   */
+  it('renders the page rather than redirecting when a planned outcome carries only this note', () => {
+    const html = capture({
+      status: 'planned',
+      jobId: 'J-1',
+      instructionId: 'INS-1',
+      granted: [],
+      grantNote: null,
+      recordingNote: 'ההוראה הזו כוללת טקסט שהגיע מהקלטה, צריך אישור מפורש ממך.',
+      identityNote: null,
+    });
+
+    expect(html).toContain('שהגיע מהקלטה');
+    expect(html).toContain('צריך אישור מפורש ממך');
+  });
+});
+
 describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N2)', () => {
   // Fix round 2: `reasonForSupersededJob` no longer accepts a `refused`
   // outcome at all — its parameter type is `Extract<..., { jobId: string }>`,
@@ -1022,6 +1096,7 @@ describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N
         instructionId: 'INS-1',
         granted: [],
         grantNote: null,
+        recordingNote: null,
         identityNote: null,
       }),
     ).toContain('J-REPLACEMENT');
@@ -1068,7 +1143,7 @@ describe('POST /instruct/:jobId/answer', () => {
   async function anInstructionJob(businessId: string, text: string): Promise<string> {
     const bundle = await installCharter(buildCharter(), { businessId });
     const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
-    await saveInstruction({ jobId: job.jobId, text }, { businessId });
+    await saveInstruction({ textOrigin: 'typed', jobId: job.jobId, text }, { businessId });
     await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup', businessId });
     return job.jobId;
   }

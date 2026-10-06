@@ -47,6 +47,58 @@ describe('the instruction door cannot widen its own authority', () => {
     }
   });
 
+  /**
+   * Owner's decision 2 (05/10/2026). `provenance` is a literal here because
+   * it has one correct value on this path; `textOrigin` cannot be, because
+   * it genuinely differs by door — a dashboard form is the owner's
+   * keystrokes, a WhatsApp voice note is a transcription provider's model
+   * output that nobody typed. So the property is the next strongest one
+   * available: the value weighed for authority is the one the CALLER stated,
+   * never one this module invented or defaulted.
+   *
+   * An allowlist of exactly one assignment, the same shape the provenance
+   * test above uses. `options.textOrigin ?? 'typed'` — the single most
+   * likely well-meant edit, and the one that would hand every future door
+   * the permissive answer for free — fails here.
+   */
+  it('takes the text origin from its caller and substitutes none of its own', () => {
+    const src = source('orchestrator/instruct.ts');
+    const assignments = src.match(/const textOrigin[^;]+;/g) ?? [];
+    expect(assignments).toEqual(['const textOrigin = options.textOrigin;']);
+
+    // And it reaches the authority filter by name, so the pinned value is
+    // provably what that filter weighs. A literal at the call site would
+    // satisfy the required field while leaving the line above dead.
+    const block = callBlock(src, 'authorisedRecipients');
+    expect(block).toContain('textOrigin,');
+  });
+
+  /**
+   * The same property one layer out, for the producer no behavioural test can
+   * reach. `POST /instruct/:jobId/answer` re-plans the JOIN of a typed answer
+   * and a parked instruction that may have arrived as a WhatsApp voice note,
+   * so the join is the owner's own bytes only if the stored half was too —
+   * and the route cannot be driven end to end under test at all, because it
+   * deliberately calls `runInstruction` with no injected planner and
+   * `refuseUnderTest` (`src/sdk/planner.ts`) stops the real one. Without this
+   * pin, replacing that expression with a bare `'typed'` would reopen the
+   * laundering path through the dashboard with every test still green.
+   *
+   * Pinned as the exact expression, the same way the WhatsApp door's own
+   * derivation is pinned in `whatsapp-invariants.test.ts`.
+   */
+  it('derives the answer route origin from the stored instruction, not from the answer', () => {
+    const server = source('dashboard/server.ts');
+    const derivations = server.match(/textOrigin: instruction\.textOrigin[^,]*,/g) ?? [];
+    expect(derivations).toEqual([
+      "textOrigin: instruction.textOrigin === 'typed' ? 'typed' : 'transcribed',",
+    ]);
+    // And the fresh-submission route states its own, so neither of the two
+    // call sites can be the one that quietly says nothing: this is a form
+    // field from an authenticated owner session, which is his keystrokes.
+    expect(server).toContain("textOrigin: 'typed'");
+  });
+
   it('never raises a ramp level or amends the charter from this path', () => {
     for (const file of ['orchestrator/instruct.ts', 'governance/typed-recipients.ts']) {
       expect(source(file)).not.toContain('setRampLevel');

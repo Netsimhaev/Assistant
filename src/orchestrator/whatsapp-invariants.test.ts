@@ -78,6 +78,16 @@ describe('the WhatsApp door cannot widen its own authority', () => {
    *   - there is exactly one call site, so a second, parallel call could not
    *     cover for the first by carrying a forbidden field while this one
    *     stays clean.
+   *
+   * **`textOrigin` rides the OPTIONS, not this argument, and that is not a
+   * way around this test.** The hazard pinned here is a value that
+   * IDENTIFIES THE SENDER reaching the pipeline, because identity is what
+   * the pipeline fixes for itself as a literal. The origin is the opposite
+   * kind of value: it can only restrict (a transcript buys less than typing
+   * ever did), it is required rather than optional so it cannot be omitted,
+   * and it is derived from how the message arrived rather than from anything
+   * in it — which is pinned by its own exact-expression test below. Moving
+   * it into this argument would weaken that test, not strengthen this one.
    */
   it('passes only { text } into runInstruction — nothing that identifies the sender', () => {
     const block = callBlock(source, 'runInstruction');
@@ -117,5 +127,48 @@ describe('the WhatsApp door cannot widen its own authority', () => {
     // specifier never has.
     const gatewayCalls = new Set(source.match(/gateway\.\w+(?=\()/g) ?? []);
     expect(gatewayCalls).toEqual(new Set(['gateway.onInbound', 'gateway.pollOnce']));
+  });
+});
+
+/**
+ * Owner's decision 2 (05/10/2026). `runInstruction`'s `textOrigin` is
+ * required and has no default, so this door CANNOT omit it — that much is a
+ * compile error and needs no test. What a quiet edit could still do is derive
+ * it from the wrong thing.
+ *
+ * This is the one value in the file that decides whether a third-party
+ * transcription model's output is treated as the owner's own typing, and the
+ * rule is that it comes from HOW the message arrived (`mediaKind`, via
+ * `isAudio`) and from the stored origin of the instruction an answer is
+ * joined to — never from anything inside the text. Reading it off `heard`
+ * (`'the message says it was typed'`) would be authority derived from
+ * content, which is the exact defect the field exists to close.
+ *
+ * Pinned as the exact expression, after whitespace normalisation, in the
+ * style `instruction-invariants.test.ts` uses for `provenance: 'boss'`: an
+ * allowlist of one, so any change here has to be made deliberately and
+ * re-argued, rather than a pattern that a plausible-looking wrong derivation
+ * could still satisfy.
+ */
+describe('where the door says the instruction text came from', () => {
+  const normalise = (text: string): string => text.replace(/\s+/g, ' ').trim();
+
+  it('derives the origin from the media kind and the joined half, never from the text', () => {
+    const assignments = source.match(/const textOrigin[^;]+;/g) ?? [];
+    expect(assignments).toHaveLength(1);
+    expect(normalise(assignments[0] ?? '')).toBe(
+      "const textOrigin: InstructionTextOrigin = !isAudio && " +
+        "(answered === null || answered.textOrigin === 'typed') ? 'typed' : 'transcribed';",
+    );
+  });
+
+  it('passes that one derived value into runInstruction, not a literal of its own', () => {
+    // Shorthand, so the value travelling into the pipeline is provably the
+    // expression pinned above. A literal written at the call site would
+    // satisfy the required field while making the derivation dead code —
+    // the test above would still pass, and this one would not.
+    const block = callBlock(source, 'runInstruction');
+    expect(block).toMatch(/\btextOrigin,/);
+    expect(block).not.toMatch(/textOrigin:\s*'/);
   });
 });
