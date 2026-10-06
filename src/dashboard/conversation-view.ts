@@ -1,0 +1,262 @@
+/**
+ * The owner's WhatsApp conversation, on the dashboard.
+ *
+ * The owner's own requirement: "כל הודעה תיכנס גם לדשבורד באתר, גם שם יוכל
+ * המשתמש לראות הודעות ולהגיב משם גם כן" — every message should land in the
+ * dashboard too, and the owner should be able to see messages and reply from
+ * there as well.
+ *
+ * **The compose box at the bottom of this screen gives the ASSISTANT an
+ * instruction. It is never an outbound message to a customer, and nothing on
+ * this page may suggest otherwise.** The tempting misreading of "reply from
+ * there" is "send a WhatsApp to this customer" — that would violate decision
+ * 4 (a message from anyone who is not the principal is recorded and never
+ * acted on or answered) and it is structurally impossible by design:
+ * `createBossMessenger` fixes `contactId` at construction, so there is no
+ * parameter anywhere through which the assistant could be told to address a
+ * stranger. "Reply from there" means typing in this box is EXACTLY as
+ * powerful as typing in WhatsApp, and no more: both are instructions to the
+ * assistant. The box therefore posts to the existing `POST /instruct` — this
+ * screen is a view onto that door, not a second one — and the next person
+ * adding a feature here must keep it that way: no per-message reply button,
+ * no "answer this" link, nothing that implies a row can be addressed
+ * directly. A row from someone who is not the principal is labelled as such
+ * (`senderLabel` below) and carries no control of its own for exactly this
+ * reason.
+ *
+ * Self-contained rather than built on top of `views.ts`'s private `page`/
+ * `logoutForm` helpers (not exported, and the brief's only mandated change to
+ * `views.ts` is exporting `escLabel`) — `views.ts` is already 1,667 lines and
+ * this screen does not need to grow it further.
+ */
+import type { StoredMessage } from '../whatsapp/store.js';
+import { escapeHtml, escLabel } from './views.js';
+
+const esc = escapeHtml;
+
+const STYLE = `
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; gap: 1rem; flex-wrap: wrap; }
+  .card { border: 1px solid #8884; border-radius: 0.5rem; padding: 0.6rem 0.9rem; margin-bottom: 0.6rem; }
+  .muted { opacity: 0.7; font-size: 0.9em; }
+  textarea { width: 100%; box-sizing: border-box; padding: 0.4rem; margin-top: 0.2rem; }
+  button { margin-top: 0.75rem; padding: 0.5rem 1.2rem; cursor: pointer; }
+`;
+
+/**
+ * Who sent a row, by a positive, exhaustive check — never "everyone who is
+ * not the owner". `direction` decides first (an outbound row is always the
+ * assistant's own message, and `recordOutbound` never sets `senderKind`, so
+ * it would otherwise read as unresolved); only an inbound row consults
+ * `senderKind`. `null` on an inbound row should not happen in production —
+ * `recordInbound` requires the field — but a value that could not be read is
+ * never treated as the safer case (the principal); it is labelled unknown.
+ */
+function senderLabel(m: StoredMessage): string {
+  if (m.direction === 'outbound') return 'העוזרת';
+  if (m.senderKind === 'principal') return 'אתה (בעל העסק)';
+  if (m.senderKind === 'other') return 'שולח אחר';
+  return 'שולח לא מזוהה';
+}
+
+/**
+ * Six states, handled by a positive, exhaustive switch — never a default
+ * branch that means "done". Every state renders its own label, always
+ * (fix round 1, Important 1): `failed` is reachable for the owner's OWN
+ * instruction — a daily-cap refusal, a planner refusal, a crash
+ * (`whatsapp-door.ts`) — and a version of this function that skipped the
+ * label for some states made `failed` indistinguishable from `handled`
+ * (succeeded). There is nothing left here that decides whether to show a
+ * label, so there is no field left to carry that decision.
+ *
+ * Prose only, never a field, for which four mean the owner is still owed
+ * something: `received`, `claimed`, `reported_interim` (an interim notice
+ * is, by its own name, not the real answer — see migration 038's docblock)
+ * and `handled` ON A MESSAGE THAT OPENED A JOB — see the `handled` case
+ * below. Fix round 2 deleted the `unfinished: boolean` this function
+ * used to return alongside `label`: it was read nowhere in `src/` once
+ * round 1 stopped branching on it, and "no live reader" is this project's
+ * own named failure class — a field something compiles that nothing reads
+ * (see `CLAUDE.md` on `COLLABORATION_GRAPH` and five others paid for before
+ * this one). It was worse than merely dead: its own docblock said only that
+ * it no longer *decided* the badge, which reads as though it still carried
+ * weight. `noUnusedLocals` does not catch an unused object property, so
+ * nothing would ever have flagged it. If the unfinished/terminal grouping
+ * needs restating later, it belongs in prose like this paragraph, not in a
+ * return value nothing consumes.
+ *
+ * The `default` branch is the exhaustiveness check: if `MessageState` ever
+ * grows a seventh member, `state` narrows to a type that is not assignable
+ * to `never` inside it, and this file fails to typecheck at that exact line
+ * — not at a call site, and not by passing tests for the wrong reason. The
+ * same branch is also the runtime fallback for a value that bypassed the
+ * type system (a stored CHECK constraint widened without the TypeScript
+ * union keeping pace): it renders as unknown, never as silently finished,
+ * because a status this code cannot explain is not one it can promise is
+ * settled.
+ */
+function stateLabel(m: StoredMessage): string {
+  switch (m.state) {
+    case 'received':
+      return 'התקבלה — עדיין לא טופלה';
+    case 'claimed':
+      return 'בטיפול כרגע';
+    case 'reported_interim':
+      return 'עודכנת בביניים — התשובה הסופית עדיין בדרך';
+    case 'handled':
+      // `'handled'` means the door finished with the MESSAGE, and that is
+      // two different facts depending on whether a job came out of it —
+      // which is why this is the one case that reads a second field (task
+      // 12; the final review's Minor 11).
+      //
+      // With a job: the instruction was received and a job was opened, and
+      // this state says NOTHING about what became of that job. It may still
+      // be planning, executing, or waiting on an approval card. Labelling it
+      // 'טופלה' claimed an outcome the record does not carry — a false
+      // statement of closure, which is the one thing the owner's own rule
+      // ("ההוראה לא נסגרה עד שאחד הצדדים אמר במפורש") exists to forbid. The
+      // honest statement is the one the record actually supports: a job
+      // exists and no report has gone out yet. `'reported'` and
+      // `'reported_interim'` are the only states that say the owner was told
+      // anything, and only `'reported'` says he was told the real outcome.
+      //
+      // Without a job: nothing further is owed and nothing is running — a
+      // stranger's message, recorded and closed out under Decision 4, or one
+      // of the owner's own messages that was answered on the spot (a closure
+      // word). That genuinely is finished.
+      //
+      // **The job's own phase is deliberately NOT read here.** It would
+      // sharpen "still running" into "closed, report pending", but this
+      // renderer is given `StoredMessage` rows and nothing else, and the
+      // sentence below is already true for every phase the job can be in —
+      // a label that needs a second query to stop being wrong is a different
+      // and worse thing from one that is merely less specific.
+      return m.jobId !== null
+        ? 'קיבלתי ופתחתי משימה — טרם דיווחתי מה יצא ממנה'
+        : 'טופלה';
+    case 'failed':
+      return 'נכשלה';
+    case 'reported':
+      // **Not 'דווחה' — fix round 1's Minor.** This state has two writers and
+      // only one of them sends a report: `reportWhatsAppJobs` does, and
+      // `retireOpenInstruction` (`whatsapp-routing.ts`) claims it to STOP one
+      // being sent, for a message the owner was told about in the
+      // acknowledgement to his own next message — he closed it, or he
+      // answered it. 'דווחה' asserted the first writer for both, which is
+      // false for every instruction the owner closed himself.
+      //
+      // What is true for BOTH writers is what the state actually means:
+      // nothing further is owed on this message. That is what the label says
+      // now.
+      return 'כבר עדכנתי אותך — אין לי יותר מה לדווח עליה';
+    default: {
+      const unreachable: never = m.state;
+      return `מצב לא מוכר (${String(unreachable)})`;
+    }
+  }
+}
+
+/**
+ * Body, then transcript, then an explicit sentence — never an empty cell.
+ * A row can legitimately carry neither (audio too long, or a transcription
+ * that failed; task 6's territory): that is an answer about what happened to
+ * THIS message, not nothing to say, so it is rendered as a sentence rather
+ * than left blank, which would read as "nothing was said" instead of "we
+ * don't have readable content for this one".
+ *
+ * `escLabel`, not `esc`, on both `body` and `transcript`: either can be
+ * stranger-authored text (an inbound message, or a voice note a
+ * transcription model turned into text from a stranger's audio — the same
+ * class as a message body and arguably wider, since the model can render
+ * anything), and a bidi override in it would change what the owner reads
+ * rather than merely how it looks.
+ *
+ * A field counts as present only when it is a NON-EMPTY string (fix round
+ * 1, Minor 3) — `refineActionClass`'s own lesson (`policy/classify.ts`):
+ * `'' !== null` is true, so a bare `!== null` check let an empty string
+ * through to a bare `<p></p>`, the exact "empty cell reads as nothing was
+ * said" ruling 4 exists to forbid. `''` is covered by the same sentence as
+ * `null`.
+ */
+function hasText(value: string | null): value is string {
+  return value !== null && value !== '';
+}
+
+function contentLine(m: StoredMessage): string {
+  if (hasText(m.body)) return escLabel(m.body);
+  if (hasText(m.transcript)) return `<em>תמלול:</em> ${escLabel(m.transcript)}`;
+  const kindNote = m.mediaKind !== null ? ` (${esc(m.mediaKind)})` : '';
+  return `<span class="muted">הודעה בלי תוכן טקסטואלי לקריאה${kindNote} — ייתכן שההקלטה הייתה ארוכה מדי או שהתמלול נכשל.</span>`;
+}
+
+/** One row. No form, no button, no link — see this module's own docblock. */
+function messageRow(m: StoredMessage): string {
+  const who = senderLabel(m);
+  const when = esc(m.providerTimestamp);
+  // `escLabel`, not `esc`: the number is provider-supplied, not ours.
+  const number = m.senderNumber !== null ? ` <span class="muted">${escLabel(m.senderNumber)}</span>` : '';
+  // Always shown (fix round 1, Important 1) — a `failed` instruction must
+  // not read identically to a `handled` one.
+  const badge = ` <span class="muted">· ${esc(stateLabel(m))}</span>`;
+
+  return `
+    <article class="card">
+      <div class="muted">${esc(who)}${number} · ${when}${badge}</div>
+      <p>${contentLine(m)}</p>
+    </article>`;
+}
+
+/**
+ * `truncated` (fix round 1, Important 2): this screen calls itself the
+ * owner's full record, and past the loaded window it quietly stops being
+ * one unless something says so. The decision of WHICH messages were cut —
+ * asking the store for one more row than the limit and checking whether it
+ * came back — belongs to the caller (`handleConversation` in `server.ts`),
+ * which is the only place that knows the limit; this function only renders
+ * the one Hebrew sentence when told to. Optional and defaulted to `false`
+ * so every existing call site that has nothing to report need not pass it.
+ */
+export function renderConversation(options: {
+  messages: readonly StoredMessage[];
+  csrf: string;
+  truncated?: boolean;
+}): string {
+  const truncated = options.truncated ?? false;
+  const rows =
+    options.messages.length === 0
+      ? '<p class="muted">עדיין לא התקבלה אף הודעה בשיחה הזו.</p>'
+      : options.messages.map(messageRow).join('\n');
+  const truncationNote = truncated
+    ? '<p class="muted">מוצגות ההודעות האחרונות בלבד — היסטוריה מוקדמת יותר אינה מוצגת כאן.</p>'
+    : '';
+
+  return `<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>שיחת הוואטסאפ</title>
+<style>${STYLE}</style>
+</head>
+<body>
+<header>
+  <h1>שיחת הוואטסאפ</h1>
+</header>
+<p class="muted">
+  מה שתכתוב בתיבה שבתחתית העמוד הוא הוראה לעוזרת, באותה סמכות ובאותה דלת
+  כמו הודעת וואטסאפ שהיית שולח לה — אך הוא לא יופיע כהודעה בשיחה שלמעלה.
+  היא אינה יכולה לענות מכאן למי ששלח הודעה; ההוראה הולכת רק לעוזרת.
+</p>
+${truncationNote}
+${rows}
+<form method="POST" action="/instruct">
+  <input type="hidden" name="csrf" value="${esc(options.csrf)}">
+  <textarea name="text" rows="3" maxlength="4000" required placeholder="כתוב הוראה לעוזרת, בדיוק כמו בוואטסאפ"></textarea>
+  <button>שלח</button>
+</form>
+<p><a href="/">לכרטיסי האישור</a> · <a href="/instruct">מה לעשות</a> · <a href="/readings">מה קראתי</a></p>
+</body>
+</html>`;
+}

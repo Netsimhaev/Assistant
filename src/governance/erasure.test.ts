@@ -421,8 +421,8 @@ describe('executeErasure', () => {
       { businessId: BUSINESS },
     );
     await getPool().query(
-      `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text)
-       VALUES ($1, $2, $3, 'x')`,
+      `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
+       VALUES ($1, $2, $3, 'x', 'typed')`,
       [`INS-${ulid()}`, BUSINESS, jobId],
     );
     await getPool().query(

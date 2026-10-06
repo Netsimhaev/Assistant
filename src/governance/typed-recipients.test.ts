@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { TYPED_RECIPIENT_CLASSES, authorisedRecipients } from './typed-recipients.js';
+import {
+  TYPED_RECIPIENT_CLASSES,
+  authorisedRecipients,
+  recipientsOnlyInRecording,
+} from './typed-recipients.js';
 
 const NO_ONE_KNOWN = { entityIds: [], emailDomains: [], phones: [], tags: [] };
 
@@ -7,6 +11,7 @@ describe('authorisedRecipients', () => {
   it('covers an address the owner typed verbatim', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי לדנה dana@example.com את ההצעה',
         actionClass: 'email.initiate',
         candidates: ['dana@example.com'],
@@ -18,6 +23,7 @@ describe('authorisedRecipients', () => {
   it('does not cover an address the owner never typed', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי לדנה את ההצעה',
         actionClass: 'email.initiate',
         candidates: ['dana@example.com'],
@@ -29,6 +35,7 @@ describe('authorisedRecipients', () => {
   it('matches an address case-insensitively', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי ל-Dana@Example.COM',
         actionClass: 'email.reply',
         candidates: ['dana@example.com'],
@@ -40,6 +47,7 @@ describe('authorisedRecipients', () => {
   it('matches a phone written with separators against one written without', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי לדנה בוואטסאפ 054-123-4567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0541234567'],
@@ -51,6 +59,7 @@ describe('authorisedRecipients', () => {
   it('matches a local phone against the same number in international form', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי ל-054-1234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['+972541234567'],
@@ -62,6 +71,7 @@ describe('authorisedRecipients', () => {
   it('covers a counterparty the charter already knows, even unnamed in the text', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי לספק את ההזמנה',
         actionClass: 'email.initiate',
         candidates: ['orders@supplier.co.il'],
@@ -77,6 +87,7 @@ describe('authorisedRecipients', () => {
     for (const known of [NO_ONE_KNOWN, { ...NO_ONE_KNOWN, emailDomains: ['supplier.co.il'] }]) {
       expect(
         authorisedRecipients({
+          textOrigin: 'typed',
           instruction: 'תזמיני מ-orders@supplier.co.il חמישים יחידות',
           actionClass: 'purchase.place',
           candidates: ['orders@supplier.co.il'],
@@ -89,6 +100,7 @@ describe('authorisedRecipients', () => {
   it('returns only the covered subset when a step reaches several people', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי ל-dana@example.com',
         actionClass: 'email.initiate',
         candidates: ['dana@example.com', 'stranger@elsewhere.com'],
@@ -124,6 +136,7 @@ describe('authorisedRecipients', () => {
   it('covers a known phone number even with nothing typed about it', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תזכירי לי מחר בבוקר',
         actionClass: 'whatsapp.initiate',
         candidates: ['0501234567'],
@@ -135,6 +148,7 @@ describe('authorisedRecipients', () => {
   it('covers a known entity id even with nothing typed about it', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תזכירי לי מחר בבוקר',
         actionClass: 'email.initiate',
         candidates: ['cust-42'],
@@ -159,6 +173,7 @@ describe('authorisedRecipients', () => {
     // for exactly this reason.)
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי הצעה',
         actionClass: 'email.initiate',
         candidates: ['orders@evil-supplier.co.il'],
@@ -175,6 +190,7 @@ describe('authorisedRecipients', () => {
     // hosting mail for every one of its customers at once.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי הצעה',
         actionClass: 'email.initiate',
         candidates: ['orders@mail.supplier.co.il'],
@@ -186,6 +202,7 @@ describe('authorisedRecipients', () => {
   it('covers a calendar recipient typed verbatim', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תקבעי פגישה עם dana@example.com',
         actionClass: 'calendar.create',
         candidates: ['dana@example.com'],
@@ -197,6 +214,7 @@ describe('authorisedRecipients', () => {
   it('covers a doc.deliver recipient typed verbatim', () => {
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי את המסמך ל-dana@example.com',
         actionClass: 'doc.deliver',
         candidates: ['dana@example.com'],
@@ -212,6 +230,7 @@ describe('authorisedRecipients', () => {
     // comparison against the fully-extracted address can.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי ל-dana@example.co.il',
         actionClass: 'email.initiate',
         candidates: ['dana@example.co'],
@@ -226,6 +245,7 @@ describe('authorisedRecipients', () => {
     // a substring, but the owner never typed that address.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'אל תשיבי — זה noreply@example.com',
         actionClass: 'email.initiate',
         candidates: ['reply@example.com'],
@@ -241,6 +261,7 @@ describe('authorisedRecipients', () => {
     // all.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'הזמנות: 100 200 521 234 567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0521234567'],
@@ -259,6 +280,7 @@ describe('authorisedRecipients', () => {
     // nine-digit floor and is not true of the rule that replaced it.)
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'לפי הזמנה מספר 12345',
         actionClass: 'whatsapp.initiate',
         candidates: ['12345'],
@@ -278,6 +300,7 @@ describe('authorisedRecipients', () => {
     // it does not.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי ל billing@acme.co.il2024',
         actionClass: 'email.initiate',
         candidates: ['billing@acme.co'],
@@ -293,6 +316,7 @@ describe('authorisedRecipients', () => {
     // `dana@sub.example.co`.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי ל dana@example.co.il_new',
         actionClass: 'email.initiate',
         candidates: ['dana@example.co'],
@@ -301,6 +325,7 @@ describe('authorisedRecipients', () => {
     ).toEqual([]);
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי ל dana@sub.example.co.il_',
         actionClass: 'email.initiate',
         candidates: ['dana@sub.example.co'],
@@ -316,6 +341,7 @@ describe('authorisedRecipients', () => {
     // address recognised.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי ל-dana@example.com',
         actionClass: 'email.initiate',
         candidates: ['dana@example.com'],
@@ -338,6 +364,7 @@ describe('authorisedRecipients', () => {
     // correctly.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי ל-dana@example.co.il2',
         actionClass: 'email.initiate',
         candidates: ['dana@example.co'],
@@ -363,6 +390,7 @@ describe('authorisedRecipients', () => {
     ];
     const ask = (instruction: string): string[] =>
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction,
         actionClass: 'email.initiate',
         candidates: ['dana@example.com'],
@@ -392,6 +420,7 @@ describe('authorisedRecipients', () => {
     // actually excludes it.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'הזמנה 100-521-234-567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0521234567'],
@@ -404,6 +433,7 @@ describe('authorisedRecipients', () => {
     // N2's second row.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'לפי חשבונית 1.521.234.567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0521234567'],
@@ -418,6 +448,7 @@ describe('authorisedRecipients', () => {
     // introduction, and `521234567` alone does not start with `0` or `972`.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'ח.פ. 521234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0521234567'],
@@ -437,6 +468,7 @@ describe('authorisedRecipients', () => {
     // stands. The test below isolates it.)
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'מספר לקוח 000521234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0521234567'],
@@ -455,6 +487,7 @@ describe('authorisedRecipients', () => {
     // number the owner typed is still not a recipient.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'מספר לקוח 000521234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['000521234567'],
@@ -470,6 +503,7 @@ describe('authorisedRecipients', () => {
     // negative that makes the feature useless to the owner it is for.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תתקשרי ל-03-1234567 ותאשרי את הפגישה',
         actionClass: 'whatsapp.initiate',
         candidates: ['031234567'],
@@ -486,6 +520,7 @@ describe('authorisedRecipients', () => {
     // international spelling.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תתקשרי ל-03-1234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['+972-3-1234567'],
@@ -494,6 +529,7 @@ describe('authorisedRecipients', () => {
     ).toEqual(['+972-3-1234567']);
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תתקשרי ל-+972-3-1234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['031234567'],
@@ -513,6 +549,7 @@ describe('authorisedRecipients', () => {
     ]) {
       expect(
         authorisedRecipients({
+          textOrigin: 'typed',
           instruction,
           actionClass: 'whatsapp.initiate',
           candidates: ['0541234567'],
@@ -529,6 +566,7 @@ describe('authorisedRecipients', () => {
     // 8-or-9 rule refuses the whole number.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי הודעה ל-+972 054-123-4567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0541234567'],
@@ -545,6 +583,7 @@ describe('authorisedRecipients', () => {
     // one digit further left. Both directions asserted.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תתקשרי ל-+972-0-3-1234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['03-1234567'],
@@ -553,6 +592,7 @@ describe('authorisedRecipients', () => {
     ).toEqual(['03-1234567']);
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תתקשרי ל-03-1234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['+972-0-3-1234567'],
@@ -575,6 +615,7 @@ describe('authorisedRecipients', () => {
     // spaced-groups test above -- still green, testing nothing.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי הודעה ל-054\u00A0123\u00A04567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0541234567'],
@@ -592,6 +633,7 @@ describe('authorisedRecipients', () => {
     // subscriber number and does not equal the candidate's `521234567`.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'יתרה 00 521234567',
         actionClass: 'whatsapp.initiate',
         candidates: ['0521234567'],
@@ -609,6 +651,7 @@ describe('authorisedRecipients', () => {
     for (const instruction of ['ח.פ.\t0\t521234567', 'ח.פ.\n0\n521234567']) {
       expect(
         authorisedRecipients({
+          textOrigin: 'typed',
           instruction,
           actionClass: 'whatsapp.initiate',
           candidates: ['0521234567'],
@@ -643,6 +686,7 @@ describe('authorisedRecipients', () => {
     ]) {
       expect(
         authorisedRecipients({
+          textOrigin: 'typed',
           instruction,
           actionClass: 'whatsapp.initiate',
           candidates: ['0521234567'],
@@ -663,6 +707,7 @@ describe('authorisedRecipients', () => {
     // other test in this file does.
     expect(
       authorisedRecipients({
+        textOrigin: 'typed',
         instruction: 'תשלחי הצעה ללקוח cust-42 לפי מה שסיכמנו',
         actionClass: 'email.initiate',
         candidates: ['cust-42'],
@@ -678,4 +723,164 @@ describe('authorisedRecipients', () => {
   // mobile (see the test for them above) -- so its string moved into
   // 'records the residual: ...', where it is now correctly recorded as
   // authorised rather than silently dropped.
+});
+
+/**
+ * The origin rule (owner's decision 2, 05/10/2026).
+ *
+ * A voice note's text is produced by a third-party transcription provider's
+ * model. Nobody typed it, and the verbatim arm's whole claim is "the owner
+ * typed this address himself" — so a mistranscription, or a compromised
+ * provider, could otherwise name a recipient and buy them a standing
+ * authorisation with no approval card. Authority is never derivable from
+ * content; a transcript is content.
+ *
+ * Both directions are pinned here, because over-tightening is a real failure
+ * too: the owner's rule is that a clear transcript authorises the ACTION, and
+ * only an address, name or number appearing **only in a recording** needs his
+ * explicit word.
+ */
+describe('authorisedRecipients and where the instruction came from', () => {
+  const SPOKEN = 'תשלחי ל-dana@example.com את ההצעה';
+
+  it('does not authorise an address that appears only in a transcript', () => {
+    // The same instruction, the same class, the same candidate as the very
+    // first test in this file — which authorises it. The ONLY difference is
+    // the origin, so this pair is the whole control: drop the origin check
+    // from `authorisedRecipients` and this test goes red while that one
+    // stays green.
+    expect(
+      authorisedRecipients({
+        textOrigin: 'transcribed',
+        instruction: SPOKEN,
+        actionClass: 'email.initiate',
+        candidates: ['dana@example.com'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('still authorises a counterparty the charter knows, however the instruction arrived', () => {
+    // The charter arm survives a recording on purpose: that authority comes
+    // from the owner's signature on the charter, not from what he typed
+    // today. Gate the whole filter on the origin instead of just the
+    // verbatim arm and this goes red — over-tightening is caught here, not
+    // only under-tightening.
+    expect(
+      authorisedRecipients({
+        textOrigin: 'transcribed',
+        instruction: 'תשלחי לספק את ההזמנה',
+        actionClass: 'email.initiate',
+        candidates: ['orders@supplier.co.il'],
+        known: { ...NO_ONE_KNOWN, emailDomains: ['supplier.co.il'] },
+      }),
+    ).toEqual(['orders@supplier.co.il']);
+  });
+
+  it('does not authorise a phone number that appears only in a transcript', () => {
+    // The phone pathway is a separate branch of `appearsVerbatimIn` with its
+    // own prefix-anchored key, so it needs its own control: a fix applied to
+    // the address arm alone would leave the number arm open, and a WhatsApp
+    // step's recipient is a number.
+    expect(
+      authorisedRecipients({
+        textOrigin: 'transcribed',
+        instruction: 'תשלחי לה וואטסאפ ל-054-123-4567',
+        actionClass: 'whatsapp.initiate',
+        candidates: ['0541234567'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+});
+
+/**
+ * `recipientsOnlyInRecording` — the counterfactual the owner's sentence is
+ * built from: who typing WOULD have authorised, and did not, because of the
+ * recording specifically.
+ *
+ * It exists so the note can be TRUE. A note that fires when nothing was
+ * withheld, or that blames the recording for something another rule stopped,
+ * is how a real notice stops being read.
+ */
+describe('recipientsOnlyInRecording', () => {
+  it('names the address a recording withheld', () => {
+    expect(
+      recipientsOnlyInRecording({
+        textOrigin: 'transcribed',
+        instruction: 'תשלחי ל-dana@example.com את ההצעה',
+        actionClass: 'email.initiate',
+        candidates: ['dana@example.com'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual(['dana@example.com']);
+  });
+
+  it('names nobody for a typed instruction, because nothing was withheld', () => {
+    expect(
+      recipientsOnlyInRecording({
+        textOrigin: 'typed',
+        instruction: 'תשלחי ל-dana@example.com את ההצעה',
+        actionClass: 'email.initiate',
+        candidates: ['dana@example.com'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  it('names nobody the charter already knows, because they were authorised anyway', () => {
+    expect(
+      recipientsOnlyInRecording({
+        textOrigin: 'transcribed',
+        instruction: 'תשלחי ל-orders@supplier.co.il את ההזמנה',
+        actionClass: 'email.initiate',
+        candidates: ['orders@supplier.co.il'],
+        known: { ...NO_ONE_KNOWN, emailDomains: ['supplier.co.il'] },
+      }),
+    ).toEqual([]);
+  });
+
+  it('names nobody for a class an instruction could never authorise anyway', () => {
+    // `purchase.place` is outside `TYPED_RECIPIENT_CLASSES`, so typing the
+    // address would not have authorised it either. Naming the recording as
+    // the reason would be a lie about which rule stopped it — the owner
+    // would go looking for a transcription problem that is not there.
+    expect(
+      recipientsOnlyInRecording({
+        textOrigin: 'transcribed',
+        instruction: 'תזמיני מ-orders@supplier.co.il חמישים יחידות',
+        actionClass: 'purchase.place',
+        candidates: ['orders@supplier.co.il'],
+        known: NO_ONE_KNOWN,
+      }),
+    ).toEqual([]);
+  });
+
+  /**
+   * The relationship between the two exported functions, asserted directly
+   * rather than left to two sets of examples that could drift apart: what a
+   * recording withholds is exactly what typing would have added. Both
+   * functions read the same two private predicates, and this is what fails
+   * if one of them grows a rule the other does not have.
+   */
+  it('is exactly what typing would have added, for every candidate', () => {
+    const shared = {
+      instruction: 'תשלחי ל-dana@example.com ול-orders@supplier.co.il ול-054-123-4567',
+      actionClass: 'email.initiate' as const,
+      candidates: ['dana@example.com', 'orders@supplier.co.il', 'stranger@elsewhere.com'],
+      known: { ...NO_ONE_KNOWN, emailDomains: ['supplier.co.il'] },
+    };
+
+    const typed = authorisedRecipients({ ...shared, textOrigin: 'typed' });
+    const spoken = authorisedRecipients({ ...shared, textOrigin: 'transcribed' });
+    const withheld = recipientsOnlyInRecording({ ...shared, textOrigin: 'transcribed' });
+
+    expect(withheld).toEqual(typed.filter((recipient) => !spoken.includes(recipient)));
+    // And the example is not a degenerate one: typing really did authorise
+    // more than the recording did, so the assertion above is comparing two
+    // different sets rather than two empty ones.
+    expect(typed).toEqual(['dana@example.com', 'orders@supplier.co.il']);
+    expect(spoken).toEqual(['orders@supplier.co.il']);
+    expect(withheld).toEqual(['dana@example.com']);
+  });
 });

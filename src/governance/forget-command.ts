@@ -13,8 +13,21 @@
  * someone a way to trigger the screen.
  */
 
-/** The openings that mean "forget". A positive list, matched at the start. */
-const FORGET_VERBS: readonly string[] = ['תשכחי', 'שכחי', 'תמחקי', 'מחקי'];
+/**
+ * The openings that mean "forget". A positive list, matched at the start.
+ *
+ * **Exported for one reason: a second verb list now exists, and the two must
+ * never share a member.** `CLOSURE_VERBS` (`./closure-command.ts`) means "the
+ * instruction is finished" and closes a parked job; this list means "open the
+ * erasure screen". A word in both would make the owner's intent depend on
+ * which check ran first — and the erasure side is the one with a contact
+ * deletion preview behind it. The disjointness test
+ * (`closure-command.test.ts`) imports BOTH exported arrays and intersects
+ * them, rather than re-typing either: two lists compared against a
+ * hand-copied duplicate of one of them is how two lists drift apart while
+ * their test stays green.
+ */
+export const FORGET_VERBS: readonly string[] = ['תשכחי', 'שכחי', 'תמחקי', 'מחקי'];
 
 /**
  * Whole-token email address test, using the same anchoring approach as

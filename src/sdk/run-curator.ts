@@ -124,6 +124,7 @@ async function main(): Promise<void> {
       stepId: 's1',
       externalId: 'live-curator-run',
       status: 'completed',
+      performed: true,
     });
     await client.query('COMMIT');
   } catch (err) {

@@ -6,6 +6,16 @@
  * and the whole authority of this path rests on the session that reached it —
  * the same structural rule `conduct.ts` keeps in the opposite direction.
  *
+ * **`textOrigin` is the opposite case and is a required option for exactly
+ * that reason.** `provenance` has one correct value here, so it is a literal;
+ * where the text came from genuinely differs by door — a dashboard form is
+ * the owner's keystrokes, a WhatsApp voice note is a transcription
+ * provider's model output that nobody typed — so it cannot be fixed in this
+ * file. What it must never be is optional: the standing authorisation this
+ * module writes rests on "the owner typed this address himself", and a door
+ * that said nothing would inherit that claim for free. Required, no default,
+ * no `??`. See `RunInstructionOptions.textOrigin` below.
+ *
  * The order is deliberate: the cap is checked before the planner is called, so
  * a pasted document costs nothing; the plan is validated before anything is
  * bound; and the authorisation is granted only after the plan is known good,
@@ -63,11 +73,17 @@ import {
   saveInstruction,
   type InstructionRecord,
 } from '../governance/instructions.js';
-import { authorisedRecipients, emailAddressesIn } from '../governance/typed-recipients.js';
+import {
+  authorisedRecipients,
+  emailAddressesIn,
+  recipientsOnlyInRecording,
+  type InstructionTextOrigin,
+} from '../governance/typed-recipients.js';
 import { listContacts } from '../memory/contacts.js';
 import { resolveContacts, type Ambiguity, type Resolution } from '../memory/contact-resolver.js';
 import { recallForPlanning } from '../memory/recall-planning.js';
 import { readEmails, readPhones } from '../policy/facts.js';
+import { stripBidiControls } from '../util/bidi.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { createJob, transition } from './jobs.js';
@@ -75,6 +91,34 @@ import { bindPlanToJob } from './plan-store.js';
 import { classMismatch } from './run-plan.js';
 
 export interface RunInstructionOptions {
+  /**
+   * Where `input.text`'s bytes came from — **required, with no default**.
+   *
+   * `provenance` is not a field here at all, because it has one correct
+   * value on this path and a caller able to aim it would be a caller able to
+   * forge an instruction (see this module's header). This one genuinely
+   * varies by door, so it cannot be a literal — but it decides the same kind
+   * of thing, so it is required instead: `CredentialSource.resolve`
+   * (`src/orchestrator/credentials.ts`) makes exactly this trade for exactly
+   * this reason, "required means an omission is a compile error rather than
+   * a wrong lookup at run time". There is deliberately no `?? 'typed'`
+   * anywhere: a door added later cannot inherit the permissive answer by
+   * saying nothing.
+   *
+   * **The one rule for a caller: derive it from HOW the message arrived,
+   * never from anything inside the text.** The WhatsApp door reads it off
+   * `mediaKind`; the dashboard states `'typed'` because an HTML form
+   * submission is the owner's own keystrokes. Both are pinned structurally
+   * (`whatsapp-invariants.test.ts`), because a value read out of the text
+   * would be authority derived from content — the thing this whole field
+   * exists to prevent.
+   *
+   * For text that JOINS two halves — an answer to a clarifying question —
+   * `'typed'` holds only if both halves were typed. Each caller computes
+   * that from the stored origin of the half it is joining to
+   * (`InstructionRecord.textOrigin`), positively.
+   */
+  textOrigin: InstructionTextOrigin;
   businessId?: string;
   /** The one step that costs money, injectable so the pipeline can be tested without an API key. */
   planner?: (request: PlanRequest) => Promise<PlanOutcome>;
@@ -108,6 +152,27 @@ export type InstructionOutcome =
        * already authorised, and this is the sentence that tells them why.
        */
       grantNote: string | null;
+      /**
+       * Set only when the instruction's text came from a recording AND that
+       * is what withheld a recipient the owner would otherwise have
+       * authorised by typing it (`recipientsOnlyInRecording`).
+       *
+       * The owner's ruling of 05/10/2026 has two halves and this is the
+       * second one: a clear transcript authorises the action, and an address
+       * that appears only in a recording needs his explicit confirmation.
+       * Withholding the grant is the first half; **saying so is the other**,
+       * and without it he gives a spoken instruction, watches it be planned,
+       * and later meets an approval card for a recipient he believes he
+       * already named — the same silence `grantNote` above exists to break,
+       * from a different cause.
+       *
+       * Null whenever nothing was actually withheld for this reason: a typed
+       * instruction, a recording whose recipients the charter already knows,
+       * or a class no instruction could authorise anyway. A note that fires
+       * when the thing it describes did not happen is how a real notice
+       * stops being read.
+       */
+      recordingNote: string | null;
       /**
        * Set only when a name was still ambiguous on the second pass, so the
        * instruction went ahead with none of that person's memory (spec
@@ -155,10 +220,14 @@ export type InstructionOutcome =
 
 export async function runInstruction(
   input: { text: string },
-  options: RunInstructionOptions = {},
+  options: RunInstructionOptions,
 ): Promise<InstructionOutcome> {
   const businessId = options.businessId ?? config.businessId;
   const planner = options.planner ?? makePlan;
+  // Read once, used for the stored row and for the grant, so the bytes that
+  // were saved and the bytes that were weighed for authority can never be
+  // described differently. No default — see the option's own docblock.
+  const textOrigin = options.textOrigin;
 
   if (input.text.trim().length === 0) {
     return { status: 'refused', reason: 'ההוראה ריקה.' };
@@ -187,7 +256,10 @@ export async function runInstruction(
 
   let instruction: InstructionRecord;
   try {
-    instruction = await saveInstruction({ jobId: job.jobId, text: input.text }, { businessId });
+    instruction = await saveInstruction(
+      { jobId: job.jobId, text: input.text, textOrigin },
+      { businessId },
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await transition(job.jobId, {
@@ -209,12 +281,20 @@ export async function runInstruction(
     businessId,
   });
 
-  // Two positive sources, never a guess: addresses the owner typed, and
-  // contacts whose name appears in the instruction. `emailAddressesIn` is the
-  // same extractor the standing-authorisation path uses — resolving a NAME is
+  // Two positive sources, never a guess: addresses that appear in the text,
+  // and contacts whose name appears in it. `emailAddressesIn` is the same
+  // extractor the standing-authorisation path uses — resolving a NAME is
   // new, and deliberately feeds memory only (spec §9): it does not widen who
   // may be written to.
-  const typed = emailAddressesIn(input.text);
+  //
+  // **Deliberately blind to `textOrigin`, and that is not an oversight.**
+  // This feeds the recall scope below and nothing else: which of the
+  // business's own remembered facts the planner is shown. Recall is reading,
+  // every row it returns carries its own provenance label, and no authority
+  // follows from it — so an address the owner only said out loud still
+  // scopes the memory block, exactly as it did before the origin rule. The
+  // only thing a recording stops buying is who may be contacted.
+  const addressesInText = emailAddressesIn(input.text);
   let resolution: Resolution = { subjects: [], ambiguities: [] };
   try {
     resolution = resolveContacts(input.text, await listContacts({ businessId }));
@@ -261,7 +341,7 @@ export async function runInstruction(
       ? renderIdentityNote(resolution.ambiguities.map((ambiguity) => ambiguity.token))
       : null;
 
-  const subjects = [...typed, ...resolution.subjects];
+  const subjects = [...addressesInText, ...resolution.subjects];
 
   // A failed recall degrades to no memory block rather than failing the
   // instruction — planning without the past is worse than planning with it,
@@ -399,10 +479,11 @@ export async function runInstruction(
     }
   }
 
-  const { granted, grantNote } = await grantForPlan(
+  const { granted, grantNote, recordingNote } = await grantForPlan(
     job.jobId,
     plan,
     input.text,
+    textOrigin,
     active.bundle.knownCounterparties,
     businessId,
   );
@@ -444,6 +525,7 @@ export async function runInstruction(
     instructionId: instruction.instructionId,
     granted,
     grantNote,
+    recordingNote,
     identityNote,
   };
 }
@@ -471,6 +553,49 @@ function renderIdentityNote(tokens: readonly string[]): string {
 interface GrantForPlanResult {
   granted: GrantedAuthorization[];
   grantNote: string | null;
+  recordingNote: string | null;
+}
+
+/**
+ * The sentence the owner reads when his instruction came from a recording and
+ * that is what kept a recipient off the standing authorisation.
+ *
+ * **Worded to be true of a joined instruction as well as a purely spoken
+ * one**, which is why it says "includes text that came from a recording"
+ * rather than "this address came from the recording". An answer to a
+ * clarifying question is planned over the join of the stored instruction and
+ * the new answer, so one of the two halves can be typed — and if the owner
+ * typed the address in that half, this still withholds it (the origin is one
+ * value for the whole text, deliberately: see the option's docblock) and a
+ * sentence claiming the address came from the recording would be false. What
+ * it does claim is exactly what happened: part of this text was not typed, so
+ * nothing in it was treated as an address the owner named himself, and here
+ * is what consequently needs his word.
+ *
+ * It names the recipients, because "something needs confirming" the owner
+ * cannot act on is the kind of notice that trains him to ignore notices.
+ *
+ * **Each recipient goes through `stripBidiControls` before it is quoted, and
+ * that strip belongs HERE rather than at either reader.** On this path the
+ * address reached the plan through a transcription provider's model, which is
+ * the least trusted text that ever reaches a sentence the owner reads — and
+ * the note travels to two surfaces with different escapers: the dashboard
+ * passes it through `escLabel` (which strips the same set, plus HTML escapes)
+ * and the WhatsApp ack is plain text with no escaping at all, where an HTML
+ * entity would render literally. `whatsapp-routing.ts`'s `instructionSnippet`
+ * makes exactly this call for exactly this reason. Stripping once, where the
+ * sentence is composed, is what keeps the WhatsApp surface from being the one
+ * that forgot — an address carrying a right-to-left override can otherwise
+ * reorder the sentence that explains why it needs confirming, so the owner
+ * reads one thing and confirms another.
+ */
+function renderRecordingNote(recipients: readonly string[]): string {
+  const names = recipients.map((recipient) => `"${stripBidiControls(recipient)}"`).join(', ');
+  return recipients.length === 1
+    ? `ההוראה הזו כוללת טקסט שהגיע מהקלטה ולא מהקלדה שלך, ולכן לא התייחסתי ל-${names} ` +
+        'כנמען שנקבת בו בעצמך. כדי שאפנה לשם, צריך אישור מפורש ממך.'
+    : `ההוראה הזו כוללת טקסט שהגיע מהקלטה ולא מהקלדה שלך, ולכן לא התייחסתי ל-${names} ` +
+        'כנמענים שנקבת בהם בעצמך. כדי שאפנה אליהם, צריך אישור מפורש ממך.';
 }
 
 /**
@@ -502,15 +627,28 @@ interface GrantForPlanResult {
  * set, one level up: every step in a multi-class plan takes the ordinary
  * approval path instead, which is the safe direction, and the instruction
  * still runs — only the shortcut is withheld, never the instruction itself.
+ *
+ * **`textOrigin` travels in here beside the instruction's bytes, and it
+ * reaches `authorisedRecipients` rather than being interpreted on the way.**
+ * The one judgement this function makes about it is which sentence the owner
+ * is owed, never which recipients are allowed — that decision belongs to the
+ * module that owns the rule (`governance/typed-recipients.ts`), and a second
+ * reading of the same flag here would be a second rule to drift from it.
  */
 async function grantForPlan(
   jobId: string,
   plan: Plan,
   instruction: string,
+  textOrigin: InstructionTextOrigin,
   known: Parameters<typeof authorisedRecipients>[0]['known'],
   businessId: string,
 ): Promise<GrantForPlanResult> {
   const byClass = new Map<ActionClass, Set<string>>();
+  // Accumulated across every step, independently of whether that step
+  // granted anything: a step whose covered set is empty is precisely where a
+  // withheld recipient lives, so this has to be collected BEFORE the
+  // `continue` below.
+  const withheld = new Set<string>();
 
   for (const step of plan.steps) {
     const actionClass = step.expectedActionClass;
@@ -519,21 +657,42 @@ async function grantForPlan(
     // did not say" must read as "no permission was widened".
     if (actionClass === null) continue;
 
+    // Emails and phones both. A WhatsApp step's recipient is a number, and
+    // Task 3 widened `coveredByAuthorization` to see them for the same
+    // reason — a grant the gate cannot match is a grant that does nothing.
+    const candidates = [...readEmails(step.input), ...readPhones(step.input)];
+
     const covered = authorisedRecipients({
       instruction,
+      textOrigin,
       actionClass,
-      // Emails and phones both. A WhatsApp step's recipient is a number, and
-      // Task 3 widened `coveredByAuthorization` to see them for the same
-      // reason — a grant the gate cannot match is a grant that does nothing.
-      candidates: [...readEmails(step.input), ...readPhones(step.input)],
+      candidates,
       known,
     });
+    // The counterfactual, from the same module and the same two predicates:
+    // who typing WOULD have authorised here. Empty for a typed instruction,
+    // so this costs nothing on the dashboard's path and says nothing there.
+    for (const recipient of recipientsOnlyInRecording({
+      instruction,
+      textOrigin,
+      actionClass,
+      candidates,
+      known,
+    })) {
+      withheld.add(recipient);
+    }
+
     if (covered.length === 0) continue;
 
     const bucket = byClass.get(actionClass) ?? new Set<string>();
     for (const address of covered) bucket.add(address);
     byClass.set(actionClass, bucket);
   }
+
+  // Sorted for the same reason `recipients` below is: the sentence the owner
+  // reads must not depend on which step the planner happened to write first.
+  const recordingNote =
+    withheld.size === 0 ? null : renderRecordingNote([...withheld].sort());
 
   // Decided explicitly, before a single `grantAuthorization` call, rather
   // than letting the table's primary key decide it via a thrown unique
@@ -549,6 +708,12 @@ async function grantForPlan(
       grantNote:
         'ההוראה נגעה ביותר מסוג פעולה אחד שאתה נקבת בנמען שלו, ולכן לא ניתנה הרשאה ' +
         'אוטומטית לאף אחד מהם — כל צעד בתוכנית יעבור את מסלול האישור הרגיל.',
+      // Carried through this early return, not dropped: the two notes answer
+      // different questions and both can be true of one instruction. A
+      // spoken, two-class instruction withheld recipients for BOTH reasons,
+      // and telling the owner only about the class count would leave him
+      // without the one fact that is specific to the recording.
+      recordingNote,
     };
   }
 
@@ -558,7 +723,7 @@ async function grantForPlan(
     await grantAuthorization({ jobId, actionClass, recipients }, { businessId, db: getPool() });
     granted.push({ actionClass, recipients });
   }
-  return { granted, grantNote: null };
+  return { granted, grantNote: null, recordingNote };
 }
 
 /**

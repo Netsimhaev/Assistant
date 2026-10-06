@@ -10,6 +10,7 @@ import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
+import { recordInbound, recordOutbound } from '../whatsapp/store.js';
 import { bindPlanToJob } from '../orchestrator/plan-store.js';
 import { Plan } from '../domain/plan.js';
 import { writeMemory } from '../memory/store.js';
@@ -30,7 +31,8 @@ import { saveNotJudged, saveVerdict, type NotJudgedReason } from '../governance/
 import { queryAudit } from '../audit/log.js';
 import {
   loadInstructionForJob,
-  recordAnswer,
+  claimAnswer,
+  pendingQuestions,
   recordQuestion,
   saveInstruction,
 } from '../governance/instructions.js';
@@ -451,6 +453,125 @@ describe('GET /', () => {
   });
 });
 
+describe('GET /conversation', () => {
+  it('refuses the conversation screen without a session', async () => {
+    const baseUrl = await startServer(BUSINESS);
+
+    const res = await fetch(`${baseUrl}/conversation`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  it('shows the full record behind a session, oldest first, labelled by sender', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    await recordInbound(
+      {
+        providerMessageId: 'wamid.owner.1',
+        senderNumber: '+972501111111',
+        senderKind: 'principal',
+        body: 'תזכיר לי להתקשר לדנה',
+        mediaKind: null,
+        providerTimestamp: '2026-10-03T08:00:00.000Z',
+      },
+      { businessId: BUSINESS },
+    );
+    // A bidi override in a stranger's own message, the same class
+    // `conversation-view.test.ts` already proves `escLabel` strips.
+    await recordInbound(
+      {
+        providerMessageId: 'wamid.stranger.1',
+        senderNumber: '+972509999999',
+        senderKind: 'other',
+        body: 'שלום‮גרר',
+        mediaKind: null,
+        providerTimestamp: '2026-10-03T08:05:00.000Z',
+      },
+      { businessId: BUSINESS },
+    );
+    await recordOutbound({ body: 'קיבלתי, אני מטפלת בזה', jobId: null }, { businessId: BUSINESS });
+
+    const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('שיחת הוואטסאפ');
+    expect(body).toContain('תזכיר לי להתקשר לדנה');
+    expect(body).toContain('אתה (בעל העסק)');
+    // The stranger's bidi override is stripped, but the message is shown
+    // and labelled — never hidden, never silently ignored (decision 5).
+    expect(body).not.toContain('‮');
+    expect(body).toContain('שולח אחר');
+    expect(body).toContain('קיבלתי, אני מטפלת בזה');
+    expect(body).toContain('העוזרת');
+    // The owner's own words first (oldest), then the stranger's, then the
+    // assistant's reply last (newest) — chronological order on the page.
+    const ownerIdx = body.indexOf('תזכיר לי להתקשר לדנה');
+    const strangerIdx = body.indexOf('שולח אחר');
+    const assistantIdx = body.indexOf('קיבלתי, אני מטפלת בזה');
+    expect(ownerIdx).toBeLessThan(strangerIdx);
+    expect(strangerIdx).toBeLessThan(assistantIdx);
+    // The compose box posts to the existing /instruct door — no second one.
+    expect(body).toContain('action="/instruct"');
+  });
+
+  it('says there is no conversation yet when nothing has been recorded', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('לא התקבלה אף הודעה');
+  });
+
+  /**
+   * Fix round 1, Important 2: truncation must be detected honestly —
+   * `fetched.length === CONVERSATION_LIMIT` is ALSO what a history of
+   * exactly 200 messages looks like, so that is not a safe test. Seeding
+   * exactly 200 rows proves the honest check (asking for one more than the
+   * limit) does not false-positive on the boundary itself.
+   */
+  async function seedMessages(businessId: string, count: number): Promise<void> {
+    await getPool().query(
+      `INSERT INTO whatsapp_messages
+         (id, business_id, direction, sender_number, sender_kind, body, provider_timestamp, state)
+       SELECT 'WA-SEED-' || lpad(gs::text, 6, '0'), $1, 'inbound', '+972500000000', 'principal',
+              'הודעה ' || gs, now() - (interval '1 second' * ($2 - gs)), 'handled'
+       FROM generate_series(1, $2) AS gs`,
+      [businessId, count],
+    );
+  }
+
+  it('shows no truncation note when the history is exactly at the limit', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    await seedMessages(BUSINESS, 200);
+
+    const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
+    const body = await res.text();
+    expect(body).not.toContain('מוצגות ההודעות האחרונות בלבד');
+    // The single oldest message of exactly 200 is still shown — nothing was
+    // dropped at the boundary itself. `>...<` anchors the match so "הודעה 1"
+    // cannot be satisfied by "הודעה 10"/"הודעה 100" etc.
+    expect(body).toContain('>הודעה 1<');
+  });
+
+  it('shows the truncation note and drops only the single oldest message past the limit', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    await seedMessages(BUSINESS, 201);
+
+    const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
+    const body = await res.text();
+    expect(body).toContain('מוצגות ההודעות האחרונות בלבד');
+    // Message 1 (the oldest of 201) is the one dropped; message 2 (now the
+    // oldest shown) and message 201 (the newest) both remain.
+    expect(body).not.toContain('>הודעה 1<');
+    expect(body).toContain('>הודעה 2<');
+    expect(body).toContain('>הודעה 201<');
+  });
+});
+
 describe('GET /readings', () => {
   it('serves the readings screen behind a session', async () => {
     const baseUrl = await startServer(BUSINESS);
@@ -681,7 +802,7 @@ describe('GET /instruct, POST /instruct', () => {
       businessId: BUSINESS,
     });
     const instruction = await saveInstruction(
-      { jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
+      { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה את ההצעה' },
       { businessId: BUSINESS },
     );
     await recordQuestion(instruction.instructionId, 'לאיזו דנה — כהן או לוי?', {
@@ -712,7 +833,7 @@ describe('GET /instruct, POST /instruct', () => {
       businessId: BUSINESS,
     });
     const answeredInstruction = await saveInstruction(
-      { jobId: answeredJob.jobId, text: 'תשלחי לדנה את ההצעה' },
+      { textOrigin: 'typed', jobId: answeredJob.jobId, text: 'תשלחי לדנה את ההצעה' },
       { businessId: BUSINESS },
     );
     await recordQuestion(answeredInstruction.instructionId, 'לאיזו דנה?', {
@@ -727,7 +848,7 @@ describe('GET /instruct, POST /instruct', () => {
     // The answer is recorded but the re-run refused, so the job is still
     // parked in `understand`. Phase alone would keep listing this as an open
     // question the owner has in fact already answered.
-    await recordAnswer(answeredInstruction.instructionId, 'דנה כהן', { businessId: BUSINESS });
+    await claimAnswer(answeredInstruction.instructionId, 'דנה כהן', { businessId: BUSINESS });
 
     // A second, still-open question on a different parked job. Without it,
     // an assertion that the answered question is absent would hold just as
@@ -739,7 +860,7 @@ describe('GET /instruct, POST /instruct', () => {
       businessId: BUSINESS,
     });
     const openInstruction = await saveInstruction(
-      { jobId: openJob.jobId, text: 'תזמיני פגישה עם רואה החשבון' },
+      { textOrigin: 'typed', jobId: openJob.jobId, text: 'תזמיני פגישה עם רואה החשבון' },
       { businessId: BUSINESS },
     );
     await recordQuestion(openInstruction.instructionId, 'איזה יום מתאים?', {
@@ -885,6 +1006,80 @@ describe('renderInstructionOutcome - the note on a needs_answer outcome', () => 
   });
 });
 
+/**
+ * Owner's decision 2 (05/10/2026), the dashboard half.
+ *
+ * `recordingNote` says an address that came only from a recording was not
+ * treated as one the owner named himself, and needs his explicit word. **This
+ * screen really can raise it**, which is why both halves are tested here and
+ * not left to the WhatsApp ack: `POST /instruct` states `'typed'` and never
+ * can, but the answer route plans the JOIN of a typed answer with a parked
+ * instruction that may have arrived as a voice note, and that join is
+ * `'transcribed'`.
+ *
+ * The pipeline half lives in `instruct.test.ts` and `whatsapp-door.test.ts`,
+ * for the reason the two note tests above already give: this route calls
+ * `runInstruction` without a planner on purpose, so no test here can produce
+ * a real planned outcome.
+ */
+describe('renderInstruct and renderInstructionOutcome - recordingNote', () => {
+  function capture(outcome: Parameters<typeof renderInstructionOutcome>[2]): string {
+    let body = '';
+    const res = {
+      writeHead: () => undefined,
+      end: (chunk?: unknown) => {
+        body = typeof chunk === 'string' ? chunk : '';
+      },
+    } as unknown as ServerResponse;
+
+    renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome);
+    return body;
+  }
+
+  it('renders the recording note, escaped, beside the other two', () => {
+    const html = renderInstruct({
+      csrf: 'tok',
+      grantNote: 'לא ניתנה הרשאה אוטומטית.',
+      recordingNote:
+        'ההוראה הזו כוללת טקסט שהגיע מהקלטה <script>alert(1)</script>, צריך אישור מפורש ממך.',
+      identityNote: 'המשכתי בלי מה שאני זוכרת על אותו אדם.',
+    });
+    expect(html).toContain('כוללת טקסט שהגיע מהקלטה');
+    expect(html).toContain('צריך אישור מפורש ממך');
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;');
+    // None of the three displaces another — they answer different questions
+    // and one instruction can raise all three.
+    expect(html).toContain('לא ניתנה הרשאה אוטומטית');
+    expect(html).toContain('המשכתי בלי מה שאני זוכרת');
+  });
+
+  it('renders no recording note block when there is none', () => {
+    expect(renderInstruct({ csrf: 'tok' })).not.toContain('שהגיע מהקלטה');
+  });
+
+  /**
+   * The wiring half, and the one that would actually have been missed: a
+   * `planned` outcome carrying ONLY this note. Before it was added to the
+   * condition, such an outcome redirected the owner home — a silent
+   * withholding, which is this branch's other recurring defect.
+   */
+  it('renders the page rather than redirecting when a planned outcome carries only this note', () => {
+    const html = capture({
+      status: 'planned',
+      jobId: 'J-1',
+      instructionId: 'INS-1',
+      granted: [],
+      grantNote: null,
+      recordingNote: 'ההוראה הזו כוללת טקסט שהגיע מהקלטה, צריך אישור מפורש ממך.',
+      identityNote: null,
+    });
+
+    expect(html).toContain('שהגיע מהקלטה');
+    expect(html).toContain('צריך אישור מפורש ממך');
+  });
+});
+
 describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N2)', () => {
   // Fix round 2: `reasonForSupersededJob` no longer accepts a `refused`
   // outcome at all — its parameter type is `Extract<..., { jobId: string }>`,
@@ -901,6 +1096,7 @@ describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N
         instructionId: 'INS-1',
         granted: [],
         grantNote: null,
+        recordingNote: null,
         identityNote: null,
       }),
     ).toContain('J-REPLACEMENT');
@@ -947,7 +1143,7 @@ describe('POST /instruct/:jobId/answer', () => {
   async function anInstructionJob(businessId: string, text: string): Promise<string> {
     const bundle = await installCharter(buildCharter(), { businessId });
     const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
-    await saveInstruction({ jobId: job.jobId, text }, { businessId });
+    await saveInstruction({ textOrigin: 'typed', jobId: job.jobId, text }, { businessId });
     await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup', businessId });
     return job.jobId;
   }
@@ -1006,7 +1202,7 @@ describe('POST /instruct/:jobId/answer', () => {
   // `answer` (unlike `text`) carries no CHECK constraint. An empty answer
   // recorded as-is would overwrite any earlier answer and re-run the pipeline
   // on text byte-identical to the original instruction, so the planner would
-  // ask the very same question again — forever. Refused before `recordAnswer`
+  // ask the very same question again — forever. Refused before `claimAnswer`
   // runs at all: the stored answer stays `null`.
   it('refuses a whitespace-only answer without recording it', async () => {
     const baseUrl = await startServer(BUSINESS);
@@ -1094,19 +1290,32 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(stored?.answer).toBe(answer);
   });
 
-  // Fix round 2, N1: a refused re-run must leave the parked job exactly where
-  // it was, not close it out. Before this fix, `handleInstructAnswer`
-  // transitioned unconditionally: the first refused POST here would have
-  // moved the job to `failed`, and the second POST — the owner's obvious
-  // next move, resubmitting from the same page — would have hit
-  // `transition(jobId, { to: 'failed' })` again on a job already `failed`,
-  // which is an illegal transition that throws uncaught to the top-level 500
-  // handler. Both POSTs below stay under the length cap's live-planner
-  // avoidance strategy (see the note on `anInstructionJob`): each answer
-  // alone is well under `MAX_INSTRUCTION_CHARS`, but joined with the
-  // ~3,990-character original both cross it, so both refuse deterministically
-  // before `createJob` — never reaching the planner.
-  it('lets a second POST retry after a refused re-run instead of 500ing', async () => {
+  /**
+   * **Task 12, fix round 1, Important 3 rewrote this test, and the property it
+   * was protecting still holds.** Fix round 2's N1 made a refused re-run leave
+   * the parked job in `understand` so a second POST would not meet
+   * `failed → failed` — an illegal transition that threw uncaught to the
+   * top-level 500 handler. The no-500 property is what mattered and is
+   * asserted below unchanged; what changed is how it is obtained.
+   *
+   * Leaving the job parked turned out to be the wrong half of the fix: the
+   * answer is recorded BEFORE the re-run, so the parked job was already out of
+   * `pendingQuestions` and `GET /instruct` could not list it. The owner was
+   * left with an instruction permanently open, invisible on the screen built
+   * to show open ones, and never reported — the
+   * instruction-silently-disappears class, and against the owner's own rule
+   * that an instruction stays open only until one side says it is finished.
+   * The route now CLOSES it and says so, exactly as the WhatsApp door does, so
+   * the second POST meets the PHASE GUARD and is refused with a readable
+   * sentence instead of throwing.
+   *
+   * Both POSTs stay under the length cap's live-planner avoidance strategy
+   * (see the note on `anInstructionJob`): each answer alone is well under
+   * `MAX_INSTRUCTION_CHARS`, but joined with the ~3,990-character original
+   * both cross it, so both refuse deterministically before `createJob` —
+   * never reaching the planner.
+   */
+  it('closes the parked job when a re-run refuses, and refuses a second POST instead of 500ing', async () => {
     const baseUrl = await startServer(BUSINESS);
     const originalText = 'א'.repeat(3990);
     const jobId = await anInstructionJob(BUSINESS, originalText);
@@ -1120,24 +1329,33 @@ describe('POST /instruct/:jobId/answer', () => {
       body: new URLSearchParams({ csrf, answer: 'ב'.repeat(20) }),
     });
     expect(firstRes.status).toBe(400);
-    expect(await firstRes.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+    const firstBody = await firstRes.text();
+    // The refusal itself, AND what became of the previous request — the owner
+    // is never left to infer that it is still waiting when it is not.
+    expect(firstBody).toContain('ההוראה ארוכה מ-4000 תווים');
+    expect(firstBody).toContain('סגרתי את הבקשה הקודמת');
 
     const afterFirst = await loadJob(jobId, { businessId: BUSINESS });
-    expect(afterFirst?.phase).toBe('understand');
+    expect(afterFirst?.phase).toBe('closed');
+    // Nothing is left for `GET /instruct` to show, which is the point: it
+    // could not have shown it anyway (the answer is recorded), so the state
+    // now matches what the owner can see.
+    expect(await pendingQuestions({ businessId: BUSINESS })).toEqual([]);
 
     // The retry — same job, a different (still over-cap-when-joined) answer.
-    // Pre-fix this 500s; post-fix it refuses the same clean way the first
-    // POST did, because the job is still `understand`, not `failed`.
+    // The property fix round 2 bought is unchanged: a readable refusal, never
+    // a 500 from an illegal `failed → failed`. It now comes from the phase
+    // guard rather than from the job having been left parked.
     const secondRes = await fetch(`${baseUrl}/instruct/${jobId}/answer`, {
       method: 'POST',
       headers: { cookie },
       body: new URLSearchParams({ csrf, answer: 'ג'.repeat(20) }),
     });
     expect(secondRes.status).toBe(400);
-    expect(await secondRes.text()).toContain('ההוראה ארוכה מ-4000 תווים');
+    expect(await secondRes.text()).toContain('כבר אינה ממתינה לתשובה');
 
     const afterSecond = await loadJob(jobId, { businessId: BUSINESS });
-    expect(afterSecond?.phase).toBe('understand');
+    expect(afterSecond?.phase).toBe('closed');
   });
 
   // Fix round 2, N1 (the other side): once a re-run DOES produce a
@@ -1169,7 +1387,7 @@ describe('POST /instruct/:jobId/answer', () => {
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('כבר אינה ממתינה לתשובה');
 
-    // The guard fires before `recordAnswer` — the row from the original
+    // The guard fires before `claimAnswer` — the row from the original
     // answer (never set in this test) stays untouched, not overwritten.
     const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
     expect(stored?.answer).toBeNull();
@@ -1243,7 +1461,7 @@ describe('POST /instruct/:jobId/answer', () => {
 
     // Nothing was written: no answer recorded, and no second job opened. The
     // parked job is still the only one. Without the claim this request reaches
-    // `recordAnswer` and `createJob` and both of these go red.
+    // `claimAnswer` and `createJob` and both of these go red.
     const stored = await loadInstructionForJob(jobId, { businessId: BUSINESS });
     expect(stored?.answer).toBeNull();
     const { rows } = await getPool().query<{ n: string }>(

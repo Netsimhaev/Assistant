@@ -28,7 +28,7 @@ import { executeStep } from './execute.js';
 const BUSINESS = 'test-business';
 /** 12:00 Asia/Jerusalem — outside the fixture charter's quiet window. */
 const NOON = new Date('2026-08-18T09:00:00.000Z');
-const NOTHING = { output: null, externalId: null };
+const NOTHING = { output: null, externalId: null, performed: true };
 
 /**
  * A reply to Dana, classified `email.reply` by `inReplyTo`.

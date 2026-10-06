@@ -296,3 +296,63 @@ export async function markContentIngested(
   );
   return result.rowCount ?? 0;
 }
+
+/**
+ * Records which inbound WhatsApp message opened this job — migration 036's
+ * `jobs.whatsapp_message_id`. Several messages can carry the same job (a
+ * clarifying answer reuses it), and only the one that opened it should ever
+ * be linked, so this is written once, by the caller that just created the
+ * job from that message — never derived from `whatsapp_messages` itself,
+ * which has no column the other direction could read it back from.
+ *
+ * Throws when the UPDATE matches no row — the same rule `settleMessage`
+ * (`src/whatsapp/store.ts`) and `markContentIngested` above already carry: a
+ * silent miss here would leave a job that looks linked to nothing, and the
+ * caller (the WhatsApp door) needs to know its own id or business id was
+ * wrong rather than finding out later, downstream, as silence.
+ */
+export async function linkWhatsAppMessage(
+  jobId: string,
+  whatsappMessageId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<void> {
+  const db = options.db ?? getPool();
+  const businessId = options.businessId ?? config.businessId;
+  const { rowCount } = await db.query(
+    `UPDATE jobs SET whatsapp_message_id = $1, updated_at = now()
+      WHERE job_id = $2 AND business_id = $3`,
+    [whatsappMessageId, jobId, businessId],
+  );
+  if (rowCount !== 1) {
+    throw new Error(
+      `linkWhatsAppMessage: no jobs row for jobId=${jobId}, businessId=${businessId}`,
+    );
+  }
+}
+
+/**
+ * The inbound WhatsApp message that opened this job, or `null`.
+ *
+ * The read counterpart of `linkWhatsAppMessage` above, and it lives beside it
+ * rather than in the WhatsApp modules for the reason that function's own
+ * docblock gives: `whatsapp_messages` has no column the other direction could
+ * be read back from, so `jobs.whatsapp_message_id` is the only place this
+ * fact exists and this file is the only writer of it.
+ *
+ * `null` covers two cases it cannot tell apart and does not need to: no such
+ * job, and a job that never came from the WhatsApp door. Both mean the same
+ * thing to every caller — there is no opening message to act on — and
+ * neither is treated as a reason to guess one.
+ */
+export async function whatsAppMessageOf(
+  jobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<string | null> {
+  const db = options.db ?? getPool();
+  const businessId = options.businessId ?? config.businessId;
+  const { rows } = await db.query<{ whatsapp_message_id: string | null }>(
+    'SELECT whatsapp_message_id FROM jobs WHERE job_id = $1 AND business_id = $2',
+    [jobId, businessId],
+  );
+  return rows[0]?.whatsapp_message_id ?? null;
+}

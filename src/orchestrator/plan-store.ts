@@ -33,6 +33,19 @@ export interface StepCompletion {
   /** The provider's handle on what the step created, or null when it created nothing. */
   externalId: string | null;
   status: StepResultStatus;
+  /**
+   * Whether the step actually did something — migration 037.
+   *
+   * `null` only ever accompanies `status: 'unknown'`: the call was dispatched
+   * and nothing authoritative came back, so the row genuinely cannot say
+   * whether anything was performed, and forcing a boolean there would claim
+   * knowledge it does not have. A `completed` row always carries a real
+   * boolean, because the caller that reaches `completed` always knows the
+   * answer before it writes — see `StepEffect.performed`'s own docblock
+   * (`execute.ts`) for why each branch states it rather than this module
+   * inferring it from anything.
+   */
+  performed: boolean | null;
 }
 
 interface PlanRow {
@@ -245,17 +258,23 @@ export async function completedSteps(
  * forever and the step would re-run on every resume after that. The reverse
  * is refused by the `WHERE`: a `completed` row is never overwritten, so a
  * later timeout on an already-finished step cannot un-know it.
+ *
+ * `performed` (migration 037) follows the exact same discipline, on the exact
+ * same `WHERE`: written on the initial INSERT, and written again only on that
+ * one promotion from `unknown` to `completed` — never on a no-op, because the
+ * same `WHERE` that gates `status` and `external_id` gates this column too.
  */
 export async function recordStepCompletion(
   tx: pg.PoolClient,
   input: StepCompletion & { jobId: string; businessId: string },
 ): Promise<void> {
   await tx.query(
-    `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status, performed)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (business_id, job_id, plan_hash, step_id) DO UPDATE
         SET status = 'completed',
             external_id = EXCLUDED.external_id,
+            performed = EXCLUDED.performed,
             completed_at = now()
       WHERE job_step_results.status = 'unknown' AND EXCLUDED.status = 'completed'`,
     [
@@ -265,6 +284,7 @@ export async function recordStepCompletion(
       input.stepId,
       input.externalId,
       input.status,
+      input.performed,
     ],
   );
 }
@@ -335,6 +355,11 @@ export async function loadPlanBody(
  * A step with no row at all is absent from the result. That is information,
  * not a gap to paper over: the caller decides what an unrecorded step means,
  * and `closeVerifiedJobs` (`verify.ts`) treats it as disqualifying.
+ *
+ * Carries `performed` (migration 037) for the same reason it carries
+ * `status`: the WhatsApp report classifies on it, and a reader that dropped
+ * it would be back to the exact gap that column exists to close — a
+ * `completed` row that cannot say whether the step did anything.
  */
 export async function stepResults(
   jobId: string,
@@ -342,8 +367,10 @@ export async function stepResults(
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StepCompletion[]> {
   const db = options.db ?? getPool();
-  const { rows } = await db.query<StepResultRow & { status: StepResultStatus }>(
-    `SELECT step_id, external_id, status FROM job_step_results
+  const { rows } = await db.query<
+    StepResultRow & { status: StepResultStatus; performed: boolean | null }
+  >(
+    `SELECT step_id, external_id, status, performed FROM job_step_results
       WHERE business_id = $1 AND job_id = $2 AND plan_hash = $3
       ORDER BY step_id`,
     [options.businessId ?? config.businessId, jobId, planHash],
@@ -353,5 +380,6 @@ export async function stepResults(
     planHash,
     externalId: row.external_id,
     status: row.status,
+    performed: row.performed,
   }));
 }

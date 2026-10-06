@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildCharter } from '../test/fixtures.js';
 import { compileCharter } from './compile.js';
-import { verifyCharterSignature } from './sign.js';
+import { signCharter, verifyCharterSignature } from './sign.js';
 import {
   BusinessCharter,
   KNOWN_TOOL_NAMES,
@@ -50,6 +50,53 @@ describe('charter signing', () => {
     };
 
     expect(() => compileCharter(tampered)).toThrow(/refusing to compile an unverified charter/);
+  });
+
+  it('refuses to sign a principal WhatsApp number that is not a full international form', () => {
+    const base = buildCharter();
+    // `buildCharter()` returns an already-signed charter; `signCharter` takes
+    // an unsigned one, so the signature is dropped the same way
+    // `scripts/seed-charter-live.ts` drops it before re-signing.
+    const { signature: _dropped, ...unsigned } = base;
+    const people = unsigned.people.map((p, i) =>
+      i === 0 ? { ...p, isPrincipal: true, channels: { whatsapp: '0541234567' } } : p,
+    );
+    expect(() => signCharter({ ...unsigned, people }, { signedByPersonId: 'owner', method: 'dashboard_click' }))
+      .toThrow(/\+972/);
+  });
+
+  /**
+   * Fix round A, finding 2 — pins the contract: whatever `signCharter` lets
+   * into `channels.whatsapp` must be the EXACT form `authorityNumberKey`
+   * (`src/governance/principal-number.ts`) accepts, so the two cannot drift
+   * apart the way a planning-document instruction once drifted from this
+   * code. `972541234567` is the literal shape ("bare international form,
+   * `972501234567` as the example") a now-corrected ledger instruction told
+   * a future gateway task to hand `senderNumber` up as. Had a charter been
+   * signed with the owner's own WhatsApp channel stored this way instead,
+   * `authorityNumberKey` would reject it on every single message — the
+   * owner failing his own principal check, filed as a stranger, with no
+   * error anywhere to explain why. `signCharter` refuses it here, at the one
+   * point a human can still catch it.
+   */
+  it('refuses the bare international form (no leading +), the exact shape the wrong ledger instruction once named', () => {
+    const base = buildCharter();
+    const { signature: _dropped, ...unsigned } = base;
+    const people = unsigned.people.map((p, i) =>
+      i === 0 ? { ...p, isPrincipal: true, channels: { whatsapp: '972541234567' } } : p,
+    );
+    expect(() => signCharter({ ...unsigned, people }, { signedByPersonId: 'owner', method: 'dashboard_click' }))
+      .toThrow(/\+972/);
+  });
+
+  it('accepts and stores the full international form with a leading + unchanged', () => {
+    const base = buildCharter();
+    const { signature: _dropped, ...unsigned } = base;
+    const people = unsigned.people.map((p, i) =>
+      i === 0 ? { ...p, isPrincipal: true, channels: { whatsapp: '+972541234567' } } : p,
+    );
+    const signed = signCharter({ ...unsigned, people }, { signedByPersonId: 'owner', method: 'dashboard_click' });
+    expect(signed.people[0]?.channels['whatsapp']).toBe('+972541234567');
   });
 });
 

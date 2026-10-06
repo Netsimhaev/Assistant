@@ -594,9 +594,16 @@ async function performStep(
     // `output.parked` is `agent.request_help`'s signal that `requestHelp`
     // already moved this job's phase itself — see `StepEffect.parked`'s own
     // docblock. Every other local handler's result never carries this key.
+    //
+    // `performed` is read off `runLocalTool`'s own result, strictly —
+    // `=== true`, never a default — because every handler in `HANDLERS`
+    // states it explicitly, `not_implemented` included. Reading anything else
+    // out of `output`'s shape here (its presence, its other keys) would be
+    // exactly the sniffing `StepEffect.performed`'s own docblock refuses.
     return {
       output,
       externalId: null,
+      performed: output['performed'] === true,
       ...(output['parked'] === true ? { parked: true } : {}),
     };
   }
@@ -754,7 +761,11 @@ async function performStep(
   if (!result.ok) {
     throw new StepChannelError(result.code, result.message, result.retryable);
   }
-  return { output: result.output, externalId: result.externalId };
+  // `performed: true` unconditionally — reaching this line at all already
+  // means the adapter returned `ok: true` (the `throw` above is the only exit
+  // for `ok: false`), which is the adapter's own affirmation that the call
+  // landed. See `StepEffect.performed`'s own docblock.
+  return { output: result.output, externalId: result.externalId, performed: true };
 }
 
 /**

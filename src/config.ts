@@ -91,4 +91,39 @@ export const config = {
   // with a daily count off `audit_log`, not with a token budget — and a second,
   // unproven cost mechanism beside the one that works is how two readers drift.
   delegationsPerDay: positiveInt('DELEGATIONS_PER_DAY', 50),
+  // Two budgets, not one — docs/superpowers/specs/2026-10-01-whatsapp-boss-channel-design.md
+  // §6.2. Shared, a customer sending fifty voice notes exhausts the budget and
+  // then the OWNER'S OWN recording goes untranscribed: a stranger degrading
+  // the owner's channel. Both are counted off `audit_log`, same reasoning as
+  // `curationRunsPerDay` above — see `whatsappTranscriptionsToday` in
+  // `src/whatsapp/transcribe.ts`.
+  whatsappTranscribeBossPerDay: positiveInt('WHATSAPP_TRANSCRIBE_BOSS_PER_DAY', 40),
+  whatsappTranscribeOtherPerDay: positiveInt('WHATSAPP_TRANSCRIBE_OTHER_PER_DAY', 20),
+  // A single recording longer than this is never sent to the provider at all
+  // — see transcribe.ts, checked before either daily budget.
+  whatsappMaxAudioSeconds: positiveInt('WHATSAPP_MAX_AUDIO_SECONDS', 180),
+  // Every instruction spends a planner call, same shape as curationRunsPerDay/
+  // delegationsPerDay above. Read by the triage task that wires instructions
+  // to the planner, not by transcribe.ts. MUST be counted off its own
+  // AuditKind (not 'whatsapp_transcription') — see that kind's docblock in
+  // src/domain/audit.ts for why a shared kind would double-count against
+  // the wrong budget.
+  whatsappInstructionsPerDay: positiveInt('WHATSAPP_INSTRUCTIONS_PER_DAY', 50),
+  // How long a clarifying question stays answerable over WhatsApp — spec
+  // §5.4 and §10.3's own table, which declared this setting before anything
+  // read it. Past the window, the owner's next message is a NEW instruction
+  // rather than an answer to a question he may have forgotten he was asked.
+  //
+  // `positiveInt`, the same shape as the four caps above, for the reason
+  // §10.3 states as the project's own rule: a value that cannot be read is
+  // never a permissive value. A malformed `WHATSAPP_QUESTION_WINDOW_MINUTES`
+  // throws at startup instead of quietly becoming `NaN` — and a `NaN`
+  // window would make `elapsed <= window` false for every message, which
+  // fails CLOSED here (everything routes as a new instruction, swallowing
+  // no answers) but would still be a setting silently not doing its job.
+  //
+  // `0` is a legal value and means something real: no message is ever read
+  // as an answer, so the channel keeps today's behaviour. That is a switch,
+  // not a broken setting.
+  whatsappQuestionWindowMinutes: positiveInt('WHATSAPP_QUESTION_WINDOW_MINUTES', 30),
 } as const;

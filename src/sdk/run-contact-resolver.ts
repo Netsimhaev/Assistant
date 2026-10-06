@@ -173,6 +173,11 @@ function reportOutcome(outcome: Awaited<ReturnType<typeof runInstruction>>): voi
     console.log(`job:    ${outcome.jobId}`);
     console.log(`granted: ${JSON.stringify(outcome.granted)}`);
     console.log(`grantNote: ${outcome.grantNote ?? '—'}`);
+    // Always `—` in this script, and printed anyway for the same reason
+    // `identityNote` is printed on the branch above: a live run that cannot
+    // see a note cannot notice the day it goes missing. It is non-null only
+    // for text that came from a recording, which no run here produces.
+    console.log(`recordingNote: ${outcome.recordingNote ?? '—'}`);
     console.log(`identityNote: ${outcome.identityNote ?? '—'}`);
   } else {
     console.log(`reason: ${outcome.reason}`);
@@ -233,7 +238,13 @@ async function main(): Promise<void> {
 
   const spyA = spyPlanner();
   const startedA = Date.now();
-  const outA = await runInstruction({ text: textA }, { businessId: BUSINESS, planner: spyA.planner });
+  // `textOrigin: 'typed'` — this script types its own instructions, exactly
+  // as the dashboard box does. The option is required and has no default
+  // (see `RunInstructionOptions`), so a script is made to state it too.
+  const outA = await runInstruction(
+    { text: textA },
+    { businessId: BUSINESS, textOrigin: 'typed', planner: spyA.planner },
+  );
   console.log(`\n(${((Date.now() - startedA) / 1000).toFixed(1)}s)`);
   reportOutcome(outA);
   reportPrompt(spyA.seen(), spyA.calls());
@@ -248,7 +259,7 @@ async function main(): Promise<void> {
 
   const outB = await runInstruction(
     { text: textB },
-    { businessId: BUSINESS, planner: forbiddenPlanner },
+    { businessId: BUSINESS, textOrigin: 'typed', planner: forbiddenPlanner },
   );
   reportOutcome(outB);
   console.log('');
@@ -267,7 +278,7 @@ async function main(): Promise<void> {
   const startedC = Date.now();
   const outC = await runInstruction(
     { text: textC },
-    { businessId: BUSINESS, identityAsked: true, planner: spyC.planner },
+    { businessId: BUSINESS, textOrigin: 'typed', identityAsked: true, planner: spyC.planner },
   );
   console.log(`\n(${((Date.now() - startedC) / 1000).toFixed(1)}s)`);
   reportOutcome(outC);

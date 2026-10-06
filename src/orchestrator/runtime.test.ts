@@ -15,6 +15,7 @@ import { upsertBinding } from './bindings.js';
 import { DEFAULT_CREDENTIAL_ENV_PREFIX } from './credentials.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
+import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { buildRuntime } from './runtime.js';
 
 const BUSINESS = config.businessId;
@@ -117,7 +118,13 @@ describe('buildRuntime', () => {
   it('registers a mail adapter under the configured system name', async () => {
     const runtime = await buildRuntime(FULL);
     expect(runtime.registry.get('office-mail')).not.toBeNull();
-    expect(runtime.warnings).toEqual([]);
+    // `FULL` configures mail/notify fully but carries no GREEN_API refs at
+    // all — the one warning this installation is left with is the WhatsApp
+    // switch being off, not a mail-side defect. See the `GREEN_API` test
+    // block below for that switch on its own.
+    expect(runtime.warnings).toEqual([
+      "no WhatsApp gateway: GREEN_API_INSTANCE_REF, GREEN_API_TOKEN_REF not set — the owner's WhatsApp channel will not run; messages will neither be received nor sent",
+    ]);
   });
 
   it('builds a notifier when a destination and SMTP are both configured', async () => {
@@ -265,6 +272,88 @@ describe('buildRuntime', () => {
   });
 
   /**
+   * Fix round 1, F3 — `sendAlert`'s own ~30 production lines (the credential
+   * resolve, the `null`-credential branch, the `transport.send` call, both
+   * deadline races) had no test at all; every caller in the suite used a
+   * hand-built double. Mirrors the notifier test just above, through the
+   * real encrypted store and the real `transport.send` call shape.
+   */
+  it('sendAlert resolves NOTIFY_CREDENTIAL_REF through the real store and reaches the transport', async () => {
+    await putSecret(
+      {
+        businessId: config.businessId,
+        ref: 'NOTIFY_MAIL',
+        value: 'סוד-התראת-הבריאות',
+        updatedBy: 'operator@example.com',
+      },
+      KEY,
+    );
+
+    const captured: Array<{ to: string; subject: string; text: string; auth?: { user?: string; pass?: string } }> = [];
+    const runtime = await buildRuntime(FULL, {
+      createTransport: (opts) => ({
+        sendMail: (mail: { to: string; subject: string; text: string }) => {
+          captured.push({ ...mail, auth: opts.auth });
+          return Promise.resolve({ messageId: 'stub-message-id' });
+        },
+      }),
+    });
+
+    const notify = runtime.notify;
+    expect(notify).toBeDefined();
+    if (notify === undefined) throw new Error('unreachable — asserted above');
+    expect(notify.sendAlert).toBeDefined();
+    if (notify.sendAlert === undefined) throw new Error('unreachable — asserted above');
+
+    const result = await notify.sendAlert('נושא ההתראה', 'גוף ההתראה');
+    expect(result.ok).toBe(true);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.subject).toBe('נושא ההתראה');
+    expect(captured[0]?.text).toBe('גוף ההתראה');
+    expect(captured[0]?.to).toBe(FULL['APPROVAL_NOTIFY_TO']);
+    expect(captured[0]?.auth?.pass).toBe('סוד-התראת-הבריאות');
+  });
+
+  /**
+   * Fix round 1, F3's second half — the property this whole task's design
+   * leans on (resolve fresh per call, never cache across the closure's
+   * lifetime) is asserted by nothing today; a refactor that hoisted the
+   * `resolve` above the closure would break it with every other test still
+   * green. Two calls, the stored secret ROTATED in between, the second call
+   * must carry the new value.
+   */
+  it('sendAlert resolves a fresh credential on every call, so a rotation takes effect on the next alert', async () => {
+    await putSecret(
+      { businessId: config.businessId, ref: 'NOTIFY_MAIL', value: 'סוד-ראשון', updatedBy: 'operator@example.com' },
+      KEY,
+    );
+    const captured: Array<{ pass?: string }> = [];
+    const runtime = await buildRuntime(FULL, {
+      createTransport: (opts) => ({
+        sendMail: () => {
+          captured.push({ pass: opts.auth.pass });
+          return Promise.resolve({ messageId: 'stub-message-id' });
+        },
+      }),
+    });
+    const notify = runtime.notify;
+    if (notify?.sendAlert === undefined) throw new Error('unreachable — asserted above');
+
+    const first = await notify.sendAlert('נושא', 'גוף');
+    expect(first.ok).toBe(true);
+    expect(captured[0]?.pass).toBe('סוד-ראשון');
+
+    await putSecret(
+      { businessId: config.businessId, ref: 'NOTIFY_MAIL', value: 'סוד-שני', updatedBy: 'operator@example.com' },
+      KEY,
+    );
+    const second = await notify.sendAlert('נושא', 'גוף');
+    expect(second.ok).toBe(true);
+    expect(captured[1]?.pass).toBe('סוד-שני');
+    expect(captured[1]?.pass).not.toBe(captured[0]?.pass);
+  });
+
+  /**
    * `SMTP_SECURE=false` is the shipped default and the runbook's value, so the
    * mandatory-STARTTLS path is the one every installation takes. The switch
    * that turns it off exists for a local relay that speaks no TLS at all
@@ -316,6 +405,129 @@ describe('buildRuntime', () => {
     // Unrelated to the mail adapter — a missing model key must not also
     // suppress the mail warning path or vice versa.
     expect(runtime.registry.get('office-mail')).not.toBeNull();
+  });
+
+  /**
+   * The switch, and the same pattern as `DOCUMENT_INBOX` and the five SMTP
+   * vars: "no WhatsApp" is a real production state today (there is no
+   * `createGreenApiGateway` yet), and it must be REPORTED, not look
+   * identical to "there was nothing to send". `FULL` carries neither
+   * `GREEN_API_INSTANCE_REF` nor `GREEN_API_TOKEN_REF`.
+   */
+  it('builds no WhatsApp gateway and warns, naming both missing GREEN-API refs', async () => {
+    const runtime = await buildRuntime(FULL);
+    expect(runtime.whatsapp).toBeUndefined();
+    expect(runtime.warnings.join(' ')).toContain('GREEN_API_INSTANCE_REF');
+    expect(runtime.warnings.join(' ')).toContain('GREEN_API_TOKEN_REF');
+  });
+
+  it('warns naming only the one GREEN-API ref that is missing', async () => {
+    const runtime = await buildRuntime({ ...FULL, GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE' });
+    expect(runtime.whatsapp).toBeUndefined();
+    expect(runtime.warnings.join(' ')).toContain('GREEN_API_TOKEN_REF');
+    expect(runtime.warnings.join(' ')).not.toContain('GREEN_API_INSTANCE_REF not set');
+  });
+
+  it('warns when both GREEN-API refs are set but neither resolves to a stored credential', async () => {
+    const runtime = await buildRuntime({
+      ...FULL,
+      GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE',
+      GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN',
+    });
+    expect(runtime.whatsapp).toBeUndefined();
+    expect(runtime.warnings.join(' ')).toMatch(/GREEN_API_INSTANCE_REF.*did not resolve/);
+    expect(runtime.warnings.join(' ')).toMatch(/GREEN_API_TOKEN_REF.*did not resolve/);
+  });
+
+  it('rejects a GREEN-API ref that is not a legal credential ref', async () => {
+    await expect(
+      buildRuntime({ ...FULL, GREEN_API_INSTANCE_REF: 'key-check', GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN' }),
+    ).rejects.toThrow(/GREEN_API_INSTANCE_REF/);
+  });
+
+  /**
+   * Both refs resolve, but no `overrides.whatsappGateway` factory is
+   * supplied — the true production default today, because no
+   * `createGreenApiGateway` exists yet (a later task supplies it; see
+   * `buildRuntime`'s own docblock). The credentials resolving is real
+   * progress over the unconfigured case above, and the warning says so.
+   */
+  it('warns that no gateway implementation is wired in yet, once both refs resolve', async () => {
+    await putSecret(
+      { businessId: config.businessId, ref: 'GREEN_API_INSTANCE', value: 'inst-1', updatedBy: 'operator@example.com' },
+      KEY,
+    );
+    await putSecret(
+      { businessId: config.businessId, ref: 'GREEN_API_TOKEN', value: 'tok-1', updatedBy: 'operator@example.com' },
+      KEY,
+    );
+    const runtime = await buildRuntime({
+      ...FULL,
+      GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE',
+      GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN',
+    });
+    expect(runtime.whatsapp).toBeUndefined();
+    expect(runtime.warnings.join(' ')).toMatch(/no gateway implementation is wired in yet/);
+  });
+
+  /**
+   * Half-resolved is not configured. A factory IS supplied here (unlike the
+   * test above, which has none to call) — so the only thing standing between
+   * this install and a gateway built on an absent token is the `instance ===
+   * null || token === null` check, not the absence of a factory. Only the
+   * instance ref is actually stored.
+   */
+  it('builds no gateway when only one of the two GREEN-API refs resolves, even with a factory supplied', async () => {
+    await putSecret(
+      { businessId: config.businessId, ref: 'GREEN_API_INSTANCE', value: 'inst-half', updatedBy: 'operator@example.com' },
+      KEY,
+    );
+    const runtime = await buildRuntime(
+      {
+        ...FULL,
+        GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE',
+        GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN', // never stored
+      },
+      { whatsappGateway: () => createFakeGateway() },
+    );
+    expect(runtime.whatsapp).toBeUndefined();
+    expect(runtime.warnings.join(' ')).toMatch(/GREEN_API_TOKEN_REF.*did not resolve/);
+  });
+
+  /**
+   * The positive path: both refs resolve AND a factory is supplied (the seam
+   * a later task's default replaces) — `runtime.whatsapp.gateway` is built
+   * from the resolved credentials, not from anything this function invented.
+   */
+  it('builds a WhatsApp gateway from the resolved credentials when a factory is supplied', async () => {
+    await putSecret(
+      { businessId: config.businessId, ref: 'GREEN_API_INSTANCE', value: 'inst-42', updatedBy: 'operator@example.com' },
+      KEY,
+    );
+    await putSecret(
+      { businessId: config.businessId, ref: 'GREEN_API_TOKEN', value: 'tok-42', updatedBy: 'operator@example.com' },
+      KEY,
+    );
+    let seenInstance: string | null = null;
+    let seenToken: string | null = null;
+    const runtime = await buildRuntime(
+      {
+        ...FULL,
+        GREEN_API_INSTANCE_REF: 'GREEN_API_INSTANCE',
+        GREEN_API_TOKEN_REF: 'GREEN_API_TOKEN',
+      },
+      {
+        whatsappGateway: ({ instance, token }) => {
+          seenInstance = instance.value;
+          seenToken = token.value;
+          return createFakeGateway();
+        },
+      },
+    );
+    expect(runtime.whatsapp).toBeDefined();
+    expect(seenInstance).toBe('inst-42');
+    expect(seenToken).toBe('tok-42');
+    expect(runtime.warnings.join(' ')).not.toMatch(/GREEN_API|WhatsApp/);
   });
 
   it('always supplies a credential source', async () => {

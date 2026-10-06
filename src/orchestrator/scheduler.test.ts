@@ -25,7 +25,7 @@ import { MasterKeyError } from '../governance/master-key.js';
  * completion, which is what lets a resumed run skip the step instead of
  * repeating it.
  */
-const NOTHING = { output: null, externalId: null };
+const NOTHING = { output: null, externalId: null, performed: true };
 
 
 const BUSINESS = 'test-business';

@@ -905,11 +905,18 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
     expect(dispatched).toHaveLength(1);
 
     // The row that says "we do not know", written with the move to followup.
-    const { rows } = await getPool().query<{ status: string; external_id: string | null }>(
-      'SELECT status, external_id FROM job_step_results WHERE job_id = $1',
+    // `performed` is `null`, not `false` — ruling 4 (task 8, fix round 1): a
+    // timeout carries no claim either way, and `false` here would be a value
+    // nobody actually read off anything.
+    const { rows } = await getPool().query<{
+      status: string;
+      external_id: string | null;
+      performed: boolean | null;
+    }>(
+      'SELECT status, external_id, performed FROM job_step_results WHERE job_id = $1',
       [job.jobId],
     );
-    expect(rows).toEqual([{ status: 'unknown', external_id: null }]);
+    expect(rows).toEqual([{ status: 'unknown', external_id: null, performed: null }]);
 
     return { job, bundle, dispatched, state, registry };
   }
@@ -941,12 +948,18 @@ describe('a dispatched call whose outcome nobody knows is not "nothing ran"', ()
     // so the far end sees the same key and can deduplicate.
     expect(dispatched[1]).toBe(dispatched[0]);
 
-    // The unknown row was promoted rather than left to re-run forever.
-    const { rows } = await getPool().query<{ status: string; external_id: string | null }>(
-      'SELECT status, external_id FROM job_step_results WHERE job_id = $1',
+    // The unknown row was promoted rather than left to re-run forever —
+    // `performed` along with `status`, from `null` to the real boolean the
+    // successful resume actually knows (ruling 5).
+    const { rows } = await getPool().query<{
+      status: string;
+      external_id: string | null;
+      performed: boolean | null;
+    }>(
+      'SELECT status, external_id, performed FROM job_step_results WHERE job_id = $1',
       [job.jobId],
     );
-    expect(rows).toEqual([{ status: 'completed', external_id: 'MSG-LATE' }]);
+    expect(rows).toEqual([{ status: 'completed', external_id: 'MSG-LATE', performed: true }]);
   });
 
   it('refuses a different plan over it, because the key that protects it would change', async () => {

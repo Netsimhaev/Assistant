@@ -27,6 +27,7 @@ import { CONNECTION_GROUP_ORDER, GROUP_LABELS, groupForServes } from './connecti
 import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
+import { stripBidiControls } from '../util/bidi.js';
 import { formatMinor } from '../util/money.js';
 
 /** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
@@ -64,13 +65,18 @@ const esc = escapeHtml;
  * necessarily something the owner typed — and they show the identifier the
  * owner is about to authorise a destruction against.
  *
- * The set: U+061C ALM, U+200E/U+200F LRM/RLM, U+202A-U+202E (the embedding
- * and override family), U+2066-U+2069 (the isolate family).
+ * **The character class itself now lives in `src/util/bidi.ts`, and that is
+ * not a tidying move.** The WhatsApp channel needs the identical strip for
+ * PLAIN text — an instruction snippet echoed back to the owner, which can
+ * originate in a transcription provider's output — and this function cannot
+ * serve it, because it also HTML-escapes and an entity in a WhatsApp message
+ * renders as the literal `&lt;`. A second copy of the class would be the
+ * duplicated control this project already paid for once
+ * (`BROWSER_ADDRESSED_CLASSES`); `stripBidiControls` is the one definition,
+ * and the set it covers is documented there.
  */
-const BIDI_CONTROLS = /[؜‎‏‪-‮⁦-⁩]/g;
-
-function escLabel(value: string): string {
-  return esc(value.replace(BIDI_CONTROLS, ''));
+export function escLabel(value: string): string {
+  return esc(stripBidiControls(value));
 }
 
 const STYLE = `
@@ -215,7 +221,7 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/instruct">מה לעשות</a> · <a href="/readings">מה קראתי</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a></p>
 ${list}`,
   );
 }
@@ -1119,11 +1125,20 @@ ${signErrorBlock}
  * folded into it, since the two can never occur together (a `grantNote` only
  * ever accompanies a `planned` outcome, an `error` only ever a `refused` one).
  *
- * `identityNote` is the second of the two notes and answers a different
- * question: a name in the instruction still fitted more than one contact
- * after the owner had already been asked once, so the instruction went ahead
- * with none of that person's memory (spec §7.2). Both can be true of one
- * instruction, so both render.
+ * `recordingNote` is the second and answers a third question: the planned
+ * text came from a recording, so an address that appears only there was not
+ * treated as one the owner named himself and needs his explicit word
+ * (`recipientsOnlyInRecording`, `src/governance/typed-recipients.ts`). It can
+ * reach this screen even though `POST /instruct` is always typed — the answer
+ * route plans the join of a typed answer with a parked instruction that may
+ * have arrived as a voice note; see `renderInstructionOutcome`'s own
+ * docblock.
+ *
+ * `identityNote` is the third and answers a different question again: a name
+ * in the instruction still fitted more than one contact after the owner had
+ * already been asked once, so the instruction went ahead with none of that
+ * person's memory (spec §7.2). All three can be true of one instruction, so
+ * all three render.
  *
  * The clarifying question goes through `escLabel`, not `esc`: it is
  * model-composed text reaching an RTL page, the same category `escLabel` was
@@ -1167,6 +1182,7 @@ export function renderInstruct(options: {
   error?: string;
   pending?: PendingQuestion[] | null;
   grantNote?: string | null;
+  recordingNote?: string | null;
   identityNote?: string | null;
 }): string {
   const error =
@@ -1174,6 +1190,19 @@ export function renderInstruct(options: {
 
   const grantNote =
     options.grantNote == null ? '' : `<p class="muted">${esc(options.grantNote)}</p>`;
+
+  // Through `escLabel`, not `esc`, and here the reason is sharper than for
+  // `identityNote` below: this note quotes recipients back at the owner, and
+  // on this path those bytes reached the row through a TRANSCRIPTION
+  // PROVIDER's model — the least trusted text that ever lands on this
+  // screen. `escLabel` is the one escaper that also strips the
+  // bidirectional-control family, which is what stops a quoted address from
+  // reordering the sentence that explains it (see its own docblock, and
+  // `original_name`'s on why the name of a thing is not its identity).
+  const recordingNote =
+    options.recordingNote == null
+      ? ''
+      : `<p class="muted">${escLabel(options.recordingNote)}</p>`;
 
   // Through `escLabel`, not `esc`: this note quotes the owner's own words
   // back at them — the name token exactly as it was typed — and a quoted
@@ -1193,6 +1222,7 @@ export function renderInstruct(options: {
     `<h1>מה לעשות</h1>
      ${error}
      ${grantNote}
+     ${recordingNote}
      ${identityNote}
      ${pending}
      <form method="POST" action="/instruct">
@@ -1210,7 +1240,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }
@@ -1271,6 +1301,9 @@ export const TABLE_LABELS: Record<string, string> = {
   jobs: 'כותרות משימה',
   job_steps: 'שורות מעבר',
   job_step_results: 'מזהי הודעה מהספק',
+  // Migration 036: the WhatsApp conversation (sender number, message body,
+  // transcript).
+  whatsapp_messages: 'הודעות וואטסאפ',
 };
 
 /**

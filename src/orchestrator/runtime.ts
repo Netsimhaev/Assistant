@@ -18,6 +18,9 @@ import type { CredentialSource } from './credentials.js';
 import { connectionAcceptsOAuthCeremony } from './oauth-eligibility.js';
 import { oauthCredentials } from './oauth-token.js';
 import type { TokenHttp } from './oauth-token.js';
+import type { CredentialHandle } from './adapters/types.js';
+import type { WhatsAppGateway } from '../whatsapp/gateway.js';
+import { canonicalHash } from '../util/canonical.js';
 
 /** Which vendor's code serves a binding's system. Matches `ConnectionBinding.provider`. */
 const GOOGLE_PROVIDER = 'google';
@@ -33,7 +36,51 @@ const GOOGLE_PROVIDER = 'google';
 export interface Runtime {
   registry: AdapterRegistry;
   credentials: CredentialSource;
-  notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
+  notify?: {
+    notifier: ApprovalNotifier;
+    dashboardBaseUrl: string;
+    /**
+     * A free-standing system alert, not about any one approval — what §7.4
+     * sends when the WhatsApp bridge drops. Same credential resolution and
+     * the same `withDeadline` discipline `createEmailNotifier`'s own
+     * `notify` uses, built right here rather than by extending
+     * `ApprovalNotifier` itself: that interface's only method takes an
+     * `ApprovalRequest`, and widening its signature (or adding a second
+     * required method) to fit one unrelated caller would break every test
+     * double that already implements it structurally
+     * (`run-due.test.ts`, `policy/engine.test.ts`). This closure reuses the
+     * exact `transport`/`to`/`credentials`/`notifyRef` this function already
+     * resolved for `notifier` below — never a second credential source, never
+     * a second SMTP configuration.
+     *
+     * Optional even when `notify` itself is present, so a test fixture that
+     * predates this field — a literal `Runtime['notify']` built by hand, as
+     * several existing scheduler tests do — keeps typechecking unchanged.
+     * Every real build of `notify` below sets it.
+     */
+    sendAlert?(subject: string, body: string): Promise<{ ok: boolean; error?: string }>;
+  };
+  /**
+   * The WhatsApp bridge, GREEN-API side only — never the messenger.
+   *
+   * **Deliberately just `{ gateway }`.** `createBossMessenger`'s `contactId`
+   * is the principal's WhatsApp number, read off the SIGNED CHARTER
+   * (`principalWhatsAppKey`) — and an owner can change that number by
+   * signing an amendment. A messenger built once, here, at process start
+   * would pin a recipient for the life of the process: after the owner
+   * changes his number the assistant would keep messaging the OLD one,
+   * which by then may belong to someone who is not the principal at all.
+   * `createBossMessenger` does no I/O at construction, so building it fresh
+   * every `schedulerPass`, from the charter that pass itself loads, costs
+   * nothing — see `scheduler.ts`.
+   *
+   * **No default gateway exists yet.** There is no production
+   * `createGreenApiGateway` in this codebase today (a later task supplies
+   * it) — only the two test doubles in `src/whatsapp/`. Until then this
+   * field is undefined in every real deployment, by construction: see
+   * `overrides.whatsappGateway` below.
+   */
+  whatsapp?: { gateway: WhatsAppGateway };
   /**
    * What could not be assembled, and why.
    *
@@ -48,6 +95,39 @@ export interface Runtime {
 const DEFAULT_MAIL_SYSTEM = 'office-mail';
 const DEFAULT_DASHBOARD_BASE_URL = 'http://127.0.0.1:8787';
 
+/**
+ * How long `sendAlert` waits for a send before giving up.
+ *
+ * Matches `NOTIFY_TIMEOUT_MS` in `src/governance/notify.ts` — this is a
+ * courtesy notification, not the work it reports on.
+ */
+const ALERT_TIMEOUT_MS = 5_000;
+
+/**
+ * Bound a promise the transport might never settle.
+ *
+ * A fifth local copy of the same pattern `notify.ts`, `messenger.ts`,
+ * `run-plan.ts` and `oauth-token.ts` each already carry their own of: an
+ * `AbortSignal` is advisory only, and nothing forces a transport (or a test
+ * double) to check it, so racing the call itself against an independent
+ * timer is what actually binds the wait. Each site's deadline wraps a
+ * different promise with a different fallback value, so — the same
+ * reasoning `withOAuthDeadline`'s own docblock states — there is nothing
+ * shared to factor out beyond the shape, which is a few lines.
+ */
+function withAlertDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`sendAlert did not finish within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
 const SMTP_KEYS = [
   'SMTP_HOST',
   'SMTP_PORT',
@@ -55,6 +135,16 @@ const SMTP_KEYS = [
   'SMTP_FROM',
   'SMTP_USER',
 ] as const;
+
+/**
+ * The two GREEN-API credential refs — same pattern as `NOTIFY_CREDENTIAL_REF`:
+ * the env var names a ref, never a secret itself, and the secret is resolved
+ * through `credentials` below. Both must name a ref that actually resolves,
+ * or the switch stays off — see `buildRuntime`'s own docblock on why this
+ * function resolves credentials only, never the charter.
+ */
+const GREEN_API_INSTANCE_REF_KEY = 'GREEN_API_INSTANCE_REF';
+const GREEN_API_TOKEN_REF_KEY = 'GREEN_API_TOKEN_REF';
 
 /**
  * Assemble a production runtime.
@@ -127,6 +217,23 @@ const SMTP_KEYS = [
  * key every 30 seconds, and that trade-off belongs to a later task, not this
  * fix round. `docs/live-thread-runbook.md` states the restart requirement
  * for an operator to actually find.
+ *
+ * **WhatsApp resolves credentials only, never the charter — that is this
+ * function's whole business with it.** The two GREEN-API refs
+ * (`GREEN_API_INSTANCE_REF`, `GREEN_API_TOKEN_REF`) are resolved through the
+ * same `credentials` this function already built; a missing or unresolved
+ * ref is a warning naming which one, following the SMTP block's own shape
+ * above, never a throw — the scheduler still has approvals to expire. The
+ * principal's WhatsApp number lives in the signed CHARTER
+ * (`principalWhatsAppKey`), and deliberately plays no part here:
+ * `probeActiveCharter` is reserved for exactly two callers (the install path
+ * and the readiness report — CLAUDE.md), and a third reader here would void
+ * the control beside it. Per-pass charter loading, and the messenger that
+ * number builds, is `scheduler.ts`'s job — see `Runtime.whatsapp`'s own
+ * docblock for why the messenger is never built here. `overrides.whatsappGateway`
+ * is the seam a later task's `createGreenApiGateway` replaces the default
+ * (today: none) with; no production caller passes it, same as the other three
+ * overrides below.
  */
 export async function buildRuntime(
   env: Record<string, string | undefined> = process.env,
@@ -134,6 +241,8 @@ export async function buildRuntime(
     createTransport?: SmtpConfig['createTransport'];
     tokenHttp?: TokenHttp;
     calendarHttp?: CalendarHttp;
+    /** Test seam only — see this function's docblock. No default exists yet. */
+    whatsappGateway?: (creds: { instance: CredentialHandle; token: CredentialHandle }) => WhatsAppGateway;
   } = {},
 ): Promise<Runtime> {
   const warnings: string[] = [];
@@ -258,8 +367,125 @@ export async function buildRuntime(
             dashboardBaseUrl === undefined || dashboardBaseUrl.length === 0
               ? DEFAULT_DASHBOARD_BASE_URL
               : dashboardBaseUrl,
+          // §7.4's health email, through the SAME transport/credentials/to
+          // this block just resolved — see `Runtime.notify`'s own docblock
+          // for why this is not a second method on `ApprovalNotifier`.
+          async sendAlert(subject, body) {
+            try {
+              const credential = await withAlertDeadline(
+                credentials.resolve(notifyRef, config.businessId),
+                ALERT_TIMEOUT_MS,
+              );
+              if (credential === null) {
+                return { ok: false, error: `לא נמצא credential עבור ${notifyRef}` };
+              }
+              await withAlertDeadline(
+                transport.send(
+                  { to: [to], subject, body },
+                  {
+                    endpoint: null,
+                    credential,
+                    // Content-derived, not clock-derived (review F3 note):
+                    // `Date.now()` here gave every call its own key, which
+                    // dedupes nothing. The same subject+body hashes the same
+                    // way whether this is a fresh alert or a retry of one
+                    // that failed to send a pass ago — exactly the case
+                    // `checkWhatsAppHealth` produces when it leaves the
+                    // transition unrecorded and tries again next pass.
+                    //
+                    // This function never reads `current.since` itself — it
+                    // only hashes whatever `body` the caller built. The
+                    // caller (`checkWhatsAppHealth`, `scheduler.ts`) is
+                    // therefore the one load-bearing fact for this key: fix
+                    // round A found that its `body` carried `current.state`
+                    // but not `current.since`, so two genuinely distinct
+                    // outages reporting the SAME state word hashed to the
+                    // SAME key, and the mail server dropped the second as a
+                    // duplicate of the first — silence, one layer past every
+                    // test, because a test counting `sendAlert` calls cannot
+                    // see a Message-ID collision. `checkWhatsAppHealth` now
+                    // embeds `since` in `body` for exactly this reason: a
+                    // retry of the SAME outage must still hash identically
+                    // (same `since`, same `state`), while two different
+                    // outages — even under the same state word — must not.
+                    idempotencyKey: `whatsapp-health-alert:${canonicalHash({ subject, body })}`,
+                    signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
+                  },
+                ),
+                ALERT_TIMEOUT_MS,
+              );
+              return { ok: true };
+            } catch (error) {
+              return { ok: false, error: error instanceof Error ? error.message : String(error) };
+            }
+          },
         };
       }
+    }
+  }
+
+  // WhatsApp (GREEN-API) — resolves credentials only. See this function's own
+  // docblock for why the charter, and the messenger built from it, have no
+  // part here.
+  let whatsapp: Runtime['whatsapp'];
+  const greenApiInstanceRef = env[GREEN_API_INSTANCE_REF_KEY];
+  const greenApiTokenRef = env[GREEN_API_TOKEN_REF_KEY];
+  const missingGreenApiRefs: string[] = [];
+  if (greenApiInstanceRef === undefined || greenApiInstanceRef.length === 0) {
+    missingGreenApiRefs.push(GREEN_API_INSTANCE_REF_KEY);
+  }
+  if (greenApiTokenRef === undefined || greenApiTokenRef.length === 0) {
+    missingGreenApiRefs.push(GREEN_API_TOKEN_REF_KEY);
+  }
+
+  if (missingGreenApiRefs.length > 0) {
+    warnings.push(
+      `no WhatsApp gateway: ${missingGreenApiRefs.join(', ')} not set — the owner's ` +
+        `WhatsApp channel will not run; messages will neither be received nor sent`,
+    );
+  } else {
+    // Present means it is a ref — validated before it is resolved, the same
+    // "typo, not a switch left off" distinction NOTIFY_CREDENTIAL_REF already
+    // draws above.
+    for (const [label, ref] of [
+      [GREEN_API_INSTANCE_REF_KEY, greenApiInstanceRef as string],
+      [GREEN_API_TOKEN_REF_KEY, greenApiTokenRef as string],
+    ] as const) {
+      if (!CREDENTIAL_REF_PATTERN.test(ref)) {
+        throw new Error(
+          `${label} אינו ref חוקי (אותיות גדולות, ספרות וקו תחתון בלבד): ${ref}`,
+        );
+      }
+    }
+    const [instanceCredential, tokenCredential] = await Promise.all([
+      credentials.resolve(greenApiInstanceRef as string, config.businessId),
+      credentials.resolve(greenApiTokenRef as string, config.businessId),
+    ]);
+    if (instanceCredential === null || tokenCredential === null) {
+      const unresolvedGreenApiRefs: string[] = [];
+      if (instanceCredential === null) unresolvedGreenApiRefs.push(GREEN_API_INSTANCE_REF_KEY);
+      if (tokenCredential === null) unresolvedGreenApiRefs.push(GREEN_API_TOKEN_REF_KEY);
+      warnings.push(
+        `no WhatsApp gateway: ${unresolvedGreenApiRefs.join(', ')} did not resolve to a ` +
+          `stored credential`,
+      );
+    } else if (overrides.whatsappGateway === undefined) {
+      // No real implementation exists yet — see `Runtime.whatsapp`'s own
+      // docblock. Resolving this far and stopping here, rather than skipping
+      // straight to this branch, is what makes a genuinely misconfigured
+      // installation (a typo'd ref) distinguishable from one that is simply
+      // waiting on a later task.
+      warnings.push(
+        `no WhatsApp gateway: GREEN-API credentials resolved, but no gateway ` +
+          `implementation is wired in yet`,
+      );
+    } else {
+      whatsapp = {
+        gateway: overrides.whatsappGateway({
+          instance: instanceCredential,
+          token: tokenCredential,
+        }),
+      };
     }
   }
 
@@ -375,6 +601,7 @@ export async function buildRuntime(
     // notifier above resolves against, not a second one built from the same key.
     credentials,
     ...(notify !== undefined ? { notify } : {}),
+    ...(whatsapp !== undefined ? { whatsapp } : {}),
     warnings,
   };
 }

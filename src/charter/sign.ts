@@ -1,5 +1,6 @@
 import type { BusinessCharter, UnsignedCharter } from '../domain/charter.js';
 import { canonicalHash } from '../util/canonical.js';
+import { authorityNumberKey } from '../governance/principal-number.js';
 
 /**
  * The content hash covers the charter *excluding* its own signature block —
@@ -26,6 +27,23 @@ export function signCharter(
   charter: UnsignedCharter,
   input: SignatureInput,
 ): BusinessCharter {
+  // Validated here, after normalisation, against the string the compiler
+  // actually keeps — the rule this project learned from the email-domain bug
+  // (`isValidEmailDomain` was `normaliseDomainString(domain) !== null`, so a
+  // wildcard signed, compiled into `doNotContact`, and blocked nothing). A
+  // principal WhatsApp number that merely "normalises to something" would be
+  // the same defect, only on an authority list instead of a block list: the
+  // signed document would carry a form the WhatsApp gate can never match,
+  // and no error would ever say so again.
+  const principal = charter.people.find((p) => p.isPrincipal);
+  const declaredWhatsApp = principal?.channels['whatsapp'];
+  if (declaredWhatsApp !== undefined && authorityNumberKey(declaredWhatsApp) === null) {
+    throw new Error(
+      `מספר הוואטסאפ של הבעלים (channels.whatsapp: "${declaredWhatsApp}") אינו בצורה בינלאומית מלאה — ` +
+        'יש לכתוב אותו עם קידומת מדינה ובלי הספרה המקומית המובילה, לדוגמה "+972541234567"',
+    );
+  }
+
   return {
     ...charter,
     signature: {

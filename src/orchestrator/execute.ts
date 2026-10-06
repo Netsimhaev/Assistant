@@ -35,6 +35,29 @@ export interface StepEffect {
   output: unknown;
   externalId: string | null;
   /**
+   * Whether the step actually did something, as the branch that ran it
+   * states for itself — never inferred here from the shape of `output`.
+   *
+   * `performStep` (`run-plan.ts`) sets this twice, once per branch, because
+   * each already knows the answer at the point it returns: the local branch
+   * reads the boolean `runLocalTool`'s own result declares (every handler,
+   * including the `not_implemented` fallback, states one), and the channel
+   * branch sets it to `true` unconditionally — reaching `completed` at all
+   * means the adapter returned `ok: true`, which is itself the adapter's
+   * affirmation that the call landed. Sniffing `output` for a `performed` key
+   * here instead would be a check on the *absence* of a known field, and
+   * "everything that is not X" is the failure class this codebase documents
+   * three times over.
+   *
+   * This is what `recordStepCompletion` (`plan-store.ts`) writes to
+   * `job_step_results.performed`, and what the WhatsApp report classifies on.
+   * `doc.fetch` is the reason it has to exist at all: it is implemented, has a
+   * handler, and still returns `{ performed: false, reason: 'no_artifacts' }`
+   * — a step that ran and did nothing, which the phase alone cannot tell
+   * apart from a step that actually sent something.
+   */
+  performed: boolean;
+  /**
    * True when performing this step already moved the JOB itself, and
    * `executeStep` must not also move it.
    *
@@ -382,6 +405,10 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
                 planHash: request.planHash,
                 externalId: null,
                 status: 'unknown' as const,
+                // Honestly unknown, not `false` — see `StepCompletion.performed`
+                // and migration 037. The call may or may not have landed; a
+                // `false` here would claim the row knows it did not.
+                performed: null,
               },
             }
           : {}),
@@ -423,6 +450,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
             planHash: request.planHash,
             externalId: effect.externalId,
             status: 'completed' as const,
+            performed: effect.performed,
           },
         }),
   });

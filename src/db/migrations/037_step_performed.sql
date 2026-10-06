@@ -1,0 +1,29 @@
+-- A completed step row says whether the step ran at all, not only that
+-- something was recorded for it.
+--
+-- `runLocalTool` can return `{ performed: false, reason: 'not_implemented' }`
+-- (no handler) or `{ performed: false, reason: 'no_artifacts' }` (a handler
+-- that ran and genuinely did nothing) — and until now neither fact survived
+-- past `StepEffect.output`, an in-memory value. What actually persisted —
+-- `stepId`, `planHash`, `externalId`, `status` — could not tell a step that
+-- truly performed its action apart from one that returned early having done
+-- nothing. A report built on that record cannot distinguish a CRM order that
+-- was entered from one that was not, which is exactly the lie the WhatsApp
+-- report (§1.3, §5.2) must never tell.
+--
+-- Nullable, and NULL is not a permissive value here, it is an honest "we do
+-- not know". An `unknown` row (`adapter_timeout`: the call went out and
+-- nothing authoritative came back) genuinely cannot say whether anything was
+-- performed — forcing `false` there would claim knowledge the row does not
+-- have, and forcing `true` would claim the opposite. `completed` rows always
+-- carry a real boolean, because the branch that writes them always knows the
+-- answer before it writes: the local branch reads `runLocalTool`'s own
+-- boolean, and the channel branch reaches `completed` only because the
+-- adapter affirmed the call.
+--
+-- Existing rows predate this column entirely and get NULL, which is the
+-- correct answer for them too: nothing about them says whether the step
+-- performed anything beyond what `status = 'completed'` already means, and a
+-- backfilled `true` would assert something nobody checked.
+ALTER TABLE job_step_results
+    ADD COLUMN performed BOOLEAN;
