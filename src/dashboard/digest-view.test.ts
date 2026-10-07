@@ -111,6 +111,46 @@ describe('renderDigestScreen', () => {
     expect(html).toContain('גרר');
   });
 
+  /**
+   * Fix round 1, item 1: `live === null` must still render the history and
+   * the form — neither needs the charter the live preview needs — and the
+   * two reasons a preview can be unavailable ("no charter yet" vs. "charter
+   * cannot be read") must say different things, never collapse into one
+   * generic sentence.
+   */
+  it('says plainly that no charter has been signed yet, and still renders the form', () => {
+    const html = renderDigestScreen({
+      settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },
+      stored: [],
+      live: null,
+      liveUnavailable: 'טרם נחתם תקנון עסקי — תצוגה חיה תופיע לאחר החתימה.',
+      csrf: 'c',
+    });
+    expect(html).toContain('טרם נחתם תקנון עסקי');
+    expect(html).toContain('לא נשלח עדיין שום תדריך');
+    expect(html).toContain('name="dailyHour"');
+  });
+
+  it('says plainly that the charter cannot be read, with text distinct from "none yet"', () => {
+    const noneYet = renderDigestScreen({
+      settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },
+      stored: [],
+      live: null,
+      liveUnavailable: 'טרם נחתם תקנון עסקי — תצוגה חיה תופיע לאחר החתימה.',
+      csrf: 'c',
+    });
+    const unreadable = renderDigestScreen({
+      settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },
+      stored: [],
+      live: null,
+      liveUnavailable: 'התקנון החתום אינו קריא כרגע, ולכן אי אפשר להציג תצוגה חיה.',
+      csrf: 'c',
+    });
+    expect(unreadable).toContain('אינו קריא כרגע');
+    expect(unreadable).not.toContain('טרם נחתם תקנון עסקי');
+    expect(noneYet).not.toContain('אינו קריא כרגע');
+  });
+
   it('carries a CSRF token on the settings form', () => {
     const html = renderDigestScreen({
       settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },

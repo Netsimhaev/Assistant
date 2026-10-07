@@ -38,11 +38,13 @@ import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/a
 import { recordCorrection } from '../governance/corrections.js';
 import { listAutonomousActions } from './autonomous-actions.js';
 import { probeActiveCharter, loadActiveCharter } from '../charter/store.js';
+import type { ActiveCharter } from '../charter/store.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import { recentDigests } from '../orchestrator/digest-store.js';
 import { collectDigestFacts } from '../orchestrator/digest-facts.js';
 import { renderDigest } from '../orchestrator/digest-render.js';
-import { scheduledHourFor } from '../orchestrator/digest-window.js';
+import { lastHourInstant, scheduledHourFor } from '../orchestrator/digest-window.js';
+import type { DigestKind } from '../orchestrator/digest-window.js';
 import { renderDigestScreen } from './digest-view.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { loadBindings } from '../orchestrator/bindings.js';
@@ -611,48 +613,26 @@ async function handleConnections(res: ServerResponse, businessId: string, sessio
   );
 }
 
-/**
- * The most recent occurrence of `hour` (local to `timeZone`) at or before
- * `now`, truncated to the top of that hour.
- *
- * Used only for the digest screen's LIVE preview window, and deliberately
- * NOT `digest-window.ts`'s own (unexported) `lastScheduledMoment`: that
- * helper refuses to find anything before the wanted hour has struck TODAY,
- * which is correct for a window that gets stored and compared against the
- * last one, but wrong here — a preview asked for at 05:00 against an 08:00
- * daily hour should still show "yesterday 08:00 to now", not nothing, since
- * nothing this function returns is ever written down or merged with a prior
- * window. `Intl`, not UTC-offset arithmetic, for the same reason
- * `digest-window.ts` already gives: the offset at a past moment is exactly
- * what daylight saving makes unsafe to assume.
- */
-function lastHourBoundary(hour: number, timeZone: string, now: Date): Date {
-  const fmt = new Intl.DateTimeFormat('en-GB', {
-    timeZone, hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
-  for (let back = 0; back <= 24 * 8; back += 1) {
-    const candidate = new Date(now.getTime() - back * 60 * 60 * 1000);
-    const parts = new Map(fmt.formatToParts(candidate).map((p) => [p.type, p.value]));
-    if (Number(parts.get('hour') ?? '0') === hour) {
-      const minute = Number(parts.get('minute') ?? '0');
-      const second = Number(parts.get('second') ?? '0');
-      const subSecondMs = candidate.getTime() % 1000;
-      return new Date(candidate.getTime() - minute * 60_000 - second * 1000 - subSecondMs);
-    }
-  }
-  // Unreachable in practice (24*8 hours spans more than one local day under
-  // every real zone/DST combination), but a window of `now`..`now` is a
-  // harmless empty preview rather than a thrown error over a screen nobody
-  // can act on anyway.
-  return now;
-}
-
 /** `DD/MM HH:MM`, local to `timeZone` — the live window's own start label. */
 function formatWindowStart(at: Date, timeZone: string): string {
   return new Intl.DateTimeFormat('he-IL', {
     timeZone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
   }).format(at);
 }
+
+/** Which kind the live preview shows: the owner's own schedule, where it says one unambiguously. */
+function previewKind(schedule: DigestSchedule): DigestKind {
+  // 'weekly' is the only schedule that does NOT include a daily digest at
+  // all (fix round 1, item 2) — previewing 'daily' for it would title the
+  // preview "תדריך יומי" for an owner who will never receive one. Every
+  // other value ('daily', 'both', 'off') includes the daily shape, or (for
+  // 'off') is shown as an illustrative example of it — `renderLiveSection`
+  // (`digest-view.ts`) adds that caveat for 'off' specifically.
+  return schedule === 'weekly' ? 'weekly' : 'daily';
+}
+
+const CHARTER_NONE_TEXT = 'טרם נחתם תקנון עסקי — תצוגה חיה תופיע לאחר החתימה.';
+const CHARTER_UNREADABLE_TEXT = 'התקנון החתום אינו קריא כרגע, ולכן אי אפשר להציג תצוגה חיה.';
 
 /**
  * "מה קרה" — the stored digest history, a live preview, and the
@@ -663,17 +643,26 @@ function formatWindowStart(at: Date, timeZone: string): string {
  * `probeActiveCharter`'s own docblock (`charter/store.ts`) reserves it for
  * exactly three callers: the install path, the readiness report, and the
  * connections screen. Widening that list quietly undoes the control it sits
- * beside. A charter this code cannot parse is the same "no policy to run
- * against" state every other production caller (`runDigests` among them,
- * `digest-run.ts`) already fails loudly on, and this screen is an ordinary
- * caller, not one of the three exceptions — an unreadable or absent charter
- * reaches the route-level catch and renders the generic 500, exactly as
- * `/instruct` already does.
+ * beside — so the fix for a fresh install (no charter yet) is to catch
+ * `loadActiveCharter` LOCALLY, which widens nothing, rather than to route
+ * around the one control that already exists for this exact question.
  *
- * The live window always previews the DAILY shape — "today so far" — no
- * matter what the owner's actual schedule is set to (spec §4: the preview
- * exists precisely so he can see one before committing to a schedule at
- * all, including while it is `'off'`).
+ * **Fix round 1, item 1: `active === null` is "no charter signed yet" — an
+ * ordinary state on a brand-new installation — never an error, and a throw
+ * from `loadActiveCharter` is "the signed charter cannot be read" — a schema
+ * mismatch. These are different facts and get different Hebrew sentences**
+ * (`CHARTER_NONE_TEXT` / `CHARTER_UNREADABLE_TEXT`), exactly the way
+ * `handleConnections` already treats "none" and "unreadable" as different
+ * `charterStatus` values rather than one. Neither case 500s: `recentDigests`
+ * and `loadDigestSettings` never needed the charter at all, so the history
+ * and the settings form render in both cases, and only the live-preview
+ * section is replaced with the one explanatory line.
+ *
+ * The live window previews whichever kind the owner's OWN schedule actually
+ * includes — `previewKind` — not unconditionally 'daily' (fix round 1, item
+ * 2): a weekly-only owner previewing a daily digest is a mislabelled
+ * preview, and this screen exists so he can tell what he was told from what
+ * he might be, which a wrong heading spends.
  */
 async function handleDigestGet(
   res: ServerResponse,
@@ -684,21 +673,31 @@ async function handleDigestGet(
   const settings = await loadDigestSettings({ businessId });
   const stored = await recentDigests({ businessId });
 
-  const active = await loadActiveCharter(businessId);
-  if (active === null) {
-    throw new Error(`no active charter for business ${businessId}`);
+  let active: ActiveCharter | null;
+  let liveUnavailable: string | undefined;
+  try {
+    active = await loadActiveCharter(businessId);
+    if (active === null) liveUnavailable = CHARTER_NONE_TEXT;
+  } catch (err) {
+    active = null;
+    liveUnavailable = CHARTER_UNREADABLE_TEXT;
+    console.error('digest screen: could not read the active charter:', err instanceof Error ? err.message : err);
   }
-  const timeZone = active.charter.identity.timezone;
-  const ceilings = {
-    monthlyMinor: active.bundle.ceilings.monthlyMinor,
-    currency: active.bundle.ceilings.currency,
-  };
 
-  const now = new Date();
-  const start = lastHourBoundary(scheduledHourFor(settings, 'daily'), timeZone, now);
-  const window = { kind: 'daily' as const, start, end: now, windowsCovered: 1 };
-  const rendered = renderDigest(await collectDigestFacts(window, ceilings, { businessId }));
-  const windowLabel = `${formatWindowStart(start, timeZone)} – עכשיו`;
+  let live: { body: string; windowLabel: string } | null = null;
+  if (active !== null) {
+    const timeZone = active.charter.identity.timezone;
+    const ceilings = {
+      monthlyMinor: active.bundle.ceilings.monthlyMinor,
+      currency: active.bundle.ceilings.currency,
+    };
+    const kind = previewKind(settings.schedule);
+    const now = new Date();
+    const start = lastHourInstant(scheduledHourFor(settings, kind), timeZone, now) ?? now;
+    const window = { kind, start, end: now, windowsCovered: 1 };
+    const rendered = renderDigest(await collectDigestFacts(window, ceilings, { businessId }));
+    live = { body: rendered.body, windowLabel: `${formatWindowStart(start, timeZone)} – עכשיו` };
+  }
 
   sendHtml(
     res,
@@ -706,7 +705,8 @@ async function handleDigestGet(
     renderDigestScreen({
       settings,
       stored,
-      live: { body: rendered.body, windowLabel },
+      live,
+      ...(liveUnavailable !== undefined ? { liveUnavailable } : {}),
       csrf: issueCsrfToken(session.sessionId),
       ...(error !== undefined ? { error } : {}),
     }),
@@ -722,12 +722,33 @@ async function handleDigestGet(
  * The `<select>` elements this screen renders only ever offer in-range
  * values, so the catch below is for a tampered or hand-built request, not
  * the normal path.
+ *
+ * **Fix round 1, item 4: a MISSING field must fail, not coerce to `0`.**
+ * `form.get(...)` returns `string | null`, and `z.coerce.number()` happily
+ * parses `null` into `0` (`Number(null) === 0`) — so a hand-built POST that
+ * simply omits `dailyHour` was silently accepted as midnight rather than
+ * refused. `z.string().min(1)` rejects `null` and `''` by construction
+ * (wrong type / too short) before the value ever reaches `Number(...)`,
+ * which is this codebase's own rule stated in those words elsewhere —
+ * "a value we could not read is not a permitting value" (`readAmountMinor`,
+ * an unresolved time zone, an unknown calendar action) — applied to a form
+ * field reaching the same door. `.pipe(z.number().int())`, not
+ * `z.coerce.number().int()` directly, because zod's `number()` already
+ * treats `NaN` (what `Number('abc')` produces) as its own invalid type
+ * rather than a number that merely fails `.int()` — this chain refuses a
+ * non-numeric string for the same reason it refuses a missing one.
  */
+const RequiredHourField = z
+  .string()
+  .min(1)
+  .transform((v) => Number(v))
+  .pipe(z.number().int());
+
 const DigestSettingsForm = z.object({
   schedule: DigestSchedule,
-  dailyHour: z.coerce.number().int(),
-  weeklyDay: z.coerce.number().int(),
-  weeklyHour: z.coerce.number().int(),
+  dailyHour: RequiredHourField,
+  weeklyDay: RequiredHourField,
+  weeklyHour: RequiredHourField,
 });
 
 async function handleDigestSettingsPost(

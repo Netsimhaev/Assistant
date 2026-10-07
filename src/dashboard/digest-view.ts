@@ -126,10 +126,61 @@ function digestRow(d: StoredDigest): string {
     </article>`;
 }
 
+/**
+ * The live-preview section, or — when the charter the preview needs cannot
+ * be used at all — one Hebrew line saying so, in its place.
+ *
+ * `live === null` covers two different facts, and this project does not let
+ * different facts look alike: "no charter has been signed yet" (an ordinary
+ * state on a brand-new installation) and "the signed charter cannot be read"
+ * (a schema mismatch — see `loadActiveCharter`'s own docblock) are distinct
+ * messages, chosen by the caller via `liveUnavailable` and never collapsed
+ * into one generic "unavailable" here. The fallback string below is only
+ * reached if a caller forgets to supply one; it exists so this function
+ * cannot throw or render a blank section, not as a message meant to be seen.
+ *
+ * The stored history and the settings form render regardless of this
+ * section's state — `recentDigests` and `loadDigestSettings` never needed
+ * the charter in the first place, and a missing/unreadable charter is no
+ * reason to hide either of them.
+ */
+function renderLiveSection(
+  live: { body: string; windowLabel: string } | null,
+  liveUnavailable: string | undefined,
+  schedule: DigestSchedule,
+): string {
+  if (live === null) {
+    const message = liveUnavailable ?? 'תצוגה חיה אינה זמינה כרגע.';
+    return `<section class="card">
+  <h2>תצוגה חיה</h2>
+  <p class="muted">${esc(message)}</p>
+</section>`;
+  }
+
+  // Spec intent: under 'off' nothing is actually scheduled, so the preview
+  // is illustrative rather than "what would have gone out a moment ago" —
+  // said explicitly rather than left for the owner to infer from a switch
+  // position elsewhere on the same page.
+  const offNote =
+    schedule === 'off'
+      ? ' התדריכים כבויים כרגע — זו רק דוגמה למה שהיית מקבל אילו הפעלת אותם.'
+      : '';
+
+  return `<section class="card">
+  <h2>תצוגה חיה — ${esc(live.windowLabel)}</h2>
+  <p class="muted">
+    תדריך כזה טרם נשלח לאף יעד — זו הדגמה בלבד של מה שהייתי אומרת לך עד כה,
+    על בסיס הנתונים כרגע. השורה הזו לא נרשמת ולא נשמרת כתדריך.${offNote}
+  </p>
+  <pre>${escLabel(live.body)}</pre>
+</section>`;
+}
+
 export function renderDigestScreen(options: {
   settings: DigestSettings;
   stored: readonly StoredDigest[];
-  live: { body: string; windowLabel: string };
+  live: { body: string; windowLabel: string } | null;
+  liveUnavailable?: string;
   csrf: string;
   error?: string;
 }): string {
@@ -161,14 +212,7 @@ export function renderDigestScreen(options: {
 </header>
 ${errorBlock}
 
-<section class="card">
-  <h2>תצוגה חיה — ${esc(live.windowLabel)}</h2>
-  <p class="muted">
-    תדריך כזה טרם נשלח לאף יעד — זו הדגמה בלבד של מה שהייתי אומרת לך עד כה,
-    על בסיס הנתונים כרגע. השורה הזו לא נרשמת ולא נשמרת כתדריך.
-  </p>
-  <pre>${escLabel(live.body)}</pre>
-</section>
+${renderLiveSection(live, options.liveUnavailable, settings.schedule)}
 
 <h2>היסטוריית תדריכים</h2>
 ${storedList}

@@ -128,6 +128,52 @@ function partsIn(
  * here, not decorative — it breaks out before that match and the function
  * returns `null`.
  */
+/**
+ * The most recent occurrence of `hour` (local to `timeZone`) at or before
+ * `now`, truncated to the top of that hour — or `null` if none is found
+ * within `maxHoursBack`.
+ *
+ * **This is the shared Intl probe-and-truncate rule, and it has exactly one
+ * home.** It used to be inlined inside `lastScheduledMoment` below; the
+ * dashboard's digest screen (`dashboard/server.ts`) needed the identical
+ * rule for its "today so far" live preview and, for a while, carried a
+ * second copy of it. A rule this codebase deliberately keeps in one place —
+ * probing via `Intl.DateTimeFormat` rather than UTC-offset arithmetic (the
+ * offset at a past moment is exactly what daylight saving makes unsafe to
+ * assume), and truncating by subtracting the zone's own reported minutes and
+ * seconds rather than `% 3_600_000` (which only lands on the local hour
+ * boundary when the zone's offset is a whole number of hours — `Asia/Kolkata`
+ * at UTC+5:30 is not) — does not get a second owner. This export, and the 12
+ * tests on `dueWindow` in `digest-window.test.ts` that exercise it through
+ * `lastScheduledMoment`, are its only coverage; the dashboard inherits that
+ * coverage by calling this function rather than re-deriving the rule.
+ *
+ * **Deliberately NOT gated to "today".** `lastScheduledMoment`'s own
+ * "hasn't struck yet today → null" and "crossed into yesterday → null" rules
+ * are a day-boundary policy specific to a window that gets STORED and
+ * compared against the last one sent — they do not belong in the shared
+ * primitive, because the dashboard's live preview wants the opposite: "the
+ * last boundary, whatever day it falls on", since nothing it computes is
+ * ever written down or merged with a prior window. `lastScheduledMoment`
+ * below adds that gate back on top of this function; this function itself
+ * only ever answers "where is the nearest matching hour going backward".
+ */
+export function lastHourInstant(
+  hour: number,
+  timeZone: string,
+  now: Date,
+  maxHoursBack = 24 * 8,
+): Date | null {
+  for (let back = 0; back <= maxHoursBack; back += 1) {
+    const candidate = new Date(now.getTime() - back * 60 * 60 * 1000);
+    const parts = partsIn(candidate, timeZone);
+    if (parts.hour !== hour) continue;
+    const subSecondMs = candidate.getTime() % 1000;
+    return new Date(candidate.getTime() - parts.minute * 60_000 - parts.second * 1000 - subSecondMs);
+  }
+  return null;
+}
+
 function lastScheduledMoment(
   settings: DigestSettings,
   kind: DigestKind,
@@ -140,22 +186,22 @@ function lastScheduledMoment(
   if (kind === 'weekly' && nowParts.weekday !== settings.weeklyDay) return null;
   if (nowParts.hour < wantedHour) return null;
 
-  for (let back = 0; back <= 25; back += 1) {
-    const candidate = new Date(now.getTime() - back * 60 * 60 * 1000);
-    const parts = partsIn(candidate, timeZone);
-    if (parts.ymd !== nowParts.ymd) return null;
-    if (parts.hour !== wantedHour) continue;
-    // Truncate to the top of that hour AS READ IN THE ZONE, not in epoch
-    // space: subtracting `candidate.getTime() % 3_600_000` only coincides
-    // with local-hour truncation when the zone's offset is a whole number
-    // of hours. `Asia/Kolkata` (UTC+5:30) is a half-hour off, and the
-    // charter accepts any resolvable IANA zone, so that mismatch is reachable
-    // by configuration, not just hypothetical. Subtracting the zone's own
-    // reported minutes/seconds is correct for every offset granularity.
-    const subSecondMs = candidate.getTime() % 1000;
-    return new Date(candidate.getTime() - parts.minute * 60_000 - parts.second * 1000 - subSecondMs);
-  }
-  return null;
+  // Bounded to 25 hours back, same as the inlined loop this replaced: the
+  // gate above already guarantees TODAY's occurrence of `wantedHour` exists
+  // within the last 24 hours when it exists at all, so 25 is enough to reach
+  // it and not so large that it would silently also reach into yesterday
+  // undetected — the `ymd` check right below is what actually rejects
+  // yesterday's match; the bound is just not wasteful about finding it.
+  const found = lastHourInstant(wantedHour, timeZone, now, 25);
+  if (found === null) return null;
+
+  // The day-boundary gate `lastHourInstant` itself does not have (see its own
+  // docblock): a match that landed on a different calendar day than `now` is
+  // the DST spring-forward case (today's hour was skipped; the probe reached
+  // back into yesterday's valid occurrence instead) and must not be reported
+  // as today's window.
+  if (partsIn(found, timeZone).ymd !== nowParts.ymd) return null;
+  return found;
 }
 
 /**

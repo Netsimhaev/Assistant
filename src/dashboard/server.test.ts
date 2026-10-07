@@ -36,7 +36,7 @@ import {
   recordQuestion,
   saveInstruction,
 } from '../governance/instructions.js';
-import { loadDigestSettings } from '../governance/digest-settings.js';
+import { loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
 import {
@@ -3240,5 +3240,106 @@ describe('digest screen', () => {
 
     const settings = await loadDigestSettings({ businessId: BUSINESS });
     expect(settings.schedule).toBe('off');
+  });
+
+  /**
+   * Fix round 1, item 1: `active === null` ("no charter signed yet") must
+   * not 500 — it is the ordinary state of a brand-new installation, and
+   * neither `recentDigests` nor `loadDigestSettings` ever needed the charter.
+   */
+  it('renders 200 with the history and the form when no charter has been signed yet', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('טרם נחתם תקנון עסקי');
+    expect(body).toContain('לא נשלח עדיין שום תדריך');
+    expect(body).toContain('name="dailyHour"');
+  });
+
+  /**
+   * The other half of item 1: a SIGNED charter this code cannot parse (a
+   * stale schema version, aged the same way `charter/stale-charter.test.ts`
+   * does — straight UPDATE on the stored column, since `BusinessCharter.parse`
+   * would refuse an old version on the way IN through `installCharter`) is a
+   * different fact from "none yet" and must say something different — still
+   * 200, still with the history and the form.
+   */
+  it('renders 200 with a message distinct from "none yet" when the signed charter cannot be read', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await getPool().query(
+      `UPDATE charter_versions
+          SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb($2::text))
+        WHERE business_id = $1`,
+      [BUSINESS, '1.1'],
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('אינו קריא כרגע');
+    expect(body).not.toContain('טרם נחתם תקנון עסקי');
+    expect(body).toContain('לא נשלח עדיין שום תדריך');
+    expect(body).toContain('name="dailyHour"');
+  });
+
+  /**
+   * Fix round 1, item 2: a weekly-only owner must see a weekly-shaped
+   * preview ('תדריך שבועי', from `renderDigest`'s own `KIND_LABEL`), never
+   * the daily one he will never receive. The settings form's own `<select>`
+   * always lists the bare word 'יומי' as one of four schedule options, so
+   * the assertion checks the two-word phrase together — the word alone would
+   * also be satisfied by that unrelated `<option>`.
+   */
+  it('previews the weekly shape for a weekly-only schedule, not the daily one', async () => {
+    const { baseUrl, cookie } = await digestSession(BUSINESS);
+    await setDigestSettings(
+      { schedule: 'weekly', dailyHour: 8, weeklyDay: 0, weeklyHour: 9, toEmail: false, toWhatsApp: false },
+      'owner',
+      { businessId: BUSINESS },
+    );
+
+    const res = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('תדריך שבועי');
+    expect(body).not.toContain('תדריך יומי');
+  });
+
+  /**
+   * Fix round 1, item 4: a POST missing a required hour field must be
+   * refused, not accepted as `0` (midnight) — `z.coerce.number().int()`
+   * parses `null` into `0`, which `RequiredHourField` must not do. Checked
+   * both ways: the refusal message renders, AND nothing was written (the
+   * settings stay at `DIGEST_DEFAULTS.dailyHour`, never silently `0`).
+   */
+  it('refuses a POST missing a required hour field, not a 500 or a silent 0', async () => {
+    const { baseUrl, cookie } = await digestSession(BUSINESS);
+    const page = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    const csrf = extractCsrf(await page.text());
+
+    const res = await fetch(`${baseUrl}/digest/settings`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf,
+        schedule: 'daily',
+        // dailyHour deliberately omitted
+        weeklyDay: '0',
+        weeklyHour: '9',
+      }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('יש לבחור ערכים תקינים בכל שדות התדריך');
+
+    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    expect(settings.schedule).toBe('off');
+    expect(settings.dailyHour).toBe(8);
   });
 });
