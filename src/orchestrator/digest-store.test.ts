@@ -72,4 +72,36 @@ describe('digest store', () => {
       recordChannel('DG-nope', 'email', 'sent', { businessId: BUSINESS }),
     ).rejects.toThrow();
   });
+
+  /**
+   * A business-id filter's real failure mode is a MISS, not a leak: without
+   * `AND business_id = $2` the UPDATE still finds the row (it matches on
+   * `digest_id` alone) and succeeds silently against someone else's digest,
+   * rather than failing to find anything. So this asserts both halves: the
+   * call rejects, AND the original row is untouched — the throw alone would
+   * not prove nothing was written.
+   */
+  it('refuses to record a channel for a digest that belongs to another business', async () => {
+    const stored = await storeDigest(
+      { window: WINDOW, rendered: { body: 'a', hadContent: true } },
+      { businessId: BUSINESS },
+    );
+    await expect(
+      recordChannel(stored.digestId, 'email', 'sent', { businessId: 'other-business' }),
+    ).rejects.toThrow();
+
+    const back = await recentDigests({ businessId: BUSINESS });
+    expect(back[0]?.emailState).toBeNull();
+  });
+
+  /**
+   * Same failure mode as above, one table query over: without its own
+   * `business_id` filter, `lastWindowEnd` would MISS by returning another
+   * business's real window as if it were this business's own, not fail to
+   * find anything.
+   */
+  it('does not see another business\'s window end', async () => {
+    await storeDigest({ window: WINDOW, rendered: { body: 'a', hadContent: true } }, { businessId: BUSINESS });
+    expect(await lastWindowEnd('daily', { businessId: 'other-business' })).toBeNull();
+  });
 });
