@@ -151,6 +151,21 @@ describe('what an erasure leaves behind', () => {
       { businessId: BUSINESS },
     );
 
+    // --- Migration 040's table. -------------------------------------------
+    //
+    // `digests` has no `job_id` at all — a digest is a periodic rollup across
+    // many jobs, not a record belonging to this one — so it cannot ride along
+    // on the job's own seeding above the way every job-scoped table in this
+    // sweep does. It is seeded here as its own, independent probe site: the
+    // only thing that can ever catch a missing `digests` wiring is the probe
+    // sitting in `body` itself. See `erasure-plan.ts`'s header for why this
+    // table is discovered by content alone, with no job-membership half.
+    await db.query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ('DG-probe', $1, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', $2, true)`,
+      [BUSINESS, `תדריך יומי · פנייה שנכשלה אל ${PROBE}`],
+    );
+
     // --- The other seven stores of spec §5.1. ----------------------------
     //
     // The document chain first. It is reached from the job the way production

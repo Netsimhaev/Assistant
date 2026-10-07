@@ -37,6 +37,7 @@ import {
   APPROVAL_REQUESTS_ERASED_PREDICATE,
   APPROVAL_REQUESTS_SCRUBBED_PREDICATE,
   APPROVAL_REQUESTS_SCRUB_SET,
+  DIGESTS_ERASED_PREDICATE,
   JOBS_SCRUBBED_PREDICATE,
   JOBS_SCRUB_SET,
   LIVE_PHASES,
@@ -154,7 +155,7 @@ export async function executeErasure(
     );
   }
 
-  const { jobIds, documentIds, memoryIds } = plan;
+  const { jobIds, documentIds, memoryIds, digestIds } = plan;
   const client = await getPool().connect();
   const results: ErasureItem[] = [];
   let txError: unknown;
@@ -228,6 +229,17 @@ export async function executeErasure(
     // three parameters in the same order: the preview and the destruction
     // cannot drift here because there is only one of them.
     await del('memories', 'DELETE FROM memories WHERE business_id=$1 AND memory_id = ANY($2)', [businessId, memoryIds]);
+    // `digests` has no job id and no document id — see `erasure-plan.ts`'s
+    // header for why it is discovered by its own `body` alone. Same
+    // predicate, same parameters, as `countItems` there; placed beside
+    // `memories` because neither table's deletion depends on the
+    // `proposals`-before-`document_readings`-before-`documents` ordering
+    // below.
+    await del(
+      'digests',
+      `DELETE FROM digests WHERE ${DIGESTS_ERASED_PREDICATE}`,
+      [businessId, digestIds],
+    );
     await del(
       'proposals',
       `DELETE FROM proposals WHERE ${PROPOSALS_ERASED_PREDICATE}`,

@@ -1304,6 +1304,9 @@ export const TABLE_LABELS: Record<string, string> = {
   // Migration 036: the WhatsApp conversation (sender number, message body,
   // transcript).
   whatsapp_messages: 'הודעות וואטסאפ',
+  // Migration 040: the stored daily/weekly digest, which names failures —
+  // a document name, a recipient, a contact — in its own rendered body.
+  digests: 'תדריכים',
 };
 
 /**

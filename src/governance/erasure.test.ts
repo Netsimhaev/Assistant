@@ -328,6 +328,7 @@ describe('executeErasure', () => {
       jobIds: [jobId],
       documentIds: [documentId],
       memoryIds: [memory.memoryId],
+      digestIds: [],
       filePaths: [],
       items: [],
       excluded: [],
@@ -359,7 +360,17 @@ describe('executeErasure', () => {
    * the dangling pointer on the job it named is cleared alongside `title`,
    * not left pointing at a row that no longer exists.
    */
-  it('touches every one of the fifteen statements — deletes vanish, scrubs stay and empty', async () => {
+  /**
+   * `digests` (migration 040) is included here deliberately, by a
+   * `digestIds` array set BY HAND rather than produced by
+   * `buildErasurePlan`'s own discovery query — the whole point of this test
+   * is to exercise `executeErasure`/`DIGESTS_ERASED_PREDICATE` on their own,
+   * independent of discovery, so a mutation that removes the discovery
+   * query in `erasure-plan.ts` leaves this test (and the deletion it proves)
+   * untouched. See `erasure-plan.test.ts`'s own digest tests for the
+   * discovery half.
+   */
+  it('touches every one of the sixteen statements — deletes vanish, scrubs stay and empty', async () => {
     const jobId = await bareJob('twelve-statements');
 
     const documentId = `DOC-${ulid()}`;
@@ -469,12 +480,19 @@ describe('executeErasure', () => {
       { jobId, kind: 'entity', subjectKey: 'i2-subject', body: {} },
       { businessId: BUSINESS },
     );
+    const digestId = `DG-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'x', true)`,
+      [digestId, BUSINESS],
+    );
 
     const plan: ErasurePlan = {
       anchor: { kind: 'document', documentId },
       jobIds: [jobId],
       documentIds: [documentId],
       memoryIds: [memory.memoryId],
+      digestIds: [digestId],
       filePaths: [],
       items: [],
       excluded: [],
@@ -501,6 +519,7 @@ describe('executeErasure', () => {
     expect(byStatement.get('agent_envelopes:delete')).toEqual({ table: 'agent_envelopes', action: 'delete', count: 1 });
     expect(byStatement.get('verification_verdicts:delete')).toEqual({ table: 'verification_verdicts', action: 'delete', count: 1 });
     expect(byStatement.get('documents:delete')).toEqual({ table: 'documents', action: 'delete', count: 1 });
+    expect(byStatement.get('digests:delete')).toEqual({ table: 'digests', action: 'delete', count: 1 });
     expect(byStatement.get('jobs:scrub')).toEqual({ table: 'jobs', action: 'scrub', count: 1 });
     expect(byStatement.get('job_steps:scrub')?.action).toBe('scrub');
     expect(byStatement.get('job_steps:scrub')?.count ?? 0).toBeGreaterThan(0);
@@ -517,6 +536,7 @@ describe('executeErasure', () => {
       ['agent_envelopes', 'envelope_id', envelopeId],
       ['verification_verdicts', 'job_id', jobId],
       ['documents', 'document_id', documentId],
+      ['digests', 'digest_id', digestId],
     ];
     for (const [table, column, value] of deletedChecks) {
       const { rows } = await getPool().query(`SELECT 1 FROM ${table} WHERE ${column} = $1`, [value]);
@@ -1157,6 +1177,7 @@ describe('executeErasure', () => {
       jobIds: [jobId],
       documentIds: [documentId],
       memoryIds: [],
+      digestIds: [],
       filePaths: [],
       items: [],
       excluded: [],

@@ -295,6 +295,62 @@ describe('buildErasurePlan', () => {
     });
   });
 
+  /**
+   * Spec §7: the stored digest NAMES failures, so a document name, a
+   * recipient or a contact name can land in its body. Once stored it
+   * survives, and "forget about Ronit" must reach it.
+   *
+   * `digests` has no `job_id` and no document reference at all (see
+   * `erasure-plan.ts`'s header), so this is the whole discovery: a digest
+   * whose body happens to name the contact must be both found AND counted
+   * for deletion by the preview, with nothing else in the system tying it
+   * to anything else that would have carried it in by accident.
+   */
+  it('finds a digest whose body mentions the contact, and counts it for deletion', async () => {
+    await installCharter(buildCharter({ version: 'digest-found' }), { businessId: BUSINESS });
+    const digestId = `DG-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', $3, true)`,
+      [digestId, BUSINESS, `תדריך יומי · ממתין לך: שליחה ל-${RONIT} נכשלה`],
+    );
+
+    const plan = await buildErasurePlan(
+      { kind: 'contact', identifier: RONIT },
+      { businessId: BUSINESS },
+    );
+
+    expect(plan.digestIds).toContain(digestId);
+    const digestItem = plan.items.find((i) => i.table === 'digests' && i.action === 'delete');
+    expect(digestItem).toEqual({ table: 'digests', action: 'delete', count: 1 });
+  });
+
+  /**
+   * The discovery half, which is the one this repo has twice forgotten (see
+   * `job_plans` and `job_authorizations` in CLAUDE.md): a search by the
+   * person's name must FIND the digest, not merely delete it once it was
+   * found through something else. No job, no document, no memory, no
+   * authorization — nothing but the digest's own `body` names the contact.
+   */
+  it('discovers a digest by its body alone, with no job or document linking to it', async () => {
+    await installCharter(buildCharter({ version: 'digest-discovery' }), { businessId: BUSINESS });
+    const digestId = `DG-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ($1, $2, 'weekly', '2026-01-01T00:00:00Z', '2026-01-08T00:00:00Z', $3, true)`,
+      [digestId, BUSINESS, `תדריך שבועי · מסמך מ-${RONIT} נדחה`],
+    );
+
+    const plan = await buildErasurePlan(
+      { kind: 'contact', identifier: RONIT },
+      { businessId: BUSINESS },
+    );
+
+    expect(plan.jobIds).toEqual([]);
+    expect(plan.documentIds).toEqual([]);
+    expect(plan.digestIds).toEqual([digestId]);
+  });
+
   it('classifies items as delete or scrub correctly', async () => {
     const jobId = await jobAbout(RONIT, 'action-classification');
     await writeMemory(
