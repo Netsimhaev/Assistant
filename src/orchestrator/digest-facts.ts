@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import type { Queryable } from '../db/pool.js';
 import { getPool } from '../db/pool.js';
 import type { DigestWindow } from './digest-window.js';
-import { failedText, isGateDenialCode, NOT_PERMITTED_TEXT } from './whatsapp-report.js';
+import { failedText, isGateDenialCode, leadingCode, NOT_PERMITTED_TEXT } from './whatsapp-report.js';
 
 /** One thing that did not go smoothly, already phrased in Hebrew. */
 export interface DigestException {
@@ -61,9 +61,22 @@ async function countOf(db: Queryable, sql: string, params: readonly unknown[]): 
  * the rule.** A gate denial is not a failure: the assistant did not break, she
  * is not permitted to do that yet, and while every action class sits at
  * `draft_only` this is the commonest reason of all.
+ *
+ * **Must extract the leading code first, exactly as `whatsapp-report.ts`'s
+ * own `classifyJob` does** (`const code = reason === null ? null :
+ * leadingCode(reason); if (code !== null && isGateDenialCode(code)) ...`) —
+ * fix round 1, item 2. `isGateDenialCode` matches exact strings for most of
+ * `GATE_DENY_CODES` (only three members are prefix-matched); calling it on
+ * the whole `${code} — ${message}` string `execute.ts` actually writes
+ * (e.g. `draft_only:persist_as_draft — ...`) silently fails every exact
+ * member, including `draft_only:persist_as_draft` itself — the single
+ * commonest reason while every action class sits at `draft_only`. Fell back
+ * to `failedText`'s generic sentence, misreporting the owner's single most
+ * common case as a breakage instead of a permission she has not yet granted.
  */
 function reasonInHebrew(rawReason: string | null): string {
-  if (rawReason !== null && isGateDenialCode(rawReason)) return NOT_PERMITTED_TEXT;
+  const code = rawReason === null ? null : leadingCode(rawReason);
+  if (code !== null && isGateDenialCode(code)) return NOT_PERMITTED_TEXT;
   return failedText(rawReason);
 }
 
@@ -115,12 +128,25 @@ export async function collectDigestFacts(
       WHERE business_id = $1 AND phase = 'closed' AND closed_at >= $2 AND closed_at < $3`,
     [businessId, start, end],
   );
+  // Windowed on the STEP's own `completed_at` — fix round 1, item 4. Windowing
+  // on the job's `closed_at` (the previous version, via a join to `jobs`)
+  // attributed a sent message to whichever window its job happened to CLOSE
+  // in, and dropped it entirely until the job reached a terminal phase — a
+  // message sent today inside a job that does not close until next week
+  // would not be counted until next week's digest. `completed_at` is NOT
+  // NULL DEFAULT now() (`004_plan_resumption.sql`) and is written the moment
+  // the step itself finished, so no join to `jobs` is needed at all.
+  //
+  // A step that really sent, inside a job that later fails, is still counted
+  // here AND its job is still named in `exceptions` below. That is one true
+  // fact reported twice — the message went out, and the job it was part of
+  // nonetheless failed — not a failure disguised as a success. Do not add a
+  // join back in to suppress one of the two; nothing here is wrong.
   const messagesSent = await countOf(
     db,
     `SELECT count(*)::text AS n FROM job_step_results r
-       JOIN jobs j ON j.job_id = r.job_id AND j.business_id = r.business_id
       WHERE r.business_id = $1 AND r.status = 'completed' AND r.performed IS TRUE
-        AND r.external_id IS NOT NULL AND j.closed_at >= $2 AND j.closed_at < $3`,
+        AND r.external_id IS NOT NULL AND r.completed_at >= $2 AND r.completed_at < $3`,
     [businessId, start, end],
   );
   const documentsRead = await countOf(
@@ -158,11 +184,26 @@ export async function collectDigestFacts(
       LIMIT ${MAX_NAMED_EXCEPTIONS + 1}`,
     [businessId, start, end],
   );
+  // **Windowed on `expires_at`, never `decided_at` — fix round 1, item 1.**
+  // `expireOverdue` (`src/governance/approvals.ts`) sets ONLY `state =
+  // 'expired'`; `decided_at` stays NULL forever — migration 001's
+  // `approval_decision_is_complete` CHECK explicitly carves `'expired'` and
+  // `'cancelled'` out of the clause that requires `decided_by`/`decided_at`.
+  // Windowing on `decided_at` therefore matched zero rows, always — exactly
+  // the "silently matches nothing" outcome this module exists to prevent.
+  // `expires_at` is the moment that actually happened inside the window.
+  //
+  // This makes the result reliable only because `expireOverdue` runs inside
+  // `tick()` and the digest collector runs AFTER `tick()` in the same
+  // `schedulerPass` — so by the time this query runs, every approval whose
+  // fuse ran out before `end` has already been swept to `'expired'`. A
+  // reorder of the scheduler that runs the digest before (or without) that
+  // sweep would reintroduce the same "matches nothing" failure one layer up.
   const { rows: expiredApprovals } = await db.query<{ summary: string }>(
     `SELECT summary FROM approval_requests
       WHERE business_id = $1 AND state = 'expired'
-        AND decided_at >= $2 AND decided_at < $3
-      ORDER BY decided_at DESC
+        AND expires_at >= $2 AND expires_at < $3
+      ORDER BY expires_at DESC
       LIMIT ${MAX_NAMED_EXCEPTIONS + 1}`,
     [businessId, start, end],
   );

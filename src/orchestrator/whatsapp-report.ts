@@ -324,7 +324,7 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
  * `delegation_refused:<code>` riding inside one of them as the `code` itself
  * — uses `${code} — ${message}`, split on the em dash.
  */
-function leadingCode(reason: string): string | null {
+export function leadingCode(reason: string): string | null {
   const RUN_DUE_PREFIX = 'run_due: ';
   if (reason.startsWith(RUN_DUE_PREFIX)) {
     return `run_due:${reason.slice(RUN_DUE_PREFIX.length)}`;
