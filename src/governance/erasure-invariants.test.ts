@@ -165,6 +165,17 @@ describe('what an erasure leaves behind', () => {
        VALUES ('DG-probe', $1, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', $2, true)`,
       [BUSINESS, `תדריך יומי · פנייה שנכשלה אל ${PROBE}`],
     );
+    // An unrelated digest, naming nothing that matches the probe — the same
+    // role `WA-unrelated-orphan` plays for `whatsapp_messages` below: without
+    // it, a `digests` predicate that matched every row in the business
+    // (rather than only rows whose `body` names the probe) would still leave
+    // this sweep green, because `DG-probe` above would be the only row
+    // either way.
+    await db.query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ('DG-unrelated', $1, 'daily', '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z', 'תדריך יומי · הכל תקין', true)`,
+      [BUSINESS],
+    );
 
     // --- The other seven stores of spec §5.1. ----------------------------
     //
@@ -320,6 +331,12 @@ describe('what an erasure leaves behind', () => {
     // "true whenever $3 is non-null" deletes this row; the real one does not.
     const unrelated = await db.query('SELECT 1 FROM whatsapp_messages WHERE id = $1', ['WA-unrelated-orphan']);
     expect(unrelated.rows).toHaveLength(1);
+
+    // The same role for `digests`: a predicate matching every row in the
+    // business rather than only the one naming the probe would delete this
+    // too.
+    const unrelatedDigest = await db.query('SELECT 1 FROM digests WHERE digest_id = $1', ['DG-unrelated']);
+    expect(unrelatedDigest.rows).toHaveLength(1);
 
     const { rows: columns } = await db.query<{ table_name: string; column_name: string }>(
       `SELECT c.table_name, c.column_name

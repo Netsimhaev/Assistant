@@ -314,13 +314,23 @@ describe('buildErasurePlan', () => {
        VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', $3, true)`,
       [digestId, BUSINESS, `תדריך יומי · ממתין לך: שליחה ל-${RONIT} נכשלה`],
     );
+    // A decoy, naming a different contact: without it, a predicate that
+    // matched every digest in the business (not just the one naming RONIT)
+    // would still report count 1, because this would otherwise be the only
+    // row in the table. With it, a selective match stays at 1 and an
+    // unselective one reports 2.
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ($1, $2, 'daily', '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z', $3, true)`,
+      [`DG-${ulid()}`, BUSINESS, 'תדריך יומי · הכל תקין, אין חריגות'],
+    );
 
     const plan = await buildErasurePlan(
       { kind: 'contact', identifier: RONIT },
       { businessId: BUSINESS },
     );
 
-    expect(plan.digestIds).toContain(digestId);
+    expect(plan.digestIds).toEqual([digestId]);
     const digestItem = plan.items.find((i) => i.table === 'digests' && i.action === 'delete');
     expect(digestItem).toEqual({ table: 'digests', action: 'delete', count: 1 });
   });
@@ -339,6 +349,14 @@ describe('buildErasurePlan', () => {
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
        VALUES ($1, $2, 'weekly', '2026-01-01T00:00:00Z', '2026-01-08T00:00:00Z', $3, true)`,
       [digestId, BUSINESS, `תדריך שבועי · מסמך מ-${RONIT} נדחה`],
+    );
+    // A second digest naming an unrelated contact, so an unselective match
+    // (every digest in the business, not just this one) would be caught by
+    // the exact-array assertion below rather than passing by coincidence.
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ($1, $2, 'weekly', '2026-01-08T00:00:00Z', '2026-01-15T00:00:00Z', $3, true)`,
+      [`DG-${ulid()}`, BUSINESS, 'תדריך שבועי · מסמך מ-avi@gamma-lift.example נדחה'],
     );
 
     const plan = await buildErasurePlan(
