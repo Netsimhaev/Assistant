@@ -65,13 +65,20 @@ describe('renderDigest', () => {
     expect(out.hadContent).toBe(true);
   });
 
-  /** Spec §1.1: successes are a number, exceptions are a name and a reason. */
+  /**
+   * Spec §1.1: successes are a number, exceptions are a name and a reason.
+   *
+   * NOTE: asserts `'7 משימות'` rather than the lone digit `'7'`. This test
+   * uses the default window ending 2026-10-07, so the header renders "07.10"
+   * and contains the digit '7' regardless of whether `jobsCompleted` renders
+   * at all — fix round 1, item 1.
+   */
   it('counts successes and names each exception with its reason', () => {
     const out = renderDigest(facts({
       done: { jobsCompleted: 7, messagesSent: 3, documentsRead: 0, memoriesWritten: 0 },
       exceptions: [{ subject: 'עדכון המערכת', reason: 'החיבור לא נענה בזמן.' }],
     }));
-    expect(out.body).toContain('7');
+    expect(out.body).toContain('7 משימות');
     expect(out.body).toContain('עדכון המערכת');
     expect(out.body).toContain('החיבור לא נענה בזמן.');
   });
@@ -137,11 +144,31 @@ describe('renderDigest', () => {
     expect(out.body).toContain('חשבונית');
   });
 
+  /**
+   * NOTE — fix round 1, item 2, two bugs in one assertion:
+   *
+   * (a) `/[a-z_.]+/g` strips lowercase only, while the check `/[A-Za-z]/`
+   * looks for both cases — so a genuine lowercase English leak (e.g.
+   * "debug trace leaked here") was deleted by the strip before the check
+   * ever saw it, and the test stayed green.
+   *
+   * (b) the fixture carried no `permissionChanges`, so the test never
+   * exercised the half of its own premise that identifiers like
+   * `email.reply` are *allowed* through — tightening the regex alone, with
+   * no identifier present to exempt, would prove nothing about the exemption.
+   *
+   * Fixed by requiring an internal `.`/`_` separator to count as an
+   * "identifier" (so bare prose words are never stripped), and by adding a
+   * real `email.reply` permission change so the exemption is genuinely
+   * exercised alongside the prose check.
+   */
   it('writes nothing in Latin letters to the owner', () => {
     const out = renderDigest(facts({
       done: { jobsCompleted: 2, messagesSent: 1, documentsRead: 0, memoriesWritten: 0 },
+      permissionChanges: [{ subject: 'email.reply', reason: 'הורשתה לפעול בלי לשאול.' }],
     }));
-    // Action-class names are identifiers and may appear; prose may not.
-    expect(out.body.replace(/[a-z_.]+/g, '')).not.toMatch(/[A-Za-z]/);
+    // Action-class names are identifiers (internal '.'/'_' separator) and may
+    // appear; bare prose words may not.
+    expect(out.body.replace(/[a-z]+(?:[._][a-z]+)+/g, '')).not.toMatch(/[A-Za-z]/);
   });
 });
