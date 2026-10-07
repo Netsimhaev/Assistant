@@ -11,8 +11,10 @@ import { upsertBinding } from './bindings.js';
 import { envCredentials } from './credentials.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
+import { setDigestSettings } from '../governance/digest-settings.js';
 import { bindPlanToJob } from './plan-store.js';
 import { loadRampLevel, setRampLevel } from './ramp.js';
+import { recentDigests } from './digest-store.js';
 import { schedulerPass } from './scheduler.js';
 import type { Runtime } from './runtime.js';
 
@@ -275,5 +277,70 @@ describe('schedulerPass', () => {
     expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe(
       'approve_required',
     );
+  });
+
+  /**
+   * Task 6, mutation check — the digest must run AFTER `runDueJobs`, not
+   * before it.
+   *
+   * `waiting.approvals` in `digest-facts.ts` is POINT-IN-TIME, not
+   * window-scoped (spec §3.1) — it counts whatever is `pending` the moment
+   * the digest looks, with no window arithmetic to get wrong. So this needs
+   * no clock trick: the approval this very pass raises either already
+   * exists in `approval_requests` by the time `runDigests` queries it, or it
+   * does not, purely as a function of which runs first within THIS pass.
+   */
+  it('counts an approval this very pass just raised', async () => {
+    const bundle = await installCharter(
+      buildCharter({
+        connections: [MAIL_CONNECTION],
+        knownCounterpartyEmailDomain: 'example.com',
+      }),
+      { businessId: BUSINESS },
+    );
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'needs approval',
+    });
+    for (const to of ['understand', 'plan', 'execute'] as const) {
+      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    }
+    await upsertBinding(
+      {
+        system: 'office-mail',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OFFICE_MAIL',
+        provider: null,
+        lastOkAt: null,
+        lastError: null,
+      },
+      { businessId: BUSINESS, by: 'test' },
+    );
+    await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
+    // `ask` clamps floor AND ceiling to `approve_required` for every class —
+    // the plan step must queue an approval rather than send or sit in draft.
+    await setAutonomyMode('ask', 'owner@example.com', { businessId: BUSINESS });
+    await setDigestSettings(
+      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false },
+      'owner',
+      { businessId: BUSINESS },
+    );
+
+    const sent: MailMessage[] = [];
+    const pass = await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });
+
+    // The step really ran and queued an approval, and nothing went out.
+    expect(pass.due.ran.map((r) => r.jobId)).toContain(job.jobId);
+    expect(sent).toHaveLength(0);
+    expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    const stored = await recentDigests({ businessId: BUSINESS });
+    expect(stored).toHaveLength(1);
+    // Distinctive: this exact count-and-label only appears when
+    // `waiting.approvals` is 1, and only `digest-render.ts`'s §3.1 block
+    // writes it.
+    expect(stored[0]?.body).toContain('1 אישורים שלא הוכרעו');
   });
 });

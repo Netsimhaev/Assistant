@@ -36,6 +36,7 @@ function cleanResult(): SchedulerPassResult {
     whatsappError: null,
     autonomy: { promoted: [], demoted: [], errored: [] },
     autonomyError: null,
+    digest: null,
   };
 }
 

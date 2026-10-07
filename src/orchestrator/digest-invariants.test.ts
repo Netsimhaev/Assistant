@@ -12,9 +12,10 @@ import { describe, expect, it } from 'vitest';
  * helper chains before anyone noticed, and both would have passed a check that
  * only read the file's own import lines.
  *
- * NOTE: the walk is pointed at `digest-render.ts` because `digest-run.ts` does
- * not exist yet — Task 6 creates it. Task 6 must move this entry point to
- * `digest-run.ts` once that file exists.
+ * The walk is pointed at `digest-run.ts` — the module that actually reaches
+ * the database and the signed charter, not `digest-render.ts` alone. A walk
+ * that silently resolved nothing from it would report "no model reachable"
+ * about a graph of one file.
  */
 const ROOT = join(process.cwd(), 'src');
 
@@ -55,8 +56,7 @@ function reachableFrom(entry: string): Set<string> {
 
 describe('the digest calls no model', () => {
   it('cannot reach a module that talks to a model, at any depth', () => {
-    // NOTE: must move to `digest-run.ts` once Task 6 creates it.
-    const reached = reachableFrom(join(ROOT, 'orchestrator', 'digest-render.ts'));
+    const reached = reachableFrom(join(ROOT, 'orchestrator', 'digest-run.ts'));
 
     // Every `src/sdk/*` module is a model caller or a step away from one.
     const offenders = [...reached].filter((f) => f.includes(join('src', 'sdk')));
@@ -69,8 +69,8 @@ describe('the digest calls no model', () => {
    * for the wrong reason, which is the failure this project names repeatedly.
    */
   it('really traverses more than the entry file', () => {
-    const reached = reachableFrom(join(ROOT, 'orchestrator', 'digest-render.ts'));
+    const reached = reachableFrom(join(ROOT, 'orchestrator', 'digest-run.ts'));
     expect(reached.size).toBeGreaterThan(5);
-    expect([...reached].some((f) => f.endsWith(join('orchestrator', 'digest-render.ts')))).toBe(true);
+    expect([...reached].some((f) => f.endsWith(join('orchestrator', 'digest-run.ts')))).toBe(true);
   });
 });
