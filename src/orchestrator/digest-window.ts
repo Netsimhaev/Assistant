@@ -37,17 +37,22 @@ export function scheduledHourFor(settings: DigestSettings, kind: DigestKind): nu
  * probes forward in minutes rather than constructing a local date, for the same
  * reason and with the same note.
  */
-function partsIn(at: Date, timeZone: string): { hour: number; weekday: number; ymd: string } {
+function partsIn(
+  at: Date,
+  timeZone: string,
+): { hour: number; minute: number; second: number; weekday: number; ymd: string } {
   const fmt = new Intl.DateTimeFormat('en-GB', {
     timeZone,
     hour12: false,
     year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', weekday: 'short',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'short',
   });
   const parts = new Map(fmt.formatToParts(at).map((p) => [p.type, p.value]));
   const weekdays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   return {
     hour: Number(parts.get('hour') ?? '0'),
+    minute: Number(parts.get('minute') ?? '0'),
+    second: Number(parts.get('second') ?? '0'),
     weekday: weekdays.indexOf(parts.get('weekday') ?? 'Sun'),
     ymd: `${parts.get('year')}-${parts.get('month')}-${parts.get('day')}`,
   };
@@ -76,6 +81,52 @@ function partsIn(at: Date, timeZone: string): { hour: number; weekday: number; y
  * loop's own `ymd` check is a second, independent guard against drifting
  * into the previous day on a zone/DST quirk that skips the wanted hour
  * entirely (it returns null rather than silently reporting yesterday's).
+ *
+ * Three edge cases below were resolved by measuring this function against
+ * real zones, not by reasoning about them in the abstract — each is stated
+ * here so a future reader doesn't "fix" a deliberate choice back into a bug.
+ *
+ * **A weekly is only ever found due on its scheduled weekday — never on a
+ * later day that merely remembers the gap.** The weekday gate above means a
+ * process that is down for the entirety of its scheduled weekday will not
+ * report that week's window on Monday, Tuesday, or any other day; it waits
+ * for the *next* occurrence of the scheduled weekday, however large the
+ * backlog. This is a real narrowing relative to scanning each candidate's
+ * own weekday over, say, the last 8 days — that wider scan would let a
+ * Wednesday poll find a missed Sunday. It is safe here only because the
+ * merge in `dueWindow` absorbs the delay rather than losing it: when the
+ * scheduled weekday does come back around, `start` is still the stale
+ * `lastSentEnd` and `windowsCovered` comes out 2 (or more), so the gap is
+ * reported, not dropped — just discovered up to 7 days later than the
+ * widest possible scan would have discovered it. Do not restore the
+ * per-candidate weekday scan thinking it closes a hole; it would reopen the
+ * "weekly swallows missed dailies" risk this module's gap-merging is
+ * designed to avoid, since a multi-day scan has no natural boundary to stop
+ * at other than the one the weekday gate already gives it for free.
+ *
+ * **DST fall-back (the clock repeats an hour): the probe finds the LATER of
+ * the two occurrences of the wanted hour, and that is correct.** "The most
+ * recently elapsed instance of this hour" is, by construction, the second
+ * time the clock reads that hour that day — probing backward from `now`
+ * reaches it first. Verified against `America/New_York` on 2026-11-01
+ * (clocks fall back from 2am EDT to 1am EST) with `wantedHour: 1`: `end`
+ * comes out `2026-11-01T06:00:00.000Z`, which is 01:00 EST — the second
+ * 1am, not the first.
+ *
+ * **DST spring-forward (the clock skips an hour): if the wanted hour never
+ * occurs that day, this returns `null` for that day, and the next day
+ * resolves normally.** The `ymd` guard in the loop is what produces this:
+ * it can never find a match for the skipped hour before crossing into the
+ * previous calendar day, so it falls through to `null` rather than
+ * reporting a neighboring hour that was never actually scheduled. The skip
+ * is absorbed the same way any other missed day is — by `windowsCovered`
+ * being larger than 1 on the next occurrence that does fire. Verified
+ * against `America/New_York` on 2026-03-08 (clocks spring forward from
+ * 1:59am to 3:00am) with `wantedHour: 2`, checked just after the skip
+ * (03:30 local): without the `ymd` guard the probe's 25-hour bound reaches
+ * all the way back to YESTERDAY's valid 2am, so the guard is load-bearing
+ * here, not decorative — it breaks out before that match and the function
+ * returns `null`.
  */
 function lastScheduledMoment(
   settings: DigestSettings,
@@ -94,8 +145,15 @@ function lastScheduledMoment(
     const parts = partsIn(candidate, timeZone);
     if (parts.ymd !== nowParts.ymd) return null;
     if (parts.hour !== wantedHour) continue;
-    // Truncate to the top of that hour: the schedule is hour-granular (spec §4).
-    return new Date(candidate.getTime() - candidate.getTime() % (60 * 60 * 1000));
+    // Truncate to the top of that hour AS READ IN THE ZONE, not in epoch
+    // space: subtracting `candidate.getTime() % 3_600_000` only coincides
+    // with local-hour truncation when the zone's offset is a whole number
+    // of hours. `Asia/Kolkata` (UTC+5:30) is a half-hour off, and the
+    // charter accepts any resolvable IANA zone, so that mismatch is reachable
+    // by configuration, not just hypothetical. Subtracting the zone's own
+    // reported minutes/seconds is correct for every offset granularity.
+    const subSecondMs = candidate.getTime() % 1000;
+    return new Date(candidate.getTime() - parts.minute * 60_000 - parts.second * 1000 - subSecondMs);
   }
   return null;
 }

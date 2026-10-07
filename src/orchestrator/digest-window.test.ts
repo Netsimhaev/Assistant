@@ -85,4 +85,71 @@ describe('dueWindow', () => {
     expect(dueWindow(daily, 'daily', null, now, TZ)).not.toBeNull();
     expect(dueWindow(daily, 'daily', null, now, 'UTC')).toBeNull();
   });
+
+  const weekly = { ...DIGEST_DEFAULTS, schedule: 'weekly' as const, weeklyDay: 0, weeklyHour: 8 };
+
+  /**
+   * Narrowing documented on `lastScheduledMoment`: a weekly is only ever
+   * found due on its OWN scheduled weekday. Without the weekday gate, a
+   * wider per-candidate scan (checking each candidate's own weekday over
+   * several days back, the way the original draft of this function scanned
+   * hours) would find last Sunday's moment on a Wednesday poll and report a
+   * window three days early — no matter how many weeks of backlog exist.
+   */
+  it('stays null for a weekly polled on a non-scheduled weekday, however large the backlog', () => {
+    const now = new Date('2026-10-07T09:00:00+03:00'); // Wednesday
+    const lastSent = new Date('2026-09-13T08:00:00+03:00'); // three weeks of backlog
+    expect(dueWindow(weekly, 'weekly', lastSent, now, TZ)).toBeNull();
+  });
+
+  /**
+   * The companion to the test above: the backlog from being polled on the
+   * "wrong" days isn't lost, it's absorbed. Once the scheduled weekday comes
+   * back around, `start` is still the stale `lastSentEnd` and the two
+   * missed weeks collapse into one window with `windowsCovered: 2` — a
+   * reader that forgot to carry `lastSentEnd` through unchanged, or that
+   * recomputed `start` from `end` instead, would lose the gap here.
+   */
+  it('fires the weekly on the next scheduled weekday, admitting the two-week gap', () => {
+    const now = new Date('2026-10-04T09:00:00+03:00'); // Sunday
+    const lastSent = new Date('2026-09-20T08:00:00+03:00'); // Sunday, two weeks earlier
+    const window = dueWindow(weekly, 'weekly', lastSent, now, TZ);
+    expect(window).not.toBeNull();
+    expect(window?.end.toISOString()).toBe(new Date('2026-10-04T08:00:00+03:00').toISOString());
+    expect(window?.start.toISOString()).toBe(lastSent.toISOString());
+    expect(window?.windowsCovered).toBe(2);
+  });
+
+  /**
+   * DST spring-forward: America/New_York skips 2am entirely on 2026-03-08
+   * (clocks jump from 1:59am to 3:00am). `now` is chosen just after the
+   * skip (03:30 local) so the backward probe, if it ignored which calendar
+   * day it had drifted into, would reach all the way back to YESTERDAY's
+   * valid 2am within its 25-hour bound — a reader without that calendar-day
+   * guard would match it and report a digest for an hour that was never
+   * scheduled today. This asserts the safe outcome instead: nothing is due
+   * for the skipped day.
+   */
+  it('returns null for a scheduled hour that daylight saving skips entirely that day', () => {
+    const springForward = { ...DIGEST_DEFAULTS, schedule: 'daily' as const, dailyHour: 2 };
+    const now = new Date('2026-03-08T07:30:00Z'); // 03:30 local, just after the skip
+    expect(dueWindow(springForward, 'daily', null, now, 'America/New_York')).toBeNull();
+  });
+
+  /**
+   * `Asia/Kolkata` is UTC+5:30 — a half-hour offset. Truncating to the top
+   * of the matched hour by subtracting `candidate.getTime() % 3_600_000`
+   * (arithmetic on raw epoch milliseconds) only lands on the local hour
+   * boundary when the zone's offset is a whole number of hours; in a
+   * half-hour zone it lands 30 minutes into the PREVIOUS local hour. This
+   * asserts the window's `end` is exactly the local scheduled hour with zero
+   * minutes, which only holds when truncation happens in the zone's own
+   * reported minutes/seconds, not in epoch space.
+   */
+  it('truncates to the top of the scheduled hour in the zone, even with a half-hour offset', () => {
+    const now = new Date('2026-10-07T09:17:00+05:30'); // Kolkata, after the 08:00 hour
+    const window = dueWindow(daily, 'daily', null, now, 'Asia/Kolkata');
+    expect(window).not.toBeNull();
+    expect(window?.end.toISOString()).toBe(new Date('2026-10-07T08:00:00+05:30').toISOString());
+  });
 });
