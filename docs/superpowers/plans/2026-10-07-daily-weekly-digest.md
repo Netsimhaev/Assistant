@@ -711,16 +711,32 @@ export interface DigestFacts {
   exceptions: readonly DigestException[];
   /** Window-scoped — spec §3.4. */
   permissionChanges: readonly DigestException[];
-  /** Spec §3.5 — both measures. */
+  /**
+   * Spec §3.5 — both measures. `rolling30Minor` and `ceilingMinor` use the
+   * **rolling 30-day window the money gate actually enforces**
+   * (`spentInWindows`, policy/budget.ts:26-33), NEVER a calendar month: a
+   * spend figure shown against a ceiling measured over a different window is
+   * two numbers on one line that cannot be compared, and nothing on the screen
+   * would say so.
+   */
   cost: {
     windowMinor: number;
-    monthMinor: number;
-    monthCeilingMinor: number;
+    rolling30Minor: number;
+    ceilingMinor: number;
+    currency: string;
   };
 }
 
+/**
+ * `ceilings` is passed IN, not loaded here. The money ceiling lives in the
+ * signed charter (`CompiledCeilings.monthlyMinor`, domain/policy.ts:107-116) —
+ * there is none in `src/config.ts`. Both callers already hold the bundle
+ * because each needs the charter's time zone, so this is one field and no new
+ * failure mode in a module that must stay read-only and throw-free.
+ */
 export async function collectDigestFacts(
   window: DigestWindow,
+  ceilings: { monthlyMinor: number; currency: string },
   options?: { businessId?: string; db?: Queryable },
 ): Promise<DigestFacts>;
 ```
@@ -747,6 +763,8 @@ const WINDOW = {
   end: new Date('2026-10-07T08:00:00+03:00'),
   windowsCovered: 1,
 };
+/** Passed in, never loaded here — see the note on `collectDigestFacts`. */
+const CEILINGS = { monthlyMinor: 50_000, currency: 'ILS' };
 
 describe('collectDigestFacts', () => {
   beforeEach(async () => {
@@ -754,7 +772,7 @@ describe('collectDigestFacts', () => {
   });
 
   it('reports an empty window as empty rather than as missing', async () => {
-    const facts = await collectDigestFacts(WINDOW, { businessId: BUSINESS });
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
     expect(facts.done.jobsCompleted).toBe(0);
     expect(facts.exceptions).toEqual([]);
     expect(facts.waiting.approvals).toBe(0);
@@ -778,7 +796,7 @@ describe('collectDigestFacts', () => {
        VALUES ('J-bad', 'execute', 'failed', 'orchestrator', 'adapter_timeout')`,
     );
 
-    const facts = await collectDigestFacts(WINDOW, { businessId: BUSINESS });
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
     expect(facts.done.jobsCompleted).toBe(1);
     expect(facts.exceptions).toHaveLength(1);
     expect(facts.exceptions[0]?.subject).toContain('עדכון המערכת');
@@ -800,7 +818,7 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-09T08:00:00+03:00'), new Date('2026-10-01T08:00:00+03:00')],
     );
 
-    const facts = await collectDigestFacts(WINDOW, { businessId: BUSINESS });
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
     expect(facts.waiting.approvals).toBe(1);
   });
 
@@ -811,27 +829,53 @@ describe('collectDigestFacts', () => {
    */
   it('names an autonomy promotion that happened inside the window', async () => {
     await getPool().query(
-      `INSERT INTO autonomy_events (business_id, action_class, direction, from_level, to_level, reason, at)
-       VALUES ($1, 'email.reply', 'promote', 'approve_required', 'auto_notify', '10 אישורים נקיים', $2)`,
+      // event_id is TEXT PRIMARY KEY with no default (migration 026).
+      `INSERT INTO autonomy_events
+         (event_id, business_id, action_class, direction, from_level, to_level, reason, at)
+       VALUES ('AE-t1', $1, 'email.reply', 'promote', 'approve_required', 'auto_notify', '10 אישורים נקיים', $2)`,
       [BUSINESS, new Date('2026-10-07T06:00:00+03:00')],
     );
 
-    const facts = await collectDigestFacts(WINDOW, { businessId: BUSINESS });
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
     expect(facts.permissionChanges).toHaveLength(1);
     expect(facts.permissionChanges[0]?.subject).toContain('email.reply');
   });
 
-  it('reports both the window cost and the month against its ceiling', async () => {
+  /**
+   * Real columns: action_class and currency are both NOT NULL, there is no
+   * `kind`, and `id` is BIGSERIAL (migration 001:202-216).
+   */
+  it('reports the window cost and the rolling 30 days against the ceiling', async () => {
     await getPool().query(
-      `INSERT INTO spend_ledger (business_id, job_id, amount_minor, kind, idempotency_key, at)
-       VALUES ($1, 'J-ok', 1250, 'model', 'k1', $2)`,
+      `INSERT INTO spend_ledger
+         (business_id, job_id, action_class, amount_minor, currency, idempotency_key, at)
+       VALUES ($1, 'J-ok', 'email.reply', 1250, 'ILS', 'k1', $2)`,
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00')],
     );
 
-    const facts = await collectDigestFacts(WINDOW, { businessId: BUSINESS });
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
     expect(facts.cost.windowMinor).toBe(1250);
-    expect(facts.cost.monthMinor).toBeGreaterThanOrEqual(1250);
-    expect(facts.cost.monthCeilingMinor).toBeGreaterThan(0);
+    expect(facts.cost.rolling30Minor).toBeGreaterThanOrEqual(1250);
+    expect(facts.cost.ceilingMinor).toBe(CEILINGS.monthlyMinor);
+  });
+
+  /**
+   * The gate sums `at >= now() - interval '30 days'`. A calendar-month figure
+   * shown against that ceiling is not comparable to it — this is the assertion
+   * that keeps the two definitions from drifting apart.
+   */
+  it('counts spend from before the first of the month inside the rolling window', async () => {
+    const twentyDaysAgo = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000);
+    await getPool().query(
+      `INSERT INTO spend_ledger
+         (business_id, job_id, action_class, amount_minor, currency, idempotency_key, at)
+       VALUES ($1, 'J-old', 'email.reply', 700, 'ILS', 'k2', $2)`,
+      [BUSINESS, twentyDaysAgo],
+    );
+
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    expect(facts.cost.rolling30Minor).toBe(700);
+    expect(facts.cost.windowMinor).toBe(0);
   });
 
   it('keeps one business's facts out of another's window', async () => {
@@ -841,7 +885,7 @@ describe('collectDigestFacts', () => {
       [new Date('2026-10-07T07:00:00+03:00')],
     );
 
-    const facts = await collectDigestFacts(WINDOW, { businessId: BUSINESS });
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
     expect(facts.done.jobsCompleted).toBe(0);
   });
 });
@@ -900,6 +944,7 @@ function reasonInHebrew(rawReason: string | null): string {
 
 export async function collectDigestFacts(
   window: DigestWindow,
+  ceilings: { monthlyMinor: number; currency: string },
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<DigestFacts> {
   const businessId = options.businessId ?? config.businessId;
@@ -972,8 +1017,9 @@ export async function collectDigestFacts(
       LIMIT ${MAX_NAMED_EXCEPTIONS + 1}`,
     [businessId, start, end],
   );
+  // The column is `reason` — there is no `rejected_reason` (migration 012:41).
   const { rows: rejectedDocs } = await db.query<{ original_name: string; reason: string | null }>(
-    `SELECT original_name, rejected_reason AS reason FROM documents
+    `SELECT original_name, reason FROM documents
       WHERE business_id = $1 AND status = 'rejected'
         AND created_at >= $2 AND created_at < $3
       ORDER BY created_at DESC
@@ -1024,10 +1070,15 @@ export async function collectDigestFacts(
       WHERE business_id = $1 AND at >= $2 AND at < $3`,
     [businessId, start, end],
   );
-  const monthMinor = await countOf(
+  // **The gate's own window, verbatim.** `spentInWindows`
+  // (policy/budget.ts:26-33) sums `at >= now() - interval '30 days'`, and
+  // `checkBudget` compares that sum to `ceilings.monthlyMinor`. A calendar
+  // month here would print a figure that is not comparable to the ceiling
+  // beside it, and nothing the owner sees would say so.
+  const rolling30Minor = await countOf(
     db,
     `SELECT coalesce(sum(amount_minor), 0)::text AS n FROM spend_ledger
-      WHERE business_id = $1 AND at >= date_trunc('month', now())`,
+      WHERE business_id = $1 AND at >= now() - interval '30 days'`,
     [businessId],
   );
 
@@ -1037,12 +1088,17 @@ export async function collectDigestFacts(
     done: { jobsCompleted, messagesSent, documentsRead, memoriesWritten },
     exceptions,
     permissionChanges,
-    cost: { windowMinor, monthMinor, monthCeilingMinor: config.monthlyCeilingMinor },
+    cost: {
+      windowMinor,
+      rolling30Minor,
+      ceilingMinor: ceilings.monthlyMinor,
+      currency: ceilings.currency,
+    },
   };
 }
 ```
 
-**If a column referenced above does not exist** — `documents.rejected_reason`, `config.monthlyCeilingMinor`, `job_step_results.performed` — open the migration or `src/config.ts` and use the real name. Do **not** invent a column: a query that silently matches nothing turns this whole block into a quiet zero, which is the failure mode this digest exists to prevent. Report any correction you had to make.
+**Every column and config name above was verified against the migrations before this task was dispatched** — see the rulings R1-R5 in the ledger, which corrected three of them. `config` is no longer imported for a ceiling; it is still imported for `config.businessId`. If you nonetheless find a name that does not resolve, **open the migration and use the real one, and report it** — do not invent a column. A query that silently matches nothing turns this whole block into a quiet zero, which is the failure mode this digest exists to prevent.
 
 - [ ] **Step 5: Run the tests and watch them pass**
 
@@ -1105,7 +1161,7 @@ function facts(over: Partial<DigestFacts> = {}): DigestFacts {
     done: { jobsCompleted: 0, messagesSent: 0, documentsRead: 0, memoriesWritten: 0 },
     exceptions: [],
     permissionChanges: [],
-    cost: { windowMinor: 0, monthMinor: 0, monthCeilingMinor: 50000 },
+    cost: { windowMinor: 0, rolling30Minor: 0, ceilingMinor: 50000, currency: 'ILS' },
     ...over,
   };
 }
@@ -1379,11 +1435,17 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
   }
 
   // §3.5 — both measures: what it cost, and how much is left.
-  if (cost.windowMinor > 0 || cost.monthMinor > 0) {
+  //
+  // **"ב-30 הימים האחרונים", never "החודש".** The ceiling beside it is
+  // enforced over a rolling 30 days (`spentInWindows`, policy/budget.ts), so
+  // calling the figure a calendar month would make the two numbers on this one
+  // line incomparable while reading as though they were not.
+  if (cost.windowMinor > 0 || cost.rolling30Minor > 0) {
     lines.push(
       '',
-      `עלות: ${formatMinor(cost.windowMinor)} בתקופה · ${formatMinor(cost.monthMinor)} מתוך ` +
-        `${formatMinor(cost.monthCeilingMinor)} החודש.`,
+      `עלות: ${formatMinor(cost.windowMinor, cost.currency)} בתקופה · ` +
+        `${formatMinor(cost.rolling30Minor, cost.currency)} מתוך ` +
+        `${formatMinor(cost.ceilingMinor, cost.currency)} ב-30 הימים האחרונים.`,
     );
   }
 
@@ -1401,7 +1463,15 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
 - [ ] **Step 4: Run both test files and watch them pass**
 
 Run: `npx vitest run src/orchestrator/digest-render.test.ts src/orchestrator/digest-invariants.test.ts`
-Expected: PASS. The invariant file will fail until Task 6 creates `digest-run.ts` — if so, point it at `digest-render.ts` for now and **move it to `digest-run.ts` in Task 6**, noting that in your report.
+Expected: PASS.
+
+**Ruled before dispatch (ledger R6):** `digest-run.ts` does not exist yet — Task 6
+creates it. Write the invariant pointed at `digest-render.ts`, and leave a one-line
+comment at the walk's entry saying it must move to `digest-run.ts` once that file
+exists. Task 6 is separately instructed to move it, so do not try to anticipate the
+file. The second test — that the walk really traverses more than the entry file — is
+what keeps this intermediate state honest: a graph of one file would satisfy the
+first test for the wrong reason.
 
 - [ ] **Step 5: Mutation-verify the three claims**
 
@@ -1728,7 +1798,10 @@ git commit -m "Digest store: stored before delivery, read back verbatim, a misse
 - Modify: `src/orchestrator/digest-invariants.test.ts` (point the walk at `digest-run.ts`)
 
 **Interfaces:**
-- Consumes: everything from Tasks 1–5; `loadActiveCharter` from `../charter/store.js` for the time zone; `Runtime.notify.sendAlert` for email; `BossMessenger` for WhatsApp.
+- Consumes: everything from Tasks 1–5, plus `loadActiveCharter` from `../charter/store.js` for the time zone **and the money ceiling** (`bundle.ceilings.monthlyMinor` / `.currency`, which `collectDigestFacts` takes as its second argument).
+- **The two delivery seams, with their real signatures — do not re-derive these:**
+  - `sendAlert(subject: string, body: string): Promise<{ ok: boolean; error?: string }>` (`orchestrator/runtime.ts:61`)
+  - `BossMessenger.send({ text: string; jobId: string | null }): Promise<{ ok: boolean; error?: string }>` (`whatsapp/messenger.ts:68-72`) — it never takes a recipient and never throws. Pass `jobId: null`: a digest belongs to no single job.
 - Produces:
 ```ts
 export interface DigestRunResult {
@@ -1896,9 +1969,15 @@ For each kind in `['daily', 'weekly']`:
 
 In `src/orchestrator/scheduler.ts`, after the `evaluateAutonomy` call (today the final step), add the digest and extend `SchedulerPassResult` with `digest: DigestRunResult | null` — `null` when the schedule is off, following `conduct`'s own docblock: "the loop did not run" and "it ran and found nothing" are different facts.
 
-- [ ] **Step 5: Point the no-model invariant at the real entry**
+- [ ] **Step 5: Point the no-model invariant at the real entry (ledger R6 — required)**
 
-Update `digest-invariants.test.ts` to walk from `digest-run.ts` and re-confirm both of its tests pass, including the one asserting the walk traverses more than one file.
+Task 4 wrote `digest-invariants.test.ts` walking from `digest-render.ts`, because
+`digest-run.ts` did not exist yet. **Change the entry to `digest-run.ts` now** and
+remove the comment Task 4 left there. Then re-confirm BOTH of its tests pass —
+especially the one asserting the walk traverses more than the entry file, since
+`digest-run.ts` is the file that actually reaches the database and the charter, and
+a walk that silently resolves nothing from it would report "no model reachable"
+about a graph of one file.
 
 - [ ] **Step 6: Run the touched tests**
 
