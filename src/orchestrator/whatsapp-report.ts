@@ -215,7 +215,7 @@ const GATE_DENY_CODES: ReadonlySet<string> = new Set([
   'delegation_not_permitted',
 ]);
 
-function isGateDenialCode(code: string): boolean {
+export function isGateDenialCode(code: string): boolean {
   return (
     GATE_DENY_CODES.has(code) ||
     code.startsWith('budget_exceeded') ||
