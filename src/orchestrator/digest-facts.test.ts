@@ -306,4 +306,33 @@ describe('collectDigestFacts', () => {
     expect(facts.exceptions[0]?.subject).toBe('חוזה.pdf');
     expect(facts.exceptions[0]?.reason).toBe('הקובץ פגום ולא ניתן לקריאה.');
   });
+
+  /**
+   * Fix round 1, item 4: a message is attributed to the window it was
+   * actually SENT in, not the window its job later happens to close in. The
+   * natural case is a job that closes well after the window ends — the
+   * message already went out inside the window, and the job itself is still
+   * open (or closes later) when the digest for that window is sent. Under
+   * the old windowing (a join to `jobs`, bounded by `j.closed_at`) this step
+   * would be invisible here and would only surface in whichever later
+   * window the job happens to close in — a step that belongs to a
+   * still-open job must still be counted as soon as it has actually sent.
+   */
+  it('counts a sent message by when it completed, not by when its job later closes', async () => {
+    const db = getPool();
+    await db.query(
+      `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
+       VALUES ('J-later-close', $1, 'תזכורת לדנה', 'closed', $3, 'boss', false, $2)`,
+      [BUSINESS, new Date('2026-10-08T07:00:00+03:00'), charterVersion],
+    );
+    await db.query(
+      `INSERT INTO job_step_results
+         (business_id, job_id, plan_hash, step_id, external_id, status, performed, completed_at)
+       VALUES ($1, 'J-later-close', 'ph-1', 'step-1', 'msg-123', 'completed', true, $2)`,
+      [BUSINESS, new Date('2026-10-07T07:00:00+03:00')],
+    );
+
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    expect(facts.done.messagesSent).toBe(1);
+  });
 });
