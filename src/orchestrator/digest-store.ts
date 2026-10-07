@@ -67,8 +67,8 @@ export async function storeDigest(
 
   const { rows } = await db.query<DigestRow>(
     `INSERT INTO digests
-       (digest_id, business_id, kind, window_start, window_end, body, had_content, screen_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+       (digest_id, business_id, kind, window_start, window_end, body, had_content)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING ${COLUMNS}`,
     [id, businessId, input.window.kind, input.window.start, input.window.end,
      input.rendered.body, input.rendered.hadContent],
