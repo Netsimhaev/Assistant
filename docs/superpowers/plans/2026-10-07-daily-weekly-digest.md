@@ -155,6 +155,12 @@ CREATE TABLE digests (
     body          TEXT        NOT NULL,
     had_content   BOOLEAN     NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- REMOVED by migration 041 during Task 5. This column was never read
+    -- anywhere, was absent from the spec, and — being set unconditionally at
+    -- insert — merely duplicated created_at. A nullable timestamp named
+    -- screen_at also invites the next reader to believe it records when the
+    -- owner SAW the digest, which nothing in this system knows. Left here as
+    -- the historical record of what was planned; do not re-add it.
     screen_at     TIMESTAMPTZ,
     email_state   TEXT,
     whatsapp_state TEXT,
