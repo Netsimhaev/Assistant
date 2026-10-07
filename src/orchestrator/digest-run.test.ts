@@ -4,6 +4,7 @@ import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { setDigestSettings } from '../governance/digest-settings.js';
+import type { BossMessenger } from '../whatsapp/messenger.js';
 import { recentDigests } from './digest-store.js';
 import { runDigests } from './digest-run.js';
 
@@ -41,7 +42,7 @@ describe('runDigests', () => {
   /** Spec §4: off means nothing is produced at all. */
   it('does nothing while the schedule is off', async () => {
     const result = await runDigests({ businessId: BUSINESS, now: new Date('2026-10-07T09:00:00+03:00') });
-    expect(result.sent).toEqual([]);
+    expect(result.produced).toEqual([]);
     expect(await recentDigests({ businessId: BUSINESS })).toEqual([]);
   });
 
@@ -110,6 +111,67 @@ describe('runDigests', () => {
   });
 
   /**
+   * Fix round 1, item 3 — the happy path of the whole delivery half.
+   * Every other channel test here has either `hadContent: false` or a
+   * failing/throwing seam, so `'sent'` was never actually written by any
+   * test; a mutation that recorded `'failed'` unconditionally would have
+   * passed unnoticed. Verified (per the coordinator's instructions) by
+   * mutating the recorded state to `'failed'` unconditionally and watching
+   * this test fail — see the task report.
+   */
+  it('records a successful email send', async () => {
+    await setDigestSettings(
+      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: true, toWhatsApp: false },
+      'owner', { businessId: BUSINESS },
+    );
+    await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
+
+    const calls: string[] = [];
+    const result = await runDigests({
+      businessId: BUSINESS,
+      now: new Date('2026-10-07T09:00:00+03:00'),
+      sendAlert: async (subject) => { calls.push(subject); return { ok: true }; },
+    });
+
+    expect(result.errored).toBeNull();
+    expect(calls).toEqual(['תדריך יומי']);
+    const stored = await recentDigests({ businessId: BUSINESS });
+    expect(stored[0]?.emailState).toBe('sent');
+  });
+
+  /** Fix round 1, item 3 — the same happy path, for WhatsApp. */
+  it('records a successful WhatsApp send', async () => {
+    await setDigestSettings(
+      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: true },
+      'owner', { businessId: BUSINESS },
+    );
+    await seedClosedJob(new Date('2026-10-07T07:00:00+03:00'));
+
+    const texts: string[] = [];
+    // `BossMessenger.send` never takes a recipient — only `{ text, jobId }` —
+    // and a digest belongs to no single job, so `jobId` must be `null`.
+    const messenger: BossMessenger = {
+      channel: 'whatsapp',
+      async send(input) {
+        expect(input.jobId).toBeNull();
+        texts.push(input.text);
+        return { ok: true };
+      },
+    };
+
+    const result = await runDigests({
+      businessId: BUSINESS,
+      now: new Date('2026-10-07T09:00:00+03:00'),
+      messenger,
+    });
+
+    expect(result.errored).toBeNull();
+    expect(texts).toHaveLength(1);
+    const stored = await recentDigests({ businessId: BUSINESS });
+    expect(stored[0]?.whatsappState).toBe('sent');
+  });
+
+  /**
    * Mutation check (Task 6, step 7 #1): storage must precede delivery.
    * `sendAlert` THROWS here, rather than merely returning `{ ok: false }` —
    * if delivery ran first, nothing would ever reach `storeDigest` and the
@@ -156,6 +218,6 @@ describe('runDigests', () => {
       businessId: BUSINESS,
       now: new Date('2026-10-11T09:00:00+03:00'), // Sunday
     });
-    expect(result.sent.map((s) => s.kind).sort()).toEqual(['daily', 'weekly']);
+    expect(result.produced.map((s) => s.kind).sort()).toEqual(['daily', 'weekly']);
   });
 });

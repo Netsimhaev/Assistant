@@ -1,16 +1,39 @@
 // **The digest runs LAST in the scheduler pass.** After the plans, after the
-// closes, after the WhatsApp report — otherwise it reports on a period that
-// ended half a second after it looked. The same ordering argument that put
-// `closeVerifiedJobs` after the plans (`scheduler.ts`'s own docblock).
+// closes, after the WhatsApp report — the same ordering argument that
+// already puts `closeVerifiedJobs` after the plans (`scheduler.ts`'s own
+// docblock): work must happen before it is reported on.
 //
-// There is a second, independent reason the ordering is load-bearing:
-// `collectDigestFacts` (`digest-facts.ts`) windows its "expired approval"
-// exception on `expires_at`, and an approval only reaches `state = 'expired'`
-// after `expireOverdue` sweeps it — which happens inside `tick()`, at the
-// START of the pass. Running the digest last is what lets it see approvals
-// that expired during its own window, in the same pass that expired them.
-// Moving this earlier would silently reopen the "matches nothing" failure
-// `digest-facts.ts`'s own docblock already names for `decided_at`.
+// **What running dead last actually buys is POINT-IN-TIME correctness for
+// `waiting.*`.** `digest-facts.ts` §3.1 (pending approvals, open questions,
+// deferred jobs) is deliberately NOT window-scoped — it is a plain `SELECT`
+// against current state. An approval `runDueJobs` raises earlier in THIS
+// very pass is already `state = 'pending'` by the time the digest's query
+// runs, so it is reported immediately instead of a full scheduler interval
+// later. Fix round 1's own test (`scheduler-runs-plans.test.ts`, "counts an
+// approval this very pass just raised") proves exactly this, and fails if
+// the digest is moved ahead of `runDueJobs`.
+//
+// The expired-approval EXCEPTION in `collectDigestFacts` (§3.3, windowed on
+// `expires_at`) only requires running the digest after `tick()` — not dead
+// last specifically — because `expireOverdue` is what flips `state` to
+// `'expired'`, and that happens once, at the very start of the pass. (An
+// earlier version of this comment claimed this was a second, independent
+// reason for the DEAD-LAST position; it is not — it is a weaker requirement
+// that the dead-last position happens to also satisfy.)
+//
+// **Same-pass WINDOW-SCOPED counting (jobsCompleted, messagesSent,
+// documentsRead, memoriesWritten) is structurally impossible, and no
+// ordering of this function within the pass changes that.** `dueWindow`'s
+// `end` is always the SCHEDULED moment and always `<= now`
+// (`digest-window.ts`'s own docblock: "never `now` itself"). Anything
+// stamped with the database's real `now()` DURING this very pass — a job's
+// `closed_at`, a step's `completed_at` — therefore has a timestamp
+// `>= now >= end`, and the `< end` bound in every window-scoped query in
+// `digest-facts.ts` excludes it by construction. Such work is always picked
+// up by a LATER pass's window instead, once enough time has passed for a
+// new scheduled hour to be in the past. Moving this function earlier or
+// later within the pass has no effect on that at all — only the
+// point-in-time measures above are ordering-sensitive.
 //
 // **No model is reachable from this file, at any depth.** Spec §2 decision 2,
 // locked by a transitive import walk in `digest-invariants.test.ts`, which is
@@ -26,10 +49,27 @@ import { dueWindow } from './digest-window.js';
 import type { DigestKind } from './digest-window.js';
 
 export interface DigestRunResult {
-  /** Every window that was due and got stored this pass, whether or not it had content. */
-  sent: readonly { kind: DigestKind; digestId: string }[];
+  /**
+   * Every window that was due and got STORED this pass — delivered to a
+   * channel, or not. An empty window (`hadContent: false`) still appears
+   * here: this field answers "which kinds did the pass process", never
+   * "which kinds actually reached an inbox". Use `screenOnly` for the count
+   * of windows that reached only the stored row (and so only the screen).
+   * Named `produced`, not `sent`, for exactly this reason — fix round 1:
+   * the field was originally called `sent`, which a reader could easily
+   * (and wrongly) take to mean "delivered".
+   */
+  produced: readonly { kind: DigestKind; digestId: string }[];
   /** Windows that were due but produced nothing worth interrupting him for. */
   screenOnly: number;
+  /**
+   * `loadActiveCharter`'s thrown message, if it threw — a stale or
+   * unparseable charter. Null on a clean pass. The same treatment
+   * `scanError`/`whatsappError`/`autonomyError` already give an escaping
+   * throw in `scheduler.ts`: caught here, reported, and never propagated —
+   * the pass still has approvals to expire and jobs to run, and an
+   * installation whose charter cannot be parsed must not lose those too.
+   */
   errored: string | null;
 }
 
@@ -69,7 +109,7 @@ export async function runDigests(options: {
 
   const settings = await loadDigestSettings({ businessId });
   if (settings.schedule === 'off') {
-    return { sent: [], screenOnly: 0, errored: null };
+    return { produced: [], screenOnly: 0, errored: null };
   }
 
   // A stale or unparseable charter makes `loadActiveCharter` THROW
@@ -82,10 +122,10 @@ export async function runDigests(options: {
   try {
     active = await loadActiveCharter(businessId);
   } catch (err) {
-    return { sent: [], screenOnly: 0, errored: err instanceof Error ? err.message : String(err) };
+    return { produced: [], screenOnly: 0, errored: err instanceof Error ? err.message : String(err) };
   }
   if (active === null) {
-    return { sent: [], screenOnly: 0, errored: `no active charter for business ${businessId}` };
+    return { produced: [], screenOnly: 0, errored: `no active charter for business ${businessId}` };
   }
   // `active.charter.identity.timezone` — never `active.bundle.quietHours`,
   // which is `null` whenever the charter leaves quiet hours unconfigured
@@ -97,7 +137,7 @@ export async function runDigests(options: {
     currency: active.bundle.ceilings.currency,
   };
 
-  const sent: { kind: DigestKind; digestId: string }[] = [];
+  const produced: { kind: DigestKind; digestId: string }[] = [];
   let screenOnly = 0;
 
   for (const kind of KINDS) {
@@ -145,17 +185,17 @@ export async function runDigests(options: {
       }
     }
 
-    // Every due window that gets stored this pass is reported in `sent` —
-    // the kind ran, whether or not it was worth his attention. `screenOnly`
-    // is the narrower count, of those that reached only the stored row (and
-    // so the screen) and never the inbox, because `rendered.hadContent` was
-    // false. A window can be in BOTH: `sent` says the pass processed it,
+    // Every due window that gets stored this pass is reported here — the
+    // kind ran, whether or not it was worth his attention. `screenOnly` is
+    // the narrower count, of those that reached only the stored row (and so
+    // the screen) and never the inbox, because `rendered.hadContent` was
+    // false. A window can be in BOTH: `produced` says the pass processed it,
     // `screenOnly` says what it was worth.
-    sent.push({ kind, digestId: stored.digestId });
+    produced.push({ kind, digestId: stored.digestId });
     if (!rendered.hadContent) screenOnly += 1;
   }
 
-  return { sent, screenOnly, errored: null };
+  return { produced, screenOnly, errored: null };
 }
 
 const EMAIL_SUBJECT: Readonly<Record<DigestKind, string>> = Object.freeze({

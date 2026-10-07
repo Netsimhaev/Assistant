@@ -112,4 +112,42 @@ describe('logErrored', () => {
       errorSpy.mockRestore();
     }
   });
+
+  /**
+   * Fix round 1, item 2 — the most serious gap this round found: nothing
+   * printed a stale-charter failure inside the digest, so an installation
+   * with the schedule on and an unparseable charter failed on every pass,
+   * forever, in total silence. Follows this repo's own precedent for a bare
+   * `*Error` assertion (`scheduler-conducts.test.ts:441`,
+   * `expect(pass.scanError).toBeTruthy()`), one layer down: the exact prefix
+   * matters here because `digest` also carries `produced`/`screenOnly`,
+   * which must stay out of the error text.
+   */
+  it('names a digest that failed to load its charter', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      logErrored({
+        ...cleanResult(),
+        digest: { produced: [], screenOnly: 0, errored: 'charter stored under an older schema' },
+      });
+      const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
+      expect(errored).toContain('digest failed: charter stored under an older schema');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  /** `digest: null` (the schedule is off) has nothing to report. */
+  it('prints nothing for a digest that did not run', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      logErrored({ ...cleanResult(), digest: null });
+      expect(logSpy).not.toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
 });

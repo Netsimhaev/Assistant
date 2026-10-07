@@ -663,16 +663,18 @@ export interface SchedulerPassResult {
   /**
    * Null when `digest_settings.schedule` is `'off'` — the same "switch, not
    * fault" shape `scan`/`conduct`/`whatsappDoor` already carry. `null` is not
-   * `{ sent: [], screenOnly: 0, errored: null }`: "the digest loop did not
-   * run" and "it ran and found no window due" are different facts about an
-   * installation, and only the first is a statement about how it is
+   * `{ produced: [], screenOnly: 0, errored: null }`: "the digest loop did
+   * not run" and "it ran and found no window due" are different facts about
+   * an installation, and only the first is a statement about how it is
    * configured — `conduct`'s own docblock draws the identical line.
    *
-   * Run LAST, after `evaluateAutonomy` — see `digest-run.ts`'s own docblock
-   * for the two independent reasons: it must report on a period that has
-   * actually closed by the time it looks, and the expired-approval exception
-   * in `digest-facts.ts` only matches rows `tick()` has already swept this
-   * very pass.
+   * Run LAST, after `evaluateAutonomy` — see `digest-run.ts`'s own header
+   * comment for what the dead-last position actually buys (point-in-time
+   * correctness for `waiting.*`, not window-scoped completeness — same-pass
+   * window-scoped counting is structurally impossible regardless of
+   * ordering) and for why the expired-approval exception in
+   * `digest-facts.ts` only requires running after `tick()`, a weaker
+   * condition the dead-last position happens to also satisfy.
    */
   digest: DigestRunResult | null;
 }
