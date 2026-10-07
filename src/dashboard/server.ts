@@ -37,7 +37,13 @@ import { readForgetCommand } from '../governance/forget-command.js';
 import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
 import { recordCorrection } from '../governance/corrections.js';
 import { listAutonomousActions } from './autonomous-actions.js';
-import { probeActiveCharter } from '../charter/store.js';
+import { probeActiveCharter, loadActiveCharter } from '../charter/store.js';
+import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
+import { recentDigests } from '../orchestrator/digest-store.js';
+import { collectDigestFacts } from '../orchestrator/digest-facts.js';
+import { renderDigest } from '../orchestrator/digest-render.js';
+import { scheduledHourFor } from '../orchestrator/digest-window.js';
+import { renderDigestScreen } from './digest-view.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { listGrants } from '../governance/oauth-grants.js';
@@ -603,6 +609,164 @@ async function handleConnections(res: ServerResponse, businessId: string, sessio
       csrf: issueCsrfToken(session.sessionId),
     }),
   );
+}
+
+/**
+ * The most recent occurrence of `hour` (local to `timeZone`) at or before
+ * `now`, truncated to the top of that hour.
+ *
+ * Used only for the digest screen's LIVE preview window, and deliberately
+ * NOT `digest-window.ts`'s own (unexported) `lastScheduledMoment`: that
+ * helper refuses to find anything before the wanted hour has struck TODAY,
+ * which is correct for a window that gets stored and compared against the
+ * last one, but wrong here — a preview asked for at 05:00 against an 08:00
+ * daily hour should still show "yesterday 08:00 to now", not nothing, since
+ * nothing this function returns is ever written down or merged with a prior
+ * window. `Intl`, not UTC-offset arithmetic, for the same reason
+ * `digest-window.ts` already gives: the offset at a past moment is exactly
+ * what daylight saving makes unsafe to assume.
+ */
+function lastHourBoundary(hour: number, timeZone: string, now: Date): Date {
+  const fmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone, hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  for (let back = 0; back <= 24 * 8; back += 1) {
+    const candidate = new Date(now.getTime() - back * 60 * 60 * 1000);
+    const parts = new Map(fmt.formatToParts(candidate).map((p) => [p.type, p.value]));
+    if (Number(parts.get('hour') ?? '0') === hour) {
+      const minute = Number(parts.get('minute') ?? '0');
+      const second = Number(parts.get('second') ?? '0');
+      const subSecondMs = candidate.getTime() % 1000;
+      return new Date(candidate.getTime() - minute * 60_000 - second * 1000 - subSecondMs);
+    }
+  }
+  // Unreachable in practice (24*8 hours spans more than one local day under
+  // every real zone/DST combination), but a window of `now`..`now` is a
+  // harmless empty preview rather than a thrown error over a screen nobody
+  // can act on anyway.
+  return now;
+}
+
+/** `DD/MM HH:MM`, local to `timeZone` — the live window's own start label. */
+function formatWindowStart(at: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat('he-IL', {
+    timeZone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(at);
+}
+
+/**
+ * "מה קרה" — the stored digest history, a live preview, and the
+ * schedule/channel settings form.
+ *
+ * **The live preview needs the charter's time zone and money ceiling, so it
+ * reads the charter via `loadActiveCharter` — never `probeActiveCharter`.**
+ * `probeActiveCharter`'s own docblock (`charter/store.ts`) reserves it for
+ * exactly three callers: the install path, the readiness report, and the
+ * connections screen. Widening that list quietly undoes the control it sits
+ * beside. A charter this code cannot parse is the same "no policy to run
+ * against" state every other production caller (`runDigests` among them,
+ * `digest-run.ts`) already fails loudly on, and this screen is an ordinary
+ * caller, not one of the three exceptions — an unreadable or absent charter
+ * reaches the route-level catch and renders the generic 500, exactly as
+ * `/instruct` already does.
+ *
+ * The live window always previews the DAILY shape — "today so far" — no
+ * matter what the owner's actual schedule is set to (spec §4: the preview
+ * exists precisely so he can see one before committing to a schedule at
+ * all, including while it is `'off'`).
+ */
+async function handleDigestGet(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  error?: string,
+): Promise<void> {
+  const settings = await loadDigestSettings({ businessId });
+  const stored = await recentDigests({ businessId });
+
+  const active = await loadActiveCharter(businessId);
+  if (active === null) {
+    throw new Error(`no active charter for business ${businessId}`);
+  }
+  const timeZone = active.charter.identity.timezone;
+  const ceilings = {
+    monthlyMinor: active.bundle.ceilings.monthlyMinor,
+    currency: active.bundle.ceilings.currency,
+  };
+
+  const now = new Date();
+  const start = lastHourBoundary(scheduledHourFor(settings, 'daily'), timeZone, now);
+  const window = { kind: 'daily' as const, start, end: now, windowsCovered: 1 };
+  const rendered = renderDigest(await collectDigestFacts(window, ceilings, { businessId }));
+  const windowLabel = `${formatWindowStart(start, timeZone)} – עכשיו`;
+
+  sendHtml(
+    res,
+    200,
+    renderDigestScreen({
+      settings,
+      stored,
+      live: { body: rendered.body, windowLabel },
+      csrf: issueCsrfToken(session.sessionId),
+      ...(error !== undefined ? { error } : {}),
+    }),
+  );
+}
+
+/**
+ * The owner's own choices: schedule and which channels to use.
+ *
+ * An out-of-range hour/day is refused by the database CHECK constraints
+ * (migration 040) — `setDigestSettings` throws, and that throw is the real
+ * enforcement, not a TypeScript range check here that could drift from it.
+ * The `<select>` elements this screen renders only ever offer in-range
+ * values, so the catch below is for a tampered or hand-built request, not
+ * the normal path.
+ */
+const DigestSettingsForm = z.object({
+  schedule: DigestSchedule,
+  dailyHour: z.coerce.number().int(),
+  weeklyDay: z.coerce.number().int(),
+  weeklyHour: z.coerce.number().int(),
+});
+
+async function handleDigestSettingsPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const parsed = DigestSettingsForm.safeParse({
+    schedule: form.get('schedule'),
+    dailyHour: form.get('dailyHour'),
+    weeklyDay: form.get('weeklyDay'),
+    weeklyHour: form.get('weeklyHour'),
+  });
+
+  if (!parsed.success) {
+    return handleDigestGet(res, businessId, session, 'יש לבחור ערכים תקינים בכל שדות התדריך.');
+  }
+
+  const toEmail = form.get('toEmail') === 'on';
+  const toWhatsApp = form.get('toWhatsApp') === 'on';
+
+  try {
+    await setDigestSettings({ ...parsed.data, toEmail, toWhatsApp }, session.username, { businessId });
+  } catch {
+    return handleDigestGet(
+      res,
+      businessId,
+      session,
+      'השעה או היום שנבחרו אינם בטווח התקין — יש לבחור שעה בין 00 ל-23 ויום בין ראשון לשבת.',
+    );
+  }
+
+  redirect(res, '/digest');
 }
 
 /**
@@ -2207,6 +2371,9 @@ async function route(
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
   if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
+  if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, businessId, session);
+  if (method === 'POST' && pathname === '/digest/settings')
+    return handleDigestSettingsPost(req, res, businessId, session);
   if (method === 'GET' && pathname === '/conversation') return handleConversation(res, businessId, session);
 
   if (method === 'GET' && pathname === '/autonomy') return handleAutonomyGet(res, businessId, session);
