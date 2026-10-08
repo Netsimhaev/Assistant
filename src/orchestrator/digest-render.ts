@@ -14,8 +14,17 @@ const KIND_LABEL: Readonly<Record<DigestFacts['window']['kind'], string>> = Obje
   weekly: 'תדריך שבועי',
 });
 
-function day(at: Date): string {
-  return new Intl.DateTimeFormat('he-IL', { day: '2-digit', month: '2-digit' }).format(at);
+/**
+ * **Always formatted in the CHARTER's zone — `timeZone` has no default.**
+ * `window.start`/`end` were computed in that zone by `digest-window.ts`; a
+ * caller that formats them in some other zone (the process's default, on a
+ * container or VPS that is not the charter's own) prints a header that can
+ * disagree with the stored row's own boundaries and with the period the
+ * owner actually lived through. Measured: the same instant renders `07.10`
+ * under `Asia/Jerusalem` and `06.10` under `UTC`.
+ */
+function day(at: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat('he-IL', { day: '2-digit', month: '2-digit', timeZone }).format(at);
 }
 
 /**
@@ -28,6 +37,9 @@ function safe(value: string): string {
   return stripBidiControls(value);
 }
 
+/** Used for §3.4 (`permissionChanges`), which the database never caps — so
+ * the hidden count really is "how many more than `MAX_NAMED_EXCEPTIONS`",
+ * computed from what was fetched because what was fetched is everything. */
 function namedList(items: readonly DigestException[]): string[] {
   const shown = items.slice(0, MAX_NAMED_EXCEPTIONS);
   const lines = shown.map((e) => `· ${safe(e.subject)} — ${safe(e.reason)}`);
@@ -36,15 +48,35 @@ function namedList(items: readonly DigestException[]): string[] {
   return lines;
 }
 
+/**
+ * §3.3's own list. Unlike `namedList` above, `items` arrives ALREADY capped
+ * and fairly interleaved across sources by `interleaveFairly`
+ * (`digest-facts.ts`) — so this never slices again, and `hiddenCount` is the
+ * exact, pre-measured figure `collectDigestFacts` computed from each
+ * source's real `count(*) OVER ()`, never `items.length` minus a constant.
+ */
+function namedExceptionsList(items: readonly DigestException[], hiddenCount: number): string[] {
+  const lines = items.map((e) => `· ${safe(e.subject)} — ${safe(e.reason)}`);
+  if (hiddenCount > 0) lines.push(`· ועוד ${hiddenCount} שלא נמנו כאן.`);
+  return lines;
+}
+
 export function renderDigest(facts: DigestFacts): RenderedDigest {
-  const { window: w, waiting, done, exceptions, permissionChanges, cost } = facts;
+  const { window: w, waiting, done, exceptions, permissionChanges, cost, timeZone } = facts;
   const lines: string[] = [];
 
-  lines.push(`${KIND_LABEL[w.kind]} · ${day(w.start)}–${day(w.end)}`);
+  lines.push(`${KIND_LABEL[w.kind]} · ${day(w.start, timeZone)}–${day(w.end, timeZone)}`);
 
   // Spec §5: a merged window admits the gap instead of rewriting history.
+  //
+  // **`windowsCovered - 1`, not `windowsCovered`.** `windowsCovered`
+  // (`digest-window.ts`) counts every scheduled window this digest absorbs,
+  // INCLUDING the one now going out — so a single missed day reports
+  // `windowsCovered === 2`, and the sentence must say "1 time missed", not
+  // "2 times". `windowsCovered` is never less than 1 (`dueWindow`'s own
+  // `Math.max(1, ...)`), so this is never negative.
   if (w.windowsCovered > 1) {
-    lines.push(`(לא יצא תדריך ${w.windowsCovered} פעמים, וזה מכסה את כל התקופה.)`);
+    lines.push(`(לא יצא תדריך ${w.windowsCovered - 1} פעמים, וזה מכסה את כל התקופה.)`);
   }
 
   // §3.1 — leads, because it is the only part that will not happen without him.
@@ -68,7 +100,7 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
 
   // §3.3 — named, with the reason.
   if (exceptions.length > 0) {
-    lines.push('', 'מה לא עבר חלק:', ...namedList(exceptions));
+    lines.push('', 'מה לא עבר חלק:', ...namedExceptionsList(exceptions, facts.exceptionsHiddenCount));
   }
 
   // §3.4 — the block that stops a promotion being discovered from the result.
@@ -91,8 +123,19 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
     );
   }
 
+  // `cost.windowMinor > 0` is included so a window whose only event cost
+  // money is never reported as "nothing happened" while a non-zero cost line
+  // renders directly above that sentence — the contradiction this fixes.
+  // `cost.rolling30Minor` is deliberately NOT part of this: it is a 30-day
+  // rolling figure that can be non-zero in an otherwise-empty window just
+  // because spend from an earlier window is still inside the 30 days, which
+  // says nothing about whether THIS window had content.
   const hadContent =
-    waitingTotal > 0 || doneTotal > 0 || exceptions.length > 0 || permissionChanges.length > 0;
+    waitingTotal > 0 ||
+    doneTotal > 0 ||
+    exceptions.length > 0 ||
+    permissionChanges.length > 0 ||
+    cost.windowMinor > 0;
 
   // Spec §2 decision 3: an empty day is SAID. The screen still gets it so the
   // record stays continuous; `hadContent` is what keeps it out of his inbox.

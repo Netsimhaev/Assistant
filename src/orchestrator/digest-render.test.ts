@@ -10,9 +10,11 @@ function facts(over: Partial<DigestFacts> = {}): DigestFacts {
       end: new Date('2026-10-07T08:00:00+03:00'),
       windowsCovered: 1,
     },
+    timeZone: 'Asia/Jerusalem',
     waiting: { approvals: 0, openQuestions: 0, deferred: 0 },
     done: { jobsCompleted: 0, messagesSent: 0, documentsRead: 0, memoriesWritten: 0 },
     exceptions: [],
+    exceptionsHiddenCount: 0,
     permissionChanges: [],
     cost: { windowMinor: 0, rolling30Minor: 0, ceilingMinor: 50000, currency: 'ILS' },
     ...over,
@@ -36,6 +38,29 @@ describe('renderDigest', () => {
     const out = renderDigest(facts());
     expect(out.body).toContain('06');
     expect(out.body).toContain('07');
+  });
+
+  /**
+   * Fix round 2, item 1: the header must be formatted in the CHARTER's zone
+   * (`facts.timeZone`), never the process's default. `2026-10-07T01:00:00
+   * +03:00` is `2026-10-06T22:00:00Z` — 01:00 on the 7th in `Asia/Jerusalem`
+   * but still the 6th in UTC — a genuine calendar-date disagreement, not
+   * merely a different hour. Checked on the header line alone (the body's
+   * first line) so no other section can coincidentally supply either digit.
+   */
+  it('states the period in the charter zone, never the process zone', () => {
+    const out = renderDigest(facts({
+      window: {
+        kind: 'daily',
+        start: new Date('2026-10-05T01:00:00+03:00'),
+        end: new Date('2026-10-06T22:00:00Z'), // = 2026-10-07T01:00:00+03:00
+        windowsCovered: 1,
+      },
+      timeZone: 'Asia/Jerusalem',
+    }));
+    const header = out.body.split('\n')[0] ?? '';
+    expect(header).toContain('07.10');
+    expect(header).not.toContain('06.10');
   });
 
   /**
@@ -84,24 +109,32 @@ describe('renderDigest', () => {
   });
 
   /**
-   * Spec §9: capped at 20 with "+N", never truncated silently.
-   *
-   * NOTE: asserts `'ועוד 3'` rather than the lone digit `'3'`. With 23 items
-   * capped at 20, the hidden count is 3 — but item index 3 is itself shown
-   * as `משימה 3`, so a bare `toContain('3')` is satisfied by that shown item
-   * regardless of whether the "+N" line exists at all. Verified: with the
-   * `hidden > 0` branch deleted from the implementation, the brief's original
-   * `toContain('3')` assertion still passed. This is the one other deviation
-   * from the brief documented in the task report.
+   * Fix round 2, item 4: `exceptions` arrives from `collectDigestFacts`
+   * ALREADY capped and interleaved, so the renderer must list it verbatim
+   * and print `exceptionsHiddenCount` exactly as given — never re-slice at
+   * 20 and never derive "hidden" from `items.length`. Simulated here with
+   * exactly `MAX_NAMED_EXCEPTIONS` (20) items (so a stray re-slice would be
+   * invisible) and a hidden count that does NOT match `23 - 20`, which is
+   * exactly the shape a capped-at-21-per-source fetch used to produce.
    */
-  it('caps the named list and says how many it did not list', () => {
-    const many = Array.from({ length: 23 }, (_, i) => ({
+  it('lists exactly what it is given and states the hidden count exactly as given', () => {
+    const twenty = Array.from({ length: 20 }, (_, i) => ({
       subject: `משימה ${i}`, reason: 'נכשלה.',
     }));
-    const out = renderDigest(facts({ exceptions: many }));
+    const out = renderDigest(facts({ exceptions: twenty, exceptionsHiddenCount: 61 }));
     expect(out.body).toContain('משימה 0');
-    expect(out.body).not.toContain('משימה 22');
-    expect(out.body).toContain('ועוד 3');
+    expect(out.body).toContain('משימה 19');
+    expect(out.body).not.toContain('משימה 20');
+    expect(out.body).toContain('ועוד 61');
+  });
+
+  /** No "+N" line at all when nothing is hidden. */
+  it('names every item with no "+N" line when nothing is hidden', () => {
+    const out = renderDigest(facts({
+      exceptions: [{ subject: 'משימה אחת', reason: 'נכשלה.' }],
+      exceptionsHiddenCount: 0,
+    }));
+    expect(out.body).not.toContain('ועוד');
   });
 
   /** Spec §3.4 — the block that exists so a promotion is never discovered from the result. */
@@ -113,8 +146,14 @@ describe('renderDigest', () => {
     expect(out.hadContent).toBe(true);
   });
 
-  /** Spec §5: a merged window admits the gap rather than rewriting history. */
-  it('admits the gap when it covers more than one scheduled window', () => {
+  /**
+   * Fix round 2, item 3: `windowsCovered` counts every scheduled window this
+   * digest absorbs INCLUDING the one now going out (`digest-window.ts`'s own
+   * `dueWindow`) — so three covered means TWO missed, not three. The old
+   * sentence printed `windowsCovered` itself and overstated every gap by
+   * exactly one.
+   */
+  it('reports the number of windows MISSED, not the number this digest covers', () => {
     const out = renderDigest(facts({
       window: {
         kind: 'daily',
@@ -123,7 +162,8 @@ describe('renderDigest', () => {
         windowsCovered: 3,
       },
     }));
-    expect(out.body).toContain('3');
+    expect(out.body).toContain('לא יצא תדריך 2 פעמים');
+    expect(out.body).not.toContain('תדריך 3 פעמים');
   });
 
   /**
@@ -170,5 +210,32 @@ describe('renderDigest', () => {
     // Action-class names are identifiers (internal '.'/'_' separator) and may
     // appear; bare prose words may not.
     expect(out.body.replace(/[a-z]+(?:[._][a-z]+)+/g, '')).not.toMatch(/[A-Za-z]/);
+  });
+
+  /**
+   * Fix round 2, item 8: `hadContent` used to ignore cost entirely, so a
+   * window whose only event cost money rendered the cost line immediately
+   * above "לא קרה כלום בתקופה הזו" — and was withheld from email/WhatsApp
+   * even though something plainly happened.
+   */
+  it('treats a window whose only event cost money as having content', () => {
+    const out = renderDigest(facts({
+      cost: { windowMinor: 500, rolling30Minor: 500, ceilingMinor: 50000, currency: 'ILS' },
+    }));
+    expect(out.hadContent).toBe(true);
+    expect(out.body).not.toContain('לא קרה כלום');
+  });
+
+  /**
+   * The flip side of the item 8 fix: a non-zero ROLLING 30-day figure alone
+   * (spend from an earlier window still inside the 30-day lookback) says
+   * nothing about whether THIS window had content, and must not flip
+   * `hadContent` on its own.
+   */
+  it('does not treat a non-zero rolling 30-day figure alone as this window having content', () => {
+    const out = renderDigest(facts({
+      cost: { windowMinor: 0, rolling30Minor: 500, ceilingMinor: 50000, currency: 'ILS' },
+    }));
+    expect(out.hadContent).toBe(false);
   });
 });
