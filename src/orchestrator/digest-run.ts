@@ -135,6 +135,7 @@ export async function runDigests(options: {
   const ceilings = {
     monthlyMinor: active.bundle.ceilings.monthlyMinor,
     currency: active.bundle.ceilings.currency,
+    timeZone,
   };
 
   const produced: { kind: DigestKind; digestId: string }[] = [];

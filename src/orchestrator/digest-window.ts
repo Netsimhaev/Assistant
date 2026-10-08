@@ -12,8 +12,10 @@ export interface DigestWindow {
   windowsCovered: number;
 }
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-const WEEK_MS = 7 * DAY_MS;
+/** Exported so a caller needing the same span (the dashboard's weekly live
+ * preview, fix round 2 item 6) does not restate the magic number. */
+export const DAY_MS = 24 * 60 * 60 * 1000;
+export const WEEK_MS = 7 * DAY_MS;
 
 /** Which kinds each schedule includes — a positive table, never a negation. */
 const KINDS_FOR_SCHEDULE: Readonly<Record<DigestSettings['schedule'], readonly DigestKind[]>> =
