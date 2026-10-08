@@ -41,26 +41,45 @@ describe('renderDigest', () => {
   });
 
   /**
-   * Fix round 2, item 1: the header must be formatted in the CHARTER's zone
-   * (`facts.timeZone`), never the process's default. `2026-10-07T01:00:00
-   * +03:00` is `2026-10-06T22:00:00Z` — 01:00 on the 7th in `Asia/Jerusalem`
-   * but still the 6th in UTC — a genuine calendar-date disagreement, not
-   * merely a different hour. Checked on the header line alone (the body's
-   * first line) so no other section can coincidentally supply either digit.
+   * Fix round 3, item 1: the previous version of this test compared the
+   * charter zone (`Asia/Jerusalem`) against a hardcoded expectation that
+   * happened to match this repo's own process zone on every development
+   * machine so far — so dropping `timeZone` from `day()`'s `Intl` options
+   * entirely left this test green (13/13) unless the process was explicitly
+   * launched with `TZ=UTC`, which `vitest.config.ts` never sets. A guard
+   * that only fires under a flag nobody sets is not a guard.
+   *
+   * This version renders the SAME instant through two different SUPPLIED
+   * zones and asserts they disagree with each other, each with the exact
+   * date `Intl` actually produces for that zone — a mutation that ignores
+   * the `timeZone` parameter and reads whatever the process zone happens to
+   * be would make both renders IDENTICAL (same process, same instant, same
+   * ignored parameter), so this cannot pass by accident regardless of what
+   * zone the machine running it is in. `Pacific/Kiritimati` (UTC+14) is
+   * chosen because no real server's default zone sits there, so there is no
+   * plausible process zone under which the mutation would coincidentally
+   * reproduce both assertions.
+   *
+   * `2026-10-06T12:00:00Z` is 02:00 on the 7th in `Pacific/Kiritimati`
+   * (UTC+14) but still 15:00 on the 6th in `Asia/Jerusalem` (UTC+3, DST in
+   * effect in early October) — a genuine calendar-date disagreement on the
+   * SAME instant, driven only by which zone string is passed in.
    */
-  it('states the period in the charter zone, never the process zone', () => {
-    const out = renderDigest(facts({
-      window: {
-        kind: 'daily',
-        start: new Date('2026-10-05T01:00:00+03:00'),
-        end: new Date('2026-10-06T22:00:00Z'), // = 2026-10-07T01:00:00+03:00
-        windowsCovered: 1,
-      },
-      timeZone: 'Asia/Jerusalem',
-    }));
-    const header = out.body.split('\n')[0] ?? '';
-    expect(header).toContain('07.10');
-    expect(header).not.toContain('06.10');
+  it('renders different calendar dates for the same instant under two different supplied zones', () => {
+    const window = {
+      kind: 'daily' as const,
+      start: new Date('2026-10-05T12:00:00Z'),
+      end: new Date('2026-10-06T12:00:00Z'),
+      windowsCovered: 1,
+    };
+    const kiritimatiHeader =
+      renderDigest(facts({ window, timeZone: 'Pacific/Kiritimati' })).body.split('\n')[0] ?? '';
+    const jerusalemHeader =
+      renderDigest(facts({ window, timeZone: 'Asia/Jerusalem' })).body.split('\n')[0] ?? '';
+
+    expect(kiritimatiHeader).toContain('07.10');
+    expect(jerusalemHeader).toContain('06.10');
+    expect(kiritimatiHeader).not.toBe(jerusalemHeader);
   });
 
   /**
