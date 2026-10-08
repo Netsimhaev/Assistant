@@ -3143,7 +3143,7 @@ describe('digest screen', () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain('תדריך כזה טרם נשלח');
-    expect(body).toContain('לא נשלח עדיין שום תדריך');
+    expect(body).toContain('לא נוצר עדיין שום תדריך');
     expect(body).toContain('name="dailyHour"');
   });
 
@@ -3256,7 +3256,7 @@ describe('digest screen', () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain('טרם נחתם תקנון עסקי');
-    expect(body).toContain('לא נשלח עדיין שום תדריך');
+    expect(body).toContain('לא נוצר עדיין שום תדריך');
     expect(body).toContain('name="dailyHour"');
   });
 
@@ -3284,7 +3284,7 @@ describe('digest screen', () => {
     const body = await res.text();
     expect(body).toContain('אינו קריא כרגע');
     expect(body).not.toContain('טרם נחתם תקנון עסקי');
-    expect(body).toContain('לא נשלח עדיין שום תדריך');
+    expect(body).toContain('לא נוצר עדיין שום תדריך');
     expect(body).toContain('name="dailyHour"');
   });
 

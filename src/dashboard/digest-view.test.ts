@@ -28,7 +28,7 @@ describe('renderDigestScreen', () => {
     expect(html).toContain('טרם נשלח');
   });
 
-  it('says plainly when no digest has ever been sent', () => {
+  it('says plainly when no digest has ever been created', () => {
     const html = renderDigestScreen({
       settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },
       stored: [],
@@ -36,7 +36,7 @@ describe('renderDigestScreen', () => {
       timeZone: TZ,
       csrf: 'c',
     });
-    expect(html).toContain('לא נשלח עדיין');
+    expect(html).toContain('לא נוצר עדיין');
   });
 
   /** Spec §6: an unreachable channel is shown, not hidden. */
@@ -214,7 +214,7 @@ describe('renderDigestScreen', () => {
       csrf: 'c',
     });
     expect(html).toContain('טרם נחתם תקנון עסקי');
-    expect(html).toContain('לא נשלח עדיין שום תדריך');
+    expect(html).toContain('לא נוצר עדיין שום תדריך');
     expect(html).toContain('name="dailyHour"');
   });
 

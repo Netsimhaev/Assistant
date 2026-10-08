@@ -222,7 +222,7 @@ export function renderDigestScreen(options: {
 
   const storedList =
     stored.length === 0
-      ? '<p class="muted">לא נשלח עדיין שום תדריך.</p>'
+      ? '<p class="muted">לא נוצר עדיין שום תדריך.</p>'
       : stored.map((d) => digestRow(d, timeZone)).join('\n');
 
   const updatedNote =
