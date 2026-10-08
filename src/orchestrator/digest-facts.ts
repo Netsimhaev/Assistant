@@ -248,12 +248,26 @@ export async function collectDigestFacts(
 
   // ---- §3.3 exceptions: window-scoped and NAMED, with the Hebrew reason.
   //
-  // Two sources outside this block exist in spec §3.3 but are not built:
-  // an untranscribed recording, and a downed bridge. Both are zero-exposure
-  // today for the same reason — the WhatsApp bridge is wired nowhere yet
-  // (CLAUDE.md, "ערוץ הוואטסאפ... בנוי במלואו ואינו פעיל באף התקנה") — so
-  // there is no producer to read from. Naming the gap here is so the next
-  // reader does not take the three sources below as §3.3 complete.
+  // Spec §3.3 names SIX sources — משימה שנכשלה, מסמך שנדחה, אישור שפג,
+  // הקלטה שלא תומללה, הוראה שסורבה, גשר שנפל — and the three queries below
+  // build exactly the first three. The other THREE are missing, not two,
+  // and they are not the same kind of missing:
+  //   - הקלטה שלא תומללה (an untranscribed recording) and גשר שנפל (a
+  //     downed bridge) are zero-exposure today because there is no
+  //     producer to read from at all — the WhatsApp bridge is wired
+  //     nowhere yet (CLAUDE.md, "ערוץ הוואטסאפ... בנוי במלואו ואינו פעיל
+  //     באף התקנה").
+  //   - הוראה שסורבה (an instruction the owner's refusal closed) has a
+  //     real producer and a real decision behind its absence: fix round 2,
+  //     item 5 deliberately chose NOT to surface a refusal anywhere in the
+  //     digest — not as a success (excluded from `jobsCompleted` above)
+  //     and not as a named exception here, because "the owner said no" is
+  //     an outcome, not a fault, and inventing a seventh block for it is a
+  //     product decision this module does not make. See that fix's own
+  //     comment on `jobsCompleted`.
+  // Naming the gap here is so the next reader does not take the three
+  // sources below as §3.3 complete, and does not mistake the third
+  // omission for an oversight.
   //
   // **Each query carries `count(*) OVER ()` alongside its `LIMIT` — an EXACT
   // total of matching rows, not an estimate from the length of the capped
