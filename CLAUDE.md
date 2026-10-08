@@ -8,7 +8,7 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 2281 מבחנים (2280 עוברים, 1 מדולג)
+npm test          # vitest run — 2364 מבחנים (2363 עוברים, 1 מדולג)
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_URL
