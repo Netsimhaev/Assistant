@@ -40,10 +40,11 @@ import { listAutonomousActions } from './autonomous-actions.js';
 import { probeActiveCharter, loadActiveCharter } from '../charter/store.js';
 import type { ActiveCharter } from '../charter/store.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
+import type { DigestSettings } from '../governance/digest-settings.js';
 import { recentDigests } from '../orchestrator/digest-store.js';
 import { collectDigestFacts } from '../orchestrator/digest-facts.js';
 import { renderDigest } from '../orchestrator/digest-render.js';
-import { lastHourInstant, scheduledHourFor } from '../orchestrator/digest-window.js';
+import { lastHourInstant, scheduledHourFor, WEEK_MS } from '../orchestrator/digest-window.js';
 import type { DigestKind } from '../orchestrator/digest-window.js';
 import { renderDigestScreen } from './digest-view.js';
 import type { CharterConnection } from '../domain/connection.js';
@@ -631,6 +632,33 @@ function previewKind(schedule: DigestSchedule): DigestKind {
   return schedule === 'weekly' ? 'weekly' : 'daily';
 }
 
+/**
+ * The live preview's own window start.
+ *
+ * **Fix round 2, item 6.** `lastHourInstant` answers "the nearest past
+ * occurrence of this hour on the clock" — it has no notion of weekday, so
+ * for a WEEKLY schedule it still only looks back up to 24 hours (the hour
+ * recurs daily) and never the 7 days a weekly digest actually spans. The
+ * title (`renderDigest`'s own `KIND_LABEL`) already says "תדריך שבועי" via
+ * `previewKind`, so a daily-sized span under that title claimed to cover a
+ * week while showing less than a day of it. Widening by a further
+ * `WEEK_MS` for the weekly case gives a preview whose span actually matches
+ * its own title, the same way the daily case's span already matches "תדריך
+ * יומי".
+ *
+ * Exported so a unit test can pin the exact span without re-deriving `now`
+ * at a different instant than the one the request handler captured.
+ */
+export function liveWindowStart(
+  settings: DigestSettings,
+  kind: DigestKind,
+  now: Date,
+  timeZone: string,
+): Date {
+  const boundary = lastHourInstant(scheduledHourFor(settings, kind), timeZone, now) ?? now;
+  return kind === 'weekly' ? new Date(boundary.getTime() - WEEK_MS) : boundary;
+}
+
 const CHARTER_NONE_TEXT = 'טרם נחתם תקנון עסקי — תצוגה חיה תופיע לאחר החתימה.';
 const CHARTER_UNREADABLE_TEXT = 'התקנון החתום אינו קריא כרגע, ולכן אי אפשר להציג תצוגה חיה.';
 
@@ -685,15 +713,25 @@ async function handleDigestGet(
   }
 
   let live: { body: string; windowLabel: string } | null = null;
+  // The zone the HISTORY table (`renderDigestScreen`'s stored-row dates) is
+  // shown in. When a charter is actually readable this is its own zone —
+  // the same one the live preview and `runDigests` itself use. When it is
+  // not (fresh install, or a schema the code cannot parse — `liveUnavailable`
+  // already says which), there is no charter zone to read at all; 'UTC' is
+  // an explicit, documented stand-in for that edge case, not the silent
+  // per-session inheritance `shortDate` (`digest-view.ts`) used to fall
+  // into — the two are never the same bug twice.
+  let timeZone = 'UTC';
   if (active !== null) {
-    const timeZone = active.charter.identity.timezone;
+    timeZone = active.charter.identity.timezone;
     const ceilings = {
       monthlyMinor: active.bundle.ceilings.monthlyMinor,
       currency: active.bundle.ceilings.currency,
+      timeZone,
     };
     const kind = previewKind(settings.schedule);
     const now = new Date();
-    const start = lastHourInstant(scheduledHourFor(settings, kind), timeZone, now) ?? now;
+    const start = liveWindowStart(settings, kind, now, timeZone);
     const window = { kind, start, end: now, windowsCovered: 1 };
     const rendered = renderDigest(await collectDigestFacts(window, ceilings, { businessId }));
     live = { body: rendered.body, windowLabel: `${formatWindowStart(start, timeZone)} – עכשיו` };
@@ -706,6 +744,7 @@ async function handleDigestGet(
       settings,
       stored,
       live,
+      timeZone,
       ...(liveUnavailable !== undefined ? { liveUnavailable } : {}),
       csrf: issueCsrfToken(session.sessionId),
       ...(error !== undefined ? { error } : {}),

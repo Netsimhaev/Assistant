@@ -36,12 +36,13 @@ import {
   recordQuestion,
   saveInstruction,
 } from '../governance/instructions.js';
-import { loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
+import { DIGEST_DEFAULTS, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
 import {
   assertBindableHost,
   createServer,
+  liveWindowStart,
   reasonForSupersededJob,
   renderInstructionOutcome,
 } from './server.js';
@@ -3308,6 +3309,30 @@ describe('digest screen', () => {
     const body = await res.text();
     expect(body).toContain('תדריך שבועי');
     expect(body).not.toContain('תדריך יומי');
+  });
+
+  /**
+   * Fix round 2, item 6: a weekly-only owner's live preview was titled
+   * "תדריך שבועי" (the test above) but spanned at most ~24 hours —
+   * `lastHourInstant` has no notion of weekday, so it only ever looks back
+   * up to a day for an hour that recurs daily. `liveWindowStart` widens the
+   * weekly case by a further `WEEK_MS`; the daily case must be UNCHANGED
+   * (no widening at all), since its title already matches its span.
+   */
+  it('spans a full week for the weekly preview, and is unchanged for the daily one', () => {
+    const now = new Date('2026-10-07T09:00:00+03:00');
+    const settings = { ...DIGEST_DEFAULTS, schedule: 'both' as const, dailyHour: 8, weeklyHour: 9 };
+    const tz = 'Asia/Jerusalem';
+
+    const dailyStart = liveWindowStart(settings, 'daily', now, tz);
+    const plainBoundary = new Date('2026-10-07T08:00:00+03:00'); // lastHourInstant(8, ...)
+    expect(dailyStart.getTime()).toBe(plainBoundary.getTime());
+
+    const weeklyStart = liveWindowStart(settings, 'weekly', now, tz);
+    const weeklyBoundary = new Date('2026-10-07T09:00:00+03:00'); // lastHourInstant(9, ...) === now itself
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    expect(weeklyStart.getTime()).toBe(weeklyBoundary.getTime() - sevenDaysMs);
+    expect(now.getTime() - weeklyStart.getTime()).toBe(sevenDaysMs);
   });
 
   /**

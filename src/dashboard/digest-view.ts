@@ -84,17 +84,34 @@ function scheduleOptions(selected: DigestSchedule): string {
 }
 
 /**
- * A Postgres `timestamptz::text` value (`YYYY-MM-DD HH:MM:SS+ZZ`), shortened
- * to `DD/MM HH:MM` by plain string slicing — never by parsing into a `Date`
- * and reformatting, which would need a time zone this view is not given and
- * was never meant to resolve on its own. If the shape does not match, the raw
- * string is shown rather than guessed at.
+ * A Postgres `timestamptz::text` value (`YYYY-MM-DD HH:MM:SS+ZZ`), formatted
+ * as `DD/MM HH:MM` in `timeZone` — the charter's own zone, passed in by the
+ * caller.
+ *
+ * **Fix round 2, item 1.** This used to shorten the string by plain slicing,
+ * on the claimed grounds that it "avoids needing a zone this view is not
+ * given". That claim was false: Postgres renders `timestamptz::text` in the
+ * DATABASE SESSION's zone, so slicing it silently inherited whatever zone
+ * the server happened to be running under — on a default-UTC container, the
+ * stored-digest card's window label and the digest body's own header
+ * (`renderDigest`, now correctly formatted in the charter's zone — item 1,
+ * first site) could show two different zones inside the SAME card. The text
+ * already carries its own correct UTC offset (that is what
+ * `timestamptz::text` means), so `new Date(...)` recovers the exact instant
+ * regardless of which zone produced the string; only the FORMATTING step
+ * needs `timeZone`, via `Intl` exactly like `digest-render.ts`'s `day`.
+ *
+ * If the shape does not parse as a date at all, the raw string is shown
+ * rather than guessed at.
  */
-function shortDate(pgTimestamp: string): string {
-  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/.exec(pgTimestamp);
-  if (!m) return pgTimestamp;
-  const [, , month, day, hour, minute] = m;
-  return `${day}/${month} ${hour}:${minute}`;
+function shortDate(pgTimestamp: string, timeZone: string): string {
+  const at = new Date(pgTimestamp);
+  if (Number.isNaN(at.getTime())) return pgTimestamp;
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(at);
+  const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? '';
+  return `${get('day')}/${get('month')} ${get('hour')}:${get('minute')}`;
 }
 
 /** One channel's row, or nothing at all when the owner never enabled it. */
@@ -108,8 +125,16 @@ function channelLine(label: string, state: ChannelState | null): string {
  * `escLabel`, never `esc` alone: it can carry a document name chosen by
  * whoever sent the file, and a bidi override inside it would change what the
  * owner reads without touching the bytes that were actually acted on.
+ *
+ * **Fix round 2, item 2: "נוצר ב-", never "נשלח ב-".** `createdAt` is the
+ * moment the row was WRITTEN, not a delivery — and both channels are off by
+ * default (spec §4), so in the default configuration every stored row used
+ * to claim "sent at…" while nothing left the machine. Delivery is spoken
+ * about only by the per-channel lines below this header, each labelled by
+ * its own `ChannelState` — never by this header line, and never implied by
+ * the header line's mere presence.
  */
-function digestRow(d: StoredDigest): string {
+function digestRow(d: StoredDigest, timeZone: string): string {
   const kindLabel = d.kind === 'daily' ? 'יומי' : 'שבועי';
   const channels = [channelLine('מייל', d.emailState), channelLine('וואטסאפ', d.whatsappState)]
     .filter((line) => line !== '')
@@ -118,8 +143,8 @@ function digestRow(d: StoredDigest): string {
   return `
     <article class="card">
       <div class="muted">
-        ${esc(kindLabel)} · ${esc(shortDate(d.windowStart))}–${esc(shortDate(d.windowEnd))}
-        · נשלח ב-${esc(shortDate(d.createdAt))}
+        ${esc(kindLabel)} · ${esc(shortDate(d.windowStart, timeZone))}–${esc(shortDate(d.windowEnd, timeZone))}
+        · נוצר ב-${esc(shortDate(d.createdAt, timeZone))}
       </div>
       <pre>${escLabel(d.body)}</pre>
       ${channels}
@@ -180,22 +205,30 @@ export function renderDigestScreen(options: {
   settings: DigestSettings;
   stored: readonly StoredDigest[];
   live: { body: string; windowLabel: string } | null;
+  /**
+   * The charter's own zone, for every date this screen shows — the stored
+   * history's window/creation dates and the "last updated" note alike.
+   * Required, with no default: a caller that has no charter to read (and so
+   * no zone) must say so explicitly (`'UTC'`, documented at the call site),
+   * never let this function fall back to one on its own.
+   */
+  timeZone: string;
   liveUnavailable?: string;
   csrf: string;
   error?: string;
 }): string {
-  const { settings, stored, live, csrf } = options;
+  const { settings, stored, live, csrf, timeZone } = options;
   const errorBlock = options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
 
   const storedList =
     stored.length === 0
       ? '<p class="muted">לא נשלח עדיין שום תדריך.</p>'
-      : stored.map(digestRow).join('\n');
+      : stored.map((d) => digestRow(d, timeZone)).join('\n');
 
   const updatedNote =
     settings.updatedAt === ''
       ? ''
-      : `<p class="muted">עודכן לאחרונה ב-${esc(shortDate(settings.updatedAt))} על ידי ${esc(settings.updatedBy)}.</p>`;
+      : `<p class="muted">עודכן לאחרונה ב-${esc(shortDate(settings.updatedAt, timeZone))} על ידי ${esc(settings.updatedBy)}.</p>`;
 
   return `<!doctype html>
 <html lang="he" dir="rtl">

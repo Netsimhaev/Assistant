@@ -4,6 +4,10 @@ import { renderDigestScreen } from './digest-view.js';
 
 const live = { body: 'תדריך יומי · היום עד כה', windowLabel: '07/10 08:00 – עכשיו' };
 
+/** Chosen because it disagrees with UTC on the calendar date for an early
+ * morning instant — see the dedicated zone test below. */
+const TZ = 'Asia/Jerusalem';
+
 describe('renderDigestScreen', () => {
   /**
    * Spec §4: the live view exists so the owner can see what a digest looks
@@ -17,6 +21,7 @@ describe('renderDigestScreen', () => {
       settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },
       stored: [],
       live,
+      timeZone: TZ,
       csrf: 'c',
     });
     expect(html).toContain('עד כה');
@@ -28,6 +33,7 @@ describe('renderDigestScreen', () => {
       settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },
       stored: [],
       live,
+      timeZone: TZ,
       csrf: 'c',
     });
     expect(html).toContain('לא נשלח עדיין');
@@ -51,6 +57,7 @@ describe('renderDigestScreen', () => {
         },
       ],
       live,
+      timeZone: TZ,
       csrf: 'c',
     });
     expect(html).toContain('לא נשלח');
@@ -80,10 +87,46 @@ describe('renderDigestScreen', () => {
         },
       ],
       live,
+      timeZone: TZ,
       csrf: 'c',
     });
     expect(html).not.toContain('נשלח בהצלחה');
     expect(html).not.toContain('לא היה מחובר');
+  });
+
+  /**
+   * Fix round 2, item 2: a stored row must be labelled by when it was
+   * CREATED, never by whether it was sent — `createdAt` is the write
+   * moment, not a delivery, and both channels are off by default, so the
+   * default configuration used to claim "sent at…" on a digest that went
+   * nowhere. Delivery is spoken about only by the per-channel lines
+   * (asserted separately above); the header line itself must never imply
+   * it. `'נשלח ב-'` (with the trailing hyphen, matching the header's exact
+   * shape) is distinctive from `'לא נשלח'` on the channel-state line two
+   * tests up, which never has that trailing `'ב-'`.
+   */
+  it('labels a stored card by when it was created, never by whether it was sent', () => {
+    const html = renderDigestScreen({
+      settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },
+      stored: [
+        {
+          digestId: 'DG-created',
+          kind: 'daily',
+          windowStart: '2026-10-06 08:00:00+03',
+          windowEnd: '2026-10-07 08:00:00+03',
+          body: 'גוף',
+          hadContent: true,
+          createdAt: '2026-10-07 08:00:01+03',
+          emailState: null,
+          whatsappState: null,
+        },
+      ],
+      live,
+      timeZone: TZ,
+      csrf: 'c',
+    });
+    expect(html).toContain('נוצר ב-');
+    expect(html).not.toContain('נשלח ב-');
   });
 
   /** A stored body can carry a document name a stranger chose. */
@@ -104,11 +147,54 @@ describe('renderDigestScreen', () => {
         },
       ],
       live,
+      timeZone: TZ,
       csrf: 'c',
     });
     expect(html).not.toContain('<script>');
     expect(html).not.toContain('‮');
     expect(html).toContain('גרר');
+  });
+
+  /**
+   * Fix round 2, item 1 (second site): `shortDate` used to shorten a
+   * Postgres `timestamptz::text` by plain string slicing, which the old
+   * docblock claimed "avoids needing a zone this view is not given" — false,
+   * because slicing shows whatever zone the DATABASE SESSION happens to
+   * render in, silently. This reproduces exactly that server configuration:
+   * the row's text carries a `+00` offset, as a UTC-session server would
+   * print `timestamptz::text` — and `2026-10-06 22:00:00+00` is
+   * `2026-10-06T22:00:00Z`, which is 01:00 on the 7th in `Asia/Jerusalem`
+   * (UTC+3, no DST in October) — a different CALENDAR DATE, not just a
+   * different hour.
+   *
+   * Old slicing reads the digits straight off the string regardless of
+   * `timeZone` and would show '06/10 22:00'; formatted correctly through the
+   * zone this test supplies, it must show '07/10 01:00'. A reverted fix
+   * fails this assertion specifically, which a same-offset fixture (where
+   * slicing and formatting coincidentally agree) cannot do.
+   */
+  it('formats a stored date in the charter zone it is given, not the one embedded in the text', () => {
+    const html = renderDigestScreen({
+      settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },
+      stored: [
+        {
+          digestId: 'DG-tz',
+          kind: 'daily',
+          windowStart: '2026-10-05 22:00:00+00',
+          windowEnd: '2026-10-06 22:00:00+00',
+          body: 'גוף',
+          hadContent: true,
+          createdAt: '2026-10-06 22:00:00+00',
+          emailState: null,
+          whatsappState: null,
+        },
+      ],
+      live,
+      timeZone: TZ,
+      csrf: 'c',
+    });
+    expect(html).toContain('07/10 01:00');
+    expect(html).not.toContain('06/10 22:00');
   });
 
   /**
@@ -124,6 +210,7 @@ describe('renderDigestScreen', () => {
       stored: [],
       live: null,
       liveUnavailable: 'טרם נחתם תקנון עסקי — תצוגה חיה תופיע לאחר החתימה.',
+      timeZone: 'UTC',
       csrf: 'c',
     });
     expect(html).toContain('טרם נחתם תקנון עסקי');
@@ -137,6 +224,7 @@ describe('renderDigestScreen', () => {
       stored: [],
       live: null,
       liveUnavailable: 'טרם נחתם תקנון עסקי — תצוגה חיה תופיע לאחר החתימה.',
+      timeZone: 'UTC',
       csrf: 'c',
     });
     const unreadable = renderDigestScreen({
@@ -144,6 +232,7 @@ describe('renderDigestScreen', () => {
       stored: [],
       live: null,
       liveUnavailable: 'התקנון החתום אינו קריא כרגע, ולכן אי אפשר להציג תצוגה חיה.',
+      timeZone: 'UTC',
       csrf: 'c',
     });
     expect(unreadable).toContain('אינו קריא כרגע');
@@ -156,6 +245,7 @@ describe('renderDigestScreen', () => {
       settings: { ...DIGEST_DEFAULTS, updatedAt: '', updatedBy: '' },
       stored: [],
       live,
+      timeZone: TZ,
       csrf: 'tok-123',
     });
     expect(html).toContain('tok-123');
