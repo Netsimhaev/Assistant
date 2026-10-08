@@ -14,6 +14,17 @@ export interface DigestException {
 
 export interface DigestFacts {
   window: DigestWindow;
+  /**
+   * The charter's own IANA zone — never the process's. `window.start`/`end`
+   * are instants computed in this zone by `digest-window.ts`; the renderer
+   * must format them back through the SAME zone, or the header's stated
+   * period and the stored row's actual boundaries read as two different
+   * days on any process whose default zone (container, VPS) is not the
+   * charter's. No default here, on purpose: a caller that forgets to supply
+   * one gets a compile error, never a silent fallback to the process zone —
+   * the exact failure mode this field exists to close off.
+   */
+  timeZone: string;
   /** Point-in-time, NOT window-scoped — spec §3.1. */
   waiting: {
     approvals: number;
@@ -27,8 +38,22 @@ export interface DigestFacts {
     documentsRead: number;
     memoriesWritten: number;
   };
-  /** Window-scoped and NAMED — spec §3.3. */
+  /**
+   * Window-scoped and NAMED — spec §3.3. Already capped to
+   * `MAX_NAMED_EXCEPTIONS` and fairly interleaved across sources (every
+   * non-empty source is named at least once before any source is named a
+   * second time) — the renderer lists these verbatim, with no slicing of
+   * its own.
+   */
   exceptions: readonly DigestException[];
+  /**
+   * The EXACT number of matching exceptions beyond those named in
+   * `exceptions` — measured per source via `count(*) OVER ()` in the
+   * database, never estimated from how many rows were fetched. "ועוד N"
+   * states a measured number, because this feature's entire premise is
+   * that every number the owner reads was measured.
+   */
+  exceptionsHiddenCount: number;
   /** Window-scoped — spec §3.4. */
   permissionChanges: readonly DigestException[];
   /**
@@ -53,6 +78,47 @@ export const MAX_NAMED_EXCEPTIONS = 20;
 async function countOf(db: Queryable, sql: string, params: readonly unknown[]): Promise<number> {
   const { rows } = await db.query<{ n: string }>(sql, [...params]);
   return Number(rows[0]?.n ?? '0');
+}
+
+/**
+ * Interleaves several already-sorted, already-capped lists round-robin, so
+ * every non-empty source names at least one item before any source names a
+ * second — one failed job, one rejected document, one expired approval, in
+ * that order, before a second failed job. Without this rule a noisy source
+ * (dozens of failed jobs, the commonest terminal outcome while every action
+ * class sits at `draft_only`) fills all `cap` slots before a quieter source
+ * (one rejected document, one expired approval) ever gets named at all —
+ * exactly the one block spec §3.3 allows to be long, silently narrowed to one
+ * source.
+ *
+ * `totals[i]` is the EXACT count of matching rows for source `i`, which may
+ * exceed `lists[i].length` when that source was itself capped at the
+ * database — so the `hiddenCount` this returns is a measured number across
+ * every source, never an estimate from array lengths.
+ */
+function interleaveFairly(
+  lists: readonly (readonly DigestException[])[],
+  totals: readonly number[],
+  cap: number,
+): { named: DigestException[]; hiddenCount: number } {
+  const named: DigestException[] = [];
+  const cursors = lists.map(() => 0);
+  let advanced = true;
+  while (advanced && named.length < cap) {
+    advanced = false;
+    for (let i = 0; i < lists.length && named.length < cap; i += 1) {
+      const list = lists[i];
+      const cursor = cursors[i];
+      if (list === undefined || cursor === undefined) continue;
+      const item = list[cursor];
+      if (item === undefined) continue;
+      named.push(item);
+      cursors[i] = cursor + 1;
+      advanced = true;
+    }
+  }
+  const totalAll = totals.reduce((sum, n) => sum + n, 0);
+  return { named, hiddenCount: totalAll - named.length };
 }
 
 /**
@@ -81,15 +147,17 @@ function reasonInHebrew(rawReason: string | null): string {
 }
 
 /**
- * `ceilings` is passed IN, not loaded here. The money ceiling lives in the
- * signed charter (`CompiledCeilings.monthlyMinor`, domain/policy.ts:107-116) —
- * there is none in `src/config.ts`. Both callers already hold the bundle
- * because each needs the charter's time zone, so this is one field and no new
- * failure mode in a module that must stay read-only and throw-free.
+ * `ceilings` (now also carrying `timeZone`) is passed IN, not loaded here.
+ * The money ceiling lives in the signed charter
+ * (`CompiledCeilings.monthlyMinor`, domain/policy.ts:107-116) — there is none
+ * in `src/config.ts` — and the zone lives in `charter.identity.timezone`.
+ * Both callers already hold the whole bundle, so this is a field on an
+ * object they already build, not a new failure mode in a module that must
+ * stay read-only and throw-free.
  */
 export async function collectDigestFacts(
   window: DigestWindow,
-  ceilings: { monthlyMinor: number; currency: string },
+  ceilings: { monthlyMinor: number; currency: string; timeZone: string },
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<DigestFacts> {
   const businessId = options.businessId ?? config.businessId;
@@ -122,10 +190,26 @@ export async function collectDigestFacts(
   );
 
   // ---- §3.2 done: window-scoped counts, no names.
+  //
+  // **Excludes a job the owner REFUSED.** `resumeAfterDecision`
+  // (`orchestrator/resume.ts:61-69`) deliberately closes, rather than fails, a
+  // job whose approval was denied — its own comment: "a person said no. That
+  // is an outcome, not a fault." Counting that `closed` row here would report
+  // a refusal as a success, the one thing spec §1.1's split between counted
+  // successes and named non-successes must not do. The discriminator is the
+  // `job_steps` row that same function writes on the way to `closed`: `actor
+  // = 'human'` and `reason` beginning `denied:` (the literal template is
+  // `` `${approval.state}:${approvalId} by ${decidedBy}` ``, and `state` is
+  // `'denied'` on that path). No new owner-facing category is added for
+  // it — that is a product decision this module does not make — a refusal is
+  // simply not counted as a completion.
   const jobsCompleted = await countOf(
     db,
-    `SELECT count(*)::text AS n FROM jobs
-      WHERE business_id = $1 AND phase = 'closed' AND closed_at >= $2 AND closed_at < $3`,
+    `SELECT count(*)::text AS n FROM jobs j
+      WHERE j.business_id = $1 AND j.phase = 'closed' AND j.closed_at >= $2 AND j.closed_at < $3
+        AND NOT EXISTS (
+          SELECT 1 FROM job_steps s
+           WHERE s.job_id = j.job_id AND s.actor = 'human' AND s.reason LIKE 'denied:%')`,
     [businessId, start, end],
   );
   // Windowed on the STEP's own `completed_at` — fix round 1, item 4. Windowing
@@ -163,25 +247,49 @@ export async function collectDigestFacts(
   );
 
   // ---- §3.3 exceptions: window-scoped and NAMED, with the Hebrew reason.
-  const { rows: failedJobs } = await db.query<{ title: string | null; reason: string | null }>(
+  //
+  // Two sources outside this block exist in spec §3.3 but are not built:
+  // an untranscribed recording, and a downed bridge. Both are zero-exposure
+  // today for the same reason — the WhatsApp bridge is wired nowhere yet
+  // (CLAUDE.md, "ערוץ הוואטסאפ... בנוי במלואו ואינו פעיל באף התקנה") — so
+  // there is no producer to read from. Naming the gap here is so the next
+  // reader does not take the three sources below as §3.3 complete.
+  //
+  // **Each query carries `count(*) OVER ()` alongside its `LIMIT` — an EXACT
+  // total of matching rows, not an estimate from the length of the capped
+  // array.** The old code capped each query at `MAX_NAMED_EXCEPTIONS + 1` and
+  // computed "hidden" from the combined array's length — so eighty unnamed
+  // failures (capped to 21 fetched) were reported as "ועוד 1", off by
+  // exactly the gap between what was fetched and what truly matched. A
+  // window function is evaluated over all rows the WHERE clause matches,
+  // before the query's own `ORDER BY`/`LIMIT` trim the result set, so every
+  // returned row (including the last one kept by `LIMIT`) carries the real
+  // total — not merely the count of what was fetched.
+  const { rows: failedJobs } = await db.query<{
+    title: string | null; reason: string | null; total_count: string;
+  }>(
     `SELECT j.title, (
         SELECT s.reason FROM job_steps s
          WHERE s.job_id = j.job_id ORDER BY s.at DESC LIMIT 1
-      ) AS reason
+      ) AS reason,
+      count(*) OVER ()::text AS total_count
        FROM jobs j
       WHERE j.business_id = $1 AND j.phase = 'failed'
         AND j.closed_at >= $2 AND j.closed_at < $3
       ORDER BY j.closed_at DESC
-      LIMIT ${MAX_NAMED_EXCEPTIONS + 1}`,
+      LIMIT ${MAX_NAMED_EXCEPTIONS}`,
     [businessId, start, end],
   );
   // The column is `reason` — there is no `rejected_reason` (migration 012).
-  const { rows: rejectedDocs } = await db.query<{ original_name: string; reason: string | null }>(
-    `SELECT original_name, reason FROM documents
+  const { rows: rejectedDocs } = await db.query<{
+    original_name: string; reason: string | null; total_count: string;
+  }>(
+    `SELECT original_name, reason, count(*) OVER ()::text AS total_count
+       FROM documents
       WHERE business_id = $1 AND status = 'rejected'
         AND created_at >= $2 AND created_at < $3
       ORDER BY created_at DESC
-      LIMIT ${MAX_NAMED_EXCEPTIONS + 1}`,
+      LIMIT ${MAX_NAMED_EXCEPTIONS}`,
     [businessId, start, end],
   );
   // **Windowed on `expires_at`, never `decided_at` — fix round 1, item 1.**
@@ -199,26 +307,37 @@ export async function collectDigestFacts(
   // fuse ran out before `end` has already been swept to `'expired'`. A
   // reorder of the scheduler that runs the digest before (or without) that
   // sweep would reintroduce the same "matches nothing" failure one layer up.
-  const { rows: expiredApprovals } = await db.query<{ summary: string }>(
-    `SELECT summary FROM approval_requests
+  const { rows: expiredApprovals } = await db.query<{ summary: string; total_count: string }>(
+    `SELECT summary, count(*) OVER ()::text AS total_count
+       FROM approval_requests
       WHERE business_id = $1 AND state = 'expired'
         AND expires_at >= $2 AND expires_at < $3
       ORDER BY expires_at DESC
-      LIMIT ${MAX_NAMED_EXCEPTIONS + 1}`,
+      LIMIT ${MAX_NAMED_EXCEPTIONS}`,
     [businessId, start, end],
   );
 
-  const exceptions: DigestException[] = [
-    ...failedJobs.map((r) => ({ subject: r.title ?? FAILED_JOB_UNTITLED, reason: reasonInHebrew(r.reason) })),
-    ...rejectedDocs.map((r) => ({
-      subject: r.original_name,
-      reason: r.reason ?? REJECTED_DOCUMENT_GENERIC_TEXT,
-    })),
-    ...expiredApprovals.map((r) => ({
-      subject: r.summary,
-      reason: EXPIRED_APPROVAL_TEXT,
-    })),
-  ];
+  const totalOf = (rows: readonly { total_count: string }[]): number =>
+    rows.length === 0 ? 0 : Number(rows[0]?.total_count ?? '0');
+
+  const failedList: DigestException[] = failedJobs.map((r) => ({
+    subject: r.title ?? FAILED_JOB_UNTITLED,
+    reason: reasonInHebrew(r.reason),
+  }));
+  const rejectedList: DigestException[] = rejectedDocs.map((r) => ({
+    subject: r.original_name,
+    reason: r.reason ?? REJECTED_DOCUMENT_GENERIC_TEXT,
+  }));
+  const expiredList: DigestException[] = expiredApprovals.map((r) => ({
+    subject: r.summary,
+    reason: EXPIRED_APPROVAL_TEXT,
+  }));
+
+  const { named: exceptions, hiddenCount: exceptionsHiddenCount } = interleaveFairly(
+    [failedList, rejectedList, expiredList],
+    [totalOf(failedJobs), totalOf(rejectedDocs), totalOf(expiredApprovals)],
+    MAX_NAMED_EXCEPTIONS,
+  );
 
   // ---- §3.4 permission changes: window-scoped.
   const { rows: autonomyRows } = await db.query<{
@@ -261,9 +380,11 @@ export async function collectDigestFacts(
 
   return {
     window,
+    timeZone: ceilings.timeZone,
     waiting: { approvals, openQuestions, deferred },
     done: { jobsCompleted, messagesSent, documentsRead, memoriesWritten },
     exceptions,
+    exceptionsHiddenCount,
     permissionChanges,
     cost: {
       windowMinor,
