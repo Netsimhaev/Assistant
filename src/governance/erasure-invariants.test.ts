@@ -78,6 +78,26 @@ describe('what an erasure leaves behind', () => {
    * exist yet, seeded below for the same reason as the other twelve — see
    * `erasure-plan.ts`'s header for why it is the one migration-026 table that
    * needed wiring at all.
+   *
+   * **A fourteenth, also outside spec §5.1: `digests` (migration 040).**
+   * Seeded in its own block below (it carries no `job_id`, so it cannot ride
+   * along on the job's seeding the way every job-scoped store above does) —
+   * see `erasure-plan.ts`'s header for why it is discovered by content alone.
+   *
+   * **This "twelve, then thirteen, then fourteen" count is spec §5.1's own
+   * original content-store enumeration, growing as new content-bearing
+   * tables were added to it — it is a DIFFERENT number from "how many
+   * tables `countItems`/the executor each name today" (17; CLAUDE.md states
+   * that figure, because it is the one a reader can grep `erasure-plan.ts`
+   * and count directly). The two will not generally match: this file's
+   * count tracks a design document's own enumeration of content-bearing
+   * stores, while the 17 also includes tables scrubbed as a consequence of
+   * a kept-vs-erased JOB rather than discovered as a content store in their
+   * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
+   * once per table name regardless of how many `action`s `countItems` runs
+   * against it. Neither number is wrong; they answer different questions,
+   * and conflating them is exactly the inconsistency a prior round of this
+   * project's own documentation fell into.
    */
   it('leaves the probe in no text or JSON column of any table, anywhere', async () => {
     const bundle = await installCharter(buildCharter({ version: 'probe' }), { businessId: BUSINESS });
