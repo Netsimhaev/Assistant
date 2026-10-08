@@ -369,6 +369,46 @@ describe('buildErasurePlan', () => {
     expect(plan.digestIds).toEqual([digestId]);
   });
 
+  /**
+   * Fix round 2, item 11: the WINDOW-anchor arm of digest discovery
+   * (`erasure-plan.ts:875-882`) had no test at all — both digest tests above
+   * use a `contact` anchor. A wrong column there (`window_start` for
+   * `created_at`) or a wrong comparison (`>` for `>=`) would mean an owner
+   * erasing a date range silently keeps the digests that summarise it.
+   * Seeded with explicit `created_at` (the column the query actually filters
+   * on, per `erasure-plan.ts`'s own header note — never `window_start`/
+   * `window_end`) so this is a genuine probe of that column and that
+   * comparison, not an accident of insertion order. The decoy sits one
+   * second before `fromIso` — the edge a `>` vs `>=` mistake would flip.
+   */
+  it('discovers a digest by a window anchor on its created_at, with a decoy just outside the range', async () => {
+    await installCharter(buildCharter({ version: 'digest-window' }), { businessId: BUSINESS });
+    const insideId = `DG-${ulid()}`;
+    const outsideId = `DG-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content, created_at)
+       VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'תדריך יומי · הכל תקין', true, $3)`,
+      [insideId, BUSINESS, '2026-03-10T12:00:00Z'],
+    );
+    // One second before the window's lower bound — the exact edge a `>`
+    // mistake (instead of `>=`) would wrongly admit, and the exact edge a
+    // decoy at some unrelated far-away date would not test at all.
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content, created_at)
+       VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'תדריך יומי · הכל תקין', true, $3)`,
+      [outsideId, BUSINESS, '2026-03-10T11:59:59Z'],
+    );
+
+    const plan = await buildErasurePlan(
+      { kind: 'window', fromIso: '2026-03-10T12:00:00Z', toIso: '2026-03-11T12:00:00Z' },
+      { businessId: BUSINESS },
+    );
+
+    expect(plan.digestIds).toEqual([insideId]);
+    const digestItem = plan.items.find((i) => i.table === 'digests' && i.action === 'delete');
+    expect(digestItem).toEqual({ table: 'digests', action: 'delete', count: 1 });
+  });
+
   it('classifies items as delete or scrub correctly', async () => {
     const jobId = await jobAbout(RONIT, 'action-classification');
     await writeMemory(
