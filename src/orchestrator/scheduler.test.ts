@@ -9,6 +9,7 @@ import type { PolicyBundle } from '../domain/policy.js';
 import { Plan } from '../domain/plan.js';
 import { createJob, loadJob, transition } from './jobs.js';
 import { executeStep } from './execute.js';
+import { setDigestSettings } from '../governance/digest-settings.js';
 import { bindPlanToJob } from './plan-store.js';
 import { runDueJobs } from './run-due.js';
 import { schedulerPass, startScheduler, tick } from './scheduler.js';
@@ -404,5 +405,46 @@ describe('a delegation resumes in the same pass it is freed', () => {
 
     const finalParent = await loadJob(job.jobId, { businessId: BUSINESS });
     expect(finalParent?.phase).not.toBe('failed');
+  });
+});
+
+/**
+ * Fix round 1, item 1 — the most mechanical-looking gap, and still real:
+ * before this describe block, nothing anywhere read `pass.digest`. The
+ * reviewer proved it by hard-coding `digest: null` into `schedulerPass`'s
+ * return object — leaving the real `runDigests` call and its database write
+ * completely untouched — and all 23 existing tests still passed, because
+ * every one of them checks the stored row through `recentDigests` instead
+ * of the field `SchedulerPassResult` actually exposes.
+ */
+describe('the digest field on SchedulerPassResult', () => {
+  it('is null when the digest schedule is off', async () => {
+    await install();
+    const inert: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, 'TEST_CRED_'),
+      warnings: [],
+    };
+    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime: inert });
+    expect(pass.digest).toBeNull();
+  });
+
+  it('carries the produced window and no error when the schedule is on', async () => {
+    await install();
+    await setDigestSettings(
+      { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false },
+      'owner',
+      { businessId: BUSINESS },
+    );
+    const inert: Runtime = {
+      registry: new AdapterRegistry([]),
+      credentials: envCredentials({}, 'TEST_CRED_'),
+      warnings: [],
+    };
+    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime: inert });
+    expect(pass.digest).not.toBeNull();
+    expect(pass.digest?.produced).toHaveLength(1);
+    expect(pass.digest?.produced[0]?.kind).toBe('daily');
+    expect(pass.digest?.errored).toBeNull();
   });
 });

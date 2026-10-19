@@ -37,7 +37,16 @@ import { readForgetCommand } from '../governance/forget-command.js';
 import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
 import { recordCorrection } from '../governance/corrections.js';
 import { listAutonomousActions } from './autonomous-actions.js';
-import { probeActiveCharter } from '../charter/store.js';
+import { probeActiveCharter, loadActiveCharter } from '../charter/store.js';
+import type { ActiveCharter } from '../charter/store.js';
+import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
+import type { DigestSettings } from '../governance/digest-settings.js';
+import { recentDigests } from '../orchestrator/digest-store.js';
+import { collectDigestFacts } from '../orchestrator/digest-facts.js';
+import { renderDigest } from '../orchestrator/digest-render.js';
+import { lastHourInstant, scheduledHourFor, WEEK_MS } from '../orchestrator/digest-window.js';
+import type { DigestKind } from '../orchestrator/digest-window.js';
+import { renderDigestScreen } from './digest-view.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { listGrants } from '../governance/oauth-grants.js';
@@ -603,6 +612,221 @@ async function handleConnections(res: ServerResponse, businessId: string, sessio
       csrf: issueCsrfToken(session.sessionId),
     }),
   );
+}
+
+/** `DD/MM HH:MM`, local to `timeZone` — the live window's own start label. */
+function formatWindowStart(at: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat('he-IL', {
+    timeZone, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(at);
+}
+
+/** Which kind the live preview shows: the owner's own schedule, where it says one unambiguously. */
+function previewKind(schedule: DigestSchedule): DigestKind {
+  // 'weekly' is the only schedule that does NOT include a daily digest at
+  // all (fix round 1, item 2) — previewing 'daily' for it would title the
+  // preview "תדריך יומי" for an owner who will never receive one. Every
+  // other value ('daily', 'both', 'off') includes the daily shape, or (for
+  // 'off') is shown as an illustrative example of it — `renderLiveSection`
+  // (`digest-view.ts`) adds that caveat for 'off' specifically.
+  return schedule === 'weekly' ? 'weekly' : 'daily';
+}
+
+/**
+ * The live preview's own window start.
+ *
+ * **Fix round 2, item 6.** `lastHourInstant` answers "the nearest past
+ * occurrence of this hour on the clock" — it has no notion of weekday, so
+ * for a WEEKLY schedule it still only looks back up to 24 hours (the hour
+ * recurs daily) and never the 7 days a weekly digest actually spans. The
+ * title (`renderDigest`'s own `KIND_LABEL`) already says "תדריך שבועי" via
+ * `previewKind`, so a daily-sized span under that title claimed to cover a
+ * week while showing less than a day of it. Widening by a further
+ * `WEEK_MS` for the weekly case gives a preview whose span actually matches
+ * its own title, the same way the daily case's span already matches "תדריך
+ * יומי".
+ *
+ * Exported so a unit test can pin the exact span without re-deriving `now`
+ * at a different instant than the one the request handler captured.
+ */
+export function liveWindowStart(
+  settings: DigestSettings,
+  kind: DigestKind,
+  now: Date,
+  timeZone: string,
+): Date {
+  const boundary = lastHourInstant(scheduledHourFor(settings, kind), timeZone, now) ?? now;
+  return kind === 'weekly' ? new Date(boundary.getTime() - WEEK_MS) : boundary;
+}
+
+const CHARTER_NONE_TEXT = 'טרם נחתם תקנון עסקי — תצוגה חיה תופיע לאחר החתימה.';
+const CHARTER_UNREADABLE_TEXT = 'התקנון החתום אינו קריא כרגע, ולכן אי אפשר להציג תצוגה חיה.';
+
+/**
+ * "מה קרה" — the stored digest history, a live preview, and the
+ * schedule/channel settings form.
+ *
+ * **The live preview needs the charter's time zone and money ceiling, so it
+ * reads the charter via `loadActiveCharter` — never `probeActiveCharter`.**
+ * `probeActiveCharter`'s own docblock (`charter/store.ts`) reserves it for
+ * exactly three callers: the install path, the readiness report, and the
+ * connections screen. Widening that list quietly undoes the control it sits
+ * beside — so the fix for a fresh install (no charter yet) is to catch
+ * `loadActiveCharter` LOCALLY, which widens nothing, rather than to route
+ * around the one control that already exists for this exact question.
+ *
+ * **Fix round 1, item 1: `active === null` is "no charter signed yet" — an
+ * ordinary state on a brand-new installation — never an error, and a throw
+ * from `loadActiveCharter` is "the signed charter cannot be read" — a schema
+ * mismatch. These are different facts and get different Hebrew sentences**
+ * (`CHARTER_NONE_TEXT` / `CHARTER_UNREADABLE_TEXT`), exactly the way
+ * `handleConnections` already treats "none" and "unreadable" as different
+ * `charterStatus` values rather than one. Neither case 500s: `recentDigests`
+ * and `loadDigestSettings` never needed the charter at all, so the history
+ * and the settings form render in both cases, and only the live-preview
+ * section is replaced with the one explanatory line.
+ *
+ * The live window previews whichever kind the owner's OWN schedule actually
+ * includes — `previewKind` — not unconditionally 'daily' (fix round 1, item
+ * 2): a weekly-only owner previewing a daily digest is a mislabelled
+ * preview, and this screen exists so he can tell what he was told from what
+ * he might be, which a wrong heading spends.
+ */
+async function handleDigestGet(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  error?: string,
+): Promise<void> {
+  const settings = await loadDigestSettings({ businessId });
+  const stored = await recentDigests({ businessId });
+
+  let active: ActiveCharter | null;
+  let liveUnavailable: string | undefined;
+  try {
+    active = await loadActiveCharter(businessId);
+    if (active === null) liveUnavailable = CHARTER_NONE_TEXT;
+  } catch (err) {
+    active = null;
+    liveUnavailable = CHARTER_UNREADABLE_TEXT;
+    console.error('digest screen: could not read the active charter:', err instanceof Error ? err.message : err);
+  }
+
+  let live: { body: string; windowLabel: string } | null = null;
+  // The zone the HISTORY table (`renderDigestScreen`'s stored-row dates) is
+  // shown in. When a charter is actually readable this is its own zone —
+  // the same one the live preview and `runDigests` itself use. When it is
+  // not (fresh install, or a schema the code cannot parse — `liveUnavailable`
+  // already says which), there is no charter zone to read at all; 'UTC' is
+  // an explicit, documented stand-in for that edge case, not the silent
+  // per-session inheritance `shortDate` (`digest-view.ts`) used to fall
+  // into — the two are never the same bug twice.
+  let timeZone = 'UTC';
+  if (active !== null) {
+    timeZone = active.charter.identity.timezone;
+    const ceilings = {
+      monthlyMinor: active.bundle.ceilings.monthlyMinor,
+      currency: active.bundle.ceilings.currency,
+      timeZone,
+    };
+    const kind = previewKind(settings.schedule);
+    const now = new Date();
+    const start = liveWindowStart(settings, kind, now, timeZone);
+    const window = { kind, start, end: now, windowsCovered: 1 };
+    const rendered = renderDigest(await collectDigestFacts(window, ceilings, { businessId }));
+    live = { body: rendered.body, windowLabel: `${formatWindowStart(start, timeZone)} – עכשיו` };
+  }
+
+  sendHtml(
+    res,
+    200,
+    renderDigestScreen({
+      settings,
+      stored,
+      live,
+      timeZone,
+      ...(liveUnavailable !== undefined ? { liveUnavailable } : {}),
+      csrf: issueCsrfToken(session.sessionId),
+      ...(error !== undefined ? { error } : {}),
+    }),
+  );
+}
+
+/**
+ * The owner's own choices: schedule and which channels to use.
+ *
+ * An out-of-range hour/day is refused by the database CHECK constraints
+ * (migration 040) — `setDigestSettings` throws, and that throw is the real
+ * enforcement, not a TypeScript range check here that could drift from it.
+ * The `<select>` elements this screen renders only ever offer in-range
+ * values, so the catch below is for a tampered or hand-built request, not
+ * the normal path.
+ *
+ * **Fix round 1, item 4: a MISSING field must fail, not coerce to `0`.**
+ * `form.get(...)` returns `string | null`, and `z.coerce.number()` happily
+ * parses `null` into `0` (`Number(null) === 0`) — so a hand-built POST that
+ * simply omits `dailyHour` was silently accepted as midnight rather than
+ * refused. `z.string().min(1)` rejects `null` and `''` by construction
+ * (wrong type / too short) before the value ever reaches `Number(...)`,
+ * which is this codebase's own rule stated in those words elsewhere —
+ * "a value we could not read is not a permitting value" (`readAmountMinor`,
+ * an unresolved time zone, an unknown calendar action) — applied to a form
+ * field reaching the same door. `.pipe(z.number().int())`, not
+ * `z.coerce.number().int()` directly, because zod's `number()` already
+ * treats `NaN` (what `Number('abc')` produces) as its own invalid type
+ * rather than a number that merely fails `.int()` — this chain refuses a
+ * non-numeric string for the same reason it refuses a missing one.
+ */
+const RequiredHourField = z
+  .string()
+  .min(1)
+  .transform((v) => Number(v))
+  .pipe(z.number().int());
+
+const DigestSettingsForm = z.object({
+  schedule: DigestSchedule,
+  dailyHour: RequiredHourField,
+  weeklyDay: RequiredHourField,
+  weeklyHour: RequiredHourField,
+});
+
+async function handleDigestSettingsPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const parsed = DigestSettingsForm.safeParse({
+    schedule: form.get('schedule'),
+    dailyHour: form.get('dailyHour'),
+    weeklyDay: form.get('weeklyDay'),
+    weeklyHour: form.get('weeklyHour'),
+  });
+
+  if (!parsed.success) {
+    return handleDigestGet(res, businessId, session, 'יש לבחור ערכים תקינים בכל שדות התדריך.');
+  }
+
+  const toEmail = form.get('toEmail') === 'on';
+  const toWhatsApp = form.get('toWhatsApp') === 'on';
+
+  try {
+    await setDigestSettings({ ...parsed.data, toEmail, toWhatsApp }, session.username, { businessId });
+  } catch {
+    return handleDigestGet(
+      res,
+      businessId,
+      session,
+      'השעה או היום שנבחרו אינם בטווח התקין — יש לבחור שעה בין 00 ל-23 ויום בין ראשון לשבת.',
+    );
+  }
+
+  redirect(res, '/digest');
 }
 
 /**
@@ -1271,6 +1495,7 @@ function planFingerprint(plan: ErasurePlan): string {
     jobIds: [...plan.jobIds].sort(),
     documentIds: [...plan.documentIds].sort(),
     memoryIds: [...plan.memoryIds].sort(),
+    digestIds: [...plan.digestIds].sort(),
     filePaths: [...plan.filePaths].sort(),
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
@@ -2207,6 +2432,9 @@ async function route(
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
   if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
+  if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, businessId, session);
+  if (method === 'POST' && pathname === '/digest/settings')
+    return handleDigestSettingsPost(req, res, businessId, session);
   if (method === 'GET' && pathname === '/conversation') return handleConversation(res, businessId, session);
 
   if (method === 'GET' && pathname === '/autonomy') return handleAutonomyGet(res, businessId, session);

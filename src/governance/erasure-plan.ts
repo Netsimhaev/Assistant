@@ -120,6 +120,72 @@
  * by neither arm and survived a contact erasure permanently. See the
  * `whatsapp_messages` discovery query beside `approval_requests`'s, below.
  * See `WHATSAPP_MESSAGES_ERASED_PREDICATE`'s own docblock for the predicate.
+ *
+ * **Migration 040 added `digests`, and it belongs here for the reason the
+ * feature's own spec names: a digest NAMES failures** — a rejected
+ * document's `original_name`, a stalled job's `title`, an expired approval's
+ * `summary` (`digest-facts.ts`'s `collectDigestFacts`) — so a document name,
+ * a recipient or a contact's name can land in `digests.body` even though
+ * nothing else about the digest mentions any of them. Once stored it
+ * survives, and "forget about Ronit" has to reach it.
+ *
+ * **Discovered by its own content alone — there is no job-membership half to
+ * this one.** Every other table above that is not itself a discovery source
+ * is reached because some OTHER query already put its owning job into
+ * `jobIds`. `digests` has no `job_id` column at all (migration 040:
+ * `digest_id`, `business_id`, `kind`, `window_start`, `window_end`, `body`,
+ * `had_content`, `created_at`, `email_state`, `whatsapp_state` — nothing
+ * else) — it is a periodic rollup across many jobs, not a record that
+ * belongs to one. So a contact-anchored erasure can only ever find one by
+ * searching `body` itself, exactly the way the contact search already
+ * searches `jobs.title`; see the `digests` discovery query below.
+ *
+ * **The window anchor: `created_at`, not `window_start`/`window_end` — the
+ * case against this, written down rather than decided silently.** A digest
+ * carries two candidate time columns: `created_at` (when this ROW was
+ * written) and `window_start`/`window_end` (the period its body
+ * SUMMARISES). Every window-anchored predicate elsewhere in this module —
+ * `jobs`, the orphan arm of `approval_requests`, the orphan/content arm of
+ * `whatsapp_messages` — matches the row's own `created_at`, never the time
+ * of the real-world event the row describes, so `created_at` is the
+ * convention already kept everywhere else in this module.
+ *
+ * `created_at` is only an honest stand-in for "content about this period"
+ * because it actually tracks `window_end` closely in this deployment:
+ * `dueWindow` (`orchestrator/digest-window.ts`) fixes `end` to the
+ * SCHEDULED moment the window closes, and `digest-run.ts` stores the row in
+ * the very same scheduler pass that computes it ("stored before delivery")
+ * — so `created_at` lands within seconds of `window_end`, never days after
+ * it. If a digest could be generated long after the period it describes,
+ * an owner erasing "last week" by `created_at` could miss a digest whose
+ * `window_start`/`window_end` fall entirely inside that week but whose
+ * `created_at` landed later — exactly the "content survives because
+ * nothing discovers it" shape this module exists to prevent, and worth
+ * re-checking if the generation delay ever stops being near-zero.
+ *
+ * Matching on `window_start`/`window_end` instead was considered and
+ * rejected — not because the concern above is wrong, but because it trades
+ * one honesty problem for a worse one. A weekly digest's window spans seven
+ * days, so ANY anchor overlapping even one of them would delete the whole
+ * week's summary — six days of content the owner never asked to erase — and
+ * this module has no existing convention for what "overlap" should even
+ * mean here (any intersection? full containment?), because no other row in
+ * it carries a RANGE rather than a single instant. Over-deletion is treated
+ * as seriously as under-deletion everywhere else in this module (see
+ * `AGENT_ENVELOPES_ERASED_PREDICATE`'s own docblock: "a `child_job_id` arm
+ * was tried here first and reverted" for exactly that reason) — inventing an
+ * untested overlap rule for the one table that would need it, instead of
+ * reusing the convention every other table here already proves out, is the
+ * wrong place to take that risk. `created_at` is the choice that stays
+ * consistent with the rest of the module and is honest about the one
+ * deployment this project actually ships.
+ *
+ * No document-anchor discovery is offered for `digests`, and that is the
+ * same honesty `approval_requests` already states for its own orphan card:
+ * the table carries no document reference of any kind — not even an
+ * indirect one through a job — so a predicate pretending a document anchor
+ * could reach a digest would be exactly the lie that anchor's own docblock
+ * already refuses to write.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -167,6 +233,7 @@ export interface ErasurePlan {
   jobIds: string[];
   documentIds: string[];
   memoryIds: string[];
+  digestIds: string[];
   filePaths: string[];
   items: ErasureItem[];
   excluded: KeptExclusion[];
@@ -522,6 +589,21 @@ export const AGENT_ENVELOPES_ERASED_PREDICATE = `business_id = $1
 export const VERIFICATION_VERDICTS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
 
 /**
+ * The `digests` rows an erasure destroys, as ONE predicate.
+ *
+ * `digest_id = ANY ($2)` alone, the same id-list shape as
+ * `VERIFICATION_VERDICTS_ERASED_PREDICATE` — no second arm, because a
+ * digest carries no job id and no document id to branch on at all.
+ * Everything `digestIds` can ever hold comes from the discovery queries in
+ * `buildErasurePlan` below (contact: `body ILIKE`; window: `created_at` —
+ * see this module's header for why `created_at` and not
+ * `window_start`/`window_end`).
+ *
+ * Parameters, in both places: `$1` businessId, `$2` digestIds.
+ */
+export const DIGESTS_ERASED_PREDICATE = `business_id = $1 AND digest_id = ANY ($2)`;
+
+/**
  * The `jobs` rows an erasure scrubs, and what gets emptied on them — as
  * shared constants for the same reason `APPROVAL_REQUESTS_SCRUB_SET` is one
  * (fix round 1, item 2). `awaiting_envelope_id` is migration 028's plain
@@ -625,6 +707,7 @@ export async function buildErasurePlan(
 
   const jobIds = new Set<string>();
   const documentIds = new Set<string>();
+  const digestIds = new Set<string>();
 
   if (anchor.kind === 'contact') {
     const pattern = `%${likeLiteral(anchor.identifier)}%`;
@@ -765,6 +848,20 @@ export async function buildErasurePlan(
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
+
+    // `digests` carries no job id at all — see this module's header for why
+    // it is discovered by its own `body` alone, with no job-membership half
+    // the way `boss_instructions`/`autonomy_marks`/`agent_envelopes`/
+    // `verification_verdicts` above also have. Without this query a contact
+    // named only in a digest's rendered summary — a failed job's title, a
+    // rejected document's name, an expired approval's recipient — is never
+    // placed anywhere this erasure looks, and the name survives permanently.
+    for (const digestId of await idsFrom(
+      db,
+      `SELECT digest_id FROM digests WHERE business_id = $1 AND body ILIKE $2 ${LIKE_ESCAPE}`,
+      [businessId, pattern],
+      'digest_id',
+    )) digestIds.add(digestId);
   }
 
   if (anchor.kind === 'window') {
@@ -774,6 +871,15 @@ export async function buildErasurePlan(
       [businessId, anchor.fromIso, anchor.toIso],
       'job_id',
     )) jobIds.add(jobId);
+
+    // `created_at`, not `window_start`/`window_end` — see this module's
+    // header for the full reasoning and the case against.
+    for (const digestId of await idsFrom(
+      db,
+      `SELECT digest_id FROM digests WHERE business_id = $1 AND created_at >= $2 AND created_at < $3`,
+      [businessId, anchor.fromIso, anchor.toIso],
+      'digest_id',
+    )) digestIds.add(digestId);
   }
 
   if (anchor.kind === 'document') {
@@ -972,13 +1078,15 @@ export async function buildErasurePlan(
     }
   }
 
-  const items = await countItems(db, businessId, anchor, jobList, documentList, memoryIds);
+  const digestList = [...digestIds];
+  const items = await countItems(db, businessId, anchor, jobList, documentList, memoryIds, digestList);
 
   return {
     anchor,
     jobIds: jobList,
     documentIds: documentList,
     memoryIds,
+    digestIds: digestList,
     filePaths,
     items,
     excluded,
@@ -1000,6 +1108,7 @@ async function countItems(
   jobIds: string[],
   documentIds: string[],
   memoryIds: string[],
+  digestIds: string[],
 ): Promise<ErasureItem[]> {
   const one = async (
     table: string,
@@ -1018,6 +1127,17 @@ async function countItems(
       `SELECT count(*)::text AS n FROM memories
         WHERE business_id = $1 AND memory_id = ANY ($2)`,
       [businessId, memoryIds],
+    ),
+    // See this module's header for why `digests` is discovered by its own
+    // content alone, with no job to carry it in by. Placed beside `memories`
+    // rather than in the job-scoped group below it: like memories, nothing
+    // about its deletion depends on the document cascade order, and its ids
+    // come from `digestIds` directly, never from `jobIds`.
+    await one(
+      'digests',
+      'delete',
+      `SELECT count(*)::text AS n FROM digests WHERE ${DIGESTS_ERASED_PREDICATE}`,
+      [businessId, digestIds],
     ),
     await one(
       'documents',

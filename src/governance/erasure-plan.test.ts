@@ -295,6 +295,120 @@ describe('buildErasurePlan', () => {
     });
   });
 
+  /**
+   * Spec §7: the stored digest NAMES failures, so a document name, a
+   * recipient or a contact name can land in its body. Once stored it
+   * survives, and "forget about Ronit" must reach it.
+   *
+   * `digests` has no `job_id` and no document reference at all (see
+   * `erasure-plan.ts`'s header), so this is the whole discovery: a digest
+   * whose body happens to name the contact must be both found AND counted
+   * for deletion by the preview, with nothing else in the system tying it
+   * to anything else that would have carried it in by accident.
+   */
+  it('finds a digest whose body mentions the contact, and counts it for deletion', async () => {
+    await installCharter(buildCharter({ version: 'digest-found' }), { businessId: BUSINESS });
+    const digestId = `DG-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', $3, true)`,
+      [digestId, BUSINESS, `תדריך יומי · ממתין לך: שליחה ל-${RONIT} נכשלה`],
+    );
+    // A decoy, naming a different contact: without it, a predicate that
+    // matched every digest in the business (not just the one naming RONIT)
+    // would still report count 1, because this would otherwise be the only
+    // row in the table. With it, a selective match stays at 1 and an
+    // unselective one reports 2.
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ($1, $2, 'daily', '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z', $3, true)`,
+      [`DG-${ulid()}`, BUSINESS, 'תדריך יומי · הכל תקין, אין חריגות'],
+    );
+
+    const plan = await buildErasurePlan(
+      { kind: 'contact', identifier: RONIT },
+      { businessId: BUSINESS },
+    );
+
+    expect(plan.digestIds).toEqual([digestId]);
+    const digestItem = plan.items.find((i) => i.table === 'digests' && i.action === 'delete');
+    expect(digestItem).toEqual({ table: 'digests', action: 'delete', count: 1 });
+  });
+
+  /**
+   * The discovery half, which is the one this repo has twice forgotten (see
+   * `job_plans` and `job_authorizations` in CLAUDE.md): a search by the
+   * person's name must FIND the digest, not merely delete it once it was
+   * found through something else. No job, no document, no memory, no
+   * authorization — nothing but the digest's own `body` names the contact.
+   */
+  it('discovers a digest by its body alone, with no job or document linking to it', async () => {
+    await installCharter(buildCharter({ version: 'digest-discovery' }), { businessId: BUSINESS });
+    const digestId = `DG-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ($1, $2, 'weekly', '2026-01-01T00:00:00Z', '2026-01-08T00:00:00Z', $3, true)`,
+      [digestId, BUSINESS, `תדריך שבועי · מסמך מ-${RONIT} נדחה`],
+    );
+    // A second digest naming an unrelated contact, so an unselective match
+    // (every digest in the business, not just this one) would be caught by
+    // the exact-array assertion below rather than passing by coincidence.
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
+       VALUES ($1, $2, 'weekly', '2026-01-08T00:00:00Z', '2026-01-15T00:00:00Z', $3, true)`,
+      [`DG-${ulid()}`, BUSINESS, 'תדריך שבועי · מסמך מ-avi@gamma-lift.example נדחה'],
+    );
+
+    const plan = await buildErasurePlan(
+      { kind: 'contact', identifier: RONIT },
+      { businessId: BUSINESS },
+    );
+
+    expect(plan.jobIds).toEqual([]);
+    expect(plan.documentIds).toEqual([]);
+    expect(plan.digestIds).toEqual([digestId]);
+  });
+
+  /**
+   * Fix round 2, item 11: the WINDOW-anchor arm of digest discovery
+   * (`erasure-plan.ts:875-882`) had no test at all — both digest tests above
+   * use a `contact` anchor. A wrong column there (`window_start` for
+   * `created_at`) or a wrong comparison (`>` for `>=`) would mean an owner
+   * erasing a date range silently keeps the digests that summarise it.
+   * Seeded with explicit `created_at` (the column the query actually filters
+   * on, per `erasure-plan.ts`'s own header note — never `window_start`/
+   * `window_end`) so this is a genuine probe of that column and that
+   * comparison, not an accident of insertion order. The decoy sits one
+   * second before `fromIso` — the edge a `>` vs `>=` mistake would flip.
+   */
+  it('discovers a digest by a window anchor on its created_at, with a decoy just outside the range', async () => {
+    await installCharter(buildCharter({ version: 'digest-window' }), { businessId: BUSINESS });
+    const insideId = `DG-${ulid()}`;
+    const outsideId = `DG-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content, created_at)
+       VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'תדריך יומי · הכל תקין', true, $3)`,
+      [insideId, BUSINESS, '2026-03-10T12:00:00Z'],
+    );
+    // One second before the window's lower bound — the exact edge a `>`
+    // mistake (instead of `>=`) would wrongly admit, and the exact edge a
+    // decoy at some unrelated far-away date would not test at all.
+    await getPool().query(
+      `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content, created_at)
+       VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'תדריך יומי · הכל תקין', true, $3)`,
+      [outsideId, BUSINESS, '2026-03-10T11:59:59Z'],
+    );
+
+    const plan = await buildErasurePlan(
+      { kind: 'window', fromIso: '2026-03-10T12:00:00Z', toIso: '2026-03-11T12:00:00Z' },
+      { businessId: BUSINESS },
+    );
+
+    expect(plan.digestIds).toEqual([insideId]);
+    const digestItem = plan.items.find((i) => i.table === 'digests' && i.action === 'delete');
+    expect(digestItem).toEqual({ table: 'digests', action: 'delete', count: 1 });
+  });
+
   it('classifies items as delete or scrub correctly', async () => {
     const jobId = await jobAbout(RONIT, 'action-classification');
     await writeMemory(

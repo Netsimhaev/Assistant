@@ -157,4 +157,19 @@ export function logErrored(result: SchedulerPassResult): void {
   for (const actionClass of result.autonomy.demoted) {
     console.log(`autonomy lowered for ${actionClass}`);
   }
+  // Fix round 1, item 2 — the most serious gap this round found. `digest` is
+  // `null` when the schedule is off, in which case there is nothing to have
+  // failed; it is non-null and carries its OWN `errored` (not a sibling
+  // top-level field, because `runDigests` fails per-kind-loop, not per-pass)
+  // whenever `loadActiveCharter` threw inside it. Before this branch, an
+  // installation with the digest switched on and a charter that cannot be
+  // parsed failed on EVERY pass, forever, printing nothing — `run-scheduler.ts`
+  // wires `logErrored` as the only reporting path in production, so a bucket
+  // with no printer here is invisible there too. Same class of silent failure
+  // the WhatsApp branch already closed twice (a duplicate-keyed alert the
+  // mail server swallowed; a bridge warning indistinguishable from "nothing
+  // to send") — this is the identical shape one module over.
+  if (result.digest !== null && result.digest.errored !== null) {
+    console.error(`digest failed: ${result.digest.errored}`);
+  }
 }

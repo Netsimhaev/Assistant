@@ -215,7 +215,7 @@ const GATE_DENY_CODES: ReadonlySet<string> = new Set([
   'delegation_not_permitted',
 ]);
 
-function isGateDenialCode(code: string): boolean {
+export function isGateDenialCode(code: string): boolean {
   return (
     GATE_DENY_CODES.has(code) ||
     code.startsWith('budget_exceeded') ||
@@ -324,7 +324,7 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
  * `delegation_refused:<code>` riding inside one of them as the `code` itself
  * — uses `${code} — ${message}`, split on the em dash.
  */
-function leadingCode(reason: string): string | null {
+export function leadingCode(reason: string): string | null {
   const RUN_DUE_PREFIX = 'run_due: ';
   if (reason.startsWith(RUN_DUE_PREFIX)) {
     return `run_due:${reason.slice(RUN_DUE_PREFIX.length)}`;

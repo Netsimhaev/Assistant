@@ -3,9 +3,12 @@ import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
+import { loadDigestSettings } from '../governance/digest-settings.js';
 import { principalWhatsAppKey } from '../governance/principal-number.js';
 import { canonicalHash } from '../util/canonical.js';
 import { conductPendingDocuments } from './conduct.js';
+import { runDigests } from './digest-run.js';
+import type { DigestRunResult } from './digest-run.js';
 import type { Judge } from '../sdk/gov-verify.js';
 import type { ConductOptions, ConductResult } from './conduct.js';
 import { createBossMessenger } from '../whatsapp/messenger.js';
@@ -657,6 +660,23 @@ export interface SchedulerPassResult {
    * bookkeeping that runs last after them failed.
    */
   autonomyError: string | null;
+  /**
+   * Null when `digest_settings.schedule` is `'off'` — the same "switch, not
+   * fault" shape `scan`/`conduct`/`whatsappDoor` already carry. `null` is not
+   * `{ produced: [], screenOnly: 0, errored: null }`: "the digest loop did
+   * not run" and "it ran and found no window due" are different facts about
+   * an installation, and only the first is a statement about how it is
+   * configured — `conduct`'s own docblock draws the identical line.
+   *
+   * Run LAST, after `evaluateAutonomy` — see `digest-run.ts`'s own header
+   * comment for what the dead-last position actually buys (point-in-time
+   * correctness for `waiting.*`, not window-scoped completeness — same-pass
+   * window-scoped counting is structurally impossible regardless of
+   * ordering) and for why the expired-approval exception in
+   * `digest-facts.ts` only requires running after `tick()`, a weaker
+   * condition the dead-last position happens to also satisfy.
+   */
+  digest: DigestRunResult | null;
 }
 
 /**
@@ -932,6 +952,32 @@ export async function schedulerPass(
   } catch (err) {
     autonomyError = err instanceof Error ? err.message : String(err);
   }
+
+  // The digest, dead last — see `SchedulerPassResult.digest`'s own docblock.
+  // `digest_settings.schedule` is checked here, once, the same "switch, not
+  // fault" gate `inbox`/`runtime.whatsapp` already apply above: `off` means
+  // the loop did not run at all, and `digest` must stay `null` rather than an
+  // empty-looking result a reader could mistake for "ran, found nothing due".
+  // `runDigests` itself reloads the settings (it has no way to be handed the
+  // ones already read here without widening its signature past what Tasks
+  // 1–5 fixed), and is never called at all when they say `off`.
+  const digestSettings = await loadDigestSettings({ businessId });
+  let digest: DigestRunResult | null = null;
+  if (digestSettings.schedule !== 'off') {
+    digest = await runDigests({
+      businessId,
+      ...(options.now !== undefined ? { now: options.now } : {}),
+      // `runtime.notify?.sendAlert` — the SAME email seam `checkWhatsAppHealth`
+      // above already sends the bridge-outage alert through, never a second,
+      // independently configured one.
+      ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
+      // The messenger built from THIS pass's own charter load, right above —
+      // `null` both when no gateway is configured and when the charter failed
+      // to load, the same guard `whatsappReport` already keys on.
+      ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
+    });
+  }
+
   return {
     tick: tickResult,
     scan,
@@ -945,6 +991,7 @@ export async function schedulerPass(
     whatsappError,
     autonomy,
     autonomyError,
+    digest,
   };
 }
 

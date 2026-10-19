@@ -36,11 +36,13 @@ import {
   recordQuestion,
   saveInstruction,
 } from '../governance/instructions.js';
+import { DIGEST_DEFAULTS, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
 import {
   assertBindableHost,
   createServer,
+  liveWindowStart,
   reasonForSupersededJob,
   renderInstructionOutcome,
 } from './server.js';
@@ -3108,5 +3110,261 @@ describe('POST /autonomy/actions/:jobId/:stepId/mark', () => {
 
     const { rows } = await getPool().query('SELECT * FROM autonomy_marks WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
+  });
+});
+
+describe('digest screen', () => {
+  /** Behind the owner session, with an active charter installed — the live
+   * preview needs the charter's time zone and money ceiling, same as
+   * `runDigests` (`digest-run.ts`). */
+  async function digestSession(businessId: string): Promise<{ baseUrl: string; cookie: string }> {
+    const baseUrl = await startServer(businessId);
+    await installCharter(buildCharter(), { businessId });
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    return { baseUrl, cookie };
+  }
+
+  it('requires a session, like the other authenticated screens', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const res = await fetch(`${baseUrl}/digest`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
+  /**
+   * One phrase distinctive to the live block's own label ('תדריך כזה טרם
+   * נשלח'), one to the empty-history state, and one to the form itself —
+   * each chosen to not also appear for an unrelated reason elsewhere on the
+   * page (the decorative-`toContain` risk this sub-project has hit before).
+   */
+  it('renders the live preview, the empty-history state, and the settings form', async () => {
+    const { baseUrl, cookie } = await digestSession(BUSINESS);
+    const res = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('תדריך כזה טרם נשלח');
+    expect(body).toContain('לא נוצר עדיין שום תדריך');
+    expect(body).toContain('name="dailyHour"');
+  });
+
+  /**
+   * Both nav strings in `views.ts` (the pending list's and `renderInstruct`'s)
+   * must carry the link — a screen reachable from only one is reachable from
+   * half the dashboard. `href="/digest"` rather than the bare label text
+   * ('מה קרה') because the words also appear, unlinked, inside the live
+   * block's own label just above.
+   */
+  it('is linked from both navigation strings', async () => {
+    const { baseUrl, cookie } = await digestSession(BUSINESS);
+    const home = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+    expect(home).toContain('href="/digest"');
+    const instructPage = await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text();
+    expect(instructPage).toContain('href="/digest"');
+  });
+
+  it('saves a schedule choice and round-trips it through loadDigestSettings', async () => {
+    const { baseUrl, cookie } = await digestSession(BUSINESS);
+    const page = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    const csrf = extractCsrf(await page.text());
+
+    const res = await fetch(`${baseUrl}/digest/settings`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf,
+        schedule: 'daily',
+        dailyHour: '7',
+        weeklyDay: '0',
+        weeklyHour: '9',
+        toEmail: 'on',
+      }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/digest');
+
+    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    expect(settings.schedule).toBe('daily');
+    expect(settings.dailyHour).toBe(7);
+    expect(settings.toEmail).toBe(true);
+    expect(settings.toWhatsApp).toBe(false);
+    expect(settings.updatedBy).toBe(USERNAME);
+  });
+
+  it('refuses to save without a valid CSRF token', async () => {
+    const { baseUrl, cookie } = await digestSession(BUSINESS);
+    const res = await fetch(`${baseUrl}/digest/settings`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf: 'wrong-token',
+        schedule: 'daily',
+        dailyHour: '7',
+        weeklyDay: '0',
+        weeklyHour: '9',
+      }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(403);
+
+    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    expect(settings.schedule).toBe('off');
+  });
+
+  /**
+   * The `<select>` elements never offer an out-of-range value, so this
+   * simulates a tampered request — exactly what the database CHECK
+   * constraints (migration 040) are the real defence against. The route must
+   * catch `setDigestSettings`'s throw and re-render 200 with a Hebrew
+   * message, never a 500, and must not have written anything.
+   */
+  it('refuses an out-of-range hour with a Hebrew message, not a 500', async () => {
+    const { baseUrl, cookie } = await digestSession(BUSINESS);
+    const page = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    const csrf = extractCsrf(await page.text());
+
+    const res = await fetch(`${baseUrl}/digest/settings`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf,
+        schedule: 'daily',
+        dailyHour: '25',
+        weeklyDay: '0',
+        weeklyHour: '9',
+      }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('אינם בטווח התקין');
+
+    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    expect(settings.schedule).toBe('off');
+  });
+
+  /**
+   * Fix round 1, item 1: `active === null` ("no charter signed yet") must
+   * not 500 — it is the ordinary state of a brand-new installation, and
+   * neither `recentDigests` nor `loadDigestSettings` ever needed the charter.
+   */
+  it('renders 200 with the history and the form when no charter has been signed yet', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('טרם נחתם תקנון עסקי');
+    expect(body).toContain('לא נוצר עדיין שום תדריך');
+    expect(body).toContain('name="dailyHour"');
+  });
+
+  /**
+   * The other half of item 1: a SIGNED charter this code cannot parse (a
+   * stale schema version, aged the same way `charter/stale-charter.test.ts`
+   * does — straight UPDATE on the stored column, since `BusinessCharter.parse`
+   * would refuse an old version on the way IN through `installCharter`) is a
+   * different fact from "none yet" and must say something different — still
+   * 200, still with the history and the form.
+   */
+  it('renders 200 with a message distinct from "none yet" when the signed charter cannot be read', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await getPool().query(
+      `UPDATE charter_versions
+          SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb($2::text))
+        WHERE business_id = $1`,
+      [BUSINESS, '1.1'],
+    );
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('אינו קריא כרגע');
+    expect(body).not.toContain('טרם נחתם תקנון עסקי');
+    expect(body).toContain('לא נוצר עדיין שום תדריך');
+    expect(body).toContain('name="dailyHour"');
+  });
+
+  /**
+   * Fix round 1, item 2: a weekly-only owner must see a weekly-shaped
+   * preview ('תדריך שבועי', from `renderDigest`'s own `KIND_LABEL`), never
+   * the daily one he will never receive. The settings form's own `<select>`
+   * always lists the bare word 'יומי' as one of four schedule options, so
+   * the assertion checks the two-word phrase together — the word alone would
+   * also be satisfied by that unrelated `<option>`.
+   */
+  it('previews the weekly shape for a weekly-only schedule, not the daily one', async () => {
+    const { baseUrl, cookie } = await digestSession(BUSINESS);
+    await setDigestSettings(
+      { schedule: 'weekly', dailyHour: 8, weeklyDay: 0, weeklyHour: 9, toEmail: false, toWhatsApp: false },
+      'owner',
+      { businessId: BUSINESS },
+    );
+
+    const res = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('תדריך שבועי');
+    expect(body).not.toContain('תדריך יומי');
+  });
+
+  /**
+   * Fix round 2, item 6: a weekly-only owner's live preview was titled
+   * "תדריך שבועי" (the test above) but spanned at most ~24 hours —
+   * `lastHourInstant` has no notion of weekday, so it only ever looks back
+   * up to a day for an hour that recurs daily. `liveWindowStart` widens the
+   * weekly case by a further `WEEK_MS`; the daily case must be UNCHANGED
+   * (no widening at all), since its title already matches its span.
+   */
+  it('spans a full week for the weekly preview, and is unchanged for the daily one', () => {
+    const now = new Date('2026-10-07T09:00:00+03:00');
+    const settings = { ...DIGEST_DEFAULTS, schedule: 'both' as const, dailyHour: 8, weeklyHour: 9 };
+    const tz = 'Asia/Jerusalem';
+
+    const dailyStart = liveWindowStart(settings, 'daily', now, tz);
+    const plainBoundary = new Date('2026-10-07T08:00:00+03:00'); // lastHourInstant(8, ...)
+    expect(dailyStart.getTime()).toBe(plainBoundary.getTime());
+
+    const weeklyStart = liveWindowStart(settings, 'weekly', now, tz);
+    const weeklyBoundary = new Date('2026-10-07T09:00:00+03:00'); // lastHourInstant(9, ...) === now itself
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    expect(weeklyStart.getTime()).toBe(weeklyBoundary.getTime() - sevenDaysMs);
+    expect(now.getTime() - weeklyStart.getTime()).toBe(sevenDaysMs);
+  });
+
+  /**
+   * Fix round 1, item 4: a POST missing a required hour field must be
+   * refused, not accepted as `0` (midnight) — `z.coerce.number().int()`
+   * parses `null` into `0`, which `RequiredHourField` must not do. Checked
+   * both ways: the refusal message renders, AND nothing was written (the
+   * settings stay at `DIGEST_DEFAULTS.dailyHour`, never silently `0`).
+   */
+  it('refuses a POST missing a required hour field, not a 500 or a silent 0', async () => {
+    const { baseUrl, cookie } = await digestSession(BUSINESS);
+    const page = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
+    const csrf = extractCsrf(await page.text());
+
+    const res = await fetch(`${baseUrl}/digest/settings`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf,
+        schedule: 'daily',
+        // dailyHour deliberately omitted
+        weeklyDay: '0',
+        weeklyHour: '9',
+      }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('יש לבחור ערכים תקינים בכל שדות התדריך');
+
+    const settings = await loadDigestSettings({ businessId: BUSINESS });
+    expect(settings.schedule).toBe('off');
+    expect(settings.dailyHour).toBe(8);
   });
 });
