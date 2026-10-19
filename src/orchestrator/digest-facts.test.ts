@@ -109,7 +109,10 @@ describe('collectDigestFacts', () => {
           risk, proposed_input, state, input_hash, expires_at, created_at)
        VALUES ('AP-1', $1, 'email.initiate', 'mail.send', 'הצעה לדנה', '',
                '{}'::jsonb, '{}'::jsonb, 'pending', 'h', $2, $3)`,
-      [BUSINESS, new Date('2026-10-09T08:00:00+03:00'), new Date('2026-10-01T08:00:00+03:00')],
+      // `expires_at` is relative to the real clock, not to WINDOW: "waiting"
+      // is filtered on `expires_at > now()`, so a fixed date here turned this
+      // test red the day after it passed.
+      [BUSINESS, new Date(Date.now() + 24 * 60 * 60 * 1000), new Date('2026-10-01T08:00:00+03:00')],
     );
 
     const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
