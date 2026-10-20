@@ -32,9 +32,16 @@ function day(at: Date, timeZone: string): string {
  * else composes a subject line. A document name is chosen by whoever sent the
  * file; a direction override inside it rearranges what he READS while leaving
  * the bytes that were acted on untouched.
+ *
+ * And every run of whitespace — line breaks first among them — collapses to
+ * one space, because each named item is exactly one line. A job title is the
+ * owner's instruction text, paragraph breaks and all; a file name is whatever
+ * the sender typed, and "\n· " inside one forges a bullet of its own. Caught
+ * on the first run against real data. Collapsing rather than stripping keeps
+ * the words apart.
  */
 function safe(value: string): string {
-  return stripBidiControls(value);
+  return stripBidiControls(value).replace(/\s+/g, ' ').trim();
 }
 
 /** Used for §3.4 (`permissionChanges`), which the database never caps — so

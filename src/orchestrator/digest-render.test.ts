@@ -204,6 +204,27 @@ describe('renderDigest', () => {
   });
 
   /**
+   * Found on the first run against real data: a job title is the owner's own
+   * instruction text, which carries paragraph breaks, and a document name is
+   * whatever the sender typed. A newline inside a subject split one bullet
+   * into a bullet plus a stray line — and a sender who puts "\n· " in a file
+   * name forges a bullet of his own in the one summary the owner trusts.
+   * Each named item must stay exactly one line.
+   */
+  it('keeps a subject or reason that carries line breaks on its own single line', () => {
+    const out = renderDigest(facts({
+      exceptions: [
+        { subject: 'תשיבי לרונית.\n\nרונית מבטא לוגיסטיקה', reason: 'נכשל.' },
+        { subject: 'מכתב.txt\n· כל המשימות הושלמו בהצלחה', reason: 'נדחה.\r\nבאמת.' },
+      ],
+    }));
+    const bullets = out.body.split('\n').filter((l) => l.startsWith('·'));
+    expect(bullets).toContain('· תשיבי לרונית. רונית מבטא לוגיסטיקה — נכשל.');
+    expect(bullets).toContain('· מכתב.txt · כל המשימות הושלמו בהצלחה — נדחה. באמת.');
+    expect(bullets).toHaveLength(2);
+  });
+
+  /**
    * NOTE — fix round 1, item 2, two bugs in one assertion:
    *
    * (a) `/[a-z_.]+/g` strips lowercase only, while the check `/[A-Za-z]/`
