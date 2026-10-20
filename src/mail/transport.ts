@@ -7,6 +7,7 @@
  * it — swapping SMTP providers, or the library itself, touches nothing
  * outside this one file.
  */
+import { Readable } from 'node:stream';
 import nodemailer from 'nodemailer';
 import { AMBIGUOUS_FAILURE_COMMAND } from '../orchestrator/adapters/mail.js';
 import type {
@@ -21,7 +22,10 @@ interface MinimalTransporter {
     from: string;
     to: string;
     subject: string;
-    text: string;
+    /** A stream, so this module can tell whether the body was ever read — see `send`. */
+    text: Readable;
+    /** Pinned so the wire format is what a string body produced (base64 under utf-8). */
+    textEncoding: 'base64';
     messageId: string;
   }): Promise<{ messageId: string }>;
 }
@@ -241,6 +245,28 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
       const domain = config.from.split('@')[1] ?? 'localhost';
       const messageId = `<${context.idempotencyKey}@${domain}>`;
 
+      // The body goes out as a stream whose first read flips this flag. A body
+      // that was never read cannot have left this process — that is logic,
+      // not a guess about the library's timing — so `false` is the one state
+      // in which a dropped connection is provably safe to retry. The library
+      // does not say so itself: measured on nodemailer 9 and 10, a drop or a
+      // socket timeout carries `{ code: 'ECONNECTION' | 'ETIMEDOUT', command:
+      // 'CONN' }` at every stage, before the greeting and after the final `.`
+      // alike, so the classifier's `command: 'DATA'` branch never fired on a
+      // drop and a body that had already gone out was reported retryable.
+      // The flag is conservative, not exact: nodemailer starts reading the
+      // body at MAIL FROM, before the server's 354, so a drop at MAIL or RCPT
+      // also reads as ambiguous. Over-reporting ambiguity costs a retry;
+      // under-reporting it costs a second send.
+      let bodyRead = false;
+      const text = new Readable({
+        read() {
+          bodyRead = true;
+          this.push(message.body, 'utf8');
+          this.push(null);
+        },
+      });
+
       let info: { messageId: string };
       try {
         info = await raceAbort(
@@ -248,13 +274,14 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
             from: config.from,
             to: message.to.join(', '),
             subject: message.subject,
-            text: message.body,
+            text,
+            textEncoding: 'base64',
             messageId,
           }),
           context.signal,
         );
       } catch (error) {
-        throw rethrowClassifiable(error);
+        throw rethrowClassifiable(error, bodyRead);
       }
 
       return { messageId: info.messageId };
@@ -309,7 +336,7 @@ function ownField(error: unknown, field: string): unknown {
  * (`src/orchestrator/execute.ts`) renders into `job_steps.reason`. The three
  * carried fields are read by that classifier and by nothing else.
  */
-function rethrowClassifiable(error: unknown): Error {
+function rethrowClassifiable(error: unknown, bodyRead: boolean): Error {
   const rethrown: Error & { responseCode?: number; command?: string; code?: string } = new Error(
     error instanceof Error ? error.message : String(error),
   );
@@ -317,8 +344,15 @@ function rethrowClassifiable(error: unknown): Error {
   const responseCode = ownField(error, 'responseCode');
   if (typeof responseCode === 'number') rethrown.responseCode = responseCode;
 
+  // `command: 'DATA'` is what the classifier reads as "the body may have left".
+  // The library sets it only when the server *replied* to the body; a drop or
+  // timeout once the body was read gets it here instead (see `send`). A reply
+  // code still wins in the classifier, which checks `responseCode` first — a
+  // `451` after the body is the server saying it did not take the message.
   const command = ownField(error, 'command');
-  if (command === AMBIGUOUS_FAILURE_COMMAND) rethrown.command = AMBIGUOUS_FAILURE_COMMAND;
+  if (command === AMBIGUOUS_FAILURE_COMMAND || (bodyRead && typeof responseCode !== 'number')) {
+    rethrown.command = AMBIGUOUS_FAILURE_COMMAND;
+  }
 
   const code = ownField(error, 'code');
   if (typeof code === 'string') rethrown.code = code;

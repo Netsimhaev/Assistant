@@ -292,9 +292,13 @@ describe('buildRuntime', () => {
     const captured: Array<{ to: string; subject: string; text: string; auth?: { user?: string; pass?: string } }> = [];
     const runtime = await buildRuntime(FULL, {
       createTransport: (opts) => ({
-        sendMail: (mail: { to: string; subject: string; text: string }) => {
-          captured.push({ ...mail, auth: opts.auth });
-          return Promise.resolve({ messageId: 'stub-message-id' });
+        // The body arrives as a stream (see `send` in `src/mail/transport.ts`);
+        // drained here so the assertion below still reads the text itself.
+        sendMail: async (mail: { to: string; subject: string; text: NodeJS.ReadableStream }) => {
+          let text = '';
+          for await (const chunk of mail.text) text += String(chunk);
+          captured.push({ to: mail.to, subject: mail.subject, text, auth: opts.auth });
+          return { messageId: 'stub-message-id' };
         },
       }),
     });

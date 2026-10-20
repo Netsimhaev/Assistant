@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import net from 'node:net';
 import { createSmtpTransport } from './transport.js';
 import type { SmtpConfig } from './transport.js';
 import { createCredentialHandle } from '../orchestrator/adapters/types.js';
@@ -393,5 +394,136 @@ describe('createSmtpTransport construction', () => {
 
   it('builds successfully with a non-empty account', () => {
     expect(() => createSmtpTransport(configWithoutAuth())).not.toThrow();
+  });
+});
+
+/**
+ * Against the real library, over a real local socket — the classifier's other
+ * tests all feed it hand-built `Object.assign(new Error(...), …)` shapes, and
+ * that is how the gap below survived two library versions unnoticed.
+ *
+ * Measured on nodemailer 9 and 10 alike: a connection that drops, or a socket
+ * that times out, reports `{ code: 'ECONNECTION' | 'ETIMEDOUT', command:
+ * 'CONN' }` at **every** stage — before the greeting and after the final `.`
+ * of the body alike. The library never puts `command: 'DATA'` on a drop; it
+ * does so only when the server *replies* to the body. So the classifier's
+ * "mid-DATA drop is ambiguous" branch could not fire, and a send whose body
+ * had already gone out was reported `retryable` — the scheduler would send
+ * it again.
+ */
+describe('createSmtpTransport against a real SMTP conversation', () => {
+  type Stage = 'GREETING' | 'EHLO' | 'MAIL' | 'AFTER_BODY' | 'NEVER';
+
+  /** A minimal SMTP peer that destroys the socket at `dropAt`. */
+  async function fakeSmtp(dropAt: Stage): Promise<{ port: number; bodies: string[]; close: () => Promise<void> }> {
+    const bodies: string[] = [];
+    const server = net.createServer((socket) => {
+      socket.on('error', () => {});
+      if (dropAt === 'GREETING') {
+        socket.destroy();
+        return;
+      }
+      socket.write('220 fake ESMTP\r\n');
+      let inData = false;
+      let body = '';
+      let buffer = '';
+      socket.on('data', (chunk) => {
+        buffer += chunk.toString('latin1');
+        let i: number;
+        while ((i = buffer.indexOf('\r\n')) >= 0) {
+          const line = buffer.slice(0, i);
+          buffer = buffer.slice(i + 2);
+          if (inData) {
+            if (line !== '.') {
+              body += `${line}\r\n`;
+              continue;
+            }
+            inData = false;
+            bodies.push(body);
+            if (dropAt === 'AFTER_BODY') {
+              socket.destroy();
+              return;
+            }
+            socket.write('250 2.0.0 queued\r\n');
+            continue;
+          }
+          const verb = (line.split(' ')[0] ?? '').toUpperCase();
+          if (verb === dropAt) {
+            socket.destroy();
+            return;
+          }
+          if (verb === 'EHLO') socket.write('250-fake\r\n250 AUTH PLAIN LOGIN\r\n');
+          else if (verb === 'AUTH') socket.write('235 ok\r\n');
+          else if (verb === 'DATA') {
+            inData = true;
+            socket.write('354 go\r\n');
+          } else if (verb === 'QUIT') {
+            socket.write('221 bye\r\n');
+            socket.end();
+          } else socket.write('250 ok\r\n');
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as net.AddressInfo;
+    return { port, bodies, close: () => new Promise((resolve) => server.close(() => resolve())) };
+  }
+
+  async function sendThroughAdapter(port: number, body = 'גוף'): Promise<unknown> {
+    const adapter = createMailAdapter({
+      system: 'office-mail',
+      transport: createSmtpTransport(
+        configWithoutAuth({ host: '127.0.0.1', port, allowCleartext: true, connectionTimeoutMs: 3_000, socketTimeoutMs: 3_000 }),
+      ),
+    });
+    return adapter.execute({
+      toolName: 'mail.send',
+      input: { to: ['dana@example.com'], subject: 'נושא', body },
+      endpoint: null,
+      credential: createCredentialHandle('OFFICE_MAIL', 'pw'),
+      idempotencyKey: 'real-socket',
+      signal: AbortSignal.timeout(8_000),
+    } satisfies AdapterCall);
+  }
+
+  it('reports a drop after the body went out as delivery_unknown, never retryable', async () => {
+    const smtp = await fakeSmtp('AFTER_BODY');
+    try {
+      const result = await sendThroughAdapter(smtp.port);
+      // Proves the body really reached the far end — the case under test, not
+      // an earlier failure that happens to classify the same way.
+      expect(smtp.bodies).toHaveLength(1);
+      expect(result).toMatchObject({ ok: false, retryable: false, code: 'delivery_unknown' });
+    } finally {
+      await smtp.close();
+    }
+  });
+
+  it('still reports a drop before any of the body was read as retryable', async () => {
+    for (const stage of ['GREETING', 'EHLO'] as const) {
+      const smtp = await fakeSmtp(stage);
+      try {
+        const result = await sendThroughAdapter(smtp.port);
+        expect(smtp.bodies).toHaveLength(0);
+        expect(result, stage).toMatchObject({ ok: false, retryable: true, code: 'transport_error' });
+      } finally {
+        await smtp.close();
+      }
+    }
+  });
+
+  it('delivers a Hebrew body intact, base64 under utf-8 as before', async () => {
+    const smtp = await fakeSmtp('NEVER');
+    const body = 'שלום דנה, ההצעה מצורפת. 500 ₪';
+    try {
+      expect(await sendThroughAdapter(smtp.port, body)).toMatchObject({ ok: true });
+      const raw = smtp.bodies[0] ?? '';
+      expect(raw).toMatch(/Content-Type: text\/plain; charset=utf-8/i);
+      expect(raw).toMatch(/Content-Transfer-Encoding: base64/i);
+      const encoded = raw.split('\r\n\r\n').slice(1).join('').replace(/\s+/g, '');
+      expect(Buffer.from(encoded, 'base64').toString('utf8')).toBe(body);
+    } finally {
+      await smtp.close();
+    }
   });
 });
