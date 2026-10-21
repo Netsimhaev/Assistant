@@ -191,6 +191,9 @@ import { join } from 'node:path';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import { keptIds, type KeptItemKind } from './kept-items.js';
+import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
+
+export { LIKE_ESCAPE };
 
 export type ErasureAnchor =
   | { kind: 'contact'; identifier: string }
@@ -252,43 +255,6 @@ export interface ErasurePlan {
  * drifting apart would be worse than one shared one (spec §7.1, I4).
  */
 export const LIVE_PHASES: readonly string[] = ['execute', 'await_approval'];
-
-/**
- * Escapes what `LIKE` would otherwise read as a pattern.
- *
- * The anchor is owner-supplied text. A bare `%` would match every row in
- * every table searched — the same reason `recallMemories` escapes its
- * keyword.
- */
-function likeLiteral(value: string): string {
-  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-}
-
-/**
- * The `ESCAPE` clause every `LIKE`/`ILIKE` in this module carries, written
- * once.
- *
- * `likeLiteral` above prefixes a backslash, and that prefix means nothing
- * unless the statement also DECLARES backslash as the escape character. The
- * two halves only work as a pair, so they live as a pair.
- *
- * **Why a constant and not fourteen typed clauses** (fix round 3, and the
- * class behind F1). Written inline, the clause is spelled with two
- * backslashes inside a template literal. One instead of two is not a syntax
- * error, not a type error and not visibly wrong: the literal quietly
- * collapses to `ESCAPE ''`, which disables escape processing altogether, and
- * the statement then fails *only* for an anchor containing `_`, `%` or a
- * backslash — an ordinary email local part. That is exactly how it reached
- * the last gate of this branch, in the one clause that had just been added.
- * A property held right fourteen times by hand is a property waiting to
- * break — the same argument that put the `proposals` predicate in one place.
- *
- * Spelled with `String.raw` deliberately: it is the one spelling the
- * collapsing rule cannot touch, so the fix cannot be undone by the mechanism
- * that caused the defect. It is the same ten characters as the two-backslash
- * template spelling — verified by running both, not assumed.
- */
-export const LIKE_ESCAPE = String.raw`ESCAPE '\'`;
 
 /**
  * The `approval_requests` rows an erasure destroys, as ONE predicate.
