@@ -49,7 +49,12 @@ import {
 } from '../orchestrator/adapters/microsoft-token-http.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import type { MailProvider } from '../mail/mailbox.js';
+import { setCursor } from '../mail/inbox-store.js';
+import { createGmailClient } from '../mail/providers/gmail.js';
+import { createGraphClient } from '../mail/providers/graph.js';
+import type { MailboxClient } from '../mail/providers/types.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
+import { mailboxProviderMatchesCharter } from './mailbox-connect.js';
 import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import { verifyCsrfToken } from './csrf.js';
 import { escapeHtml } from './views.js';
@@ -114,6 +119,18 @@ export interface OAuthRouteOptions {
   dashboardBaseUrl: string;
   /** Test seam only. No production caller ever passes it. */
   fetchImpl?: typeof fetch;
+  /**
+   * Test seam only: the mailbox client the callback takes the initial cursor
+   * with. Absent, the real Gmail / Graph client for the provider is used.
+   */
+  mailboxClientFor?: (provider: MailProvider) => MailboxClient;
+}
+
+/** How long the callback waits for the provider to hand back the initial cursor. */
+const INITIAL_CURSOR_TIMEOUT_MS = 30_000;
+
+function defaultMailboxClientFor(provider: MailProvider): MailboxClient {
+  return provider === 'microsoft' ? createGraphClient() : createGmailClient();
 }
 
 /**
@@ -283,6 +300,20 @@ function redirect(res: ServerResponse, location: string): void {
   res.end();
 }
 
+function refuseUnsupported(res: ServerResponse, system: string): void {
+  sendHtml(
+    res,
+    400,
+    page(
+      'מערכת לא נתמכת',
+      errorBlock(
+        `המערכת "${system}" אינה מוגדרת בתקנון החתום כחיבור שתהליך ההרשאה הזה יכול לשרת — ` +
+          'נדרש חיבור בערוץ API שמשרת קריאת יומן (calendar.read), או את חיבור תיבת הדואר (mailbox) שמשרת mail.send. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
+      ),
+    ),
+  );
+}
+
 /**
  * `GET /oauth/:system/start` -- requires a session (enforced by the caller,
  * `server.ts`'s `route()`, before this is ever reached). Mints a PKCE pair
@@ -351,14 +382,20 @@ export async function handleOAuthStart(
   }
   const profile = connection === undefined ? null : oauthProfileFor(connection, provider);
   if (connection === undefined || profile === null || !connectionAcceptsOAuthCeremony(connection)) {
+    return refuseUnsupported(res, system);
+  }
+  // The mailbox: only the provider the owner SIGNED for (the charter names it
+  // as the connection's subprocessor). Mail passing through a provider the
+  // signed charter does not name is the change the subprocessor list exists
+  // to put in front of the owner. Positive match — `mailbox-connect.ts`.
+  if (system === MAILBOX_SYSTEM && !mailboxProviderMatchesCharter(connection, provider)) {
     return sendHtml(
       res,
       400,
       page(
-        'מערכת לא נתמכת',
+        'ספק שלא נחתם',
         errorBlock(
-          `המערכת "${system}" אינה מוגדרת בתקנון החתום כחיבור שתהליך ההרשאה הזה יכול לשרת — ` +
-            'נדרש חיבור בערוץ API שמשרת קריאת יומן (calendar.read), או את חיבור תיבת הדואר (mailbox) שמשרת mail.send. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
+          'התקנון החתום מתיר לחבר את תיבת המייל רק אצל הספק שנבחר בחתימה. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
         ),
       ),
     );
@@ -543,6 +580,35 @@ export async function handleOAuthCallback(
   const account = accountLookup ?? 'לא זוהה';
   const credentialRef = credentialRefForSystem(system);
 
+  // The mailbox's read cursor is taken NOW, at connect time, with the access
+  // token the exchange just returned: mail that arrived before this moment is
+  // never read (no backfill). Taken BEFORE the transaction below, like the
+  // other provider calls, so no pooled connection is held across a network
+  // round trip -- and a failure here writes nothing at all (no grant, no
+  // binding, no cursor): a grant with no cursor would be a live binding the
+  // poller cannot start from. The state is already consumed; the owner starts
+  // the ceremony again.
+  let mailboxCursor: string | null = null;
+  if (system === MAILBOX_SYSTEM) {
+    const client = (options.mailboxClientFor ?? defaultMailboxClientFor)(provider);
+    try {
+      mailboxCursor = await client.initialCursor(exchange.accessToken, AbortSignal.timeout(INITIAL_CURSOR_TIMEOUT_MS));
+    } catch (error) {
+      console.error('mailbox connect: could not take the initial cursor:', error instanceof Error ? error.message : error);
+      return sendHtml(
+        res,
+        502,
+        page(
+          'החיבור לא הושלם',
+          errorBlock(
+            `${providerName} לא אפשר לקבוע מאיזו נקודה לקרוא את המיילים החדשים, ולכן לא נשמר דבר — לא הרשאה ולא חיבור. ` +
+              'יש לנסות לחבר שוב בעוד כמה דקות.',
+          ),
+        ),
+      );
+    }
+  }
+
   // The grant, its audit row, and the binding write are ONE transaction --
   // not three independent commits. `appendAudit` committing separately AFTER
   // `writeGrant` would leave a refresh token for the business's own Google
@@ -600,7 +666,13 @@ export async function handleOAuthCallback(
     // no adapter ever registered for it. Existing operational fields
     // (`endpoint`, health) are preserved rather than reset, since
     // `upsertBinding` is a whole-row replace.
-    const existing = (await loadBindings({ businessId, db: tx })).find((b) => b.system === system) ?? null;
+    // The mailbox is a fresh connection every time (possibly to another
+    // provider than before): no operational field carries over, and its
+    // cursor is written in this same transaction, with `connectedAt` now.
+    const existing =
+      system === MAILBOX_SYSTEM
+        ? null
+        : ((await loadBindings({ businessId, db: tx })).find((b) => b.system === system) ?? null);
     await upsertBinding(
       {
         system,
@@ -613,6 +685,12 @@ export async function handleOAuthCallback(
       },
       { businessId, by: session.username, db: tx },
     );
+    if (mailboxCursor !== null) {
+      await setCursor(
+        { provider, cursor: mailboxCursor, connectedAt: new Date().toISOString() },
+        { businessId, db: tx },
+      );
+    }
   });
 
   sendHtml(
@@ -625,7 +703,8 @@ export async function handleOAuthCallback(
           exchange.grantedScopes.length > 0 ? escapeHtml(exchange.grantedScopes.join(', ')) : 'לא דווח היקף'
         }.</p>` +
         `<p class="muted">שימו לב: תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו. ` +
-        `אם הוא כבר רץ, החיבור החדש ייכנס לתוקף רק אחרי שהוא יופעל מחדש.</p>`,
+        `אם הוא כבר רץ, החיבור החדש ייכנס לתוקף רק אחרי שהוא יופעל מחדש.</p>` +
+        (system === MAILBOX_SYSTEM ? `<p><a href="/connections/mailbox">למצב תיבת המייל</a></p>` : ''),
     ),
   );
 }

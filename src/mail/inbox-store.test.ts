@@ -2,8 +2,8 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
-  claimMail, insertInvoice, listInvoices, mailReadsToday, recordIncoming, searchMail,
-  settleMail, type IncomingMail,
+  claimMail, getCursor, insertInvoice, listInvoices, mailReadsToday, recordIncoming, searchMail,
+  setCursor, settleMail, type IncomingMail,
 } from './inbox-store.js';
 
 const BUSINESS = 'test-business';
@@ -22,6 +22,25 @@ function mail(over: Partial<IncomingMail> = {}): IncomingMail {
 describe('inbox store', () => {
   beforeEach(async () => { await resetDatabase(); });
   afterAll(async () => { await closePool(); });
+
+  it('setCursor records connectedAt when given, and a reconnect moves it', async () => {
+    await setCursor({ provider: 'google', cursor: 'h1', connectedAt: '2026-10-01T00:00:00.000Z' }, opts);
+    expect((await getCursor(opts))?.connectedAt).toBe('2026-10-01T00:00:00.000Z');
+    await setCursor({ provider: 'microsoft', cursor: 'd1', connectedAt: '2026-10-21T08:00:00.000Z' }, opts);
+    const c = await getCursor(opts);
+    expect(c?.provider).toBe('microsoft');
+    expect(c?.cursor).toBe('d1');
+    expect(c?.connectedAt).toBe('2026-10-21T08:00:00.000Z');
+  });
+
+  it('setCursor without connectedAt keeps the connection time of an existing cursor', async () => {
+    await setCursor({ provider: 'google', cursor: 'h1', connectedAt: '2026-10-01T00:00:00.000Z' }, opts);
+    await setCursor({ provider: 'google', cursor: 'h2', lastPollAt: '2026-10-02T00:00:00.000Z' }, opts);
+    const c = await getCursor(opts);
+    expect(c?.cursor).toBe('h2');
+    expect(c?.connectedAt).toBe('2026-10-01T00:00:00.000Z');
+    expect(c?.lastPollAt).toBe('2026-10-02T00:00:00.000Z');
+  });
 
   it('recordIncoming returns null for a second insert of the same provider id', async () => {
     expect(await recordIncoming(mail(), opts)).not.toBeNull();

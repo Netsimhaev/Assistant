@@ -304,15 +304,23 @@ export async function getCursor(options: Options = {}): Promise<MailCursor | nul
   };
 }
 
+/**
+ * Whole-row write of the cursor. `connectedAt` is written when given (the
+ * connect ceremony passes it, so a reconnect — possibly to another provider —
+ * moves it) and otherwise left as it was (`now()` on a first insert). The
+ * poll fields are replaced as given, `null` when omitted: a caller advancing
+ * the cursor states its own poll outcome.
+ */
 export async function setCursor(c: MailCursor, options: Options = {}): Promise<void> {
   const { businessId, db } = ctx(options);
   await db.query(
-    `INSERT INTO mailbox_cursor (business_id, provider, cursor, last_poll_at, last_error)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO mailbox_cursor (business_id, provider, cursor, connected_at, last_poll_at, last_error)
+     VALUES ($1, $2, $3, COALESCE($6::timestamptz, now()), $4, $5)
      ON CONFLICT (business_id) DO UPDATE SET
        provider = EXCLUDED.provider, cursor = EXCLUDED.cursor,
+       connected_at = COALESCE($6::timestamptz, mailbox_cursor.connected_at),
        last_poll_at = EXCLUDED.last_poll_at, last_error = EXCLUDED.last_error`,
-    [businessId, c.provider, c.cursor, c.lastPollAt ?? null, c.lastError ?? null],
+    [businessId, c.provider, c.cursor, c.lastPollAt ?? null, c.lastError ?? null, c.connectedAt ?? null],
   );
 }
 

@@ -28,6 +28,7 @@ import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibilit
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { stripBidiControls } from '../util/bidi.js';
+import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import { formatMinor } from '../util/money.js';
 
 /** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
@@ -645,7 +646,13 @@ function connectionRowHtml(row: ConnectionRow, csrf: string): string {
            <input type="hidden" name="csrf" value="${esc(csrf)}">
            <button type="submit">ביטול החיבור</button>
          </form>`
-      : connectionAcceptsOAuthCeremony(connection)
+      : connection.system === MAILBOX_SYSTEM
+        ? // The mailbox's ceremony needs a provider, and the provider must be
+          // the one the owner signed for: its own page builds that link
+          // (`mailbox-connect.ts`). A bare `/oauth/mailbox/start` here would
+          // be refused with a 400.
+          '<a href="/connections/mailbox">לחיבור</a>'
+        : connectionAcceptsOAuthCeremony(connection)
         ? `<a href="${startPath}">לחיבור</a>`
         : '<span class="muted">לא ניתן לחבר אוטומטית דרך המסך הזה</span>';
 
@@ -751,6 +758,11 @@ export function renderConnections(options: {
   הקריאה הבאה, גם אם ה-scheduler רץ כבר, כבר נכשלת.
 </p>
 ${notice}
+${
+  options.charterStatus === 'ok' && !options.connections.some((c) => c.system === MAILBOX_SYSTEM)
+    ? '<p><a href="/connections/mailbox">חיבור תיבת המייל של העסק (Gmail או Microsoft 365)</a></p>'
+    : ''
+}
 ${sections === '' && notice === '' ? '<p>התקנון הפעיל אינו מצהיר על אף חיבור.</p>' : sections}`,
   );
 }

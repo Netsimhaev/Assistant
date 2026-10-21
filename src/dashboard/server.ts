@@ -73,6 +73,9 @@ import {
   handleOAuthStart,
 } from './oauth-routes.js';
 import type { OAuthRouteOptions } from './oauth-routes.js';
+import type { MailProvider } from '../mail/mailbox.js';
+import type { MailboxClient } from '../mail/providers/types.js';
+import { handleMailboxSignGet, handleMailboxSignPost, handleMailboxStatus } from './mailbox-connect.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { MAX_RECALL, recallMemories } from '../memory/store.js';
@@ -174,6 +177,12 @@ export interface DashboardOptions {
    * keep. No production caller ever passes it.
    */
   oauthFetch?: typeof fetch;
+  /**
+   * Test seam for the mailbox client the OAuth callback takes the initial
+   * cursor with. No production caller passes it: absent, the callback uses
+   * the real Gmail / Graph client for the provider.
+   */
+  mailboxClientFor?: (provider: MailProvider) => MailboxClient;
 }
 
 /**
@@ -2432,6 +2441,20 @@ async function route(
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
   if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
+  // Connecting the business mailbox: sign the charter amendment FIRST, then
+  // run the OAuth ceremony — see `mailbox-connect.ts` for why that order.
+  if (method === 'GET' && pathname === '/connections/mailbox') return handleMailboxStatus(res, businessId);
+  if (method === 'GET' && pathname === '/connections/mailbox/sign') {
+    return handleMailboxSignGet(
+      res,
+      businessId,
+      issueCsrfToken(session.sessionId),
+      new URL(req.url ?? '/', 'http://dashboard.local').searchParams,
+    );
+  }
+  if (method === 'POST' && pathname === '/connections/mailbox/sign') {
+    return handleMailboxSignPost(res, businessId, session, await readFormBody(req));
+  }
   if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, businessId, session);
   if (method === 'POST' && pathname === '/digest/settings')
     return handleDigestSettingsPost(req, res, businessId, session);
@@ -2574,6 +2597,7 @@ export function createServer(options: DashboardOptions = {}): Server {
     dashboardBaseUrl:
       options.dashboardBaseUrl ?? process.env['DASHBOARD_BASE_URL'] ?? DEFAULT_DASHBOARD_BASE_URL,
     ...(options.oauthFetch !== undefined ? { fetchImpl: options.oauthFetch } : {}),
+    ...(options.mailboxClientFor !== undefined ? { mailboxClientFor: options.mailboxClientFor } : {}),
   };
 
   const server = createHttpServer((req, res) => {

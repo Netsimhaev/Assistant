@@ -34,6 +34,10 @@ import { resetDatabase } from '../test/db.js';
 import { createOwner } from './auth.js';
 import { issueCsrfToken } from './csrf.js';
 import { createServer } from './server.js';
+import { buildMailboxAmendment } from '../charter/amend-mailbox.js';
+import { signCharter } from '../charter/sign.js';
+import type { MailProvider } from '../mail/mailbox.js';
+import type { MailboxClient } from '../mail/providers/types.js';
 
 const BUSINESS = 'test-business';
 const USERNAME = 'owner';
@@ -108,13 +112,16 @@ afterAll(async () => {
   await closePool();
 });
 
-async function startServer(options: { oauthFetch?: typeof fetch } = {}): Promise<string> {
+async function startServer(
+  options: { oauthFetch?: typeof fetch; mailboxClientFor?: (provider: MailProvider) => MailboxClient } = {},
+): Promise<string> {
   server = createServer({
     businessId: BUSINESS,
     port: 0,
     credentialKeyPath: keyPath,
     dashboardBaseUrl: DASHBOARD_BASE_URL,
     ...(options.oauthFetch !== undefined ? { oauthFetch: options.oauthFetch } : {}),
+    ...(options.mailboxClientFor !== undefined ? { mailboxClientFor: options.mailboxClientFor } : {}),
   });
   await once(server, 'listening');
   const address = server.address() as AddressInfo;
@@ -1005,17 +1012,26 @@ describe('GET /connections', () => {
 // --- Mailbox connection (Task 4): provider chosen at start, carried on the
 // stored state row, per-provider exchange / account / revoke. -----------------
 describe('mailbox ceremony', () => {
-  const MAILBOX_CONNECTION: CharterConnection = {
-    system: 'mailbox',
-    label: 'תיבת הדואר',
-    channel: 'api',
-    serves: ['mail.send'],
-    target: null,
-    subprocessor: null,
-  };
+  /**
+   * The mailbox connection exists only through the signed amendment
+   * (`charter/amend-mailbox.ts`), which names the chosen provider as its
+   * subprocessor — and the ceremony starts only for that provider. Built
+   * from an installed base so `supersedes` resolves.
+   */
+  async function installMailboxCharter(provider: MailProvider): Promise<void> {
+    const amendment = buildMailboxAmendment(buildCharter(), new Date(), provider);
+    await installCharter(signCharter(amendment, { signedByPersonId: USERNAME, method: 'dashboard_click' }), {
+      businessId: BUSINESS,
+    });
+  }
+
+  /** The callback takes the initial cursor; no real provider in tests. */
+  const fakeMailboxClient = (): MailboxClient =>
+    ({ initialCursor: async () => 'cursor-0' }) as unknown as MailboxClient;
 
   beforeEach(async () => {
-    await installCharter(buildCharter({ connections: [MAILBOX_CONNECTION] }), { businessId: BUSINESS });
+    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await installMailboxCharter('microsoft');
     await putSecret(
       { businessId: BUSINESS, ref: 'MICROSOFT_OAUTH_CLIENT_ID', value: 'ms-client-id', updatedBy: 'test' },
       key,
@@ -1074,7 +1090,7 @@ describe('mailbox ceremony', () => {
   });
 
   it('callback writes the grant with the provider stored on the state, not one from the query string', async () => {
-    const baseUrl = await startServer({ oauthFetch: microsoftFetch() });
+    const baseUrl = await startServer({ oauthFetch: microsoftFetch(), mailboxClientFor: fakeMailboxClient });
     const cookie = await loginWithPassword(baseUrl);
     const start = await fetch(`${baseUrl}/oauth/mailbox/start?provider=microsoft`, {
       headers: { cookie },
@@ -1108,7 +1124,8 @@ describe('mailbox ceremony', () => {
       }
       throw new Error(`unexpected fetch in test: ${url.toString()}`);
     }) as typeof fetch;
-    const baseUrl = await startServer({ oauthFetch: gfetch });
+    await installMailboxCharter('google');
+    const baseUrl = await startServer({ oauthFetch: gfetch, mailboxClientFor: fakeMailboxClient });
     const cookie = await loginWithPassword(baseUrl);
     const start = await fetch(`${baseUrl}/oauth/mailbox/start?provider=google`, {
       headers: { cookie },
