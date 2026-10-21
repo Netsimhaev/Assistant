@@ -30,6 +30,7 @@ function jsonResponse(status: number, body: unknown): Response {
 describe('buildConsentUrl', () => {
   it('asks the provider for a refresh token explicitly', () => {
     const url = buildConsentUrl({
+      authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
       provider: 'google',
       clientId: 'cid',
       redirectUri: REDIRECT_URI,
@@ -47,6 +48,7 @@ describe('buildConsentUrl', () => {
   it('carries the state and the code challenge verbatim, never mutating them', () => {
     const url = new URL(
       buildConsentUrl({
+      authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
         provider: 'google',
         clientId: 'cid',
         redirectUri: REDIRECT_URI,
@@ -64,14 +66,15 @@ describe('buildConsentUrl', () => {
   it('refuses a provider it does not know how to serve', () => {
     expect(() =>
       buildConsentUrl({
-        provider: 'microsoft',
+      authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+        provider: 'yahoo',
         clientId: 'cid',
         redirectUri: REDIRECT_URI,
         scopes: ['s'],
         state: 'st',
         codeChallenge: 'ch',
       }),
-    ).toThrow(/microsoft/);
+    ).toThrow(/yahoo/);
   });
 });
 
@@ -140,6 +143,7 @@ describe('exchangeCode', () => {
       accessToken: 'access-token-value',
       refreshToken: 'refresh-token-value',
       grantedScopes: ['https://www.googleapis.com/auth/calendar.readonly'],
+      idToken: null,
     });
     // PKCE actually travels: the verifier must reach the token request body.
     expect(capturedBody).toContain('code_verifier=verifier-value');
@@ -161,6 +165,7 @@ describe('exchangeCode', () => {
       accessToken: 'access-token-value',
       refreshToken: 'refresh-token-value',
       grantedScopes: [],
+      idToken: null,
     });
   });
 

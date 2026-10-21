@@ -1001,3 +1001,160 @@ describe('GET /connections', () => {
     expect(body).toContain('לא הותקן עדיין תקנון פעיל');
   });
 });
+
+// --- Mailbox connection (Task 4): provider chosen at start, carried on the
+// stored state row, per-provider exchange / account / revoke. -----------------
+describe('mailbox ceremony', () => {
+  const MAILBOX_CONNECTION: CharterConnection = {
+    system: 'mailbox',
+    label: 'תיבת הדואר',
+    channel: 'api',
+    serves: ['mail.send'],
+    target: null,
+    subprocessor: null,
+  };
+
+  beforeEach(async () => {
+    await installCharter(buildCharter({ connections: [MAILBOX_CONNECTION] }), { businessId: BUSINESS });
+    await putSecret(
+      { businessId: BUSINESS, ref: 'MICROSOFT_OAUTH_CLIENT_ID', value: 'ms-client-id', updatedBy: 'test' },
+      key,
+    );
+    await putSecret(
+      { businessId: BUSINESS, ref: 'MICROSOFT_OAUTH_CLIENT_SECRET', value: 'ms-client-secret', updatedBy: 'test' },
+      key,
+    );
+  });
+
+  function microsoftFetch(): typeof fetch {
+    return (async (url: string | URL) => {
+      const href = url.toString();
+      if (href.includes('login.microsoftonline.com') && href.includes('/token')) {
+        return jsonResponse(200, {
+          access_token: 'ms-access',
+          refresh_token: 'ms-refresh',
+          expires_in: 3600,
+          scope: 'Mail.ReadWrite Mail.Send User.Read offline_access',
+        });
+      }
+      if (href.includes('graph.microsoft.com/v1.0/me')) {
+        return jsonResponse(200, { mail: null, userPrincipalName: 'owner@contoso.example' });
+      }
+      throw new Error(`unexpected fetch in test: ${href}`);
+    }) as typeof fetch;
+  }
+
+  it('start for mailbox with provider=microsoft redirects to login.microsoftonline.com with the four scopes', async () => {
+    const baseUrl = await startServer({ oauthFetch: microsoftFetch() });
+    const cookie = await loginWithPassword(baseUrl);
+    const res = await fetch(`${baseUrl}/oauth/mailbox/start?provider=microsoft`, {
+      headers: { cookie },
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    const url = new URL(res.headers.get('location') ?? '');
+    expect(url.hostname).toBe('login.microsoftonline.com');
+    expect(url.searchParams.get('scope')?.split(' ').sort()).toEqual(
+      ['Mail.ReadWrite', 'Mail.Send', 'User.Read', 'offline_access'].sort(),
+    );
+    expect(url.searchParams.get('response_mode')).toBe('query');
+    expect(url.searchParams.get('access_type')).toBeNull();
+    expect(url.searchParams.get('client_id')).toBe('ms-client-id');
+  });
+
+  it('start for mailbox without a valid provider is refused and writes no state', async () => {
+    const baseUrl = await startServer({ oauthFetch: microsoftFetch() });
+    const cookie = await loginWithPassword(baseUrl);
+    for (const q of ['', '?provider=yahoo']) {
+      const res = await fetch(`${baseUrl}/oauth/mailbox/start${q}`, { headers: { cookie }, redirect: 'manual' });
+      expect(res.status).toBe(400);
+    }
+    const { rows } = await getPool().query('SELECT count(*)::text AS n FROM oauth_states');
+    expect(rows[0]?.['n']).toBe('0');
+  });
+
+  it('callback writes the grant with the provider stored on the state, not one from the query string', async () => {
+    const baseUrl = await startServer({ oauthFetch: microsoftFetch() });
+    const cookie = await loginWithPassword(baseUrl);
+    const start = await fetch(`${baseUrl}/oauth/mailbox/start?provider=microsoft`, {
+      headers: { cookie },
+      redirect: 'manual',
+    });
+    const state = new URL(start.headers.get('location') ?? '').searchParams.get('state');
+    const res = await fetch(`${baseUrl}/oauth/callback?state=${state}&code=c&provider=google`, {
+      headers: { cookie },
+    });
+    expect(res.status).toBe(200);
+    const grant = await readGrantBySystem('mailbox', BUSINESS, key);
+    expect(grant?.provider).toBe('microsoft');
+    expect(grant?.account).toBe('owner@contoso.example');
+    expect(grant?.refreshToken).toBe('ms-refresh');
+    const binding = (await loadBindings({ businessId: BUSINESS })).find((b) => b.system === 'mailbox');
+    expect(binding?.provider).toBe('microsoft');
+    expect(binding?.credentialRef).toBe('OAUTH_MAILBOX');
+  });
+
+  it('google mailbox start uses the Gmail scopes, and the account comes from the id-token email claim', async () => {
+    const idToken = `h.${Buffer.from(JSON.stringify({ email: 'me@gmail.example' })).toString('base64url')}.s`;
+    const gfetch = (async (url: string | URL) => {
+      if (url.toString().includes('oauth2.googleapis.com/token')) {
+        return jsonResponse(200, {
+          access_token: 'ga',
+          refresh_token: 'gr',
+          expires_in: 3600,
+          scope: 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send openid email',
+          id_token: idToken,
+        });
+      }
+      throw new Error(`unexpected fetch in test: ${url.toString()}`);
+    }) as typeof fetch;
+    const baseUrl = await startServer({ oauthFetch: gfetch });
+    const cookie = await loginWithPassword(baseUrl);
+    const start = await fetch(`${baseUrl}/oauth/mailbox/start?provider=google`, {
+      headers: { cookie },
+      redirect: 'manual',
+    });
+    const loc = new URL(start.headers.get('location') ?? '');
+    expect(loc.hostname).toBe('accounts.google.com');
+    expect(loc.searchParams.get('scope')).toContain('gmail.modify');
+    expect(loc.searchParams.get('access_type')).toBe('offline');
+    const res = await fetch(`${baseUrl}/oauth/callback?state=${loc.searchParams.get('state')}&code=c`, {
+      headers: { cookie },
+    });
+    expect(res.status).toBe(200);
+    const grant = await readGrantBySystem('mailbox', BUSINESS, key);
+    expect(grant?.provider).toBe('google');
+    expect(grant?.account).toBe('me@gmail.example');
+  });
+
+  it('revoking a Microsoft grant revokes locally and makes no provider call', async () => {
+    const baseUrl = await startServer({
+      oauthFetch: (async () => {
+        throw new Error('no provider call expected');
+      }) as typeof fetch,
+    });
+    const cookie = await loginWithPassword(baseUrl);
+    await writeGrant(
+      {
+        businessId: BUSINESS,
+        system: 'mailbox',
+        provider: 'microsoft',
+        credentialRef: 'OAUTH_MAILBOX',
+        account: 'owner@contoso.example',
+        scopes: ['Mail.Send'],
+        refreshToken: 'ms-refresh',
+        grantedBy: 'test',
+      },
+      key,
+    );
+    const csrf = issueCsrfToken(sessionIdFromCookie(cookie));
+    const res = await fetch(`${baseUrl}/oauth/mailbox/revoke`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(await readGrantBySystem('mailbox', BUSINESS, key)).toBeNull();
+  });
+});

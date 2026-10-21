@@ -37,6 +37,7 @@ describe('oauth-state: the anti-forgery gate for the consent ceremony', () => {
       system: 'office-calendar',
       sessionId: 'session-abc',
       codeVerifier: 'verifier-xyz',
+      provider: null,
     });
   });
 

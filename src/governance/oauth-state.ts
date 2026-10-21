@@ -44,6 +44,8 @@ export interface CreateStateInput {
   system: string;
   sessionId: string;
   codeVerifier: string;
+  /** The provider the owner chose at start (mailbox). Stored on the row; the callback reads it from here, never from the query string. */
+  provider?: string;
 }
 
 /**
@@ -67,9 +69,9 @@ export async function createState(
   const state = randomBytes(32).toString('base64url');
   const expiresAt = new Date(Date.now() + STATE_TTL_MS).toISOString();
   await db.query(
-    `INSERT INTO oauth_states (state, business_id, system, session_id, code_verifier, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [state, input.businessId, input.system, input.sessionId, input.codeVerifier, expiresAt],
+    `INSERT INTO oauth_states (state, business_id, system, session_id, code_verifier, expires_at, provider)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [state, input.businessId, input.system, input.sessionId, input.codeVerifier, expiresAt, input.provider ?? null],
   );
   return state;
 }
@@ -107,6 +109,8 @@ export interface ConsumedState {
   system: string;
   sessionId: string;
   codeVerifier: string;
+  /** `null` for a ceremony that had no provider choice (calendar). */
+  provider: string | null;
 }
 
 /**
@@ -139,17 +143,17 @@ export async function consumeState(
   options: { db?: Queryable } = {},
 ): Promise<ConsumedState | null> {
   const db = options.db ?? getPool();
-  const { rows } = await db.query<{ system: string; session_id: string; code_verifier: string }>(
+  const { rows } = await db.query<{ system: string; session_id: string; code_verifier: string; provider: string | null }>(
     `UPDATE oauth_states
         SET consumed_at = now()
       WHERE state = $1
         AND business_id = $2
         AND consumed_at IS NULL
         AND expires_at > now()
-      RETURNING system, session_id, code_verifier`,
+      RETURNING system, session_id, code_verifier, provider`,
     [state, businessId],
   );
   const row = rows[0];
   if (row === undefined) return null;
-  return { system: row.system, sessionId: row.session_id, codeVerifier: row.code_verifier };
+  return { system: row.system, sessionId: row.session_id, codeVerifier: row.code_verifier, provider: row.provider };
 }

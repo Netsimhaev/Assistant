@@ -25,21 +25,20 @@ import {
   GOOGLE_CLIENT_ID_REF,
   GOOGLE_CLIENT_SECRET_REF,
 } from '../orchestrator/adapters/google-token-http.js';
+import {
+  MICROSOFT_CLIENT_ID_REF,
+  MICROSOFT_CLIENT_SECRET_REF,
+} from '../orchestrator/adapters/microsoft-token-http.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
+import type { MailProvider } from '../mail/mailbox.js';
+import { GOOGLE_TOKEN_URL } from './oauth-profiles.js';
 
-/** The only provider this ceremony knows how to talk to today. See module docblock. */
-const SUPPORTED_PROVIDER = 'google';
+/** The providers this ceremony talks to: Google (calendar, Gmail) and Microsoft (mailbox only). */
+function isSupportedProvider(provider: string): provider is MailProvider {
+  return provider === 'google' || provider === 'microsoft';
+}
 
-const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
-
-/**
- * Google's token endpoint. The same URL `google-token-http.ts` uses for a
- * refresh -- duplicated as a literal rather than imported, because that
- * module does not export its own copy (`DEFAULT_TOKEN_ENDPOINT` is private
- * there) and a provider's token endpoint is a fixed public fact, not
- * configuration either module should take from the other.
- */
-const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+const MICROSOFT_ME_ENDPOINT = 'https://graph.microsoft.com/v1.0/me';
 
 /**
  * Google's primary calendar resource, read with the SAME access token and
@@ -70,6 +69,8 @@ export function codeChallengeFor(verifier: string): string {
 
 export interface BuildConsentUrlInput {
   provider: string;
+  /** From the per-system profile (`oauth-profiles.ts`). */
+  authorizeUrl: string;
   clientId: string;
   redirectUri: string;
   scopes: readonly string[];
@@ -93,10 +94,10 @@ export interface BuildConsentUrlInput {
  * hour -- see spec 5.3.
  */
 export function buildConsentUrl(input: BuildConsentUrlInput): string {
-  if (input.provider !== SUPPORTED_PROVIDER) {
+  if (!isSupportedProvider(input.provider)) {
     throw new Error(`buildConsentUrl: הספק "${input.provider}" אינו נתמך`);
   }
-  const url = new URL(GOOGLE_AUTH_ENDPOINT);
+  const url = new URL(input.authorizeUrl);
   url.searchParams.set('client_id', input.clientId);
   url.searchParams.set('redirect_uri', input.redirectUri);
   url.searchParams.set('response_type', 'code');
@@ -104,7 +105,12 @@ export function buildConsentUrl(input: BuildConsentUrlInput): string {
   url.searchParams.set('state', input.state);
   url.searchParams.set('code_challenge', input.codeChallenge);
   url.searchParams.set('code_challenge_method', 'S256');
-  url.searchParams.set('access_type', 'offline');
+  if (input.provider === 'google') {
+    // Google-only: Microsoft gets its refresh token from the `offline_access` scope.
+    url.searchParams.set('access_type', 'offline');
+  } else {
+    url.searchParams.set('response_mode', 'query');
+  }
   url.searchParams.set('prompt', 'consent');
   return url.toString();
 }
@@ -116,6 +122,10 @@ export interface ExchangeCodeInput {
   /** Resolves the APPLICATION's own client id/secret -- never the business's grant. Production: `storedCredentials(key)`. */
   credentials: CredentialSource;
   businessId: string;
+  /** Defaults to `'google'`. Selects the client refs and, with `tokenUrl`, the endpoint. */
+  provider?: MailProvider;
+  /** From the per-system profile. Defaults to Google's. */
+  tokenUrl?: string;
   /** Test seam only. No production caller ever passes it -- the same discipline `googleTokenHttp`'s `fetchImpl` keeps. */
   fetchImpl?: typeof fetch;
 }
@@ -128,6 +138,8 @@ export type ExchangeCodeOutcome =
       refreshToken: string | null;
       /** What the provider actually GRANTED, from its own `scope` field -- never what was requested. A provider may hand back fewer scopes than asked for; recording the request instead would be a lie about what the assistant can actually do. */
       grantedScopes: string[];
+      /** Google OIDC `id_token` when `openid` was granted, else `null`. Used only to read the account's email. */
+      idToken: string | null;
     }
   | { ok: false; kind: 'misconfigured' | 'rejected' | 'transient'; message: string };
 
@@ -146,6 +158,7 @@ const GoogleAuthCodeSuccessBody = z.object({
   access_token: z.string().min(1),
   refresh_token: z.string().min(1).optional(),
   scope: z.string().optional(),
+  id_token: z.string().min(1).optional(),
 });
 
 /**
@@ -166,16 +179,20 @@ const GoogleAuthCodeSuccessBody = z.object({
 export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCodeOutcome> {
   const doFetch = input.fetchImpl ?? fetch;
 
+  const provider = input.provider ?? 'google';
+  const names = provider === 'microsoft' ? 'Microsoft' : 'Google';
+  const idRef = provider === 'microsoft' ? MICROSOFT_CLIENT_ID_REF : GOOGLE_CLIENT_ID_REF;
+  const secretRef = provider === 'microsoft' ? MICROSOFT_CLIENT_SECRET_REF : GOOGLE_CLIENT_SECRET_REF;
+  const tokenUrl = input.tokenUrl ?? GOOGLE_TOKEN_URL;
   const [clientId, clientSecret] = await Promise.all([
-    input.credentials.resolve(GOOGLE_CLIENT_ID_REF, input.businessId),
-    input.credentials.resolve(GOOGLE_CLIENT_SECRET_REF, input.businessId),
+    input.credentials.resolve(idRef, input.businessId),
+    input.credentials.resolve(secretRef, input.businessId),
   ]);
   if (clientId === null || clientSecret === null) {
     return {
       ok: false,
       kind: 'misconfigured',
-      message:
-        `תצורת ה-OAuth של Google חסרה — יש להקציב ${GOOGLE_CLIENT_ID_REF} ו-${GOOGLE_CLIENT_SECRET_REF} במאגר הסודות`,
+      message: `תצורת ה-OAuth של ${names} חסרה — יש להקציב ${idRef} ו-${secretRef} במאגר הסודות`,
     };
   }
 
@@ -190,7 +207,7 @@ export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCo
 
   let response: Response;
   try {
-    response = await doFetch(GOOGLE_TOKEN_ENDPOINT, {
+    response = await doFetch(tokenUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
@@ -199,7 +216,7 @@ export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCo
     return {
       ok: false,
       kind: 'transient',
-      message: `כשל רשת בהחלפת קוד ההרשאה מול Google: ${errorText(error)}`,
+      message: `כשל רשת בהחלפת קוד ההרשאה מול ${names}: ${errorText(error)}`,
     };
   }
 
@@ -209,7 +226,7 @@ export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCo
       return {
         ok: false,
         kind: 'transient',
-        message: 'Google החזירה תשובה תקינה בסטטוס אך עם גוף שלא ניתן לפענח',
+        message: `${names} החזיר תשובה תקינה בסטטוס אך עם גוף שלא ניתן לפענח`,
       };
     }
     return {
@@ -219,6 +236,7 @@ export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCo
       grantedScopes: (parsed.data.scope ?? '')
         .split(/\s+/)
         .filter((scope) => scope.length > 0),
+      idToken: parsed.data.id_token ?? null,
     };
   }
 
@@ -229,14 +247,14 @@ export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCo
     return {
       ok: false,
       kind: 'transient',
-      message: `כשל זמני מול Google — סטטוס ${response.status}${suffix}`,
+      message: `כשל זמני מול ${names} — סטטוס ${response.status}${suffix}`,
     };
   }
 
   return {
     ok: false,
     kind: 'rejected',
-    message: `Google דחתה את קוד ההרשאה — סטטוס ${response.status}${suffix}`,
+    message: `${names} דחה את קוד ההרשאה — סטטוס ${response.status}${suffix}`,
   };
 }
 
@@ -285,4 +303,47 @@ async function readErrorCode(response: Response): Promise<string | null> {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The account's email from a Google OIDC id-token (`openid email` scopes).
+ * The token arrived directly from Google's token endpoint over TLS in the
+ * same exchange, so its signature is not re-verified; it is read only as a
+ * display label for the owner, never as a fact any decision depends on.
+ * `null` on any malformed input.
+ */
+export function emailFromIdToken(idToken: string | null): string | null {
+  if (idToken === null) return null;
+  const part = idToken.split('.')[1];
+  if (part === undefined) return null;
+  try {
+    const claims: unknown = JSON.parse(Buffer.from(part, 'base64url').toString('utf8'));
+    if (typeof claims !== 'object' || claims === null) return null;
+    const email = (claims as Record<string, unknown>)['email'];
+    return typeof email === 'string' && email.length > 0 ? email : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The Microsoft account's address: Graph `/me` -> `mail ?? userPrincipalName`. `null` on any failure; a label only. */
+export async function fetchMicrosoftAccount(
+  accessToken: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  let response: Response;
+  try {
+    response = await fetchImpl(MICROSOFT_ME_ENDPOINT, { headers: { Authorization: `Bearer ${accessToken}` } });
+  } catch {
+    return null;
+  }
+  if (response.status < 200 || response.status >= 300) return null;
+  const body = await readJson(response);
+  if (typeof body !== 'object' || body === null) return null;
+  const record = body as Record<string, unknown>;
+  for (const key of ['mail', 'userPrincipalName']) {
+    const value = record[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return null;
 }

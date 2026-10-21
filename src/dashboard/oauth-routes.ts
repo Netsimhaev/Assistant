@@ -43,6 +43,12 @@ import {
   GOOGLE_CLIENT_ID_REF,
   GOOGLE_CLIENT_SECRET_REF,
 } from '../orchestrator/adapters/google-token-http.js';
+import {
+  MICROSOFT_CLIENT_ID_REF,
+  MICROSOFT_CLIENT_SECRET_REF,
+} from '../orchestrator/adapters/microsoft-token-http.js';
+import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
+import type { MailProvider } from '../mail/mailbox.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
 import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import { verifyCsrfToken } from './csrf.js';
@@ -51,18 +57,29 @@ import {
   buildConsentUrl,
   codeChallengeFor,
   createCodeVerifier,
+  emailFromIdToken,
   exchangeCode,
   fetchGoogleAccount,
+  fetchMicrosoftAccount,
 } from './oauth-consent.js';
+import {
+  GOOGLE_REVOKE_URL,
+  GOOGLE_TOKEN_URL,
+  MICROSOFT_TOKEN_URL,
+  oauthProfileFor,
+} from './oauth-profiles.js';
 
-/** The one provider this ceremony authorises today. See module docblock. */
-const OAUTH_PROVIDER = 'google';
-
-/** The narrowest scope that allows the one read this subproject serves -- calendar events, read-only. Widening it is a separate decision, requiring re-consent (spec 5.3). */
-const GOOGLE_CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
-
-/** Google's token revocation endpoint. No client authentication required -- the token itself is the credential being revoked. */
-const GOOGLE_REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
+/**
+ * The provider for a ceremony start. `mailbox` takes the owner's choice from
+ * the `provider` query parameter (validated against `MailProvider`); every
+ * other system is Google-only (calendar). The value is then stored on the
+ * single-use state row, and the callback reads it from there.
+ */
+function chosenProvider(system: string, query: URLSearchParams | undefined): MailProvider | null {
+  if (system !== MAILBOX_SYSTEM) return 'google';
+  const raw = query?.get('provider') ?? null;
+  return raw === 'google' || raw === 'microsoft' ? raw : null;
+}
 
 /**
  * The same default `buildRuntime` (`orchestrator/runtime.ts`) uses for
@@ -301,6 +318,7 @@ export async function handleOAuthStart(
   session: OAuthSession,
   system: string,
   options: OAuthRouteOptions,
+  query?: URLSearchParams,
 ): Promise<void> {
   try {
     assertValidOAuthSystemName(system);
@@ -325,7 +343,16 @@ export async function handleOAuthStart(
     active = null;
   }
   const connection = active?.charter.connections.find((c) => c.system === system);
-  if (!connectionAcceptsOAuthCeremony(connection)) {
+  const provider = chosenProvider(system, query);
+  if (provider === null) {
+    return sendHtml(
+      res,
+      400,
+      page('ספק לא תקין', errorBlock('יש לבחור ספק דואר: google או microsoft. לא בוצעה כל פעולה.')),
+    );
+  }
+  const profile = connection === undefined ? null : oauthProfileFor(connection, provider);
+  if (connection === undefined || profile === null || !connectionAcceptsOAuthCeremony(connection)) {
     return sendHtml(
       res,
       400,
@@ -360,9 +387,11 @@ export async function handleOAuthStart(
   // owner has to start the whole ceremony over having learned nothing they
   // could not have been told up front.
   const credentials = storedCredentials(key);
+  const idRef = provider === 'microsoft' ? MICROSOFT_CLIENT_ID_REF : GOOGLE_CLIENT_ID_REF;
+  const secretRef = provider === 'microsoft' ? MICROSOFT_CLIENT_SECRET_REF : GOOGLE_CLIENT_SECRET_REF;
   const [clientId, clientSecret] = await Promise.all([
-    credentials.resolve(GOOGLE_CLIENT_ID_REF, businessId),
-    credentials.resolve(GOOGLE_CLIENT_SECRET_REF, businessId),
+    credentials.resolve(idRef, businessId),
+    credentials.resolve(secretRef, businessId),
   ]);
   if (clientId === null || clientSecret === null) {
     return sendHtml(
@@ -371,7 +400,7 @@ export async function handleOAuthStart(
       page(
         'תצורה חסרה',
         errorBlock(
-          `תצורת ה-OAuth של Google חסרה — יש להקציב ${GOOGLE_CLIENT_ID_REF} ו-${GOOGLE_CLIENT_SECRET_REF} ` +
+          `תצורת ה-OAuth של ${provider === 'microsoft' ? 'Microsoft' : 'Google'} חסרה — יש להקציב ${idRef} ו-${secretRef} ` +
             'במאגר הסודות לפני שאפשר להתחיל.',
         ),
       ),
@@ -379,12 +408,19 @@ export async function handleOAuthStart(
   }
 
   const codeVerifier = createCodeVerifier();
-  const state = await createState({ businessId, system, sessionId: session.sessionId, codeVerifier });
+  const state = await createState({
+    businessId,
+    system,
+    sessionId: session.sessionId,
+    codeVerifier,
+    ...(system === MAILBOX_SYSTEM ? { provider } : {}),
+  });
   const consentUrl = buildConsentUrl({
-    provider: OAUTH_PROVIDER,
+    provider,
+    authorizeUrl: profile.authorizeUrl,
     clientId: clientId.value,
     redirectUri: redirectUriFor(options.dashboardBaseUrl),
-    scopes: [GOOGLE_CALENDAR_READONLY_SCOPE],
+    scopes: profile.scopes,
     state,
     codeChallenge: codeChallengeFor(codeVerifier),
   });
@@ -426,6 +462,11 @@ export async function handleOAuthCallback(
   // Trusted from here on -- the row this session actually opened, never the
   // query string.
   const system = consumed.system;
+  // The provider the owner chose at start, from the stored row. Only the
+  // mailbox records one; everything else is the Google calendar ceremony.
+  const provider: MailProvider =
+    consumed.provider === 'microsoft' ? 'microsoft' : 'google';
+  const providerName = provider === 'microsoft' ? 'Microsoft' : 'Google';
 
   const providerError = params.get('error');
   if (providerError !== null) {
@@ -459,6 +500,8 @@ export async function handleOAuthCallback(
     code,
     codeVerifier: consumed.codeVerifier,
     redirectUri: redirectUriFor(options.dashboardBaseUrl),
+    provider,
+    tokenUrl: provider === 'microsoft' ? MICROSOFT_TOKEN_URL : GOOGLE_TOKEN_URL,
     credentials: storedCredentials(key),
     businessId,
     ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
@@ -469,7 +512,7 @@ export async function handleOAuthCallback(
   }
 
   if (exchange.refreshToken === null) {
-    // access_type=offline + prompt=consent were both sent (buildConsentUrl's
+    // access_type=offline (Google) or offline_access (Microsoft), plus prompt=consent, were sent (buildConsentUrl's
     // own docblock) -- a missing refresh token here means something is
     // already wrong (a stale, already-authorised grant Google silently
     // re-approved before this ceremony asked for `prompt=consent`, most
@@ -480,7 +523,7 @@ export async function handleOAuthCallback(
       page(
         'ההרשאה נכשלה',
         errorBlock(
-          'Google לא החזירה אסימון רענון עבור החיבור הזה. אם המערכת כבר חוברה בעבר, יש לבטל אותה ולנסות שוב.',
+          `${providerName} לא החזיר אסימון רענון עבור החיבור הזה. אם המערכת כבר חוברה בעבר, יש לבטל אותה ולנסות שוב.`,
         ),
       ),
     );
@@ -492,7 +535,15 @@ export async function handleOAuthCallback(
   // could reassign the property.
   const refreshToken: string = exchange.refreshToken;
 
-  const account = (await fetchGoogleAccount(exchange.accessToken, options.fetchImpl)) ?? 'לא זוהה';
+  // Account label: Microsoft -> Graph /me; Google mailbox -> `openid email`
+  // id-token claim; Google calendar -> the primary calendar's id.
+  const accountLookup =
+    provider === 'microsoft'
+      ? await fetchMicrosoftAccount(exchange.accessToken, options.fetchImpl)
+      : system === MAILBOX_SYSTEM
+        ? emailFromIdToken(exchange.idToken)
+        : await fetchGoogleAccount(exchange.accessToken, options.fetchImpl);
+  const account = accountLookup ?? 'לא זוהה';
   const credentialRef = credentialRefForSystem(system);
 
   // The grant, its audit row, and the binding write are ONE transaction --
@@ -518,7 +569,7 @@ export async function handleOAuthCallback(
       {
         businessId,
         system,
-        provider: OAUTH_PROVIDER,
+        provider,
         credentialRef,
         account,
         scopes: exchange.grantedScopes,
@@ -539,9 +590,9 @@ export async function handleOAuthCallback(
         // `erasure.ts`'s owner-triggered actions.
         charterVersion: 'n/a',
         provenance: 'boss',
-        inputHash: canonicalHash({ businessId, system, provider: OAUTH_PROVIDER, credentialRef }),
+        inputHash: canonicalHash({ businessId, system, provider, credentialRef }),
         reason:
-          `oauth consent granted for system "${system}" (provider: ${OAUTH_PROVIDER}) by ${session.username}; ` +
+          `oauth consent granted for system "${system}" (provider: ${provider}) by ${session.username}; ` +
           `scopes: ${exchange.grantedScopes.length > 0 ? exchange.grantedScopes.join(', ') : '(none reported)'}`,
       },
       { businessId, tx },
@@ -559,7 +610,7 @@ export async function handleOAuthCallback(
         status: 'live',
         endpoint: existing?.endpoint ?? null,
         credentialRef,
-        provider: OAUTH_PROVIDER,
+        provider,
         lastOkAt: existing?.lastOkAt ?? null,
         lastError: existing?.lastError ?? null,
       },
@@ -638,17 +689,22 @@ export async function handleOAuthRevoke(
   // instead of assuming the call itself proves something was live.
   const changed = await revokeGrant(system, businessId, session.username);
 
-  type ProviderOutcome = 'revoked' | 'failed' | 'no_live_grant' | 'key_unavailable';
+  type ProviderOutcome = 'revoked' | 'failed' | 'no_live_grant' | 'key_unavailable' | 'no_revoke_endpoint';
   let providerOutcome: ProviderOutcome;
   if (keyUnavailable) {
     providerOutcome = 'key_unavailable';
   } else if (grant === null) {
     providerOutcome = 'no_live_grant';
+  } else if (grant.provider !== 'google') {
+    // Microsoft offers no token revocation endpoint for this flow: the local
+    // revoke is the whole act, and the owner can remove the app's access in
+    // their Microsoft account settings.
+    providerOutcome = 'no_revoke_endpoint';
   } else {
     providerOutcome = 'failed';
     try {
       const doFetch = options.fetchImpl ?? fetch;
-      const response = await doFetch(GOOGLE_REVOKE_ENDPOINT, {
+      const response = await doFetch(GOOGLE_REVOKE_URL, {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ token: grant.refreshToken }).toString(),
@@ -666,6 +722,7 @@ export async function handleOAuthRevoke(
     revoked: 'the provider confirmed revocation',
     failed: 'the provider-side revocation attempt failed — the local revoke is authoritative regardless',
     no_live_grant: 'no live grant was found to revoke at the provider',
+    no_revoke_endpoint: 'the provider has no token revocation endpoint — the local revoke is the whole act',
     key_unavailable:
       'could not attempt provider revocation — the master key would not open, so whether access remains at the provider is unknown',
   };

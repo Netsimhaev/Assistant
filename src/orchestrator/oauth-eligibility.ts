@@ -37,10 +37,16 @@
  * imported for the identical reason. A second provider needs a real mapping
  * from provider to served-tools here, not a second predicate module.
  */
-import { GOOGLE_CALENDAR_SERVED_TOOLS } from './adapters/google-calendar.js';
+import { oauthProfileFor } from '../dashboard/oauth-profiles.js';
 import type { CharterConnection } from '../domain/connection.js';
 
 /**
+ * **Per-system profiles (mailbox connection, Task 4).** "Eligible" is now
+ * `oauthProfileFor(connection) !== null` (`dashboard/oauth-profiles.ts`): the
+ * `mailbox` connection serving `mail.send`, or any connection serving
+ * `calendar.read`. This predicate therefore no longer implies "a calendar
+ * adapter exists" -- `runtime.ts` checks `calendar.read` explicitly for that.
+ *
  * Whether a charter-declared connection is one the OAuth ceremony (and the
  * adapter it authorises) can actually serve.
  *
@@ -59,6 +65,5 @@ import type { CharterConnection } from '../domain/connection.js';
  */
 export function connectionAcceptsOAuthCeremony(connection: CharterConnection | undefined): boolean {
   if (connection === undefined) return false;
-  if (connection.channel !== 'api') return false;
-  return GOOGLE_CALENDAR_SERVED_TOOLS.some((tool) => connection.serves.includes(tool));
+  return oauthProfileFor(connection) !== null && connection.channel === 'api';
 }

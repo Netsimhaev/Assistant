@@ -2457,7 +2457,14 @@ async function route(
     if (raw !== undefined) {
       const system = decodePathSegment(raw);
       if (system === null) return sendHtml(res, 404, renderNotFound());
-      return handleOAuthStart(res, businessId, session, system, oauthOptions);
+      return handleOAuthStart(
+        res,
+        businessId,
+        session,
+        system,
+        oauthOptions,
+        new URL(req.url ?? '/', 'http://dashboard.local').searchParams,
+      );
     }
   }
   if (method === 'GET' && pathname === '/oauth/callback') {

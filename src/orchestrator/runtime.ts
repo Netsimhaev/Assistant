@@ -10,12 +10,13 @@ import { browserAdapter } from './adapters/browser.js';
 import { createGoogleCalendarAdapter } from './adapters/google-calendar.js';
 import type { CalendarHttp } from './adapters/google-calendar.js';
 import { googleTokenHttp } from './adapters/google-token-http.js';
+import { microsoftTokenHttp } from './adapters/microsoft-token-http.js';
+import { providerTokenHttp } from './adapters/provider-token-http.js';
 import { createMailAdapter } from './adapters/mail.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { loadBindings } from './bindings.js';
 import { CREDENTIAL_REF_PATTERN } from './credentials.js';
 import type { CredentialSource } from './credentials.js';
-import { connectionAcceptsOAuthCeremony } from './oauth-eligibility.js';
 import { oauthCredentials } from './oauth-token.js';
 import type { TokenHttp } from './oauth-token.js';
 import type { CredentialHandle } from './adapters/types.js';
@@ -267,7 +268,10 @@ export async function buildRuntime(
     fallback: storedCredentials(key),
     http:
       overrides.tokenHttp ??
-      googleTokenHttp({ credentials: storedCredentials(key) }),
+      providerTokenHttp({
+        google: googleTokenHttp({ credentials: storedCredentials(key) }),
+        microsoft: microsoftTokenHttp({ credentials: storedCredentials(key) }),
+      }),
   });
 
   // A missing ref is a warning below, in the same place APPROVAL_NOTIFY_TO's
@@ -559,7 +563,11 @@ export async function buildRuntime(
     // OAuth ceremony (`oauth-routes.ts`'s `handleOAuthStart`) and the
     // connections screen (`views.ts`) answer this exact question with the
     // same function, not a second copy that can drift.
-    if (!connectionAcceptsOAuthCeremony(connection)) continue;
+    // Explicit, NOT `connectionAcceptsOAuthCeremony`: that predicate now also
+    // accepts the `mailbox` connection (it has an OAuth profile), and a
+    // mailbox binding must never receive a calendar adapter.
+    if (connection === undefined || connection.channel !== 'api') continue;
+    if (!connection.serves.includes('calendar.read')) continue;
     // The `serves` check above closes the SEEDED case (a charter that
     // declares `office-mail` for `mail.send` only, so it never reaches
     // here at all) but not the general one (fix-round 2, finding I3): a
