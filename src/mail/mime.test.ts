@@ -36,3 +36,31 @@ describe('capBody', () => {
     expect(capBody('short')).toEqual({ text: 'short', truncated: false });
   });
 });
+
+describe('header injection', () => {
+  it('an encoded CR/LF inside the angle brackets is never decoded into the address', () => {
+    expect(parseAddress('X <=?UTF-8?Q?a@b.com=0D=0ABcc:_victim@y.com?=>')).toBeNull();
+    expect(parseAddress('a@b.com\r\nBcc: v@y.com')).toBeNull();
+    expect(parseAddress('"x y" <a b@c.com>')).toBeNull();
+  });
+  it('a display name cannot carry a line break', () => {
+    const p = parseAddress('=?UTF-8?Q?x=0D=0Ay?= <a@b.com>');
+    expect(p?.address).toBe('a@b.com');
+    expect(p?.name).not.toMatch(/[\r\n]/);
+    expect(decodeHeader('=?UTF-8?Q?a=0D=0Ab?=')).not.toMatch(/[\r\n]/);
+  });
+});
+
+describe('decodeHeader multibyte split', () => {
+  it('decodes a character split across adjacent encoded words', () => {
+    expect(decodeHeader('=?UTF-8?Q?=D7?= =?UTF-8?Q?=A9?=')).toBe('ש');
+  });
+});
+
+describe('capBody surrogate safety', () => {
+  it('does not end on half a surrogate pair', () => {
+    const r = capBody('x'.repeat(MAX_BODY_CHARS - 1) + '😀' + 'tail');
+    expect(r.truncated).toBe(true);
+    expect(r.text.length).toBe(MAX_BODY_CHARS - 1);
+  });
+});

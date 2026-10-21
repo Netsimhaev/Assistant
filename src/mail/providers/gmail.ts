@@ -7,12 +7,24 @@
  * Every method returns a failure value rather than throwing.
  */
 import type { HeaderFlags, IncomingMail, MailAttachment } from '../inbox-store.js';
-import { capBody, decodeHeader, htmlToText, isBulkPrecedence, parseAddress, parseAddressList } from '../mime.js';
+import { MAIL_LABELS } from '../mailbox.js';
+import {
+  ADDRESS_SHAPE,
+  capBody,
+  decodeBytes,
+  decodeHeader,
+  htmlToText,
+  isBulkPrecedence,
+  parseAddress,
+  parseAddressList,
+} from '../mime.js';
 import {
   asRecord,
+  cursorExpired,
   defaultMailboxHttp,
   failureFromStatus,
   guarded,
+  labelNotAllowed,
   MailboxCursorError,
   ok2xx,
   type MailboxClient,
@@ -46,8 +58,14 @@ function walk(part: GmailPart, visit: (p: GmailPart) => void, depth = 0): void {
   for (const child of part.parts ?? []) walk(child, visit, depth + 1);
 }
 
-function decodeData(data: string | undefined): string {
-  return data === undefined ? '' : Buffer.from(data, 'base64url').toString('utf8');
+const ALLOWED_LABELS: readonly string[] = Object.values(MAIL_LABELS);
+const GMAIL_LABEL_ID = /^Label_\d+$/;
+
+/** Decode a part body using the charset its Content-Type declares (Hebrew mail is often windows-1255). */
+function decodeData(data: string | undefined, headers: GmailPart['headers']): string {
+  if (data === undefined) return '';
+  const charset = /charset\s*=\s*"?([^";\s]+)/i.exec(headerOf(headers, 'Content-Type') ?? '')?.[1];
+  return decodeBytes(Buffer.from(data, 'base64url'), charset ?? 'utf-8');
 }
 
 function toIncoming(raw: unknown): IncomingMail | null {
@@ -61,17 +79,20 @@ function toIncoming(raw: unknown): IncomingMail | null {
   let html = '';
   const attachments: MailAttachment[] = [];
   walk(payload, (p) => {
-    if (p.filename !== undefined && p.filename !== '' && p.body?.attachmentId !== undefined) {
-      attachments.push({
-        attachmentId: p.body.attachmentId,
-        filename: p.filename,
-        mediaType: p.mimeType ?? 'application/octet-stream',
-        size: p.body.size ?? 0,
-      });
+    if (p.filename !== undefined && p.filename !== '') {
+      // A named part is an attachment, never body text, even when its data is inline.
+      if (p.body?.attachmentId !== undefined) {
+        attachments.push({
+          attachmentId: p.body.attachmentId,
+          filename: p.filename,
+          mediaType: p.mimeType ?? 'application/octet-stream',
+          size: p.body.size ?? 0,
+        });
+      }
       return;
     }
-    if (p.mimeType === 'text/plain') plain += decodeData(p.body?.data);
-    else if (p.mimeType === 'text/html') html += decodeData(p.body?.data);
+    if (p.mimeType === 'text/plain') plain += decodeData(p.body?.data, p.headers);
+    else if (p.mimeType === 'text/html') html += decodeData(p.body?.data, p.headers);
   });
   const text = plain.trim() !== '' ? plain : htmlToText(html);
   const body = capBody(text);
@@ -115,12 +136,21 @@ function encodeSubject(subject: string): string {
   return `=?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`;
 }
 
-function buildRaw(reply: OutgoingReply): string {
+/** Builds the RFC 822 message, or a failure when any header value could carry a line break or a bad address. */
+function buildRaw(reply: OutgoingReply): string | MailboxFailure {
   const refs = [reply.references, reply.inReplyTo].filter((v): v is string => v !== null && v !== '').join(' ');
   const encodedBody = (Buffer.from(reply.body, 'utf8').toString('base64').match(/.{1,76}/g) ?? []).join('\r\n');
+  const subject = encodeSubject(reply.subject);
+  const headerValues = [...reply.to, subject, reply.inReplyTo, refs];
+  if (headerValues.some((v) => /[\r\n]/.test(v))) {
+    return { failure: 'rejected', status: 0, message: 'reply header value contains a line break' };
+  }
+  if (reply.to.length === 0 || !reply.to.every((a) => ADDRESS_SHAPE.test(a))) {
+    return { failure: 'rejected', status: 0, message: 'reply recipient is not a plain address' };
+  }
   const lines = [
     `To: ${reply.to.join(', ')}`,
-    `Subject: ${encodeSubject(reply.subject)}`,
+    `Subject: ${subject}`,
     `In-Reply-To: ${reply.inReplyTo}`,
     `References: ${refs}`,
     'MIME-Version: 1.0',
@@ -135,7 +165,16 @@ function buildRaw(reply: OutgoingReply): string {
 export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): MailboxClient {
   return {
     async initialCursor(token, signal) {
-      const res = await http.request({ method: 'GET', url: `${BASE}/profile`, accessToken: token, signal });
+      let res: Awaited<ReturnType<MailboxHttp['request']>>;
+      try {
+        res = await http.request({ method: 'GET', url: `${BASE}/profile`, accessToken: token, signal });
+      } catch (error) {
+        throw new MailboxCursorError({
+          failure: 'transient',
+          status: 0,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
       const historyId = asRecord(res.body)['historyId'];
       if (!ok2xx(res.status)) throw new MailboxCursorError(failureFromStatus(res.status, res.body));
       if (typeof historyId !== 'string' && typeof historyId !== 'number') {
@@ -149,6 +188,7 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
         const ids: string[] = [];
         let nextCursor = cursor;
         let pageToken: string | null = null;
+        let exhausted = false;
         for (let page = 0; page < MAX_HISTORY_PAGES; page++) {
           const url = new URL(`${BASE}/history`);
           url.searchParams.set('startHistoryId', cursor);
@@ -156,6 +196,8 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
           url.searchParams.set('labelId', 'INBOX');
           if (pageToken !== null) url.searchParams.set('pageToken', pageToken);
           const res = await http.request({ method: 'GET', url: url.toString(), accessToken: token, signal });
+          // An old startHistoryId is answered with 404: that cursor can never work again.
+          if (res.status === 404) return cursorExpired(res.status, 'startHistoryId is too old');
           if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);
           const body = asRecord(res.body);
           if (body['historyId'] !== undefined) nextCursor = String(body['historyId']);
@@ -173,9 +215,14 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
             }
           }
           const next = body['nextPageToken'];
-          if (typeof next !== 'string' || next === '') break;
+          if (typeof next !== 'string' || next === '') {
+            exhausted = true;
+            break;
+          }
           pageToken = next;
         }
+        // Never advance the cursor past pages we did not read.
+        if (!exhausted) return { failure: 'transient', status: 0, message: 'history page cap reached' } as MailboxFailure;
 
         const messages: IncomingMail[] = [];
         for (const id of ids) {
@@ -213,6 +260,8 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
 
     ensureLabels(token, names, signal) {
       return guarded(async () => {
+        const bad = names.find((n) => !ALLOWED_LABELS.includes(n));
+        if (bad !== undefined) return labelNotAllowed(bad);
         const list = await http.request({ method: 'GET', url: `${BASE}/labels`, accessToken: token, signal });
         if (!ok2xx(list.status)) return failureFromStatus(list.status, list.body);
         const existing = new Map<string, string>();
@@ -246,8 +295,11 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
       });
     },
 
-    addLabel(token, providerMessageId, _labelName, labelId, signal) {
+    addLabel(token, providerMessageId, labelName, labelId, signal) {
       return guarded(async () => {
+        // Only our own labels, only by a user-label id: a system label id can never pass.
+        if (!ALLOWED_LABELS.includes(labelName)) return labelNotAllowed(labelName);
+        if (!GMAIL_LABEL_ID.test(labelId)) return labelNotAllowed(labelId);
         const res = await http.request({
           method: 'POST',
           url: `${BASE}/messages/${encodeURIComponent(providerMessageId)}/modify`,
@@ -262,11 +314,13 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
 
     sendReply(token, reply, signal) {
       return guarded(async () => {
+        const raw = buildRaw(reply);
+        if (typeof raw !== 'string') return raw;
         const res = await http.request({
           method: 'POST',
           url: `${BASE}/messages/send`,
           accessToken: token,
-          body: { raw: Buffer.from(buildRaw(reply), 'utf8').toString('base64url'), threadId: reply.threadId },
+          body: { raw: Buffer.from(raw, 'utf8').toString('base64url'), threadId: reply.threadId },
           signal,
         });
         if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);

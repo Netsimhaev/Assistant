@@ -45,7 +45,8 @@ function listRoutes(msg: unknown) {
         body: { value: [{ id: 'at1', name: 'inv.pdf', contentType: 'application/pdf', size: 99 }] },
       };
     }
-    return { status: 200, body: { value: [msg], '@odata.deltaLink': `${DELTA}2` } };
+    if (/\/me\/messages\/g1\?/.test(r.url)) return { status: 200, body: msg };
+    return { status: 200, body: { value: [{ id: 'g1' }], '@odata.deltaLink': `${DELTA}2` } };
   };
 }
 
@@ -94,7 +95,8 @@ describe('graph client', () => {
     const { http } = fake(() => {
       n++;
       if (n === 1) return { status: 200, body: { value: [{ id: 'x', '@removed': { reason: 'deleted' } }], '@odata.nextLink': 'https://graph.microsoft.com/next' } };
-      return { status: 200, body: { value: [graphMessage({ hasAttachments: false })], '@odata.deltaLink': 'D2' } };
+      if (n === 2) return { status: 200, body: { value: [{ id: 'g1' }, { id: 'g1' }], '@odata.deltaLink': 'D2' } };
+      return { status: 200, body: graphMessage({ hasAttachments: false }) };
     });
     const r = await createGraphClient(http).listSince('tok', DELTA, signal);
     if ('failure' in r) throw new Error('unexpected failure');
@@ -113,11 +115,8 @@ describe('graph client', () => {
     expect(patch.body).toEqual({ categories: ['Red', 'חשבוניות'] });
   });
 
-  it('sendReply creates a reply draft addressed to the given recipients and sends it', async () => {
-    const { http, calls } = fake((r) => {
-      if (r.url.endsWith('/createReply')) return { status: 201, body: { id: 'draft1' } };
-      return { status: 202, body: null };
-    });
+  it('sendReply is a single POST to /reply with explicit recipients and no draft calls', async () => {
+    const { http, calls } = fake(() => ({ status: 202, body: null }));
     const r = await createGraphClient(http).sendReply(
       'tok',
       {
@@ -131,22 +130,22 @@ describe('graph client', () => {
       },
       signal,
     );
-    expect(r).toEqual({ externalId: 'draft1' });
-    expect(calls[0]?.url).toContain('/me/messages/g1/createReply');
-    const patch = calls.find((c) => c.method === 'PATCH')!;
-    expect(patch.url).toContain('/me/messages/draft1');
-    expect(patch.body).toMatchObject({
-      toRecipients: [{ emailAddress: { address: 'dana@example.com' } }],
-      body: { contentType: 'text', content: 'תודה' },
+    expect(r).toEqual({ externalId: null });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe('POST');
+    expect(calls[0]?.url).toMatch(/\/me\/messages\/g1\/reply$/);
+    expect(calls[0]?.body).toEqual({
+      message: { toRecipients: [{ emailAddress: { address: 'dana@example.com' } }], ccRecipients: [] },
+      comment: 'תודה',
     });
-    expect(calls[calls.length - 1]?.url).toContain('/me/messages/draft1/send');
+    expect(calls.some((c) => /createReply|\/send$/.test(c.url) || c.method === 'PATCH')).toBe(false);
   });
 
   it('sendReply without providerMessageId is rejected', async () => {
     const { http } = fake(() => ({ status: 200, body: {} }));
     const r = await createGraphClient(http).sendReply(
       'tok',
-      { to: ['a@b.com'], subject: 's', body: 'b', inReplyTo: '<x>', references: null, threadId: 'c' },
+      { to: ['a@b.com'], subject: 's', body: 'b', inReplyTo: '<x>', references: null, threadId: 'c', providerMessageId: '' },
       signal,
     );
     expect(r).toMatchObject({ failure: 'rejected' });
@@ -156,7 +155,7 @@ describe('graph client', () => {
     const { http } = fake(() => ({ status: 401, body: { error: { message: 'expired' } } }));
     const c = createGraphClient(http);
     expect(await c.listSince('tok', DELTA, signal)).toMatchObject({ failure: 'auth', status: 401 });
-    expect(await c.addLabel('tok', 'g', 'x', 'y', signal)).toMatchObject({ failure: 'auth' });
+    expect(await c.addLabel('tok', 'g', 'חשבוניות', 'y', signal)).toMatchObject({ failure: 'auth' });
     await expect(c.initialCursor('tok', signal)).rejects.toBeInstanceOf(MailboxCursorError);
   });
 
@@ -170,7 +169,39 @@ describe('graph client', () => {
     const cursor = await createGraphClient(http).initialCursor('tok', signal);
     expect(cursor).toBe('DELTA-FINAL');
     expect(calls[0]?.url).toContain('mailFolders/inbox/messages/delta');
+    const first = decodeURIComponent(calls[0]?.url ?? '');
+    expect(first).toMatch(/\$filter=receivedDateTime ge \d{4}-\d{2}-\d{2}T/);
+    expect(first).toContain('$select=id');
+    expect(first).not.toContain('body');
+    expect(calls[0]?.headers).toEqual({ Prefer: 'odata.maxpagesize=50' });
     expect(calls).toHaveLength(2);
+  });
+
+  it('410 and syncStateNotFound map to cursor_expired', async () => {
+    const gone = fake(() => ({ status: 410, body: null }));
+    expect(await createGraphClient(gone.http).listSince('tok', DELTA, signal)).toMatchObject({ failure: 'cursor_expired' });
+    const sync = fake(() => ({ status: 400, body: { error: { code: 'syncStateNotFound', message: 'x' } } }));
+    expect(await createGraphClient(sync.http).listSince('tok', DELTA, signal)).toMatchObject({ failure: 'cursor_expired' });
+  });
+
+  it('addLabel and ensureLabels accept only the closed label set, with zero HTTP calls otherwise', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: {} }));
+    const c = createGraphClient(http);
+    expect(await c.addLabel('tok', 'g1', 'SPAM', 'x', signal)).toMatchObject({ failure: 'rejected' });
+    expect(await c.addLabel('tok', 'g1', 'Junk', 'x', signal)).toMatchObject({ failure: 'rejected' });
+    expect(await c.ensureLabels('tok', ['Red'], signal)).toMatchObject({ failure: 'rejected' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('sendReply refuses a recipient that is not a plain address, with no HTTP call', async () => {
+    const { http, calls } = fake(() => ({ status: 202, body: null }));
+    const r = await createGraphClient(http).sendReply(
+      'tok',
+      { to: ['a@b.com\r\nBcc: v@y.com'], subject: 's', body: 'b', inReplyTo: '<x>', references: null, threadId: 'c', providerMessageId: 'g1' },
+      signal,
+    );
+    expect(r).toMatchObject({ failure: 'rejected' });
+    expect(calls).toHaveLength(0);
   });
 
   it('ensureLabels creates only missing categories', async () => {

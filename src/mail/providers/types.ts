@@ -6,11 +6,13 @@ export interface MailboxHttp {
     url: string;
     accessToken: string;
     body?: unknown;
+    /** Extra request headers (e.g. Prefer). The Authorization header is always set by the transport. */
+    headers?: Record<string, string>;
     signal: AbortSignal;
   }): Promise<{ status: number; body: unknown; bytes?: Buffer }>;
 }
 
-export type MailboxFailure = { failure: 'auth' | 'transient' | 'rejected'; status: number; message: string };
+export type MailboxFailure = { failure: 'auth' | 'transient' | 'rejected' | 'cursor_expired'; status: number; message: string };
 
 export interface OutgoingReply {
   to: string[];
@@ -19,8 +21,8 @@ export interface OutgoingReply {
   inReplyTo: string;
   references: string | null;
   threadId: string;
-  /** Provider's own id of the mail being answered. Graph needs it: its reply is addressed by id, not by Message-ID. */
-  providerMessageId?: string;
+  /** Provider's own id of the mail being answered. Graph needs it (its reply is addressed by id, not by Message-ID); Gmail ignores it. */
+  providerMessageId: string;
 }
 
 export interface MailboxClient {
@@ -86,6 +88,11 @@ export function failureFromStatus(status: number, body: unknown): MailboxFailure
   return { failure: 'rejected', status, message: `mailbox provider rejected the request (${status})${suffix}` };
 }
 
+/** The cursor the provider was asked to resume from no longer exists. The poller re-takes it; there is no backfill. */
+export function cursorExpired(status: number, message: string): MailboxFailure {
+  return { failure: 'cursor_expired', status, message: `mailbox cursor expired (${status}): ${message}` };
+}
+
 export function ok2xx(status: number): boolean {
   return status >= 200 && status < 300;
 }
@@ -95,7 +102,7 @@ export function defaultMailboxHttp(): MailboxHttp {
   return {
     async request(input) {
       try {
-        const headers: Record<string, string> = { Authorization: `Bearer ${input.accessToken}` };
+        const headers: Record<string, string> = { ...input.headers, Authorization: `Bearer ${input.accessToken}` };
         const init: RequestInit = { method: input.method, headers, signal: input.signal };
         if (input.body !== undefined) {
           headers['Content-Type'] = 'application/json';
@@ -123,6 +130,11 @@ export async function guarded<T>(fn: () => Promise<T | MailboxFailure>): Promise
   } catch (error) {
     return { failure: 'transient', status: 0, message: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** A write may only name a label from the closed set (src/mail/mailbox.ts). */
+export function labelNotAllowed(name: string): MailboxFailure {
+  return { failure: 'rejected', status: 0, message: `label "${name}" is not in the closed label set` };
 }
 
 export function asRecord(v: unknown): Record<string, unknown> {

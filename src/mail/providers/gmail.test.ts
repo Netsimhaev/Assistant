@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createGmailClient } from './gmail.js';
-import type { MailboxHttp } from './types.js';
+import { MailboxCursorError, type MailboxHttp, type OutgoingReply } from './types.js';
 
 type Req = Parameters<MailboxHttp['request']>[0];
 
@@ -120,6 +120,7 @@ describe('gmail client', () => {
         inReplyTo: '<abc@example.com>',
         references: '<first@example.com>',
         threadId: 't1',
+        providerMessageId: 'm1',
       },
       signal,
     );
@@ -141,9 +142,9 @@ describe('gmail client', () => {
     const { http } = fake(() => ({ status: 401, body: { error: { message: 'bad token' } } }));
     const c = createGmailClient(http);
     expect(await c.listSince('tok', '1', signal)).toMatchObject({ failure: 'auth', status: 401 });
-    expect(await c.addLabel('tok', 'm', 'x', 'y', signal)).toMatchObject({ failure: 'auth' });
+    expect(await c.addLabel('tok', 'm', 'חשבוניות', 'Label_1', signal)).toMatchObject({ failure: 'auth' });
     const net = fake(() => ({ status: 0, body: null }));
-    expect(await createGmailClient(net.http).ensureLabels('tok', ['a'], signal)).toMatchObject({ failure: 'transient' });
+    expect(await createGmailClient(net.http).ensureLabels('tok', ['חשבוניות'], signal)).toMatchObject({ failure: 'transient' });
   });
 
   it('initialCursor reads the profile historyId; ensureLabels creates only missing labels', async () => {
@@ -157,5 +158,126 @@ describe('gmail client', () => {
     const map = await c.ensureLabels('tok', ['חשבוניות', 'ממתין לתשובה'], signal);
     expect(map).toEqual({ חשבוניות: 'L1', 'ממתין לתשובה': 'L2' });
     expect(calls.filter((x) => x.method === 'POST')).toHaveLength(1);
+  });
+
+  it('a From with an encoded CR/LF inside the angle brackets yields no address (no header injection)', async () => {
+    const evil = '"X" <=?UTF-8?Q?a@b.com=0D=0ABcc:_victim@y.com?=>';
+    const { http } = fake(gmailRoutes(message([...BASE_HEADERS.filter(([n]) => n !== 'From'), ['From', evil]])));
+    const r = await createGmailClient(http).listSince('tok', '100', signal);
+    if ('failure' in r) throw new Error('unexpected failure');
+    expect(r.messages[0]?.fromAddress).toBe('');
+    expect(r.messages[0]?.fromAddress).not.toMatch(/[\r\n]/);
+  });
+
+  describe('sendReply refuses header-breaking values without any HTTP call', () => {
+    const ok: OutgoingReply = {
+      to: ['dana@example.com'],
+      subject: 'Re: x',
+      body: 'b',
+      inReplyTo: '<abc@example.com>',
+      references: null,
+      threadId: 't1',
+      providerMessageId: 'm1',
+    };
+    const cases: Array<[string, Partial<OutgoingReply>]> = [
+      ['to with CRLF', { to: ['a@b.com\r\nBcc: v@y.com'] }],
+      ['to not an address', { to: ['not an address'] }],
+      ['inReplyTo with LF', { inReplyTo: '<a>\nBcc: v@y.com' }],
+      ['references with CR', { references: '<a>\rX: y' }],
+    ];
+    for (const [label, patch] of cases) {
+      it(label, async () => {
+        const { http, calls } = fake(() => ({ status: 200, body: { id: 'x' } }));
+        const r = await createGmailClient(http).sendReply('tok', { ...ok, ...patch }, signal);
+        expect(r).toMatchObject({ failure: 'rejected' });
+        expect(calls).toHaveLength(0);
+      });
+    }
+  });
+
+  it('history 404 maps to cursor_expired', async () => {
+    const { http } = fake(() => ({ status: 404, body: { error: { message: 'startHistoryId too old' } } }));
+    expect(await createGmailClient(http).listSince('tok', '1', signal)).toMatchObject({ failure: 'cursor_expired' });
+  });
+
+  it('hitting the history page cap fails transient instead of advancing the cursor', async () => {
+    const { http } = fake((r) =>
+      r.url.includes('/history') ? { status: 200, body: { historyId: '999', nextPageToken: 'more' } } : { status: 404, body: {} },
+    );
+    expect(await createGmailClient(http).listSince('tok', '1', signal)).toMatchObject({ failure: 'transient' });
+  });
+
+  it('addLabel only accepts our label names and user-label ids, with zero HTTP calls otherwise', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: {} }));
+    const c = createGmailClient(http);
+    expect(await c.addLabel('tok', 'm1', 'SPAM', 'SPAM', signal)).toMatchObject({ failure: 'rejected' });
+    expect(await c.addLabel('tok', 'm1', 'חשבוניות', 'TRASH', signal)).toMatchObject({ failure: 'rejected' });
+    expect(await c.addLabel('tok', 'm1', 'UNREAD', 'Label_1', signal)).toMatchObject({ failure: 'rejected' });
+    expect(calls).toHaveLength(0);
+    expect(await c.ensureLabels('tok', ['SPAM'], signal)).toMatchObject({ failure: 'rejected' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('decodes a windows-1255 body by its declared charset', async () => {
+    const msg = {
+      id: 'm1',
+      threadId: 't1',
+      internalDate: '1',
+      payload: {
+        mimeType: 'text/plain',
+        headers: [
+          ...BASE_HEADERS.map(([name, value]) => ({ name, value })),
+          { name: 'Content-Type', value: 'text/plain; charset=windows-1255' },
+        ],
+        body: { data: Buffer.from([0xf9, 0xec, 0xe5, 0xed]).toString('base64url') },
+      },
+    };
+    const { http } = fake(gmailRoutes(msg));
+    const r = await createGmailClient(http).listSince('tok', '100', signal);
+    if ('failure' in r) throw new Error('unexpected failure');
+    expect(r.messages[0]?.bodyText).toBe('שלום');
+  });
+
+  it('a named part with inline data is not appended to the body', async () => {
+    const msg = {
+      id: 'm1',
+      threadId: 't1',
+      internalDate: '1',
+      payload: {
+        mimeType: 'multipart/mixed',
+        headers: BASE_HEADERS.map(([name, value]) => ({ name, value })),
+        parts: [
+          { mimeType: 'text/plain', body: { data: b64u('real body') } },
+          { mimeType: 'text/plain', filename: 'notes.txt', body: { data: b64u('attached text') } },
+        ],
+      },
+    };
+    const { http } = fake(gmailRoutes(msg));
+    const r = await createGmailClient(http).listSince('tok', '100', signal);
+    if ('failure' in r) throw new Error('unexpected failure');
+    expect(r.messages[0]?.bodyText).toBe('real body');
+  });
+
+  it('initialCursor surfaces a thrown HTTP error as MailboxCursorError', async () => {
+    const http: MailboxHttp = {
+      async request() {
+        throw new Error('boom');
+      },
+    };
+    await expect(createGmailClient(http).initialCursor('tok', signal)).rejects.toBeInstanceOf(MailboxCursorError);
+  });
+});
+
+describe('gmail subject encoding', () => {
+  it('a subject carrying CR/LF is encoded into one word, never a second header', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: { id: 'x' } }));
+    await createGmailClient(http).sendReply(
+      'tok',
+      { to: ['a@b.com'], subject: 'hi\r\nBcc: v@y.com', body: 'b', inReplyTo: '<x>', references: null, threadId: 't', providerMessageId: 'm' },
+      signal,
+    );
+    const raw = Buffer.from((calls[0]?.body as { raw: string }).raw, 'base64url').toString('utf8');
+    const headerBlock = raw.split('\r\n\r\n')[0]!;
+    expect(headerBlock.split('\r\n').some((l) => /^bcc:/i.test(l))).toBe(false);
   });
 });

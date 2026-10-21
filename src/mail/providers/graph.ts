@@ -8,12 +8,15 @@
  * Every method returns a failure value rather than throwing.
  */
 import type { HeaderFlags, IncomingMail, MailAttachment } from '../inbox-store.js';
-import { capBody, htmlToText, isBulkPrecedence } from '../mime.js';
+import { MAIL_LABELS } from '../mailbox.js';
+import { ADDRESS_SHAPE, capBody, htmlToText, isBulkPrecedence } from '../mime.js';
 import {
   asRecord,
+  cursorExpired,
   defaultMailboxHttp,
   failureFromStatus,
   guarded,
+  labelNotAllowed,
   MailboxCursorError,
   ok2xx,
   type MailboxClient,
@@ -24,13 +27,30 @@ import {
 const BASE = 'https://graph.microsoft.com/v1.0';
 const SELECT =
   'id,conversationId,internetMessageId,subject,from,replyTo,toRecipients,receivedDateTime,body,hasAttachments,internetMessageHeaders';
-const INITIAL_DELTA_URL = `${BASE}/me/mailFolders/inbox/messages/delta?$select=${SELECT}`;
 const MAX_PAGES = 200;
+const DELTA_HEADERS = { Prefer: 'odata.maxpagesize=50' };
+const ALLOWED_LABELS: readonly string[] = Object.values(MAIL_LABELS);
+
+/**
+ * The initial delta only needs to reach a deltaLink: filter to mail received from now on
+ * (no backfill) and select just the id so the walk stays tiny. Later delta pages carry
+ * only ids as well; `listSince` fetches each message in full.
+ */
+function initialDeltaUrl(now: Date): string {
+  const filter = encodeURIComponent(`receivedDateTime ge ${now.toISOString()}`);
+  return `${BASE}/me/mailFolders/inbox/messages/delta?$filter=${filter}&$select=id`;
+}
+
+function isExpiredCursor(status: number, body: unknown): boolean {
+  if (status === 410) return true;
+  const code = asRecord(asRecord(body)['error'])['code'];
+  return typeof code === 'string' && /^(syncStateNotFound|resyncRequired|syncStateInvalid)$/i.test(code);
+}
 
 function addressOf(v: unknown): { address: string; name: string | null } | null {
   const email = asRecord(asRecord(v)['emailAddress']);
   const address = email['address'];
-  if (typeof address !== 'string' || address.trim() === '') return null;
+  if (typeof address !== 'string' || !ADDRESS_SHAPE.test(address.trim())) return null;
   const name = email['name'];
   return {
     address: address.trim().toLowerCase(),
@@ -100,7 +120,8 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
     const entries: Array<Record<string, unknown>> = [];
     let url = startUrl;
     for (let page = 0; page < MAX_PAGES; page++) {
-      const res = await http.request({ method: 'GET', url, accessToken: token, signal });
+      const res = await http.request({ method: 'GET', url, accessToken: token, headers: DELTA_HEADERS, signal });
+      if (isExpiredCursor(res.status, res.body)) return cursorExpired(res.status, 'delta state is no longer valid');
       if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);
       const body = asRecord(res.body);
       for (const v of Array.isArray(body['value']) ? body['value'] : []) entries.push(asRecord(v));
@@ -119,7 +140,7 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
   return {
     async initialCursor(token, signal) {
       // Consume the whole initial delta without keeping a message: no backfill.
-      const result = await guarded(() => walkDelta(token, INITIAL_DELTA_URL, signal));
+      const result = await guarded(() => walkDelta(token, initialDeltaUrl(new Date()), signal));
       if ('failure' in result) throw new MailboxCursorError(result);
       return result.deltaLink;
     },
@@ -129,12 +150,25 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
         const walked = await walkDelta(token, cursor, signal);
         if ('failure' in walked) return walked;
         const messages: IncomingMail[] = [];
+        // Delta also reports messages that merely changed, so one may come back more than once;
+        // the store dedupes on (business, provider message id).
+        const seen = new Set<string>();
         for (const entry of walked.entries) {
           if (entry['@removed'] !== undefined) continue;
           const id = entry['id'];
-          if (typeof id !== 'string') continue;
+          if (typeof id !== 'string' || seen.has(id)) continue;
+          seen.add(id);
+          const full = await http.request({
+            method: 'GET',
+            url: `${BASE}/me/messages/${encodeURIComponent(id)}?$select=${SELECT}`,
+            accessToken: token,
+            signal,
+          });
+          if (full.status === 404) continue; // gone since the delta
+          if (!ok2xx(full.status)) return failureFromStatus(full.status, full.body);
+          const raw = asRecord(full.body);
           const attachments: MailAttachment[] = [];
-          if (entry['hasAttachments'] === true) {
+          if (raw['hasAttachments'] === true) {
             const res = await http.request({
               method: 'GET',
               url: `${BASE}/me/messages/${encodeURIComponent(id)}/attachments?$select=id,name,contentType,size`,
@@ -154,7 +188,7 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
               });
             }
           }
-          const mail = toIncoming(entry, attachments);
+          const mail = toIncoming(raw, attachments);
           if (mail !== null) messages.push(mail);
         }
         return { messages, nextCursor: walked.deltaLink };
@@ -180,6 +214,8 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
 
     ensureLabels(token, names, signal) {
       return guarded(async () => {
+        const bad = names.find((n) => !ALLOWED_LABELS.includes(n));
+        if (bad !== undefined) return labelNotAllowed(bad);
         const list = await http.request({
           method: 'GET',
           url: `${BASE}/me/outlook/masterCategories`,
@@ -222,6 +258,7 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
 
     addLabel(token, providerMessageId, labelName, _labelId, signal) {
       return guarded(async () => {
+        if (!ALLOWED_LABELS.includes(labelName)) return labelNotAllowed(labelName);
         const url = `${BASE}/me/messages/${encodeURIComponent(providerMessageId)}`;
         const current = await http.request({ method: 'GET', url: `${url}?$select=categories`, accessToken: token, signal });
         if (!ok2xx(current.status)) return failureFromStatus(current.status, current.body);
@@ -236,39 +273,27 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
 
     sendReply(token, reply, signal) {
       return guarded(async () => {
-        if (reply.providerMessageId === undefined || reply.providerMessageId === '') {
+        if (reply.providerMessageId === '') {
           return { failure: 'rejected', status: 0, message: 'graph reply needs the provider message id' } as MailboxFailure;
         }
-        // createReply threads the draft to the original; the recipients are then set
-        // explicitly so a different Reply-To on the original can never redirect it.
-        const created = await http.request({
-          method: 'POST',
-          url: `${BASE}/me/messages/${encodeURIComponent(reply.providerMessageId)}/createReply`,
-          accessToken: token,
-          body: {},
-          signal,
-        });
-        if (!ok2xx(created.status)) return failureFromStatus(created.status, created.body);
-        const draftId = asRecord(created.body)['id'];
-        if (typeof draftId !== 'string') {
-          return { failure: 'rejected', status: created.status, message: 'createReply returned no id' } as MailboxFailure;
+        if (reply.to.length === 0 || !reply.to.every((a) => ADDRESS_SHAPE.test(a))) {
+          return { failure: 'rejected', status: 0, message: 'reply recipient is not a plain address' } as MailboxFailure;
         }
-        const draftUrl = `${BASE}/me/messages/${encodeURIComponent(draftId)}`;
-        const patched = await http.request({
-          method: 'PATCH',
-          url: draftUrl,
+        // One call, no draft left behind on failure. The recipients are set explicitly so a
+        // different Reply-To on the original can never redirect the answer, and cc stays empty.
+        // Graph answers 202 with an empty body, so there is no sent-message id to report.
+        const res = await http.request({
+          method: 'POST',
+          url: `${BASE}/me/messages/${encodeURIComponent(reply.providerMessageId)}/reply`,
           accessToken: token,
           body: {
-            toRecipients: reply.to.map((address) => ({ emailAddress: { address } })),
-            ccRecipients: [],
-            body: { contentType: 'text', content: reply.body },
+            message: { toRecipients: reply.to.map((address) => ({ emailAddress: { address } })), ccRecipients: [] },
+            comment: reply.body,
           },
           signal,
         });
-        if (!ok2xx(patched.status)) return failureFromStatus(patched.status, patched.body);
-        const sent = await http.request({ method: 'POST', url: `${draftUrl}/send`, accessToken: token, signal });
-        if (!ok2xx(sent.status)) return failureFromStatus(sent.status, sent.body);
-        return { externalId: draftId };
+        if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);
+        return { externalId: null };
       });
     },
   };
