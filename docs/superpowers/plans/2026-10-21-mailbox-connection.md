@@ -518,11 +518,7 @@ Core gate change. `/security-review` is mandatory after this task.
 - Modify: `src/orchestrator/scheduler.ts` (pass `notifyBoss` built from `whatsappMessenger` when present), `src/orchestrator/whatsapp-door.ts` and its routing (mail-card replies), and the tests of the files you touch
 
 **Interfaces:**
-- `renderMailNotice(mail: StoredMail, categories: MailCategory[]): string`:
-  - `📧 ${escName} <${fromAddress}>` then a newline;
-  - a category word: `חשבונית` or `שאלה שמחכה לתשובה`;
-  - the summary;
-  - everything passes through `stripBidiControls`.
+- Consumes `renderMailNotice` (defined in Task 9, `src/mail/whatsapp-notice.ts`).
 - `renderMailCardWhatsApp(approval: ApprovalRequest, payload): string`:
   - recipient address, subject and **full body**;
   - then `השב "שלח" כדי לשלוח, או כתוב נוסח חדש במקומה.`
