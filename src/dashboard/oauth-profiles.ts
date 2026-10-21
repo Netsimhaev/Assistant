@@ -11,6 +11,7 @@
 import type { CharterConnection } from '../domain/connection.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import type { MailProvider } from '../mail/mailbox.js';
+import { MICROSOFT_TOKEN_ENDPOINT } from '../orchestrator/adapters/microsoft-token-http.js';
 
 export interface OAuthProfile {
   provider: MailProvider;
@@ -25,7 +26,7 @@ export const GOOGLE_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/aut
 export const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 export const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 export const MICROSOFT_AUTHORIZE_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize';
-export const MICROSOFT_TOKEN_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
+export const MICROSOFT_TOKEN_URL = MICROSOFT_TOKEN_ENDPOINT;
 
 /** The narrowest scope that allows the one calendar read. Widening it requires re-consent. */
 const GOOGLE_CALENDAR_PROFILE: OAuthProfile = {

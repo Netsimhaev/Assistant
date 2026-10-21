@@ -1,7 +1,7 @@
 /**
  * ONE predicate, shared by three call sites that must never be allowed to
- * drift into disagreeing about the same question: "does a Google adapter
- * exist, or will one ever run, for this charter-declared connection?"
+ * drift into disagreeing about the same question: "can an OAuth grant
+ * ever be written for for this charter-declared connection?"
  *
  * Before this module existed, `runtime.ts` answered it once (to decide
  * whether to register `createGoogleCalendarAdapter` for a `provider:
@@ -30,38 +30,30 @@
  * ceremony that accepts a system no adapter will ever serve is exactly the
  * hole item 1 closes.
  *
- * **Provider-agnostic in name, Google-shaped in body, on purpose.** This
- * ceremony authorises exactly one provider today (`oauth-routes.ts`'s own
- * module docblock: "Google only, today"), so the tool list this checks is
- * `GOOGLE_CALENDAR_SERVED_TOOLS` — the same constant `runtime.ts` already
- * imported for the identical reason. A second provider needs a real mapping
- * from provider to served-tools here, not a second predicate module.
+ * **Per-system profiles.** Eligibility is `oauthProfileFor(connection) !== null`
+ * (`dashboard/oauth-profiles.ts`) AND `channel === 'api'`: the `mailbox`
+ * connection serving `mail.send` (Gmail or Microsoft 365, chosen at start), or
+ * any connection serving `calendar.read` (Google Calendar). It therefore does
+ * NOT imply "a calendar adapter exists" -- `runtime.ts` checks `calendar.read`
+ * explicitly when registering that adapter.
  */
 import { oauthProfileFor } from '../dashboard/oauth-profiles.js';
 import type { CharterConnection } from '../domain/connection.js';
 
 /**
- * **Per-system profiles (mailbox connection, Task 4).** "Eligible" is now
- * `oauthProfileFor(connection) !== null` (`dashboard/oauth-profiles.ts`): the
- * `mailbox` connection serving `mail.send`, or any connection serving
- * `calendar.read`. This predicate therefore no longer implies "a calendar
- * adapter exists" -- `runtime.ts` checks `calendar.read` explicitly for that.
- *
- * Whether a charter-declared connection is one the OAuth ceremony (and the
- * adapter it authorises) can actually serve.
+ * Whether a charter-declared connection is one the OAuth ceremony can serve.
  *
  * `undefined` (no connection declared for this system at all) is `false`,
  * never an exception — both call sites already handle "nothing declared" as
  * an ordinary case (`views.ts` renders an unauthorised row for every
  * declared connection regardless; `handleOAuthStart` refuses a system the
  * charter never named exactly the same way it refuses one the charter named
- * but did not serve `calendar.read` on).
+ * but gave no OAuth profile).
  *
- * Checked positively — `channel === 'api'` AND `serves` intersects the
- * provider's own served-tools list — never as "anything that is not
- * `office-mail`" or some other exclusion. `office-mail` is refused here
- * because it fails the `serves` intersection, the same reason ANY
- * non-calendar connection is refused, not because its name is special-cased.
+ * Checked positively -- an OAuth profile exists AND `channel === 'api'` --
+ * never as "anything that is not `office-mail`". `office-mail` is refused
+ * because it has no profile (not the `mailbox` system, serves no calendar
+ * tool), not because its name is special-cased.
  */
 export function connectionAcceptsOAuthCeremony(connection: CharterConnection | undefined): boolean {
   if (connection === undefined) return false;

@@ -66,7 +66,7 @@ describe('buildConsentUrl', () => {
   it('refuses a provider it does not know how to serve', () => {
     expect(() =>
       buildConsentUrl({
-      authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+        authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
         provider: 'yahoo',
         clientId: 'cid',
         redirectUri: REDIRECT_URI,

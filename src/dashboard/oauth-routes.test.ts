@@ -1128,8 +1128,10 @@ describe('mailbox ceremony', () => {
   });
 
   it('revoking a Microsoft grant revokes locally and makes no provider call', async () => {
+    let providerCalls = 0;
     const baseUrl = await startServer({
       oauthFetch: (async () => {
+        providerCalls += 1;
         throw new Error('no provider call expected');
       }) as typeof fetch,
     });
@@ -1156,5 +1158,11 @@ describe('mailbox ceremony', () => {
     });
     expect(res.status).toBe(302);
     expect(await readGrantBySystem('mailbox', BUSINESS, key)).toBeNull();
+    // The route swallows provider-call errors, so a throwing stub proves
+    // nothing: count invocations, and check the audit row names the branch.
+    expect(providerCalls).toBe(0);
+    const audit = await queryAudit({ businessId: BUSINESS, kind: 'credential_change' });
+    const latest = audit[audit.length - 1];
+    expect(latest?.reason).toContain('no token revocation endpoint');
   });
 });

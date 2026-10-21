@@ -64,8 +64,6 @@ import {
 } from './oauth-consent.js';
 import {
   GOOGLE_REVOKE_URL,
-  GOOGLE_TOKEN_URL,
-  MICROSOFT_TOKEN_URL,
   oauthProfileFor,
 } from './oauth-profiles.js';
 
@@ -360,7 +358,7 @@ export async function handleOAuthStart(
         'מערכת לא נתמכת',
         errorBlock(
           `המערכת "${system}" אינה מוגדרת בתקנון החתום כחיבור שתהליך ההרשאה הזה יכול לשרת — ` +
-            'נדרש חיבור בערוץ API שמשרת קריאת יומן. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
+            'נדרש חיבור בערוץ API שמשרת קריאת יומן (calendar.read), או את חיבור תיבת הדואר (mailbox) שמשרת mail.send. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
         ),
       ),
     );
@@ -501,7 +499,6 @@ export async function handleOAuthCallback(
     codeVerifier: consumed.codeVerifier,
     redirectUri: redirectUriFor(options.dashboardBaseUrl),
     provider,
-    tokenUrl: provider === 'microsoft' ? MICROSOFT_TOKEN_URL : GOOGLE_TOKEN_URL,
     credentials: storedCredentials(key),
     businessId,
     ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),

@@ -31,7 +31,7 @@ import {
 } from '../orchestrator/adapters/microsoft-token-http.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
 import type { MailProvider } from '../mail/mailbox.js';
-import { GOOGLE_TOKEN_URL } from './oauth-profiles.js';
+import { GOOGLE_TOKEN_URL, MICROSOFT_TOKEN_URL } from './oauth-profiles.js';
 
 /** The providers this ceremony talks to: Google (calendar, Gmail) and Microsoft (mailbox only). */
 function isSupportedProvider(provider: string): provider is MailProvider {
@@ -124,8 +124,6 @@ export interface ExchangeCodeInput {
   businessId: string;
   /** Defaults to `'google'`. Selects the client refs and, with `tokenUrl`, the endpoint. */
   provider?: MailProvider;
-  /** From the per-system profile. Defaults to Google's. */
-  tokenUrl?: string;
   /** Test seam only. No production caller ever passes it -- the same discipline `googleTokenHttp`'s `fetchImpl` keeps. */
   fetchImpl?: typeof fetch;
 }
@@ -183,7 +181,7 @@ export async function exchangeCode(input: ExchangeCodeInput): Promise<ExchangeCo
   const names = provider === 'microsoft' ? 'Microsoft' : 'Google';
   const idRef = provider === 'microsoft' ? MICROSOFT_CLIENT_ID_REF : GOOGLE_CLIENT_ID_REF;
   const secretRef = provider === 'microsoft' ? MICROSOFT_CLIENT_SECRET_REF : GOOGLE_CLIENT_SECRET_REF;
-  const tokenUrl = input.tokenUrl ?? GOOGLE_TOKEN_URL;
+  const tokenUrl = provider === 'microsoft' ? MICROSOFT_TOKEN_URL : GOOGLE_TOKEN_URL;
   const [clientId, clientSecret] = await Promise.all([
     input.credentials.resolve(idRef, input.businessId),
     input.credentials.resolve(secretRef, input.businessId),

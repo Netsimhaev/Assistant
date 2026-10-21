@@ -74,6 +74,7 @@ export interface OAuthGrantSummary {
   system: string;
   provider: string;
   credentialRef: string;
+  /** Display label only -- never an authority (not for "is this sender ourselves", not for building a From). */
   account: string;
   scopes: string[];
   grantedAt: string;
@@ -93,6 +94,7 @@ export interface WriteGrantInput {
   system: string;
   provider: string;
   credentialRef: string;
+  /** Display label only -- never an authority (not for "is this sender ourselves", not for building a From). */
   account: string;
   scopes: readonly string[];
   refreshToken: string;
