@@ -30,7 +30,12 @@ import { loadJob } from './jobs.js';
 import { raiseMailReply, type RaisedReply } from './mail-reply.js';
 import { runDueJobs } from './run-due.js';
 import { runWhatsAppDoor } from './whatsapp-door.js';
-import { MULTIPLE_MAIL_CARDS_REFUSAL, presentMailCard } from './whatsapp-mail-card.js';
+import {
+  EMPTY_REPLACEMENT,
+  MAIL_CARD_CLOSED,
+  MULTIPLE_MAIL_CARDS_REFUSAL,
+  presentMailCard,
+} from './whatsapp-mail-card.js';
 
 const BUSINESS = 'test-business';
 const PRINCIPAL = '+972500000000';
@@ -44,14 +49,16 @@ afterAll(async () => {
 });
 
 let nextId = 0;
-function textMsg(senderNumber: string, body: string): NormalizedInboundMessage {
+function textMsg(senderNumber: string, body: string, providerTimestamp?: string): NormalizedInboundMessage {
   nextId += 1;
   return {
     providerMessageId: `wamid.mail-card-${nextId}`,
     senderNumber,
     body,
     mediaKind: null,
-    providerTimestamp: new Date().toISOString(),
+    // The owner answers a moment after the card arrives — never in the same
+    // instant (`openMailCards` requires strictly after the presentation).
+    providerTimestamp: providerTimestamp ?? new Date(Date.now() + 1_000).toISOString(),
   };
 }
 
@@ -64,6 +71,14 @@ function audioMsg(senderNumber: string): NormalizedInboundMessage {
     mediaKind: 'audio',
     providerTimestamp: new Date().toISOString(),
     downloadAudio: async () => ({ bytes: Buffer.from('x'), mimeType: 'audio/ogg', seconds: 3 }),
+  };
+}
+
+/** A planner that records it was reached and declines, so nothing is planned. */
+function plannerReached(onCall: () => unknown) {
+  return async (_request: PlanRequest): Promise<PlanOutcome> => {
+    onCall();
+    return { status: 'unparseable', raw: '', reason: 'test' };
   };
 }
 
@@ -173,7 +188,7 @@ describe('approve-by-WhatsApp', () => {
     const raised = await raiseAndPresent(h);
     const original = await getApproval(raised.approvalId, { businessId: BUSINESS });
 
-    h.gateway.enqueue(textMsg(PRINCIPAL, 'שלום דנה, ההצעה תגיע ביום ראשון.'));
+    h.gateway.enqueue(textMsg(PRINCIPAL, '‏נוסח: שלום דנה, ההצעה תגיע ביום ראשון.'));
     const result = await door(h);
     expect(result.mailCardReplies).toBe(1);
 
@@ -203,7 +218,7 @@ describe('approve-by-WhatsApp', () => {
     const h = await harness();
     const raised = await raiseAndPresent(h);
 
-    h.gateway.enqueue(textMsg(PRINCIPAL, 'נוסח חדש לגמרי'));
+    h.gateway.enqueue(textMsg(PRINCIPAL, 'נוסח : נוסח חדש לגמרי'));
     await door(h);
     h.gateway.enqueue(textMsg(PRINCIPAL, 'שלח'));
     await door(h);
@@ -248,32 +263,76 @@ describe('approve-by-WhatsApp', () => {
     expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
   });
 
-  it('a voice note never approves or edits: it asks him to type, and the card stays as it was', async () => {
+  it('a voice note inside the window goes to the ordinary door and never approves', async () => {
     const h = await harness();
     const raised = await raiseAndPresent(h);
-    let transcribed = 0;
+    let planned = 0;
 
     h.gateway.enqueue(audioMsg(PRINCIPAL));
     const result = await runWhatsAppDoor({
       gateway: h.gateway,
       messenger: h.messenger,
       businessId: BUSINESS,
-      planner: neverPlanned,
-      provider: async () => {
-        transcribed += 1;
-        return { text: 'שלח' };
-      },
+      planner: plannerReached(() => (planned += 1)),
+      provider: async () => ({ text: 'שלח' }),
     });
 
-    expect(transcribed).toBe(0);
-    expect(result.refused).toBe(1);
-    expect(lastSent(h)).toContain('"שלח"');
+    expect(planned).toBe(1);
+    expect(result.mailCardReplies).toBe(0);
     expect((await approvalsFor(raised.replyJobId)).map((r) => r.state)).toEqual(['pending']);
 
-    // The window is still open: a typed "שלח" right after still approves.
+    // The card is still open: a typed "שלח" right after approves it.
     h.gateway.enqueue(textMsg(PRINCIPAL, 'שלח'));
     await door(h);
     expect((await approvalsFor(raised.replyJobId)).map((r) => r.state)).toEqual(['approved']);
+  });
+
+  it('a plain instruction inside the window reaches the instruction door and the card stays open', async () => {
+    const h = await harness();
+    const raised = await raiseAndPresent(h);
+    let planned = 0;
+
+    h.gateway.enqueue(textMsg(PRINCIPAL, 'תזכירי לי מחר להתקשר לספק'));
+    const result = await door(h, plannerReached(() => (planned += 1)));
+
+    expect(planned).toBe(1);
+    expect(result.mailCardReplies).toBe(0);
+    expect((await approvalsFor(raised.replyJobId)).map((r) => r.state)).toEqual(['pending']);
+
+    h.gateway.enqueue(textMsg(PRINCIPAL, 'שלח'));
+    await door(h);
+    expect((await approvalsFor(raised.replyJobId)).map((r) => r.state)).toEqual(['approved']);
+  });
+
+  it('"נוסח:" with nothing after it is refused and changes nothing', async () => {
+    const h = await harness();
+    const raised = await raiseAndPresent(h);
+
+    for (const body of ['נוסח:', 'נוסח:   ‏‮ ']) {
+      h.gateway.enqueue(textMsg(PRINCIPAL, body));
+      const result = await door(h);
+      expect(result.refused).toBe(1);
+      expect(lastSent(h)).toBe(EMPTY_REPLACEMENT);
+    }
+    expect((await approvalsFor(raised.replyJobId)).map((r) => r.state)).toEqual(['pending']);
+  });
+
+  it('a "שלח" sent before a card was presented never approves that card', async () => {
+    const h = await harness();
+    const a = await raiseAndPresent(h, 1);
+    const beforeB = new Date(Date.now() - 1_000).toISOString();
+    // Card A is decided on the dashboard; card B is then presented.
+    await getPool().query(
+      "UPDATE approval_requests SET state = 'denied', decided_by = 'p', decided_at = now(), input_hash_at_decision = input_hash WHERE job_id = $1",
+      [a.replyJobId],
+    );
+    const b = await raiseAndPresent(h, 2);
+
+    // The owner's "שלח", typed for card A, is only delivered now.
+    h.gateway.enqueue(textMsg(PRINCIPAL, 'שלח', beforeB));
+    await door(h, plannerReached(() => undefined));
+
+    expect((await approvalsFor(b.replyJobId)).map((r) => r.state)).toEqual(['pending']);
   });
 
   it('a closure word closes the window without deciding, and the next message is an instruction again', async () => {
@@ -283,6 +342,8 @@ describe('approve-by-WhatsApp', () => {
     h.gateway.enqueue(textMsg(PRINCIPAL, 'סגרנו'));
     const closed = await door(h);
     expect(closed.closed).toBe(1);
+    expect(lastSent(h)).toBe(MAIL_CARD_CLOSED);
+    expect(MAIL_CARD_CLOSED).toContain('טיוטת המייל');
     expect((await approvalsFor(raised.replyJobId)).map((r) => r.state)).toEqual(['pending']);
 
     let planned = 0;

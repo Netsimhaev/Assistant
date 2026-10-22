@@ -57,7 +57,7 @@ describe('renderMailCardWhatsApp', () => {
     expect(text).toContain('Re: מתי תגיע ההצעה?');
     expect(text).toContain('שלום דנה,\nנחזור אלייך עד מחר.');
     expect(text.endsWith(MAIL_CARD_INSTRUCTION)).toBe(true);
-    expect(MAIL_CARD_INSTRUCTION).toBe('השב "שלח" כדי לשלוח, או כתוב נוסח חדש במקומה.');
+    expect(MAIL_CARD_INSTRUCTION).toBe('השב "שלח" כדי לשלוח, או "נוסח:" ואחריו נוסח חדש.');
   });
 
   it('strips bidi controls from every field it shows, the body included', () => {
@@ -71,6 +71,12 @@ describe('renderMailCardWhatsApp', () => {
     const text = renderMailCardWhatsApp(approval(), { ...PAYLOAD, body: 'נוסח חדש של הבעלים' });
     expect(text).toContain('נוסח חדש של הבעלים');
     expect(text).not.toContain('נחזור אלייך עד מחר');
+  });
+
+  it('refuses to render a payload that does not name exactly one recipient', () => {
+    expect(() => renderMailCardWhatsApp(approval(), { ...PAYLOAD, to: ['a@x.example', 'b@x.example'] })).toThrow();
+    expect(() => renderMailCardWhatsApp(approval(), { ...PAYLOAD, to: [] })).toThrow();
+    expect(() => renderMailCardWhatsApp(approval(), { ...PAYLOAD, to: 'a@x.example' })).toThrow();
   });
 
   it('repeats the warning lines the card header carries', () => {

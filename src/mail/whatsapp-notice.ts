@@ -53,7 +53,7 @@ export function renderMailNotice(mail: MailNoticeInput, categories: readonly Mai
  * something the sender or the model wrote — so an outbound row ending with
  * it is a card this code sent.
  */
-export const MAIL_CARD_INSTRUCTION = 'השב "שלח" כדי לשלוח, או כתוב נוסח חדש במקומה.';
+export const MAIL_CARD_INSTRUCTION = 'השב "שלח" כדי לשלוח, או "נוסח:" ואחריו נוסח חדש.';
 
 /** Shown first, so the owner reads what the message is before he reads the body. */
 const CARD_TITLE = '✉️ טיוטת תשובה לאישור';
@@ -81,8 +81,14 @@ export function renderMailCardWhatsApp(approval: ApprovalRequest, payload: unkno
       ? (payload as Record<string, unknown>)
       : {};
   const own = (key: string): unknown => (Object.hasOwn(record, key) ? record[key] : undefined);
+  // A mailbox reply has exactly one recipient — the original From (spec
+  // §5.2). A payload naming anything else is not a card this code raised, and
+  // showing only its first address would hide who else it goes to: refuse.
   const to = own('to');
-  const recipient = Array.isArray(to) && typeof to[0] === 'string' ? to[0] : '';
+  if (!Array.isArray(to) || to.length !== 1 || typeof to[0] !== 'string') {
+    throw new Error('renderMailCardWhatsApp: a reply card must name exactly one recipient');
+  }
+  const recipient: string = to[0];
   const subject = own('subject');
   const body = own('body');
 

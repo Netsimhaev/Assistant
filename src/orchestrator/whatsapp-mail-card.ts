@@ -9,11 +9,22 @@
  * word "שלח" (or "שלחי") alone, after `stripBidiControls` and `trim` —
  * and only when exactly one card is open. Nothing else decides anything.
  *
- * **A voice note never approves and never edits.** A transcript is a
- * provider's model output over audio, not the owner's keystrokes (the same
- * reason `textOrigin: 'transcribed'` withholds the typed-recipient arm in
- * `typed-recipients.ts`). The door does not even transcribe it here: it asks
- * him to type, and the card stays exactly as it was.
+ * **Only three shapes of TYPED text are mail-card actions; everything else
+ * passes to the ordinary door and the card stays open (fix round 1 ruling).**
+ * "שלח"/"שלחי" approves; a closure word closes the window; and a message that
+ * starts with "נוסח:" (or "נוסח :") is a replacement body. Any other text — a
+ * new instruction, an answer to an instruction question — is not read as
+ * anything here. A voice note never reaches this module at all: a transcript
+ * is a provider's model output over audio, not the owner's keystrokes (the
+ * same reason `textOrigin: 'transcribed'` withholds the typed-recipient arm
+ * in `typed-recipients.ts`), so it goes to the ordinary door, which cannot
+ * approve a card either. Image or document captions go there too.
+ *
+ * **A message older than the card never answers it.** The owner's message
+ * must have been sent (provider timestamp) strictly AFTER the card was
+ * presented. A "שלח" typed for card A and delivered late, after card B went
+ * up, would otherwise approve B — a card he had not seen when he typed it.
+ * An unreadable timestamp is never "after".
  *
  * **A replacement is an edit of `body` and nothing else.** The new payload is
  * the proposal with `body` swapped, and `mailReplyEditAllowed` — the same rule
@@ -70,10 +81,19 @@ import { resumeAfterDecision } from './resume.js';
 /** Verbatim from the brief: two open cards, and "שלח" cannot say which. */
 export const MULTIPLE_MAIL_CARDS_REFUSAL = 'יש כמה טיוטות פתוחות — אשרי בדשבורד.';
 
-export const AUDIO_CANNOT_DECIDE =
-  'הקלטה לא מאשרת ולא משנה טיוטת מייל. כדי לשלוח — כתוב "שלח". כדי לשנות — כתוב את הנוסח החדש.';
+/** Said for "נוסח:" with nothing (or only direction marks) after it. */
+export const EMPTY_REPLACEMENT = 'לא קיבלתי נוסח חדש. כתוב "נוסח:" ואחריו את הנוסח המלא.';
 
-export const MAIL_CARD_CLOSED = 'סגרתי. הטיוטה לא נשלחה, והיא מחכה לך בדשבורד.';
+/** Says only the mail draft was closed — open instruction questions are untouched. */
+export const MAIL_CARD_CLOSED =
+  'סגרתי רק את טיוטת המייל בוואטסאפ. היא לא נשלחה, והיא מחכה לך בדשבורד.';
+
+/**
+ * The decision is recorded but moving the job on failed. Said instead of the
+ * generic error, so the owner does not send "שלח" again at a decided card.
+ */
+export const DECIDED_RESUME_FAILED =
+  'רשמתי את האישור, אבל לא הצלחתי להתחיל את השליחה. כדאי לבדוק את הבקשה בדשבורד.';
 
 export const MAIL_CARD_GONE = 'הטיוטה הזו כבר הוכרעה או שפג תוקפה — לא שיניתי דבר.';
 
@@ -88,6 +108,21 @@ const APPROVE_WORDS: ReadonlySet<string> = new Set(['שלח', 'שלחי']);
 
 export function isApproveWord(text: string): boolean {
   return APPROVE_WORDS.has(stripBidiControls(text).trim());
+}
+
+/** "נוסח:" or "נוסח :" at the start, after bidi stripping and trim. */
+const REPLACEMENT_PREFIX = /^נוסח ?:/;
+
+/**
+ * The replacement body a message carries, or `null` when it is not a
+ * replacement at all. An empty string means the prefix was there and nothing
+ * after it — a refusal, never an empty body.
+ */
+export function replacementBody(text: string): string | null {
+  const clean = stripBidiControls(text).trim();
+  const match = REPLACEMENT_PREFIX.exec(clean);
+  if (match === null) return null;
+  return clean.slice(match[0].length).trim();
 }
 
 // --- Presenting ---------------------------------------------------------------
@@ -145,6 +180,12 @@ interface OpenRow {
 export async function openMailCards(input: {
   businessId?: string;
   excludeMessageId: string;
+  /**
+   * When the message being routed was sent (its provider timestamp). Only a
+   * card presented strictly before this moment is open for it; unreadable
+   * means no card is open.
+   */
+  inboundAt: string;
   now?: number;
   windowMinutes?: number;
   db?: Queryable;
@@ -153,6 +194,8 @@ export async function openMailCards(input: {
   const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
   if (windowMinutes <= 0) return [];
   const nowMs = input.now ?? Date.now();
+  const inboundMs = Date.parse(input.inboundAt);
+  if (Number.isNaN(inboundMs)) return [];
   const db = input.db ?? getPool();
 
   const { rows } = await db.query<OpenRow>(
@@ -198,6 +241,10 @@ export async function openMailCards(input: {
   for (const row of rows) {
     const presentedMs = row.presented_at.getTime();
     if (Number.isNaN(presentedMs) || nowMs - presentedMs > windowMinutes * 60_000) continue;
+    // Strictly after, with no tolerance in the permissive direction: a reply
+    // the provider dates at or before the presentation is not read as an
+    // answer to it — it goes to the ordinary door instead.
+    if (!(inboundMs > presentedMs)) continue;
     if (row.later_texts.some((text) => isClosureCommand(text))) continue;
     const approval = await getApproval(row.approval_id, { businessId });
     if (approval === null || mailboxReplyRecipient(approval.proposedInput) === null) continue;
@@ -208,15 +255,33 @@ export async function openMailCards(input: {
 
 // --- Reading the owner's message ----------------------------------------------
 
-export type MailCardOutcome = 'decided' | 'replaced' | 'closed' | 'refused' | 'skipped';
+export type MailCardOutcome =
+  | 'decided'
+  | 'replaced'
+  | 'closed'
+  | 'refused'
+  | 'skipped'
+  | 'passthrough';
 
 /**
- * The owner's message while at least one card is open. The caller has
+ * Whether a typed message is one of the three mail-card actions. Read before
+ * anything is claimed, so a message that is not one is left untouched for
+ * the ordinary door.
+ */
+export function isMailCardAction(text: string): boolean {
+  return isApproveWord(text) || isClosureCommand(text) || replacementBody(text) !== null;
+}
+
+/**
+ * The owner's TYPED message while at least one card is open. The caller has
  * already established that the sender is the principal and that `cards` is
  * non-empty.
  *
- * The message is claimed first — before anything is decided — so a
- * redelivered or raced copy of the same "שלח" cannot decide twice.
+ * Returns `'passthrough'` — without claiming or settling anything — for a
+ * message that is not text or not a mail-card action; the caller hands it to
+ * the ordinary door. Otherwise the message is claimed first, before anything
+ * is decided, so a redelivered or raced copy of the same "שלח" cannot decide
+ * twice.
  */
 export async function handleMailCardMessage(input: {
   msg: NormalizedInboundMessage;
@@ -226,19 +291,19 @@ export async function handleMailCardMessage(input: {
   businessId: string;
 }): Promise<MailCardOutcome> {
   const { msg, storedId, cards, messenger, businessId } = input;
+  if (msg.mediaKind !== null) return 'passthrough';
+  const text = msg.body ?? '';
+  if (!isMailCardAction(text)) return 'passthrough';
 
   const claimed = await claimMessage(storedId, { businessId });
   if (!claimed) return 'skipped';
 
-  const refuse = async (text: string): Promise<'refused'> => {
-    await messenger.send({ text, jobId: null });
+  const refuse = async (reply: string): Promise<'refused'> => {
+    await messenger.send({ text: reply, jobId: null });
     await settleMessage(storedId, 'failed', {}, { businessId });
     return 'refused';
   };
 
-  if (msg.mediaKind === 'audio') return refuse(AUDIO_CANNOT_DECIDE);
-
-  const text = msg.body ?? '';
   const by = `whatsapp:${authorityNumberKey(msg.senderNumber) ?? msg.senderNumber}`;
 
   if (isApproveWord(text)) {
@@ -254,9 +319,11 @@ export async function handleMailCardMessage(input: {
     return 'closed';
   }
 
+  const newBody = replacementBody(text) ?? '';
+  if (newBody === '') return refuse(EMPTY_REPLACEMENT);
   const only = cards.length === 1 ? cards[0] : undefined;
   if (only === undefined) return refuse(MULTIPLE_MAIL_CARDS_REFUSAL);
-  return replaceBody(only.approval, text, { storedId, messenger, businessId, refuse });
+  return replaceBody(only.approval, newBody, { storedId, messenger, businessId, refuse });
 }
 
 interface StepContext {
@@ -295,11 +362,21 @@ async function approveCard(
     throw error;
   }
   // After `decide` has committed, exactly as the dashboard runs it:
-  // `transition` opens its own transaction.
-  await resumeAfterDecision(decided, ctx.by, { businessId: ctx.businessId });
+  // `transition` opens its own transaction. The decision is permanent by
+  // now, so a failure to move the job is told to the owner as exactly that —
+  // never as the generic error that would invite a second "שלח" at a card
+  // that is already decided — and the message is still settled.
+  let resumed = true;
+  try {
+    await resumeAfterDecision(decided, ctx.by, { businessId: ctx.businessId });
+  } catch {
+    resumed = false;
+  }
 
   await ctx.messenger.send({
-    text: mailCardApproved(mailboxReplyRecipient(card.proposedInput) ?? ''),
+    text: resumed
+      ? mailCardApproved(mailboxReplyRecipient(card.proposedInput) ?? '')
+      : DECIDED_RESUME_FAILED,
     jobId: null,
   });
   await settleMessage(
@@ -325,13 +402,12 @@ async function approveCard(
  */
 async function replaceBody(
   card: ApprovalRequest,
-  text: string,
+  newBody: string,
   ctx: StepContext,
 ): Promise<MailCardOutcome> {
   if (card.jobId === null) return ctx.refuse(MAIL_CARD_GONE);
   const jobId = card.jobId;
   const proposed = card.proposedInput as Record<string, unknown>;
-  const newBody = stripBidiControls(text).trim();
   const edited: Record<string, unknown> = { ...proposed, body: newBody };
   if (!mailReplyEditAllowed(proposed, edited)) return ctx.refuse(MAIL_CARD_GONE);
 

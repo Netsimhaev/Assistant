@@ -27,11 +27,16 @@ import {
 import { MAIL_LABELS } from '../mail/mailbox.js';
 import type { MailboxClient, MailboxFailure } from '../mail/providers/types.js';
 import { MAIL_CARD_INSTRUCTION, renderMailNotice } from '../mail/whatsapp-notice.js';
+import { RETRY_PREFIX } from '../mail/reply-card.js';
+import { decide } from '../governance/approvals.js';
+import { resumeAfterDecision } from './resume.js';
+import { runDueJobs } from './run-due.js';
 import type { Triage, TriageOutcome } from '../sdk/mail-triage.js';
 import { resetDatabase } from '../test/db.js';
 import {
   DRAFT_BODY,
   NOON,
+  fakeMailboxClient,
   QUESTION_TRIAGE,
   incomingMail,
   installMailboxCharter,
@@ -449,6 +454,37 @@ describe('pollMailbox', () => {
     expect(card?.text).toContain('dana@client.example');
     expect(card?.text).toContain(DRAFT_BODY);
     expect(card?.text.endsWith(MAIL_CARD_INSTRUCTION)).toBe(true);
+  });
+
+  it('a card re-raised after a failed approved send is presented on WhatsApp too', async () => {
+    const { documentRoot } = await setup();
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-Q' })], nextCursor: 'C-1' }]);
+    const n = notifier();
+    const run = () =>
+      pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify, now: NOON });
+
+    expectOk(await run());
+    const [row] = await mailRows();
+    const replyJobId = row?.reply_job_id ?? '';
+    const { rows } = await getPool().query<{ approval_id: string }>(
+      'SELECT approval_id FROM approval_requests WHERE business_id = $1 AND job_id = $2',
+      [BUSINESS, replyJobId],
+    );
+    const decided = await decide(rows[0]?.approval_id ?? '', 'approved', { by: 'p', channel: 'dashboard' }, { businessId: BUSINESS });
+    await resumeAfterDecision(decided, 'p', { businessId: BUSINESS });
+    const failing = fakeMailboxClient([{ failure: 'rejected', status: 400, message: 'bad request' }]);
+    await runDueJobs({ businessId: BUSINESS, runtime: mailboxRuntime(failing.client), now: NOON });
+    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+
+    const before = n.sent.length;
+    const second = expectOk(await run());
+    expect(second.reraised).toBe(1);
+    expect(n.sent).toHaveLength(before + 1);
+    const card = n.sent.at(-1);
+    expect(card?.text).toContain(RETRY_PREFIX);
+    expect(card?.text.endsWith(MAIL_CARD_INSTRUCTION)).toBe(true);
+    expect(card?.jobId).not.toBe(replyJobId);
+    expect(card?.jobId).toBe((await mailRows())[0]?.reply_job_id);
   });
 
   it('without a WhatsApp bridge nothing is presented and the notice is counted unnotified', async () => {

@@ -47,6 +47,7 @@ import {
   replySubject,
 } from '../mail/reply-card.js';
 import { buildFacts } from '../policy/facts.js';
+import { stripBidiControls } from '../util/bidi.js';
 import { assessRisk } from '../policy/risk.js';
 import type { Drafter } from '../sdk/mail-drafter.js';
 import { createJob, transition, type Job } from './jobs.js';
@@ -118,7 +119,9 @@ export async function raiseMailReply(
   const payload: ReplyPayload = {
     to: [mail.fromAddress],
     subject: replySubject(mail.subject),
-    body: draft.body,
+    // Model output over a stranger's mail: no direction overrides in what is
+    // proposed, so what the owner reads on any card is what would be sent.
+    body: stripBidiControls(draft.body),
     inReplyTo: mail.internetMessageId,
     references: mail.references,
     threadId: mail.threadId,
@@ -312,6 +315,8 @@ export interface ReraiseResult {
   failed: number;
   /** Failed reply jobs whose approved payload no longer reads as a mailbox reply. Left alone. */
   skipped: number;
+  /** The fresh cards raised this call, so the caller can present them on WhatsApp. */
+  approvalIds: string[];
 }
 
 /**
@@ -372,7 +377,7 @@ export async function reraiseAfterFailedSend(
     [businessId, MAY_HAVE_SENT_CODES],
   );
 
-  const result: ReraiseResult = { reraised: 0, failed: 0, skipped: 0 };
+  const result: ReraiseResult = { reraised: 0, failed: 0, skipped: 0, approvalIds: [] };
   for (const row of rows) {
     const approved =
       row.state === 'approved_with_edit' && row.edited_input !== null ? row.edited_input : row.proposed_input;
@@ -386,7 +391,7 @@ export async function reraiseAfterFailedSend(
     // already spent, so this failed job will not be offered again — the mail
     // says why instead of going quiet.
     try {
-      await raiseReplyCard(
+      const raised = await raiseReplyCard(
         {
           mailId: row.mail_id,
           originalSubject: row.original_subject,
@@ -399,6 +404,7 @@ export async function reraiseAfterFailedSend(
         { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
       );
       result.reraised += 1;
+      result.approvalIds.push(raised.approvalId);
     } catch {
       result.failed += 1;
       try {

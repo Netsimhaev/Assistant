@@ -103,6 +103,20 @@ describe('replySubject', () => {
 });
 
 describe('raiseMailReply', () => {
+  it('strips bidi controls from the drafted body, so the proposal is what the owner reads', async () => {
+    const bundle = await installMailboxCharter();
+    const mail = await storedMail();
+    const raised = await raiseMailReply(
+      { mail, triage: TRIAGE, bundle, drafter: stubDrafter('שלום‮ דנה⁦, 500‏ ש"ח') },
+      { businessId: BUSINESS },
+    );
+    if (raised === null) throw new Error('expected a card');
+    const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    expect((approval?.proposedInput as { body: string }).body).toBe('שלום דנה, 500 ש"ח');
+    const stored = await loadPlanBody(raised.replyJobId, { businessId: BUSINESS });
+    expect((stored?.plan.steps[0]?.input as { body: string }).body).toBe('שלום דנה, 500 ש"ח');
+  });
+
   it('raises a card on a reply job whose plan step carries the exact payload', async () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail();
@@ -386,6 +400,7 @@ describe('reraiseAfterFailedSend', () => {
     expect(cards).toHaveLength(1);
     const card = cards[0];
     if (card === undefined) throw new Error('no card');
+    expect(first.approvalIds).toEqual([card.approval_id]);
     expect(card.job_id).not.toBe(raised.replyJobId);
     expect(card.detail.startsWith(RETRY_PREFIX)).toBe(true);
     expect(card.detail).not.toContain(MAY_HAVE_SENT_WARNING);

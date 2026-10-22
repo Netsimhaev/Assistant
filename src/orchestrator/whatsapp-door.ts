@@ -146,7 +146,7 @@ import {
 import { transcribeInbound, type TranscriptionProvider } from '../whatsapp/transcribe.js';
 import { runInstruction, type InstructionOutcome, type RunInstructionOptions } from './instruct.js';
 import { linkWhatsAppMessage } from './jobs.js';
-import { handleMailCardMessage, openMailCards } from './whatsapp-mail-card.js';
+import { handleMailCardMessage, isMailCardAction, openMailCards } from './whatsapp-mail-card.js';
 import {
   ambiguousQuestion,
   claimAsAnswer,
@@ -519,16 +519,18 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
 
     const isAudio = msg.mediaKind === 'audio';
 
-    // An open mailbox reply card is read FIRST — before transcription, before
-    // the instruction cap, before `pendingQuestions` — and only inside its
-    // window (`openMailCards`). A voice note is caught here untranscribed:
-    // it can neither approve nor edit a card, so paying to transcribe it
-    // would buy nothing. An empty text message falls through to the
-    // ordinary empty-message reply below.
-    if (isAudio || (msg.body !== null && msg.body.trim() !== '')) {
+    // An open mailbox reply card is read FIRST — before transcription, the
+    // instruction cap and `pendingQuestions` — but only for TYPED text that
+    // is one of the three mail-card actions ("שלח", a closure word,
+    // "נוסח: …"), only inside the card's window, and only for a message sent
+    // after the card was presented (`openMailCards`). Anything else — a voice
+    // note, a caption, a new instruction — falls through to the ordinary door
+    // below, and the card stays open.
+    if (msg.mediaKind === null && msg.body !== null && isMailCardAction(msg.body)) {
       const cards = await openMailCards({
         businessId: ctx.businessId,
         excludeMessageId: stored.id,
+        inboundAt: msg.providerTimestamp,
         ...(ctx.questionWindowMinutes !== undefined
           ? { windowMinutes: ctx.questionWindowMinutes }
           : {}),
@@ -542,7 +544,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
           businessId: ctx.businessId,
         });
         if (handled === 'decided' || handled === 'replaced') return 'mailCard';
-        return handled;
+        if (handled !== 'passthrough') return handled;
       }
     }
 

@@ -377,6 +377,15 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
       { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
     );
     result.reraised = reraised.reraised;
+    if (options.notifyBoss !== undefined) {
+      for (const approvalId of reraised.approvalIds) {
+        try {
+          await presentMailCard(approvalId, options.notifyBoss, { businessId });
+        } catch {
+          // Never load-bearing: the re-raised card is on the dashboard.
+        }
+      }
+    }
   } catch (error) {
     result.error = `reraise: ${message(error)}`;
   }
