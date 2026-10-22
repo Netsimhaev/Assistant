@@ -39,7 +39,7 @@ function html(res: ServerResponse, status: number, body: string): void {
   res.end(body);
 }
 
-function notFound(res: ServerResponse): void {
+export function notFound(res: ServerResponse): void {
   res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', ...SECURITY_HEADERS });
   res.end('לא נמצא');
 }
@@ -84,7 +84,37 @@ function dayEndIso(day: string, timeZone: string): string | null {
 }
 
 function param(url: URL, name: string): string {
-  return (url.searchParams.get(name) ?? '').trim().slice(0, 200);
+  return stripBidiControls(url.searchParams.get(name) ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+}
+
+const CURSOR_PROBLEM = /^(cursor_expired_unrecovered|list_|credential_error)/;
+const GAP_WINDOW_DAYS = 7;
+
+/**
+ * When the poll last recorded a reconnect gap (mail that arrived while the
+ * mailbox was disconnected and was never read), within the last week. Read
+ * from the durable audit row, not from `mailbox_cursor.last_error`, which the
+ * next clean pass overwrites.
+ */
+async function recentGapAt(businessId: string): Promise<string | null> {
+  const { rows } = await getPool().query<{ at: Date | null }>(
+    `SELECT max(at) AS at FROM audit_log
+      WHERE business_id = $1 AND reason = 'mail_cursor_gap' AND at > now() - ($2 || ' days')::interval`,
+    [businessId, String(GAP_WINDOW_DAYS)],
+  );
+  return rows[0]?.at?.toISOString() ?? null;
+}
+
+/** The subset of `ids` that belong to this business and are in a status that may be served. */
+async function downloadableDocuments(businessId: string, ids: readonly (string | undefined)[]): Promise<Set<string>> {
+  const wanted = [...new Set(ids.filter((i): i is string => i !== undefined))];
+  if (wanted.length === 0) return new Set();
+  const { rows } = await getPool().query<{ document_id: string }>(
+    `SELECT document_id FROM documents
+      WHERE business_id = $1 AND document_id = ANY($2::text[]) AND status IN ('extracted', 'stored')`,
+    [businessId, wanted],
+  );
+  return new Set(rows.map((r) => r.document_id));
 }
 
 export async function handleMailList(res: ServerResponse, businessId: string, url: URL, csrf: string): Promise<void> {
@@ -109,7 +139,12 @@ export async function handleMailList(res: ServerResponse, businessId: string, ur
     },
     { businessId },
   );
-  const [mailboxStatus, cursor] = await Promise.all([mailboxBannerStatus(businessId), getCursor({ businessId })]);
+  const [mailboxStatus, cursor, gapAt, downloadable] = await Promise.all([
+    mailboxBannerStatus(businessId),
+    getCursor({ businessId }),
+    recentGapAt(businessId),
+    downloadableDocuments(businessId, rows.flatMap((m) => m.attachments.map((a) => a.documentId))),
+  ]);
   html(
     res,
     200,
@@ -117,7 +152,9 @@ export async function handleMailList(res: ServerResponse, businessId: string, ur
       rows,
       filters,
       mailboxStatus,
-      gap: cursor?.lastError === 'cursor_expired_gap',
+      gapAt,
+      cursorProblem: CURSOR_PROBLEM.test(cursor?.lastError ?? ''),
+      downloadable,
       timeZone,
       csrf,
     }),
@@ -178,6 +215,7 @@ export async function handleMailDetail(res: ServerResponse, businessId: string, 
       timeZone,
       cardApprovalId,
       documents: docRows.map((r) => ({ documentId: r.document_id, fileName: r.file_name })),
+      downloadable: await downloadableDocuments(businessId, mail.attachments.map((a) => a.documentId)),
     }),
   );
 }

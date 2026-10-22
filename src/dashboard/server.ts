@@ -83,7 +83,7 @@ import {
   handleMailboxSignPost,
   handleMailboxStatus,
 } from './mailbox-connect.js';
-import { handleDocumentFile, handleInvoices, handleMailDetail, handleMailList } from './mail-handlers.js';
+import { handleDocumentFile, handleInvoices, handleMailDetail, handleMailList, notFound } from './mail-handlers.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { MAX_RECALL, recallMemories } from '../memory/store.js';
@@ -2495,11 +2495,13 @@ async function route(
   }
   const mailMatch = MAIL_PATH.exec(pathname);
   if (method === 'GET' && mailMatch?.[1] !== undefined) {
-    return handleMailDetail(res, businessId, decodeURIComponent(mailMatch[1]));
+    const mailId = decodePathSegment(mailMatch[1]);
+    return mailId === null ? notFound(res) : handleMailDetail(res, businessId, mailId);
   }
   const documentFileMatch = DOCUMENT_FILE_PATH.exec(pathname);
   if (method === 'GET' && documentFileMatch?.[1] !== undefined) {
-    return handleDocumentFile(res, businessId, decodeURIComponent(documentFileMatch[1]), documentRoot);
+    const documentId = decodePathSegment(documentFileMatch[1]);
+    return documentId === null ? notFound(res) : handleDocumentFile(res, businessId, documentId, documentRoot);
   }
   // Connecting the business mailbox: sign the charter amendment FIRST, then
   // run the OAuth ceremony — see `mailbox-connect.ts` for why that order.

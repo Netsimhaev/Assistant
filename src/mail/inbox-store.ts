@@ -27,6 +27,8 @@ export interface MailAttachment {
   filename: string;
   mediaType: string;
   size: number;
+  /** Set once the attachment was ingested as a document (`linkAttachmentDocument`). */
+  documentId?: string;
 }
 
 export interface IncomingMail {
@@ -550,6 +552,33 @@ function builder(businessId: string): {
       where.push(sql(params.length));
     },
   };
+}
+
+/**
+ * Record, inside the mail's own `attachments` JSON, which document an
+ * attachment became. No new table: the mail row already owns its attachment
+ * list. Business-scoped; ids are NUL-stripped like everything else that is
+ * written from provider text. Other elements are left exactly as they were.
+ */
+export async function linkAttachmentDocument(
+  mailId: string,
+  attachmentId: string,
+  documentId: string,
+  options: Options = {},
+): Promise<void> {
+  const { businessId, db } = ctx(options);
+  await db.query(
+    `UPDATE mail_messages
+        SET attachments = (
+          SELECT coalesce(jsonb_agg(
+                   CASE WHEN e->>'attachmentId' = $3
+                        THEN e || jsonb_build_object('documentId', $4::text)
+                        ELSE e END
+                   ORDER BY ord), '[]'::jsonb)
+            FROM jsonb_array_elements(attachments) WITH ORDINALITY AS t(e, ord))
+      WHERE business_id = $1 AND mail_id = $2`,
+    [businessId, mailId, noNul(attachmentId), noNul(documentId)],
+  );
 }
 
 /** One mail by id, scoped to its business. `null` when this business does not own it. */

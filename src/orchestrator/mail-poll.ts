@@ -79,6 +79,7 @@ import { isAutomatedSender } from '../mail/automated.js';
 import {
   claimMail,
   getCursor,
+  linkAttachmentDocument,
   hasInvoiceForMail,
   mailForJob,
   insertInvoice,
@@ -775,6 +776,13 @@ async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<I
           { businessId, documentRoot: pass.documentRoot },
         );
         out.push({ documentId: document.documentId, fileName: attachment.filename, mediaType: document.mediaType });
+        // Persist the link so the owner can download it from the mail screen.
+        // Never fatal: the document is already ingested either way.
+        try {
+          await linkAttachmentDocument(mail.mailId, attachment.attachmentId, document.documentId, { businessId });
+        } catch {
+          await noteMailError(mail.mailId, 'attachment_failed', { businessId });
+        }
       } finally {
         await rm(dir, { recursive: true, force: true });
       }

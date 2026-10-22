@@ -12,6 +12,7 @@
  */
 import type { InvoiceRow, MailRow } from '../mail/inbox-store.js';
 import type { MailCategory } from '../mail/mailbox.js';
+import { stripBidiControls } from '../util/bidi.js';
 import { escLabel, escapeHtml as esc, page } from './views.js';
 import type { MailboxBannerStatus } from './mailbox-connect.js';
 
@@ -86,8 +87,8 @@ const SNIPPET_RADIUS = 60;
  * alternative so a query like `amp` never marks the inside of one.
  */
 export function highlightSnippet(text: string, query: string, radius = SNIPPET_RADIUS): string {
-  const collapsed = text.replace(/\s+/g, ' ').trim();
-  const q = query.trim();
+  const collapsed = stripBidiControls(text).replace(/\s+/g, ' ').trim();
+  const q = stripBidiControls(query).replace(/\s+/g, ' ').trim();
   if (q === '') return esc(collapsed.slice(0, radius * 2));
   const at = collapsed.toLowerCase().indexOf(q.toLowerCase());
   let slice = collapsed;
@@ -137,16 +138,27 @@ function mailboxBanner(status: MailboxBannerStatus): string {
 }
 
 const GAP_BANNER = 'חלק מהמיילים שהגיעו בזמן שהתיבה הייתה מנותקת לא נקראו';
+const CURSOR_PROBLEM_BANNER = 'יש תקלה בקריאת התיבה — הפרטים במסך החיבור';
+
+/** The 📎 download links for every linked attachment whose document may be served. */
+function attachmentLinks(mail: MailRow, downloadable: ReadonlySet<string>): string {
+  return mail.attachments
+    .filter((a) => a.documentId !== undefined && downloadable.has(a.documentId))
+    .map((a) => `<a href="/documents/${esc(encodeURIComponent(a.documentId as string))}/file">📎 ${escLabel(a.filename)}</a>`)
+    .join('<br>');
+}
 
 export function renderMailList(options: {
   rows: readonly MailRow[];
   filters: MailFilters;
   mailboxStatus: MailboxBannerStatus;
-  gap: boolean;
+  gapAt: string | null;
+  cursorProblem: boolean;
+  downloadable: ReadonlySet<string>;
   timeZone: string;
   csrf: string;
 }): string {
-  const { rows, filters, mailboxStatus, gap, timeZone } = options;
+  const { rows, filters, mailboxStatus, gapAt, cursorProblem, downloadable, timeZone } = options;
   const categoryOptions = [
     `<option value=""${filters.category === '' ? ' selected' : ''}>כל הסיווגים</option>`,
     ...(Object.keys(CATEGORY_LABEL) as MailCategory[]).map(
@@ -164,7 +176,7 @@ export function renderMailList(options: {
       return `<tr>
   <td>${esc(formatWhen(m.receivedAt, timeZone))}</td>
   <td>${senderCell(m)}</td>
-  <td><a href="/mail/${esc(encodeURIComponent(m.mailId))}"><b>${escLabel(m.subject)}</b></a><br>${highlightSnippet(source, filters.q)}</td>
+  <td><a href="/mail/${esc(encodeURIComponent(m.mailId))}"><b>${escLabel(m.subject)}</b></a><br>${highlightSnippet(source, filters.q)}${attachmentLinks(m, downloadable) === '' ? '' : `<br>${attachmentLinks(m, downloadable)}`}</td>
   <td>${categoriesCell(m)}</td>
   <td>${didCell(m)}</td>
 </tr>`;
@@ -175,7 +187,8 @@ export function renderMailList(options: {
     `<h1>מיילים</h1>
 <p><a href="/">לכרטיסי האישור</a> · <a href="/mail/invoices">חשבוניות לפי ספק</a></p>
 ${mailboxBanner(mailboxStatus)}
-${gap ? `<p class="card error">${esc(GAP_BANNER)}</p>` : ''}
+${gapAt !== null ? `<p class="card error">${esc(GAP_BANNER)} (בתאריך ${esc(formatWhen(gapAt, timeZone).slice(0, 10))})</p>` : ''}
+${cursorProblem ? `<p class="card error">${esc(CURSOR_PROBLEM_BANNER)}</p>` : ''}
 <form method="get" action="/mail" class="card">
   <label>חיפוש טקסט <input type="text" name="q" value="${esc(filters.q)}"></label>
   <label>ממי <input type="text" name="sender" value="${esc(filters.sender)}"></label>
@@ -237,8 +250,8 @@ export function renderInvoices(options: {
               : '<span class="muted">אין קובץ</span>';
           return `<tr>
   <td>${esc(formatWhen(i.receivedAt, timeZone))}</td>
-  <td>${i.invoiceNumber === null ? '—' : esc(i.invoiceNumber)} <span class="muted">(לא מאומת)</span></td>
-  <td>${i.amountText === null ? '—' : esc(i.amountText)} <span class="muted">(לא מאומת)</span></td>
+  <td>${i.invoiceNumber === null ? '—' : escLabel(i.invoiceNumber)} <span class="muted">(לא מאומת)</span></td>
+  <td>${i.amountText === null ? '—' : escLabel(i.amountText)} <span class="muted">(לא מאומת)</span></td>
   <td>${i.fileName === null ? '—' : escLabel(i.fileName)}</td>
   <td>${download} · <a href="/mail/${esc(encodeURIComponent(i.mailId))}">מייל מקורי</a></td>
 </tr>`;
@@ -277,20 +290,31 @@ export function renderMailDetail(options: {
   timeZone: string;
   cardApprovalId: string | null;
   documents: readonly { documentId: string; fileName: string | null }[];
+  downloadable: ReadonlySet<string>;
 }): string {
-  const { mail, timeZone, cardApprovalId, documents } = options;
+  const { mail, timeZone, cardApprovalId, documents, downloadable } = options;
   const cats = categoriesCell(mail);
+  const linkedIds = new Set(mail.attachments.map((a) => a.documentId).filter((d): d is string => d !== undefined));
   const docLinks = documents
+    .filter((d) => !linkedIds.has(d.documentId))
     .map(
       (d) =>
         `<li>${d.fileName === null ? 'מסמך' : escLabel(d.fileName)} · <a href="/documents/${esc(encodeURIComponent(d.documentId))}/file">הורד</a></li>`,
     )
     .join('');
-  const attachments = mail.attachments.map((a) => `<li>${escLabel(a.filename)}</li>`).join('');
+  const attachments = mail.attachments
+    .map((a) => {
+      const link =
+        a.documentId !== undefined && downloadable.has(a.documentId)
+          ? ` · <a href="/documents/${esc(encodeURIComponent(a.documentId))}/file">הורד</a>`
+          : '';
+      return `<li>${escLabel(a.filename)}${link}</li>`;
+    })
+    .join('');
   const body =
     mail.bodyText === ''
       ? '<p class="muted">גוף המייל אינו שמור (עבר זמן השמירה, או שלא נקרא).</p>'
-      : `<pre>${esc(mail.bodyText)}</pre>`;
+      : `<pre>${esc(stripBidiControls(mail.bodyText))}</pre>`;
   return page(
     'מייל',
     `<h1>${escLabel(mail.subject)}</h1>
