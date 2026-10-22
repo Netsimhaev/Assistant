@@ -247,6 +247,20 @@ export async function recordIncoming(raw: IncomingMail, options: Options = {}): 
   return row ? toStoredMail(row) : null;
 }
 
+/**
+ * The mail whose triage job is this one, or `null`. The curation brief reads
+ * the sender from here: the stored header, never anything a model said.
+ */
+export async function mailForJob(jobId: string, options: Options = {}): Promise<StoredMail | null> {
+  const { businessId, db } = ctx(options);
+  const { rows } = await db.query<MailDbRow>(
+    `SELECT ${COLUMNS} FROM mail_messages WHERE business_id = $1 AND job_id = $2 LIMIT 1`,
+    [businessId, jobId],
+  );
+  const row = rows[0];
+  return row ? toStoredMail(row) : null;
+}
+
 /** Moves `received|over_cap` to `claimed`; the row count says who won. */
 export async function claimMail(mailId: string, options: Options = {}): Promise<boolean> {
   const { businessId, db } = ctx(options);

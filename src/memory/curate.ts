@@ -46,7 +46,15 @@ export interface CurateJobOptions {
   curator?: Curator;
   /** Defaults to `config.curationRunsPerDay`. Injected by tests, same as `ConductOptions.readsPerDay`. */
   runsPerDay?: number;
+  /**
+   * `mail` curates a mail's planless triage job from its stored summary, with
+   * its own audit-row prefix and its own daily count. Default is unchanged.
+   */
+  scope?: CurationScope;
 }
+
+export type CurationScope = 'default' | 'mail';
+const MAIL_PREFIX = 'mail:';
 
 /**
  * The daily ceiling counts AUDIT rows, not `memories` rows.
@@ -59,14 +67,15 @@ export interface CurateJobOptions {
  * candidates, which is precisely a call that was paid for.
  */
 export async function curationRunsToday(
-  options: { businessId?: string; db?: Queryable } = {},
+  options: { businessId?: string; db?: Queryable; scope?: CurationScope } = {},
 ): Promise<number> {
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM audit_log
-      WHERE business_id = $1 AND kind = 'curation' AND at >= date_trunc('day', now())`,
-    [businessId],
+      WHERE business_id = $1 AND kind = 'curation' AND at >= date_trunc('day', now())
+        AND (reason LIKE 'mail:%') = $2`,
+    [businessId, (options.scope ?? 'default') === 'mail'],
   );
   return Number(rows[0]?.n ?? '0');
 }
@@ -76,6 +85,8 @@ export async function curateJob(
   options: CurateJobOptions = {},
 ): Promise<CurationOutcome> {
   const businessId = options.businessId ?? config.businessId;
+  const scope = options.scope ?? 'default';
+  const prefix = scope === 'mail' ? MAIL_PREFIX : '';
   const idle: CurationOutcome = { ran: false, skipped: null, written: 0, rejected: 0, failed: false };
 
   let written = 0;
@@ -89,17 +100,22 @@ export async function curateJob(
   // `not_qualified`, `no_key`, `over_cap`, `no_brief`) are ordinary early
   // returns, not throws, so none of them touch the `catch`.
   try {
-    const stored = await loadPlanBody(jobId, { businessId });
-    if (stored === null) return { ...idle, skipped: 'no_plan' };
-    if (!jobQualifiesForCuration(stored.plan)) return { ...idle, skipped: 'not_qualified' };
+    // A mail's triage job carries no plan by design; its brief comes from the
+    // stored mail row, and the caller decides which categories qualify.
+    if (scope === 'default') {
+      const stored = await loadPlanBody(jobId, { businessId });
+      if (stored === null) return { ...idle, skipped: 'no_plan' };
+      if (!jobQualifiesForCuration(stored.plan)) return { ...idle, skipped: 'not_qualified' };
+    }
 
     // Same switch discipline as DOCUMENT_INBOX: no key means the feature is
     // off, reported rather than silently identical to "nothing to remember".
     if (options.curator === undefined && (process.env['ANTHROPIC_API_KEY'] ?? '') === '') {
       return { ...idle, skipped: 'no_key' };
     }
-    const runsPerDay = options.runsPerDay ?? config.curationRunsPerDay;
-    if ((await curationRunsToday({ businessId })) >= runsPerDay) {
+    const runsPerDay =
+      options.runsPerDay ?? (scope === 'mail' ? config.mailCurationPerDay : config.curationRunsPerDay);
+    if ((await curationRunsToday({ businessId, scope })) >= runsPerDay) {
       return { ...idle, skipped: 'over_cap' };
     }
 
@@ -143,7 +159,7 @@ export async function curateJob(
         artifacts: [],
         costMinor: null,
         tokens: null,
-        reason: `אצירה · ${written} עובדות נשמרו · ${rejected} נדחו`,
+        reason: `${prefix}אצירה · ${written} עובדות נשמרו · ${rejected} נדחו`,
       },
       { businessId },
     );
@@ -158,7 +174,7 @@ export async function curateJob(
     // error's constructor name is recorded, never its message — a message
     // could echo back a candidate's subject or body, which is exactly what
     // this audit kind must never carry.
-    await recordCurationFailure(businessId, jobId, written, rejected, err);
+    await recordCurationFailure(businessId, jobId, written, rejected, err, prefix);
     // `ran` reflects whether any effect actually happened: writes that
     // completed before the failure are real and must not be reported
     // alongside `ran: false`, which fix round 1 (minor 8) called
@@ -180,6 +196,7 @@ async function recordCurationFailure(
   written: number,
   rejected: number,
   err: unknown,
+  prefix: string,
 ): Promise<void> {
   const errorKind = err instanceof Error ? err.constructor.name : 'unknown';
   try {
@@ -193,7 +210,7 @@ async function recordCurationFailure(
         artifacts: [],
         costMinor: null,
         tokens: null,
-        reason: `אצירה נכשלה · ${written} עובדות נשמרו לפני הכשל · ${rejected} נדחו · שגיאה: ${errorKind}`,
+        reason: `${prefix}אצירה נכשלה · ${written} עובדות נשמרו לפני הכשל · ${rejected} נדחו · שגיאה: ${errorKind}`,
       },
       { businessId },
     );

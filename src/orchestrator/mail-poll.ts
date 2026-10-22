@@ -80,6 +80,7 @@ import {
   claimMail,
   getCursor,
   hasInvoiceForMail,
+  mailForJob,
   insertInvoice,
   mailAwaitingTriage,
   mailReadsToday,
@@ -103,6 +104,8 @@ import { renderMailNotice } from '../mail/whatsapp-notice.js';
 import { runMailDrafter, type Drafter } from '../sdk/mail-drafter.js';
 import { runMailTriage, type Triage } from '../sdk/mail-triage.js';
 import { canonicalHash } from '../util/canonical.js';
+import { curateJob } from '../memory/curate.js';
+import type { Curator } from '../sdk/curator.js';
 import { loadBindings } from './bindings.js';
 import { createJob, loadJob, transition, type Job } from './jobs.js';
 import { raiseMailReply, reraiseAfterFailedSend } from './mail-reply.js';
@@ -144,6 +147,8 @@ export interface PollMailboxOptions {
   client?: MailboxClient;
   triage?: Triage;
   drafter?: Drafter;
+  /** Test seam for the curation model call; production leaves it unset. */
+  curator?: Curator;
   readsPerDay?: number;
   documentRoot?: string;
   /** The WhatsApp line to the owner. Absent when no WhatsApp gateway is configured. */
@@ -341,6 +346,7 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
     token,
     triage: options.triage ?? runMailTriage,
     drafter: options.drafter ?? runMailDrafter,
+    curator: options.curator,
     documentRoot: options.documentRoot ?? config.documentRoot,
     notifyBoss: options.notifyBoss,
     notify: options.notify,
@@ -438,6 +444,7 @@ interface PassContext {
   token: string;
   triage: Triage;
   drafter: Drafter;
+  curator: Curator | undefined;
   documentRoot: string;
   notifyBoss: PollMailboxOptions['notifyBoss'];
   notify: NotifyTarget | undefined;
@@ -539,6 +546,25 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     );
     settled = true;
 
+    // What the assistant learns from invoice and question mail. Never fatal:
+    // the mail is settled and visible; a curation failure is only noted.
+    if (
+      (categories.includes('invoice') || categories.includes('question')) &&
+      mail.fromAddress.trim() !== ''
+    ) {
+      try {
+        const curated = await curateJob(job.jobId, {
+          businessId,
+          scope: 'mail',
+          runsPerDay: config.mailCurationPerDay,
+          ...(pass.curator !== undefined ? { curator: pass.curator } : {}),
+        });
+        if (curated.failed) await noteCurationFailure(mail, job.jobId, businessId);
+      } catch {
+        await noteCurationFailure(mail, job.jobId, businessId);
+      }
+    }
+
     // The same path `conduct.ts` takes for a job that raises no card: the
     // triage job's work is done here; a reply, if any, lives on its own job.
     for (const to of ['plan', 'closed'] as const) {
@@ -586,6 +612,22 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
         // The job may already have moved; nothing more to do here.
       }
     }
+  }
+}
+
+/**
+ * Curation is the least important thing this handling does, and a mail keeps
+ * one error string (last write wins): note the failure only when nothing more
+ * telling — a refused label, a lost attachment — is already on the row.
+ */
+async function noteCurationFailure(mail: StoredMail, jobId: string, businessId: string): Promise<void> {
+  try {
+    const current = await mailForJob(jobId, { businessId });
+    if (current !== null && current.error === null) {
+      await noteMailError(mail.mailId, 'curation_failed', { businessId });
+    }
+  } catch {
+    // Best effort.
   }
 }
 
