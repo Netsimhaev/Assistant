@@ -70,6 +70,7 @@ import { join } from 'node:path';
 import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
+import { getPool } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, TEXT, XLSX } from '../documents/media-type.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -646,13 +647,33 @@ async function noteCurationFailure(mail: StoredMail, jobId: string, businessId: 
 /** Terminal phases: a job there needs nothing more from us. */
 const TERMINAL_PHASES: readonly string[] = ['closed', 'failed', 'halted'];
 
+/** What an orphaned triage job is titled once its subject is taken off it. */
+export const ORPHANED_TRIAGE_TITLE = 'מייל נכנס (טיפול שנקטע)';
+
 /**
  * Move a crashed handling's triage job to `failed` — legal from every phase
  * this module leaves a triage job in (`intake`, `understand`, `plan`).
  * Best effort: a job that moved on its own is not this mail's problem.
+ *
+ * **And take the mail's subject off it first.** Re-handling overwrites
+ * `mail_messages.job_id` with the new triage job, so after this the orphan is
+ * reachable from the mail by nothing — and its title `מייל: <subject>` is the
+ * one copy of the subject an erasure of that sender could never find.
+ * Matching orphans by title in the erasure planner was rejected: two senders
+ * can share a subject, and a title match would erase the other one's job.
+ * So the subject is removed at the source, unconditionally (an orphan that
+ * already reached a terminal phase is just as unreachable), and BEFORE the
+ * transition: if the transition then fails, the title is already neutral,
+ * which is the safe half to have done. `transition` opens its own
+ * transaction and takes no title, so the two are separate statements.
  */
 async function failOrphanedJob(jobId: string, businessId: string): Promise<void> {
   try {
+    await getPool().query('UPDATE jobs SET title = $3 WHERE business_id = $1 AND job_id = $2', [
+      businessId,
+      jobId,
+      ORPHANED_TRIAGE_TITLE,
+    ]);
     const orphan = await loadJob(jobId, { businessId });
     if (orphan === null || TERMINAL_PHASES.includes(orphan.phase)) return;
     await transition(jobId, {

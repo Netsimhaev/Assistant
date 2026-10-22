@@ -271,13 +271,6 @@ export async function executeErasure(
       `DELETE FROM whatsapp_messages WHERE ${WHATSAPP_MESSAGES_ERASED_PREDICATE}`,
       whatsappMessageParams(businessId, jobIds, plan.anchor),
     );
-    // `autonomy_marks.note` is owner-written content about a corrected step
-    // and is not restricted to naming the counterparty the step happened to
-    // be addressed to — see `erasure-plan.ts`'s header for why this is the
-    // one migration-026 table wired in here (its two siblings are not) and
-    // why `buildErasurePlan` also searches `note` itself to discover a job
-    // that has no other tie to the contact. Same predicate, same parameters,
-    // as `countItems` there.
     // The mailbox (migrations 042/044). `mail_invoices` FIRST: its `mail_id`
     // cascades from `mail_messages`, and a cascade that beat this statement
     // to the row would leave it reporting zero for a table that lost rows —
@@ -295,6 +288,13 @@ export async function executeErasure(
       `DELETE FROM mail_messages WHERE ${MAIL_MESSAGES_ERASED_PREDICATE}`,
       [businessId, mailIds],
     );
+    // `autonomy_marks.note` is owner-written content about a corrected step
+    // and is not restricted to naming the counterparty the step happened to
+    // be addressed to — see `erasure-plan.ts`'s header for why this is the
+    // one migration-026 table wired in here (its two siblings are not) and
+    // why `buildErasurePlan` also searches `note` itself to discover a job
+    // that has no other tie to the contact. Same predicate, same parameters,
+    // as `countItems` there.
     await del('autonomy_marks', 'DELETE FROM autonomy_marks WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);

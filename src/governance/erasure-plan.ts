@@ -607,6 +607,13 @@ export const DIGESTS_ERASED_PREDICATE = `business_id = $1 AND digest_id = ANY ($
  * appeared in a reply draft). It is reached by its own content, its own
  * arrival time, and nothing else.
  *
+ * **A kept job does not keep its mail.** Mails are not a keepable kind, so a
+ * mail found by the anchor goes even when its triage or reply job is kept. A
+ * kept reply job that is still live keeps its approval card (job-scoped, and
+ * the job was kept), but loses what is keyed on the mail row: the dashboard's
+ * reply layout (`isMailReplyJob`) and its WhatsApp presentation
+ * (`openMailCards` joins on `mail_messages.reply_job_id`).
+ *
  * Parameters, in both places: `$1` businessId, `$2` mailIds.
  */
 export const MAIL_MESSAGES_ERASED_PREDICATE = `business_id = $1 AND mail_id = ANY ($2)`;
@@ -625,8 +632,11 @@ export const MAIL_MESSAGES_ERASED_PREDICATE = `business_id = $1 AND mail_id = AN
  * An invoice row is a record ABOUT one document (its number, amount and file
  * name), so it goes with the document. The mail that delivered it does not: a
  * mail is a person's message, it may carry other attachments, and erasing one
- * file is not "forget this sender". Its `attachments` JSON keeps the
- * now-dangling `documentId` (a system id, not content).
+ * file is not "forget this sender". A document-anchor erasure therefore
+ * leaves the delivering mail standing, with its `attachments[].filename`
+ * (chosen by the sender — the mail is the sender's message, and it is erased
+ * by a contact or window anchor, not by a document one) and the now-dangling
+ * `attachments[].documentId` (a system id, not content).
  *
  * The same arm also fires under a contact or window anchor, for every
  * document the plan erases — including the rare case of a second sender's

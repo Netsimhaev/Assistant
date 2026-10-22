@@ -30,6 +30,8 @@ import { MAIL_CARD_INSTRUCTION, renderMailNotice } from '../mail/whatsapp-notice
 import { RETRY_PREFIX } from '../mail/reply-card.js';
 import { decide } from '../governance/approvals.js';
 import { resumeAfterDecision } from './resume.js';
+import { buildErasurePlan } from '../governance/erasure-plan.js';
+import { executeErasure } from '../governance/erasure.js';
 import { runDueJobs } from './run-due.js';
 import type { Triage, TriageOutcome } from '../sdk/mail-triage.js';
 import { resetDatabase } from '../test/db.js';
@@ -729,6 +731,61 @@ describe('pollMailbox', () => {
     const [row] = await mailRows();
     expect(row?.state).toBe('triaged');
     expect(row?.job_id).not.toBe(orphan.jobId);
+  });
+
+  /**
+   * Fix round 1 (Task 14 review). Re-handling overwrites `mail.job_id`, so the
+   * orphan is unreachable from the mail afterwards — and an erasure must not
+   * match orphans by title (two senders can share a subject). So the subject
+   * is taken off the orphan at the source, when it is failed.
+   */
+  it('an orphaned triage job no longer carries the mail subject after re-handling', async () => {
+    const { bundle, documentRoot } = await setup();
+    const subject = 'פגישה עם רונית_כהן';
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-ORPH', subject })], nextCursor: 'C-1' }]);
+    // Records the mail without triaging it (no reads left), so the orphan
+    // below is the ONLY job the crashed handling made — as in production.
+    await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot, readsPerDay: 0 });
+    // The crashed handling's triage job, titled exactly as `handleMail` titles it.
+    const orphan = await createJob({ charterVersion: bundle.charterVersion, provenance: 'unknown_external', businessId: BUSINESS, title: `מייל: ${subject}` });
+    await transition(orphan.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+    await getPool().query(
+      `UPDATE mail_messages SET state = 'claimed', triaged_at = NULL, job_id = $2, claimed_at = now() - interval '31 minutes'
+        WHERE business_id = $1`,
+      [BUSINESS, orphan.jobId],
+    );
+
+    expectOk(
+      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }),
+    );
+
+    const failed = await loadJob(orphan.jobId, { businessId: BUSINESS });
+    expect(failed?.phase).toBe('failed');
+    expect(failed?.title).toBe('מייל נכנס (טיפול שנקטע)');
+
+    // And a contact erasure by the sender's ADDRESS — which the subject never
+    // contains — leaves no copy of the subject anywhere outside the three
+    // tables an erasure deliberately keeps.
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: 'dana@client.example' }, { businessId: BUSINESS, documentRoot });
+    await executeErasure(plan, { businessId: BUSINESS });
+    const { rows: columns } = await getPool().query<{ table_name: string; column_name: string }>(
+      `SELECT c.table_name, c.column_name
+         FROM information_schema.columns c
+         JOIN information_schema.tables t USING (table_schema, table_name)
+        WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+          AND c.data_type IN ('text', 'jsonb', 'json', 'ARRAY')
+          AND c.table_name NOT IN ('audit_log', 'spend_ledger', 'signatures')`,
+    );
+    expect(columns.length).toBeGreaterThan(100);
+    const found: string[] = [];
+    for (const column of columns) {
+      const { rows } = await getPool().query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM "${column.table_name}" WHERE "${column.column_name}"::text LIKE $1`,
+        ['%רונית_כהן%'],
+      );
+      if (Number(rows[0]?.n ?? '0') > 0) found.push(`${column.table_name}.${column.column_name}`);
+    }
+    expect(found).toEqual([]);
   });
 
   it('a fresh claim (under 30 minutes) is left alone', async () => {
