@@ -132,7 +132,12 @@ export async function curateJob(
     rejected = sifted.rejected.length;
 
     for (const candidate of sifted.accepted) {
-      const resolved = await resolveConflict(candidate, jobId, businessId);
+      // Mail scope is chunk-only and never retires: the From header is not
+      // authenticated, so a spoofed mail must not be able to supersede a
+      // fact the assistant already holds about a known sender. A chunk has no
+      // uniqueness, so nothing is retired; the claim is kept as a labelled claim.
+      const resolved =
+        scope === 'mail' ? asMailChunk(candidate) : await resolveConflict(candidate, jobId, businessId);
       await writeMemory(
         {
           jobId,
@@ -217,6 +222,18 @@ async function recordCurationFailure(
   } catch {
     // Swallowed on purpose — see the docblock above.
   }
+}
+
+function asMailChunk(candidate: CurationCandidate): { kind: 'chunk'; body: Record<string, unknown> } {
+  if (candidate.kind === 'chunk') return { kind: 'chunk', body: candidate.body };
+  return {
+    kind: 'chunk',
+    body: {
+      claim: candidate.body,
+      about: candidate.attribute ?? candidate.subjectKey,
+      note: 'טענה ממייל נכנס — נשמרה כטענה ולא כעובדה',
+    },
+  };
 }
 
 /**

@@ -17,7 +17,8 @@ import { setCursor } from '../mail/inbox-store.js';
 import { buildCurationBrief } from './curation-brief.js';
 import { curateJob, curationRunsToday } from './curate.js';
 import { siftCandidates, type CurationResult } from './curation-parse.js';
-import { recallMemories } from './store.js';
+import { recallMemories, writeMemory } from './store.js';
+import { config } from '../config.js';
 
 const BUSINESS = 'test-business';
 const SENDER = 'supplier@vendor.example';
@@ -181,5 +182,111 @@ describe('curation from mail', () => {
     );
     expect(rows).toEqual([{ state: 'triaged', error: 'curation_failed' }]);
     expect(await curationRunsToday({ businessId: BUSINESS, scope: 'mail' })).toBe(1);
+  });
+
+  it('mail brief carries neither the subject nor the body', async () => {
+    const bundle = await installMailboxCharter(BUSINESS);
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      title: 'מייל: SUBJECT-CANARY',
+      businessId: BUSINESS,
+    });
+    const mail = await storedMail(BUSINESS, {
+      fromAddress: SENDER,
+      subject: 'SUBJECT-CANARY',
+      bodyText: 'BODY-CANARY',
+    });
+    await settleMail(
+      mail.mailId,
+      { state: 'triaged', categories: ['question'], summary: 'שאלה על הצעה', jobId: job.jobId },
+      { businessId: BUSINESS },
+    );
+    const brief = await buildCurationBrief(job.jobId, { businessId: BUSINESS });
+    expect(brief).not.toBeNull();
+    expect(brief?.text).toContain('שאלה על הצעה');
+    expect(brief?.text).not.toContain('SUBJECT-CANARY');
+    expect(brief?.text).not.toContain('BODY-CANARY');
+  });
+
+  it('mail brief is null without a sender address', async () => {
+    const bundle = await installMailboxCharter(BUSINESS);
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+      title: 'x',
+      businessId: BUSINESS,
+    });
+    const mail = await storedMail(BUSINESS, { fromAddress: '' });
+    await settleMail(
+      mail.mailId,
+      { state: 'triaged', categories: ['invoice'], summary: 's', jobId: job.jobId },
+      { businessId: BUSINESS },
+    );
+    expect(await buildCurationBrief(job.jobId, { businessId: BUSINESS })).toBeNull();
+  });
+
+  it('mail scope never retires: an existing non-boss preference survives, the claim lands as a chunk', async () => {
+    const jobId = await seedMailJob();
+    const { rows: versions } = await getPool().query<{ charter_version: string }>(
+      'SELECT charter_version FROM jobs WHERE job_id = $1',
+      [jobId],
+    );
+    const staffJob = await createJob({
+      charterVersion: versions[0]!.charter_version,
+      provenance: 'staff',
+      title: 'seed',
+      businessId: BUSINESS,
+    });
+    await writeMemory(
+      { jobId: staffJob.jobId, kind: 'preference', subjectKey: SENDER, attribute: 'bank', body: { value: 'OLD' }, sourceRef: 'seed' },
+      { businessId: BUSINESS },
+    );
+    const outcome = await curateJob(jobId, {
+      businessId: BUSINESS,
+      scope: 'mail',
+      curator: async () => ({
+        candidates: [
+          { kind: 'preference', subjectKey: SENDER, attribute: 'bank', body: { value: 'NEW' }, sourceRef: 'mail' },
+          { kind: 'entity', subjectKey: SENDER, body: { name: 'x' }, sourceRef: 'mail' },
+        ],
+      }),
+    });
+    expect(outcome).toMatchObject({ written: 2, failed: false });
+    const { rows } = await getPool().query<{ kind: string; retired_at: Date | null; body: unknown }>(
+      'SELECT kind, retired_at, body FROM memories WHERE business_id = $1 AND subject_key = $2',
+      [BUSINESS, SENDER],
+    );
+    const pref = rows.filter((r) => r.kind === 'preference');
+    expect(pref).toHaveLength(1);
+    expect(pref[0]?.retired_at).toBeNull();
+    expect(JSON.stringify(pref[0]?.body)).toContain('OLD');
+    expect(rows.filter((r) => r.kind === 'chunk')).toHaveLength(2);
+    expect(rows.filter((r) => r.kind === 'entity')).toHaveLength(0);
+    expect(rows.every((r) => r.retired_at === null)).toBe(true);
+  });
+
+  it('an empty sender address is never curated', async () => {
+    let calls = 0;
+    const result = await pollOne(['invoice'], '', async () => {
+      calls += 1;
+      return { candidates: [] };
+    });
+    expect(result?.triaged).toBe(1);
+    expect(calls).toBe(0);
+  });
+
+  it('a question mail is curated', async () => {
+    let calls = 0;
+    const result = await pollOne(['question'], SENDER, async () => {
+      calls += 1;
+      return { candidates: [] };
+    });
+    expect(result?.triaged).toBe(1);
+    expect(calls).toBe(1);
+  });
+
+  it('the mail curation ceiling defaults to 100', () => {
+    expect(config.mailCurationPerDay).toBe(100);
   });
 });

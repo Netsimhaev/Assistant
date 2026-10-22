@@ -125,7 +125,6 @@ async function loadReadingForJob(
  */
 async function buildMailBrief(
   jobId: string,
-  title: string | null,
   options: { businessId: string; db: Queryable },
 ): Promise<CurationBrief | null> {
   const mail = await mailForJob(jobId, options);
@@ -133,7 +132,8 @@ async function buildMailBrief(
   const sender = mail.fromAddress.trim();
   if (sender === '') return null;
   const sections = [
-    `# המשימה\n${title ?? '(ללא כותרת)'}`,
+    `# המשימה
+מייל שהתקבל בתיבת הדואר (הנושא והגוף אינם נכללים בכוונה)`,
     `# נושאים מותרים\n` +
       `מותר לך לכתוב עובדה רק על מי שמזהה אותו מופיע ברשימה הזו, ` +
       `ו-subjectKey חייב להיות זהה למזהה כאן אות באות — לא שם, לא ניחוש:\n- ${sender}`,
@@ -156,7 +156,7 @@ export async function buildCurationBrief(
   if (job === null) return null;
 
   const stored = await loadPlanBody(jobId, { businessId, db });
-  if (stored === null) return buildMailBrief(jobId, job.title, { businessId, db });
+  if (stored === null) return buildMailBrief(jobId, { businessId, db });
 
   const recipients = new Set<string>();
   const entityIds = new Set<string>();
