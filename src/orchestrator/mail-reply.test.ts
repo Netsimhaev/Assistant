@@ -100,6 +100,27 @@ async function approve(approvalId: string, editedInput?: unknown): Promise<void>
   await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
 }
 
+describe('replySubject folds control characters (a subject must never break a header)', () => {
+  it('CR, LF, TAB and other C0/C1 controls become single spaces', () => {
+    expect(replySubject('שאלה\r\nBcc: v@y.com')).toBe('Re: שאלה Bcc: v@y.com');
+    expect(replySubject('a\tb\u0000c\u007fd\u0085e')).toBe('Re: a b c d e');
+    expect(replySubject('Re:\nhello')).toBe('Re: hello');
+  });
+
+  it('a raised reply proposes a subject with no line break in it', async () => {
+    const bundle = await installMailboxCharter();
+    const mail = await storedMail({ subject: 'Invoice\r\nBcc: v@y.com' });
+    const raised = await raiseMailReply(
+      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+      { businessId: BUSINESS },
+    );
+    if (raised === null) throw new Error('expected a card');
+    const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    const subject = (approval?.proposedInput as Record<string, unknown>)['subject'];
+    expect(subject).toBe('Re: Invoice Bcc: v@y.com');
+  });
+});
+
 describe('replySubject', () => {
   it('prefixes Re: unless already there, any case', () => {
     expect(replySubject('שאלה')).toBe('Re: שאלה');

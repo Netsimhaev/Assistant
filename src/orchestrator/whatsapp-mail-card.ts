@@ -408,6 +408,10 @@ async function replaceBody(
   if (card.jobId === null) return ctx.refuse(MAIL_CARD_GONE);
   const jobId = card.jobId;
   const proposed = card.proposedInput as Record<string, unknown>;
+  // Only `body` is replaced, so the subject is untouched by construction and
+  // the Outlook rule (`mailReplyEditRefusal`, R22: on Microsoft 365 the reply
+  // subject is set by Outlook and may not be edited) holds here on every
+  // provider without needing to know which one is bound.
   const edited: Record<string, unknown> = { ...proposed, body: newBody };
   if (!mailReplyEditAllowed(proposed, edited)) return ctx.refuse(MAIL_CARD_GONE);
 

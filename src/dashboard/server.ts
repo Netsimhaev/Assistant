@@ -73,10 +73,10 @@ import {
   handleOAuthStart,
 } from './oauth-routes.js';
 import type { OAuthRouteOptions } from './oauth-routes.js';
-import type { MailProvider } from '../mail/mailbox.js';
+import { MAILBOX_SYSTEM, type MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
 import { isMailReplyJob } from '../mail/inbox-store.js';
-import { MAIL_REPLY_EDIT_REFUSAL, mailReplyEditAllowed, mailboxReplyRecipient } from '../mail/reply-card.js';
+import { mailReplyEditRefusal, mailboxReplyRecipient } from '../mail/reply-card.js';
 import {
   handleMailboxRevertPost,
   handleMailboxSignGet,
@@ -1875,9 +1875,25 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
       ...(verdict !== null ? { verdict } : {}),
       ...(notJudgedReason !== null ? { notJudged: notJudgedReason } : {}),
       ...(verdictUnreadable ? { verdictUnreadable: true } : {}),
-      ...((await isMailReplyCard(approval.jobId, businessId)) ? { mailReply: true } : {}),
+      ...(await mailReplyOptions(approval.jobId, businessId)),
     }),
   );
+}
+
+/** The card options a mailbox reply needs: the marker, and the provider when one is bound. */
+async function mailReplyOptions(
+  jobId: string | null,
+  businessId: string,
+): Promise<{ mailReply?: true; mailProvider?: string }> {
+  if (!(await isMailReplyCard(jobId, businessId))) return {};
+  const mailProvider = await mailboxProviderOf(businessId);
+  return mailProvider !== null ? { mailReply: true, mailProvider } : { mailReply: true };
+}
+
+/** The provider on the business's `mailbox` binding, or `null` when none is bound. */
+async function mailboxProviderOf(businessId: string): Promise<string | null> {
+  const bindings = await loadBindings({ businessId });
+  return bindings.find((b) => b.system === MAILBOX_SYSTEM)?.provider ?? null;
 }
 
 /** The positive marker the reply layout and the reply edit rule key on. */
@@ -2273,6 +2289,8 @@ async function handleDecision(
   );
 
   const mailReply = await isMailReplyCard(approval.jobId, businessId);
+  const mailProvider = mailReply ? await mailboxProviderOf(businessId) : null;
+  const providerOption = mailProvider !== null ? { mailProvider } : {};
 
   if (!edit.ok) {
     return sendHtml(
@@ -2284,21 +2302,28 @@ async function handleDecision(
         editValue: edit.raw,
         ...(note !== undefined ? { noteValue: note } : {}),
         ...(mailReply ? { mailReply: true } : {}),
+        ...providerOption,
         error: 'התוכן שהוזן אינו אובייקט JSON תקין. יש להזין מבנה בסגנון { "שדה": ערך } ולנסות שוב.',
       }),
     );
   }
 
   // A mailbox reply goes to the original From, always (mailbox spec 5.2):
-  // only the subject and the body may be edited. Keyed on the marker OR the
-  // reply shape of what was proposed -- the refusal only ever narrows, so the
-  // broader test is the safe one -- and checked before `decide`, so the
-  // approval stays pending and nothing can run.
-  if (
+  // only the subject and the body may be edited — and on a Microsoft 365
+  // mailbox only the body, since Outlook sets the reply subject itself (R22).
+  // Keyed on the marker OR the reply shape of what was proposed -- the
+  // refusal only ever narrows, so the broader test is the safe one -- and
+  // checked before `decide`, so the approval stays pending and nothing can run.
+  const editRefusal =
     edit.editedInput !== undefined &&
-    (mailReply || mailboxReplyRecipient(approval.proposedInput) !== null) &&
-    !mailReplyEditAllowed(approval.proposedInput, edit.editedInput)
-  ) {
+    (mailReply || mailboxReplyRecipient(approval.proposedInput) !== null)
+      ? mailReplyEditRefusal(
+          approval.proposedInput,
+          edit.editedInput,
+          mailProvider ?? (await mailboxProviderOf(businessId)),
+        )
+      : null;
+  if (editRefusal !== null) {
     return sendHtml(
       res,
       400,
@@ -2308,7 +2333,8 @@ async function handleDecision(
         editValue: JSON.stringify(edit.editedInput, null, 2),
         ...(note !== undefined ? { noteValue: note } : {}),
         ...(mailReply ? { mailReply: true } : {}),
-        error: MAIL_REPLY_EDIT_REFUSAL,
+        ...providerOption,
+        error: editRefusal,
       }),
     );
   }

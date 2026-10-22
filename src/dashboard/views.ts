@@ -29,7 +29,7 @@ import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
-import { WARNING_PREFIXES, mailboxReplyRecipient, splitReplyDetail } from '../mail/reply-card.js';
+import { OUTLOOK_SUBJECT_NOTE, WARNING_PREFIXES, mailboxReplyRecipient, splitReplyDetail } from '../mail/reply-card.js';
 import { formatMinor } from '../util/money.js';
 
 /** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
@@ -1100,6 +1100,11 @@ export function renderApprovalCard(options: {
    * like a reply renders as before.
    */
   mailReply?: boolean;
+  /**
+   * The provider on the `mailbox` binding. `microsoft` adds a line saying the
+   * subject is set by Outlook (R22) — the route refuses a subject edit there.
+   */
+  mailProvider?: string;
 }): string {
   const { approval } = options;
   // A pending card can carry a staged edit — the owner's replacement body for
@@ -1119,7 +1124,10 @@ export function renderApprovalCard(options: {
   const replyRecipient =
     options.mailReply === true ? mailboxReplyRecipient(approval.proposedInput) : null;
   const detailBlock =
-    replyRecipient === null ? `<p>${esc(approval.detail)}</p>` : mailReplyDetail(approval.detail);
+    replyRecipient === null
+      ? `<p>${esc(approval.detail)}</p>`
+      : mailReplyDetail(approval.detail) +
+        (options.mailProvider === 'microsoft' ? `\n  <p class="muted">${esc(OUTLOOK_SUBJECT_NOTE)}</p>` : '');
   const recipientRow =
     replyRecipient === null
       ? ''

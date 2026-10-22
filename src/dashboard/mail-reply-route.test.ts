@@ -37,6 +37,8 @@ const BUSINESS = 'test-business';
 const USERNAME = 'owner';
 const PASSWORD = 'correct horse battery staple';
 const REFUSAL = 'בתשובה למייל אפשר לערוך רק את הנושא ואת גוף ההודעה';
+const OUTLOOK_REFUSAL = 'ב-Outlook הנושא נקבע אוטומטית — אפשר לערוך רק את גוף ההודעה';
+const OUTLOOK_SUBJECT_NOTE = 'ב-Outlook הנושא נקבע אוטומטית';
 
 let server: Server | null = null;
 
@@ -78,8 +80,8 @@ function csrfOf(html: string): string {
   return match[1];
 }
 
-async function setup() {
-  const bundle = await installMailboxCharter(BUSINESS);
+async function setup(provider: 'google' | 'microsoft' = 'google') {
+  const bundle = await installMailboxCharter(BUSINESS, provider);
   const mail = await storedMail(BUSINESS);
   const raised = await raiseMailReply(
     { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() },
@@ -142,6 +144,11 @@ describe('editing a mailbox-reply card', () => {
     expect((await getApproval(s.raised.approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
   });
 
+  it('on Gmail the card says nothing about the subject being set by the provider', async () => {
+    const s = await setup('google');
+    expect(s.html).not.toContain(OUTLOOK_SUBJECT_NOTE);
+  });
+
   it('a body-and-subject edit is accepted and sent', async () => {
     const s = await setup();
     const res = await submit(s, { ...s.proposed, subject: 'Re: נושא ערוך', body: 'גוף ערוך' });
@@ -152,5 +159,42 @@ describe('editing a mailbox-reply card', () => {
     expect(sent[0]?.body).toBe('גוף ערוך');
     expect(sent[0]?.subject).toBe('Re: נושא ערוך');
     expect(sent[0]?.to).toEqual(['dana@client.example']);
+  });
+});
+
+describe('a Microsoft 365 mailbox sets the reply subject itself (R22)', () => {
+  // Graph's /reply ignores a subject: Outlook writes "RE: <original>". An
+  // accepted subject edit would be a change the owner approved and that never
+  // happened, so it is refused — and the card says so up front.
+
+  it('the card says the subject is set by Outlook', async () => {
+    const s = await setup('microsoft');
+    expect(s.html).toContain(OUTLOOK_SUBJECT_NOTE);
+  });
+
+  it('a subject edit is refused with the Outlook reason, the approval stays pending, nothing is sent', async () => {
+    const s = await setup('microsoft');
+    const res = await submit(s, { ...s.proposed, subject: 'Re: נושא ערוך', body: 'גוף ערוך' });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain(OUTLOOK_REFUSAL);
+    expect((await getApproval(s.raised.approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+    expect(await runAndCollect()).toHaveLength(0);
+  });
+
+  it('a body-only edit is accepted and sent (the refusal is about the subject, not every edit)', async () => {
+    const s = await setup('microsoft');
+    const res = await submit(s, { ...s.proposed, body: 'גוף ערוך' });
+    expect(res.status).toBe(302);
+    expect((await getApproval(s.raised.approvalId, { businessId: BUSINESS }))?.state).toBe('approved_with_edit');
+    const sent = await runAndCollect();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.body).toBe('גוף ערוך');
+  });
+
+  it('a recipient edit on Microsoft still gets the general refusal', async () => {
+    const s = await setup('microsoft');
+    const res = await submit(s, { ...s.proposed, to: ['someone-else@other.example'] });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain(REFUSAL);
   });
 });

@@ -18,9 +18,20 @@
 import { stripBidiControls } from '../util/bidi.js';
 import { canonicalJson } from '../util/canonical.js';
 
-/** `Re: ` unless the subject already starts with `re:`, any case. */
+/**
+ * `Re: ` unless the subject already starts with `re:`, any case.
+ *
+ * Control characters (C0, DEL, C1 — CR and LF among them) are folded to one
+ * space first. A subject header can be RFC 2047-encoded so that it DECODES to
+ * a line break, and that string is what lands here; proposed as is, it is a
+ * subject the Gmail client refuses ("header value contains a line break") on
+ * every send and on every re-raise, so the reply could never go out. Folding
+ * here keeps the proposal — what the owner reads and approves — clean.
+ */
 export function replySubject(subject: string): string {
-  return /^\s*re:/i.test(subject) ? subject : `Re: ${subject}`;
+  // eslint-disable-next-line no-control-regex
+  const folded = subject.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ');
+  return /^\s*re:/i.test(folded) ? folded : `Re: ${folded}`;
 }
 
 export const REPLY_TO_WARNING_PREFIX = 'שים לב: המייל ביקש שהתשובה תישלח ל-';
@@ -102,6 +113,38 @@ export function splitReplyDetail(detail: string): { header: string[]; body: stri
 
 /** Shown when an edit to a mailbox-reply card touches anything but subject and body. */
 export const MAIL_REPLY_EDIT_REFUSAL = 'בתשובה למייל אפשר לערוך רק את הנושא ואת גוף ההודעה';
+
+/**
+ * Microsoft 365 answers a reply through Graph's `/reply`, which takes no
+ * subject: Outlook writes "RE: <original subject>" itself. A subject edit on
+ * such a card would be approved and then silently not happen, so it is
+ * refused (ruling R22), and the card says so before the owner tries.
+ */
+export const OUTLOOK_SUBJECT_REFUSAL = 'ב-Outlook הנושא נקבע אוטומטית — אפשר לערוך רק את גוף ההודעה';
+export const OUTLOOK_SUBJECT_NOTE =
+  'ב-Outlook הנושא נקבע אוטומטית ("RE:" ונושא המייל המקורי) — אפשר לערוך רק את גוף ההודעה.';
+
+/**
+ * Why an edit to a mailbox-reply card is refused, or `null` when it is allowed.
+ *
+ * The provider-aware form of `mailReplyEditAllowed`: everything that rule
+ * refuses is refused here with its own sentence, and on a `microsoft`
+ * mailbox a changed subject is refused too. Positive: the subject is locked
+ * only when the provider IS `microsoft`; Gmail sends the subject it is given.
+ */
+export function mailReplyEditRefusal(
+  proposed: unknown,
+  edited: unknown,
+  provider: string | null,
+): string | null {
+  if (!mailReplyEditAllowed(proposed, edited)) return MAIL_REPLY_EDIT_REFUSAL;
+  if (provider === 'microsoft') {
+    const p = proposed as Record<string, unknown>;
+    const e = edited as Record<string, unknown>;
+    if (canonicalJson(p['subject']) !== canonicalJson(e['subject'])) return OUTLOOK_SUBJECT_REFUSAL;
+  }
+  return null;
+}
 
 /** The only fields an owner may change on a mailbox-reply card. */
 const EDITABLE_REPLY_FIELDS: ReadonlySet<string> = new Set(['subject', 'body']);

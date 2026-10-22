@@ -12,6 +12,7 @@ import type { MailTriage } from '../domain/mail-triage.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { recordIncoming, type IncomingMail, type StoredMail } from '../mail/inbox-store.js';
+import type { MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient, MailboxFailure, OutgoingMessage, OutgoingReply } from '../mail/providers/types.js';
 import { createMailboxSendAdapter } from '../orchestrator/adapters/mailbox-send.js';
 import { AdapterRegistry } from '../orchestrator/adapters/registry.js';
@@ -34,12 +35,15 @@ export const QUESTION_TRIAGE: MailTriage = {
   replyGist: 'לומר שנחזור אליה עד מחר',
 };
 
-export async function installMailboxCharter(businessId: string): Promise<PolicyBundle> {
+export async function installMailboxCharter(
+  businessId: string,
+  provider: MailProvider = 'google',
+): Promise<PolicyBundle> {
   const base = buildCharter({ version: `2026-08-15.${businessId}` });
   // The amendment supersedes the base version, which must exist first.
   await installCharter(base, { businessId });
   const signed = BusinessCharter.parse(
-    signCharter(buildMailboxAmendment(base, NOON, 'google'), {
+    signCharter(buildMailboxAmendment(base, NOON, provider), {
       signedByPersonId: 'owner',
       method: 'dashboard_click',
       signedAt: NOON,
@@ -52,7 +56,7 @@ export async function installMailboxCharter(businessId: string): Promise<PolicyB
       status: 'live',
       endpoint: null,
       credentialRef: 'OAUTH_MAILBOX',
-      provider: 'google',
+      provider,
       lastOkAt: null,
       lastError: null,
     },
