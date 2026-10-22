@@ -206,8 +206,10 @@ export async function scanInbox(options: ScanInboxOptions): Promise<ScanResult> 
       continue;
     }
 
-    // Decided positively — `DocumentStatus` is three-way, and there is no
-    // permissive `else` left to swallow a value none of these three named.
+    // Decided positively — `DocumentStatus` is four-way, and there is no
+    // permissive `else` left to swallow a value none of these named. A
+    // `stored` document (a PDF, migration 044) was kept as the owner sent it,
+    // so it files into `processed/` beside an extracted one.
     //
     // Each branch's move is wrapped on its own: the document already has a
     // verdict at this point, but filing the file into its folder is a
@@ -220,7 +222,7 @@ export async function scanInbox(options: ScanInboxOptions): Promise<ScanResult> 
     // that was ingested but never actually filed into `processed/` did not
     // happen from that record's point of view. It counts as `deferred`
     // instead — the claimed copy stays in `working/`, unfiled either way.
-    if (document.status === 'extracted') {
+    if (document.status === 'extracted' || document.status === 'stored') {
       try {
         await moveWithoutClobber(claimed, join(inbox, PROCESSED), name);
         result.ingested += 1;

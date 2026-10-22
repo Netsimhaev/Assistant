@@ -80,6 +80,8 @@ import {
   DOCX,
   JSON as JSON_MEDIA_TYPE,
   MARKDOWN,
+  PDF,
+  STORE_ONLY_TYPES,
   TEXT,
   XLSX,
   sniffMediaType,
@@ -88,7 +90,7 @@ import { buildOutline } from './outline.js';
 import { extractorFor } from './registry.js';
 import { runExtractor } from './run-extractor.js';
 import type { ExtractOutcome, RunExtractorOptions } from './run-extractor.js';
-import { insertOrGetDocument, markExtracted, markRejected } from './store.js';
+import { insertOrGetDocument, markExtracted, markRejected, markStored } from './store.js';
 import type { DocumentRecord, DocumentSource } from './types.js';
 
 /** §3.4: the original file's own size ceiling — independent of, and checked before, the content-level caps §5.3 enforces inside the extractor. */
@@ -128,6 +130,7 @@ export const EXTENSION_BY_MEDIA_TYPE: Readonly<Record<string, string>> = {
   [TEXT]: 'txt',
   [MARKDOWN]: 'md',
   [JSON_MEDIA_TYPE]: 'json',
+  [PDF]: 'pdf',
 };
 const UNKNOWN_EXTENSION = 'bin';
 
@@ -294,6 +297,15 @@ export async function ingestDocument(
 
   if (sniffed === null) {
     return reject('סוג הקובץ אינו מזוהה או אינו נתמך');
+  }
+
+  // Store-only (a PDF): the bytes are kept and downloadable, and nothing
+  // parses them. A terminal status of its own — `rejected` would tell the
+  // owner the file was refused, and `extracted` would offer it to a reader
+  // with no artefacts to read.
+  if (STORE_ONLY_TYPES.has(sniffed)) {
+    await markStored(documentId, { businessId });
+    return { ...document, status: 'stored' };
   }
 
   const extractorId = extractorFor(sniffed);

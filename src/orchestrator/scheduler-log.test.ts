@@ -56,6 +56,35 @@ describe('logErrored', () => {
     }
   });
 
+  it('prints a mailbox cursor gap and a nonzero unnotified count', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      logErrored({
+        ...cleanResult(),
+        mail: {
+          status: 'ok',
+          recorded: 0,
+          triaged: 0,
+          overCap: 0,
+          labelled: 0,
+          notified: 0,
+          unnotified: 3,
+          drafts: 0,
+          reraised: 0,
+          failed: 0,
+          gap: true,
+        },
+      });
+      const all = [...logSpy.mock.calls, ...errorSpy.mock.calls].map((c) => String(c[0])).join('\n');
+      expect(all).toContain('mailbox cursor expired');
+      expect(all).toContain('3 mail(s) from people had no WhatsApp channel');
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
   /**
    * The exact gap F4 named: ruling 3 is only honest once a deferred count and
    * an errored job id are actually printed somewhere an operator reads.

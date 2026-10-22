@@ -188,9 +188,45 @@ function ctx(options: Options): { businessId: string; db: Queryable } {
   return { businessId: options.businessId ?? config.businessId, db: options.db ?? getPool() };
 }
 
+/**
+ * Postgres refuses U+0000 in `text` and in `jsonb`, so one hostile mail with a
+ * NUL in its subject, body or attachment name used to make `recordIncoming`
+ * throw on every pass — and the cursor never advanced past it. Stripped here,
+ * in the one function both providers record through.
+ */
+function noNul(value: string): string {
+  return value.includes('\u0000') ? value.replace(/\u0000/g, '') : value;
+}
+
+function sanitize(input: IncomingMail): IncomingMail {
+  const opt = (v: string | null): string | null => (v === null ? null : noNul(v));
+  return {
+    providerMessageId: noNul(input.providerMessageId),
+    threadId: noNul(input.threadId),
+    internetMessageId: opt(input.internetMessageId),
+    references: opt(input.references),
+    fromAddress: noNul(input.fromAddress),
+    fromName: opt(input.fromName),
+    replyTo: opt(input.replyTo),
+    toAddresses: input.toAddresses.map(noNul),
+    subject: noNul(input.subject),
+    receivedAt: noNul(input.receivedAt),
+    bodyText: noNul(input.bodyText),
+    bodyTruncated: input.bodyTruncated,
+    headerFlags: input.headerFlags,
+    attachments: input.attachments.map((a) => ({
+      attachmentId: noNul(a.attachmentId),
+      filename: noNul(a.filename),
+      mediaType: noNul(a.mediaType),
+      size: a.size,
+    })),
+  };
+}
+
 /** Returns `null` on a duplicate `(business_id, provider_message_id)`. */
-export async function recordIncoming(input: IncomingMail, options: Options = {}): Promise<StoredMail | null> {
+export async function recordIncoming(raw: IncomingMail, options: Options = {}): Promise<StoredMail | null> {
   const { businessId, db } = ctx(options);
+  const input = sanitize(raw);
   const { rows } = await db.query<MailDbRow>(
     `INSERT INTO mail_messages
        (mail_id, business_id, provider_message_id, thread_id, internet_message_id,
@@ -215,11 +251,51 @@ export async function recordIncoming(input: IncomingMail, options: Options = {})
 export async function claimMail(mailId: string, options: Options = {}): Promise<boolean> {
   const { businessId, db } = ctx(options);
   const res = await db.query(
-    `UPDATE mail_messages SET state = 'claimed'
+    `UPDATE mail_messages SET state = 'claimed', claimed_at = now()
       WHERE business_id = $1 AND mail_id = $2 AND state IN ('received', 'over_cap')`,
     [businessId, mailId],
   );
   return (res.rowCount ?? 0) === 1;
+}
+
+/**
+ * Return claims older than `minutes` to `received`, so a poller that crashed
+ * after `claimMail` does not leave the mail stuck forever (nothing re-reads
+ * `claimed`). A NULL `claimed_at` (a row claimed before migration 044) counts
+ * as stale. The orphaned triage job is the re-handler's to close — it knows
+ * the mail's `job_id`. Returns how many rows moved.
+ */
+export async function staleClaimsToReceived(minutes: number, options: Options = {}): Promise<number> {
+  const { businessId, db } = ctx(options);
+  const res = await db.query(
+    `UPDATE mail_messages SET state = 'received', claimed_at = NULL
+      WHERE business_id = $1 AND state = 'claimed'
+        AND (claimed_at IS NULL OR claimed_at < now() - make_interval(mins => $2))`,
+    [businessId, minutes],
+  );
+  return res.rowCount ?? 0;
+}
+
+export const UNRECORDABLE_SUBJECT = '(לא ניתן לשמור את המייל)';
+
+/**
+ * A placeholder for a message that failed to record on several passes in a
+ * row: no content at all, state `failed`, error `unrecordable`. It exists so
+ * the cursor can move past the message (the dedupe then absorbs it on every
+ * later listing) and so the mail screen shows that something arrived and was
+ * not kept. `ON CONFLICT DO NOTHING`: a real row, if one ever got written,
+ * wins.
+ */
+export async function recordUnrecordable(providerMessageId: string, options: Options = {}): Promise<void> {
+  const { businessId, db } = ctx(options);
+  await db.query(
+    `INSERT INTO mail_messages
+       (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
+        received_at, body_text, state, error)
+     VALUES ($1, $2, $3, '', '', $4, now(), NULL, 'failed', 'unrecordable')
+     ON CONFLICT (business_id, provider_message_id) DO NOTHING`,
+    [`M-${ulid()}`, businessId, noNul(providerMessageId), UNRECORDABLE_SUBJECT],
+  );
 }
 
 export async function settleMail(mailId: string, patch: SettlePatch, options: Options = {}): Promise<void> {
@@ -327,16 +403,17 @@ export async function claimFailedReply(
  */
 export async function recordMailProgress(
   mailId: string,
-  progress: { labelsApplied?: string[]; notifiedAt?: string },
+  progress: { labelsApplied?: string[]; notifiedAt?: string; jobId?: string },
   options: Options = {},
 ): Promise<void> {
   const { businessId, db } = ctx(options);
   const res = await db.query(
     `UPDATE mail_messages SET
         labels_applied = COALESCE($3::text[], labels_applied),
-        notified_at = COALESCE($4::timestamptz, notified_at)
+        notified_at = COALESCE($4::timestamptz, notified_at),
+        job_id = COALESCE($5, job_id)
       WHERE business_id = $1 AND mail_id = $2`,
-    [businessId, mailId, progress.labelsApplied ?? null, progress.notifiedAt ?? null],
+    [businessId, mailId, progress.labelsApplied ?? null, progress.notifiedAt ?? null, progress.jobId ?? null],
   );
   if ((res.rowCount ?? 0) !== 1) throw new Error(`recordMailProgress: no mail row for ${mailId}`);
 }

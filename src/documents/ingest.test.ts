@@ -4,10 +4,10 @@ import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { guardZipArchive, ingestDocument } from './ingest.js';
-import { loadArtifacts } from './store.js';
+import { documentsAwaitingRead, loadArtifacts, loadDocument } from './store.js';
 import type { OutlineContent } from './types.js';
 
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
@@ -34,6 +34,32 @@ afterAll(async () => {
 });
 
 describe('ingestDocument', () => {
+  it('stores a PDF as a store-only document: status stored, original.pdf on disk, never offered for reading', async () => {
+    const path = join(ROOT, 'incoming.pdf');
+    await writeFile(
+      path,
+      Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]),
+    );
+    const doc = await ingestDocument({ path, source: 'mail', originalName: 'invoice.pdf' }, OPTS);
+    expect(doc.status).toBe('stored');
+    expect(doc.mediaType).toBe('application/pdf');
+    expect(doc.storedPath.endsWith('/original.pdf')).toBe(true);
+    expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
+    expect(await loadArtifacts(doc.documentId, OPTS)).toEqual([]);
+    const reloaded = await loadDocument(doc.documentId, OPTS);
+    expect(reloaded?.status).toBe('stored');
+    // Even with source manual, a stored document is not one the conductor reads.
+    await getPool().query("UPDATE documents SET source = 'manual' WHERE document_id = $1", [doc.documentId]);
+    expect(await documentsAwaitingRead(10, OPTS)).toEqual([]);
+  });
+
+  it('still rejects binary that is not a PDF, whatever the name says', async () => {
+    const path = join(ROOT, 'fake.pdf');
+    await writeFile(path, Buffer.from([0x00, 0x01, 0xff, 0xfe, 0x80, 0x81]));
+    const doc = await ingestDocument({ path, source: 'mail', originalName: 'fake.pdf' }, OPTS);
+    expect(doc.status).toBe('rejected');
+  });
+
   it('stores, extracts and records in one pass', async () => {
     const doc = await ingestDocument({ path: fixture('tiny.xlsx'), source: 'manual' }, OPTS);
     expect(doc.status).toBe('extracted');

@@ -48,6 +48,15 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.mail !== null && result.mail.status !== 'ok') {
     console.error(`mailbox poll: ${result.mail.status}${result.mail.error !== undefined ? ` (${result.mail.error})` : ''}`);
   }
+  // A gap is mail that will never be read (no backfill) — an operator must
+  // see it the pass it happens; the audit row (`mail_cursor_gap`) keeps it.
+  if (result.mail?.gap === true) {
+    console.error('mailbox cursor expired and was re-taken: mail that arrived in between was not read');
+  }
+  // Spec §2.6: "no WhatsApp notices" must not look like "nothing to notify".
+  if (result.mail !== null && result.mail.unnotified > 0) {
+    console.log(`${result.mail.unnotified} mail(s) from people had no WhatsApp channel to notify the owner on`);
+  }
   // `ConductResult.verificationFailed` (fix round 1's Important 3) is exactly
   // this file's own rule applied to a bucket that, until now, had no printer
   // at all: "visible, unlike a bare swallow" was true only to a test.

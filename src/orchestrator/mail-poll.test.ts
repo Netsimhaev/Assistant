@@ -38,7 +38,7 @@ import {
   stubDrafter,
 } from '../test/mailbox.js';
 import { envCredentials } from './credentials.js';
-import { loadJob } from './jobs.js';
+import { createJob, loadJob, transition } from './jobs.js';
 import { oauthCredentials } from './oauth-token.js';
 import type { TokenHttp } from './oauth-token.js';
 import { pollMailbox, type MailPollResult } from './mail-poll.js';
@@ -84,7 +84,7 @@ interface FakeClient {
 
 function fakeClient(
   batches: ({ messages: IncomingMail[]; nextCursor: string } | MailboxFailure)[],
-  extra: { initialCursor?: string } = {},
+  extra: { initialCursor?: string; fetch?: (attachmentId: string) => Buffer | MailboxFailure } = {},
 ): FakeClient {
   const state: FakeClient = { client: null as unknown as MailboxClient, listCalls: [], ensureCalls: 0, labelled: [], fetched: [] };
   state.client = {
@@ -96,7 +96,7 @@ function fakeClient(
     },
     fetchAttachment: async (_token, providerMessageId, attachmentId) => {
       state.fetched.push(`${providerMessageId}/${attachmentId}`);
-      return PDF_BYTES;
+      return extra.fetch !== undefined ? extra.fetch(attachmentId) : PDF_BYTES;
     },
     ensureLabels: async (_token, names) => {
       state.ensureCalls += 1;
@@ -301,11 +301,11 @@ describe('pollMailbox', () => {
     // The image is not a type ingest supports: never fetched.
     expect(fake.fetched).toEqual(['PM-PDF/A-1']);
     const { rows: docs } = await getPool().query<{ document_id: string; source: string; original_name: string }>(
-      'SELECT document_id, source, original_name FROM documents WHERE business_id = $1',
+      'SELECT document_id, source, original_name, status, stored_path FROM documents WHERE business_id = $1',
       [BUSINESS],
     );
     expect(docs).toHaveLength(1);
-    expect(docs[0]).toMatchObject({ source: 'mail', original_name: 'invoice-17.pdf' });
+    expect(docs[0]).toMatchObject({ source: 'mail', original_name: 'invoice-17.pdf', status: 'stored' });
     const { rows: invoices } = await getPool().query<{ document_id: string | null; file_name: string | null }>(
       'SELECT document_id, file_name FROM mail_invoices WHERE business_id = $1',
       [BUSINESS],
@@ -485,7 +485,190 @@ describe('pollMailbox', () => {
     const cursor = await getCursor({ businessId: BUSINESS });
     expect(cursor?.cursor).toBe('C-0');
     expect(cursor?.lastError).not.toBeNull();
+    // Fix round 1: a record failure no longer stalls everything already stored.
+    expect(triage.calls).toBe(2);
+  });
+
+  it('one message that cannot be recorded becomes a placeholder on its third failing pass, and the cursor moves', async () => {
+    const { documentRoot } = await setup();
+    const broken = incomingMail({ providerMessageId: 'PM-BROKEN' });
+    Object.defineProperty(broken, 'subject', {
+      get() {
+        throw new Error('unmappable');
+      },
+    });
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-OK' }), broken], nextCursor: 'C-1' }]);
+    const run = () =>
+      pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot });
+
+    for (const _ of [1, 2]) {
+      expect(expectOk(await run()).status).toBe('error');
+      expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-0');
+    }
+    const third = expectOk(await run());
+    expect(third.status).toBe('ok');
+    expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-1');
+    const { rows } = await getPool().query<{ state: string; error: string | null; subject: string }>(
+      "SELECT state, error, subject FROM mail_messages WHERE provider_message_id = 'PM-BROKEN'",
+    );
+    expect(rows).toEqual([{ state: 'failed', error: 'unrecordable', subject: '(לא ניתן לשמור את המייל)' }]);
+  });
+
+  it('a mail carrying NUL bytes is recorded and triaged rather than stalling the poll', async () => {
+    const { documentRoot } = await setup();
+    const mail = incomingMail({ providerMessageId: 'PM-NUL', subject: 'x\u0000y', bodyText: 'a\u0000b' });
+    const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }]);
+
+    const result = expectOk(
+      await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }),
+    );
+
+    expect(result).toMatchObject({ status: 'ok', recorded: 1, triaged: 1 });
+    expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-1');
+  });
+
+  it('a failed attachment fetch keeps the notice, the invoice row (without a document) and the card', async () => {
+    const { documentRoot } = await setup();
+    const attachment: MailAttachment = { attachmentId: 'A-1', filename: 'invoice.pdf', mediaType: 'application/pdf', size: 100 };
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-AF', attachments: [attachment] })], nextCursor: 'C-1' }], {
+      fetch: () => ({ failure: 'transient', status: 503, message: 'unavailable' }),
+    });
+    const n = notifier();
+    const both: MailTriage = { ...QUESTION_TRIAGE, categories: ['invoice', 'question'], invoice: INVOICE_TRIAGE.invoice };
+
+    const result = expectOk(
+      await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(both), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify, now: NOON }),
+    );
+
+    expect(fake.fetched).toEqual(['PM-AF/A-1']);
+    expect(result).toMatchObject({ failed: 0, notified: 1, drafts: 1 });
+    const { rows } = await getPool().query<{ state: string; error: string | null }>("SELECT state, error FROM mail_messages WHERE provider_message_id = 'PM-AF'");
+    expect(rows).toEqual([{ state: 'triaged', error: 'attachment_failed' }]);
+    const { rows: invoices } = await getPool().query('SELECT document_id FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+    expect(invoices).toEqual([{ document_id: null }]);
+  });
+
+  it('skips an attachment over 25 MB without downloading it, and takes at most 10 per mail', async () => {
+    const { documentRoot } = await setup();
+    const huge: MailAttachment = { attachmentId: 'BIG', filename: 'huge.pdf', mediaType: 'application/pdf', size: 26 * 1024 * 1024 };
+    const many: MailAttachment[] = Array.from({ length: 12 }, (_, i) => ({
+      attachmentId: `A-${i}`,
+      filename: `p${i}.pdf`,
+      mediaType: 'application/pdf',
+      size: 100,
+    }));
+    const fake = fakeClient(
+      [
+        { messages: [incomingMail({ providerMessageId: 'PM-BIG', attachments: [huge] }), incomingMail({ providerMessageId: 'PM-MANY', receivedAt: '2026-10-21T08:30:00.000Z', attachments: many })], nextCursor: 'C-1' },
+      ],
+      // Distinct bytes per attachment, so dedupe by hash cannot hide a fetch.
+      { fetch: (id) => Buffer.concat([PDF_BYTES, Buffer.from(id)]) },
+    );
+
+    expectOk(
+      await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }),
+    );
+
+    expect(fake.fetched.filter((f) => f.startsWith('PM-BIG'))).toEqual([]);
+    expect(fake.fetched.filter((f) => f.startsWith('PM-MANY'))).toHaveLength(10);
+    const { rows } = await getPool().query<{ error: string | null }>("SELECT error FROM mail_messages WHERE provider_message_id = 'PM-BIG'");
+    expect(rows[0]?.error).toBe('attachment_too_large');
+  });
+
+  it('accepts an octet-stream attachment named .pdf and lets the bytes decide', async () => {
+    const { documentRoot } = await setup();
+    const attachment: MailAttachment = { attachmentId: 'A-1', filename: 'scan.pdf', mediaType: 'application/octet-stream', size: PDF_BYTES.length };
+    const other: MailAttachment = { attachmentId: 'A-2', filename: 'data.bin', mediaType: 'application/octet-stream', size: 4 };
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-OCT', attachments: [attachment, other] })], nextCursor: 'C-1' }]);
+
+    expectOk(
+      await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }),
+    );
+
+    expect(fake.fetched).toEqual(['PM-OCT/A-1']);
+    const { rows } = await getPool().query<{ status: string; media_type: string }>('SELECT status, media_type FROM documents WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toEqual([{ status: 'stored', media_type: 'application/pdf' }]);
+  });
+
+  it('returns a stale claim to received and fails its orphaned triage job before re-handling', async () => {
+    const { bundle, documentRoot } = await setup();
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-STALE' })], nextCursor: 'C-1' }]);
+    // A first pass whose triage is never reached: simulate the crash by hand.
+    await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot, readsPerDay: 1 });
+    const orphan = await createJob({ charterVersion: bundle.charterVersion, provenance: 'unknown_external', businessId: BUSINESS, title: 'orphan' });
+    await transition(orphan.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+    await getPool().query(
+      `UPDATE mail_messages SET state = 'claimed', triaged_at = NULL, job_id = $2, claimed_at = now() - interval '31 minutes'
+        WHERE business_id = $1`,
+      [BUSINESS, orphan.jobId],
+    );
+    const triage = stubTriage(OTHER_TRIAGE);
+
+    const result = expectOk(
+      await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }),
+    );
+
+    expect(triage.calls).toBe(1);
+    expect(result.triaged).toBe(1);
+    expect((await loadJob(orphan.jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    const [row] = await mailRows();
+    expect(row?.state).toBe('triaged');
+    expect(row?.job_id).not.toBe(orphan.jobId);
+  });
+
+  it('a fresh claim (under 30 minutes) is left alone', async () => {
+    const { documentRoot } = await setup();
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-FRESH' })], nextCursor: 'C-1' }]);
+    await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot, readsPerDay: 1 });
+    await getPool().query("UPDATE mail_messages SET state = 'claimed', triaged_at = NULL, claimed_at = now() - interval '5 minutes' WHERE business_id = $1", [BUSINESS]);
+    const triage = stubTriage(OTHER_TRIAGE);
+
+    await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot });
+
     expect(triage.calls).toBe(0);
+    expect((await mailRows())[0]?.state).toBe('claimed');
+  });
+
+  it('triages at most 20 mails in one pass by default', async () => {
+    const { documentRoot } = await setup();
+    const mails = Array.from({ length: 21 }, (_, i) =>
+      incomingMail({ providerMessageId: `PM-${String(i).padStart(2, '0')}`, receivedAt: new Date(Date.UTC(2026, 9, 21, 8, i)).toISOString() }),
+    );
+    const fake = fakeClient([{ messages: mails, nextCursor: 'C-1' }]);
+    const triage = stubTriage(OTHER_TRIAGE);
+
+    const result = expectOk(
+      await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }),
+    );
+
+    expect(triage.calls).toBe(20);
+    expect(result).toMatchObject({ recorded: 21, triaged: 20 });
+  });
+
+  it('a close that throws after the mail settled leaves it triaged, not failed', async () => {
+    const { documentRoot } = await setup();
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-CLOSE' })], nextCursor: 'C-1' }]);
+    // The triage stub moves the triage job to `failed` behind the poller's
+    // back, so the poller's own `plan` transition is illegal and throws.
+    const triage: Triage = async () => {
+      const { rows } = await getPool().query<{ job_id: string }>(
+        "SELECT job_id FROM jobs WHERE business_id = $1 AND title LIKE 'מייל:%' ORDER BY created_at DESC LIMIT 1",
+        [BUSINESS],
+      );
+      const jobId = rows[0]?.job_id;
+      if (jobId === undefined) throw new Error('no triage job');
+      await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+      return { status: 'read', triage: OTHER_TRIAGE };
+    };
+
+    const result = expectOk(
+      await pollMailbox({ businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }),
+    );
+
+    expect(result.failed).toBe(0);
+    const [row] = await mailRows();
+    expect(row?.state).toBe('triaged');
+    expect(row?.categories).toEqual(['other']);
   });
 
   it('a transient listing failure reports an error and keeps the cursor', async () => {
@@ -525,5 +708,13 @@ describe('pollMailbox', () => {
     const cursor = await getCursor({ businessId: BUSINESS });
     expect(cursor?.cursor).toBe('C-FRESH');
     expect(cursor?.lastError).toBe('cursor_expired_gap');
+
+    // Durable: the next clean pass overwrites `last_error`, the audit row stays.
+    const { rows: gapRows } = await getPool().query<{ reason: string; whole: string }>(
+      "SELECT reason, row_to_json(a)::text AS whole FROM audit_log a WHERE business_id = $1 AND reason = 'mail_cursor_gap'",
+      [BUSINESS],
+    );
+    expect(gapRows).toHaveLength(1);
+    expect(gapRows[0]?.whole).not.toContain('C-0');
   });
 });

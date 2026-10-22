@@ -14,6 +14,20 @@ export const CSV = 'text/csv';
 export const TEXT = 'text/plain';
 export const MARKDOWN = 'text/markdown';
 export const JSON = 'application/json';
+/**
+ * Store-only: kept on disk and downloadable, never extracted (`ingestDocument`
+ * gives it the terminal status `stored`). Named by its `%PDF-` magic.
+ */
+export const PDF = 'application/pdf';
+
+/**
+ * Types `sniffMediaType` names that the pipeline stores without parsing. A
+ * positive list, disjoint from `registry.ts`'s `SUPPORTED`
+ * (`media-type-tables.test.ts` locks both directions).
+ */
+export const STORE_ONLY_TYPES: ReadonlySet<string> = new Set([PDF]);
+
+const PDF_MAGIC = Buffer.from('%PDF-', 'latin1');
 
 const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
 
@@ -73,6 +87,12 @@ function looksLikeText(head: Buffer): boolean {
  */
 export function sniffMediaType(head: Buffer, originalName: string): string | null {
   const ext = extensionOf(originalName);
+
+  // Before the text check: a PDF whose first kilobytes are ASCII would
+  // otherwise read as plain text. The bytes decide; the name has no say.
+  if (head.length >= PDF_MAGIC.length && head.subarray(0, PDF_MAGIC.length).equals(PDF_MAGIC)) {
+    return PDF;
+  }
 
   if (isZipContainer(head)) {
     // Only among ZIP containers does the extension get a say. A ZIP whose

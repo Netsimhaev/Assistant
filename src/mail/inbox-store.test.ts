@@ -3,7 +3,7 @@ import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   claimMail, getCursor, insertInvoice, listInvoices, mailReadsToday, recordIncoming, searchMail,
-  setCursor, settleMail, type IncomingMail,
+  setCursor, settleMail, staleClaimsToReceived, type IncomingMail,
 } from './inbox-store.js';
 
 const BUSINESS = 'test-business';
@@ -87,5 +87,44 @@ describe('inbox store', () => {
     await settleMail(b.mailId, { state: 'triaged' }, opts);
     await getPool().query(`UPDATE mail_messages SET triaged_at = now() - interval '2 days' WHERE mail_id = $1`, [b.mailId]);
     expect(await mailReadsToday(opts)).toBe(1);
+  });
+  it('recordIncoming strips NUL from every text field, so a hostile mail cannot stall the poll', async () => {
+    const stored = await recordIncoming(
+      mail({
+        subject: 'a\u0000b',
+        bodyText: 'x\u0000y',
+        fromName: 'N\u0000m',
+        toAddresses: ['me\u0000@biz.co.il'],
+        attachments: [{ attachmentId: 'A\u0000', filename: 'f\u0000.pdf', mediaType: 'application/pdf', size: 1 }],
+      }),
+      opts,
+    );
+    expect(stored?.subject).toBe('ab');
+    expect(stored?.bodyText).toBe('xy');
+    expect(stored?.fromName).toBe('Nm');
+    expect(stored?.toAddresses).toEqual(['me@biz.co.il']);
+    expect(stored?.attachments[0]?.filename).toBe('f.pdf');
+  });
+
+  it('claimMail stamps claimed_at, and staleClaimsToReceived returns only old claims', async () => {
+    const a = await recordIncoming(mail({ providerMessageId: 'old' }), opts);
+    const b = await recordIncoming(mail({ providerMessageId: 'fresh' }), opts);
+    if (a === null || b === null) throw new Error('setup');
+    expect(await claimMail(a.mailId, opts)).toBe(true);
+    expect(await claimMail(b.mailId, opts)).toBe(true);
+    const { rows } = await getPool().query<{ claimed_at: Date | null }>(
+      'SELECT claimed_at FROM mail_messages WHERE mail_id = $1', [b.mailId],
+    );
+    expect(rows[0]?.claimed_at).not.toBeNull();
+    await getPool().query("UPDATE mail_messages SET claimed_at = now() - interval '31 minutes' WHERE mail_id = $1", [a.mailId]);
+
+    expect(await staleClaimsToReceived(30, opts)).toBe(1);
+    const { rows: states } = await getPool().query<{ provider_message_id: string; state: string }>(
+      'SELECT provider_message_id, state FROM mail_messages ORDER BY provider_message_id',
+    );
+    expect(states).toEqual([
+      { provider_message_id: 'fresh', state: 'claimed' },
+      { provider_message_id: 'old', state: 'received' },
+    ]);
   });
 });

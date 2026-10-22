@@ -230,6 +230,22 @@ export async function markExtracted(
 }
 
 /** Mark a document `rejected` with a human-readable reason (§8). The original bytes stay on disk. */
+/** A store-only document (a PDF): terminal, no artefacts. */
+export async function markStored(
+  documentId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<void> {
+  const db = options.db ?? getPool();
+  const { rowCount } = await db.query(
+    `UPDATE documents SET status = 'stored'
+      WHERE business_id = $1 AND document_id = $2`,
+    [options.businessId ?? config.businessId, documentId],
+  );
+  if (rowCount !== 1) {
+    throw new Error(`markStored: no document ${documentId} for business ${options.businessId ?? config.businessId}`);
+  }
+}
+
 export async function markRejected(
   documentId: string,
   reason: string,

@@ -49,9 +49,14 @@ describe('the three media-type tables stay in sync', () => {
   });
 
   it('every media-type constant has an entry in registry.ts\'s SUPPORTED', () => {
+    // Store-only types (a PDF) are the one positive exception: named by the
+    // sniff, kept on disk, never handed to an extractor. Never both.
     for (const mediaType of MEDIA_TYPE_CONSTANTS) {
-      expect(Object.hasOwn(SUPPORTED, mediaType), mediaType).toBe(true);
+      const extracted = Object.hasOwn(SUPPORTED, mediaType);
+      const storeOnly = MediaType.STORE_ONLY_TYPES.has(mediaType);
+      expect(extracted !== storeOnly, mediaType).toBe(true);
     }
+    expect(MediaType.STORE_ONLY_TYPES.has(MediaType.PDF)).toBe(true);
   });
 
   it('every media-type constant has an entry in ingest.ts\'s EXTENSION_BY_MEDIA_TYPE', () => {

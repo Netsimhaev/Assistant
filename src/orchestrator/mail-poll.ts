@@ -50,12 +50,19 @@
  * reply job is not drafted again, and a mail that already has an invoice row
  * gets no second one.
  *
- * **Non-fatal steps.** A label the provider refused, a WhatsApp notice that
- * did not go out, and a reply card that threw are noted on the mail
- * (`noteMailError`) and the mail still settles `triaged` with its categories:
- * the owner can see it on the mail screen, which a `failed` row would hide.
- * The triage call itself, and fetching or ingesting an attachment, are the
- * per-mail failures the poison-pill rule speaks about.
+ * **Non-fatal steps.** A label the provider refused, an attachment that
+ * could not be fetched or ingested (or was too large), a WhatsApp notice that
+ * did not go out, a reply card that threw, and a triage job that would not
+ * close after the mail settled are noted on the mail (`noteMailError`) and
+ * the mail still settles `triaged` with its categories: the owner can see it
+ * on the mail screen, which a `failed` row would hide. The triage call itself
+ * is the per-mail failure the poison-pill rule speaks about.
+ *
+ * **Crash recovery.** A row a crashed poller left `claimed` goes back to
+ * `received` after 30 minutes (`staleClaimsToReceived`), and the triage job
+ * that handling opened is failed before a new one opens. A message that will
+ * not record at all becomes a content-free placeholder on its third failing
+ * pass, so the cursor can move (`recordBatch`).
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -79,9 +86,12 @@ import {
   markOverCap,
   noteMailError,
   recordIncoming,
+  recordUnrecordable,
   recordMailProgress,
   setCursor,
+  staleClaimsToReceived,
   settleMail,
+  type IncomingMail,
   type MailCursor,
   type StoredMail,
 } from '../mail/inbox-store.js';
@@ -94,7 +104,7 @@ import { runMailDrafter, type Drafter } from '../sdk/mail-drafter.js';
 import { runMailTriage, type Triage } from '../sdk/mail-triage.js';
 import { canonicalHash } from '../util/canonical.js';
 import { loadBindings } from './bindings.js';
-import { createJob, transition, type Job } from './jobs.js';
+import { createJob, loadJob, transition, type Job } from './jobs.js';
 import { raiseMailReply, reraiseAfterFailedSend } from './mail-reply.js';
 import { OAuthGrantRevokedError, OAuthRefreshRejectedError } from './oauth-token.js';
 import type { NotifyTarget } from './proposal-approval.js';
@@ -141,12 +151,18 @@ export interface PollMailboxOptions {
   /** Approval-card email target — the same one the conductor gets. */
   notify?: NotifyTarget;
   now?: Date;
-  /** Most mails considered in one pass. */
+  /** Most mails triaged in one pass (default 20): a pass is bounded in time as well as in money. */
   limit?: number;
 }
 
 const MAILBOX_CREDENTIAL_REF = 'OAUTH_MAILBOX';
 const CALL_TIMEOUT_MS = 30_000;
+const DEFAULT_TRIAGE_LIMIT = 20;
+/** A claim older than this is a crashed poller's, not a slow one's: a pass triages at most 20 mails. */
+const STALE_CLAIM_MINUTES = 30;
+/** The document pipeline's own ceiling (`ingest.ts`). Checked on the declared size, before downloading. */
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MAIL = 10;
 
 /** Attachment types the document pipeline accepts. PDF is stored and kept downloadable. */
 const INGESTIBLE_TYPES: ReadonlySet<string> = new Set([
@@ -199,6 +215,12 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
   if (binding.provider !== 'google' && binding.provider !== 'microsoft') return null;
   const cursor = await getCursor({ businessId });
   if (cursor === null) return null;
+
+  // A poller that crashed after `claimMail` left its rows `claimed`, which
+  // nothing re-reads. Returned to `received` here, at the top of every pass
+  // of a connected mailbox; the orphaned triage job is failed when the mail
+  // is handled again (`handleMail`).
+  await staleClaimsToReceived(STALE_CLAIM_MINUTES, { businessId });
 
   const provider: MailProvider = binding.provider;
   const ref = binding.credentialRef ?? MAILBOX_CREDENTIAL_REF;
@@ -269,22 +291,45 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
       }
       await writeCursor({ cursor: fresh, lastError: 'cursor_expired_gap' });
       result.gap = true;
+      // `last_error` is overwritten by the next clean pass; the audit row is
+      // the durable record that mail between the two cursors was never read.
+      // Codes only — no cursor value, no address.
+      await appendAudit(
+        {
+          jobId: null,
+          actor: 'orchestrator',
+          kind: 'incident',
+          reason: 'mail_cursor_gap',
+          inputHash: canonicalHash({ event: 'mail_cursor_gap', provider, status: listed.status }),
+          provenance: 'unknown_external',
+          charterVersion: active.charter.charterVersion,
+          envelopeId: null,
+          onBehalfOf: null,
+          actionClass: null,
+          risk: null,
+          outputHash: null,
+          artifacts: [],
+          costMinor: null,
+          tokens: null,
+        },
+        { businessId },
+      );
     } else {
       // transient or rejected: the cursor stays where it was.
       await writeCursor({ lastError: `list_${listed.failure}` });
       return { ...result, status: 'error', error: listed.message };
     }
   } else {
-    try {
-      for (const incoming of listed.messages) {
-        const stored = await recordIncoming(incoming, { businessId });
-        if (stored !== null) result.recorded += 1;
-      }
-    } catch (error) {
-      await writeCursor({ lastError: 'record_failed' });
-      return { ...result, status: 'error', error: message(error) };
+    const failure = await recordBatch(listed.messages, cursor, result, businessId);
+    if (failure === null) {
+      await writeCursor({ cursor: listed.nextCursor });
+    } else {
+      // The cursor stays; what WAS stored is still triaged below, and the
+      // re-raise still runs. Only the advance waits for the whole batch.
+      await writeCursor({ lastError: failure.lastError });
+      result.status = 'error';
+      result.error = failure.error;
     }
-    await writeCursor({ cursor: listed.nextCursor });
   }
 
   // --- 3–4. Triage ----------------------------------------------------------
@@ -305,7 +350,7 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
 
   const readsPerDay = options.readsPerDay ?? config.mailReadsPerDay;
   let remaining = readsPerDay - (await mailReadsToday({ businessId }));
-  const waiting = await mailAwaitingTriage(options.limit ?? 100, { businessId });
+  const waiting = await mailAwaitingTriage(options.limit ?? DEFAULT_TRIAGE_LIMIT, { businessId });
   for (const mail of waiting) {
     if (remaining <= 0) {
       await markOverCap(mail.mailId, { businessId });
@@ -331,6 +376,60 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
   return result;
 }
 
+/** How many consecutive passes one message may fail to record before it becomes a placeholder. */
+export const UNRECORDABLE_AFTER_PASSES = 3;
+
+/**
+ * Record every listed message; return `null` when all of them are stored (or
+ * already were), else what to write on the cursor row.
+ *
+ * Each message is recorded on its own, so one that throws does not stop the
+ * rest of the batch from being stored. The cursor still waits for ALL of
+ * them: advancing past a message we failed to store would lose it for good.
+ *
+ * **The per-message skip.** A message that fails on every pass would hold
+ * the cursor still forever. The count of consecutive failures lives on the
+ * cursor row's own `last_error` (`record_failed:<id hash>:<n>`), durable
+ * across restarts and needing no new column. On the `UNRECORDABLE_AFTER_PASSES`
+ * pass a content-free placeholder row is written instead (state `failed`,
+ * error `unrecordable`) and the batch counts as recorded. Only the first
+ * failing message in a batch is tracked; a second one starts its count once
+ * the first is past. A message whose provider id itself cannot be read has
+ * nothing to key on and is never skipped — the cursor stays, loudly.
+ */
+async function recordBatch(
+  messages: readonly IncomingMail[],
+  cursor: MailCursor,
+  result: MailPollResult,
+  businessId: string,
+): Promise<{ lastError: string; error: string } | null> {
+  let failure: { lastError: string; error: string } | null = null;
+  for (const incoming of messages) {
+    try {
+      const stored = await recordIncoming(incoming, { businessId });
+      if (stored !== null) result.recorded += 1;
+      continue;
+    } catch (error) {
+      if (failure !== null) continue;
+      let key: string;
+      try {
+        key = canonicalHash({ providerMessageId: incoming.providerMessageId }).slice(0, 12);
+      } catch {
+        failure = { lastError: 'record_failed', error: message(error) };
+        continue;
+      }
+      const previous = /^record_failed:([0-9a-f]{12}):(\d+)$/.exec(cursor.lastError ?? '');
+      const count = previous !== null && previous[1] === key ? Number(previous[2]) + 1 : 1;
+      if (count >= UNRECORDABLE_AFTER_PASSES) {
+        await recordUnrecordable(incoming.providerMessageId, { businessId });
+        continue;
+      }
+      failure = { lastError: `record_failed:${key}:${count}`, error: message(error) };
+    }
+  }
+  return failure;
+}
+
 interface PassContext {
   businessId: string;
   bundle: PolicyBundle;
@@ -350,7 +449,13 @@ interface PassContext {
 async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
   const { businessId, result } = pass;
   let job: Job | null = null;
+  let settled = false;
   try {
+    // A mail handled again after a crash (stale claim, or a reset) may still
+    // name the triage job the crashed handling opened. Left alone, that job
+    // sits in `intake`/`understand`/`plan` forever — phases nothing reads.
+    if (mail.jobId !== null) await failOrphanedJob(mail.jobId, businessId);
+
     job = await createJob({
       charterVersion: pass.charterVersion,
       // Not a parameter, and not derived from anything a mail says.
@@ -358,6 +463,8 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
       businessId,
       title: `מייל: ${mail.subject}`,
     });
+    // Written at once, so a crash from here on leaves the job findable.
+    await recordMailProgress(mail.mailId, { jobId: job.jobId }, { businessId });
     await transition(job.jobId, {
       to: 'understand',
       actor: 'orchestrator',
@@ -430,6 +537,7 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
       },
       { businessId },
     );
+    settled = true;
 
     // The same path `conduct.ts` takes for a job that raises no card: the
     // triage job's work is done here; a reply, if any, lives on its own job.
@@ -442,6 +550,18 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
       });
     }
   } catch (error) {
+    if (settled) {
+      // The mail's own work is done and recorded; only closing its triage
+      // job failed. Re-settling as `failed` would hide a classified mail
+      // from the owner over bookkeeping. Noted, and the job is left to
+      // `failOrphanedJob` should the mail ever be handled again.
+      try {
+        await noteMailError(mail.mailId, 'job_close_failed', { businessId });
+      } catch {
+        // Best effort.
+      }
+      return;
+    }
     result.failed += 1;
     const reason = message(error).slice(0, 500);
     try {
@@ -466,6 +586,29 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
         // The job may already have moved; nothing more to do here.
       }
     }
+  }
+}
+
+/** Terminal phases: a job there needs nothing more from us. */
+const TERMINAL_PHASES: readonly string[] = ['closed', 'failed', 'halted'];
+
+/**
+ * Move a crashed handling's triage job to `failed` — legal from every phase
+ * this module leaves a triage job in (`intake`, `understand`, `plan`).
+ * Best effort: a job that moved on its own is not this mail's problem.
+ */
+async function failOrphanedJob(jobId: string, businessId: string): Promise<void> {
+  try {
+    const orphan = await loadJob(jobId, { businessId });
+    if (orphan === null || TERMINAL_PHASES.includes(orphan.phase)) return;
+    await transition(jobId, {
+      to: 'failed',
+      actor: 'orchestrator',
+      reason: 'mail poll: handling was interrupted; the mail is being handled again',
+      businessId,
+    });
+  } catch {
+    // Nothing more to do here.
   }
 }
 
@@ -543,36 +686,58 @@ interface IngestedAttachment {
 }
 
 /**
- * Fetch and ingest every attachment of a type the document pipeline accepts.
+ * Fetch and ingest the attachments the document pipeline accepts — a
+ * declared ingestible type, or `application/octet-stream` named `.pdf`
+ * (providers often label a PDF that way; the sniff in `ingestDocument`
+ * decides what it really is, never the name).
  *
  * The temp file is named by us, never by the sender: the filename travels
  * only as `originalName`, which `ingestDocument` stores verbatim and never
- * treats as a path (§5.5). A fetch the provider refused is a failure of this
- * mail. Types the pipeline does not take are left in the mailbox, unfetched.
+ * treats as a path (§5.5).
+ *
+ * **Never fatal to the mail.** An attachment over 25 MB (declared size) is
+ * skipped before it is downloaded (`attachment_too_large`); at most 10 are
+ * taken per mail; a fetch the provider refused or an ingest that threw is
+ * noted (`attachment_failed`) and the rest continue. Losing one PDF must not
+ * also lose the owner's notice, the invoice row and the reply card. The
+ * attachment stays in the mailbox either way.
  */
 async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<IngestedAttachment[]> {
+  const { businessId } = pass;
   const out: IngestedAttachment[] = [];
+  let taken = 0;
   for (const attachment of mail.attachments) {
     const mediaType = baseMediaType(attachment.mediaType);
-    if (!INGESTIBLE_TYPES.has(mediaType)) continue;
-    const bytes = await pass.client.fetchAttachment(
-      pass.token,
-      mail.providerMessageId,
-      attachment.attachmentId,
-      AbortSignal.timeout(CALL_TIMEOUT_MS),
-    );
-    if (isFailure(bytes)) throw new Error(`attachment_fetch_failed: ${bytes.message}`);
-    const dir = await mkdtemp(join(tmpdir(), 'mail-att-'));
+    const pdfByName = mediaType === 'application/octet-stream' && attachment.filename.toLowerCase().endsWith('.pdf');
+    if (!INGESTIBLE_TYPES.has(mediaType) && !pdfByName) continue;
+    if (attachment.size > MAX_ATTACHMENT_BYTES) {
+      await noteMailError(mail.mailId, 'attachment_too_large', { businessId });
+      continue;
+    }
+    if (taken >= MAX_ATTACHMENTS_PER_MAIL) break;
+    taken += 1;
     try {
-      const path = join(dir, 'attachment');
-      await writeFile(path, bytes);
-      const document = await ingestDocument(
-        { path, source: 'mail', originalName: attachment.filename },
-        { businessId: pass.businessId, documentRoot: pass.documentRoot },
+      const bytes = await pass.client.fetchAttachment(
+        pass.token,
+        mail.providerMessageId,
+        attachment.attachmentId,
+        AbortSignal.timeout(CALL_TIMEOUT_MS),
       );
-      out.push({ documentId: document.documentId, fileName: attachment.filename, mediaType });
-    } finally {
-      await rm(dir, { recursive: true, force: true });
+      if (isFailure(bytes)) throw new Error(bytes.message);
+      const dir = await mkdtemp(join(tmpdir(), 'mail-att-'));
+      try {
+        const path = join(dir, 'attachment');
+        await writeFile(path, bytes);
+        const document = await ingestDocument(
+          { path, source: 'mail', originalName: attachment.filename },
+          { businessId, documentRoot: pass.documentRoot },
+        );
+        out.push({ documentId: document.documentId, fileName: attachment.filename, mediaType: document.mediaType });
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    } catch {
+      await noteMailError(mail.mailId, 'attachment_failed', { businessId });
     }
   }
   return out;
