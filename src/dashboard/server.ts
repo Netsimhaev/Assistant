@@ -75,6 +75,8 @@ import {
 import type { OAuthRouteOptions } from './oauth-routes.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
+import { isMailReplyJob } from '../mail/inbox-store.js';
+import { MAIL_REPLY_EDIT_REFUSAL, mailReplyEditAllowed, mailboxReplyRecipient } from '../mail/reply-card.js';
 import {
   handleMailboxRevertPost,
   handleMailboxSignGet,
@@ -1871,8 +1873,14 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
       ...(verdict !== null ? { verdict } : {}),
       ...(notJudgedReason !== null ? { notJudged: notJudgedReason } : {}),
       ...(verdictUnreadable ? { verdictUnreadable: true } : {}),
+      ...((await isMailReplyCard(approval.jobId, businessId)) ? { mailReply: true } : {}),
     }),
   );
+}
+
+/** The positive marker the reply layout and the reply edit rule key on. */
+async function isMailReplyCard(jobId: string | null, businessId: string): Promise<boolean> {
+  return jobId !== null && (await isMailReplyJob(jobId, { businessId }));
 }
 
 /** JSON.parse can hand back an object, an array, a string, a number, a boolean, or null — only the first is a tool payload. */
@@ -2262,6 +2270,8 @@ async function handleDecision(
     approval.inputHash,
   );
 
+  const mailReply = await isMailReplyCard(approval.jobId, businessId);
+
   if (!edit.ok) {
     return sendHtml(
       res,
@@ -2271,7 +2281,32 @@ async function handleDecision(
         csrf: issueCsrfToken(session.sessionId),
         editValue: edit.raw,
         ...(note !== undefined ? { noteValue: note } : {}),
+        ...(mailReply ? { mailReply: true } : {}),
         error: 'התוכן שהוזן אינו אובייקט JSON תקין. יש להזין מבנה בסגנון { "שדה": ערך } ולנסות שוב.',
+      }),
+    );
+  }
+
+  // A mailbox reply goes to the original From, always (mailbox spec 5.2):
+  // only the subject and the body may be edited. Keyed on the marker OR the
+  // reply shape of what was proposed -- the refusal only ever narrows, so the
+  // broader test is the safe one -- and checked before `decide`, so the
+  // approval stays pending and nothing can run.
+  if (
+    edit.editedInput !== undefined &&
+    (mailReply || mailboxReplyRecipient(approval.proposedInput) !== null) &&
+    !mailReplyEditAllowed(approval.proposedInput, edit.editedInput)
+  ) {
+    return sendHtml(
+      res,
+      400,
+      renderApprovalCard({
+        approval,
+        csrf: issueCsrfToken(session.sessionId),
+        editValue: JSON.stringify(edit.editedInput, null, 2),
+        ...(note !== undefined ? { noteValue: note } : {}),
+        ...(mailReply ? { mailReply: true } : {}),
+        error: MAIL_REPLY_EDIT_REFUSAL,
       }),
     );
   }

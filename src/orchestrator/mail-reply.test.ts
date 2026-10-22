@@ -13,43 +13,30 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
-import { buildCharter } from '../test/fixtures.js';
-import { installCharter } from '../charter/store.js';
-import { buildMailboxAmendment } from '../charter/amend-mailbox.js';
-import { signCharter } from '../charter/sign.js';
-import { BusinessCharter } from '../domain/charter.js';
+import {
+  DRAFT_BODY as BODY,
+  NOON,
+  QUESTION_TRIAGE as TRIAGE,
+  fakeMailboxClient as fakeClient,
+  installMailboxCharter as installFor,
+  mailboxRuntime as runtimeWith,
+  storedMail as storedFor,
+  stubDrafter,
+  type SendResult,
+} from '../test/mailbox.js';
 import type { PolicyBundle } from '../domain/policy.js';
-import type { MailTriage } from '../domain/mail-triage.js';
+import type { IncomingMail, StoredMail } from '../mail/inbox-store.js';
 import { decide, getApproval } from '../governance/approvals.js';
-import { loadAutonomyMode } from '../governance/autonomy-mode.js';
-import { claimFailedReply, recordIncoming, type IncomingMail, type StoredMail } from '../mail/inbox-store.js';
-import type { MailboxClient, MailboxFailure, OutgoingReply } from '../mail/providers/types.js';
+import { claimFailedReply } from '../mail/inbox-store.js';
 import { MAY_HAVE_SENT_WARNING, RETRY_PREFIX } from '../mail/reply-card.js';
 import type { Drafter } from '../sdk/mail-drafter.js';
-import { AdapterRegistry } from './adapters/registry.js';
-import { createMailboxSendAdapter } from './adapters/mailbox-send.js';
-import { upsertBinding } from './bindings.js';
-import { envCredentials } from './credentials.js';
 import { loadJob, transition } from './jobs.js';
 import { loadPlanBody } from './plan-store.js';
 import { raiseMailReply, reraiseAfterFailedSend, replySubject } from './mail-reply.js';
 import { resumeAfterDecision } from './resume.js';
 import { runDueJobs } from './run-due.js';
-import type { Runtime } from './runtime.js';
 
 const BUSINESS = 'test-business';
-const PREFIX = 'TEST_CRED_';
-// 09:00 UTC is noon in Asia/Jerusalem — outside the fixture's quiet hours.
-const NOON = new Date('2026-10-21T09:00:00.000Z');
-const BODY = 'שלום דנה, קיבלנו את פנייתך ונחזור אלייך עד מחר.';
-
-const TRIAGE: MailTriage = {
-  categories: ['question'],
-  summary: 'דנה שואלת מתי תגיע הצעת המחיר',
-  isPerson: true,
-  invoice: null,
-  replyGist: 'לומר שנחזור אליה עד מחר',
-};
 
 beforeEach(async () => {
   await resetDatabase();
@@ -66,90 +53,12 @@ function reraise() {
 }
 
 async function installMailboxCharter(): Promise<PolicyBundle> {
-  const base = buildCharter();
-  // The amendment supersedes the base version, which must exist first.
-  await installCharter(base, { businessId: BUSINESS });
-  const signed = BusinessCharter.parse(
-    signCharter(buildMailboxAmendment(base, NOON, 'google'), {
-      signedByPersonId: 'owner',
-      method: 'dashboard_click',
-      signedAt: NOON,
-    }),
-  );
-  const bundle = await installCharter(signed, { businessId: BUSINESS });
-  activeBundle = bundle;
-  await upsertBinding(
-    {
-      system: 'mailbox',
-      status: 'live',
-      endpoint: null,
-      credentialRef: 'OAUTH_MAILBOX',
-      provider: 'google',
-      lastOkAt: null,
-      lastError: null,
-    },
-    { businessId: BUSINESS, by: 'test' },
-  );
-  expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
-  return bundle;
+  activeBundle = await installFor(BUSINESS);
+  return activeBundle;
 }
 
-function incoming(overrides: Partial<IncomingMail> = {}): IncomingMail {
-  return {
-    providerMessageId: 'PM-1',
-    threadId: 'TH-1',
-    internetMessageId: '<q-1@client.example>',
-    references: '<q-0@client.example>',
-    fromAddress: 'dana@client.example',
-    fromName: 'דנה לוי',
-    replyTo: null,
-    toAddresses: ['office@business.example'],
-    subject: 'מתי תגיע ההצעה?',
-    receivedAt: '2026-10-21T08:00:00.000Z',
-    bodyText: 'היי, מתי תגיע הצעת המחיר?',
-    bodyTruncated: false,
-    headerFlags: { listUnsubscribe: false, autoSubmitted: false, bulkPrecedence: false },
-    attachments: [],
-    ...overrides,
-  };
-}
-
-async function storedMail(overrides: Partial<IncomingMail> = {}): Promise<StoredMail> {
-  const mail = await recordIncoming(incoming(overrides), { businessId: BUSINESS });
-  if (mail === null) throw new Error('duplicate mail in test setup');
-  return mail;
-}
-
-function stubDrafter(body: string = BODY): Drafter & { calls: number } {
-  const fn = (async () => {
-    fn.calls += 1;
-    return { status: 'drafted' as const, body };
-  }) as unknown as Drafter & { calls: number };
-  fn.calls = 0;
-  return fn;
-}
-
-type SendResult = { externalId: string | null } | MailboxFailure;
-
-function fakeClient(results: SendResult[] = [{ externalId: 'SENT-1' }]) {
-  const sent: OutgoingReply[] = [];
-  const client = {
-    sendReply: async (_token: string, reply: OutgoingReply) => {
-      sent.push(reply);
-      return results[Math.min(sent.length - 1, results.length - 1)] ?? { externalId: 'SENT-1' };
-    },
-  } as unknown as MailboxClient;
-  return { client, sent };
-}
-
-function runtimeWith(client: MailboxClient): Runtime {
-  return {
-    registry: new AdapterRegistry([
-      createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client }),
-    ]),
-    credentials: envCredentials({ [`${PREFIX}OAUTH_MAILBOX`]: 'access-token' }, PREFIX),
-    warnings: [],
-  };
+function storedMail(overrides: Partial<IncomingMail> = {}): Promise<StoredMail> {
+  return storedFor(BUSINESS, overrides);
 }
 
 async function mailRow(mailId: string): Promise<{ error: string | null; reply_job_id: string | null }> {
@@ -324,6 +233,25 @@ describe('raiseMailReply', () => {
     expect(drafter.calls).toBe(0);
     expect(await approvalCount()).toBe(0);
     expect((await mailRow(mail.mailId)).error).toBe('no_sender');
+  });
+
+  it('a failure after the card is queued cancels the card and fails the job', async () => {
+    const bundle = await installMailboxCharter();
+    const mail = await storedMail();
+    // A mail id with no row: `linkReplyJob`, the last write, throws.
+    await expect(
+      raiseMailReply(
+        { mail: { ...mail, mailId: 'M-missing' }, triage: TRIAGE, bundle, drafter: stubDrafter() },
+        { businessId: BUSINESS },
+      ),
+    ).rejects.toThrow(/linkReplyJob/);
+    const { rows } = await getPool().query<{ state: string; job_id: string }>(
+      'SELECT state, job_id FROM approval_requests WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.state).toBe('cancelled');
+    expect((await loadJob(rows[0]?.job_id ?? '', { businessId: BUSINESS }))?.phase).toBe('failed');
   });
 
   it('a failed draft raises no card and opens no job', async () => {
@@ -503,7 +431,7 @@ describe('reraiseAfterFailedSend', () => {
     expect(cards[0]?.detail).toContain(`${RETRY_PREFIX}\n${MAY_HAVE_SENT_WARNING}`);
   });
 
-  it('a denied card is not re-raised (the approval was never spent)', async () => {
+  it('a job the gate refused before any approval was spent is not re-raised', async () => {
     const bundle = await installMailboxCharter();
     const mail = await storedMail();
     const raised = await raiseMailReply(
@@ -517,5 +445,48 @@ describe('reraiseAfterFailedSend', () => {
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(fakeClient().client), now: NOON });
     expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
     expect((await reraise()).reraised).toBe(0);
+  });
+
+  it('an owner denial closes the job and is not re-raised', async () => {
+    const bundle = await installMailboxCharter();
+    const mail = await storedMail();
+    const raised = await raiseMailReply(
+      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+      { businessId: BUSINESS },
+    );
+    if (raised === null) throw new Error('expected a card');
+    const decided = await decide(raised.approvalId, 'denied', { by: 'p_boss', channel: 'dashboard' },
+      { businessId: BUSINESS });
+    await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
+    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+    expect((await reraise()).reraised).toBe(0);
+  });
+
+  it('a failure re-raising one row is recorded on its mail and the batch continues', async () => {
+    const bundle = await installMailboxCharter();
+    const failed: string[] = [];
+    for (const n of [1, 2]) {
+      const mail = await storedMail({ providerMessageId: `PM-${n}`, internetMessageId: `<q-${n}@client.example>` });
+      const raised = await raiseMailReply(
+        { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+        { businessId: BUSINESS },
+      );
+      if (raised === null) throw new Error('expected a card');
+      await approve(raised.approvalId);
+      failed.push(mail.mailId);
+    }
+    await runDueJobs({
+      businessId: BUSINESS,
+      runtime: runtimeWith(fakeClient([{ failure: 'rejected', status: 400, message: 'bad' }]).client),
+      now: NOON,
+    });
+
+    // A charter version no row carries: `createJob` fails its foreign key for
+    // every row, so both re-raises fail after their claim.
+    const broken = { ...bundle, charterVersion: 'no-such-version' };
+    const result = await reraiseAfterFailedSend({ bundle: broken }, { businessId: BUSINESS });
+    expect(result).toMatchObject({ reraised: 0, failed: 2 });
+    for (const mailId of failed) expect((await mailRow(mailId)).error).toBe('reraise_failed');
+    expect(await approvalCount()).toBe(2);
   });
 });

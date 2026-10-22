@@ -397,6 +397,28 @@ export async function decide(
 }
 
 /**
+ * Withdraw a card nobody has answered yet, because the work it asks about
+ * can no longer happen (its job failed while the card was being raised).
+ *
+ * `pending` only, in the `WHERE`: a decided card is the owner's answer and is
+ * never overwritten. `cancelled` needs no decider (migration 001's
+ * `approval_decision_is_complete` carves it out), which is the honest record:
+ * no person decided this. Returns whether a row moved.
+ */
+export async function cancelPendingApproval(
+  approvalId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<boolean> {
+  const db = options.db ?? getPool();
+  const res = await db.query(
+    `UPDATE approval_requests SET state = 'cancelled'
+      WHERE approval_id = $1 AND business_id = $2 AND state = 'pending'`,
+    [approvalId, options.businessId ?? config.businessId],
+  );
+  return (res.rowCount ?? 0) === 1;
+}
+
+/**
  * Expire approvals whose fuse ran out. Called by the scheduler.
  * Returns the ones that expired so the caller can escalate where configured.
  */

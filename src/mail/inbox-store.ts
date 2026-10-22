@@ -278,6 +278,21 @@ export async function linkReplyJob(mailId: string, replyJobId: string, options: 
 }
 
 /**
+ * Whether a job is a mailbox reply job — the positive marker the dashboard
+ * keys the reply card's layout and edit rule on. Only the reply path writes
+ * `reply_job_id`, so a card built from some other payload that merely LOOKS
+ * like a reply never gets the reply layout.
+ */
+export async function isMailReplyJob(jobId: string, options: Options = {}): Promise<boolean> {
+  const { businessId, db } = ctx(options);
+  const { rows } = await db.query(
+    'SELECT 1 FROM mail_messages WHERE business_id = $1 AND reply_job_id = $2 LIMIT 1',
+    [businessId, jobId],
+  );
+  return rows.length > 0;
+}
+
+/**
  * Take a failed reply job off its mail, so it is re-raised at most once.
  *
  * A single conditional UPDATE: the row count says whether this caller won.

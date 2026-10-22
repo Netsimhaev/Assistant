@@ -33,7 +33,7 @@ import { getPool } from '../db/pool.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { MailTriage } from '../domain/mail-triage.js';
 import { Plan } from '../domain/plan.js';
-import { enqueueApproval } from '../governance/approvals.js';
+import { cancelPendingApproval, enqueueApproval } from '../governance/approvals.js';
 import {
   claimFailedReply,
   linkReplyJob,
@@ -187,6 +187,8 @@ async function raiseReplyCard(
     title: `תשובה: ${input.originalSubject}`,
   });
 
+  // Hoisted so the catch can withdraw a card that went up before the throw.
+  let approvalId: string | null = null;
   try {
     for (const to of ['understand', 'plan'] as const) {
       await transition(job.jobId, {
@@ -216,7 +218,7 @@ async function raiseReplyCard(
     const risk = await assessRisk(facts, input.bundle);
 
     const who = displayLine(input.displayName ?? '') || recipient;
-    const approvalId = await enqueueApproval(
+    approvalId = await enqueueApproval(
       {
         jobId: job.jobId,
         facts,
@@ -255,9 +257,18 @@ async function raiseReplyCard(
     await linkReplyJob(input.mailId, job.jobId, { businessId });
     return { replyJobId: job.jobId, approvalId };
   } catch (error) {
-    // Every phase a throw can leave the job in (`intake`/`understand`/`plan`)
-    // has no reader; close it rather than leak it. Best effort: the original
-    // error is the one worth surfacing.
+    // A card already queued would otherwise sit pending on a failed job: the
+    // owner could approve it, and nothing would ever run. Withdraw it first.
+    if (approvalId !== null) {
+      try {
+        await cancelPendingApproval(approvalId, { businessId });
+      } catch {
+        // Best effort; `expireOverdue` retires it on schedule regardless.
+      }
+    }
+    // Every phase a throw can leave the job in has no reader that would move
+    // it on; close it rather than leak it. Best effort: the original error is
+    // the one worth surfacing.
     try {
       await transition(job.jobId, {
         to: 'failed',
@@ -297,6 +308,8 @@ interface FailedReplyRow {
 
 export interface ReraiseResult {
   reraised: number;
+  /** Claimed, then raising the fresh card threw. Recorded on the mail as `reraise_failed`. */
+  failed: number;
   /** Failed reply jobs whose approved payload no longer reads as a mailbox reply. Left alone. */
   skipped: number;
 }
@@ -359,7 +372,7 @@ export async function reraiseAfterFailedSend(
     [businessId, MAY_HAVE_SENT_CODES],
   );
 
-  const result: ReraiseResult = { reraised: 0, skipped: 0 };
+  const result: ReraiseResult = { reraised: 0, failed: 0, skipped: 0 };
   for (const row of rows) {
     const approved =
       row.state === 'approved_with_edit' && row.edited_input !== null ? row.edited_input : row.proposed_input;
@@ -369,19 +382,31 @@ export async function reraiseAfterFailedSend(
     }
     if (!(await claimFailedReply(row.mail_id, row.job_id, { businessId }))) continue;
 
-    await raiseReplyCard(
-      {
-        mailId: row.mail_id,
-        originalSubject: row.original_subject,
-        displayName: row.from_name,
-        replyTo: row.reply_to,
-        payload: approved as Record<string, unknown>,
-        bundle: input.bundle,
-        retry: { mayHaveSent: row.may_have_sent },
-      },
-      { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
-    );
-    result.reraised += 1;
+    // Per row: one failure must not stop the rest of the batch. The claim is
+    // already spent, so this failed job will not be offered again — the mail
+    // says why instead of going quiet.
+    try {
+      await raiseReplyCard(
+        {
+          mailId: row.mail_id,
+          originalSubject: row.original_subject,
+          displayName: row.from_name,
+          replyTo: row.reply_to,
+          payload: approved as Record<string, unknown>,
+          bundle: input.bundle,
+          retry: { mayHaveSent: row.may_have_sent },
+        },
+        { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
+      );
+      result.reraised += 1;
+    } catch {
+      result.failed += 1;
+      try {
+        await noteMailError(row.mail_id, 'reraise_failed', { businessId });
+      } catch {
+        // The database is having the same bad moment; the count still says so.
+      }
+    }
   }
   return result;
 }

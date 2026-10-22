@@ -16,6 +16,7 @@
  * a warning, and must never be dressed as one.
  */
 import { stripBidiControls } from '../util/bidi.js';
+import { canonicalJson } from '../util/canonical.js';
 
 /** `Re: ` unless the subject already starts with `re:`, any case. */
 export function replySubject(subject: string): string {
@@ -97,4 +98,36 @@ export function splitReplyDetail(detail: string): { header: string[]; body: stri
   const at = detail.indexOf('\n\n');
   if (at === -1) return { header: detail.split('\n'), body: '' };
   return { header: detail.slice(0, at).split('\n'), body: detail.slice(at + 2) };
+}
+
+/** Shown when an edit to a mailbox-reply card touches anything but subject and body. */
+export const MAIL_REPLY_EDIT_REFUSAL = 'בתשובה למייל אפשר לערוך רק את הנושא ואת גוף ההודעה';
+
+/** The only fields an owner may change on a mailbox-reply card. */
+const EDITABLE_REPLY_FIELDS: ReadonlySet<string> = new Set(['subject', 'body']);
+
+/**
+ * Whether an edit to a mailbox-reply payload keeps everything but the subject
+ * and the body exactly as proposed.
+ *
+ * Positive and whole: the edited payload must have the same own keys as the
+ * proposed one — none removed, none added — and every key outside
+ * `EDITABLE_REPLY_FIELDS` must be canonically equal. The recipient of a reply
+ * is always the original From (mailbox spec §5.2); an owner who wants to
+ * write to someone else uses the instruction door. Dropping `inReplyTo`
+ * would also turn the reply into a cold `email.initiate`, and adding a key
+ * (a `cc`, say) is a field nothing on the card showed.
+ */
+export function mailReplyEditAllowed(proposed: unknown, edited: unknown): boolean {
+  if (typeof proposed !== 'object' || proposed === null || Array.isArray(proposed)) return false;
+  if (typeof edited !== 'object' || edited === null || Array.isArray(edited)) return false;
+  const p = proposed as Record<string, unknown>;
+  const e = edited as Record<string, unknown>;
+  const keys = new Set([...Object.keys(p), ...Object.keys(e)]);
+  for (const key of keys) {
+    if (!Object.hasOwn(p, key) || !Object.hasOwn(e, key)) return false;
+    if (EDITABLE_REPLY_FIELDS.has(key)) continue;
+    if (canonicalJson(p[key]) !== canonicalJson(e[key])) return false;
+  }
+  return true;
 }

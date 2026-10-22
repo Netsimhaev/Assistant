@@ -1093,6 +1093,13 @@ export function renderApprovalCard(options: {
    * and this text must still reach the owner when they don't.
    */
   signError?: string;
+  /**
+   * The card's job is a mailbox reply job (`isMailReplyJob`, the mail row's
+   * `reply_job_id`) — a marker only the reply path writes. The reply layout
+   * needs it AND a payload of the reply shape; a payload that merely looks
+   * like a reply renders as before.
+   */
+  mailReply?: boolean;
 }): string {
   const { approval } = options;
   const editValue = options.editValue ?? JSON.stringify(approval.proposedInput, null, 2);
@@ -1102,7 +1109,8 @@ export function renderApprovalCard(options: {
   const risk = approval.risk;
   // Positive shape test on the payload as proposed; anything else renders
   // exactly as before.
-  const replyRecipient = mailboxReplyRecipient(approval.proposedInput);
+  const replyRecipient =
+    options.mailReply === true ? mailboxReplyRecipient(approval.proposedInput) : null;
   const detailBlock =
     replyRecipient === null ? `<p>${esc(approval.detail)}</p>` : mailReplyDetail(approval.detail);
   const recipientRow =

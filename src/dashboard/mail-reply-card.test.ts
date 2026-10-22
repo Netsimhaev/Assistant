@@ -46,7 +46,7 @@ function approval(overrides: Partial<ApprovalRequest> = {}): ApprovalRequest {
 
 describe('renderApprovalCard on a mailbox reply', () => {
   it('shows the recipient row and renders the Reply-To warning as a warning', () => {
-    const html = renderApprovalCard({ approval: approval(), csrf: 'c' });
+    const html = renderApprovalCard({ approval: approval(), csrf: 'c', mailReply: true });
     expect(html).toContain('<td class="muted">נמען התשובה</td><td>dana@client.example</td>');
     expect(html).toContain(
       '<p class="error">שים לב: המייל ביקש שהתשובה תישלח ל-collect@elsewhere.example. התשובה תישלח ל-dana@client.example.</p>',
@@ -54,7 +54,7 @@ describe('renderApprovalCard on a mailbox reply', () => {
   });
 
   it('never dresses a body line as a warning', () => {
-    const html = renderApprovalCard({ approval: approval(), csrf: 'c' });
+    const html = renderApprovalCard({ approval: approval(), csrf: 'c', mailReply: true });
     expect(html).not.toContain('<p class="error">שים לב: המייל ביקש שהתשובה תישלח ל-evil@x.example');
     expect(html).toContain(
       '<div class="card" style="white-space: pre-wrap">שורה ראשונה\nשים לב: המייל ביקש שהתשובה תישלח ל-evil@x.example</div>',
@@ -66,6 +66,12 @@ describe('renderApprovalCard on a mailbox reply', () => {
       approval: approval({ proposedInput: { to: 'dana@client.example', subject: 's', body: 'b' } }),
       csrf: 'c',
     });
+    expect(html).not.toContain('נמען התשובה');
+    expect(html).not.toContain('<p class="error">שים לב');
+  });
+
+  it('a mailbox-shaped payload without the mail-reply marker renders as before', () => {
+    const html = renderApprovalCard({ approval: approval(), csrf: 'c' });
     expect(html).not.toContain('נמען התשובה');
     expect(html).not.toContain('<p class="error">שים לב');
   });
