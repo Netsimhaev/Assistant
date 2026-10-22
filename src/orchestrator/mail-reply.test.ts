@@ -27,7 +27,12 @@ import {
 import type { PolicyBundle } from '../domain/policy.js';
 import type { IncomingMail, StoredMail } from '../mail/inbox-store.js';
 import { decide, getApproval } from '../governance/approvals.js';
-import { claimFailedReply } from '../mail/inbox-store.js';
+import { claimFailedReply, linkReplyJob } from '../mail/inbox-store.js';
+import type { Proposal } from '../domain/proposal.js';
+import { createJob } from './jobs.js';
+import { bindPlanToJob } from './plan-store.js';
+import { raiseProposalApproval, RAMP_HONESTY } from './proposal-approval.js';
+import { proposalToPlan } from './proposal-to-plan.js';
 import { MAY_HAVE_SENT_WARNING, RETRY_PREFIX } from '../mail/reply-card.js';
 import type { Drafter } from '../sdk/mail-drafter.js';
 import { loadJob, transition } from './jobs.js';
@@ -349,6 +354,96 @@ describe('approve sends, under mode off', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]?.body).toBe('גוף ערוך על ידי הבעלים');
     expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+  });
+});
+
+describe('the stage-8 exemption is a mailbox-reply-job exemption (R20)', () => {
+  /**
+   * A conductor card for a threaded `mail.send`: the conductor binds the plan,
+   * raises the card through `raiseProposalApproval` (which carries
+   * RAMP_HONESTY — "approving does not execute"), and parks the job. The
+   * payload is a complete mailbox reply, so the send adapter WOULD send it if
+   * the gate let it through — the only thing that can stop it is the gate.
+   */
+  async function conductorCardApproved(options: { linkToMail: boolean }) {
+    const bundle = await installMailboxCharter();
+    const mail = await storedMail();
+    const payload = {
+      to: ['dana@client.example'],
+      subject: 'Re: מתי תגיע ההצעה?',
+      body: 'שלום דנה, מצורפת ההצעה.',
+      inReplyTo: '<q-1@client.example>',
+      references: '<q-0@client.example>',
+      threadId: 'TH-1',
+      providerMessageId: 'PM-1',
+    };
+    const proposal = {
+      headline: 'קראתי את המסמך',
+      stance: 'act',
+      reasons: [{ text: 'נשאלה שאלה', findingLabel: 'שאלה', sourceRef: { ordinal: 0, locator: null } }],
+      action: {
+        headline: 'אשיב לדנה',
+        purpose: 'לענות על השאלה',
+        agent: 'comms.email',
+        intent: 'reply_to_sender',
+        toolName: 'mail.send',
+        expectedActionClass: 'email.reply',
+        input: payload,
+      },
+      clarifyingQuestion: null,
+    } as unknown as Proposal;
+    const job = await createJob({
+      businessId: BUSINESS,
+      charterVersion: bundle.charterVersion,
+      provenance: 'unknown_external',
+    });
+    for (const to of ['understand', 'plan'] as const) {
+      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+    }
+    const plan = proposalToPlan(proposal, { goal: 'test' });
+    if (plan === null) throw new Error('no plan');
+    await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
+    const approvalId = await raiseProposalApproval(
+      { jobId: job.jobId, proposal, bundle },
+      { businessId: BUSINESS },
+    );
+    if (approvalId === null) throw new Error('expected a conductor card');
+    const card = await getApproval(approvalId, { businessId: BUSINESS });
+    expect(card?.detail).toContain(RAMP_HONESTY);
+    await transition(job.jobId, {
+      to: 'await_approval', actor: 'orchestrator', reason: 'test', businessId: BUSINESS,
+    });
+    if (options.linkToMail) await linkReplyJob(mail.mailId, job.jobId, { businessId: BUSINESS });
+
+    await approve(approvalId);
+    const { client, sent } = fakeClient();
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    const { rows } = await getPool().query<{ consumed_at: Date | null }>(
+      'SELECT consumed_at FROM approval_requests WHERE approval_id = $1',
+      [approvalId],
+    );
+    return { jobId: job.jobId, sent, consumed: rows[0]?.consumed_at ?? null };
+  }
+
+  it('an approved conductor card for a threaded mail.send sends nothing under mode off', async () => {
+    const { jobId, sent, consumed } = await conductorCardApproved({ linkToMail: false });
+
+    expect(sent).toHaveLength(0);
+    expect(consumed).toBeNull();
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'policy_denial'`,
+      [jobId],
+    );
+    expect(rows.some((r) => r.reason.startsWith('draft_only'))).toBe(true);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+  });
+
+  it('control: the same approved payload on a mailbox reply job sends', async () => {
+    const { jobId, sent, consumed } = await conductorCardApproved({ linkToMail: true });
+
+    expect(sent).toHaveLength(1);
+    expect(consumed).not.toBeNull();
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
   });
 });
 

@@ -25,6 +25,9 @@ import { DENY_CODES, type PolicyBundle } from '../domain/policy.js';
 import { evaluateToolCall, type GateContext } from './engine.js';
 import { buildFacts } from './facts.js';
 import { assessRisk } from './risk.js';
+import { APPROVED_REPLY_EXEMPTION_MARKER } from './approved-reply.js';
+import { linkReplyJob } from '../mail/inbox-store.js';
+import { storedMail } from '../test/mailbox.js';
 
 const BUSINESS = 'test-business';
 // 09:00 UTC is noon in Asia/Jerusalem, outside the fixture's 20:00-07:00
@@ -50,7 +53,10 @@ interface Setup {
   ctx: GateContext;
 }
 
-async function setup(overrides: CharterOverrides = {}): Promise<Setup> {
+async function setup(
+  overrides: CharterOverrides = {},
+  options: { mailboxReplyJob?: boolean } = {},
+): Promise<Setup> {
   const charter = buildCharter(overrides);
   const bundle = await installCharter(charter, { businessId: BUSINESS });
   // The dial is not written: a fresh install reads `off`. Asserted, because
@@ -64,6 +70,12 @@ async function setup(overrides: CharterOverrides = {}): Promise<Setup> {
     charterVersion: bundle.charterVersion,
     provenance: 'unknown_external',
   });
+  // A mailbox reply job: a mail row names it as its reply job (R20). Every
+  // test here runs on one unless it says otherwise.
+  if (options.mailboxReplyJob !== false) {
+    const mail = await storedMail(BUSINESS);
+    await linkReplyJob(mail.mailId, job.jobId, { businessId: BUSINESS });
+  }
   return {
     bundle,
     jobId: job.jobId,
@@ -163,6 +175,76 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
 
     expect(decision.outcome).toBe('allow');
     expect(await consumedAt(approvalId)).not.toBeNull();
+  });
+
+  it('records the exemption on the approval_consumed audit row', async () => {
+    const s = await setup();
+    const approvalId = await approvedCard(s);
+
+    const decision = await evaluateToolCall('mail.send', REPLY, {
+      ...s.ctx, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    expect(decision.outcome).toBe('allow');
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'approval'`,
+      [s.jobId],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.reason.endsWith(` ${APPROVED_REPLY_EXEMPTION_MARKER}`)).toBe(true);
+  });
+
+  it('an approval spent WITHOUT the exemption carries no marker', async () => {
+    // A ceiling that already allows the class (`approve_required` ramp under
+    // a charter whose unknown_external ceiling is `approve_required`), on a job
+    // that is NOT a mailbox reply job: stage 8 passes on its own, stage 10
+    // spends the approval, and the row must not claim the exemption.
+    const s = await setup(
+      { provenanceCeiling: { unknown_external: 'approve_required' } },
+      { mailboxReplyJob: false },
+    );
+    const approvalId = await approvedCard(s);
+
+    const decision = await evaluateToolCall('mail.send', REPLY, {
+      ...s.ctx, rampLevel: 'approve_required', approval: { approvalId, stepId: STEP_ID },
+    });
+
+    expect(decision.outcome).toBe('allow');
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'approval'`,
+      [s.jobId],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.reason).not.toContain(APPROVED_REPLY_EXEMPTION_MARKER);
+  });
+
+  it('an approved reply on a job no mail names as its reply job is denied draft_only', async () => {
+    // Everything else identical to the positive test above: same bytes, same
+    // tool, same job, decided and unspent. Only the mailbox marker is absent —
+    // the shape of a conductor card (RAMP_HONESTY) for a threaded mail.send.
+    const s = await setup({}, { mailboxReplyJob: false });
+    const approvalId = await approvedCard(s);
+
+    const decision = await evaluateToolCall('mail.send', REPLY, {
+      ...s.ctx, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    await expectDeniedAtStage8(decision, s.jobId);
+    expect(await consumedAt(approvalId)).toBeNull();
+  });
+
+  it('a mail row of another business naming this job does not count', async () => {
+    const s = await setup({}, { mailboxReplyJob: false });
+    const mail = await storedMail('other-business');
+    await linkReplyJob(mail.mailId, s.jobId, { businessId: 'other-business' });
+    const approvalId = await approvedCard(s);
+
+    const decision = await evaluateToolCall('mail.send', REPLY, {
+      ...s.ctx, approval: { approvalId, stepId: STEP_ID },
+    });
+
+    await expectDeniedAtStage8(decision, s.jobId);
+    expect(await consumedAt(approvalId)).toBeNull();
   });
 
   it('same call without ctx.approval is denied draft_only', async () => {

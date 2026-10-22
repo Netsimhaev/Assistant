@@ -27,7 +27,7 @@ import { isOutbound, isKnownTool } from './classify.js';
 import { assessRisk, type NormsLookup } from './risk.js';
 import { inQuietHours, redactPayload } from './redact.js';
 import { mayDelegate } from '../governance/delegation.js';
-import { approvedReplyCovers } from './approved-reply.js';
+import { APPROVED_REPLY_EXEMPTION_MARKER, approvedReplyCovers } from './approved-reply.js';
 
 export interface GateContext extends FactsContext {
   agent: AgentId;
@@ -368,7 +368,13 @@ export async function evaluateToolCall(
           provenance: facts.provenance,
           inputHash: facts.inputHash,
           risk,
-          reason: `approval_consumed:${ctx.approval.approvalId} (intent seq ${intent.seq})`,
+          // The exemption is otherwise invisible in the trail: the row would
+          // read exactly like an approval spent on a ceiling that let it
+          // through anyway. A fixed token, so a reader can find every send
+          // that ran on the owner's "yes" alone.
+          reason:
+            `approval_consumed:${ctx.approval.approvalId} (intent seq ${intent.seq})` +
+            (approvedReply ? ` ${APPROVED_REPLY_EXEMPTION_MARKER}` : ''),
         },
         { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
       );

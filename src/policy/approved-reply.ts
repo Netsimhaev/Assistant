@@ -17,8 +17,9 @@ import type { GateContext } from './engine.js';
  * asked for and could never be honoured.
  *
  * Why this is safe — every condition is positive, and each one is a predicate
- * the stage-10 claim (`consumeApproval`) ALSO enforces, so this can never
- * widen a call that the claim would then refuse to spend:
+ * the stage-10 claim (`consumeApproval`) ALSO enforces — except the
+ * mailbox-reply-job marker, which only narrows — so this can never widen a
+ * call that the claim would then refuse to spend:
  *
  *   - `ctx.approval` is present and `ctx.jobId` is a string — an approval
  *     belongs to a job, and the executor supplies both;
@@ -26,6 +27,17 @@ import type { GateContext } from './engine.js';
  *     `mail.send` without a real `inReplyTo` is a cold message to someone,
  *     and the charter caps that class for a reason this exemption does not
  *     get to overrule;
+ *   - the job is a MAILBOX REPLY JOB: a `mail_messages` row in this
+ *     business names it as its `reply_job_id` — the same positive marker
+ *     `isMailReplyJob` and `openMailCards` read, and the one a re-raise
+ *     (ruling R8) relinks to the fresh job. This is what keeps the exemption
+ *     to the cards whose text says "approving sends". The conductor
+ *     (`raiseProposalApproval`) also raises cards for threaded `mail.send`
+ *     payloads, and those carry `RAMP_HONESTY` — "approving records your
+ *     decision and does NOT perform the action". Without this marker such a
+ *     card, approved under `off`, would have SENT: the class, tool, job and
+ *     hash conditions below all hold for it (ruling R20). Not consumed by
+ *     `consumeApproval`, so this one condition is the exemption's own;
  *   - the row is in this business, decided `approved`/`approved_with_edit`,
  *     unspent, unexpired, on THIS job, for THIS tool, and its
  *     `input_hash_at_decision` equals the hash of the bytes about to run —
@@ -43,6 +55,9 @@ import type { GateContext } from './engine.js';
  * an envelope's `autonomyCeiling` still apply; budget and the `blocked` risk
  * band still run after it.
  */
+/** Appended to the `approval_consumed` audit reason when the exemption carried the call. */
+export const APPROVED_REPLY_EXEMPTION_MARKER = 'approved_reply_exemption';
+
 export async function approvedReplyCovers(
   facts: ActionFacts,
   toolName: string,
@@ -65,7 +80,11 @@ export async function approvedReplyCovers(
         AND consumed_at IS NULL
         AND expires_at > now()
         AND proposed_tool = $4
-        AND input_hash_at_decision = $5`,
+        AND input_hash_at_decision = $5
+        AND EXISTS (
+          SELECT 1 FROM mail_messages m
+           WHERE m.business_id = $2 AND m.reply_job_id = $3
+        )`,
     [ctx.approval.approvalId, businessId, ctx.jobId, toolName, liveInputHash],
   );
   return rows[0] !== undefined;
