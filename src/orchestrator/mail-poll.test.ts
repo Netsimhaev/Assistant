@@ -118,6 +118,7 @@ function fakeClient(
       return true as const;
     },
     sendReply: async () => ({ externalId: 'SENT-1' }),
+    sendNew: async () => ({ externalId: 'SENT-NEW-1' }),
   };
   return state;
 }

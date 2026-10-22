@@ -30,6 +30,8 @@ import { decide, getApproval } from '../governance/approvals.js';
 import { claimFailedReply, linkReplyJob } from '../mail/inbox-store.js';
 import type { Proposal } from '../domain/proposal.js';
 import { createJob } from './jobs.js';
+import { Plan } from '../domain/plan.js';
+import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { bindPlanToJob } from './plan-store.js';
 import { raiseProposalApproval, RAMP_HONESTY } from './proposal-approval.js';
 import { proposalToPlan } from './proposal-to-plan.js';
@@ -444,6 +446,82 @@ describe('the stage-8 exemption is a mailbox-reply-job exemption (R20)', () => {
     expect(sent).toHaveLength(1);
     expect(consumed).not.toBeNull();
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+  });
+});
+
+describe('a new message goes out through the mailbox too, under the gate (R21)', () => {
+  /**
+   * The instruction door's shape: a `boss` job whose one step is a
+   * `mail.send` with no threading field — `email.initiate` at the gate. After
+   * the mailbox amendment the mailbox adapter is the only one serving
+   * `mail.send`, so before R21 this failed `not_a_reply` even when approved.
+   */
+  async function newMailJob(): Promise<string> {
+    const bundle = await installMailboxCharter();
+    const job = await createJob({
+      businessId: BUSINESS,
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+    });
+    for (const to of ['understand', 'plan'] as const) {
+      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+    }
+    await bindPlanToJob(
+      job.jobId,
+      Plan.parse({
+        goal: 'write to Avi',
+        steps: [
+          {
+            id: 's1',
+            agent: 'comms.email',
+            intent: 'send the offer',
+            toolName: 'mail.send',
+            input: { to: 'avi@partner.example', subject: 'הצעת מחיר', body: 'מצורפת ההצעה' },
+            expectedActionClass: 'email.initiate',
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+    return job.jobId;
+  }
+
+  it('asks first, and once approved sends a new message (not a reply) from the mailbox', async () => {
+    const jobId = await newMailJob();
+    await setAutonomyMode('ask', 'p_boss', { businessId: BUSINESS });
+    const { client, sent, sentNew } = fakeClient();
+
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    // email.initiate is approve_required in the charter: a card, nothing sent.
+    expect(sentNew).toHaveLength(0);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+    const { rows } = await getPool().query<{ approval_id: string }>(
+      `SELECT approval_id FROM approval_requests WHERE job_id = $1 AND state = 'pending'`,
+      [jobId],
+    );
+    const approvalId = rows[0]?.approval_id;
+    if (approvalId === undefined) throw new Error('expected a card');
+
+    await approve(approvalId);
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    expect(sent).toHaveLength(0);
+    expect(sentNew).toEqual([{ to: ['avi@partner.example'], subject: 'הצעת מחיר', body: 'מצורפת ההצעה' }]);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+  });
+
+  it('under mode off a new message is still refused at stage 8 — no exemption reaches it', async () => {
+    const jobId = await newMailJob();
+    const { client, sentNew } = fakeClient();
+
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+
+    expect(sentNew).toHaveLength(0);
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'policy_denial'`,
+      [jobId],
+    );
+    expect(rows.some((r) => r.reason.startsWith('draft_only') && r.reason.endsWith('email.initiate'))).toBe(true);
   });
 });
 

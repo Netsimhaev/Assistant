@@ -268,6 +268,53 @@ describe('gmail client', () => {
   });
 });
 
+describe('gmail sendNew (R21: a new message, not a reply)', () => {
+  it('posts messages/send with no threadId and no threading headers', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: { id: 'new1' } }));
+    const r = await createGmailClient(http).sendNew(
+      'tok',
+      { to: ['dana@example.com', 'avi@example.org'], subject: 'הצעת מחיר', body: 'שלום' },
+      signal,
+    );
+    expect(r).toEqual({ externalId: 'new1' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe('POST');
+    expect(calls[0]?.url).toMatch(/\/messages\/send$/);
+    const body = calls[0]?.body as Record<string, unknown>;
+    expect(Object.keys(body)).toEqual(['raw']);
+    const raw = Buffer.from(body['raw'] as string, 'base64url').toString('utf8');
+    expect(raw).toContain('To: dana@example.com, avi@example.org');
+    expect(raw).not.toMatch(/In-Reply-To|References/i);
+    const payload = raw.split('\r\n\r\n')[1]!;
+    expect(Buffer.from(payload.replace(/\r\n/g, ''), 'base64').toString('utf8')).toBe('שלום');
+    // No draft is ever created.
+    expect(calls.some((c) => /drafts/.test(c.url))).toBe(false);
+  });
+
+  const ok = { to: ['dana@example.com'], subject: 'x', body: 'b' };
+  const cases: Array<[string, Partial<typeof ok>]> = [
+    ['to with CRLF', { to: ['a@b.com\r\nBcc: v@y.com'] }],
+    ['one of several recipients not an address', { to: ['a@b.com', 'not an address'] }],
+    ['no recipients', { to: [] }],
+  ];
+  for (const [label, patch] of cases) {
+    it(`refuses ${label} without any HTTP call`, async () => {
+      const { http, calls } = fake(() => ({ status: 200, body: { id: 'x' } }));
+      const r = await createGmailClient(http).sendNew('tok', { ...ok, ...patch }, signal);
+      expect(r).toMatchObject({ failure: 'rejected' });
+      expect(calls).toHaveLength(0);
+    });
+  }
+
+  it('a subject carrying CR/LF never opens a second header', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: { id: 'x' } }));
+    await createGmailClient(http).sendNew('tok', { ...ok, subject: 'hi\r\nBcc: v@y.com' }, signal);
+    const raw = Buffer.from((calls[0]?.body as { raw: string }).raw, 'base64url').toString('utf8');
+    const headerBlock = raw.split('\r\n\r\n')[0]!;
+    expect(headerBlock.split('\r\n').some((l) => /^bcc:/i.test(l))).toBe(false);
+  });
+});
+
 describe('gmail subject encoding', () => {
   it('a subject carrying CR/LF is encoded into one word, never a second header', async () => {
     const { http, calls } = fake(() => ({ status: 200, body: { id: 'x' } }));

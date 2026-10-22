@@ -1,19 +1,26 @@
 import { describe, expect, it } from 'vitest';
-import type { MailboxClient, MailboxFailure, OutgoingReply } from '../../mail/providers/types.js';
+import type { MailboxClient, MailboxFailure, OutgoingMessage, OutgoingReply } from '../../mail/providers/types.js';
 import { createMailboxSendAdapter } from './mailbox-send.js';
 import { createCredentialHandle } from './types.js';
 import type { AdapterCall } from './types.js';
 
 function fakeClient(result: { externalId: string | null } | MailboxFailure) {
   const sent: Array<{ token: string; reply: OutgoingReply }> = [];
+  const sentNew: Array<{ token: string; message: OutgoingMessage }> = [];
   const client = {
     sendReply: async (token: string, reply: OutgoingReply) => {
       sent.push({ token, reply });
       return result;
     },
+    sendNew: async (token: string, message: OutgoingMessage) => {
+      sentNew.push({ token, message });
+      return result;
+    },
   } as unknown as MailboxClient;
-  return { client, sent };
+  return { client, sent, sentNew };
 }
+
+const NEW_MAIL = { to: 'dana@client.example', subject: 'הצעת מחיר', body: 'מצורפת הצעה' };
 
 const GOOD = {
   to: 'dana@client.example',
@@ -115,6 +122,87 @@ describe('mailbox send adapter', () => {
       retryable: false,
       code: 'send_rejected',
     });
+  });
+
+  it('sends a payload with no threading field as a NEW message, not a reply (R21)', async () => {
+    const { client, sent, sentNew } = fakeClient({ externalId: 'new-1' });
+    const adapter = createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client });
+    const result = await adapter.execute(call(NEW_MAIL));
+    expect(result).toMatchObject({ ok: true, externalId: 'new-1' });
+    expect(sent).toHaveLength(0);
+    expect(sentNew).toEqual([
+      { token: 'tok', message: { to: ['dana@client.example'], subject: 'הצעת מחיר', body: 'מצורפת הצעה' } },
+    ]);
+  });
+
+  it('a new message may go to several recipients', async () => {
+    const { client, sentNew } = fakeClient({ externalId: 'new-1' });
+    const adapter = createMailboxSendAdapter({ system: 'mailbox', provider: 'microsoft', client });
+    const result = await adapter.execute(call({ ...NEW_MAIL, to: ['a@x.com', 'b@y.com'] }));
+    expect(result).toMatchObject({ ok: true });
+    expect(sentNew[0]?.message.to).toEqual(['a@x.com', 'b@y.com']);
+  });
+
+  it('null or empty threading fields read as absent, so the payload is a new message', async () => {
+    const { client, sent, sentNew } = fakeClient({ externalId: 'new-1' });
+    const adapter = createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client });
+    const result = await adapter.execute(
+      call({ ...NEW_MAIL, inReplyTo: null, threadId: null, providerMessageId: '' }),
+    );
+    expect(result).toMatchObject({ ok: true });
+    expect(sentNew).toHaveLength(1);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('SOME but not all threading fields is refused as not_a_reply, never sent as new', async () => {
+    const { client, sent, sentNew } = fakeClient({ externalId: 'x' });
+    const adapter = createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client });
+    for (const partial of [
+      { inReplyTo: '<a@b>' },
+      { threadId: 'T1' },
+      { providerMessageId: 'M1' },
+      { inReplyTo: '<a@b>', threadId: 'T1' },
+      // A non-string value is not "absent".
+      { threadId: 42 },
+    ]) {
+      expect(await adapter.execute(call({ ...NEW_MAIL, ...partial }))).toMatchObject({
+        ok: false,
+        retryable: false,
+        code: 'not_a_reply',
+      });
+    }
+    expect(sent).toHaveLength(0);
+    expect(sentNew).toHaveLength(0);
+  });
+
+  it('a new message with no readable recipient or no subject/body sends nothing', async () => {
+    const { client, sentNew } = fakeClient({ externalId: 'x' });
+    const adapter = createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client });
+    expect(await adapter.execute(call({ ...NEW_MAIL, to: 'not an address' }))).toMatchObject({
+      ok: false,
+      code: 'no_recipient',
+    });
+    expect(await adapter.execute(call({ ...NEW_MAIL, subject: '' }))).toMatchObject({
+      ok: false,
+      code: 'message_incomplete',
+    });
+    expect(sentNew).toHaveLength(0);
+  });
+
+  it('a new message maps provider failures exactly like a reply', async () => {
+    const run = async (f: MailboxFailure) =>
+      createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client: fakeClient(f).client }).execute(
+        call(NEW_MAIL),
+      );
+    expect(await run({ failure: 'transient', status: 0, message: 'm' })).toMatchObject({
+      retryable: false,
+      code: 'delivery_unknown',
+    });
+    expect(await run({ failure: 'transient', status: 503, message: 'm' })).toMatchObject({
+      retryable: true,
+      code: 'transient',
+    });
+    expect(await run({ failure: 'rejected', status: 400, message: 'm' })).toMatchObject({ code: 'send_rejected' });
   });
 
   it('refuses a tool it does not serve', async () => {

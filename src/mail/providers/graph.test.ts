@@ -204,6 +204,50 @@ describe('graph client', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('sendNew is one POST to /me/sendMail, saved to Sent, with no draft and no reply endpoint (R21)', async () => {
+    const { http, calls } = fake(() => ({ status: 202, body: null }));
+    const r = await createGraphClient(http).sendNew(
+      'tok',
+      { to: ['dana@example.com', 'avi@example.org'], subject: 'הצעת מחיר', body: 'שלום' },
+      signal,
+    );
+    expect(r).toEqual({ externalId: null });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe('POST');
+    expect(calls[0]?.url).toMatch(/\/me\/sendMail$/);
+    expect(calls[0]?.body).toEqual({
+      message: {
+        subject: 'הצעת מחיר',
+        body: { contentType: 'Text', content: 'שלום' },
+        toRecipients: [
+          { emailAddress: { address: 'dana@example.com' } },
+          { emailAddress: { address: 'avi@example.org' } },
+        ],
+        ccRecipients: [],
+      },
+      saveToSentItems: true,
+    });
+    expect(calls.some((c) => /createReply|\/messages(\/|$)|\/reply/.test(c.url) || c.method === 'PATCH')).toBe(false);
+  });
+
+  const refused: Array<[string, { to?: string[]; subject?: string }]> = [
+    ['a recipient with CRLF', { to: ['a@b.com\r\nBcc: v@y.com'] }],
+    ['no recipients', { to: [] }],
+    ['a subject with CR/LF', { subject: 'hi\r\nBcc: v@y.com' }],
+  ];
+  for (const [label, patch] of refused) {
+    it(`sendNew refuses ${label}, with no HTTP call`, async () => {
+      const { http, calls } = fake(() => ({ status: 202, body: null }));
+      const r = await createGraphClient(http).sendNew(
+        'tok',
+        { to: ['dana@example.com'], subject: 's', body: 'b', ...patch },
+        signal,
+      );
+      expect(r).toMatchObject({ failure: 'rejected' });
+      expect(calls).toHaveLength(0);
+    });
+  }
+
   it('ensureLabels creates only missing categories', async () => {
     const { http, calls } = fake((r) =>
       r.method === 'GET'

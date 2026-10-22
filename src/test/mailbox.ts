@@ -12,7 +12,7 @@ import type { MailTriage } from '../domain/mail-triage.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { recordIncoming, type IncomingMail, type StoredMail } from '../mail/inbox-store.js';
-import type { MailboxClient, MailboxFailure, OutgoingReply } from '../mail/providers/types.js';
+import type { MailboxClient, MailboxFailure, OutgoingMessage, OutgoingReply } from '../mail/providers/types.js';
 import { createMailboxSendAdapter } from '../orchestrator/adapters/mailbox-send.js';
 import { AdapterRegistry } from '../orchestrator/adapters/registry.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
@@ -101,13 +101,19 @@ export type SendResult = { externalId: string | null } | MailboxFailure;
 
 export function fakeMailboxClient(results: SendResult[] = [{ externalId: 'SENT-1' }]) {
   const sent: OutgoingReply[] = [];
+  /** New messages (`sendNew`, ruling R21) — kept apart so a reply test never counts one. */
+  const sentNew: OutgoingMessage[] = [];
   const client = {
     sendReply: async (_token: string, reply: OutgoingReply) => {
       sent.push(reply);
       return results[Math.min(sent.length - 1, results.length - 1)] ?? { externalId: 'SENT-1' };
     },
+    sendNew: async (_token: string, message: OutgoingMessage) => {
+      sentNew.push(message);
+      return { externalId: 'SENT-NEW-1' };
+    },
   } as unknown as MailboxClient;
-  return { client, sent };
+  return { client, sent, sentNew };
 }
 
 export function mailboxRuntime(client: MailboxClient): Runtime {

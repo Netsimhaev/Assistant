@@ -25,6 +25,16 @@ export interface OutgoingReply {
   providerMessageId: string;
 }
 
+/**
+ * A NEW message, not an answer to one (ruling R21): no threading fields at all,
+ * so the provider opens a fresh conversation. One or more recipients.
+ */
+export interface OutgoingMessage {
+  to: string[];
+  subject: string;
+  body: string;
+}
+
 export interface MailboxClient {
   /** Throws `MailboxCursorError` on failure: this signature has no failure arm. */
   initialCursor(token: string, signal: AbortSignal): Promise<string>;
@@ -54,6 +64,12 @@ export interface MailboxClient {
   sendReply(
     token: string,
     reply: OutgoingReply,
+    signal: AbortSignal,
+  ): Promise<{ externalId: string | null } | MailboxFailure>;
+  /** Send a new message — straight out, never via a saved draft. */
+  sendNew(
+    token: string,
+    message: OutgoingMessage,
     signal: AbortSignal,
   ): Promise<{ externalId: string | null } | MailboxFailure>;
 }

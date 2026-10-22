@@ -296,6 +296,39 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
         return { externalId: null };
       });
     },
+
+    sendNew(token, message, signal) {
+      return guarded(async () => {
+        if (message.to.length === 0 || !message.to.every((a) => ADDRESS_SHAPE.test(a))) {
+          return { failure: 'rejected', status: 0, message: 'mail recipient is not a plain address' } as MailboxFailure;
+        }
+        // JSON, not raw headers, so a line break cannot open a header here —
+        // refused anyway, so both providers answer the same payload the same way.
+        if (/[\r\n]/.test(message.subject)) {
+          return { failure: 'rejected', status: 0, message: 'mail subject contains a line break' } as MailboxFailure;
+        }
+        // One call: sendMail sends and files in Sent; no draft is created, so
+        // nothing is left behind on failure. cc stays empty, as on a reply.
+        // Graph answers 202 with an empty body: no sent-message id to report.
+        const res = await http.request({
+          method: 'POST',
+          url: `${BASE}/me/sendMail`,
+          accessToken: token,
+          body: {
+            message: {
+              subject: message.subject,
+              body: { contentType: 'Text', content: message.body },
+              toRecipients: message.to.map((address) => ({ emailAddress: { address } })),
+              ccRecipients: [],
+            },
+            saveToSentItems: true,
+          },
+          signal,
+        });
+        if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);
+        return { externalId: null };
+      });
+    },
   };
 }
 

@@ -1,5 +1,6 @@
 /**
- * Gmail REST client. Reads new inbox mail, adds our own labels, sends replies.
+ * Gmail REST client. Reads new inbox mail, adds our own labels, sends replies
+ * and new messages.
  *
  * Writes are add-only by construction: the only mutation of an existing
  * message is `messages.modify` with `addLabelIds`. There is no code path that
@@ -28,9 +29,9 @@ import {
   MailboxCursorError,
   ok2xx,
   type MailboxClient,
+  type OutgoingMessage,
   type MailboxFailure,
   type MailboxHttp,
-  type OutgoingReply,
 } from './types.js';
 
 const BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
@@ -136,23 +137,33 @@ function encodeSubject(subject: string): string {
   return `=?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`;
 }
 
-/** Builds the RFC 822 message, or a failure when any header value could carry a line break or a bad address. */
-function buildRaw(reply: OutgoingReply): string | MailboxFailure {
-  const refs = [reply.references, reply.inReplyTo].filter((v): v is string => v !== null && v !== '').join(' ');
-  const encodedBody = (Buffer.from(reply.body, 'utf8').toString('base64').match(/.{1,76}/g) ?? []).join('\r\n');
-  const subject = encodeSubject(reply.subject);
-  const headerValues = [...reply.to, subject, reply.inReplyTo, refs];
+/**
+ * Builds the RFC 822 message, or a failure when any header value could carry
+ * a line break or a bad address. `threading` is `null` for a new message
+ * (`sendNew`): no In-Reply-To and no References, and the same guards on
+ * every header that is written.
+ */
+function buildRaw(
+  message: OutgoingMessage,
+  threading: { inReplyTo: string; references: string | null } | null,
+): string | MailboxFailure {
+  const refs =
+    threading === null
+      ? null
+      : [threading.references, threading.inReplyTo].filter((v): v is string => v !== null && v !== '').join(' ');
+  const encodedBody = (Buffer.from(message.body, 'utf8').toString('base64').match(/.{1,76}/g) ?? []).join('\r\n');
+  const subject = encodeSubject(message.subject);
+  const headerValues = [...message.to, subject, ...(threading === null || refs === null ? [] : [threading.inReplyTo, refs])];
   if (headerValues.some((v) => /[\r\n]/.test(v))) {
-    return { failure: 'rejected', status: 0, message: 'reply header value contains a line break' };
+    return { failure: 'rejected', status: 0, message: 'mail header value contains a line break' };
   }
-  if (reply.to.length === 0 || !reply.to.every((a) => ADDRESS_SHAPE.test(a))) {
-    return { failure: 'rejected', status: 0, message: 'reply recipient is not a plain address' };
+  if (message.to.length === 0 || !message.to.every((a) => ADDRESS_SHAPE.test(a))) {
+    return { failure: 'rejected', status: 0, message: 'mail recipient is not a plain address' };
   }
   const lines = [
-    `To: ${reply.to.join(', ')}`,
+    `To: ${message.to.join(', ')}`,
     `Subject: ${subject}`,
-    `In-Reply-To: ${reply.inReplyTo}`,
-    `References: ${refs}`,
+    ...(threading === null || refs === null ? [] : [`In-Reply-To: ${threading.inReplyTo}`, `References: ${refs}`]),
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset=UTF-8',
     'Content-Transfer-Encoding: base64',
@@ -314,13 +325,32 @@ export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): Mai
 
     sendReply(token, reply, signal) {
       return guarded(async () => {
-        const raw = buildRaw(reply);
+        const raw = buildRaw(reply, { inReplyTo: reply.inReplyTo, references: reply.references });
         if (typeof raw !== 'string') return raw;
         const res = await http.request({
           method: 'POST',
           url: `${BASE}/messages/send`,
           accessToken: token,
           body: { raw: Buffer.from(raw, 'utf8').toString('base64url'), threadId: reply.threadId },
+          signal,
+        });
+        if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);
+        const id = asRecord(res.body)['id'];
+        return { externalId: typeof id === 'string' ? id : null };
+      });
+    },
+
+    sendNew(token, message, signal) {
+      return guarded(async () => {
+        // The same builder and guards as a reply, with no threading headers,
+        // and no `threadId` in the request: Gmail opens a new conversation.
+        const raw = buildRaw(message, null);
+        if (typeof raw !== 'string') return raw;
+        const res = await http.request({
+          method: 'POST',
+          url: `${BASE}/messages/send`,
+          accessToken: token,
+          body: { raw: Buffer.from(raw, 'utf8').toString('base64url') },
           signal,
         });
         if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);
