@@ -32,8 +32,15 @@ describe('mail triage', () => {
     expect(options.tools).toEqual([]);
     expect(options.settingSources).toEqual([]);
     expect(options.model).toBe('haiku');
-    expect(Object.keys(options.env ?? {})).not.toContain('ANTHROPIC_API_KEY');
+    expect(Object.keys(options.env ?? {}).every((k) => k === 'PATH')).toBe(true);
+    expect(options.maxTurns).toBe(1);
     expect(prompt).toContain('fixednonce');
     expect(String(options.systemPrompt)).toContain('fixednonce');
+  });
+
+  it('two builds without an explicit nonce use different nonces', () => {
+    const bundle = { promptFragments: { 'intake.triage': 'f' } } as unknown as PolicyBundle;
+    const mail = { subject: 's', fromName: null, bodyText: 'b', bodyTruncated: false } as never;
+    expect(buildTriageCall({ bundle, mail }).prompt).not.toBe(buildTriageCall({ bundle, mail }).prompt);
   });
 });

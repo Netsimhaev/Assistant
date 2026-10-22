@@ -9,7 +9,8 @@ import { config } from '../config.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { MailTriage, mailTriageProblems } from '../domain/mail-triage.js';
 import type { StoredMail } from '../mail/inbox-store.js';
-import { TRIAGE_LABELS, mailFence, renderTriageBrief } from '../mail/triage-brief.js';
+import { TRIAGE_LABELS, renderTriageBrief } from '../mail/triage-brief.js';
+import { buildFence } from '../util/fence.js';
 import { extractJsonObjects } from '../util/json-extract.js';
 
 export const MAIL_TRIAGE_MODEL = 'haiku';
@@ -47,7 +48,7 @@ export function parseTriageResponse(raw: string): TriageOutcome {
 function buildContract(nonce: string): string {
   const fences = Object.values(TRIAGE_LABELS)
     .map((label) => {
-      const f = mailFence(label, nonce);
+      const f = buildFence(label, nonce);
       return `בין "${f.open}" ל-"${f.close}"`;
     })
     .join('; ');
@@ -77,7 +78,8 @@ export function buildTriageCall(
       settingSources: [],
       env: process.env['PATH'] === undefined ? {} : { PATH: process.env['PATH'] },
       permissionMode: 'default',
-      maxTurns: 3,
+      // No tools, so there is no second turn.
+      maxTurns: 1,
     },
   };
 }

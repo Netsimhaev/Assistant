@@ -8,8 +8,8 @@ import { randomBytes } from 'node:crypto';
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from '../config.js';
 import type { PolicyBundle } from '../domain/policy.js';
-import { mailFence, stripUntilStable } from '../mail/triage-brief.js';
 import { stripBidiControls } from '../util/bidi.js';
+import { buildFence, stripFenceMarkers } from '../util/fence.js';
 
 export const MAIL_DRAFTER_MODEL = 'sonnet';
 export const DRAFT_MAX_CHARS = 4_000;
@@ -31,8 +31,8 @@ const LABELS = {
 
 export function renderDraftPrompt(request: DraftRequest, nonce: string): string {
   const block = (title: string, label: string, text: string): string => {
-    const f = mailFence(label, nonce);
-    const safe = stripUntilStable(stripUntilStable(stripBidiControls(text), f.open), f.close).slice(0, 1_000);
+    const f = buildFence(label, nonce);
+    const safe = stripFenceMarkers(stripBidiControls(text), f).slice(0, 1_000);
     return `# ${title}\n${f.open}\n${safe}\n${f.close}`;
   };
   return [
@@ -45,7 +45,7 @@ export function renderDraftPrompt(request: DraftRequest, nonce: string): string 
 function buildContract(nonce: string): string {
   const fences = Object.values(LABELS)
     .map((l) => {
-      const f = mailFence(l, nonce);
+      const f = buildFence(l, nonce);
       return `"${f.open}" עד "${f.close}"`;
     })
     .join(', ');
@@ -71,7 +71,8 @@ export function buildDraftCall(
       settingSources: [],
       env: process.env['PATH'] === undefined ? {} : { PATH: process.env['PATH'] },
       permissionMode: 'default',
-      maxTurns: 3,
+      // No tools, so there is no second turn.
+      maxTurns: 1,
     },
   };
 }
@@ -80,6 +81,7 @@ export function buildDraftCall(
 export function interpretDraft(raw: string): DraftOutcome {
   const body = stripBidiControls(raw).trim().slice(0, DRAFT_MAX_CHARS).trim();
   if (body === '') return { status: 'failed', reason: 'empty draft' };
+  // Fails closed: a legitimate bracketed phrase also triggers a redraft.
   if (/\[[^\]\n]{1,40}\]/.test(body)) return { status: 'failed', reason: 'draft contains a placeholder' };
   return { status: 'drafted', body };
 }

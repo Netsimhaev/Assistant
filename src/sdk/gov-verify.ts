@@ -143,6 +143,7 @@ import { READ_FOR_QUESTION_MAX_CHARS } from '../governance/intent-registry.js';
 import { ungroundedNumbers } from '../governance/numeric-grounding.js';
 import { Verdict, saveVerdict } from '../governance/verdict-store.js';
 import { requestHelp } from '../orchestrator/delegate.js';
+import { buildFence, stripFenceMarkers, type Fence } from '../util/fence.js';
 import { extractJsonObjects } from '../util/json-extract.js';
 
 /**
@@ -250,50 +251,10 @@ export const QUESTION_FENCE_LABEL = FENCED_FIELD_LABEL.question;
 export const ANSWER_FENCE_LABEL = FENCED_FIELD_LABEL.answer;
 export const DRAFT_FENCE_LABEL = FENCED_FIELD_LABEL.draftText;
 
-export interface Fence {
-  open: string;
-  close: string;
-}
-
-/**
- * `nonce` must be non-empty. An empty nonce would build a fixed, predictable
- * marker — exactly the literal-marker vulnerability the nonce exists to
- * replace — and nothing upstream validates the value `freshNonce()`'s own
- * caller supplies, so this is the one place that can refuse it before it
- * becomes a forgeable marker in a live prompt.
- */
-export function buildFence(label: string, nonce: string): Fence {
-  if (nonce.length === 0) {
-    throw new Error('buildFence: nonce must not be empty — an empty nonce is a fixed, forgeable marker');
-  }
-  return { open: `=== ${label} :: ${nonce} ===`, close: `=== סוף ${label} :: ${nonce} ===` };
-}
-
-/**
- * Remove every occurrence of `marker` from `text`, re-scanning after each
- * pass until nothing changes. A single pass — `text.split(marker).join('')`
- * — missed exactly this: `'...מצוט' + marker + 'ט...'` strips the middle
- * occurrence and leaves the two fragments to recombine into a NEW, complete
- * marker the single pass never looks for again. Looping catches it; see this
- * module's own docblock for why looping a literal-matching strip is still
- * not the actual security boundary here (the nonce is) — this exists as
- * belt-and-braces, not as the guarantee.
- *
- * Termination: each pass either finds no match (loop ends) or removes at
- * least one full occurrence of `marker`, which strictly shortens the string.
- * A monotonically shrinking, non-negative length cannot loop forever.
- */
-function stripUntilStable(text: string, marker: string): string {
-  let result = text;
-  for (;;) {
-    const next = result.split(marker).join('');
-    if (next === result) return result;
-    result = next;
-  }
-}
+export { buildFence, type Fence };
 
 function sanitiseForFence(text: string, fence: Fence): string {
-  return stripUntilStable(stripUntilStable(text, fence.open), fence.close);
+  return stripFenceMarkers(text, fence);
 }
 
 /** `\` before every regex-special character, so a label can be dropped into a `RegExp` literally. */

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { StoredMail } from './inbox-store.js';
-import { TRIAGE_BRIEF_MAX_CHARS, TRIAGE_LABELS, mailFence, renderTriageBrief } from './triage-brief.js';
+import { buildFence as mailFence } from '../util/fence.js';
+import { TRIAGE_BRIEF_MAX_CHARS, TRIAGE_LABELS, renderTriageBrief } from './triage-brief.js';
 
 function mail(over: Partial<StoredMail> = {}): StoredMail {
   return {
@@ -38,5 +39,16 @@ describe('renderTriageBrief', () => {
     expect(out.split(f.close)).toHaveLength(2);
     expect(out).not.toContain('‮');
     expect(() => mailFence('l', '')).toThrow();
+  });
+
+  it('omits a fromName that is itself an address', () => {
+    const out = renderTriageBrief(mail({ fromName: 'sender.header@evil.example' }), 'n0nce');
+    expect(out).not.toContain('sender.header@evil.example');
+    expect(out).not.toContain(TRIAGE_LABELS.fromName);
+  });
+
+  it('omits a fromName that contains the header address case-insensitively', () => {
+    const out = renderTriageBrief(mail({ fromName: 'Sender.Header@Evil.example' }), 'n0nce');
+    expect(out.toLowerCase()).not.toContain('sender.header');
   });
 });
