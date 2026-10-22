@@ -243,6 +243,15 @@ function revertForm(base: string, csrf: string): string {
 
 type GrantSummary = Awaited<ReturnType<typeof listGrants>>[number];
 
+export type MailboxBannerStatus = 'not_connected' | 'needs_reauth' | 'connected';
+
+/** The one status the mail screens show, derived from the same grant `mailboxIsWorking` reads. */
+export async function mailboxBannerStatus(businessId: string): Promise<MailboxBannerStatus> {
+  const { grant } = await mailboxIsWorking(businessId);
+  if (grant === null) return 'not_connected';
+  return grant.needsReauthAt !== null ? 'needs_reauth' : 'connected';
+}
+
 /** Working = a live binding AND a live grant that does not need reauth. Anything else is "not working". */
 async function mailboxIsWorking(businessId: string): Promise<{ working: boolean; grant: GrantSummary | null }> {
   const [bindings, grants] = await Promise.all([loadBindings({ businessId }), listGrants(businessId)]);

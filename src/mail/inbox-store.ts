@@ -552,6 +552,17 @@ function builder(businessId: string): {
   };
 }
 
+/** One mail by id, scoped to its business. `null` when this business does not own it. */
+export async function getMail(mailId: string, options: Options = {}): Promise<StoredMail | null> {
+  const { businessId, db } = ctx(options);
+  const { rows } = await db.query<MailDbRow>(
+    `SELECT ${COLUMNS} FROM mail_messages WHERE business_id = $1 AND mail_id = $2`,
+    [businessId, mailId],
+  );
+  const row = rows[0];
+  return row === undefined ? null : toStoredMail(row);
+}
+
 export async function searchMail(q: MailSearch, options: Options = {}): Promise<MailRow[]> {
   const { businessId, db } = ctx(options);
   const b = builder(businessId);

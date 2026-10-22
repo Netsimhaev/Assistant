@@ -83,6 +83,7 @@ import {
   handleMailboxSignPost,
   handleMailboxStatus,
 } from './mailbox-connect.js';
+import { handleDocumentFile, handleInvoices, handleMailDetail, handleMailList } from './mail-handlers.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { MAX_RECALL, recallMemories } from '../memory/store.js';
@@ -2424,6 +2425,8 @@ async function handleAutonomousActionMark(
 }
 
 const CARD_PATH = /^\/a\/([^/]+)$/;
+const MAIL_PATH = /^\/mail\/([^/]+)$/;
+const DOCUMENT_FILE_PATH = /^\/documents\/([^/]+)\/file$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
 const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
 const AUTONOMOUS_ACTION_MARK_PATH = /^\/autonomy\/actions\/([^/]+)\/([^/]+)\/mark$/;
@@ -2446,7 +2449,8 @@ async function route(
   oauthOptions: OAuthRouteOptions,
 ): Promise<void> {
   const method = req.method ?? 'GET';
-  const pathname = new URL(req.url ?? '/', 'http://dashboard.local').pathname;
+  const requestUrl = new URL(req.url ?? '/', 'http://dashboard.local');
+  const pathname = requestUrl.pathname;
 
   if (method === 'GET' && pathname === '/login') return handleLoginGet(res);
   // Deliberately no CSRF check here — not an oversight. A CSRF token is
@@ -2481,6 +2485,22 @@ async function route(
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
   if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
+  // The mailbox screens: list with search, invoices by supplier, one mail, and
+  // the business-scoped document download they link to.
+  if (method === 'GET' && pathname === '/mail') {
+    return handleMailList(res, businessId, requestUrl, issueCsrfToken(session.sessionId));
+  }
+  if (method === 'GET' && pathname === '/mail/invoices') {
+    return handleInvoices(res, businessId, requestUrl, issueCsrfToken(session.sessionId));
+  }
+  const mailMatch = MAIL_PATH.exec(pathname);
+  if (method === 'GET' && mailMatch?.[1] !== undefined) {
+    return handleMailDetail(res, businessId, decodeURIComponent(mailMatch[1]));
+  }
+  const documentFileMatch = DOCUMENT_FILE_PATH.exec(pathname);
+  if (method === 'GET' && documentFileMatch?.[1] !== undefined) {
+    return handleDocumentFile(res, businessId, decodeURIComponent(documentFileMatch[1]), documentRoot);
+  }
   // Connecting the business mailbox: sign the charter amendment FIRST, then
   // run the OAuth ceremony — see `mailbox-connect.ts` for why that order.
   if (method === 'GET' && pathname === '/connections/mailbox') {
