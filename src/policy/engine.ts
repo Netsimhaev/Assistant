@@ -27,6 +27,7 @@ import { isOutbound, isKnownTool } from './classify.js';
 import { assessRisk, type NormsLookup } from './risk.js';
 import { inQuietHours, redactPayload } from './redact.js';
 import { mayDelegate } from '../governance/delegation.js';
+import { approvedReplyCovers } from './approved-reply.js';
 
 export interface GateContext extends FactsContext {
   agent: AgentId;
@@ -274,29 +275,16 @@ export async function evaluateToolCall(
   }
 
   // 8. Autonomy ------------------------------------------------------------
-  const effective = effectiveAutonomy(facts, ctx);
+  // A reply the owner already approved, byte for byte, on this job and tool,
+  // is judged without the ramp and provenance ceilings — and only those two.
+  // See `approvedReplyCovers` for the conditions and for what it does not
+  // bypass. `facts.inputHash` is the same hash stage 10 hands
+  // `consumeApproval`, so the exemption and the claim agree on the bytes.
+  const approvedReply = await approvedReplyCovers(facts, facts.toolName, facts.inputHash, ctx);
+  let effective = effectiveAutonomy(facts, ctx, { skipRampAndProvenance: approvedReply });
 
-  if (effective === 'forbidden') {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
-      kind: 'policy_denial',
-      reason: `${DENY_CODES.autonomyForbidden}: ${facts.actionClass}`,
-    });
-    return deny(
-      DENY_CODES.autonomyForbidden,
-      `${facts.actionClass} אסור לחלוטין בהגדרות הנוכחיות`,
-    );
-  }
-
-  if (effective === 'draft_only') {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
-      kind: 'policy_denial',
-      reason: `${DENY_CODES.draftOnly}: ${facts.actionClass}`,
-    });
-    return deny(
-      DENY_CODES.draftOnly,
-      `${facts.actionClass} במצב טיוטה בלבד — נשמר לאישור ידני`,
-    );
-  }
+  const stage8Denial = await autonomyDenial(effective, facts, ctx, currentVersion, businessId);
+  if (stage8Denial !== null) return stage8Denial;
 
   // 9. Budget --------------------------------------------------------------
   // An amount we could not read is not an amount of zero. Without this, a
@@ -394,6 +382,19 @@ export async function evaluateToolCall(
     // Every failure code falls through to the normal path, which queues a
     // fresh request. That is the correct answer to all of them: the human
     // approved something, and it was not this.
+    //
+    // Except that the normal path must not run on a ceiling the exemption
+    // relaxed. `approvedReplyCovers` is a read; between it and the claim
+    // above another runner can spend the same approval. Carrying on with the
+    // relaxed `effective` would then let a routine-band reply through
+    // UNATTENDED — a second send of an approval that was used once. So the
+    // stage-8 verdict is recomputed with every ceiling, exactly as if the
+    // exemption had never applied.
+    if (approvedReply) {
+      effective = effectiveAutonomy(facts, ctx);
+      const lostClaim = await autonomyDenial(effective, facts, ctx, currentVersion, businessId);
+      if (lostClaim !== null) return lostClaim;
+    }
   }
 
   // An instruction the owner already gave for this job, if it covers this
@@ -583,17 +584,66 @@ function matchDoNotContact(
 }
 
 /**
+ * Stage 8's two refusals, shared by the stage itself and by the lost-claim
+ * fallback in stage 10, so the two can never word or audit them differently.
+ * Returns `null` when the level permits the action to continue.
+ */
+async function autonomyDenial(
+  effective: AutonomyLevel,
+  facts: ActionFacts,
+  ctx: GateContext,
+  currentVersion: string,
+  businessId: string,
+): Promise<PolicyDecision | null> {
+  if (effective === 'forbidden') {
+    await recordIntent(facts, ctx, currentVersion, businessId, {
+      kind: 'policy_denial',
+      reason: `${DENY_CODES.autonomyForbidden}: ${facts.actionClass}`,
+    });
+    return deny(
+      DENY_CODES.autonomyForbidden,
+      `${facts.actionClass} אסור לחלוטין בהגדרות הנוכחיות`,
+    );
+  }
+
+  if (effective === 'draft_only') {
+    await recordIntent(facts, ctx, currentVersion, businessId, {
+      kind: 'policy_denial',
+      reason: `${DENY_CODES.draftOnly}: ${facts.actionClass}`,
+    });
+    return deny(
+      DENY_CODES.draftOnly,
+      `${facts.actionClass} במצב טיוטה בלבד — נשמר לאישור ידני`,
+    );
+  }
+
+  return null;
+}
+
+/**
  * Combine every ceiling that applies. Five independent sources, all able to
  * tighten and none able to loosen — that is what makes them ceilings.
+ *
+ * `skipRampAndProvenance` drops exactly two of the five, and is set only by
+ * stage 8 when `approvedReplyCovers` holds: an owner who approved these exact
+ * bytes has answered, for this one call, the question both of those ceilings
+ * exist to ask ("has a person looked at what an untrusted chain wants to
+ * send?"). The other three are not that question and stay: the signed
+ * charter's base for the class, every counterparty override, and an
+ * envelope's hard cap. Named as the two it omits, never as "everything except"
+ * — a control written as a negation is how this file has lost ceilings before.
  */
-function effectiveAutonomy(facts: ActionFacts, ctx: GateContext): AutonomyLevel {
+function effectiveAutonomy(
+  facts: ActionFacts,
+  ctx: GateContext,
+  options: { skipRampAndProvenance?: boolean } = {},
+): AutonomyLevel {
   const actionClass = facts.actionClass;
   if (actionClass === null) return 'auto';
+  const skip = options.skipRampAndProvenance === true;
 
-  const ceilings: AutonomyLevel[] = [
-    ctx.bundle.autonomyBase[actionClass],
-    ctx.bundle.provenanceCeiling[facts.provenance],
-  ];
+  const ceilings: AutonomyLevel[] = [ctx.bundle.autonomyBase[actionClass]];
+  if (!skip) ceilings.push(ctx.bundle.provenanceCeiling[facts.provenance]);
 
   // Every key that identifies the other side, each against its own bucket.
   // Keyed by entityId alone, an override written against a domain, a phone or
@@ -624,7 +674,7 @@ function effectiveAutonomy(facts: ActionFacts, ctx: GateContext): AutonomyLevel 
   for (const override of candidates) {
     if (override !== undefined) ceilings.push(override);
   }
-  if (ctx.rampLevel !== undefined) ceilings.push(ctx.rampLevel);
+  if (!skip && ctx.rampLevel !== undefined) ceilings.push(ctx.rampLevel);
   if (ctx.autonomyCeiling !== undefined) ceilings.push(ctx.autonomyCeiling);
 
   return mostRestrictiveAutonomy(ceilings);
