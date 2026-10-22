@@ -34,6 +34,7 @@
     "sdk:contact-resolver": "tsx src/sdk/run-contact-resolver.ts",
     "sdk:delegate": "tsx src/sdk/run-delegate.ts",
     "sdk:judge": "tsx src/sdk/run-judge.ts",
+    "sdk:mail-triage": "tsx src/sdk/run-mail-triage.ts",
     "connector:calendar": "tsx scripts/connector-calendar.ts"
   },
   "dependencies": {
