@@ -70,6 +70,13 @@ describe('renderApprovalCard on a mailbox reply', () => {
     expect(html).not.toContain('<p class="error">שים לב');
   });
 
+  it('a pending card with a staged edit offers the edit, so approving here sends what WhatsApp showed', () => {
+    const staged = { ...PAYLOAD, body: 'הנוסח שהבעלים כתב בוואטסאפ' };
+    const html = renderApprovalCard({ approval: approval({ editedInput: staged }), csrf: 'c', mailReply: true });
+    expect(html).toContain('הנוסח שהבעלים כתב בוואטסאפ');
+    expect(html).not.toContain('שורה ראשונה\\n');
+  });
+
   it('a mailbox-shaped payload without the mail-reply marker renders as before', () => {
     const html = renderApprovalCard({ approval: approval(), csrf: 'c' });
     expect(html).not.toContain('נמען התשובה');

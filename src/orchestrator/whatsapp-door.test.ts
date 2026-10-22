@@ -191,7 +191,7 @@ describe('runWhatsAppDoor', () => {
       planner: plannedWith(mailPlan()),
     });
 
-    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, malformedSenderCount: 0 });
     expect(messenger.sentTexts).toHaveLength(1);
     expect(messenger.sentTexts[0]).toContain('קיבלתי');
 
@@ -1195,7 +1195,7 @@ describe('runWhatsAppDoor', () => {
       },
     });
 
-    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, malformedSenderCount: 0 });
     expect(seenInstructions).toEqual(['ראשונה (מוקדמת)', 'שנייה (מאוחרת)']);
   });
 

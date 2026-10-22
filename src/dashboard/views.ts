@@ -1102,7 +1102,14 @@ export function renderApprovalCard(options: {
   mailReply?: boolean;
 }): string {
   const { approval } = options;
-  const editValue = options.editValue ?? JSON.stringify(approval.proposedInput, null, 2);
+  // A pending card can carry a staged edit — the owner's replacement body for
+  // a mailbox reply, sent over WhatsApp (`stagePendingEdit`). Offer THAT, so
+  // approving here sends what he last wrote and saw, not the draft he replaced.
+  const offered =
+    approval.state === 'pending' && approval.editedInput !== null && approval.editedInput !== undefined
+      ? approval.editedInput
+      : approval.proposedInput;
+  const editValue = options.editValue ?? JSON.stringify(offered, null, 2);
   const noteValue = options.noteValue ?? '';
   const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
   const signErrorBlock = options.signError ? `<p class="error">${esc(options.signError)}</p>` : '';

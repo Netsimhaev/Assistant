@@ -26,10 +26,11 @@ import {
 } from '../mail/inbox-store.js';
 import { MAIL_LABELS } from '../mail/mailbox.js';
 import type { MailboxClient, MailboxFailure } from '../mail/providers/types.js';
-import { renderMailNotice } from '../mail/whatsapp-notice.js';
+import { MAIL_CARD_INSTRUCTION, renderMailNotice } from '../mail/whatsapp-notice.js';
 import type { Triage, TriageOutcome } from '../sdk/mail-triage.js';
 import { resetDatabase } from '../test/db.js';
 import {
+  DRAFT_BODY,
   NOON,
   QUESTION_TRIAGE,
   incomingMail,
@@ -402,7 +403,9 @@ describe('pollMailbox', () => {
     expect(triage.calls).toBe(2); // it really was handled a second time
     expect(second).toMatchObject({ triaged: 1, labelled: 0, notified: 0, drafts: 0 });
     expect(fake.labelled).toHaveLength(2);
-    expect(n.sent).toHaveLength(1);
+    // The notice and the reply card, each once: the second handling sends neither.
+    expect(n.sent).toHaveLength(2);
+    expect(n.sent[1]?.text.endsWith(MAIL_CARD_INSTRUCTION)).toBe(true);
     expect(drafter.calls).toBe(1);
     const { rows: invoices } = await getPool().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
     expect(invoices).toHaveLength(1);
@@ -427,6 +430,41 @@ describe('pollMailbox', () => {
     const [row] = await mailRows();
     expect(row?.reply_job_id).not.toBeNull();
     expect((await loadJob(row?.reply_job_id ?? '', { businessId: BUSINESS }))?.phase).toBe('await_approval');
+  });
+
+  it('a question presents its reply card on WhatsApp, against the reply job, right after the notice', async () => {
+    const { documentRoot } = await setup();
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-Q' })], nextCursor: 'C-1' }]);
+    const n = notifier();
+
+    const result = expectOk(
+      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter: stubDrafter(), documentRoot, notifyBoss: n.notify, now: NOON }),
+    );
+
+    expect(result).toMatchObject({ drafts: 1, notified: 1 });
+    const [row] = await mailRows();
+    expect(n.sent).toHaveLength(2);
+    const card = n.sent[1];
+    expect(card?.jobId).toBe(row?.reply_job_id);
+    expect(card?.text).toContain('dana@client.example');
+    expect(card?.text).toContain(DRAFT_BODY);
+    expect(card?.text.endsWith(MAIL_CARD_INSTRUCTION)).toBe(true);
+  });
+
+  it('without a WhatsApp bridge nothing is presented and the notice is counted unnotified', async () => {
+    const { documentRoot } = await setup();
+    const fake = fakeClient([{ messages: [incomingMail({ providerMessageId: 'PM-Q' })], nextCursor: 'C-1' }]);
+
+    const result = expectOk(
+      await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(QUESTION_TRIAGE), drafter: stubDrafter(), documentRoot, now: NOON }),
+    );
+
+    expect(result).toMatchObject({ drafts: 1, notified: 0, unnotified: 1 });
+    const { rows } = await getPool().query(
+      "SELECT 1 FROM whatsapp_messages WHERE business_id = $1 AND direction = 'outbound'",
+      [BUSINESS],
+    );
+    expect(rows).toHaveLength(0);
   });
 
   it('an empty sender is never notified', async () => {

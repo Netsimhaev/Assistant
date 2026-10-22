@@ -146,6 +146,7 @@ import {
 import { transcribeInbound, type TranscriptionProvider } from '../whatsapp/transcribe.js';
 import { runInstruction, type InstructionOutcome, type RunInstructionOptions } from './instruct.js';
 import { linkWhatsAppMessage } from './jobs.js';
+import { handleMailCardMessage, openMailCards } from './whatsapp-mail-card.js';
 import {
   ambiguousQuestion,
   claimAsAnswer,
@@ -187,6 +188,15 @@ export interface DoorResult {
    * an honest, complete answer to what was asked, not a denial of it.
    */
   closed: number;
+  /**
+   * The owner answered an open mailbox reply card (`whatsapp-mail-card.ts`):
+   * approved it with "שלח", or replaced its body. Counted apart from
+   * `instructed` because no instruction ran and no job was opened — a
+   * decision on an existing card is not a new request. A refusal there (a
+   * voice note, two open cards) counts under `refused`, and a closure word
+   * under `closed`, exactly as on the instruction path.
+   */
+  mailCardReplies: number;
   /**
    * Counted separately from `recordedOnly` — fix round B, finding 3. A
    * `senderNumber` that fails `authorityNumberKey` outright is a GATEWAY
@@ -393,7 +403,7 @@ interface ProcessContext {
   questionWindowMinutes?: number;
 }
 
-type ProcessOutcome = 'recordedOnly' | 'instructed' | 'refused' | 'closed' | 'skipped';
+type ProcessOutcome = 'recordedOnly' | 'instructed' | 'refused' | 'closed' | 'mailCard' | 'skipped';
 
 /**
  * Tells the owner something and closes the message out — no job involved, no
@@ -508,6 +518,33 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     established = true;
 
     const isAudio = msg.mediaKind === 'audio';
+
+    // An open mailbox reply card is read FIRST — before transcription, before
+    // the instruction cap, before `pendingQuestions` — and only inside its
+    // window (`openMailCards`). A voice note is caught here untranscribed:
+    // it can neither approve nor edit a card, so paying to transcribe it
+    // would buy nothing. An empty text message falls through to the
+    // ordinary empty-message reply below.
+    if (isAudio || (msg.body !== null && msg.body.trim() !== '')) {
+      const cards = await openMailCards({
+        businessId: ctx.businessId,
+        excludeMessageId: stored.id,
+        ...(ctx.questionWindowMinutes !== undefined
+          ? { windowMinutes: ctx.questionWindowMinutes }
+          : {}),
+      });
+      if (cards.length > 0) {
+        const handled = await handleMailCardMessage({
+          msg,
+          storedId: stored.id,
+          cards,
+          messenger: ctx.messenger,
+          businessId: ctx.businessId,
+        });
+        if (handled === 'decided' || handled === 'replaced') return 'mailCard';
+        return handled;
+      }
+    }
 
     if (isAudio) {
       if (ctx.provider === undefined) {
@@ -920,7 +957,7 @@ export async function runWhatsAppDoor(options: {
   const ordered = [...collected].sort(compareInbound);
 
   const result: DoorResult = {
-    polled, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, malformedSenderCount: 0,
+    polled, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, malformedSenderCount: 0,
   };
 
   const ctx: ProcessContext = {
@@ -957,6 +994,7 @@ export async function runWhatsAppDoor(options: {
     else if (outcome === 'instructed') result.instructed += 1;
     else if (outcome === 'refused') result.refused += 1;
     else if (outcome === 'closed') result.closed += 1;
+    else if (outcome === 'mailCard') result.mailCardReplies += 1;
     // 'skipped' — a redelivery, a race on the claim, or a failure before the
     // message was ever claimed — adds to none of the four buckets.
   }

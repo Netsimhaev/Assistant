@@ -112,6 +112,7 @@ import { createJob, loadJob, transition, type Job } from './jobs.js';
 import { raiseMailReply, reraiseAfterFailedSend } from './mail-reply.js';
 import { OAuthGrantRevokedError, OAuthRefreshRejectedError } from './oauth-token.js';
 import type { NotifyTarget } from './proposal-approval.js';
+import { presentMailCard } from './whatsapp-mail-card.js';
 import type { Runtime } from './runtime.js';
 
 export interface MailPollResult {
@@ -525,6 +526,7 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
           // stale id would re-link a failed job and reopen it for re-raise.
           replyJobId = raised.replyJobId;
           result.drafts += 1;
+          await presentCardOnWhatsApp(mail, raised.approvalId, pass);
         }
       } catch {
         await noteMailError(mail.mailId, 'reply_failed', { businessId });
@@ -829,4 +831,23 @@ async function notifyOwner(
   await recordMailProgress(mail.mailId, { notifiedAt: at }, { businessId });
   pass.result.notified += 1;
   return at;
+}
+
+/**
+ * Put a freshly raised reply card in front of the owner on WhatsApp — the
+ * recipient, the subject, the full body, and how to answer it (mailbox spec
+ * §5.2 item 7). The outbound row this writes is what opens the card's window
+ * in the door (`openMailCards`).
+ *
+ * Never load-bearing, like the notice: the card is on the dashboard either
+ * way. With no bridge (`notifyBoss` absent) nothing is sent and the
+ * dashboard stays the only channel; a failed send is noted on the mail.
+ */
+async function presentCardOnWhatsApp(mail: StoredMail, approvalId: string, pass: PassContext): Promise<void> {
+  if (pass.notifyBoss === undefined) return;
+  try {
+    await presentMailCard(approvalId, pass.notifyBoss, { businessId: pass.businessId });
+  } catch {
+    await noteMailError(mail.mailId, 'card_present_failed', { businessId: pass.businessId });
+  }
 }

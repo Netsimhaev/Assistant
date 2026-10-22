@@ -419,6 +419,35 @@ export async function cancelPendingApproval(
 }
 
 /**
+ * Put a proposed edit on a card nobody has answered yet — the owner's
+ * replacement text for a mailbox reply, sent over WhatsApp (mailbox spec §5.2
+ * item 7). The card stays `pending`; nothing is decided here.
+ *
+ * Why the edit is staged rather than made the proposal: the proposal's
+ * `input_hash` is how `unspentApprovalFor` finds this card from the job's
+ * bound plan step, and that step still carries the drafted payload. The edit
+ * becomes binding only when the owner approves it — `decide` with this same
+ * `editedInput` rebinds `input_hash_at_decision` to it and labels the row
+ * `approved_with_edit`, the honest label for text the owner rewrote.
+ *
+ * `pending` only, in the `WHERE`, so a decided card is never rewritten.
+ * Returns whether a row moved.
+ */
+export async function stagePendingEdit(
+  approvalId: string,
+  editedInput: unknown,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<boolean> {
+  const db = options.db ?? getPool();
+  const res = await db.query(
+    `UPDATE approval_requests SET edited_input = $3
+      WHERE approval_id = $1 AND business_id = $2 AND state = 'pending'`,
+    [approvalId, options.businessId ?? config.businessId, JSON.stringify(editedInput)],
+  );
+  return (res.rowCount ?? 0) === 1;
+}
+
+/**
  * Expire approvals whose fuse ran out. Called by the scheduler.
  * Returns the ones that expired so the caller can escalate where configured.
  */
