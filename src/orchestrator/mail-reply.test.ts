@@ -35,7 +35,7 @@ import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { bindPlanToJob } from './plan-store.js';
 import { raiseProposalApproval, RAMP_HONESTY } from './proposal-approval.js';
 import { proposalToPlan } from './proposal-to-plan.js';
-import { MAY_HAVE_SENT_WARNING, RETRY_PREFIX } from '../mail/reply-card.js';
+import { EXPIRED_PREFIX, MAY_HAVE_SENT_WARNING, RETRY_PREFIX } from '../mail/reply-card.js';
 import type { Drafter } from '../sdk/mail-drafter.js';
 import { loadJob, transition } from './jobs.js';
 import { loadPlanBody } from './plan-store.js';
@@ -669,6 +669,144 @@ describe('reraiseAfterFailedSend', () => {
     await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
     expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('closed');
     expect((await reraise()).reraised).toBe(0);
+  });
+
+  describe('an approved reply whose approval expired before it could be sent', () => {
+    // 19:30 UTC is 22:30 in Asia/Jerusalem — inside the fixture's quiet hours.
+    const NIGHT = new Date('2026-10-21T19:30:00.000Z');
+
+    /** Approve at night: the gate defers on quiet hours, the approval unspent. */
+    async function approvedThenDeferred() {
+      const bundle = await installMailboxCharter();
+      const mail = await storedMail();
+      const { client, sent } = fakeClient();
+      const raised = await raiseMailReply(
+        { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+        { businessId: BUSINESS },
+      );
+      if (raised === null) throw new Error('expected a card');
+      await approve(raised.approvalId);
+      await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NIGHT });
+      expect(sent).toHaveLength(0);
+      expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+      return { mail, client, sent, raised };
+    }
+
+    async function expire(approvalId: string): Promise<void> {
+      await getPool().query(
+        `UPDATE approval_requests SET expires_at = now() - interval '1 minute' WHERE approval_id = $1`,
+        [approvalId],
+      );
+    }
+
+    async function wakeAndRun(jobId: string, client: Parameters<typeof runtimeWith>[0]): Promise<void> {
+      await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test: wake', businessId: BUSINESS });
+      await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    }
+
+    it('is re-asked once, saying the approval expired, and approving the fresh card sends', async () => {
+      const { mail, client, sent, raised } = await approvedThenDeferred();
+      await expire(raised.approvalId);
+      await wakeAndRun(raised.replyJobId, client);
+      // Without the approval the woken step dies at stage 8 — the "yes" lost.
+      expect(sent).toHaveLength(0);
+      expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+
+      const first = await reraise();
+      expect(first.reraised).toBe(1);
+      const cards = await pendingCards();
+      expect(cards).toHaveLength(1);
+      const card = cards[0];
+      if (card === undefined) throw new Error('no card');
+      expect(card.detail.startsWith(EXPIRED_PREFIX)).toBe(true);
+      expect(card.detail).not.toContain(RETRY_PREFIX);
+      expect(card.detail).not.toContain(MAY_HAVE_SENT_WARNING);
+      expect((await mailRow(mail.mailId)).reply_job_id).toBe(card.job_id);
+      const fresh = await getApproval(card.approval_id, { businessId: BUSINESS });
+      const old = await getApproval(raised.approvalId, { businessId: BUSINESS });
+      expect(fresh?.proposedInput).toEqual(old?.proposedInput);
+
+      expect((await reraise()).reraised).toBe(0);
+
+      await approve(card.approval_id);
+      const second = fakeClient();
+      await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(second.client), now: NOON });
+      expect(second.sent).toHaveLength(1);
+    });
+
+    it('the re-asked card carries the edit the owner approved, not the original draft', async () => {
+      const bundle = await installMailboxCharter();
+      const mail = await storedMail();
+      const { client } = fakeClient();
+      const raised = await raiseMailReply(
+        { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+        { businessId: BUSINESS },
+      );
+      if (raised === null) throw new Error('expected a card');
+      const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+      const edited = { ...(approval?.proposedInput as Record<string, unknown>), body: 'גוף ערוך' };
+      await approve(raised.approvalId, edited);
+      await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NIGHT });
+      await expire(raised.approvalId);
+      await wakeAndRun(raised.replyJobId, client);
+
+      expect((await reraise()).reraised).toBe(1);
+      const card = (await pendingCards())[0];
+      if (card === undefined) throw new Error('no card');
+      const fresh = await getApproval(card.approval_id, { businessId: BUSINESS });
+      expect((fresh?.proposedInput as Record<string, unknown>)['body']).toBe('גוף ערוך');
+    });
+
+    it('an approval that expired only AFTER the job had already failed is not re-raised', async () => {
+      // The job failed for its own reason while the approval was still live;
+      // that "yes" was not lost to expiry, so nothing is re-asked.
+      const { client, raised } = await approvedThenDeferred();
+      await transition(raised.replyJobId, {
+        to: 'failed', actor: 'orchestrator', reason: 'test: failed for another reason', businessId: BUSINESS,
+      });
+      await getPool().query(
+        `UPDATE job_steps SET at = now() - interval '2 hours' WHERE job_id = $1 AND to_phase = 'failed'`,
+        [raised.replyJobId],
+      );
+      await expire(raised.approvalId);
+      void client;
+
+      expect((await reraise()).reraised).toBe(0);
+      expect(await pendingCards()).toHaveLength(0);
+    });
+
+    it('an owner-denied card is never re-raised, even past its expiry', async () => {
+      const bundle = await installMailboxCharter();
+      const mail = await storedMail();
+      const raised = await raiseMailReply(
+        { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+        { businessId: BUSINESS },
+      );
+      if (raised === null) throw new Error('expected a card');
+      const decided = await decide(raised.approvalId, 'denied', { by: 'p_boss', channel: 'dashboard' },
+        { businessId: BUSINESS });
+      await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
+      await expire(raised.approvalId);
+      // Even forced onto the failed path, a denial is not an approval to re-ask.
+      // Phase AND a failed step after the expiry: every other condition of
+      // the expired branch holds, so only the approval's state refuses it.
+      await getPool().query(`UPDATE jobs SET phase = 'failed' WHERE job_id = $1`, [raised.replyJobId]);
+      await getPool().query(
+        `INSERT INTO job_steps (job_id, from_phase, to_phase, actor, reason)
+         VALUES ($1, 'closed', 'failed', 'test', 'test: forced')`,
+        [raised.replyJobId],
+      );
+
+      expect((await reraise()).reraised).toBe(0);
+    });
+
+    it('a deferred reply that is then sent is never re-raised', async () => {
+      const { client, sent, raised } = await approvedThenDeferred();
+      await wakeAndRun(raised.replyJobId, client);
+      expect(sent).toHaveLength(1);
+      await expire(raised.approvalId);
+      expect((await reraise()).reraised).toBe(0);
+    });
   });
 
   it('a failure re-raising one row is recorded on its mail and the batch continues', async () => {

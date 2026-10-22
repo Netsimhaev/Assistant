@@ -149,7 +149,7 @@ interface ReplyCardInput {
   /** Bound verbatim as the plan step's input AND the card's proposed input. */
   payload: Record<string, unknown>;
   bundle: PolicyBundle;
-  retry?: { mayHaveSent: boolean };
+  retry?: { mayHaveSent: boolean; expired?: boolean };
 }
 
 /**
@@ -307,6 +307,8 @@ interface FailedReplyRow {
   edited_input: unknown;
   state: string;
   may_have_sent: boolean;
+  /** The approval was never spent: it expired before the send was attempted. */
+  expired: boolean;
 }
 
 export interface ReraiseResult {
@@ -331,8 +333,22 @@ export interface ReraiseResult {
  * there was one) and a first line saying so.
  *
  * Found by a positive marker: the mail row's `reply_job_id` names the job, the
- * job is `failed`, an approval on it was consumed, and no step result for it
- * is `completed`. Each failed job is re-raised at most once:
+ * job is `failed`, no step result for it is `completed`, and the owner's
+ * "yes" was lost in one of exactly two ways:
+ *
+ *   - **spent, then failed** — an approval on it was consumed (the case
+ *     above; `RETRY_PREFIX`);
+ *   - **expired before it could be spent** — an approval decided
+ *     `approved`/`approved_with_edit`, never consumed, whose `expires_at`
+ *     passed BEFORE the job failed. A reply approved inside quiet hours is
+ *     deferred (stage 7) with the approval unspent; if the fuse burns before
+ *     the window ends, the woken step meets stage 8 without it and fails.
+ *     The card says so (`EXPIRED_PREFIX`). Required to have expired before
+ *     the failure, so a job that failed for its own reason while the approval
+ *     was still live is not re-asked merely because the card aged out later.
+ *
+ * An owner's denial is neither (its state is `denied`), so it is never
+ * re-raised. Each failed job is re-raised at most once:
  * `claimFailedReply` takes it off the mail in one conditional UPDATE before
  * anything else happens, and the mail is then linked to the new job.
  *
@@ -347,7 +363,7 @@ export async function reraiseAfterFailedSend(
   const businessId = options.businessId ?? config.businessId;
   const { rows } = await getPool().query<FailedReplyRow>(
     `SELECT m.mail_id, j.job_id, m.subject AS original_subject, m.from_name, m.reply_to,
-            a.proposed_input, a.edited_input, a.state,
+            a.proposed_input, a.edited_input, a.state, a.expired,
             (EXISTS (
                SELECT 1 FROM job_steps s
                 WHERE s.job_id = j.job_id
@@ -359,12 +375,26 @@ export async function reraiseAfterFailedSend(
        FROM mail_messages m
        JOIN jobs j ON j.business_id = m.business_id AND j.job_id = m.reply_job_id
        JOIN LATERAL (
-         SELECT ar.proposed_input, ar.edited_input, ar.state
+         SELECT ar.proposed_input, ar.edited_input, ar.state,
+                (ar.consumed_at IS NULL) AS expired
            FROM approval_requests ar
           WHERE ar.business_id = m.business_id
             AND ar.job_id = j.job_id
-            AND ar.consumed_at IS NOT NULL
-          ORDER BY ar.consumed_at DESC
+            AND (
+              ar.consumed_at IS NOT NULL
+              OR (
+                ar.consumed_at IS NULL
+                AND ar.state IN ('approved', 'approved_with_edit')
+                AND ar.expires_at <= now()
+                AND EXISTS (
+                  SELECT 1 FROM job_steps f
+                   WHERE f.job_id = j.job_id
+                     AND f.to_phase = 'failed'
+                     AND f.at >= ar.expires_at
+                )
+              )
+            )
+          ORDER BY COALESCE(ar.consumed_at, ar.expires_at) DESC
           LIMIT 1
        ) a ON true
       WHERE m.business_id = $1
@@ -399,7 +429,7 @@ export async function reraiseAfterFailedSend(
           replyTo: row.reply_to,
           payload: approved as Record<string, unknown>,
           bundle: input.bundle,
-          retry: { mayHaveSent: row.may_have_sent },
+          retry: { mayHaveSent: row.may_have_sent, expired: row.expired },
         },
         { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
       );

@@ -38,6 +38,8 @@ export function replySubject(subject: string): string {
 
 export const REPLY_TO_WARNING_PREFIX = 'שים לב: המייל ביקש שהתשובה תישלח ל-';
 export const RETRY_PREFIX = 'השליחה הקודמת לא הושלמה — לאשר שוב?';
+/** The owner said yes, but the approval expired before the reply could go out (quiet hours, a long deferral). */
+export const EXPIRED_PREFIX = 'האישור פג לפני שהמייל נשלח — לאשר שוב?';
 export const MAY_HAVE_SENT_WARNING = 'ייתכן שהמייל כבר יצא — בדקו בתיבת הדואר שנשלח לפני שמאשרים.';
 export const RECIPIENT_LABEL = 'התשובה תישלח ל-';
 export const SUBJECT_LABEL = 'נושא: ';
@@ -45,6 +47,7 @@ export const SUBJECT_LABEL = 'נושא: ';
 /** Header lines the card renders as warnings. Matched only in the header block. */
 export const WARNING_PREFIXES: readonly string[] = [
   RETRY_PREFIX,
+  EXPIRED_PREFIX,
   MAY_HAVE_SENT_WARNING,
   REPLY_TO_WARNING_PREFIX,
 ];
@@ -67,14 +70,18 @@ export interface ReplyDetailInput {
   /** The reply's own subject (already `Re:`-prefixed). */
   subject: string;
   body: string;
-  /** Set when this card re-asks after an approved send did not complete. */
-  retry?: { mayHaveSent: boolean };
+  /**
+   * Set when this card re-asks after an approved send did not complete.
+   * `expired`: the approval ran out before the send was attempted, rather
+   * than a send that was attempted and failed.
+   */
+  retry?: { mayHaveSent: boolean; expired?: boolean };
 }
 
 export function composeReplyDetail(input: ReplyDetailInput): string {
   const header: string[] = [];
   if (input.retry !== undefined) {
-    header.push(RETRY_PREFIX);
+    header.push(input.retry.expired === true ? EXPIRED_PREFIX : RETRY_PREFIX);
     if (input.retry.mayHaveSent) header.push(MAY_HAVE_SENT_WARNING);
   }
   if (replyToDiffers(input.replyTo, input.fromAddress)) {
