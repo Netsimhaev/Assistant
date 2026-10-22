@@ -23,10 +23,12 @@ import { canonicalJson } from '../util/canonical.js';
  *
  * Control characters (C0, DEL, C1 — CR and LF among them) are folded to one
  * space first. A subject header can be RFC 2047-encoded so that it DECODES to
- * a line break, and that string is what lands here; proposed as is, it is a
- * subject the Gmail client refuses ("header value contains a line break") on
- * every send and on every re-raise, so the reply could never go out. Folding
- * here keeps the proposal — what the owner reads and approves — clean.
+ * a line break, and that string is what lands here. The send path does not
+ * depend on this — the Gmail client re-encodes any non-printable subject as
+ * one encoded word, and Graph's `/reply` takes no subject — but a proposal
+ * carrying a raw line break is a subject the owner reads as two lines and a
+ * header value every downstream guard has to get right. Folding here keeps
+ * the proposal — what the owner reads and approves — one clean line.
  */
 export function replySubject(subject: string): string {
   // eslint-disable-next-line no-control-regex
