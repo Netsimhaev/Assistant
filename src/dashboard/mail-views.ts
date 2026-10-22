@@ -173,10 +173,11 @@ export function renderMailList(options: {
           : filters.q !== '' && (m.summary ?? '').toLowerCase().includes(filters.q.toLowerCase())
             ? (m.summary as string)
             : (m.summary ?? m.subject);
+      const links = attachmentLinks(m, downloadable);
       return `<tr>
   <td>${esc(formatWhen(m.receivedAt, timeZone))}</td>
   <td>${senderCell(m)}</td>
-  <td><a href="/mail/${esc(encodeURIComponent(m.mailId))}"><b>${escLabel(m.subject)}</b></a><br>${highlightSnippet(source, filters.q)}${attachmentLinks(m, downloadable) === '' ? '' : `<br>${attachmentLinks(m, downloadable)}`}</td>
+  <td><a href="/mail/${esc(encodeURIComponent(m.mailId))}"><b>${escLabel(m.subject)}</b></a><br>${highlightSnippet(source, filters.q)}${links === '' ? '' : `<br>${links}`}</td>
   <td>${categoriesCell(m)}</td>
   <td>${didCell(m)}</td>
 </tr>`;

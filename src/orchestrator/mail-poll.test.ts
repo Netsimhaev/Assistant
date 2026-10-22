@@ -316,6 +316,44 @@ describe('pollMailbox', () => {
     expect(invoices).toEqual([{ document_id: docs[0]?.document_id, file_name: 'invoice-17.pdf' }]);
   });
 
+  it('links every ingested attachment of a document-category mail on the mail row', async () => {
+    const { documentRoot } = await setup();
+    const pdf = (id: string, name: string): MailAttachment => ({ attachmentId: id, filename: name, mediaType: 'application/pdf', size: PDF_BYTES.length + 1 });
+    const mail = incomingMail({ providerMessageId: 'PM-DOCS', attachments: [pdf('A-1', 'offer.pdf'), pdf('A-2', 'terms.pdf')] });
+    // Different bytes per attachment, or the two would dedupe into one document.
+    const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], {
+      fetch: (id) => Buffer.concat([PDF_BYTES, Buffer.from(id.slice(-1))]),
+    });
+    const documentTriage: MailTriage = { categories: ['document'], summary: 'הצעה ותנאים', isPerson: false, invoice: null, replyGist: null };
+
+    expectOk(
+      await pollMailbox({ curator: stubCurator,
+        businessId: BUSINESS,
+        runtime: mailboxRuntime(fake.client),
+        client: fake.client,
+        triage: stubTriage(documentTriage),
+        drafter: stubDrafter(),
+        documentRoot,
+      }),
+    );
+
+    const { rows } = await getPool().query<{ attachments: MailAttachment[] }>(
+      'SELECT attachments FROM mail_messages WHERE business_id = $1 AND provider_message_id = $2',
+      [BUSINESS, 'PM-DOCS'],
+    );
+    const linked = rows[0]?.attachments ?? [];
+    expect(linked.map((a) => a.attachmentId)).toEqual(['A-1', 'A-2']);
+    const ids = linked.map((a) => a.documentId);
+    expect(ids.every((i) => typeof i === 'string')).toBe(true);
+    expect(new Set(ids).size).toBe(2);
+    const { rows: docs } = await getPool().query<{ document_id: string; status: string }>(
+      'SELECT document_id, status FROM documents WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(docs.map((d) => d.status)).toEqual(['stored', 'stored']);
+    expect(docs.map((d) => d.document_id).sort()).toEqual([...(ids as string[])].sort());
+  });
+
   it('over cap: 3 mails, cap 2 → 2 triaged, 1 over_cap, triage stub called exactly twice', async () => {
     const { documentRoot } = await setup();
     const mails = [1, 2, 3].map((i) =>
