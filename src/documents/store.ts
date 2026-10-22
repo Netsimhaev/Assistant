@@ -327,6 +327,14 @@ export const MAX_READ_ATTEMPTS = 3;
  * through the pipeline; asking again under a second provenance is a
  * different question than this loop asks, and would spend money on a
  * document the owner has already been told about.
+ *
+ * **Mail attachments are skipped (`source <> 'mail'`).** `intake.triage`
+ * already read the mail the attachment came with, and the mail poll raised
+ * whatever card that mail warranted (spec §5.5). Reading the attachment here
+ * a second time would be a second model call and a second card about the
+ * same mail. The only caller of this function is the conductor, so the
+ * filter changes nothing else; the document is still stored, downloadable
+ * and linked from its invoice row.
  */
 export async function documentsAwaitingRead(
   limit: number,
@@ -340,6 +348,7 @@ export async function documentsAwaitingRead(
       WHERE d.business_id = $1
         AND d.status = 'extracted'
         AND d.read_attempts < $2
+        AND d.source <> 'mail'
         AND NOT EXISTS (
               SELECT 1 FROM document_readings r
                 JOIN proposals p

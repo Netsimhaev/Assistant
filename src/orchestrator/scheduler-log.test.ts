@@ -21,6 +21,8 @@ function cleanResult(): SchedulerPassResult {
     conduct: null,
     delegated: { resumed: [], timedOut: [], errored: [] },
     whatsappDoor: null,
+    mail: null,
+    mailError: null,
     due: { ran: [], lockedOut: [], unbound: [], phaseMoved: [], errored: [] },
     verified: {
       closed: [],

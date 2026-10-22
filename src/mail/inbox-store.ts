@@ -314,6 +314,43 @@ export async function claimFailedReply(
   return (res.rowCount ?? 0) === 1;
 }
 
+/**
+ * Record a side effect the poller just performed — a label added in the
+ * mailbox, a WhatsApp notice sent — the moment it happens, without touching
+ * `state`.
+ *
+ * Settling writes the same columns, but only at the end of a mail's handling.
+ * A crash between the label (or the notice) and the settle would otherwise
+ * leave the row `claimed` with nothing saying the effect already happened,
+ * and the next handling would label or notify a second time (spec §5.4: "a
+ * re-poll after a crash does not read, label or notify twice").
+ */
+export async function recordMailProgress(
+  mailId: string,
+  progress: { labelsApplied?: string[]; notifiedAt?: string },
+  options: Options = {},
+): Promise<void> {
+  const { businessId, db } = ctx(options);
+  const res = await db.query(
+    `UPDATE mail_messages SET
+        labels_applied = COALESCE($3::text[], labels_applied),
+        notified_at = COALESCE($4::timestamptz, notified_at)
+      WHERE business_id = $1 AND mail_id = $2`,
+    [businessId, mailId, progress.labelsApplied ?? null, progress.notifiedAt ?? null],
+  );
+  if ((res.rowCount ?? 0) !== 1) throw new Error(`recordMailProgress: no mail row for ${mailId}`);
+}
+
+/** Whether an invoice row already exists for this mail — a re-handled mail must not add a second. */
+export async function hasInvoiceForMail(mailId: string, options: Options = {}): Promise<boolean> {
+  const { businessId, db } = ctx(options);
+  const { rows } = await db.query(
+    'SELECT 1 FROM mail_invoices WHERE business_id = $1 AND mail_id = $2 LIMIT 1',
+    [businessId, mailId],
+  );
+  return rows.length > 0;
+}
+
 export async function markOverCap(mailId: string, options: Options = {}): Promise<void> {
   const { businessId, db } = ctx(options);
   await db.query(

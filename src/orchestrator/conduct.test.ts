@@ -744,3 +744,36 @@ describe('conductPendingDocuments', () => {
     }
   });
 });
+
+describe('conductPendingDocuments and mail-sourced documents', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    await installCharter(buildCharter(), { businessId: BUSINESS });
+  });
+
+  // `intake.triage` already read the mail an attachment came with (spec
+  // §5.5). Reading it a second time here would spend a second model call and
+  // raise a second card about the same mail.
+  it('conductPendingDocuments skips a mail-sourced document', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cd-mail-'));
+    const path = join(dir, 'from-mail.txt');
+    await writeFile(path, 'מסמך שהגיע במייל', 'utf8');
+    const doc = await ingestDocument(
+      { path, source: 'mail' },
+      { businessId: BUSINESS, documentRoot: dir },
+    );
+    expect(doc.status).toBe('extracted');
+    const d = deps();
+
+    const result = await conductPendingDocuments({ businessId: BUSINESS, reader: d.reader, proposer: d.proposer });
+
+    expect(result.considered).toBe(0);
+    expect(d.calls.reads).toBe(0);
+
+    // The control: the same bytes under `manual` ARE considered, so the zero
+    // above is the source filter and not an empty or broken pass.
+    await getPool().query("UPDATE documents SET source = 'manual' WHERE document_id = $1", [doc.documentId]);
+    const again = await conductPendingDocuments({ businessId: BUSINESS, reader: d.reader, proposer: d.proposer });
+    expect(again.considered).toBe(1);
+  });
+});

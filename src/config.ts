@@ -82,6 +82,10 @@ export const config = {
   documentRoot: resolve(required('DOCUMENT_ROOT')),
   documentInbox: optional('DOCUMENT_INBOX'),
   documentReadsPerDay: positiveInt('DOCUMENT_READS_PER_DAY', 20),
+  // Model reads (triage calls) of incoming mail per day. A mail pulled after
+  // the ceiling is recorded and shown as "not read — daily ceiling reached",
+  // and is read on a later pass once the count resets (spec §5.4).
+  mailReadsPerDay: positiveInt('MAIL_READS_PER_DAY', 200),
   // A billed model call per finished job. A feature that spends money with no
   // switch starts charging an existing installation on the day it upgrades —
   // which is exactly what `DOCUMENT_INBOX` did before it became a switch.

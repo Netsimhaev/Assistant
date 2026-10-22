@@ -40,6 +40,14 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.scanError !== null) {
     console.error(`document inbox scan failed: ${result.scanError}`);
   }
+  // The mailbox poll: a thrown pass, or a provider failure the poll itself
+  // reported. `mail === null` is "no mailbox connected", not a failure.
+  if (result.mailError !== null) {
+    console.error(`mailbox poll failed: ${result.mailError}`);
+  }
+  if (result.mail !== null && result.mail.status !== 'ok') {
+    console.error(`mailbox poll: ${result.mail.status}${result.mail.error !== undefined ? ` (${result.mail.error})` : ''}`);
+  }
   // `ConductResult.verificationFailed` (fix round 1's Important 3) is exactly
   // this file's own rule applied to a bucket that, until now, had no printer
   // at all: "visible, unlike a bare swallow" was true only to a test.
