@@ -246,6 +246,59 @@ export async function settleMail(mailId: string, patch: SettlePatch, options: Op
   if ((res.rowCount ?? 0) !== 1) throw new Error(`settleMail: no mail row for ${mailId}`);
 }
 
+/**
+ * Record why a mail got no reply card, without touching `state`.
+ *
+ * Separate from `settleMail` on purpose: the reply path (`mail-reply.ts`)
+ * runs inside the poller's handling of one mail, before the poller settles
+ * it, and must not decide that mail's state. `settleMail` COALESCEs `error`,
+ * so a later settle without an error keeps this one.
+ */
+export async function noteMailError(mailId: string, error: string, options: Options = {}): Promise<void> {
+  const { businessId, db } = ctx(options);
+  const res = await db.query(
+    'UPDATE mail_messages SET error = $3 WHERE business_id = $1 AND mail_id = $2',
+    [businessId, mailId, error],
+  );
+  if ((res.rowCount ?? 0) !== 1) throw new Error(`noteMailError: no mail row for ${mailId}`);
+}
+
+/**
+ * Point a mail at its reply job — the positive marker `reraiseAfterFailedSend`
+ * finds reply jobs by. Written by the reply path itself, so the marker does not
+ * depend on the poller settling the row.
+ */
+export async function linkReplyJob(mailId: string, replyJobId: string, options: Options = {}): Promise<void> {
+  const { businessId, db } = ctx(options);
+  const res = await db.query(
+    'UPDATE mail_messages SET reply_job_id = $3 WHERE business_id = $1 AND mail_id = $2',
+    [businessId, mailId, replyJobId],
+  );
+  if ((res.rowCount ?? 0) !== 1) throw new Error(`linkReplyJob: no mail row for ${mailId}`);
+}
+
+/**
+ * Take a failed reply job off its mail, so it is re-raised at most once.
+ *
+ * A single conditional UPDATE: the row count says whether this caller won.
+ * Two concurrent re-raisers cannot both proceed, and a crash after the claim
+ * leaves the mail unlinked — the failed job is never offered again, which is
+ * the safe direction (no second card, so no second send), never a duplicate.
+ */
+export async function claimFailedReply(
+  mailId: string,
+  failedJobId: string,
+  options: Options = {},
+): Promise<boolean> {
+  const { businessId, db } = ctx(options);
+  const res = await db.query(
+    `UPDATE mail_messages SET reply_job_id = NULL
+      WHERE business_id = $1 AND mail_id = $2 AND reply_job_id = $3`,
+    [businessId, mailId, failedJobId],
+  );
+  return (res.rowCount ?? 0) === 1;
+}
+
 export async function markOverCap(mailId: string, options: Options = {}): Promise<void> {
   const { businessId, db } = ctx(options);
   await db.query(

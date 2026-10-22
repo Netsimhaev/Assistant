@@ -29,6 +29,7 @@ import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
+import { WARNING_PREFIXES, mailboxReplyRecipient, splitReplyDetail } from '../mail/reply-card.js';
 import { formatMinor } from '../util/money.js';
 
 /** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
@@ -1017,6 +1018,31 @@ function stillRunningNote(options: {
   return '<p class="muted">בבדיקה — פסיקת האימות תופיע כאן כשתהיה מוכנה.</p>';
 }
 
+/**
+ * The detail of a mailbox-reply card (`orchestrator/mail-reply.ts`).
+ *
+ * The header block is code-written (`composeReplyDetail`), so a header line
+ * that starts with one of `WARNING_PREFIXES` is a warning this code issued —
+ * a differing Reply-To, or a re-asked send that may already have gone out —
+ * and is rendered as one. The body after the blank line is the drafted reply,
+ * model text derived from a stranger's mail: it is never scanned for those
+ * prefixes, and is shown with its line breaks rather than run together, since
+ * it is exactly what will be sent. Every part goes through `escLabel`: the
+ * subject and Reply-To are sender-written.
+ */
+function mailReplyDetail(detail: string): string {
+  const { header, body } = splitReplyDetail(detail);
+  const lines = header
+    .map((line) =>
+      WARNING_PREFIXES.some((prefix) => line.startsWith(prefix))
+        ? `<p class="error">${escLabel(line)}</p>`
+        : `<p>${escLabel(line)}</p>`,
+    )
+    .join('\n  ');
+  return `${lines}
+  <div class="card" style="white-space: pre-wrap">${escLabel(body)}</div>`;
+}
+
 export function renderApprovalCard(options: {
   approval: ApprovalRequest;
   csrf: string;
@@ -1074,6 +1100,16 @@ export function renderApprovalCard(options: {
   const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
   const signErrorBlock = options.signError ? `<p class="error">${esc(options.signError)}</p>` : '';
   const risk = approval.risk;
+  // Positive shape test on the payload as proposed; anything else renders
+  // exactly as before.
+  const replyRecipient = mailboxReplyRecipient(approval.proposedInput);
+  const detailBlock =
+    replyRecipient === null ? `<p>${esc(approval.detail)}</p>` : mailReplyDetail(approval.detail);
+  const recipientRow =
+    replyRecipient === null
+      ? ''
+      : `
+    <tr><td class="muted">נמען התשובה</td><td>${escLabel(replyRecipient)}</td></tr>`;
 
   return page(
     approval.summary,
@@ -1084,8 +1120,8 @@ export function renderApprovalCard(options: {
 <p><a href="/">&rarr; חזרה לרשימה</a></p>
 <div class="card">
   <h2>${esc(approval.summary)}</h2>
-  <p>${esc(approval.detail)}</p>
-  <table>
+  ${detailBlock}
+  <table>${recipientRow}
     <tr><td class="muted">כלי</td><td>${esc(approval.proposedTool)}</td></tr>
     <tr><td class="muted">סוג פעולה</td><td>${esc(approval.actionClass)}</td></tr>
     <tr><td class="muted">סיכון</td><td class="band-${esc(risk.band)}">${esc(bandLabel(risk.band))} (${esc(risk.total)}) — ${esc(risk.explanation)}</td></tr>
