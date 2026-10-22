@@ -13,6 +13,10 @@ import { googleTokenHttp } from './adapters/google-token-http.js';
 import { microsoftTokenHttp } from './adapters/microsoft-token-http.js';
 import { providerTokenHttp } from './adapters/provider-token-http.js';
 import { createMailAdapter } from './adapters/mail.js';
+import { createMailboxSendAdapter } from './adapters/mailbox-send.js';
+import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
+import type { MailProvider } from '../mail/mailbox.js';
+import type { MailboxClient } from '../mail/providers/types.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { loadBindings } from './bindings.js';
 import { CREDENTIAL_REF_PATTERN } from './credentials.js';
@@ -242,6 +246,8 @@ export async function buildRuntime(
     createTransport?: SmtpConfig['createTransport'];
     tokenHttp?: TokenHttp;
     calendarHttp?: CalendarHttp;
+    /** Test seam: the mailbox client a send adapter uses, per provider. */
+    mailboxClient?: (provider: MailProvider) => MailboxClient;
     /** Test seam only — see this function's docblock. No default exists yet. */
     whatsappGateway?: (creds: { instance: CredentialHandle; token: CredentialHandle }) => WhatsAppGateway;
   } = {},
@@ -595,6 +601,30 @@ export async function buildRuntime(
       createGoogleCalendarAdapter({
         system: binding.system,
         ...(overrides.calendarHttp !== undefined ? { http: overrides.calendarHttp } : {}),
+      }),
+    );
+  }
+
+  // The mailbox (Gmail / Microsoft 365) reply adapter. Same discipline as the
+  // calendar loop: the binding names the vendor, the charter's connection
+  // decides the tool (`mail.send` over `api`). The OAuth credential is
+  // resolved per call by `oauthCredentials`, so no grant is needed here.
+  for (const binding of bindings) {
+    if (binding.system !== MAILBOX_SYSTEM) continue;
+    if (binding.provider !== 'google' && binding.provider !== 'microsoft') continue;
+    const connection = connectionBySystem.get(binding.system);
+    if (connection === undefined || connection.channel !== 'api') continue;
+    if (!connection.serves.includes('mail.send')) continue;
+    if (systemAdapters.some((a) => a.system === binding.system)) {
+      warnings.push(`no mailbox adapter for "${binding.system}": an adapter is already registered under this system name`);
+      continue;
+    }
+    const provider: MailProvider = binding.provider;
+    systemAdapters.push(
+      createMailboxSendAdapter({
+        system: binding.system,
+        provider,
+        ...(overrides.mailboxClient !== undefined ? { client: overrides.mailboxClient(provider) } : {}),
       }),
     );
   }
