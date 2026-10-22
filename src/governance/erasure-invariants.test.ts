@@ -84,10 +84,14 @@ describe('what an erasure leaves behind', () => {
    * along on the job's seeding the way every job-scoped store above does) —
    * see `erasure-plan.ts`'s header for why it is discovered by content alone.
    *
-   * **This "twelve, then thirteen, then fourteen" count is spec §5.1's own
+   * **A fifteenth and sixteenth, also outside spec §5.1: `mail_messages` and
+   * `mail_invoices` (migrations 042/044)** — seeded in their own block, not
+   * tied to the job, because a mail is discovered by its own columns.
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (17; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (19; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
@@ -342,6 +346,58 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, job.jobId, JSON.stringify({ mismatch: `שני מספרים בטיוטה אינם במסמך אצל ${PROBE}` })],
     );
 
+    // --- Migrations 042/044: the mailbox. ---------------------------------
+    //
+    // `mail_messages` and `mail_invoices` are content stores with no job of
+    // their own to ride in on — a mail is discovered by its own columns
+    // (`MAIL_MESSAGES_ERASED_PREDICATE`'s docblock). The mail here is NOT
+    // tied to `job`, deliberately: the probe sits in the mail's own body and
+    // sender, and its invoice's `supplier_address`, and only the mail
+    // discovery reaches them. Its attachment links a document whose name
+    // carries the probe and which nothing else in this sweep references — so
+    // the document surviving would mean the mail→document closure is missing.
+    const mailDocumentId = `DOC-mail-probe-${Date.now()}`;
+    await db.query(
+      `INSERT INTO documents
+         (document_id, business_id, source, original_name, media_type, sha256,
+          byte_size, stored_path, status)
+       VALUES ($1, $2, 'manual', $3, 'application/pdf', repeat('e', 64), 12, $4, 'stored')`,
+      [mailDocumentId, BUSINESS, `חשבונית של ${PROBE}.pdf`, `${BUSINESS}/${mailDocumentId}/original.pdf`],
+    );
+    await db.query(
+      `INSERT INTO mail_messages
+         (mail_id, business_id, provider_message_id, thread_id, from_address, from_name,
+          reply_to, to_addresses, subject, received_at, body_text, summary, attachments, state)
+       VALUES ('M-probe', $1, 'pm-probe', 'th-probe', $2, 'Probe Sender', $2, ARRAY[$2], $3, now(),
+               $4, $5, $6::jsonb, 'triaged')`,
+      [
+        BUSINESS,
+        PROBE,
+        `חשבונית מ-${PROBE}`,
+        `שלום, כאן ${PROBE}, מצורפת חשבונית`,
+        `${PROBE} שלח חשבונית`,
+        JSON.stringify([
+          { attachmentId: 'att-1', filename: `${PROBE}.pdf`, mediaType: 'application/pdf', size: 12, documentId: mailDocumentId },
+        ]),
+      ],
+    );
+    await db.query(
+      `INSERT INTO mail_invoices
+         (invoice_id, business_id, mail_id, supplier_address, supplier_name, document_id, file_name, received_at)
+       VALUES ('INV-probe', $1, 'M-probe', $2, $3, $4, $5, now())`,
+      [BUSINESS, PROBE, `ספק ${PROBE}`, mailDocumentId, `${PROBE}.pdf`],
+    );
+    // An unrelated mail, the narrowness control — the role `WA-unrelated-orphan`
+    // and `DG-unrelated` play for their own tables.
+    await db.query(
+      `INSERT INTO mail_messages
+         (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
+          received_at, body_text, state)
+       VALUES ('M-unrelated', $1, 'pm-unrelated', 'th-unrelated', 'barber@shop.example',
+               'תור לספר', now(), 'מתי אפשר לקבוע תור?', 'triaged')`,
+      [BUSINESS],
+    );
+
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
     await executeErasure(plan, { businessId: BUSINESS });
 
@@ -387,6 +443,14 @@ describe('what an erasure leaves behind', () => {
     }
 
     expect(found).toEqual([]);
+
+    // The mailbox's narrowness control, and the mail→document closure: the
+    // attachment's document carried the probe only in its own name, which the
+    // sweep above covers — asserted directly as well so a failure names it.
+    const unrelatedMail = await db.query('SELECT 1 FROM mail_messages WHERE mail_id = $1', ['M-unrelated']);
+    expect(unrelatedMail.rows).toHaveLength(1);
+    const mailDocument = await db.query('SELECT 1 FROM documents WHERE document_id = $1', [mailDocumentId]);
+    expect(mailDocument.rows).toHaveLength(0);
   });
 
   /**
@@ -761,6 +825,190 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS],
     );
     expect(remaining.rows.map((r) => r.id)).toEqual(['WA-outside-window']);
+  });
+
+  /**
+   * A mail closes over to every job it produced, and the anchor here is
+   * deliberately a NAME that appears only in the mail's own body — not the
+   * sender's address, which every reply job's plan also carries. So nothing
+   * below can be reached by its own content: the triage job (`job_id`), the
+   * live reply job (`reply_job_id`), the failed predecessor a re-raise
+   * unlinked from the mail (found only by its plan naming the mail's
+   * `providerMessageId`), their cards, the WhatsApp copy of the reply card,
+   * the curated memory and the attachment's document all go because the
+   * mail went.
+   */
+  it('contact erasure deletes the mail and its reply job', async () => {
+    const bundle = await installCharter(buildCharter({ version: 'mail' }), { businessId: BUSINESS });
+    const db = getPool();
+    const NAME = 'רונית_כהן';
+    const SENDER = 'ronit@client.example';
+    const mk = async (title: string): Promise<string> =>
+      (
+        await createJob({
+          charterVersion: bundle.charterVersion,
+          provenance: 'unknown_external',
+          businessId: BUSINESS,
+          title,
+        })
+      ).jobId;
+
+    const triageJob = await mk('מייל: שאלה על המחיר');
+    const replyJob = await mk('תשובה: שאלה על המחיר');
+    const failedReplyJob = await mk('תשובה: שאלה על המחיר');
+
+    const documentId = `DOC-mail-${Date.now()}`;
+    await db.query(
+      `INSERT INTO documents
+         (document_id, business_id, source, original_name, media_type, sha256,
+          byte_size, stored_path, status)
+       VALUES ($1, $2, 'manual', 'quote.pdf', 'application/pdf', repeat('f', 64), 12, $3, 'stored')`,
+      [documentId, BUSINESS, `${BUSINESS}/${documentId}/original.pdf`],
+    );
+    await db.query(
+      `INSERT INTO mail_messages
+         (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
+          received_at, body_text, attachments, state, job_id, reply_job_id)
+       VALUES ('M-ronit', $1, 'pm-ronit', 'th-ronit', $2, 'שאלה על המחיר', now(), $3, $4::jsonb,
+               'triaged', $5, $6)`,
+      [
+        BUSINESS,
+        SENDER,
+        `שלום, כאן ${NAME}. כמה עולה?`,
+        JSON.stringify([{ attachmentId: 'a1', filename: 'quote.pdf', mediaType: 'application/pdf', size: 12, documentId }]),
+        triageJob,
+        replyJob,
+      ],
+    );
+    await db.query(
+      `INSERT INTO mail_invoices (invoice_id, business_id, mail_id, supplier_address, received_at)
+       VALUES ('INV-ronit', $1, 'M-ronit', $2, now())`,
+      [BUSINESS, SENDER],
+    );
+
+    const replyPlan = (body: string) =>
+      JSON.stringify({
+        goal: 'תשובה לשולח: שאלה על המחיר',
+        steps: [
+          {
+            id: 'reply',
+            agent: 'comms.email',
+            intent: 'reply_to_sender',
+            toolName: 'mail.send',
+            input: { to: [SENDER], subject: 'Re: שאלה על המחיר', body, inReplyTo: '<m@x>', references: null, threadId: 'th-ronit', providerMessageId: 'pm-ronit' },
+            expectedActionClass: 'email.reply',
+          },
+        ],
+      });
+    for (const [jobId, hash] of [[replyJob, 'hp-r'], [failedReplyJob, 'hp-f']] as const) {
+      await db.query(
+        `INSERT INTO job_plans (business_id, job_id, plan_hash, plan) VALUES ($1, $2, $3, $4::jsonb)`,
+        [BUSINESS, jobId, hash, replyPlan('המחיר הוא 500 ש"ח')],
+      );
+      await db.query(
+        `INSERT INTO approval_requests
+           (approval_id, business_id, job_id, action_class, summary, detail, risk,
+            proposed_tool, proposed_input, input_hash, expires_at)
+         VALUES ($1, $2, $3, 'email.reply', 'תשובה', 'המחיר הוא 500', '{}'::jsonb, 'mail.send',
+                 $4::jsonb, $5, now() + interval '1 hour')`,
+        [`AP-${jobId}`, BUSINESS, jobId, JSON.stringify({ to: [SENDER] }), `h-${jobId}`],
+      );
+    }
+    await db.query(
+      `INSERT INTO whatsapp_messages (id, business_id, direction, body, provider_timestamp, state, job_id)
+       VALUES ('WA-mail-card', $1, 'outbound', 'תשובה מוצעת: המחיר הוא 500', now(), 'handled', $2)`,
+      [BUSINESS, replyJob],
+    );
+    await writeMemory(
+      { jobId: triageJob, kind: 'chunk', subjectKey: SENDER, body: { claim: 'שאלה על מחיר' } },
+      { businessId: BUSINESS },
+    );
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: NAME }, { businessId: BUSINESS });
+    expect([...plan.jobIds].sort()).toEqual([triageJob, replyJob, failedReplyJob].sort());
+    expect(plan.documentIds).toEqual([documentId]);
+    expect(plan.mailIds).toEqual(['M-ronit']);
+
+    await executeErasure(plan, { businessId: BUSINESS });
+
+    const count = async (sql: string, params: unknown[]): Promise<number> =>
+      (await db.query(sql, params)).rows.length;
+    expect(await count('SELECT 1 FROM mail_messages WHERE mail_id = $1', ['M-ronit'])).toBe(0);
+    expect(await count('SELECT 1 FROM mail_invoices WHERE invoice_id = $1', ['INV-ronit'])).toBe(0);
+    expect(await count('SELECT 1 FROM job_plans WHERE job_id = ANY ($1)', [[replyJob, failedReplyJob]])).toBe(0);
+    expect(await count('SELECT 1 FROM approval_requests WHERE job_id = ANY ($1)', [[replyJob, failedReplyJob]])).toBe(0);
+    expect(await count('SELECT 1 FROM whatsapp_messages WHERE id = $1', ['WA-mail-card'])).toBe(0);
+    expect(await count('SELECT 1 FROM memories WHERE business_id = $1', [BUSINESS])).toBe(0);
+    expect(await count('SELECT 1 FROM documents WHERE document_id = $1', [documentId])).toBe(0);
+    expect(await count('SELECT 1 FROM jobs WHERE job_id = ANY ($1) AND title IS NOT NULL', [[triageJob, replyJob, failedReplyJob]])).toBe(0);
+  });
+
+  /** The window arm: `received_at`, inside the window gone, outside kept. */
+  it('reaches mail by received_at on a window anchor', async () => {
+    await installCharter(buildCharter({ version: 'mail-window' }), { businessId: BUSINESS });
+    for (const [mailId, at] of [
+      ['M-in', '2026-01-01T12:00:00.000Z'],
+      ['M-out', '2026-03-01T12:00:00.000Z'],
+    ] as const) {
+      await getPool().query(
+        `INSERT INTO mail_messages
+           (mail_id, business_id, provider_message_id, thread_id, from_address, subject, received_at, body_text)
+         VALUES ($1, $2, $3, 't', 'a@b.example', 's', $4, 'גוף')`,
+        [mailId, BUSINESS, `pm-${mailId}`, at],
+      );
+      await getPool().query(
+        `INSERT INTO mail_invoices (invoice_id, business_id, mail_id, supplier_address, received_at)
+         VALUES ($1, $2, $3, 'a@b.example', $4)`,
+        [`INV-${mailId}`, BUSINESS, mailId, at],
+      );
+    }
+    const plan = await buildErasurePlan(
+      { kind: 'window', fromIso: '2026-01-01T00:00:00.000Z', toIso: '2026-01-02T00:00:00.000Z' },
+      { businessId: BUSINESS },
+    );
+    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+    // The explicit invoice delete is credited, not pre-empted by the cascade.
+    expect(outcome.deleted.find((i) => i.table === 'mail_invoices')?.count).toBe(1);
+    expect(outcome.deleted.find((i) => i.table === 'mail_messages')?.count).toBe(1);
+
+    const mails = await getPool().query<{ mail_id: string }>('SELECT mail_id FROM mail_messages');
+    expect(mails.rows.map((r) => r.mail_id)).toEqual(['M-out']);
+    const invoices = await getPool().query<{ invoice_id: string }>('SELECT invoice_id FROM mail_invoices');
+    expect(invoices.rows.map((r) => r.invoice_id)).toEqual(['INV-M-out']);
+  });
+
+  /**
+   * The document arm: an invoice row pointing at the erased document goes;
+   * the mail that delivered it is not the document and stays.
+   */
+  it('removes the invoice of an erased document and keeps the mail', async () => {
+    await installCharter(buildCharter({ version: 'mail-doc' }), { businessId: BUSINESS });
+    const db = getPool();
+    const documentId = `DOC-inv-${Date.now()}`;
+    await db.query(
+      `INSERT INTO documents
+         (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status)
+       VALUES ($1, $2, 'manual', 'inv.pdf', 'application/pdf', repeat('a', 64), 12, $3, 'stored')`,
+      [documentId, BUSINESS, `${BUSINESS}/${documentId}/original.pdf`],
+    );
+    await db.query(
+      `INSERT INTO mail_messages
+         (mail_id, business_id, provider_message_id, thread_id, from_address, subject, received_at, body_text)
+       VALUES ('M-doc', $1, 'pm-doc', 't', 'a@b.example', 's', now(), 'גוף')`,
+      [BUSINESS],
+    );
+    await db.query(
+      `INSERT INTO mail_invoices (invoice_id, business_id, mail_id, supplier_address, document_id, received_at)
+       VALUES ('INV-doc', $1, 'M-doc', 'a@b.example', $2, now()),
+              ('INV-other', $1, 'M-doc', 'a@b.example', NULL, now())`,
+      [BUSINESS, documentId],
+    );
+    const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
+    await executeErasure(plan, { businessId: BUSINESS });
+
+    const invoices = await db.query<{ invoice_id: string }>('SELECT invoice_id FROM mail_invoices');
+    expect(invoices.rows.map((r) => r.invoice_id)).toEqual(['INV-other']);
+    expect((await db.query('SELECT 1 FROM mail_messages WHERE mail_id = $1', ['M-doc'])).rows).toHaveLength(1);
   });
 
   /**

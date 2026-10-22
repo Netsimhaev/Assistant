@@ -472,6 +472,25 @@ describe('the mail field on SchedulerPassResult', () => {
     expect(pass.mailError).toBeNull();
   });
 
+  it('scrubs a body past its year on every pass, mailbox connected or not', async () => {
+    await install();
+    const old = new Date(NOON.getTime() - 400 * 24 * 3600_000);
+    await getPool().query(
+      `INSERT INTO mail_messages
+         (mail_id, business_id, provider_message_id, thread_id, from_address, subject, received_at, body_text)
+       VALUES ('M-old', $1, 'pm-old', 't', 'a@b.example', 's', $2, 'גוף ישן')`,
+      [BUSINESS, old.toISOString()],
+    );
+    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime: inert() });
+    expect(pass.mailRetention).toEqual({ scrubbed: 1 });
+    expect(pass.mailRetentionError).toBeNull();
+    const { rows } = await getPool().query<{ body_text: string | null }>(
+      'SELECT body_text FROM mail_messages WHERE mail_id = $1',
+      ['M-old'],
+    );
+    expect(rows[0]?.body_text).toBeNull();
+  });
+
   it('polls the connected mailbox and raises the reply card in the same pass', async () => {
     await installMailboxCharter(BUSINESS);
     await setCursor({ provider: 'google', cursor: 'C-0' }, { businessId: BUSINESS });

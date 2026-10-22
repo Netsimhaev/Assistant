@@ -1370,6 +1370,10 @@ export const TABLE_LABELS: Record<string, string> = {
   // Migration 040: the stored daily/weekly digest, which names failures —
   // a document name, a recipient, a contact — in its own rendered body.
   digests: 'תדריכים',
+  // Migrations 042/044: mail read from the connected mailbox, and the
+  // invoices extracted from it.
+  mail_messages: 'מיילים',
+  mail_invoices: 'חשבוניות ממיילים',
 };
 
 /**

@@ -45,6 +45,11 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.mailError !== null) {
     console.error(`mailbox poll failed: ${result.mailError}`);
   }
+  // Mail body retention (`mail-retention.ts`): a failed pass leaves bodies
+  // past their year in place until the next one succeeds.
+  if (result.mailRetentionError !== null) {
+    console.error(`mail body retention failed: ${result.mailRetentionError}`);
+  }
   if (result.mail !== null && result.mail.status !== 'ok') {
     console.error(`mailbox poll: ${result.mail.status}${result.mail.error !== undefined ? ` (${result.mail.error})` : ''}`);
   }

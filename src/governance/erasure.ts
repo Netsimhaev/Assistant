@@ -41,6 +41,8 @@ import {
   JOBS_SCRUBBED_PREDICATE,
   JOBS_SCRUB_SET,
   LIVE_PHASES,
+  MAIL_INVOICES_ERASED_PREDICATE,
+  MAIL_MESSAGES_ERASED_PREDICATE,
   PROPOSALS_ERASED_PREDICATE,
   STRANDED_PARENT_PREDICATE,
   VERIFICATION_VERDICTS_ERASED_PREDICATE,
@@ -155,7 +157,7 @@ export async function executeErasure(
     );
   }
 
-  const { jobIds, documentIds, memoryIds, digestIds } = plan;
+  const { jobIds, documentIds, memoryIds, digestIds, mailIds } = plan;
   const client = await getPool().connect();
   const results: ErasureItem[] = [];
   let txError: unknown;
@@ -276,6 +278,23 @@ export async function executeErasure(
     // why `buildErasurePlan` also searches `note` itself to discover a job
     // that has no other tie to the contact. Same predicate, same parameters,
     // as `countItems` there.
+    // The mailbox (migrations 042/044). `mail_invoices` FIRST: its `mail_id`
+    // cascades from `mail_messages`, and a cascade that beat this statement
+    // to the row would leave it reporting zero for a table that lost rows —
+    // the `proposals`-before-`document_readings` rule from this file's
+    // header, one table pair over. Neither has a foreign key to `documents`,
+    // so their place relative to the `documents` delete below is free. Same
+    // predicates, same parameters, as `countItems` in `erasure-plan.ts`.
+    await del(
+      'mail_invoices',
+      `DELETE FROM mail_invoices WHERE ${MAIL_INVOICES_ERASED_PREDICATE}`,
+      [businessId, mailIds, documentIds],
+    );
+    await del(
+      'mail_messages',
+      `DELETE FROM mail_messages WHERE ${MAIL_MESSAGES_ERASED_PREDICATE}`,
+      [businessId, mailIds],
+    );
     await del('autonomy_marks', 'DELETE FROM autonomy_marks WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);

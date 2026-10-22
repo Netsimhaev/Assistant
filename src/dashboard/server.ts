@@ -1513,6 +1513,7 @@ function planFingerprint(plan: ErasurePlan): string {
     documentIds: [...plan.documentIds].sort(),
     memoryIds: [...plan.memoryIds].sort(),
     digestIds: [...plan.digestIds].sort(),
+    mailIds: [...plan.mailIds].sort(),
     filePaths: [...plan.filePaths].sort(),
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),

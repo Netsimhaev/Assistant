@@ -162,6 +162,7 @@ describe('the erasure screen', () => {
         documentIds: [],
         memoryIds: [],
         digestIds: [],
+        mailIds: [],
         filePaths: [],
         items: [],
         excluded: [
@@ -186,6 +187,7 @@ describe('the erasure screen', () => {
         documentIds: [],
         memoryIds: [],
         digestIds: [],
+        mailIds: [],
         filePaths: [],
         items: [],
         excluded: [],
@@ -866,6 +868,7 @@ describe('the smaller things the screen owes the owner', () => {
         documentIds: [],
         memoryIds: [],
         digestIds: [],
+        mailIds: [],
         filePaths: [],
         items: [],
         excluded: [],

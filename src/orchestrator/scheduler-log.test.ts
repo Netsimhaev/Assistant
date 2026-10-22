@@ -34,6 +34,8 @@ function cleanResult(): SchedulerPassResult {
       curated: [],
       curationSkipped: [],
     },
+    mailRetention: { scrubbed: 0 },
+    mailRetentionError: null,
     whatsappReport: null,
     whatsappError: null,
     autonomy: { promoted: [], demoted: [], errored: [] },

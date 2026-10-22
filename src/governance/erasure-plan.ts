@@ -186,6 +186,33 @@
  * indirect one through a job — so a predicate pretending a document anchor
  * could reach a digest would be exactly the lie that anchor's own docblock
  * already refuses to write.
+ *
+ * **Migrations 042/044 added the mailbox: `mail_messages` and `mail_invoices`
+ * are wired in below; `mailbox_cursor` is not.** A mail row is the most
+ * counterparty-shaped content this module handles — sender, name, reply-to,
+ * recipients, subject, the full body, the model's summary, attachment file
+ * names — and like `digests` it is discovered by its own columns, not through
+ * a job: the contact anchor searches them directly, the window anchor matches
+ * `received_at` (when the mail ARRIVED — the real-world event the row records,
+ * and the only time column the owner can see on the mail screen; `created_at`
+ * trails it by one poll interval at most), and the document anchor reaches
+ * only `mail_invoices`, by its `document_id` (see `MAIL_INVOICES_ERASED_
+ * PREDICATE` for why the mail itself is not the document). Ids land in
+ * `mailIds`, and every mail found then closes over to what it produced: its
+ * triage job (`job_id`), its reply job (`reply_job_id`), every EARLIER reply
+ * job a re-raise unlinked from it (found by its bound plan naming the mail's
+ * `providerMessageId` — `claimFailedReply` nulls `reply_job_id`, so the
+ * column alone forgets a predecessor whose plan and card still hold the
+ * recipient and the drafted body), and the documents its attachments were
+ * ingested as (`attachments[].documentId`, `mail_invoices.document_id`). The
+ * existing job-scoped machinery then erases those jobs' plans, cards, step
+ * records, WhatsApp copies and memories exactly as it does for any other job.
+ *
+ * `mailbox_cursor` holds one row per business: the provider, an opaque
+ * provider cursor, timestamps and `last_error` — a closed set of codes
+ * (`list_<failure>`, `cursor_expired_gap`, `record_failed:<hash>:<n>`, the
+ * hash being of a provider id, never an address). Nothing in it can name a
+ * counterparty, so it is left out for the same reason `autonomy_mode` is.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -237,6 +264,8 @@ export interface ErasurePlan {
   documentIds: string[];
   memoryIds: string[];
   digestIds: string[];
+  /** `mail_messages` rows found by the anchor itself — see this module's header. */
+  mailIds: string[];
   filePaths: string[];
   items: ErasureItem[];
   excluded: KeptExclusion[];
@@ -570,6 +599,65 @@ export const VERIFICATION_VERDICTS_ERASED_PREDICATE = `business_id = $1 AND job_
 export const DIGESTS_ERASED_PREDICATE = `business_id = $1 AND digest_id = ANY ($2)`;
 
 /**
+ * The `mail_messages` rows an erasure destroys: exactly the `mailIds` the
+ * plan's discovery found, the same id-list shape as `DIGESTS_ERASED_PREDICATE`.
+ * A mail has no job-membership arm — it is never reached BY a job (a job in
+ * `jobIds` for some other reason does not drag in the mail it answered:
+ * that would erase one sender's mail because a second contact's name
+ * appeared in a reply draft). It is reached by its own content, its own
+ * arrival time, and nothing else.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` mailIds.
+ */
+export const MAIL_MESSAGES_ERASED_PREDICATE = `business_id = $1 AND mail_id = ANY ($2)`;
+
+/**
+ * The `mail_invoices` rows an erasure destroys: every invoice of an erased
+ * mail, AND every invoice whose `document_id` is an erased document.
+ *
+ * **Deleted explicitly, before `mail_messages`, though the FK cascades.**
+ * `mail_invoices.mail_id` is `ON DELETE CASCADE`, so deleting the mail first
+ * would remove its invoices silently and this statement would report zero for
+ * a table that really lost rows — the same "cascade beats the explicit
+ * delete" defect `erasure.ts`'s header names for `proposals`.
+ *
+ * **The document arm is the document anchor's whole reach into the mailbox.**
+ * An invoice row is a record ABOUT one document (its number, amount and file
+ * name), so it goes with the document. The mail that delivered it does not: a
+ * mail is a person's message, it may carry other attachments, and erasing one
+ * file is not "forget this sender". Its `attachments` JSON keeps the
+ * now-dangling `documentId` (a system id, not content).
+ *
+ * The same arm also fires under a contact or window anchor, for every
+ * document the plan erases — including the rare case of a second sender's
+ * invoice whose PDF deduplicated (`documents` is unique on `sha256`) onto a
+ * document this erasure takes. That is the precedent `PROPOSALS_ERASED_
+ * PREDICATE` already set ("any proposal on a reading of a document being
+ * erased is about to be destroyed regardless of which job made it"): an
+ * invoice record whose document is gone describes nothing that exists.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` mailIds, `$3` documentIds.
+ */
+export const MAIL_INVOICES_ERASED_PREDICATE = `business_id = $1
+  AND (mail_id = ANY ($2) OR document_id = ANY ($3))`;
+
+/**
+ * A mail's content columns, matched against a contact pattern (`$2`). Every
+ * column a person's identity or words can land in: sender, display name,
+ * reply-to, recipients, subject, body, the model's summary, and the
+ * attachment list (file names are chosen by the sender). Never the provider
+ * ids, flags, categories or labels — structure and closed sets, not content.
+ */
+const MAIL_CONTENT_MATCHES = `(from_address ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(from_name, '')  ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(reply_to, '')   ILIKE $2 ${LIKE_ESCAPE}
+      OR array_to_string(to_addresses, chr(10)) ILIKE $2 ${LIKE_ESCAPE}
+      OR subject ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(body_text, '')  ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(summary, '')    ILIKE $2 ${LIKE_ESCAPE}
+      OR attachments::text        ILIKE $2 ${LIKE_ESCAPE})`;
+
+/**
  * The `jobs` rows an erasure scrubs, and what gets emptied on them — as
  * shared constants for the same reason `APPROVAL_REQUESTS_SCRUB_SET` is one
  * (fix round 1, item 2). `awaiting_envelope_id` is migration 028's plain
@@ -674,6 +762,7 @@ export async function buildErasurePlan(
   const jobIds = new Set<string>();
   const documentIds = new Set<string>();
   const digestIds = new Set<string>();
+  const mailIds = new Set<string>();
 
   if (anchor.kind === 'contact') {
     const pattern = `%${likeLiteral(anchor.identifier)}%`;
@@ -828,9 +917,41 @@ export async function buildErasurePlan(
       [businessId, pattern],
       'digest_id',
     )) digestIds.add(digestId);
+
+    // The mailbox, by its own content — see this module's header. Two
+    // sources: the mail row's own columns, and its invoice rows (the
+    // supplier's name and the invoice's number and file name are written
+    // from the mail, but a reader of this query should not have to know
+    // that to trust it covers them).
+    for (const mailId of await idsFrom(
+      db,
+      `SELECT mail_id FROM mail_messages WHERE business_id = $1 AND ${MAIL_CONTENT_MATCHES}`,
+      [businessId, pattern],
+      'mail_id',
+    )) mailIds.add(mailId);
+
+    for (const mailId of await idsFrom(
+      db,
+      `SELECT DISTINCT mail_id FROM mail_invoices
+        WHERE business_id = $1
+          AND (supplier_address ILIKE $2 ${LIKE_ESCAPE}
+            OR coalesce(supplier_name, '')  ILIKE $2 ${LIKE_ESCAPE}
+            OR coalesce(invoice_number, '') ILIKE $2 ${LIKE_ESCAPE}
+            OR coalesce(file_name, '')      ILIKE $2 ${LIKE_ESCAPE})`,
+      [businessId, pattern],
+      'mail_id',
+    )) mailIds.add(mailId);
   }
 
   if (anchor.kind === 'window') {
+    // `received_at`, not `created_at` — see this module's header.
+    for (const mailId of await idsFrom(
+      db,
+      `SELECT mail_id FROM mail_messages WHERE business_id = $1 AND received_at >= $2 AND received_at < $3`,
+      [businessId, anchor.fromIso, anchor.toIso],
+      'mail_id',
+    )) mailIds.add(mailId);
+
     for (const jobId of await idsFrom(
       db,
       `SELECT job_id FROM jobs WHERE business_id = $1 AND created_at >= $2 AND created_at < $3`,
@@ -850,6 +971,58 @@ export async function buildErasurePlan(
 
   if (anchor.kind === 'document') {
     documentIds.add(anchor.documentId);
+  }
+
+  // What every mail found above produced. Runs BEFORE the job→document and
+  // memory closures below, because the jobs it adds are exactly what those
+  // closures read (a mail's curated memory is `written_by_job` = its triage
+  // job; see this module's header for the whole chain).
+  if (mailIds.size > 0) {
+    const mailList = [...mailIds];
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT job_id FROM mail_messages
+        WHERE business_id = $1 AND mail_id = ANY ($2) AND job_id IS NOT NULL
+       UNION
+       SELECT reply_job_id AS job_id FROM mail_messages
+        WHERE business_id = $1 AND mail_id = ANY ($2) AND reply_job_id IS NOT NULL`,
+      [businessId, mailList],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // Every reply job ever raised for these mails, including a predecessor a
+    // re-raise took off `reply_job_id` (`claimFailedReply`). Matched by JSON
+    // containment on the bound plan — a `mail.send` step whose input names
+    // this mail's `providerMessageId` — never by `ILIKE` on an id: the
+    // provider's id is exact, and containment needs no escaping.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT p.job_id FROM job_plans p
+         JOIN mail_messages m ON m.business_id = p.business_id
+        WHERE p.business_id = $1 AND m.mail_id = ANY ($2)
+          AND p.plan -> 'steps' @> jsonb_build_array(jsonb_build_object(
+                'toolName', 'mail.send',
+                'input', jsonb_build_object('providerMessageId', m.provider_message_id)))`,
+      [businessId, mailList],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // The documents its attachments were ingested as. Both places the link
+    // lives: `attachments[].documentId` (Task 12, R14) and the invoice row.
+    for (const documentId of await idsFrom(
+      db,
+      `SELECT e ->> 'documentId' AS document_id
+         FROM mail_messages m,
+              jsonb_array_elements(CASE WHEN jsonb_typeof(m.attachments) = 'array'
+                                        THEN m.attachments ELSE '[]'::jsonb END) AS e
+        WHERE m.business_id = $1 AND m.mail_id = ANY ($2)
+          AND e ->> 'documentId' IS NOT NULL
+       UNION
+       SELECT document_id FROM mail_invoices
+        WHERE business_id = $1 AND mail_id = ANY ($2) AND document_id IS NOT NULL`,
+      [businessId, mailList],
+      'document_id',
+    )) documentIds.add(documentId);
   }
 
   // Documents reached through the jobs that read them.
@@ -1045,7 +1218,10 @@ export async function buildErasurePlan(
   }
 
   const digestList = [...digestIds];
-  const items = await countItems(db, businessId, anchor, jobList, documentList, memoryIds, digestList);
+  const mailList = [...mailIds];
+  const items = await countItems(
+    db, businessId, anchor, jobList, documentList, memoryIds, digestList, mailList,
+  );
 
   return {
     anchor,
@@ -1053,6 +1229,7 @@ export async function buildErasurePlan(
     documentIds: documentList,
     memoryIds,
     digestIds: digestList,
+    mailIds: mailList,
     filePaths,
     items,
     excluded,
@@ -1075,6 +1252,7 @@ async function countItems(
   documentIds: string[],
   memoryIds: string[],
   digestIds: string[],
+  mailIds: string[],
 ): Promise<ErasureItem[]> {
   const one = async (
     table: string,
@@ -1143,6 +1321,21 @@ async function countItems(
       'scrub',
       `SELECT count(*)::text AS n FROM approval_requests WHERE ${APPROVAL_REQUESTS_SCRUBBED_PREDICATE}`,
       approvalRequestParams(businessId, jobIds, anchor),
+    ),
+    // The mailbox. `mail_invoices` before `mail_messages`, matching the
+    // executor's order — see `MAIL_INVOICES_ERASED_PREDICATE` for why the
+    // cascade must not be what removes an invoice.
+    await one(
+      'mail_invoices',
+      'delete',
+      `SELECT count(*)::text AS n FROM mail_invoices WHERE ${MAIL_INVOICES_ERASED_PREDICATE}`,
+      [businessId, mailIds, documentIds],
+    ),
+    await one(
+      'mail_messages',
+      'delete',
+      `SELECT count(*)::text AS n FROM mail_messages WHERE ${MAIL_MESSAGES_ERASED_PREDICATE}`,
+      [businessId, mailIds],
     ),
     await one(
       'boss_instructions',

@@ -32,6 +32,7 @@ import { runDueJobs } from './run-due.js';
 import type { RunDueResult } from './run-due.js';
 import { buildRuntime } from './runtime.js';
 import { closeVerifiedJobs } from './verify.js';
+import { scrubOldMailBodies } from './mail-retention.js';
 import type { CloseVerifiedResult } from './verify.js';
 import type { Runtime } from './runtime.js';
 
@@ -641,6 +642,18 @@ export interface SchedulerPassResult {
   due: RunDueResult;
   verified: CloseVerifiedResult;
   /**
+   * The 365-day mail body retention (`mail-retention.ts`), run every pass
+   * right after `closeVerifiedJobs`. Not behind the mailbox switch: a body
+   * stored while a mailbox WAS connected still ages out after it is
+   * disconnected, and the statement is one indexed `UPDATE` that finds
+   * nothing on an installation that never had mail. Null only when it threw
+   * — `mailRetentionError` then says why, the same pairing `scan`/
+   * `scanError` already use, and for the same reason: bookkeeping that
+   * failed must not take down the pass whose real work already succeeded.
+   */
+  mailRetention: { scrubbed: number } | null;
+  mailRetentionError: string | null;
+  /**
    * Null under the same switch as `whatsappDoor` above. Run after
    * `closeVerifiedJobs`, not before: a job the door opened and this very pass
    * ran all the way to `closed` must be reportable in the SAME pass, or the
@@ -975,6 +988,18 @@ export async function schedulerPass(
   // it.
   const verified = await closeVerifiedJobs(options);
 
+  // Mail body retention — see `SchedulerPassResult.mailRetention`.
+  let mailRetention: { scrubbed: number } | null = null;
+  let mailRetentionError: string | null = null;
+  try {
+    mailRetention = await scrubOldMailBodies({
+      businessId,
+      ...(options.now !== undefined ? { now: options.now } : {}),
+    });
+  } catch (err) {
+    mailRetentionError = err instanceof Error ? err.message : String(err);
+  }
+
   // The report, right after `closeVerifiedJobs` — see
   // `SchedulerPassResult.whatsappReport`'s own docblock. Guarded on
   // `whatsappMessenger !== null`: that is `null` both when no gateway is
@@ -1046,6 +1071,8 @@ export async function schedulerPass(
     mailError,
     due,
     verified,
+    mailRetention,
+    mailRetentionError,
     whatsappReport,
     whatsappError,
     autonomy,
