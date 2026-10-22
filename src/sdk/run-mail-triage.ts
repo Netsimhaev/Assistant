@@ -17,8 +17,7 @@
  * the quarantine rule this script exists to let a person watch.
  */
 import { config } from '../config.js';
-import { buildCharter } from '../test/fixtures.js';
-import { installCharter, loadActiveCharter } from '../charter/store.js';
+import { loadActiveCharter } from '../charter/store.js';
 import { closePool } from '../db/pool.js';
 import { getMail } from '../mail/inbox-store.js';
 import { isAutomatedSender } from '../mail/automated.js';
@@ -53,8 +52,15 @@ async function main(): Promise<void> {
     return;
   }
 
+  // No fixture fallback: installing a charter would be a write, and this
+  // script promises to write nothing.
   const active = await loadActiveCharter(config.businessId);
-  const bundle = active?.bundle ?? (await installCharter(buildCharter()));
+  if (active === null) {
+    console.error(`אין תקנון פעיל לעסק ${config.businessId}. יש לחתום על תקנון לפני ההרצה; הסקריפט אינו כותב דבר.`);
+    process.exitCode = 1;
+    return;
+  }
+  const bundle = active.bundle;
 
   console.log(`מאת: ${mail.fromAddress || '(אין שולח)'}   נושא: ${mail.subject}`);
   if (mail.bodyText === '') console.log('(גוף ההודעה נמחק במדיניות השמירה — הסיווג רץ על הנושא בלבד)');
