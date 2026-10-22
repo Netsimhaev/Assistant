@@ -153,3 +153,72 @@ export function buildMailboxAmendment(
     },
   };
 }
+
+/**
+ * The provider the SIGNED charter names for its mailbox, or `null` when the
+ * mailbox connection names no subprocessor this code knows. Positive match
+ * against `MAILBOX_SUBPROCESSOR`, never "anything that is not Google".
+ */
+export function signedMailboxProvider(connection: CharterConnection): MailProvider | null {
+  for (const provider of ['google', 'microsoft'] as const) {
+    if (connection.subprocessor === MAILBOX_SUBPROCESSOR[provider]) return provider;
+  }
+  return null;
+}
+
+/**
+ * Whether the OAuth ceremony may run for `provider` on this mailbox
+ * connection: only for the provider the owner signed for. Mail passing
+ * through a provider the signed charter does not name is the change the
+ * subprocessor list exists to put in front of the owner.
+ */
+export function mailboxProviderMatchesCharter(connection: CharterConnection, provider: MailProvider): boolean {
+  return signedMailboxProvider(connection) === provider;
+}
+
+export class NoMailboxToRevertError extends Error {
+  constructor(charterVersion: string) {
+    super(`charter ${charterVersion} declares no "${MAILBOX_SYSTEM}" connection; nothing to revert`);
+    this.name = 'NoMailboxToRevertError';
+  }
+}
+
+/**
+ * The way back: an amendment that undoes the mailbox amendment's two effects
+ * on the charter -- `connections` and `data.subprocessorsAllowed` are
+ * restored from `beforeMailbox`, the version the mailbox amendment
+ * superseded. Every other field is the ACTIVE charter's, so a later change
+ * the owner signed is not undone with it. A new version, effective now,
+ * superseding the active one -- never a re-activation of the old row, which
+ * would leave the trail saying the owner never signed the way back.
+ *
+ * Throws `NoMailboxToRevertError` when the active charter has no mailbox, and
+ * refuses a `beforeMailbox` that itself declares one (it is then not the
+ * version before the mailbox was added).
+ */
+export function buildMailboxRevert(
+  active: BusinessCharter,
+  beforeMailbox: BusinessCharter,
+  now: Date,
+): UnsignedCharter {
+  if (!active.connections.some((c) => c.system === MAILBOX_SYSTEM)) {
+    throw new NoMailboxToRevertError(active.charterVersion);
+  }
+  if (beforeMailbox.connections.some((c) => c.system === MAILBOX_SYSTEM)) {
+    throw new Error(
+      `charter ${beforeMailbox.charterVersion} already declares a mailbox; it is not the version before the mailbox amendment`,
+    );
+  }
+  const { signature: _signature, ...rest } = structuredClone(active);
+  return {
+    ...rest,
+    charterVersion: `${active.charterVersion}.mbx-revert-${ulid()}`,
+    effectiveFrom: now.toISOString(),
+    supersedes: active.charterVersion,
+    connections: structuredClone(beforeMailbox.connections),
+    data: {
+      ...rest.data,
+      subprocessorsAllowed: [...beforeMailbox.data.subprocessorsAllowed],
+    },
+  };
+}

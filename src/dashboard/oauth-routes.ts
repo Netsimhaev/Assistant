@@ -49,15 +49,16 @@ import {
 } from '../orchestrator/adapters/microsoft-token-http.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import type { MailProvider } from '../mail/mailbox.js';
+import type { CharterConnection } from '../domain/connection.js';
 import { setCursor } from '../mail/inbox-store.js';
 import { createGmailClient } from '../mail/providers/gmail.js';
 import { createGraphClient } from '../mail/providers/graph.js';
 import type { MailboxClient } from '../mail/providers/types.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
-import { mailboxProviderMatchesCharter } from './mailbox-connect.js';
+import { mailboxProviderMatchesCharter } from '../charter/amend-mailbox.js';
 import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import { verifyCsrfToken } from './csrf.js';
-import { escapeHtml } from './views.js';
+import { escLabel, escapeHtml } from './views.js';
 import {
   buildConsentUrl,
   codeChallengeFor,
@@ -314,6 +315,59 @@ function refuseUnsupported(res: ServerResponse, system: string): void {
   );
 }
 
+const KEY_UNAVAILABLE_MESSAGE =
+  'לא ניתן להתחיל בתהליך ההרשאה: המפתח הראשי של ההתקנה אינו מוגדר או שאינו תקין.';
+
+type ProviderClient =
+  | { ok: true; clientId: { value: string } }
+  | { ok: false; message: string };
+
+/**
+ * The provider app's own client id AND secret, both resolved for this
+ * business -- the one check `handleOAuthStart` and `oauthCeremonyPreflight`
+ * share, so the sign page cannot pass a preflight the ceremony then fails.
+ */
+async function resolveProviderClient(key: Buffer, businessId: string, provider: MailProvider): Promise<ProviderClient> {
+  const credentials = storedCredentials(key);
+  const idRef = provider === 'microsoft' ? MICROSOFT_CLIENT_ID_REF : GOOGLE_CLIENT_ID_REF;
+  const secretRef = provider === 'microsoft' ? MICROSOFT_CLIENT_SECRET_REF : GOOGLE_CLIENT_SECRET_REF;
+  const [clientId, clientSecret] = await Promise.all([
+    credentials.resolve(idRef, businessId),
+    credentials.resolve(secretRef, businessId),
+  ]);
+  if (clientId === null || clientSecret === null) {
+    return {
+      ok: false,
+      message:
+        `תצורת ה-OAuth של ${provider === 'microsoft' ? 'Microsoft' : 'Google'} חסרה — יש להקציב ${idRef} ו-${secretRef} ` +
+        'במאגר הסודות לפני שאפשר להתחיל.',
+    };
+  }
+  return { ok: true, clientId };
+}
+
+/**
+ * Can the OAuth ceremony start for `provider` on this installation? `null`
+ * when it can, otherwise the Hebrew reason. Asked by the mailbox sign page
+ * BEFORE the owner signs: signing moves `mail.send` to the mailbox, so a
+ * signature the ceremony then cannot complete would cut outgoing mail off
+ * for nothing.
+ */
+export async function oauthCeremonyPreflight(
+  businessId: string,
+  provider: MailProvider,
+  credentialKeyPath: string | undefined,
+): Promise<string | null> {
+  let key: Buffer;
+  try {
+    key = await loadKeyForRequest(credentialKeyPath);
+  } catch {
+    return KEY_UNAVAILABLE_MESSAGE;
+  }
+  const client = await resolveProviderClient(key, businessId, provider);
+  return client.ok ? null : client.message;
+}
+
 /**
  * `GET /oauth/:system/start` -- requires a session (enforced by the caller,
  * `server.ts`'s `route()`, before this is ever reached). Mints a PKCE pair
@@ -410,7 +464,7 @@ export async function handleOAuthStart(
       500,
       page(
         'שגיאת תצורה',
-        errorBlock('לא ניתן להתחיל בתהליך ההרשאה: המפתח הראשי של ההתקנה אינו מוגדר או שאינו תקין.'),
+        errorBlock(KEY_UNAVAILABLE_MESSAGE),
       ),
     );
   }
@@ -421,26 +475,11 @@ export async function handleOAuthStart(
   // exchange in `handleOAuthCallback` -- AFTER the state was burned, so the
   // owner has to start the whole ceremony over having learned nothing they
   // could not have been told up front.
-  const credentials = storedCredentials(key);
-  const idRef = provider === 'microsoft' ? MICROSOFT_CLIENT_ID_REF : GOOGLE_CLIENT_ID_REF;
-  const secretRef = provider === 'microsoft' ? MICROSOFT_CLIENT_SECRET_REF : GOOGLE_CLIENT_SECRET_REF;
-  const [clientId, clientSecret] = await Promise.all([
-    credentials.resolve(idRef, businessId),
-    credentials.resolve(secretRef, businessId),
-  ]);
-  if (clientId === null || clientSecret === null) {
-    return sendHtml(
-      res,
-      500,
-      page(
-        'תצורה חסרה',
-        errorBlock(
-          `תצורת ה-OAuth של ${provider === 'microsoft' ? 'Microsoft' : 'Google'} חסרה — יש להקציב ${idRef} ו-${secretRef} ` +
-            'במאגר הסודות לפני שאפשר להתחיל.',
-        ),
-      ),
-    );
+  const client = await resolveProviderClient(key, businessId, provider);
+  if (!client.ok) {
+    return sendHtml(res, 500, page('תצורה חסרה', errorBlock(client.message)));
   }
+  const clientId = client.clientId;
 
   const codeVerifier = createCodeVerifier();
   const state = await createState({
@@ -513,6 +552,32 @@ export async function handleOAuthCallback(
         errorBlock(`הבקשה לחבר את המערכת "${system}" נדחתה, ולא בוצע דבר.`),
       ),
     );
+  }
+
+  // The mailbox: the charter may have changed since `/start` (reverted, or
+  // re-signed for another provider). Re-checked against the charter NOW,
+  // before the exchange and before anything is written -- a grant for a
+  // provider the active charter does not name is mail passing through an
+  // unsigned subprocessor.
+  if (system === MAILBOX_SYSTEM) {
+    let mailbox: CharterConnection | undefined;
+    try {
+      mailbox = (await loadActiveCharter(businessId))?.charter.connections.find((c) => c.system === MAILBOX_SYSTEM);
+    } catch {
+      mailbox = undefined;
+    }
+    if (mailbox === undefined || !mailboxProviderMatchesCharter(mailbox, provider)) {
+      return sendHtml(
+        res,
+        400,
+        page(
+          'ספק שלא נחתם',
+          errorBlock(
+            'התקנון הפעיל אינו מתיר עוד לחבר את תיבת המייל אצל הספק הזה (הוא השתנה מאז שהחיבור התחיל). לא נשמר דבר.',
+          ),
+        ),
+      );
+    }
   }
 
   const code = params.get('code');
@@ -698,7 +763,7 @@ export async function handleOAuthCallback(
     200,
     page(
       'ההרשאה הושלמה',
-      `<p>החיבור למערכת "<b>${escapeHtml(system)}</b>" אושר בהצלחה, לחשבון <b>${escapeHtml(account)}</b>.</p>` +
+      `<p>החיבור למערכת "<b>${escapeHtml(system)}</b>" אושר בהצלחה, לחשבון <b>${escLabel(account)}</b>.</p>` +
         `<p>ההיקפים שאושרו בפועל: ${
           exchange.grantedScopes.length > 0 ? escapeHtml(exchange.grantedScopes.join(', ')) : 'לא דווח היקף'
         }.</p>` +

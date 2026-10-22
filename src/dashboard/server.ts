@@ -75,7 +75,12 @@ import {
 import type { OAuthRouteOptions } from './oauth-routes.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
-import { handleMailboxSignGet, handleMailboxSignPost, handleMailboxStatus } from './mailbox-connect.js';
+import {
+  handleMailboxRevertPost,
+  handleMailboxSignGet,
+  handleMailboxSignPost,
+  handleMailboxStatus,
+} from './mailbox-connect.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { MAX_RECALL, recallMemories } from '../memory/store.js';
@@ -2443,17 +2448,23 @@ async function route(
   if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
   // Connecting the business mailbox: sign the charter amendment FIRST, then
   // run the OAuth ceremony — see `mailbox-connect.ts` for why that order.
-  if (method === 'GET' && pathname === '/connections/mailbox') return handleMailboxStatus(res, businessId);
+  if (method === 'GET' && pathname === '/connections/mailbox') {
+    return handleMailboxStatus(res, businessId, issueCsrfToken(session.sessionId));
+  }
   if (method === 'GET' && pathname === '/connections/mailbox/sign') {
     return handleMailboxSignGet(
       res,
       businessId,
       issueCsrfToken(session.sessionId),
       new URL(req.url ?? '/', 'http://dashboard.local').searchParams,
+      oauthOptions.credentialKeyPath,
     );
   }
   if (method === 'POST' && pathname === '/connections/mailbox/sign') {
-    return handleMailboxSignPost(res, businessId, session, await readFormBody(req));
+    return handleMailboxSignPost(res, businessId, session, await readFormBody(req), oauthOptions.credentialKeyPath);
+  }
+  if (method === 'POST' && pathname === '/connections/mailbox/revert') {
+    return handleMailboxRevertPost(res, businessId, session, await readFormBody(req));
   }
   if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, businessId, session);
   if (method === 'POST' && pathname === '/digest/settings')

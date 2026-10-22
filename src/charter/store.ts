@@ -216,6 +216,27 @@ export async function probeActiveCharter(
 }
 
 /**
+ * One stored charter version of this business, parsed — or `null` when no
+ * such version exists for it. Throws on a version this code cannot parse, the
+ * same as `loadActiveCharter`; the one caller (the dashboard's mailbox
+ * revert, which reads the version the mailbox amendment superseded) turns
+ * that into a refusal. Never a source of policy: the gate reads only the
+ * active charter.
+ */
+export async function loadCharterVersion(
+  charterVersion: string,
+  businessId: string = config.businessId,
+  db: Queryable = getPool(),
+): Promise<BusinessCharter | null> {
+  const { rows } = await db.query<{ charter: unknown }>(
+    'SELECT charter FROM charter_versions WHERE business_id = $1 AND charter_version = $2',
+    [businessId, charterVersion],
+  );
+  const row = rows[0];
+  return row ? BusinessCharter.parse(row.charter) : null;
+}
+
+/**
  * The version the gate must be running against.
  *
  * A run holding a stale bundle is denied rather than allowed — a mid-flight

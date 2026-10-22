@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { BusinessCharter } from '../domain/charter.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { buildCharter } from '../test/fixtures.js';
-import { MAILBOX_SUBPROCESSOR, buildMailboxAmendment } from './amend-mailbox.js';
+import { MAILBOX_SUBPROCESSOR, buildMailboxAmendment, buildMailboxRevert } from './amend-mailbox.js';
 import { signCharter, verifyCharterSignature } from './sign.js';
 
 const NOW = new Date('2026-10-21T08:00:00.000Z');
@@ -129,5 +129,29 @@ describe('buildMailboxAmendment', () => {
     const before = JSON.stringify(active);
     buildMailboxAmendment(active, NOW, 'google');
     expect(JSON.stringify(active)).toBe(before);
+  });
+});
+
+describe('buildMailboxRevert', () => {
+  it('restores the pre-mailbox connections and subprocessors, keeps everything else of the active charter', () => {
+    const before = buildCharter({ connections: [OFFICE_MAIL, CALENDAR] });
+    const active = sign(buildMailboxAmendment(before, NOW, 'microsoft'));
+    const revert = sign(buildMailboxRevert(active, before, NOW));
+    expect(revert.connections).toEqual(before.connections);
+    expect(revert.data.subprocessorsAllowed).toEqual(before.data.subprocessorsAllowed);
+    expect(revert.supersedes).toBe(active.charterVersion);
+    expect(revert.charterVersion).not.toBe(before.charterVersion);
+    expect(revert.charterVersion).not.toBe(active.charterVersion);
+    expect(verifyCharterSignature(revert)).toEqual({ valid: true });
+  });
+
+  it('refuses when the active charter has no mailbox', () => {
+    const before = buildCharter({ connections: [OFFICE_MAIL] });
+    expect(() => buildMailboxRevert(before, before, NOW)).toThrow(/mailbox/);
+  });
+
+  it('refuses a "before" version that itself declares a mailbox', () => {
+    const active = sign(buildMailboxAmendment(buildCharter({ connections: [OFFICE_MAIL] }), NOW, 'google'));
+    expect(() => buildMailboxRevert(active, active, NOW)).toThrow(/mailbox/);
   });
 });
