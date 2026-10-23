@@ -75,6 +75,29 @@ export function mailTriageProblems(t: MailTriage, shownAttachmentCount: number):
   return [...new Set(problems)];
 }
 
+/** The problems that concern single attachment entries — droppable without losing the rest of the triage. */
+export const ATTACHMENT_ENTRY_PROBLEMS: ReadonlySet<string> = new Set([
+  'attachment_index_unknown',
+  'attachment_index_duplicate',
+]);
+
+/**
+ * Drop the attachment entries `mailTriageProblems` would report — an index
+ * the brief did not show, and EVERY entry of an index named twice (two
+ * readings of one file cannot both be right, and nothing says which) — and
+ * keep the rest of the triage. Returns how many entries were dropped.
+ */
+export function keepValidAttachments(
+  t: MailTriage,
+  shownAttachmentCount: number,
+): { triage: MailTriage; dropped: number } {
+  const counts = new Map<number, number>();
+  for (const a of t.attachments) counts.set(a.index, (counts.get(a.index) ?? 0) + 1);
+  const kept = t.attachments.filter((a) => a.index < shownAttachmentCount && counts.get(a.index) === 1);
+  const dropped = t.attachments.length - kept.length;
+  return dropped === 0 ? { triage: t, dropped: 0 } : { triage: { ...t, attachments: kept }, dropped };
+}
+
 /** Whether the reader judged this attachment an invoice — by its type or by invoice details. */
 export function attachmentIsInvoice(a: TriageAttachment): boolean {
   return a.docType === 'invoice' || a.invoice !== null;
@@ -82,16 +105,24 @@ export function attachmentIsInvoice(a: TriageAttachment): boolean {
 
 /**
  * The model can only lower an automated mail to `other`, never raise it —
- * and that holds for an invoice found inside an attachment too: an automated
- * mail stays `other` (its PDF invoice is still recorded, which grants nothing).
+ * with ONE positive exception (owner's ruling, Task 2 review): an automated
+ * mail whose attachment the reader identifies as an invoice is `['invoice']`,
+ * so the invoice label and the invoice rows follow. Never `question` or
+ * `document`, and `isPerson` stays `false` — so still no WhatsApp notice and
+ * no reply card (WhatsApp is for real people only). A body-only invoice on an
+ * automated mail stays `other`, as before. Pass a triage whose attachment
+ * entries were already checked (`keepValidAttachments`).
+ *
  * For a mail from a person, an invoice attachment adds `invoice` (replacing a
- * lone `other`), so the label and the invoice screen follow.
+ * lone `other`).
  */
 export function finalCategories(
   t: MailTriage,
   automated: boolean,
 ): { categories: MailCategory[]; isPerson: boolean } {
-  if (automated) return { categories: ['other'], isPerson: false };
+  if (automated) {
+    return { categories: t.attachments.some(attachmentIsInvoice) ? ['invoice'] : ['other'], isPerson: false };
+  }
   let categories: MailCategory[] = [...t.categories];
   if (t.attachments.some(attachmentIsInvoice) && !categories.includes('invoice')) {
     categories = [...categories.filter((c) => c !== 'other'), 'invoice'];

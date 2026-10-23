@@ -1004,6 +1004,121 @@ describe('pollMailbox', () => {
       ]);
     });
 
+    it('a body invoice with no details and a PDF invoice with them make one row carrying the PDF details', async () => {
+      const { documentRoot } = await setup();
+      const bytes = buildPdf([['Invoice INV-9 total 500']]);
+      const mail = incomingMail({ providerMessageId: 'PM-BD', attachments: [pdfAttachment(bytes, 'A-1', 'inv-9.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      const triage = capturingTriage({
+        ...INVOICE_TRIAGE,
+        invoice: null,
+        attachments: [{ index: 0, docType: 'invoice', summary: 'חשבונית INV-9', invoice: { number: 'INV-9', amountText: '500', dateText: null } }],
+      });
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      const docId = (await storedAttachments('PM-BD'))[0]?.documentId;
+      const { rows } = await getPool().query(
+        'SELECT document_id, invoice_number, amount_text FROM mail_invoices WHERE business_id = $1',
+        [BUSINESS],
+      );
+      expect(rows).toEqual([{ document_id: docId, invoice_number: 'INV-9', amount_text: '500' }]);
+    });
+
+    it('a body invoice falls back field by field to the linked PDF invoice', async () => {
+      const { documentRoot } = await setup();
+      const bytes = buildPdf([['Invoice INV-17 total 500']]);
+      const mail = incomingMail({ providerMessageId: 'PM-FB', attachments: [pdfAttachment(bytes, 'A-1', 'inv.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      const triage = capturingTriage({
+        ...INVOICE_TRIAGE,
+        invoice: { number: 'INV-17', amountText: null, dateText: null },
+        attachments: [{ index: 0, docType: 'invoice', summary: 'חשבונית', invoice: { number: 'OTHER', amountText: '500', dateText: null } }],
+      });
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      const { rows } = await getPool().query('SELECT invoice_number, amount_text FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+      expect(rows).toEqual([{ invoice_number: 'INV-17', amount_text: '500' }]);
+    });
+
+    it('a noreply mail with an invoice PDF is labelled and recorded, with no notice and no reply card', async () => {
+      const { documentRoot } = await setup();
+      const bytes = buildPdf([['Invoice INV-5']]);
+      const mail = incomingMail({ providerMessageId: 'PM-NR', fromAddress: 'noreply@vendor.example', attachments: [pdfAttachment(bytes, 'A-1', 'inv-5.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      // The model even claims a person and a question; neither survives for automated mail.
+      const triage = capturingTriage({
+        categories: ['question'],
+        summary: 'חשבונית חודשית',
+        isPerson: true,
+        invoice: null,
+        replyGist: 'לאשר קבלה',
+        attachments: [{ index: 0, docType: 'invoice', summary: 'חשבונית INV-5', invoice: { number: 'INV-5', amountText: '80', dateText: null } }],
+      });
+      const drafter = stubDrafter();
+      const n = notifier();
+
+      const result = expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter, documentRoot, notifyBoss: n.notify, now: NOON }));
+
+      expect(triage.requests).toHaveLength(1);
+      expect(result).toMatchObject({ triaged: 1, failed: 0, labelled: 1, notified: 0, unnotified: 0, drafts: 0 });
+      const [row] = await mailRows();
+      expect(row?.categories).toEqual(['invoice']);
+      expect(row?.labels_applied).toEqual([MAIL_LABELS.invoice]);
+      expect(row?.reply_job_id).toBeNull();
+      expect(n.sent).toHaveLength(0);
+      expect(drafter.calls).toBe(0);
+      const { rows: invoices } = await getPool().query('SELECT invoice_number, amount_text FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+      expect(invoices).toEqual([{ invoice_number: 'INV-5', amount_text: '80' }]);
+    });
+
+    it('a noreply mail the model calls a question stays other', async () => {
+      const { documentRoot } = await setup();
+      const mail = incomingMail({ providerMessageId: 'PM-NQ', fromAddress: 'noreply@vendor.example' });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }]);
+      const triage = capturingTriage({ ...QUESTION_TRIAGE });
+      const drafter = stubDrafter();
+      const n = notifier();
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter, documentRoot, notifyBoss: n.notify, now: NOON }));
+
+      expect(triage.requests).toHaveLength(1);
+      const [row] = await mailRows();
+      expect(row?.categories).toEqual(['other']);
+      expect(row?.labels_applied).toEqual([]);
+      expect(n.sent).toHaveLength(0);
+      expect(drafter.calls).toBe(0);
+    });
+
+    it('a bad attachment entry is dropped and noted, and the rest of the triage is kept', async () => {
+      const { documentRoot } = await setup();
+      const bytes = buildPdf([['Price quote']]);
+      const mail = incomingMail({ providerMessageId: 'PM-BAD', attachments: [pdfAttachment(bytes, 'A-1', 'q.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      const triage = capturingTriage({
+        ...OTHER_TRIAGE,
+        categories: ['document'],
+        attachments: [
+          { index: 0, docType: 'quote', summary: 'הצעת מחיר', invoice: null },
+          { index: 7, docType: 'invoice', summary: 'אין כזו', invoice: { number: 'GHOST', amountText: null, dateText: null } },
+        ],
+      });
+
+      const result = expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      expect(triage.requests).toHaveLength(1);
+      expect(result).toMatchObject({ triaged: 1, failed: 0 });
+      const { rows } = await getPool().query<{ state: string; categories: string[]; error: string | null }>(
+        'SELECT state, categories, error FROM mail_messages WHERE business_id = $1',
+        [BUSINESS],
+      );
+      expect(rows).toEqual([{ state: 'triaged', categories: ['document'], error: 'attachment_reading_dropped' }]);
+      expect((await storedAttachments('PM-BAD'))[0]).toMatchObject({ docType: 'quote', summary: 'הצעת מחיר' });
+      const { rows: invoices } = await getPool().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+      expect(invoices).toHaveLength(0);
+    });
+
     it('a scanned PDF is shown to triage as not read and stored with scanned: true', async () => {
       const { documentRoot } = await setup();
       const bytes = buildPdf([null]);

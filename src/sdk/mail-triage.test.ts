@@ -44,11 +44,13 @@ describe('mail triage', () => {
     expect(buildTriageCall({ bundle, mail }).prompt).not.toBe(buildTriageCall({ bundle, mail }).prompt);
   });
 
-  it('parseTriageResponse checks attachment indexes against what the brief showed', () => {
+  it('parseTriageResponse tolerates attachment-only problems but not others', () => {
     const withAtt = { ...ok, attachments: [{ index: 1, docType: 'invoice', summary: 'חשבונית', invoice: null }] };
     expect(parseTriageResponse(JSON.stringify(withAtt), 2).status).toBe('read');
-    expect(parseTriageResponse(JSON.stringify(withAtt), 1).status).toBe('unreadable');
-    expect(parseTriageResponse(JSON.stringify(withAtt)).status).toBe('unreadable');
+    // Out of range: still read — the poll drops that entry (Task 2 review, minor 5).
+    expect(parseTriageResponse(JSON.stringify(withAtt), 1).status).toBe('read');
+    // A non-attachment problem alongside still makes it unreadable.
+    expect(parseTriageResponse(JSON.stringify({ ...withAtt, replyGist: null }), 1).status).toBe('unreadable');
   });
 
   it('the prompt carries the attachments and the contract names the closed type set', () => {

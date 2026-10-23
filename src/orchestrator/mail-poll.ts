@@ -78,7 +78,12 @@ import { getPool } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, TEXT, XLSX } from '../documents/media-type.js';
 import type { PolicyBundle } from '../domain/policy.js';
-import { attachmentIsInvoice, finalCategories, type MailTriage } from '../domain/mail-triage.js';
+import {
+  attachmentIsInvoice,
+  finalCategories,
+  keepValidAttachments,
+  type MailTriage,
+} from '../domain/mail-triage.js';
 import { loadArtifacts, loadDocument } from '../documents/store.js';
 import { renderArtifactFull } from '../documents/brief.js';
 import { listGrants } from '../governance/oauth-grants.js';
@@ -511,14 +516,20 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
 
     // Counted before the call: a call that throws was still made and billed.
     result.triaged += 1;
-    const outcome = await pass.triage({ bundle: pass.bundle, mail, attachments: entries.map((e) => e.brief) });
+    const briefAttachments = entries.map((e) => e.brief);
+    const outcome = await pass.triage({ bundle: pass.bundle, mail, attachments: briefAttachments });
     if (outcome.status !== 'read') throw new Error(`triage_unreadable: ${outcome.reason}`);
-    const triage: MailTriage = outcome.triage;
+    // A bad attachment entry (an index the brief did not show, or one named
+    // twice) costs that entry only, never the mail: it is dropped and noted,
+    // and the rest of the reading stands. Every other problem already made
+    // the response unreadable above.
+    const shown = shownAttachmentCount(briefAttachments);
+    const checked = keepValidAttachments(outcome.triage, shown);
+    const triage: MailTriage = checked.triage;
+    if (checked.dropped > 0) await noteMailError(mail.mailId, 'attachment_reading_dropped', { businessId });
 
-    const { categories, isPerson } = finalCategories(
-      triage,
-      isAutomatedSender(mail.headerFlags, mail.fromAddress),
-    );
+    const automated = isAutomatedSender(mail.headerFlags, mail.fromAddress);
+    const { categories, isPerson } = finalCategories(triage, automated);
 
     const labelsApplied = await applyLabels(mail, categories, job.jobId, pass);
     await recordAttachmentReadings(mail, triage, entries, pass);
@@ -526,7 +537,7 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     const documents = [...ingested.values()];
     // The reader's invoice attachments that became documents, in stored order.
     const invoiceAttachments = triage.attachments
-      .filter(attachmentIsInvoice)
+      .filter((a) => a.index < shown && attachmentIsInvoice(a))
       .sort((a, b) => a.index - b.index)
       .flatMap((a) => {
         const entry = entries[a.index];
@@ -535,27 +546,33 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
           : [];
       });
 
-    // The mail-level invoice the BODY names, as before. `categories` alone is
-    // no longer the test: an invoice attachment adds the category too, and
-    // that one is recorded per document below. Linked to the reader's first
-    // invoice attachment when there is one, so the two never make two rows.
-    if (
+    // The mail-level invoice the BODY names, as before — for a mail from a
+    // person only (an automated mail's invoice comes from its attachments
+    // alone). `categories` is no longer the test: an invoice attachment adds
+    // the category too, and that one is recorded per document below.
+    //   - The body names an invoice but gave no details, and an attachment is
+    //     one: no separate body row — the attachment rows carry the invoice
+    //     (a body row would take the document and leave its details behind).
+    //   - Both: one row, linked to the first invoice attachment, each field
+    //     the body's when it has one and that attachment's otherwise.
+    const firstInvoice = invoiceAttachments[0];
+    const bodyInvoice =
+      !automated &&
       triage.categories.includes('invoice') &&
-      categories.includes('invoice') &&
-      !(await hasInvoiceForMail(mail.mailId, { businessId }))
-    ) {
-      const firstInvoice = invoiceAttachments[0];
+      !(triage.invoice === null && firstInvoice !== undefined);
+    if (bodyInvoice && !(await hasInvoiceForMail(mail.mailId, { businessId }))) {
       const linked =
         firstInvoice !== undefined
           ? { documentId: firstInvoice.documentId, fileName: firstInvoice.entry.attachment.filename }
           : (documents.find((d) => d.mediaType === 'application/pdf') ?? documents[0] ?? null);
+      const fromAttachment = firstInvoice?.triaged.invoice ?? null;
       await insertInvoice(
         {
           mailId: mail.mailId,
           supplierAddress: mail.fromAddress,
           supplierName: mail.fromName,
-          invoiceNumber: triage.invoice?.number ?? null,
-          amountText: triage.invoice?.amountText ?? null,
+          invoiceNumber: triage.invoice?.number ?? fromAttachment?.number ?? null,
+          amountText: triage.invoice?.amountText ?? fromAttachment?.amountText ?? null,
           documentId: linked?.documentId ?? null,
           fileName: linked?.fileName ?? null,
           receivedAt: mail.receivedAt,
@@ -565,8 +582,9 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     }
 
     // An invoice found inside an attachment (§9.3), even when the body named
-    // none: one row per (mail, document), never a second on a re-handle.
-    // Unverified like the body's — no module under `src/policy/` reads it.
+    // none: one row per (mail, document) — checked here, and held by
+    // migration 046's unique index under `insertInvoice`. Unverified like the
+    // body's — no module under `src/policy/` reads it.
     for (const { triaged: a, entry, documentId } of invoiceAttachments) {
       if (await hasInvoiceForDocument(mail.mailId, documentId, { businessId })) continue;
       await insertInvoice(

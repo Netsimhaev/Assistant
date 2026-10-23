@@ -68,6 +68,21 @@ describe('inbox store', () => {
     expect(rows[0]!.providerMessageId).toBe('a');
   });
 
+  it('insertInvoice writes one row per (mail, document) and refuses a second', async () => {
+    const m = (await recordIncoming(mail(), opts))!;
+    const inv = {
+      mailId: m.mailId, supplierAddress: 'a@acme.com', supplierName: null, invoiceNumber: '1', amountText: null,
+      documentId: 'DOC-1', fileName: 'a.pdf', receivedAt: '2026-10-05T00:00:00Z',
+    };
+    expect(await insertInvoice(inv, opts)).not.toBeNull();
+    expect(await insertInvoice({ ...inv, invoiceNumber: '2' }, opts)).toBeNull();
+    // Rows with no document are not bound by it.
+    expect(await insertInvoice({ ...inv, documentId: null }, opts)).not.toBeNull();
+    expect(await insertInvoice({ ...inv, documentId: null }, opts)).not.toBeNull();
+    const { rows } = await getPool().query('SELECT invoice_number FROM mail_invoices WHERE business_id = $1 AND document_id = $2', [BUSINESS, 'DOC-1']);
+    expect(rows).toEqual([{ invoice_number: '1' }]);
+  });
+
   it('listInvoices filters by supplier, number and date range', async () => {
     const m = (await recordIncoming(mail(), opts))!;
     const inv = { mailId: m.mailId, supplierName: null, amountText: null, documentId: null, fileName: null };

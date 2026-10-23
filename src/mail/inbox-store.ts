@@ -533,18 +533,24 @@ export async function setCursor(c: MailCursor, options: Options = {}): Promise<v
   );
 }
 
-export async function insertInvoice(i: NewInvoice, options: Options = {}): Promise<string> {
+/**
+ * One invoice row. At most one per (mail, document) — migration 046's partial
+ * unique index — so a second for the same document is a no-op and returns
+ * `null`. Rows with no document are not bound by it.
+ */
+export async function insertInvoice(i: NewInvoice, options: Options = {}): Promise<string | null> {
   const { businessId, db } = ctx(options);
   const id = `INV-${ulid()}`;
-  await db.query(
+  const res = await db.query(
     `INSERT INTO mail_invoices
        (invoice_id, business_id, mail_id, supplier_address, supplier_name,
         invoice_number, amount_text, document_id, file_name, received_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT DO NOTHING`,
     [id, businessId, i.mailId, i.supplierAddress, i.supplierName, i.invoiceNumber,
      i.amountText, i.documentId, i.fileName, i.receivedAt],
   );
-  return id;
+  return (res.rowCount ?? 0) === 1 ? id : null;
 }
 
 /** Small builder so every filter is a numbered parameter, never interpolated. */

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { MailTriage, mailTriageProblems, finalCategories } from './mail-triage.js';
+import { MailTriage, mailTriageProblems, finalCategories, keepValidAttachments } from './mail-triage.js';
 
 const base: MailTriage = {
   categories: ['other'], summary: 'x', isPerson: true, invoice: null, replyGist: null, attachments: [],
@@ -50,13 +50,29 @@ describe('attachments', () => {
     expect(MailTriage.safeParse({ ...base, attachments: [{ ...att(0), summary: 'x'.repeat(301) }] }).success).toBe(false);
   });
 
-  it('an invoice attachment adds the invoice category (replacing other), never for an automated mail', () => {
+  it('an invoice attachment adds the invoice category (replacing other), for an automated mail too', () => {
     const t = { ...base, attachments: [att(0)] };
     expect(finalCategories(t, false).categories).toEqual(['invoice']);
     expect(finalCategories({ ...t, categories: ['question'], replyGist: 'g' }, false).categories).toEqual(['question', 'invoice']);
     const viaInvoiceObject = { ...base, attachments: [{ ...att(0), docType: 'other' as const, invoice: { number: '1', amountText: null, dateText: null } }] };
     expect(finalCategories(viaInvoiceObject, false).categories).toEqual(['invoice']);
-    expect(finalCategories(t, true).categories).toEqual(['other']);
+    // Ruling (Task 2 review): the one positive exception for automated mail.
+    expect(finalCategories(t, true)).toEqual({ categories: ['invoice'], isPerson: false });
+    // Only the invoice: an automated mail is never raised to question or document.
+    const mixed = { ...t, categories: ['question' as const, 'document' as const], replyGist: 'g', isPerson: true };
+    expect(finalCategories(mixed, true)).toEqual({ categories: ['invoice'], isPerson: false });
+    // A body-only invoice on an automated mail stays other, as before.
+    const bodyOnly = { ...base, categories: ['invoice' as const], invoice: { number: '1', amountText: null, dateText: null } };
+    expect(finalCategories(bodyOnly, true).categories).toEqual(['other']);
+  });
+
+  it('keepValidAttachments drops out-of-range and duplicated entries and keeps the rest', () => {
+    const t = { ...base, attachments: [att(0), att(4), att(1), att(1), att(2)] };
+    const kept = keepValidAttachments(t, 3);
+    expect(kept.triage.attachments.map((a) => a.index)).toEqual([0, 2]);
+    expect(kept.dropped).toBe(3);
+    expect(mailTriageProblems(kept.triage, 3)).toEqual([]);
+    expect(keepValidAttachments(base, 0)).toEqual({ triage: base, dropped: 0 });
   });
 });
 

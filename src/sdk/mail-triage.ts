@@ -7,7 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { config } from '../config.js';
 import type { PolicyBundle } from '../domain/policy.js';
-import { MailTriage, mailTriageProblems } from '../domain/mail-triage.js';
+import { ATTACHMENT_ENTRY_PROBLEMS, MailTriage, mailTriageProblems } from '../domain/mail-triage.js';
 import type { StoredMail } from '../mail/inbox-store.js';
 import {
   TRIAGE_LABELS,
@@ -37,8 +37,10 @@ export interface TriageRequest {
 export type Triage = (request: TriageRequest) => Promise<TriageOutcome>;
 
 /**
- * `shownAttachmentCount` is how many attachments the brief showed: an
- * attachment index at or past it is refused (`mailTriageProblems`).
+ * `shownAttachmentCount` is how many attachments the brief showed. A problem
+ * with a single attachment entry (an index past it, or one named twice) does
+ * NOT make the response unreadable: the poll pass drops those entries
+ * (`keepValidAttachments`) and notes it on the mail. Every other problem does.
  */
 export function parseTriageResponse(raw: string, shownAttachmentCount = 0): TriageOutcome {
   const candidates = extractJsonObjects(raw);
@@ -50,7 +52,9 @@ export function parseTriageResponse(raw: string, shownAttachmentCount = 0): Tria
       last = parsed.error.issues[0]?.message ?? last;
       continue;
     }
-    const problems = mailTriageProblems(parsed.data, shownAttachmentCount);
+    const problems = mailTriageProblems(parsed.data, shownAttachmentCount).filter(
+      (p) => !ATTACHMENT_ENTRY_PROBLEMS.has(p),
+    );
     if (problems.length > 0) {
       last = problems.join(',');
       continue;
