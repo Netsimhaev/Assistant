@@ -299,8 +299,8 @@ export async function ingestDocument(
     return reject('סוג הקובץ אינו מזוהה או אינו נתמך');
   }
 
-  // Store-only (a PDF): the bytes are kept and downloadable, and nothing
-  // parses them. A terminal status of its own — `rejected` would tell the
+  // Store-only (no type today; a PDF until it gained an extractor): the
+  // bytes are kept and downloadable, and nothing parses them. A terminal status of its own — `rejected` would tell the
   // owner the file was refused, and `extracted` would offer it to a reader
   // with no artefacts to read.
   if (STORE_ONLY_TYPES.has(sniffed)) {

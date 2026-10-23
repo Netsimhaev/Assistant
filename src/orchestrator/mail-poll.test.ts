@@ -50,6 +50,7 @@ import { createJob, loadJob, transition } from './jobs.js';
 import { oauthCredentials } from './oauth-token.js';
 import type { TokenHttp } from './oauth-token.js';
 import { pollMailbox, type MailPollResult } from './mail-poll.js';
+import { buildPdf } from '../documents/fixtures/build-pdf.js';
 import type { Runtime } from './runtime.js';
 
 const BUSINESS = 'test-business';
@@ -73,10 +74,12 @@ const OTHER_TRIAGE: MailTriage = {
   replyGist: null,
 };
 
-/** A PDF header followed by the binary comment line every real PDF carries. */
-const PDF_BYTES = Buffer.from([
-  0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34, 0x0a, 0x25, 0xe2, 0xe3, 0xcf, 0xd3, 0x0a, 0x31, 0x20,
-]);
+/**
+ * A real one-page PDF. Since PDFs are extracted (23/10) a header alone is a
+ * malformed file and is rejected; these tests are about the mail flow, so
+ * they use a PDF the extractor reads.
+ */
+const PDF_BYTES = buildPdf([['Invoice INV-17']]);
 
 beforeEach(async () => {
   await resetDatabase();
@@ -317,7 +320,7 @@ describe('pollMailbox', () => {
       [BUSINESS],
     );
     expect(docs).toHaveLength(1);
-    expect(docs[0]).toMatchObject({ source: 'mail', original_name: 'invoice-17.pdf', status: 'stored' });
+    expect(docs[0]).toMatchObject({ source: 'mail', original_name: 'invoice-17.pdf', status: 'extracted' });
     const { rows: invoices } = await getPool().query<{ document_id: string | null; file_name: string | null }>(
       'SELECT document_id, file_name FROM mail_invoices WHERE business_id = $1',
       [BUSINESS],
@@ -359,7 +362,7 @@ describe('pollMailbox', () => {
       'SELECT document_id, status FROM documents WHERE business_id = $1',
       [BUSINESS],
     );
-    expect(docs.map((d) => d.status)).toEqual(['stored', 'stored']);
+    expect(docs.map((d) => d.status)).toEqual(['extracted', 'extracted']);
     expect(docs.map((d) => d.document_id).sort()).toEqual([...(ids as string[])].sort());
   });
 
@@ -705,7 +708,7 @@ describe('pollMailbox', () => {
 
     expect(fake.fetched).toEqual(['PM-OCT/A-1']);
     const { rows } = await getPool().query<{ status: string; media_type: string }>('SELECT status, media_type FROM documents WHERE business_id = $1', [BUSINESS]);
-    expect(rows).toEqual([{ status: 'stored', media_type: 'application/pdf' }]);
+    expect(rows).toEqual([{ status: 'extracted', media_type: 'application/pdf' }]);
   });
 
   it('returns a stale claim to received and fails its orphaned triage job before re-handling', async () => {

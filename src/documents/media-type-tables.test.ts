@@ -41,6 +41,7 @@ const ALL_EXTRACTOR_IDS: Record<ExtractorId, true> = {
   docx: true,
   csv: true,
   passthrough: true,
+  pdf: true,
 };
 
 describe('the three media-type tables stay in sync', () => {
@@ -49,14 +50,16 @@ describe('the three media-type tables stay in sync', () => {
   });
 
   it('every media-type constant has an entry in registry.ts\'s SUPPORTED', () => {
-    // Store-only types (a PDF) are the one positive exception: named by the
-    // sniff, kept on disk, never handed to an extractor. Never both.
+    // Store-only types are the one positive exception: named by the sniff,
+    // kept on disk, never handed to an extractor. Never both. The set is
+    // empty today — a PDF left it on 23/10 when it gained an extractor.
     for (const mediaType of MEDIA_TYPE_CONSTANTS) {
       const extracted = Object.hasOwn(SUPPORTED, mediaType);
       const storeOnly = MediaType.STORE_ONLY_TYPES.has(mediaType);
       expect(extracted !== storeOnly, mediaType).toBe(true);
     }
-    expect(MediaType.STORE_ONLY_TYPES.has(MediaType.PDF)).toBe(true);
+    expect(MediaType.STORE_ONLY_TYPES.has(MediaType.PDF)).toBe(false);
+    expect(SUPPORTED[MediaType.PDF]).toBe('pdf');
   });
 
   it('every media-type constant has an entry in ingest.ts\'s EXTENSION_BY_MEDIA_TYPE', () => {

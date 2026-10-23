@@ -4,8 +4,9 @@ import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
+import { buildPdf } from './fixtures/build-pdf.js';
 import { guardZipArchive, ingestDocument } from './ingest.js';
 import { documentsAwaitingRead, loadArtifacts, loadDocument } from './store.js';
 import type { OutlineContent } from './types.js';
@@ -34,23 +35,49 @@ afterAll(async () => {
 });
 
 describe('ingestDocument', () => {
-  it('stores a PDF as a store-only document: status stored, original.pdf on disk, never offered for reading', async () => {
+  it('ingestDocument stores a PDF as extracted with page artifacts', async () => {
     const path = join(ROOT, 'incoming.pdf');
+    await writeFile(path, buildPdf([['Invoice INV-17'], ['Total 1200 NIS']]));
+    const doc = await ingestDocument({ path, source: 'mail', originalName: 'invoice.pdf' }, OPTS);
+    expect(doc.status).toBe('extracted');
+    expect(doc.mediaType).toBe('application/pdf');
+    expect(doc.storedPath.endsWith('/original.pdf')).toBe(true);
+    expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
+    const artifacts = await loadArtifacts(doc.documentId, OPTS);
+    // Two page artefacts, then the outline buildOutline appends.
+    expect(artifacts.map((a) => [a.ordinal, a.kind, a.partName])).toEqual([
+      [0, 'text', 'עמוד 1'],
+      [1, 'text', 'עמוד 2'],
+      [2, 'outline', null],
+    ]);
+    expect((await loadDocument(doc.documentId, OPTS))?.status).toBe('extracted');
+  });
+
+  it('a malformed PDF is rejected with a Hebrew reason, not a crash', async () => {
+    const path = join(ROOT, 'broken.pdf');
     await writeFile(
       path,
       Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]),
     );
-    const doc = await ingestDocument({ path, source: 'mail', originalName: 'invoice.pdf' }, OPTS);
-    expect(doc.status).toBe('stored');
-    expect(doc.mediaType).toBe('application/pdf');
-    expect(doc.storedPath.endsWith('/original.pdf')).toBe(true);
-    expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
+    const doc = await ingestDocument({ path, source: 'manual', originalName: 'broken.pdf' }, OPTS);
+    expect(doc.status).toBe('rejected');
+    expect(doc.reason).toMatch(/^הפענוח נכשל: /);
     expect(await loadArtifacts(doc.documentId, OPTS)).toEqual([]);
-    const reloaded = await loadDocument(doc.documentId, OPTS);
-    expect(reloaded?.status).toBe('stored');
-    // Even with source manual, a stored document is not one the conductor reads.
-    await getPool().query("UPDATE documents SET source = 'manual' WHERE document_id = $1", [doc.documentId]);
-    expect(await documentsAwaitingRead(10, OPTS)).toEqual([]);
+    // The bytes are kept, like every other rejection after the disk write.
+    expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
+  });
+
+  it('a manually ingested PDF is offered to the conductor; a mail-sourced one is not', async () => {
+    const manualPath = join(ROOT, 'manual.pdf');
+    const mailPath = join(ROOT, 'mail.pdf');
+    await writeFile(manualPath, buildPdf([['Contract draft']]));
+    await writeFile(mailPath, buildPdf([['Contract draft']], { trailingComment: 'mail copy' }));
+    const manual = await ingestDocument({ path: manualPath, source: 'manual' }, OPTS);
+    const mail = await ingestDocument({ path: mailPath, source: 'mail' }, OPTS);
+    expect([manual.status, mail.status]).toEqual(['extracted', 'extracted']);
+
+    const offered = await documentsAwaitingRead(10, OPTS);
+    expect(offered.map((d) => d.documentId)).toEqual([manual.documentId]);
   });
 
   it('still rejects binary that is not a PDF, whatever the name says', async () => {

@@ -15,17 +15,21 @@ export const TEXT = 'text/plain';
 export const MARKDOWN = 'text/markdown';
 export const JSON = 'application/json';
 /**
- * Store-only: kept on disk and downloadable, never extracted (`ingestDocument`
- * gives it the terminal status `stored`). Named by its `%PDF-` magic.
+ * Named by its `%PDF-` magic. Extracted page by page (`extractors/pdf.ts`)
+ * since 23/10; before that it was store-only (migration 044), and rows
+ * already stored that way keep the `stored` status.
  */
 export const PDF = 'application/pdf';
 
 /**
- * Types `sniffMediaType` names that the pipeline stores without parsing. A
- * positive list, disjoint from `registry.ts`'s `SUPPORTED`
- * (`media-type-tables.test.ts` locks both directions).
+ * Types `sniffMediaType` names that the pipeline stores without parsing
+ * (`ingestDocument` gives them the terminal status `stored`). A positive
+ * list, disjoint from `registry.ts`'s `SUPPORTED`
+ * (`media-type-tables.test.ts` locks both directions). Empty today — a PDF
+ * left it when it gained an extractor — and kept, with its branch in
+ * `ingestDocument`, for the next type that must be kept but not parsed.
  */
-export const STORE_ONLY_TYPES: ReadonlySet<string> = new Set([PDF]);
+export const STORE_ONLY_TYPES: ReadonlySet<string> = new Set<string>([]);
 
 const PDF_MAGIC = Buffer.from('%PDF-', 'latin1');
 

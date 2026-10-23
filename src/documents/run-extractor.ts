@@ -12,6 +12,11 @@
  *     is crossed, checked as bytes arrive rather than after the whole
  *     stream has been buffered (that buffering would itself be the
  *     resource exhaustion this exists to prevent)
+ *   - code generation: the child runs with
+ *     `--disallow-code-generation-from-strings`, so `eval` and
+ *     `new Function` throw inside it whatever a parsing library (or a file
+ *     steering one) attempts — the control `extractors/pdf.ts` relies on
+ *     for "no script ever runs"
  *   - environment: the child receives `PATH` and nothing else — the same
  *     rule `src/sdk/know-reader.ts` already applies to the quarantine
  *     agent's own subprocess, so the database URL and any API key never
@@ -106,9 +111,8 @@ const DEFAULT_CHILD_PATH = defaultChildPath(import.meta.url);
 const TSX_LOADER = pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href;
 
 /**
- * Parses one file in an isolated, capped child process. Every one of the
- * four caps in the isolation contract above is enforced from here, not
- * inside the child; `options` lets a caller (or a test) override the
+ * Parses one file in an isolated, capped child process. Every limit in the
+ * isolation contract above is enforced from here, not inside the child; `options` lets a caller (or a test) override the
  * defaults, which are the spec §3.4 numbers.
  */
 export async function runExtractor(
@@ -124,7 +128,15 @@ export async function runExtractor(
   return new Promise<ExtractOutcome>((resolve) => {
     const child = spawn(
       process.execPath,
-      [`--max-old-space-size=${memoryMb}`, '--import', TSX_LOADER, childPath, extractor, sourcePath],
+      [
+        `--max-old-space-size=${memoryMb}`,
+        '--disallow-code-generation-from-strings',
+        '--import',
+        TSX_LOADER,
+        childPath,
+        extractor,
+        sourcePath,
+      ],
       {
         // PATH and nothing else. See the module docblock and
         // `src/sdk/know-reader.ts`, which applies the identical rule to the
