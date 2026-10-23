@@ -50,6 +50,30 @@ describe('renderMailNotice', () => {
   });
 });
 
+describe('renderMailNotice attachments', () => {
+  const base = { fromName: 'דנה', fromAddress: 'dana@client.example', summary: 'מצורף' };
+  it('notice adds attachment lines, capped at 3', () => {
+    const attachments = [1, 2, 3, 4, 5].map((n) => ({ docType: 'invoice' as const, summary: 'סכום ' + n }));
+    const text = renderMailNotice({ ...base, attachments }, ['invoice']);
+    const lines = text.split('\n');
+    expect(lines.filter((l) => l.startsWith('📎'))).toEqual([
+      '📎 חשבונית: סכום 1', '📎 חשבונית: סכום 2', '📎 חשבונית: סכום 3',
+    ]);
+    expect(lines[lines.length - 1]).toBe('ועוד 2');
+  });
+  it('folds each line and strips bidi controls', () => {
+    const text = renderMailNotice(
+      { ...base, attachments: [{ docType: 'quote', summary: 'שורה\n‮שנייה' }] },
+      ['question'],
+    );
+    expect(text.split('\n').filter((l) => l.startsWith('📎'))).toEqual(['📎 הצעת מחיר: שורה שנייה']);
+    expect(text).not.toMatch(/[‪-‮]/);
+  });
+  it('no attachments leaves the notice unchanged', () => {
+    expect(renderMailNotice(base, ['question']).split('\n')).toHaveLength(2);
+  });
+});
+
 describe('renderMailCardWhatsApp', () => {
   it('carries the recipient, the subject, the full body and ends with the instruction line', () => {
     const text = renderMailCardWhatsApp(approval(), PAYLOAD);

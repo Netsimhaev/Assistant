@@ -11,6 +11,7 @@
  */
 import { stripBidiControls } from '../util/bidi.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
+import { ATTACHMENT_DOC_TYPE_LABELS, type AttachmentDocType } from '../domain/mail-triage.js';
 import type { MailCategory } from './mailbox.js';
 import { RECIPIENT_LABEL, SUBJECT_LABEL, WARNING_PREFIXES, splitReplyDetail } from './reply-card.js';
 
@@ -28,7 +29,16 @@ export interface MailNoticeInput {
   fromName: string | null;
   fromAddress: string;
   summary: string;
+  /**
+   * What the triage reader said about each attachment it saw. The poll passes
+   * the validated `triage.attachments` (entries it dropped are already gone),
+   * so the notice does not depend on re-reading the stored row.
+   */
+  attachments?: readonly { docType: AttachmentDocType; summary: string }[];
 }
+
+/** At most this many attachment lines; the rest are counted ("ועוד N"). */
+export const NOTICE_ATTACHMENT_LINES = 3;
 
 export function renderMailNotice(mail: MailNoticeInput, categories: readonly MailCategory[]): string {
   const address = oneLine(mail.fromAddress);
@@ -38,7 +48,12 @@ export function renderMailNotice(mail: MailNoticeInput, categories: readonly Mai
     .map((c) => CATEGORY_WORDS[c])
     .filter((w): w is string => w !== undefined)
     .join(' · ');
-  return `📧 ${who}\n${words}: ${oneLine(mail.summary)}`;
+  const attachments = mail.attachments ?? [];
+  const lines = attachments
+    .slice(0, NOTICE_ATTACHMENT_LINES)
+    .map((a) => `📎 ${ATTACHMENT_DOC_TYPE_LABELS[a.docType] ?? ATTACHMENT_DOC_TYPE_LABELS.other}: ${oneLine(a.summary)}`);
+  if (attachments.length > NOTICE_ATTACHMENT_LINES) lines.push(`ועוד ${attachments.length - NOTICE_ATTACHMENT_LINES}`);
+  return [`📧 ${who}`, `${words}: ${oneLine(mail.summary)}`, ...lines].join('\n');
 }
 
 // ---------------------------------------------------------------------------

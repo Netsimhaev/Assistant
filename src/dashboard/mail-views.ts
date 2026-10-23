@@ -11,6 +11,7 @@
  * slicing `timestamptz::text` (which is in the DB session's zone).
  */
 import type { InvoiceRow, MailRow } from '../mail/inbox-store.js';
+import { ATTACHMENT_DOC_TYPE_LABELS, AttachmentDocType } from '../domain/mail-triage.js';
 import type { MailCategory } from '../mail/mailbox.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { escLabel, escapeHtml as esc, page } from './views.js';
@@ -56,6 +57,31 @@ export interface MailFilters {
   to: string;
   sender: string;
   category: string;
+}
+
+/** Hebrew word for a stored type; a value outside the closed set gives `''`, never the raw value. */
+export function docTypeLabel(value: unknown): string {
+  const parsed = AttachmentDocType.safeParse(value);
+  return parsed.success ? ATTACHMENT_DOC_TYPE_LABELS[parsed.data] : '';
+}
+
+export interface DocumentFilters {
+  type: string;
+  sender: string;
+  from: string;
+  to: string;
+}
+
+export interface DocumentRow {
+  mailId: string;
+  receivedAt: string;
+  fromName: string | null;
+  fromAddress: string;
+  filename: string;
+  docType: string | null;
+  summary: string | null;
+  scanned: boolean;
+  documentId: string | null;
 }
 
 export interface InvoiceFilters {
@@ -186,7 +212,7 @@ export function renderMailList(options: {
   return page(
     'מיילים',
     `<h1>מיילים</h1>
-<p><a href="/">לכרטיסי האישור</a> · <a href="/mail/invoices">חשבוניות לפי ספק</a></p>
+<p><a href="/">לכרטיסי האישור</a> · <a href="/mail/invoices">חשבוניות לפי ספק</a> · <a href="/mail/documents">מסמכים מצורפים</a></p>
 ${mailboxBanner(mailboxStatus)}
 ${gapAt !== null ? `<p class="card error">${esc(GAP_BANNER)} (בתאריך ${esc(formatWhen(gapAt, timeZone).slice(0, 10))})</p>` : ''}
 ${cursorProblem ? `<p class="card error">${esc(CURSOR_PROBLEM_BANNER)}</p>` : ''}
@@ -309,7 +335,13 @@ export function renderMailDetail(options: {
         a.documentId !== undefined && downloadable.has(a.documentId)
           ? ` · <a href="/documents/${esc(encodeURIComponent(a.documentId))}/file">הורד</a>`
           : '';
-      return `<li>${escLabel(a.filename)}${link}</li>`;
+      const type = docTypeLabel(a.docType);
+      const extra = [
+        type === '' ? '' : ` · <b>${esc(type)}</b>`,
+        a.scanned === true ? ' · <span class="muted">קובץ סרוק — לא נקרא</span>' : '',
+        a.summary !== undefined && a.summary !== '' ? `<br><span class="muted">${escLabel(a.summary)}</span>` : '',
+      ].join('');
+      return `<li>${escLabel(a.filename)}${link}${extra}</li>`;
     })
     .join('');
   const body =
@@ -334,5 +366,65 @@ ${body}
 ${mail.bodyTruncated ? '<p class="muted">הגוף נחתך בשמירה.</p>' : ''}
 ${attachments !== '' ? `<h2>קבצים מצורפים</h2><ul>${attachments}</ul>` : ''}
 ${docLinks !== '' ? `<h2>מסמכים שנשמרו</h2><ul>${docLinks}</ul>` : ''}`,
+  );
+}
+
+export function renderMailDocuments(options: {
+  rows: readonly DocumentRow[];
+  filters: DocumentFilters;
+  downloadable: ReadonlySet<string>;
+  timeZone: string;
+}): string {
+  const { rows, filters, downloadable, timeZone } = options;
+  const typeOptions = [
+    `<option value=""${filters.type === '' ? ' selected' : ''}>כל הסוגים</option>`,
+    ...AttachmentDocType.options.map(
+      (t) => `<option value="${t}"${filters.type === t ? ' selected' : ''}>${esc(ATTACHMENT_DOC_TYPE_LABELS[t])}</option>`,
+    ),
+  ].join('');
+  const body = rows
+    .map((r) => {
+      const sender = r.fromName !== null && r.fromName !== '' ? `${escLabel(r.fromName)}<br>` : '';
+      const download =
+        r.documentId !== null && downloadable.has(r.documentId)
+          ? `<a href="/documents/${esc(encodeURIComponent(r.documentId))}/file">הורד</a>`
+          : '<span class="muted">אין קובץ</span>';
+      const summary = r.scanned
+        ? '<span class="muted">קובץ סרוק — לא נקרא</span>'
+        : r.summary !== null && r.summary !== ''
+          ? escLabel(r.summary)
+          : '—';
+      return `<tr>
+  <td>${esc(formatWhen(r.receivedAt, timeZone))}</td>
+  <td>${sender}<span class="muted">${escLabel(r.fromAddress)}</span></td>
+  <td>${escLabel(r.filename)}</td>
+  <td>${esc(docTypeLabel(r.docType) || '—')}</td>
+  <td>${summary}</td>
+  <td>${download}</td>
+  <td><a href="/mail/${esc(encodeURIComponent(r.mailId))}">מייל מקורי</a></td>
+</tr>`;
+    })
+    .join('\n');
+  return page(
+    'מסמכים מצורפים',
+    `<h1>מסמכים מצורפים</h1>
+<p><a href="/mail">מיילים</a> · <a href="/mail/invoices">חשבוניות לפי ספק</a></p>
+<p class="muted">הסוג והסיכום נקראו מהמסמך על ידי העוזרת ואינם מאומתים.</p>
+<form method="get" action="/mail/documents" class="card">
+  <label>סוג <select name="type">${typeOptions}</select></label>
+  <label>ממי <input type="text" name="sender" value="${esc(filters.sender)}"></label>
+  <label>מתאריך <input type="date" name="from" value="${esc(filters.from)}"></label>
+  <label>עד תאריך <input type="date" name="to" value="${esc(filters.to)}"></label>
+  <button type="submit">סינון</button>
+</form>
+${
+  rows.length === 0
+    ? '<p class="muted">לא נמצאו מסמכים.</p>'
+    : `<table style="width:100%;border-collapse:collapse" border="1" cellpadding="6">
+<thead><tr><th>תאריך</th><th>שולח</th><th>שם קובץ</th><th>סוג</th><th>סיכום</th><th>הורדה</th><th>מייל מקורי</th></tr></thead>
+<tbody>
+${body}
+</tbody></table>`
+}`,
   );
 }

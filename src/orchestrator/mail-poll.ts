@@ -1041,7 +1041,7 @@ async function notifyOwner(
   }
   try {
     await pass.notifyBoss(
-      renderMailNotice({ fromName: mail.fromName, fromAddress: mail.fromAddress, summary: triage.summary }, categories),
+      renderMailNotice({ fromName: mail.fromName, fromAddress: mail.fromAddress, summary: triage.summary, attachments: triage.attachments }, categories),
       jobId,
     );
   } catch {

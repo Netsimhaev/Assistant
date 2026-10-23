@@ -12,7 +12,7 @@ import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
-import { insertInvoice, linkAttachmentDocument, markOverCap, noteMailError, setCursor, settleMail } from '../mail/inbox-store.js';
+import { annotateAttachment, insertInvoice, linkAttachmentDocument, markOverCap, noteMailError, setCursor, settleMail } from '../mail/inbox-store.js';
 import { resetDatabase } from '../test/db.js';
 import { storedMail } from '../test/mailbox.js';
 import { createOwner } from './auth.js';
@@ -416,5 +416,115 @@ describe('fix round 1', () => {
     const cookie = await login(baseUrl);
     expect((await get(baseUrl, cookie, '/mail/%E0%A4%A')).status).toBe(404);
     expect((await get(baseUrl, cookie, '/documents/%E0%A4%A/file')).status).toBe(404);
+  });
+});
+
+describe('PDF summaries and the documents screen', () => {
+  const att = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
+    attachmentId: id, filename: name, mediaType: 'application/pdf', size: 5, ...extra,
+  });
+
+  /** `recordIncoming` keeps only the provider fields, so the reader's fields are written the way the poll writes them. */
+  async function mailWith(businessId: string, over: Parameters<typeof storedMail>[1]): ReturnType<typeof storedMail> {
+    const given = (over?.attachments ?? []) as unknown as Record<string, unknown>[];
+    const m = await storedMail(businessId, {
+      ...over,
+      attachments: given.map(({ docType: _d, summary: _s, scanned: _c, documentId: _i, ...base }) => base) as never,
+    });
+    for (const a of given) {
+      const id = a['attachmentId'] as string;
+      await annotateAttachment(
+        m.mailId, id,
+        {
+          ...(a['docType'] !== undefined ? { docType: a['docType'] as never } : {}),
+          ...(a['summary'] !== undefined ? { summary: a['summary'] as string } : {}),
+          ...(a['scanned'] !== undefined ? { scanned: a['scanned'] as boolean } : {}),
+        },
+        { businessId },
+      );
+      if (a['documentId'] !== undefined) await linkAttachmentDocument(m.mailId, id, a['documentId'] as string, { businessId });
+    }
+    return m;
+  }
+
+  it('mail detail shows summary, type and scanned state', async () => {
+    const m = await mailWith(BUSINESS, {
+      providerMessageId: 'PD-1',
+      attachments: [
+        att('a1', 'offer.pdf', { docType: 'quote', summary: 'הצעה <b>לשיפוץ</b> בסך 12,000' }),
+        att('a2', 'scan.pdf', { docType: 'other', scanned: true }),
+      ],
+    });
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    const html = await (await get(baseUrl, cookie, `/mail/${m.mailId}`)).text();
+    expect(html).toContain('הצעת מחיר');
+    expect(html).toContain('הצעה &lt;b&gt;לשיפוץ&lt;/b&gt; בסך 12,000');
+    expect(html).not.toContain('<b>לשיפוץ</b>');
+    expect(html).toContain('קובץ סרוק — לא נקרא');
+  });
+
+  async function seedDocs(): Promise<{ a: string }> {
+    const a = await mailWith(BUSINESS, {
+      providerMessageId: 'DOC-A', fromAddress: 'dana@client.example', fromName: 'דנה',
+      attachments: [
+        att('a1', 'inv.pdf', { docType: 'invoice', summary: 'חשבונית מס 77', documentId: 'docQ1' }),
+        att('a2', 'contract.pdf', { docType: 'contract', summary: 'חוזה שכירות' }),
+      ],
+    });
+    await mailWith(OTHER, {
+      providerMessageId: 'DOC-B', fromAddress: 'x@other.example',
+      attachments: [att('b1', 'secret.pdf', { docType: 'invoice', summary: 'סוד של עסק אחר' })],
+    });
+    await addDocument(BUSINESS, 'docQ1');
+    return { a: a.mailId };
+  }
+
+  it('/mail/documents filters by type and is business-scoped', async () => {
+    const { a } = await seedDocs();
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    const all = await (await get(baseUrl, cookie, '/mail/documents')).text();
+    expect(all).toContain('חשבונית מס 77');
+    expect(all).toContain('חוזה שכירות');
+    expect(all).not.toContain('סוד של עסק אחר');
+    expect(all).toContain('href="/documents/docQ1/file"');
+    expect(all).toContain(`href="/mail/${a}"`);
+    const only = await (await get(baseUrl, cookie, '/mail/documents?type=contract')).text();
+    expect(only).toContain('חוזה שכירות');
+    expect(only).not.toContain('חשבונית מס 77');
+    const bySender = await (await get(baseUrl, cookie, '/mail/documents?sender=nobody')).text();
+    expect(bySender).not.toContain('חוזה שכירות');
+    const byDate = await (await get(baseUrl, cookie, '/mail/documents?from=2999-01-01')).text();
+    expect(byDate).not.toContain('חוזה שכירות');
+  });
+
+  it('an unknown type parameter does not filter and is not echoed raw', async () => {
+    await seedDocs();
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    const html = await (await get(baseUrl, cookie, `/mail/documents?type=${encodeURIComponent('<script>x</script>')}`)).text();
+    expect(html).toContain('חוזה שכירות');
+    expect(html).toContain('חשבונית מס 77');
+    expect(html).not.toContain('<script>x</script>');
+  });
+
+  it('requires a session', async () => {
+    const baseUrl = await start();
+    expect((await fetch(`${baseUrl}/mail/documents`, { redirect: 'manual' })).status).toBe(302);
+  });
+
+  it('summary with U+202E is stripped on every surface', async () => {
+    const m = await mailWith(BUSINESS, {
+      providerMessageId: 'BD-1',
+      attachments: [att('a1', 'x.pdf', { docType: 'report', summary: 'דוח\u202E חצי\u2066 שנתי' })],
+    });
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    for (const path of [`/mail/${m.mailId}`, '/mail/documents']) {
+      const html = await (await get(baseUrl, cookie, path)).text();
+      expect(html).toContain('דוח חצי שנתי');
+      expect(html).not.toMatch(/[\u202A-\u202E\u2066-\u2069]/);
+    }
   });
 });

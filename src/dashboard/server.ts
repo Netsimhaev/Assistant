@@ -83,7 +83,7 @@ import {
   handleMailboxSignPost,
   handleMailboxStatus,
 } from './mailbox-connect.js';
-import { handleDocumentFile, handleInvoices, handleMailDetail, handleMailList, notFound } from './mail-handlers.js';
+import { handleDocumentFile, handleInvoices, handleMailDetail, handleMailDocuments, handleMailList, notFound } from './mail-handlers.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { MAX_RECALL, recallMemories } from '../memory/store.js';
@@ -2520,6 +2520,8 @@ async function route(
   if (method === 'GET' && pathname === '/mail/invoices') {
     return handleInvoices(res, businessId, requestUrl, issueCsrfToken(session.sessionId));
   }
+  // Before `MAIL_PATH`, which would read "documents" as a mail id.
+  if (method === 'GET' && pathname === '/mail/documents') return handleMailDocuments(res, businessId, requestUrl);
   const mailMatch = MAIL_PATH.exec(pathname);
   if (method === 'GET' && mailMatch?.[1] !== undefined) {
     const mailId = decodePathSegment(mailMatch[1]);

@@ -16,6 +16,8 @@ import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
 import { loadDocument } from '../documents/store.js';
+import { AttachmentDocType } from '../domain/mail-triage.js';
+import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
 import { getCursor, getMail, listInvoices, searchMail } from '../mail/inbox-store.js';
 import type { MailCategory } from '../mail/mailbox.js';
 import { stripBidiControls } from '../util/bidi.js';
@@ -23,6 +25,9 @@ import { mailboxBannerStatus } from './mailbox-connect.js';
 import {
   groupInvoices,
   renderInvoices,
+  renderMailDocuments,
+  type DocumentFilters,
+  type DocumentRow,
   renderMailDetail,
   renderMailList,
   type InvoiceFilters,
@@ -183,6 +188,69 @@ export async function handleInvoices(res: ServerResponse, businessId: string, ur
     { businessId },
   );
   html(res, 200, renderInvoices({ groups: groupInvoices(rows), filters, timeZone, csrf }));
+}
+
+const DOCUMENT_LIMIT = 200;
+
+/** Every attachment of every mail of this business, newest mail first, filtered as the owner asked. */
+export async function handleMailDocuments(res: ServerResponse, businessId: string, url: URL): Promise<void> {
+  const requestedType = param(url, 'type');
+  // A closed set: anything else means "no filter" and is never echoed back.
+  const type = AttachmentDocType.safeParse(requestedType).success ? requestedType : '';
+  const filters: DocumentFilters = { type, sender: param(url, 'sender'), from: param(url, 'from'), to: param(url, 'to') };
+  const timeZone = await charterTimeZone(businessId);
+  const fromIso = dayStartIso(filters.from, timeZone);
+  const toIso = dayEndIso(filters.to, timeZone);
+  const where = ['m.business_id = $1'];
+  const params: unknown[] = [businessId];
+  const add = (sql: (n: number) => string, value: unknown): void => {
+    params.push(value);
+    where.push(sql(params.length));
+  };
+  if (type !== '') add((n) => `a.elem ->> 'docType' = $${n}`, type);
+  if (filters.sender !== '') {
+    add(
+      (n) => `(m.from_address ILIKE $${n} ${LIKE_ESCAPE} OR coalesce(m.from_name, '') ILIKE $${n} ${LIKE_ESCAPE})`,
+      `%${likeLiteral(filters.sender)}%`,
+    );
+  }
+  if (fromIso !== null) add((n) => `m.received_at >= $${n}::timestamptz`, fromIso);
+  if (toIso !== null) add((n) => `m.received_at < $${n}::timestamptz`, toIso);
+  params.push(DOCUMENT_LIMIT);
+  const { rows } = await getPool().query<{
+    mail_id: string;
+    received_at: Date;
+    from_name: string | null;
+    from_address: string;
+    filename: string | null;
+    doc_type: string | null;
+    summary: string | null;
+    scanned: boolean | null;
+    document_id: string | null;
+  }>(
+    `SELECT m.mail_id, m.received_at, m.from_name, m.from_address,
+            a.elem ->> 'filename' AS filename, a.elem ->> 'docType' AS doc_type,
+            a.elem ->> 'summary' AS summary, (a.elem ->> 'scanned')::boolean AS scanned,
+            a.elem ->> 'documentId' AS document_id
+       FROM mail_messages m
+      CROSS JOIN LATERAL jsonb_array_elements(m.attachments) AS a(elem)
+      WHERE ${where.join(' AND ')}
+      ORDER BY m.received_at DESC, m.mail_id DESC LIMIT $${params.length}`,
+    params,
+  );
+  const docs: DocumentRow[] = rows.map((r) => ({
+    mailId: r.mail_id,
+    receivedAt: r.received_at.toISOString(),
+    fromName: r.from_name,
+    fromAddress: r.from_address,
+    filename: r.filename ?? '',
+    docType: r.doc_type,
+    summary: r.summary,
+    scanned: r.scanned === true,
+    documentId: r.document_id,
+  }));
+  const downloadable = await downloadableDocuments(businessId, docs.map((d) => d.documentId ?? undefined));
+  html(res, 200, renderMailDocuments({ rows: docs, filters, downloadable, timeZone }));
 }
 
 export async function handleMailDetail(res: ServerResponse, businessId: string, mailId: string): Promise<void> {
