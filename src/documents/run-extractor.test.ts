@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { fileURLToPath } from 'node:url';
-import { defaultChildPath, runExtractor } from './run-extractor.js';
+import { defaultChildPath, runExtractor, vmRssBytes } from './run-extractor.js';
 import type { TextContent } from './types.js';
 
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
@@ -85,6 +85,9 @@ describe('runExtractor', () => {
     // catch -- the real-world case extractor_crashed exists to name.
     const outcome = await runExtractor('passthrough', fixture('small.txt'), {
       memoryMb: 32,
+      // Far above the heap cap, so on Linux the parent's RSS sampler cannot
+      // win the race and turn this heap abort into extractor_memory.
+      rssCapMb: 4096,
       childPath: stubChild('oom.ts'),
       timeoutMs: 15_000,
     });
@@ -161,5 +164,48 @@ describe('runExtractor', () => {
         else process.env[key] = value;
       }
     }
+  });
+});
+
+describe("the child's own hardening", () => {
+  const probe = async (name: string): Promise<Record<string, unknown>> => {
+    const outcome = await runExtractor('passthrough', fixture('small.txt'), { childPath: stubChild(name) });
+    if (!outcome.ok) throw new Error(`${name}: ${outcome.code} ${outcome.detail}`);
+    return outcome.artifacts[0]?.content as Record<string, unknown>;
+  };
+
+  it('runs the child with string code generation disabled: new Function and eval both throw', async () => {
+    expect(await probe('codegen-probe.ts')).toEqual({ functionThrew: true, evalThrew: true });
+  });
+
+  it('refuses @napi-rs/canvas once the native-canvas block is installed', async () => {
+    expect(await probe('canvas-probe.ts')).toEqual({ refused: true });
+  });
+
+  it('kills a child whose off-heap memory crosses the RSS cap, and names it extractor_memory', async () => {
+    // offheap.ts allocates Buffers -- outside the V8 heap, so the heap cap
+    // never fires -- in a loop that never yields. Only the in-child
+    // watchdog thread can stop it.
+    const started = Date.now();
+    const outcome = await runExtractor('passthrough', fixture('small.txt'), {
+      childPath: stubChild('offheap.ts'),
+      rssCapMb: 300,
+      timeoutMs: 20_000,
+    });
+    expect(outcome).toMatchObject({ ok: false, code: 'extractor_memory' });
+    if (!outcome.ok) expect(outcome.detail).toContain('300');
+    expect(Date.now() - started).toBeLessThan(20_000);
+  }, 30_000);
+});
+
+describe('vmRssBytes', () => {
+  it('reads VmRSS from a Linux /proc/<pid>/status text', () => {
+    const status = ['Name:\tnode', 'VmPeak:\t 9000 kB', 'VmRSS:\t  524288 kB', 'Threads:\t7', ''].join('\n');
+    expect(vmRssBytes(status)).toBe(524288 * 1024);
+  });
+
+  it('answers null, never zero, when the line is missing or unreadable', () => {
+    expect(vmRssBytes(['Name:\tnode', ''].join('\n'))).toBeNull();
+    expect(vmRssBytes(['VmRSS:\tlots kB', ''].join('\n'))).toBeNull();
   });
 });

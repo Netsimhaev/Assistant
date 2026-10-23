@@ -5,7 +5,7 @@
   "type": "module",
   "description": "AI personal assistant for businesses — governance spine (Phase 0)",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.15"
   },
   "allowScripts": [
     "esbuild"

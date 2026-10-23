@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildPdf } from '../fixtures/build-pdf.js';
+import { buildPdf, visualOrder } from '../fixtures/build-pdf.js';
 import { runExtractor } from '../run-extractor.js';
 import type { Block, TextContent } from '../types.js';
 import { MAX_PDF_PAGES, PDF_LOAD_OPTIONS, extractPdf } from './pdf.js';
@@ -129,8 +129,10 @@ describe('extractPdf', () => {
     // The options the library actually received, not merely the constant.
     expect(getDocumentCalls).toHaveLength(1);
     const params = getDocumentCalls[0] ?? {};
+    // `isEvalSupported` is deliberately not asserted: pdfjs-dist 6 ignores
+    // it. "No eval" is enforced by the child's V8 flag, which
+    // run-extractor.test.ts proves reaches the child.
     expect(params).toMatchObject({
-      isEvalSupported: false,
       disableFontFace: true,
       useSystemFonts: false,
       enableXfa: false,
@@ -144,7 +146,53 @@ describe('extractPdf', () => {
       expect(params[urlOption], urlOption).toBeUndefined();
     }
     expect(params['data']).toBeInstanceOf(Uint8Array);
-    expect(PDF_LOAD_OPTIONS).toMatchObject({ isEvalSupported: false, disableFontFace: true, useSystemFonts: false });
+    expect(PDF_LOAD_OPTIONS).toMatchObject({ disableFontFace: true, useSystemFonts: false });
+  });
+
+  describe('Hebrew and mixed-direction lines', () => {
+    const firstLine = async (name: string, line: Parameters<typeof buildPdf>[0][number]): Promise<string> => {
+      const artifacts = await extractPdf(await writePdf(name, buildPdf([line])));
+      return textOf(artifacts[0]?.content);
+    };
+
+    it('reads a single Hebrew run in logical order', async () => {
+      expect(await firstLine('he-one.pdf', [visualOrder('שלום')])).toBe('שלום');
+    });
+
+    it('reads a number and a Hebrew word from two runs, number first in the stream, right to left', async () => {
+      const line = [
+        { text: '1200', x: 36 },
+        { text: visualOrder('חשבונית'), x: 80 },
+      ];
+      expect(await firstLine('he-mixed.pdf', [line])).toBe('חשבונית 1200');
+    });
+
+    it('reads two Hebrew words with a space between them, whichever comes first in the stream', async () => {
+      const left = { text: visualOrder('עולם'), x: 36 };
+      const right = { text: visualOrder('שלום'), x: 100 };
+      expect(await firstLine('he-left-first.pdf', [[left, right]])).toBe('שלום עולם');
+      expect(await firstLine('he-right-first.pdf', [[right, left]])).toBe('שלום עולם');
+    });
+
+    it('leaves a left-to-right line of two runs in left-to-right order, spaced', async () => {
+      const line = [
+        { text: 'Total', x: 36 },
+        { text: '1200 NIS', x: 80 },
+      ];
+      expect(await firstLine('en-two-runs.pdf', [line])).toBe('Total 1200 NIS');
+      // Out of stream order too: position decides, not the order written.
+      expect(await firstLine('en-reversed.pdf', [[line[1]!, line[0]!]])).toBe('Total 1200 NIS');
+    });
+
+    it('does not glue or split runs that touch', async () => {
+      // "Invo" in Helvetica at 12pt is 22.68pt wide (278+556+500+556 per
+      // mille): "ice" starts where "Invo" ends, so no space belongs there.
+      const line = [
+        { text: 'Invo', x: 36 },
+        { text: 'ice', x: 58.68 },
+      ];
+      expect(await firstLine('en-touching.pdf', [line])).toBe('Invoice');
+    });
   });
 
   it('rejects a malformed PDF by throwing — the child turns that into a controlled failure', async () => {
@@ -164,6 +212,24 @@ describe('the PDF extractor inside the isolated child', () => {
     if (!outcome.ok) return;
     expect(outcome.artifacts.map((a) => textOf(a.content))).toEqual(['First page', 'Second page']);
   });
+
+  it('extracts with the native canvas package blocked in the child', async () => {
+    // The child refuses to resolve @napi-rs/canvas (child-hardening.ts);
+    // pdf.js falls back with a warning and text extraction does not need it.
+    const outcome = await runExtractor('pdf', await writePdf('no-canvas.pdf', buildPdf([['Still read']])));
+    expect(outcome).toMatchObject({ ok: true });
+    if (outcome.ok) expect(textOf(outcome.artifacts[0]?.content)).toBe('Still read');
+  });
+
+  it('a decompression bomb is killed for memory, not extracted, within the time cap', async () => {
+    // ~2 KB on disk per MiB inflated; 2 GiB inflated would be far past any cap.
+    const bytes = buildPdf([['bomb']], { flateBombMib: 2048 });
+    expect(bytes.length).toBeLessThan(8 * 1024 * 1024);
+    const started = Date.now();
+    const outcome = await runExtractor('pdf', await writePdf('bomb.pdf', bytes));
+    expect(outcome).toMatchObject({ ok: false, code: 'extractor_memory' });
+    expect(Date.now() - started).toBeLessThan(30_000);
+  }, 60_000);
 
   it('a malformed PDF is a controlled extractor_failed, not a crash', async () => {
     const path = await writePdf('child-broken.pdf', Buffer.from('%PDF-1.7\ngarbage', 'latin1'));

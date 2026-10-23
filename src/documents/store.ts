@@ -351,6 +351,12 @@ export const MAX_READ_ATTEMPTS = 3;
  * same mail. The only caller of this function is the conductor, so the
  * filter changes nothing else; the document is still stored, downloadable
  * and linked from its invoice row.
+ *
+ * **Scanned PDFs are skipped.** A PDF none of whose pages yielded text is
+ * `extracted` with `scanned_no_text` on its first artefact (ordinal 0,
+ * `extractors/pdf.ts`). Reading it would be a paid model call on a brief
+ * with nothing in it. The test is the flag's presence — a positive fact the
+ * extractor wrote — not an inference from empty artefacts.
  */
 export async function documentsAwaitingRead(
   limit: number,
@@ -365,6 +371,13 @@ export async function documentsAwaitingRead(
         AND d.status = 'extracted'
         AND d.read_attempts < $2
         AND d.source <> 'mail'
+        AND NOT EXISTS (
+              SELECT 1 FROM document_artifacts a
+               WHERE a.document_id = d.document_id
+                 AND a.business_id = d.business_id
+                 AND a.ordinal = 0
+                 AND 'scanned_no_text' = ANY (a.flags)
+            )
         AND NOT EXISTS (
               SELECT 1 FROM document_readings r
                 JOIN proposals p

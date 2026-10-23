@@ -80,6 +80,32 @@ describe('ingestDocument', () => {
     expect(offered.map((d) => d.documentId)).toEqual([manual.documentId]);
   });
 
+  it('a scanned manual PDF is extracted, flagged, and never offered to the conductor', async () => {
+    const scanPath = join(ROOT, 'scan.pdf');
+    const textPath = join(ROOT, 'text.pdf');
+    await writeFile(scanPath, buildPdf([null, null]));
+    await writeFile(textPath, buildPdf([null, ['Signed copy']]));
+    const scan = await ingestDocument({ path: scanPath, source: 'manual' }, OPTS);
+    const withText = await ingestDocument({ path: textPath, source: 'manual' }, OPTS);
+    expect([scan.status, withText.status]).toEqual(['extracted', 'extracted']);
+    expect((await loadArtifacts(scan.documentId, OPTS))[0]?.flags).toEqual(['scanned_no_text']);
+
+    // A model call on a brief with no text would spend money to learn nothing.
+    const offered = await documentsAwaitingRead(10, OPTS);
+    expect(offered.map((d) => d.documentId)).toEqual([withText.documentId]);
+  });
+
+  it('a PDF decompression bomb is rejected for memory with a Hebrew reason, not extracted', async () => {
+    const path = join(ROOT, 'bomb.pdf');
+    await writeFile(path, buildPdf([['bomb']], { flateBombMib: 2048 }));
+    const started = Date.now();
+    const doc = await ingestDocument({ path, source: 'mail', originalName: 'invoice.pdf' }, OPTS);
+    expect(doc.status).toBe('rejected');
+    expect(doc.reason).toMatch(/תקרת הזיכרון/);
+    expect(await loadArtifacts(doc.documentId, OPTS)).toEqual([]);
+    expect(Date.now() - started).toBeLessThan(30_000);
+  }, 60_000);
+
   it('still rejects binary that is not a PDF, whatever the name says', async () => {
     const path = join(ROOT, 'fake.pdf');
     await writeFile(path, Buffer.from([0x00, 0x01, 0xff, 0xfe, 0x80, 0x81]));

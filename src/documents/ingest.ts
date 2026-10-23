@@ -197,7 +197,8 @@ function reasonForExtractFailure(outcome: Extract<ExtractOutcome, { ok: false }>
   switch (outcome.code) {
     case 'extractor_timeout':
     case 'extractor_output_too_large':
-      // run-extractor.ts already phrases these two in Hebrew.
+    case 'extractor_memory':
+      // run-extractor.ts already phrases these three in Hebrew.
       return outcome.detail;
     case 'extractor_crashed':
       return `תהליך הפענוח קרס: ${outcome.detail}`;
@@ -300,9 +301,10 @@ export async function ingestDocument(
   }
 
   // Store-only (no type today; a PDF until it gained an extractor): the
-  // bytes are kept and downloadable, and nothing parses them. A terminal status of its own — `rejected` would tell the
-  // owner the file was refused, and `extracted` would offer it to a reader
-  // with no artefacts to read.
+  // bytes are kept and downloadable, and nothing parses them. A terminal
+  // status of its own — `rejected` would tell the owner the file was
+  // refused, and `extracted` would offer it to a reader with no artefacts
+  // to read.
   if (STORE_ONLY_TYPES.has(sniffed)) {
     await markStored(documentId, { businessId });
     return { ...document, status: 'stored' };
