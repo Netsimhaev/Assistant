@@ -24,6 +24,8 @@ import { isAutomatedSender } from '../mail/automated.js';
 import { finalCategories } from '../domain/mail-triage.js';
 import { runMailTriage } from './mail-triage.js';
 import { runMailDrafter } from './mail-drafter.js';
+import { attachmentEntries } from '../orchestrator/mail-poll.js';
+import { ATTACHMENT_DOC_TYPE_LABELS } from '../domain/mail-triage.js';
 
 const mailId = process.argv[2];
 
@@ -65,7 +67,9 @@ async function main(): Promise<void> {
   console.log(`מאת: ${mail.fromAddress || '(אין שולח)'}   נושא: ${mail.subject}`);
   if (mail.bodyText === '') console.log('(גוף ההודעה נמחק במדיניות השמירה — הסיווג רץ על הנושא בלבד)');
 
-  const outcome = await runMailTriage({ bundle, mail });
+  // Reads the documents the poll pass already ingested; ingests nothing.
+  const entries = await attachmentEntries(mail, new Map(), config.businessId);
+  const outcome = await runMailTriage({ bundle, mail, attachments: entries.map((e) => e.brief) });
   if (outcome.status !== 'read') {
     console.log(`\n--- סיווג נכשל ---\n${outcome.reason}`);
     return;
@@ -87,6 +91,10 @@ async function main(): Promise<void> {
     );
   }
   console.log(`מהות התשובה: ${triage.replyGist ?? '—'}`);
+  for (const a of triage.attachments) {
+    const name = entries[a.index]?.attachment.filename ?? '?';
+    console.log(`צרופה ${a.index} (${name}): ${ATTACHMENT_DOC_TYPE_LABELS[a.docType]} — ${a.summary}`);
+  }
 
   if (!final.categories.includes('question') || triage.replyGist === null) {
     console.log('\nאין שאלה לענות עליה — המנסח לא נקרא.');

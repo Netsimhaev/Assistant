@@ -6,6 +6,7 @@
  * `null` off the empty result. `claimMail` is a single conditional UPDATE
  * whose row count says whether it won, so two pollers cannot both proceed.
  */
+import type { AttachmentDocType } from '../domain/mail-triage.js';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
@@ -29,6 +30,16 @@ export interface MailAttachment {
   size: number;
   /** Set once the attachment was ingested as a document (`linkAttachmentDocument`). */
   documentId?: string;
+  /**
+   * What the triage reader said this attachment is (`annotateAttachment`).
+   * A model's reading of hostile text: advisory, for the owner's screens and
+   * filters only — no module under `src/policy/` reads it.
+   */
+  docType?: AttachmentDocType;
+  /** The reader's summary of the attachment, at most 300 characters. */
+  summary?: string;
+  /** The document was ingested and had no extractable text (a scan). */
+  scanned?: boolean;
 }
 
 export interface IncomingMail {
@@ -579,6 +590,55 @@ export async function linkAttachmentDocument(
       WHERE business_id = $1 AND mail_id = $2`,
     [businessId, mailId, noNul(attachmentId), noNul(documentId)],
   );
+}
+
+/** What the triage pass learned about one attachment. Every field optional; absent ones are left as they were. */
+export interface AttachmentAnnotation {
+  docType?: AttachmentDocType;
+  summary?: string;
+  scanned?: boolean;
+}
+
+/**
+ * Merge the triage pass's per-attachment result into that element of the
+ * mail's own `attachments` JSON — the sibling of `linkAttachmentDocument`,
+ * with the same rules: business-scoped, matched by `attachmentId`, every
+ * string NUL-stripped (jsonb refuses U+0000), other elements untouched.
+ */
+export async function annotateAttachment(
+  mailId: string,
+  attachmentId: string,
+  annotation: AttachmentAnnotation,
+  options: Options = {},
+): Promise<void> {
+  const { businessId, db } = ctx(options);
+  const patch: Record<string, unknown> = {};
+  if (annotation.docType !== undefined) patch['docType'] = noNul(annotation.docType);
+  if (annotation.summary !== undefined) patch['summary'] = noNul(annotation.summary);
+  if (annotation.scanned !== undefined) patch['scanned'] = annotation.scanned;
+  if (Object.keys(patch).length === 0) return;
+  await db.query(
+    `UPDATE mail_messages
+        SET attachments = (
+          SELECT coalesce(jsonb_agg(
+                   CASE WHEN e->>'attachmentId' = $3
+                        THEN e || $4::jsonb
+                        ELSE e END
+                   ORDER BY ord), '[]'::jsonb)
+            FROM jsonb_array_elements(attachments) WITH ORDINALITY AS t(e, ord))
+      WHERE business_id = $1 AND mail_id = $2`,
+    [businessId, mailId, noNul(attachmentId), JSON.stringify(patch)],
+  );
+}
+
+/** Whether an invoice row already links this mail to this document — one row per (mail, document). */
+export async function hasInvoiceForDocument(mailId: string, documentId: string, options: Options = {}): Promise<boolean> {
+  const { businessId, db } = ctx(options);
+  const { rows } = await db.query(
+    'SELECT 1 FROM mail_invoices WHERE business_id = $1 AND mail_id = $2 AND document_id = $3 LIMIT 1',
+    [businessId, mailId, documentId],
+  );
+  return rows.length > 0;
 }
 
 /** One mail by id, scoped to its business. `null` when this business does not own it. */

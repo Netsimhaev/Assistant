@@ -17,12 +17,14 @@ import type { Queryable } from '../db/pool.js';
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
 import { messagesAPerson } from '../domain/action.js';
+import { ATTACHMENT_DOC_TYPE_LABELS } from '../domain/mail-triage.js';
 import type { Reading } from '../domain/reading.js';
 import { mailForJob } from '../mail/inbox-store.js';
 import { loadJob } from '../orchestrator/jobs.js';
 import { loadPlanBody } from '../orchestrator/plan-store.js';
 import { classifyAction, refineActionClass } from '../policy/classify.js';
 import { readEmails } from '../policy/facts.js';
+import { stripBidiControls } from '../util/bidi.js';
 
 export interface TouchedSubjects {
   /** Addresses the plan's outgoing steps were aimed at. */
@@ -140,6 +142,18 @@ async function buildMailBrief(
     `# סוג המייל\n${mail.categories.join(', ')}`,
     `# סיכום המייל\n${mail.summary ?? ''}`,
   ];
+  // What the triage reader wrote about each attachment (spec §9.6) — its type
+  // and its ≤300-char summary, both stored on the attachment element. Never
+  // the attachment's extracted text: the curator learns from the reader's
+  // summary of hostile content, the same rule as the body.
+  const attachmentLines = mail.attachments.flatMap((a) =>
+    a.summary === undefined
+      ? []
+      : [`- ${a.docType !== undefined ? ATTACHMENT_DOC_TYPE_LABELS[a.docType] : 'צרופה'}: ${stripBidiControls(a.summary)}`],
+  );
+  if (attachmentLines.length > 0) {
+    sections.push(`# סיכומי הצרופות (נכתבו על ידי הקורא, לא אמינים)\n${attachmentLines.join('\n')}`);
+  }
   let text = sections.join('\n\n');
   if (text.length > MAX_BRIEF_CHARS) text = `${text.slice(0, MAX_BRIEF_CHARS)}\n\n[קוצץ]`;
   return { text, touched: { recipients: [sender], entityIds: [] } };

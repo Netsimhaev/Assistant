@@ -19,6 +19,10 @@ import { curateJob, curationRunsToday } from './curate.js';
 import { siftCandidates, type CurationResult } from './curation-parse.js';
 import { recallMemories, writeMemory } from './store.js';
 import { config } from '../config.js';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { buildPdf } from '../documents/fixtures/build-pdf.js';
 
 const BUSINESS = 'test-business';
 const SENDER = 'supplier@vendor.example';
@@ -85,6 +89,7 @@ async function pollOne(category: MailTriage['categories'], fromAddress: string, 
     isPerson: false,
     invoice: category.includes('invoice') ? { number: '1', amountText: '10', dateText: null } : null,
     replyGist: null,
+    attachments: [],
   };
   const triage = (async () => ({ status: 'read', triage: triaged })) as unknown as Triage;
   return pollMailbox({
@@ -98,6 +103,58 @@ async function pollOne(category: MailTriage['categories'], fromAddress: string, 
 }
 
 describe('curation from mail', () => {
+
+  it('curator brief includes attachment summaries and never PDF text', async () => {
+    await installMailboxCharter(BUSINESS);
+    await setCursor({ provider: 'google', cursor: 'C-0' }, { businessId: BUSINESS });
+    const bytes = buildPdf([['PDFCANARY invoice 77']]);
+    const mail = incomingMail({
+      providerMessageId: 'PM-CUR',
+      fromAddress: SENDER,
+      attachments: [{ attachmentId: 'A-1', filename: 'inv.pdf', mediaType: 'application/pdf', size: bytes.length }],
+    });
+    const client = {
+      initialCursor: async () => 'C-NEW',
+      listSince: async () => ({ messages: [mail], nextCursor: 'C-1' }),
+      fetchAttachment: async () => bytes,
+      ensureLabels: async (_t: string, names: string[]) => Object.fromEntries(names.map((n) => [n, `L-${n}`])),
+      addLabel: async () => true as const,
+      sendReply: async () => ({ externalId: 'S' }),
+    } as unknown as MailboxClient;
+    let seenText = '';
+    const triage = (async ({ attachments }: { attachments?: readonly { text: string | null }[] }) => {
+      // The quarantined reader DID see the PDF text…
+      expect(attachments?.[0]?.text).toContain('PDFCANARY');
+      const t: MailTriage = {
+        categories: ['invoice'],
+        summary: 'סיכום',
+        isPerson: false,
+        invoice: null,
+        replyGist: null,
+        attachments: [{ index: 0, docType: 'invoice', summary: 'ATTACHMENT-SUMMARY-77', invoice: null }],
+      };
+      return { status: 'read', triage: t };
+    }) as unknown as Triage;
+    const documentRoot = await mkdtemp(join(tmpdir(), 'mail-cur-'));
+    const result = await pollMailbox({
+      businessId: BUSINESS,
+      runtime: mailboxRuntime(client),
+      client,
+      triage,
+      drafter: stubDrafter(),
+      documentRoot,
+      curator: async (brief) => {
+        seenText = brief.text;
+        return { candidates: [] };
+      },
+    });
+    expect(result).toMatchObject({ triaged: 1, failed: 0 });
+    // …the curator gets the model's summary of it, never the text itself.
+    expect(seenText).toContain('ATTACHMENT-SUMMARY-77');
+    expect(seenText).toContain('חשבונית');
+    expect(seenText).not.toContain('PDFCANARY');
+  });
+
   it('mail job brief touches exactly the sender address', async () => {
     const jobId = await seedMailJob();
     const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });

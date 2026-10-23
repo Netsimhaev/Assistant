@@ -33,7 +33,8 @@ import { resumeAfterDecision } from './resume.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
 import { executeErasure } from '../governance/erasure.js';
 import { runDueJobs } from './run-due.js';
-import type { Triage, TriageOutcome } from '../sdk/mail-triage.js';
+import type { Triage, TriageOutcome, TriageRequest } from '../sdk/mail-triage.js';
+import { renderTriageBrief } from '../mail/triage-brief.js';
 import { resetDatabase } from '../test/db.js';
 import {
   DRAFT_BODY,
@@ -64,6 +65,7 @@ const INVOICE_TRIAGE: MailTriage = {
   isPerson: true,
   invoice: { number: 'INV-17', amountText: '1,200 ₪', dateText: '20/10/2026' },
   replyGist: null,
+  attachments: [],
 };
 
 const OTHER_TRIAGE: MailTriage = {
@@ -72,6 +74,7 @@ const OTHER_TRIAGE: MailTriage = {
   isPerson: false,
   invoice: null,
   replyGist: null,
+  attachments: [],
 };
 
 /**
@@ -336,7 +339,7 @@ describe('pollMailbox', () => {
     const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], {
       fetch: (id) => Buffer.concat([PDF_BYTES, Buffer.from(id.slice(-1))]),
     });
-    const documentTriage: MailTriage = { categories: ['document'], summary: 'הצעה ותנאים', isPerson: false, invoice: null, replyGist: null };
+    const documentTriage: MailTriage = { categories: ['document'], summary: 'הצעה ותנאים', isPerson: false, invoice: null, replyGist: null, attachments: [] };
 
     expectOk(
       await pollMailbox({ curator: stubCurator,
@@ -892,5 +895,132 @@ describe('pollMailbox', () => {
     );
     expect(gapRows).toHaveLength(1);
     expect(gapRows[0]?.whole).not.toContain('C-0');
+  });
+
+  describe('PDF attachments are read by triage', () => {
+    const pdfAttachment = (bytes: Buffer, id = 'A-1', filename = 'offer.pdf'): MailAttachment =>
+      ({ attachmentId: id, filename, mediaType: 'application/pdf', size: bytes.length });
+
+    function capturingTriage(triage: MailTriage): Triage & { requests: TriageRequest[] } {
+      const fn = (async (request: TriageRequest) => {
+        fn.requests.push(request);
+        return { status: 'read', triage } satisfies TriageOutcome;
+      }) as Triage & { requests: TriageRequest[] };
+      fn.requests = [];
+      return fn;
+    }
+
+    async function storedAttachments(providerMessageId: string): Promise<MailAttachment[]> {
+      const { rows } = await getPool().query<{ attachments: MailAttachment[] }>(
+        'SELECT attachments FROM mail_messages WHERE business_id = $1 AND provider_message_id = $2',
+        [BUSINESS, providerMessageId],
+      );
+      return rows[0]?.attachments ?? [];
+    }
+
+    it('poll ingests before triage and writes summary and docType onto the attachment element', async () => {
+      const { documentRoot } = await setup();
+      const bytes = buildPdf([['Price quote Q-55 total 900']]);
+      const png: MailAttachment = { attachmentId: 'A-0', filename: 'logo.png', mediaType: 'image/png', size: 10 };
+      const mail = incomingMail({ providerMessageId: 'PM-Q', attachments: [png, pdfAttachment(bytes)] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      const triage = capturingTriage({
+        ...OTHER_TRIAGE,
+        categories: ['document'],
+        attachments: [{ index: 1, docType: 'quote', summary: 'הצעת מחיר Q-55 על 900', invoice: null }],
+      });
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      expect(triage.requests).toHaveLength(1);
+      const seen = triage.requests[0]?.attachments ?? [];
+      // The PDF's text was there when the model was asked: ingest ran first.
+      expect(seen).toHaveLength(2);
+      expect(seen[0]).toMatchObject({ filename: 'logo.png', text: null, notRead: 'unsupported' });
+      expect(seen[1]?.text).toContain('Price quote Q-55');
+      const brief = renderTriageBrief(triage.requests[0]!.mail, 'nn', seen);
+      expect(brief).toContain('Price quote Q-55');
+
+      const stored = await storedAttachments('PM-Q');
+      expect(stored[0]).toEqual(png);
+      expect(stored[1]).toMatchObject({ attachmentId: 'A-1', docType: 'quote', summary: 'הצעת מחיר Q-55 על 900', scanned: false });
+      expect(typeof stored[1]?.documentId).toBe('string');
+      const { rows: invoices } = await getPool().query('SELECT 1 FROM mail_invoices WHERE business_id = $1', [BUSINESS]);
+      expect(invoices).toHaveLength(0);
+    });
+
+    it('an invoice found only inside a PDF creates an invoice row and the invoice label', async () => {
+      const { documentRoot } = await setup();
+      const bytes = buildPdf([['Invoice INV-9 total 500']]);
+      const mail = incomingMail({ providerMessageId: 'PM-PI', attachments: [pdfAttachment(bytes, 'A-1', 'scan-9.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      const triage = capturingTriage({
+        ...OTHER_TRIAGE,
+        categories: ['document'],
+        isPerson: true,
+        attachments: [{ index: 0, docType: 'invoice', summary: 'חשבונית INV-9', invoice: { number: 'INV-9', amountText: '500', dateText: null } }],
+      });
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      expect(triage.requests).toHaveLength(1);
+      const [row] = await mailRows();
+      expect(row?.categories).toContain('invoice');
+      expect(row?.categories).not.toContain('other');
+      expect(row?.labels_applied).toEqual([MAIL_LABELS.invoice]);
+      expect(fake.labelled).toEqual([{ providerMessageId: 'PM-PI', label: MAIL_LABELS.invoice }]);
+      const docId = (await storedAttachments('PM-PI'))[0]?.documentId;
+      const { rows: invoices } = await getPool().query(
+        'SELECT document_id, invoice_number, amount_text, file_name FROM mail_invoices WHERE business_id = $1',
+        [BUSINESS],
+      );
+      expect(invoices).toEqual([{ document_id: docId, invoice_number: 'INV-9', amount_text: '500', file_name: 'scan-9.pdf' }]);
+    });
+
+    it('a body invoice and the same PDF invoice make one row, and a second PDF invoice its own', async () => {
+      const { documentRoot } = await setup();
+      const a = buildPdf([['Invoice A']]);
+      const b = buildPdf([['Invoice B']]);
+      const mail = incomingMail({ providerMessageId: 'PM-2I', attachments: [pdfAttachment(a, 'A-1', 'a.pdf'), pdfAttachment(b, 'A-2', 'b.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: (id) => (id === 'A-1' ? a : b) });
+      const triage = capturingTriage({
+        ...INVOICE_TRIAGE,
+        attachments: [
+          { index: 0, docType: 'invoice', summary: 'חשבונית א', invoice: null },
+          { index: 1, docType: 'invoice', summary: 'חשבונית ב', invoice: { number: 'B-2', amountText: null, dateText: null } },
+        ],
+      });
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      const docs = (await storedAttachments('PM-2I')).map((x) => x.documentId);
+      const { rows: invoices } = await getPool().query<{ document_id: string; invoice_number: string | null }>(
+        'SELECT document_id, invoice_number FROM mail_invoices WHERE business_id = $1 ORDER BY file_name',
+        [BUSINESS],
+      );
+      expect(invoices).toEqual([
+        { document_id: docs[0], invoice_number: 'INV-17' },
+        { document_id: docs[1], invoice_number: 'B-2' },
+      ]);
+    });
+
+    it('a scanned PDF is shown to triage as not read and stored with scanned: true', async () => {
+      const { documentRoot } = await setup();
+      const bytes = buildPdf([null]);
+      const mail = incomingMail({ providerMessageId: 'PM-SC', attachments: [pdfAttachment(bytes, 'A-1', 'scan.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      expect(triage.requests).toHaveLength(1);
+      const seen = triage.requests[0]?.attachments ?? [];
+      expect(seen).toEqual([{ filename: 'scan.pdf', text: null, notRead: 'scanned', truncated: false }]);
+      expect(renderTriageBrief(triage.requests[0]!.mail, 'nn', seen)).toContain('(לא נקרא: סרוק)');
+      const [stored] = await storedAttachments('PM-SC');
+      expect(stored).toMatchObject({ scanned: true });
+      expect(typeof stored?.documentId).toBe('string');
+      expect(stored?.summary).toBeUndefined();
+    });
   });
 });

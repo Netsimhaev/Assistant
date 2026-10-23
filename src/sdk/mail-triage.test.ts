@@ -43,4 +43,23 @@ describe('mail triage', () => {
     const mail = { subject: 's', fromName: null, bodyText: 'b', bodyTruncated: false } as never;
     expect(buildTriageCall({ bundle, mail }).prompt).not.toBe(buildTriageCall({ bundle, mail }).prompt);
   });
+
+  it('parseTriageResponse checks attachment indexes against what the brief showed', () => {
+    const withAtt = { ...ok, attachments: [{ index: 1, docType: 'invoice', summary: 'חשבונית', invoice: null }] };
+    expect(parseTriageResponse(JSON.stringify(withAtt), 2).status).toBe('read');
+    expect(parseTriageResponse(JSON.stringify(withAtt), 1).status).toBe('unreadable');
+    expect(parseTriageResponse(JSON.stringify(withAtt)).status).toBe('unreadable');
+  });
+
+  it('the prompt carries the attachments and the contract names the closed type set', () => {
+    const bundle = { promptFragments: { 'intake.triage': 'f' } } as unknown as PolicyBundle;
+    const mail = { subject: 's', fromName: null, bodyText: 'b', bodyTruncated: false, fromAddress: 'x@y.example', replyTo: null, toAddresses: [] } as never;
+    const attachments = [{ filename: 'a.pdf', text: 'PDF-BODY', notRead: null, truncated: false }];
+    const { prompt, options } = buildTriageCall({ bundle, mail, attachments }, 'nn');
+    expect(prompt).toContain('=== צרופה 0: a.pdf :: nn ===');
+    expect(prompt).toContain('PDF-BODY');
+    const system = String(options.systemPrompt);
+    expect(system).toContain('"attachments"');
+    for (const t of ['invoice', 'receipt', 'quote', 'contract', 'order', 'report', 'other']) expect(system).toContain(`"${t}"`);
+  });
 });

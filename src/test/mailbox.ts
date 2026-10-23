@@ -33,6 +33,7 @@ export const QUESTION_TRIAGE: MailTriage = {
   isPerson: true,
   invoice: null,
   replyGist: 'לומר שנחזור אליה עד מחר',
+  attachments: [],
 };
 
 export async function installMailboxCharter(

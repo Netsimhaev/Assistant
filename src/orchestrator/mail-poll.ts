@@ -26,8 +26,12 @@
  *      `gap` — no backfill (spec §2.2).
  *   3. Triage, oldest first, while the daily ceiling allows. Over the
  *      ceiling a mail is marked `over_cap` and the model is never called.
- *   4. Per mail: label → attachments → invoice → owner notice → reply card →
- *      settle → close the triage job. A failure inside one mail settles THAT
+ *   4. Per mail: attachments → triage → label → per-attachment reading →
+ *      invoices → owner notice → reply card → settle → close the triage job.
+ *      Attachments are ingested BEFORE the triage call (spec §9.3) so the
+ *      quarantined reader sees their extracted text, fenced, in its brief;
+ *      ingest stays non-fatal per attachment, and one that failed is shown
+ *      to the reader as not read. A failure inside one mail settles THAT
  *      mail as `failed` and the pass moves on.
  *   5. `reraiseAfterFailedSend`, once, after the triage loop: it is
  *      independent of this batch, and running it last means a pass whose
@@ -74,13 +78,17 @@ import { getPool } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, TEXT, XLSX } from '../documents/media-type.js';
 import type { PolicyBundle } from '../domain/policy.js';
-import { finalCategories, type MailTriage } from '../domain/mail-triage.js';
+import { attachmentIsInvoice, finalCategories, type MailTriage } from '../domain/mail-triage.js';
+import { loadArtifacts, loadDocument } from '../documents/store.js';
+import { renderArtifactFull } from '../documents/brief.js';
 import { listGrants } from '../governance/oauth-grants.js';
 import { isAutomatedSender } from '../mail/automated.js';
 import {
+  annotateAttachment,
   claimMail,
   getCursor,
   linkAttachmentDocument,
+  hasInvoiceForDocument,
   hasInvoiceForMail,
   mailForJob,
   insertInvoice,
@@ -95,6 +103,7 @@ import {
   staleClaimsToReceived,
   settleMail,
   type IncomingMail,
+  type MailAttachment,
   type MailCursor,
   type StoredMail,
 } from '../mail/inbox-store.js';
@@ -103,6 +112,11 @@ import { createGmailClient } from '../mail/providers/gmail.js';
 import { createGraphClient } from '../mail/providers/graph.js';
 import { MailboxCursorError, isFailure, type MailboxClient } from '../mail/providers/types.js';
 import { renderMailNotice } from '../mail/whatsapp-notice.js';
+import {
+  TRIAGE_ATTACHMENT_MAX_CHARS,
+  shownAttachmentCount,
+  type BriefAttachment,
+} from '../mail/triage-brief.js';
 import { runMailDrafter, type Drafter } from '../sdk/mail-drafter.js';
 import { runMailTriage, type Triage } from '../sdk/mail-triage.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -491,9 +505,13 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
       businessId,
     });
 
+    // Before the call, so the reader sees what the attachments say (§9.3).
+    const ingested = await ingestAttachments(mail, pass);
+    const entries = await attachmentEntries(mail, ingested, businessId);
+
     // Counted before the call: a call that throws was still made and billed.
     result.triaged += 1;
-    const outcome = await pass.triage({ bundle: pass.bundle, mail });
+    const outcome = await pass.triage({ bundle: pass.bundle, mail, attachments: entries.map((e) => e.brief) });
     if (outcome.status !== 'read') throw new Error(`triage_unreadable: ${outcome.reason}`);
     const triage: MailTriage = outcome.triage;
 
@@ -503,10 +521,34 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     );
 
     const labelsApplied = await applyLabels(mail, categories, job.jobId, pass);
-    const documents = await ingestAttachments(mail, pass);
+    await recordAttachmentReadings(mail, triage, entries, pass);
 
-    if (categories.includes('invoice') && !(await hasInvoiceForMail(mail.mailId, { businessId }))) {
-      const linked = documents.find((d) => d.mediaType === 'application/pdf') ?? documents[0] ?? null;
+    const documents = [...ingested.values()];
+    // The reader's invoice attachments that became documents, in stored order.
+    const invoiceAttachments = triage.attachments
+      .filter(attachmentIsInvoice)
+      .sort((a, b) => a.index - b.index)
+      .flatMap((a) => {
+        const entry = entries[a.index];
+        return entry !== undefined && entry.documentId !== null
+          ? [{ triaged: a, entry, documentId: entry.documentId }]
+          : [];
+      });
+
+    // The mail-level invoice the BODY names, as before. `categories` alone is
+    // no longer the test: an invoice attachment adds the category too, and
+    // that one is recorded per document below. Linked to the reader's first
+    // invoice attachment when there is one, so the two never make two rows.
+    if (
+      triage.categories.includes('invoice') &&
+      categories.includes('invoice') &&
+      !(await hasInvoiceForMail(mail.mailId, { businessId }))
+    ) {
+      const firstInvoice = invoiceAttachments[0];
+      const linked =
+        firstInvoice !== undefined
+          ? { documentId: firstInvoice.documentId, fileName: firstInvoice.entry.attachment.filename }
+          : (documents.find((d) => d.mediaType === 'application/pdf') ?? documents[0] ?? null);
       await insertInvoice(
         {
           mailId: mail.mailId,
@@ -516,6 +558,26 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
           amountText: triage.invoice?.amountText ?? null,
           documentId: linked?.documentId ?? null,
           fileName: linked?.fileName ?? null,
+          receivedAt: mail.receivedAt,
+        },
+        { businessId },
+      );
+    }
+
+    // An invoice found inside an attachment (§9.3), even when the body named
+    // none: one row per (mail, document), never a second on a re-handle.
+    // Unverified like the body's — no module under `src/policy/` reads it.
+    for (const { triaged: a, entry, documentId } of invoiceAttachments) {
+      if (await hasInvoiceForDocument(mail.mailId, documentId, { businessId })) continue;
+      await insertInvoice(
+        {
+          mailId: mail.mailId,
+          supplierAddress: mail.fromAddress,
+          supplierName: mail.fromName,
+          invoiceNumber: a.invoice?.number ?? null,
+          amountText: a.invoice?.amountText ?? null,
+          documentId,
+          fileName: entry.attachment.filename,
           receivedAt: mail.receivedAt,
         },
         { businessId },
@@ -760,6 +822,115 @@ interface IngestedAttachment {
   mediaType: string;
 }
 
+/** Whether the document pipeline takes this attachment at all. */
+function isIngestible(attachment: MailAttachment): boolean {
+  const mediaType = baseMediaType(attachment.mediaType);
+  const pdfByName = mediaType === 'application/octet-stream' && attachment.filename.toLowerCase().endsWith('.pdf');
+  return INGESTIBLE_TYPES.has(mediaType) || pdfByName;
+}
+
+/** One stored attachment: its document (if any) and how the triage brief shows it. */
+export interface AttachmentEntry {
+  attachment: MailAttachment;
+  documentId: string | null;
+  /** The document was ingested and yielded no text (`scanned_no_text`). */
+  scanned: boolean;
+  brief: BriefAttachment;
+}
+
+/**
+ * Every stored attachment, in stored order (the order the brief indexes by),
+ * with the text its document's artefacts hold — rendered by the same
+ * `renderArtifactFull` layout the reading brief uses, bounded a little past
+ * what the brief will show so the brief can still mark the cut. Exported for
+ * the live `sdk:mail-triage` script, which reads but never writes.
+ *
+ * Reads only: an attachment whose document cannot be loaded is shown as not
+ * ingested rather than failing the mail.
+ */
+export async function attachmentEntries(
+  mail: StoredMail,
+  ingested: ReadonlyMap<string, IngestedAttachment>,
+  businessId: string,
+): Promise<AttachmentEntry[]> {
+  const out: AttachmentEntry[] = [];
+  for (const attachment of mail.attachments) {
+    const documentId = ingested.get(attachment.attachmentId)?.documentId ?? attachment.documentId ?? null;
+    const notRead = (reason: 'scanned' | 'not_ingested' | 'unsupported', scanned = false): AttachmentEntry => ({
+      attachment,
+      documentId,
+      scanned,
+      brief: { filename: attachment.filename, text: null, notRead: reason, truncated: false },
+    });
+    if (documentId === null) {
+      out.push(notRead(isIngestible(attachment) ? 'not_ingested' : 'unsupported'));
+      continue;
+    }
+    try {
+      const document = await loadDocument(documentId, { businessId });
+      if (document === null || document.status !== 'extracted') {
+        out.push(notRead(document?.status === 'stored' ? 'unsupported' : 'not_ingested'));
+        continue;
+      }
+      const artifacts = await loadArtifacts(documentId, { businessId });
+      if (artifacts[0]?.flags.includes('scanned_no_text') === true) {
+        out.push(notRead('scanned', true));
+        continue;
+      }
+      const bound = TRIAGE_ATTACHMENT_MAX_CHARS + 1_000;
+      const pieces: string[] = [];
+      let length = 0;
+      for (const artifact of artifacts) {
+        if (length > bound) break;
+        const piece = renderArtifactFull(artifact);
+        pieces.push(piece);
+        length += piece.length + 2;
+      }
+      out.push({
+        attachment,
+        documentId,
+        scanned: false,
+        brief: {
+          filename: attachment.filename,
+          text: pieces.join('\n\n').slice(0, bound),
+          notRead: null,
+          truncated: artifacts.some((a) => a.flags.includes('truncated')),
+        },
+      });
+    } catch {
+      out.push(notRead('not_ingested'));
+    }
+  }
+  return out;
+}
+
+/**
+ * Write what the reader said about each shown attachment — its type and
+ * summary — and, for every ingested one, whether it was a scan, onto the
+ * attachment's own element. Never fatal: the mail still settles.
+ */
+async function recordAttachmentReadings(
+  mail: StoredMail,
+  triage: MailTriage,
+  entries: readonly AttachmentEntry[],
+  pass: PassContext,
+): Promise<void> {
+  const { businessId } = pass;
+  const shown = shownAttachmentCount(entries.map((e) => e.brief));
+  for (const [index, entry] of entries.entries()) {
+    const said = index < shown ? triage.attachments.find((a) => a.index === index) : undefined;
+    const annotation = {
+      ...(said !== undefined ? { docType: said.docType, summary: said.summary } : {}),
+      ...(entry.documentId !== null ? { scanned: entry.scanned } : {}),
+    };
+    try {
+      await annotateAttachment(mail.mailId, entry.attachment.attachmentId, annotation, { businessId });
+    } catch {
+      await noteMailError(mail.mailId, 'attachment_failed', { businessId });
+    }
+  }
+}
+
 /**
  * Fetch and ingest the attachments the document pipeline accepts — a
  * declared ingestible type, or `application/octet-stream` named `.pdf`
@@ -777,14 +948,12 @@ interface IngestedAttachment {
  * also lose the owner's notice, the invoice row and the reply card. The
  * attachment stays in the mailbox either way.
  */
-async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<IngestedAttachment[]> {
+async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<Map<string, IngestedAttachment>> {
   const { businessId } = pass;
-  const out: IngestedAttachment[] = [];
+  const out = new Map<string, IngestedAttachment>();
   let taken = 0;
   for (const attachment of mail.attachments) {
-    const mediaType = baseMediaType(attachment.mediaType);
-    const pdfByName = mediaType === 'application/octet-stream' && attachment.filename.toLowerCase().endsWith('.pdf');
-    if (!INGESTIBLE_TYPES.has(mediaType) && !pdfByName) continue;
+    if (!isIngestible(attachment)) continue;
     if (attachment.size > MAX_ATTACHMENT_BYTES) {
       await noteMailError(mail.mailId, 'attachment_too_large', { businessId });
       continue;
@@ -807,7 +976,11 @@ async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<I
           { path, source: 'mail', originalName: attachment.filename },
           { businessId, documentRoot: pass.documentRoot },
         );
-        out.push({ documentId: document.documentId, fileName: attachment.filename, mediaType: document.mediaType });
+        out.set(attachment.attachmentId, {
+          documentId: document.documentId,
+          fileName: attachment.filename,
+          mediaType: document.mediaType,
+        });
         // Persist the link so the owner can download it from the mail screen.
         // Never fatal: the document is already ingested either way.
         try {
