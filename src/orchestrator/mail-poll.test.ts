@@ -10,7 +10,8 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { randomBytes } from 'node:crypto';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { ingestDocument } from '../documents/ingest.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { closePool, getPool } from '../db/pool.js';
@@ -1136,6 +1137,129 @@ describe('pollMailbox', () => {
       expect(stored).toMatchObject({ scanned: true });
       expect(typeof stored?.documentId).toBe('string');
       expect(stored?.summary).toBeUndefined();
+    });
+
+    it('an undecodable PDF is stored with its reason, linked for download, and shown to triage as undecodable', async () => {
+      const { documentRoot } = await setup();
+      const bytes = Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]);
+      const mail = incomingMail({ providerMessageId: 'PM-UD', attachments: [pdfAttachment(bytes, 'A-1', 'broken.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      expect(triage.requests).toHaveLength(1);
+      const seen = triage.requests[0]?.attachments ?? [];
+      expect(seen).toEqual([{ filename: 'broken.pdf', text: null, notRead: 'undecodable', truncated: false }]);
+      expect(renderTriageBrief(triage.requests[0]!.mail, 'nn', seen)).toContain('(לא נקרא: לא ניתן לפענח)');
+      const [stored] = await storedAttachments('PM-UD');
+      expect(typeof stored?.documentId).toBe('string');
+      expect(stored).toMatchObject({ scanned: false });
+      const { rows } = await getPool().query<{ status: string; reason: string | null }>(
+        'SELECT status, reason FROM documents WHERE business_id = $1 AND document_id = $2',
+        [BUSINESS, stored?.documentId],
+      );
+      expect(rows).toEqual([{ status: 'stored', reason: expect.stringMatching(/^הפענוח נכשל: /) }]);
+    });
+
+    it('a PDF stored before PDF reading existed is shown to triage as such, not as an unsupported type', async () => {
+      const { documentRoot } = await setup();
+      const bytes = buildPdf([['Old offer']]);
+      // A pre-branch row: the same bytes, `stored`, no reason, no artefacts.
+      const tmp = await mkdtemp(join(tmpdir(), 'legacy-pdf-'));
+      const path = join(tmp, 'old.pdf');
+      await writeFile(path, bytes);
+      const legacy = await ingestDocument({ path, source: 'mail', originalName: 'old.pdf' }, { businessId: BUSINESS, documentRoot });
+      await getPool().query('DELETE FROM document_artifacts WHERE business_id = $1 AND document_id = $2', [BUSINESS, legacy.documentId]);
+      await getPool().query("UPDATE documents SET status = 'stored', reason = NULL WHERE business_id = $1 AND document_id = $2", [BUSINESS, legacy.documentId]);
+      const mail = incomingMail({ providerMessageId: 'PM-LG', attachments: [pdfAttachment(bytes, 'A-1', 'old.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      const seen = triage.requests[0]?.attachments ?? [];
+      expect(seen).toEqual([{ filename: 'old.pdf', text: null, notRead: 'stored_before_reading', truncated: false }]);
+      const brief = renderTriageBrief(triage.requests[0]!.mail, 'nn', seen);
+      expect(brief).toContain('(לא נקרא: נשמר לפני שקריאת PDF נבנתה)');
+      expect(brief).not.toContain('סוג לא נתמך');
+      expect((await storedAttachments('PM-LG'))[0]?.documentId).toBe(legacy.documentId);
+    });
+
+    it('re-handling clears a summary and type the new triage no longer gives', async () => {
+      const { documentRoot } = await setup();
+      const bytes = buildPdf([['Price quote Q-77']]);
+      const mail = incomingMail({ providerMessageId: 'PM-RH', attachments: [pdfAttachment(bytes, 'A-1', 'q.pdf')] });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: () => bytes });
+      const first = capturingTriage({
+        ...OTHER_TRIAGE,
+        categories: ['document'],
+        attachments: [{ index: 0, docType: 'quote', summary: 'הצעת מחיר Q-77', invoice: null }],
+      });
+      const run = (triage: Triage) =>
+        pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot });
+
+      expectOk(await run(first));
+      expect((await storedAttachments('PM-RH'))[0]).toMatchObject({ docType: 'quote', summary: 'הצעת מחיר Q-77' });
+
+      await getPool().query("UPDATE mail_messages SET state = 'received', triaged_at = NULL WHERE business_id = $1", [BUSINESS]);
+      const second = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'], attachments: [] });
+      expectOk(await run(second));
+
+      expect(second.requests).toHaveLength(1);
+      const [stored] = await storedAttachments('PM-RH');
+      expect(stored?.summary).toBeUndefined();
+      expect(stored?.docType).toBeUndefined();
+      expect(stored).toMatchObject({ attachmentId: 'A-1', scanned: false });
+      expect(typeof stored?.documentId).toBe('string');
+    });
+
+    it('stops ingesting a mail\'s attachments once its time budget is spent, noting it, and still triages', async () => {
+      const { documentRoot } = await setup();
+      const bytes = [buildPdf([['One']]), buildPdf([['Two']]), buildPdf([['Three']])];
+      const mail = incomingMail({
+        providerMessageId: 'PM-TB',
+        attachments: bytes.map((b, i) => pdfAttachment(b, `A-${i}`, `${i}.pdf`)),
+      });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], {
+        // A slow provider: each attachment takes longer than the whole budget.
+        fetch: ((id: string) =>
+          new Promise((resolve) => setTimeout(() => resolve(bytes[Number(id.slice(2))]!), 300))) as unknown as (id: string) => Buffer,
+      });
+      const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
+
+      const result = expectOk(
+        await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot, attachmentBudgetMs: 200 }),
+      );
+
+      expect(result).toMatchObject({ triaged: 1, failed: 0 });
+      // The first attachment is always taken; the budget then stops the rest.
+      expect(fake.fetched).toEqual(['PM-TB/A-0']);
+      const seen = triage.requests[0]?.attachments ?? [];
+      expect(seen.map((a) => a.notRead)).toEqual([null, 'not_ingested', 'not_ingested']);
+      const { rows } = await getPool().query<{ state: string; error: string | null }>(
+        'SELECT state, error FROM mail_messages WHERE business_id = $1',
+        [BUSINESS],
+      );
+      expect(rows).toEqual([{ state: 'triaged', error: 'attachment_budget_exceeded' }]);
+    });
+
+    it('with the default budget every attachment of a mail is ingested', async () => {
+      const { documentRoot } = await setup();
+      const bytes = [buildPdf([['One']]), buildPdf([['Two']]), buildPdf([['Three']])];
+      const mail = incomingMail({
+        providerMessageId: 'PM-TD',
+        attachments: bytes.map((b, i) => pdfAttachment(b, `A-${i}`, `${i}.pdf`)),
+      });
+      const fake = fakeClient([{ messages: [mail], nextCursor: 'C-1' }], { fetch: (id) => bytes[Number(id.slice(2))]! });
+      const triage = capturingTriage({ ...OTHER_TRIAGE, categories: ['document'] });
+
+      expectOk(await pollMailbox({ curator: stubCurator, businessId: BUSINESS, runtime: mailboxRuntime(fake.client), client: fake.client, triage, drafter: stubDrafter(), documentRoot }));
+
+      expect(fake.fetched).toHaveLength(3);
+      expect((triage.requests[0]?.attachments ?? []).map((a) => a.notRead)).toEqual([null, null, null]);
+      const { rows } = await getPool().query<{ error: string | null }>('SELECT error FROM mail_messages WHERE business_id = $1', [BUSINESS]);
+      expect(rows).toEqual([{ error: null }]);
     });
   });
 });

@@ -45,8 +45,12 @@ export const TRIAGE_LABELS = {
   body: 'גוף ההודעה (לא אמין)',
 } as const;
 
-/** Why an attachment's text is not in the brief. */
-export type AttachmentNotRead = 'scanned' | 'not_ingested' | 'unsupported';
+/**
+ * Why an attachment's text is not in the brief. `undecodable`: a PDF kept
+ * `stored` because extraction failed (ruling P7). `stored_before_reading`: a
+ * PDF kept `stored` with no reason — ingested before PDFs were read at all.
+ */
+export type AttachmentNotRead = 'scanned' | 'not_ingested' | 'unsupported' | 'undecodable' | 'stored_before_reading';
 
 /** One stored attachment, as the brief shows it. Built in code from the document's artefacts. */
 export interface BriefAttachment {
@@ -64,6 +68,8 @@ const NOT_READ_TEXT: Record<AttachmentNotRead, string> = {
   scanned: '(לא נקרא: סרוק)',
   not_ingested: '(לא נקרא: לא נקלט)',
   unsupported: '(לא נקרא: סוג לא נתמך)',
+  undecodable: '(לא נקרא: לא ניתן לפענח)',
+  stored_before_reading: '(לא נקרא: נשמר לפני שקריאת PDF נבנתה)',
 };
 
 const CUT_NOTICE = '\n(קוצץ — התוכן המקורי ארוך יותר)';

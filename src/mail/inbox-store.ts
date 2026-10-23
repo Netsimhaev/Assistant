@@ -603,6 +603,12 @@ export interface AttachmentAnnotation {
   docType?: AttachmentDocType;
   summary?: string;
   scanned?: boolean;
+  /**
+   * This annotation is the whole reading: any `docType`/`summary` a previous
+   * handling wrote is dropped first, so a re-handled mail whose new triage
+   * says nothing about the attachment does not keep a stale summary.
+   */
+  replaceReading?: boolean;
 }
 
 /**
@@ -622,18 +628,19 @@ export async function annotateAttachment(
   if (annotation.docType !== undefined) patch['docType'] = noNul(annotation.docType);
   if (annotation.summary !== undefined) patch['summary'] = noNul(annotation.summary);
   if (annotation.scanned !== undefined) patch['scanned'] = annotation.scanned;
-  if (Object.keys(patch).length === 0) return;
+  const replace = annotation.replaceReading === true;
+  if (Object.keys(patch).length === 0 && !replace) return;
   await db.query(
     `UPDATE mail_messages
         SET attachments = (
           SELECT coalesce(jsonb_agg(
                    CASE WHEN e->>'attachmentId' = $3
-                        THEN e || $4::jsonb
+                        THEN (CASE WHEN $5::boolean THEN e - 'docType' - 'summary' ELSE e END) || $4::jsonb
                         ELSE e END
                    ORDER BY ord), '[]'::jsonb)
             FROM jsonb_array_elements(attachments) WITH ORDINALITY AS t(e, ord))
       WHERE business_id = $1 AND mail_id = $2`,
-    [businessId, mailId, noNul(attachmentId), JSON.stringify(patch)],
+    [businessId, mailId, noNul(attachmentId), JSON.stringify(patch), replace],
   );
 }
 

@@ -229,23 +229,29 @@ export async function markExtracted(
   });
 }
 
-/** Mark a document `rejected` with a human-readable reason (§8). The original bytes stay on disk. */
-/** A store-only document (a PDF): terminal, no artefacts. */
+/**
+ * A stored document: terminal, no artefacts, kept downloadable and never
+ * offered to a reader (`documentsAwaitingRead` takes `extracted` only).
+ * `reason` says why it was not read — today a PDF whose extraction failed
+ * after its bytes were written (ruling P7); `null` for a row written before
+ * PDFs were extracted at all (a store-only type).
+ */
 export async function markStored(
   documentId: string,
-  options: { businessId?: string; db?: Queryable } = {},
+  options: { businessId?: string; db?: Queryable; reason?: string } = {},
 ): Promise<void> {
   const db = options.db ?? getPool();
   const { rowCount } = await db.query(
-    `UPDATE documents SET status = 'stored'
+    `UPDATE documents SET status = 'stored', reason = $3
       WHERE business_id = $1 AND document_id = $2`,
-    [options.businessId ?? config.businessId, documentId],
+    [options.businessId ?? config.businessId, documentId, options.reason ?? null],
   );
   if (rowCount !== 1) {
     throw new Error(`markStored: no document ${documentId} for business ${options.businessId ?? config.businessId}`);
   }
 }
 
+/** Mark a document `rejected` with a human-readable reason (§8). The original bytes stay on disk. */
 export async function markRejected(
   documentId: string,
   reason: string,

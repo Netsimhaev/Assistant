@@ -15,6 +15,7 @@ import { appendAudit } from '../audit/log.js';
 import { annotateAttachment, insertInvoice, linkAttachmentDocument, markOverCap, noteMailError, setCursor, settleMail } from '../mail/inbox-store.js';
 import { resetDatabase } from '../test/db.js';
 import { storedMail } from '../test/mailbox.js';
+import { ingestDocument } from '../documents/ingest.js';
 import { createOwner } from './auth.js';
 import { createServer } from './server.js';
 import { DOCUMENT_LIMIT } from './mail-handlers.js';
@@ -327,6 +328,24 @@ describe('fix round 1', () => {
     expect(list).toContain('href="/documents/docP2/file"');
     expect(list).toContain('📎');
     expect((await get(baseUrl, cookie, '/documents/docP1/file')).status).toBe(200);
+  });
+
+  it('a mailed PDF that cannot be decoded is still downloadable from the mail (ruling P7)', async () => {
+    const m = await storedMail(BUSINESS, { providerMessageId: 'D-U', attachments: [pdf('a1', 'broken.pdf')] });
+    const src = join(root, 'incoming-broken');
+    const bytes = Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]);
+    await writeFile(src, bytes);
+    const doc = await ingestDocument({ path: src, source: 'mail', originalName: 'broken.pdf' }, { businessId: BUSINESS, documentRoot: root });
+    expect(doc.status).toBe('stored');
+    expect(doc.reason).toMatch(/^הפענוח נכשל: /);
+    await linkAttachmentDocument(m.mailId, 'a1', doc.documentId, { businessId: BUSINESS });
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    const detail = await (await get(baseUrl, cookie, `/mail/${m.mailId}`)).text();
+    expect(detail).toContain(`href="/documents/${doc.documentId}/file"`);
+    const file = await get(baseUrl, cookie, `/documents/${doc.documentId}/file`);
+    expect(file.status).toBe(200);
+    expect(Buffer.from(await file.arrayBuffer()).equals(bytes)).toBe(true);
   });
 
   it('does not offer a download for a linked document that was rejected', async () => {

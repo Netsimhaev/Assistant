@@ -66,6 +66,14 @@
  * derived and stored (it is one of the dedupe INSERT's own columns), but
  * nothing exists at that path, and a caller that expects to open every
  * rejected document's stored copy must check for this one case first.
+ *
+ * **A PDF that fails extraction is `stored`, not `rejected` (ruling P7).**
+ * Once a sniffed PDF's bytes are on disk, an extraction-stage failure — a
+ * password, a content error, the timeout, the memory cap — ends in `stored`
+ * with the same Hebrew reason in `reason`: downloadable by the owner, never
+ * read (the conductor takes `extracted` only). Refusals before extraction —
+ * the size cap, an unidentified type, the archive guard — stay `rejected`,
+ * and so does an extraction failure of any other type.
  */
 
 import { createHash } from 'node:crypto';
@@ -326,7 +334,17 @@ export async function ingestDocument(
 
   const outcome = await runExtractor(extractorId, absolutePath, options.runExtractorOptions);
   if (!outcome.ok) {
-    return reject(reasonForExtractFailure(outcome));
+    const reason = reasonForExtractFailure(outcome);
+    // Ruling P7: a PDF that passed the sniff and is already on disk but would
+    // not decode (a password, a content error, the timeout, the memory cap)
+    // stays downloadable — `rejected` would take the owner's copy of a mailed
+    // attachment away (spec §9, "attached for download"). It is never read:
+    // the conductor takes `extracted` only. Every other type keeps `rejected`.
+    if (sniffed === PDF) {
+      await markStored(documentId, { businessId, reason });
+      return { ...document, status: 'stored', reason };
+    }
+    return reject(reason);
   }
 
   const outline = buildOutline(outcome.artifacts);

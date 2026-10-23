@@ -53,19 +53,42 @@ describe('ingestDocument', () => {
     expect((await loadDocument(doc.documentId, OPTS))?.status).toBe('extracted');
   });
 
-  it('a malformed PDF is rejected with a Hebrew reason, not a crash', async () => {
+  it('a malformed PDF is stored (downloadable, never read) with a Hebrew reason, not rejected', async () => {
     const path = join(ROOT, 'broken.pdf');
     await writeFile(
       path,
       Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]),
     );
     const doc = await ingestDocument({ path, source: 'manual', originalName: 'broken.pdf' }, OPTS);
-    expect(doc.status).toBe('rejected');
+    // Ruling P7: the bytes are on disk, so the owner keeps the download.
+    expect(doc.status).toBe('stored');
     expect(doc.reason).toMatch(/^הפענוח נכשל: /);
+    expect(await loadDocument(doc.documentId, OPTS)).toMatchObject({ status: 'stored', reason: doc.reason });
     expect(await loadArtifacts(doc.documentId, OPTS)).toEqual([]);
-    // The bytes are kept, like every other rejection after the disk write.
     expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
+    // A manual document is otherwise the conductor's — a stored one never is.
+    expect(await documentsAwaitingRead(10, OPTS)).toEqual([]);
   });
+
+  it('a PDF the extractor refuses (as for a password) or that times out is stored with the reason', async () => {
+    const failPath = join(ROOT, 'locked.pdf');
+    const hangPath = join(ROOT, 'slow.pdf');
+    await writeFile(failPath, buildPdf([['Locked']]));
+    await writeFile(hangPath, buildPdf([['Slow']]));
+    const failed = await ingestDocument(
+      { path: failPath, source: 'manual' },
+      { ...OPTS, runExtractorOptions: { childPath: stubChild('fail.ts') } },
+    );
+    const timedOut = await ingestDocument(
+      { path: hangPath, source: 'manual' },
+      { ...OPTS, runExtractorOptions: { timeoutMs: 200, childPath: stubChild('hang.ts') } },
+    );
+    expect([failed.status, timedOut.status]).toEqual(['stored', 'stored']);
+    expect(failed.reason).toContain('נכשל');
+    expect(timedOut.reason?.length).toBeGreaterThan(0);
+    expect((await loadDocument(timedOut.documentId, OPTS))?.reason).toBe(timedOut.reason);
+    expect(await documentsAwaitingRead(10, OPTS)).toEqual([]);
+  }, 10_000);
 
   it('a manually ingested PDF is offered to the conductor; a mail-sourced one is not', async () => {
     const manualPath = join(ROOT, 'manual.pdf');
@@ -95,12 +118,12 @@ describe('ingestDocument', () => {
     expect(offered.map((d) => d.documentId)).toEqual([withText.documentId]);
   });
 
-  it('a PDF decompression bomb is rejected for memory with a Hebrew reason, not extracted', async () => {
+  it('a PDF decompression bomb is stopped for memory with a Hebrew reason, stored and not extracted', async () => {
     const path = join(ROOT, 'bomb.pdf');
     await writeFile(path, buildPdf([['bomb']], { flateBombMib: 2048 }));
     const started = Date.now();
     const doc = await ingestDocument({ path, source: 'mail', originalName: 'invoice.pdf' }, OPTS);
-    expect(doc.status).toBe('rejected');
+    expect(doc.status).toBe('stored');
     expect(doc.reason).toMatch(/תקרת הזיכרון/);
     expect(await loadArtifacts(doc.documentId, OPTS)).toEqual([]);
     expect(Date.now() - started).toBeLessThan(30_000);

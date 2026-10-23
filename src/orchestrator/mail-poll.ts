@@ -76,7 +76,8 @@ import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { getPool } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
-import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, TEXT, XLSX } from '../documents/media-type.js';
+import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, PDF, TEXT, XLSX } from '../documents/media-type.js';
+import type { DocumentRecord } from '../documents/types.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import {
   attachmentIsInvoice,
@@ -120,6 +121,7 @@ import { renderMailNotice } from '../mail/whatsapp-notice.js';
 import {
   TRIAGE_ATTACHMENT_MAX_CHARS,
   shownAttachmentCount,
+  type AttachmentNotRead,
   type BriefAttachment,
 } from '../mail/triage-brief.js';
 import { runMailDrafter, type Drafter } from '../sdk/mail-drafter.js';
@@ -180,6 +182,8 @@ export interface PollMailboxOptions {
   now?: Date;
   /** Most mails triaged in one pass (default 20): a pass is bounded in time as well as in money. */
   limit?: number;
+  /** Test seam: one mail's attachment-ingest time budget (default 90 s). */
+  attachmentBudgetMs?: number;
 }
 
 const MAILBOX_CREDENTIAL_REF = 'OAUTH_MAILBOX';
@@ -190,6 +194,8 @@ const STALE_CLAIM_MINUTES = 30;
 /** The document pipeline's own ceiling (`ingest.ts`). Checked on the declared size, before downloading. */
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MAIL = 10;
+/** Wall-clock budget for one mail's attachments, checked before each starts (`ingestAttachments`). */
+const ATTACHMENT_BUDGET_MS = 90_000;
 
 /** Attachment types the document pipeline accepts. PDF is stored and kept downloadable. */
 const INGESTIBLE_TYPES: ReadonlySet<string> = new Set([
@@ -370,6 +376,7 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
     drafter: options.drafter ?? runMailDrafter,
     curator: options.curator,
     documentRoot: options.documentRoot ?? config.documentRoot,
+    attachmentBudgetMs: options.attachmentBudgetMs ?? ATTACHMENT_BUDGET_MS,
     notifyBoss: options.notifyBoss,
     notify: options.notify,
     labelIds: null,
@@ -477,6 +484,8 @@ interface PassContext {
   drafter: Drafter;
   curator: Curator | undefined;
   documentRoot: string;
+  /** Time budget for one mail's attachment ingest (`ingestAttachments`). */
+  attachmentBudgetMs: number;
   notifyBoss: PollMailboxOptions['notifyBoss'];
   notify: NotifyTarget | undefined;
   /** Resolved lazily, once per pass; `'failed'` when the provider refused. */
@@ -857,6 +866,16 @@ export interface AttachmentEntry {
 }
 
 /**
+ * Why a `stored` document was not read. A PDF with a reason failed extraction
+ * after its bytes were kept (ruling P7); a PDF without one was stored before
+ * PDFs were read at all. Anything else stored is a store-only type.
+ */
+function storedNotRead(document: DocumentRecord): AttachmentNotRead {
+  if (document.mediaType !== PDF) return 'unsupported';
+  return document.reason !== null ? 'undecodable' : 'stored_before_reading';
+}
+
+/**
  * Every stored attachment, in stored order (the order the brief indexes by),
  * with the text its document's artefacts hold — rendered by the same
  * `renderArtifactFull` layout the reading brief uses, bounded a little past
@@ -874,7 +893,7 @@ export async function attachmentEntries(
   const out: AttachmentEntry[] = [];
   for (const attachment of mail.attachments) {
     const documentId = ingested.get(attachment.attachmentId)?.documentId ?? attachment.documentId ?? null;
-    const notRead = (reason: 'scanned' | 'not_ingested' | 'unsupported', scanned = false): AttachmentEntry => ({
+    const notRead = (reason: AttachmentNotRead, scanned = false): AttachmentEntry => ({
       attachment,
       documentId,
       scanned,
@@ -887,7 +906,7 @@ export async function attachmentEntries(
     try {
       const document = await loadDocument(documentId, { businessId });
       if (document === null || document.status !== 'extracted') {
-        out.push(notRead(document?.status === 'stored' ? 'unsupported' : 'not_ingested'));
+        out.push(notRead(document?.status === 'stored' ? storedNotRead(document) : 'not_ingested'));
         continue;
       }
       const artifacts = await loadArtifacts(documentId, { businessId });
@@ -937,7 +956,10 @@ async function recordAttachmentReadings(
   const shown = shownAttachmentCount(entries.map((e) => e.brief));
   for (const [index, entry] of entries.entries()) {
     const said = index < shown ? triage.attachments.find((a) => a.index === index) : undefined;
+    // This triage is the whole reading: a summary an earlier handling wrote
+    // and this one did not repeat is dropped, never kept stale.
     const annotation = {
+      replaceReading: true,
       ...(said !== undefined ? { docType: said.docType, summary: said.summary } : {}),
       ...(entry.documentId !== null ? { scanned: entry.scanned } : {}),
     };
@@ -965,10 +987,20 @@ async function recordAttachmentReadings(
  * noted (`attachment_failed`) and the rest continue. Losing one PDF must not
  * also lose the owner's notice, the invoice row and the reply card. The
  * attachment stays in the mailbox either way.
+ *
+ * **A time budget per mail** (`pass.attachmentBudgetMs`, 90 s by default).
+ * Ten attachments at a 30 s fetch timeout plus a 30 s extraction each would
+ * hold one pass for ten minutes. The budget is checked before each
+ * attachment starts, so the worst case is the budget plus the one attachment
+ * already in flight (≤ one fetch timeout + one extraction timeout). Once it
+ * is spent the rest are left unfetched and noted once
+ * (`attachment_budget_exceeded`); triage shows them as not ingested. The
+ * first attachment always starts.
  */
 async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<Map<string, IngestedAttachment>> {
   const { businessId } = pass;
   const out = new Map<string, IngestedAttachment>();
+  const deadline = Date.now() + pass.attachmentBudgetMs;
   let taken = 0;
   for (const attachment of mail.attachments) {
     if (!isIngestible(attachment)) continue;
@@ -977,6 +1009,10 @@ async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<M
       continue;
     }
     if (taken >= MAX_ATTACHMENTS_PER_MAIL) break;
+    if (taken > 0 && Date.now() >= deadline) {
+      await noteMailError(mail.mailId, 'attachment_budget_exceeded', { businessId });
+      break;
+    }
     taken += 1;
     try {
       const bytes = await pass.client.fetchAttachment(

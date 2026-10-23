@@ -657,6 +657,18 @@ export const MAIL_INVOICES_ERASED_PREDICATE = `business_id = $1
  * reply-to, recipients, subject, body, the model's summary, and the
  * attachment list (file names are chosen by the sender). Never the provider
  * ids, flags, categories or labels — structure and closed sets, not content.
+ *
+ * `attachments::text` also carries each attachment's `summary` (and
+ * `docType`) that the triage reader wrote from a PDF's text (spec §9.3), so a
+ * contact named only inside an attachment summary is matched too.
+ *
+ * **Known gap.** A contact anchor does not search `document_artifacts` — the
+ * extracted text of the attached files themselves. A person named only
+ * inside a PDF (and in neither the mail nor the reader's summary of it) is
+ * not found by this pattern; that document is erased only when the mail that
+ * delivered it is matched (its documents go with it) or by a document
+ * anchor. Searching artefact text by contact would reach every document
+ * that merely mentions the name, which is a different, broader erasure.
  */
 const MAIL_CONTENT_MATCHES = `(from_address ILIKE $2 ${LIKE_ESCAPE}
       OR coalesce(from_name, '')  ILIKE $2 ${LIKE_ESCAPE}

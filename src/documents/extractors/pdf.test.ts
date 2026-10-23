@@ -2,6 +2,9 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildPdf, visualOrder } from '../fixtures/build-pdf.js';
 import { runExtractor } from '../run-extractor.js';
 import type { Block, TextContent } from '../types.js';
@@ -220,6 +223,35 @@ describe('the PDF extractor inside the isolated child', () => {
     expect(outcome).toMatchObject({ ok: true });
     if (outcome.ok) expect(textOf(outcome.artifacts[0]?.content)).toBe('Still read');
   });
+
+  it('the real child refuses the native canvas package — its own refusal is on the child\'s stderr', async () => {
+    // `runExtractor` keeps a successful child's stderr to itself, so the real
+    // child is spawned here exactly as `runExtractor` spawns it (same flags,
+    // same loader, same PATH-only env) to read its stderr. pdf.js's import
+    // warning quotes the error it caught; that error text is the hook's own
+    // (`child-hardening.ts`), so seeing it proves the hook ran in the real
+    // child — not just in the `canvas-probe.ts` stub.
+    const path = await writePdf('no-canvas-stderr.pdf', buildPdf([['Still read']]));
+    const childPath = fileURLToPath(new URL('../extract-child.ts', import.meta.url));
+    const tsx = pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href;
+    const { stdout, stderr, code } = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ['--max-old-space-size=256', '--disallow-code-generation-from-strings', '--import', tsx, childPath, 'pdf', path, '512'],
+        { env: process.env['PATH'] === undefined ? {} : { PATH: process.env['PATH'] }, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let out = '';
+      let err = '';
+      child.stdout.on('data', (c: Buffer) => (out += c.toString('utf8')));
+      child.stderr.on('data', (c: Buffer) => (err += c.toString('utf8')));
+      child.on('error', reject);
+      child.on('close', (exit) => resolve({ stdout: out, stderr: err, code: exit }));
+    });
+    expect(code).toBe(0);
+    expect(stdout).toContain('Still read');
+    expect(stderr).toContain('Cannot load "@napi-rs/canvas" package');
+    expect(stderr).toContain('native module @napi-rs/canvas is refused in the extraction child');
+  }, 30_000);
 
   it('a decompression bomb is killed for memory, not extracted, within the time cap', async () => {
     // ~2 KB on disk per MiB inflated; 2 GiB inflated would be far past any cap.

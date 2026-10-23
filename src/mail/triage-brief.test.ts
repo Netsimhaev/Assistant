@@ -80,6 +80,27 @@ describe('renderTriageBrief', () => {
     expect(out.indexOf(mailFence(TRIAGE_LABELS.body, 'n0nce').open)).toBeLessThan(out.indexOf(f0.open));
   });
 
+  it('names each reason an attachment was not read, distinctly', () => {
+    const atts: BriefAttachment[] = [
+      { filename: 'a.pdf', text: null, notRead: 'scanned', truncated: false },
+      { filename: 'b.pdf', text: null, notRead: 'not_ingested', truncated: false },
+      { filename: 'c.png', text: null, notRead: 'unsupported', truncated: false },
+      { filename: 'd.pdf', text: null, notRead: 'undecodable', truncated: false },
+      { filename: 'e.pdf', text: null, notRead: 'stored_before_reading', truncated: false },
+    ];
+    const out = renderTriageBrief(mail(), 'n0nce', atts);
+    const inside = (i: number, name: string): string => {
+      const f = attachmentFence(i, name, 'n0nce');
+      return out.slice(out.indexOf(f.open) + f.open.length, out.indexOf(f.close));
+    };
+    expect(inside(0, 'a.pdf')).toContain('(לא נקרא: סרוק)');
+    expect(inside(1, 'b.pdf')).toContain('(לא נקרא: לא נקלט)');
+    expect(inside(2, 'c.png')).toContain('(לא נקרא: סוג לא נתמך)');
+    expect(inside(3, 'd.pdf')).toContain('(לא נקרא: לא ניתן לפענח)');
+    expect(inside(4, 'e.pdf')).toContain('(לא נקרא: נשמר לפני שקריאת PDF נבנתה)');
+    expect(inside(4, 'e.pdf')).not.toContain('סוג לא נתמך');
+  });
+
   it('brief caps attachment text and keeps the whole brief ≤ 24,000', () => {
     const big = (c: string): BriefAttachment => ({ filename: `${c}.pdf`, text: c.repeat(20_000), notRead: null, truncated: false });
     const one = renderTriageBrief(mail(), 'n0nce', [big('א')]);
