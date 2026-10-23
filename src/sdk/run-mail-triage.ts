@@ -21,7 +21,8 @@ import { loadActiveCharter } from '../charter/store.js';
 import { closePool } from '../db/pool.js';
 import { getMail } from '../mail/inbox-store.js';
 import { isAutomatedSender } from '../mail/automated.js';
-import { finalCategories } from '../domain/mail-triage.js';
+import { finalCategories, keepValidAttachments } from '../domain/mail-triage.js';
+import { shownAttachmentCount } from '../mail/triage-brief.js';
 import { runMailTriage } from './mail-triage.js';
 import { runMailDrafter } from './mail-drafter.js';
 import { attachmentEntries } from '../orchestrator/mail-poll.js';
@@ -69,19 +70,24 @@ async function main(): Promise<void> {
 
   // Reads the documents the poll pass already ingested; ingests nothing.
   const entries = await attachmentEntries(mail, new Map(), config.businessId);
-  const outcome = await runMailTriage({ bundle, mail, attachments: entries.map((e) => e.brief) });
+  const briefAttachments = entries.map((e) => e.brief);
+  const outcome = await runMailTriage({ bundle, mail, attachments: briefAttachments });
   if (outcome.status !== 'read') {
     console.log(`\n--- סיווג נכשל ---\n${outcome.reason}`);
     return;
   }
-  const { triage } = outcome;
+  // The same order the poll pass uses: drop bad attachment entries first, so
+  // the categories shown here are the ones the pass would actually settle on.
+  const checked = keepValidAttachments(outcome.triage, shownAttachmentCount(briefAttachments));
+  const triage = checked.triage;
+  if (checked.dropped > 0) console.log(`(${checked.dropped} רשומות צרופה פגומות הושמטו — כמו בסבב הסריקה)`);
   const automated = isAutomatedSender(mail.headerFlags, mail.fromAddress);
   const final = finalCategories(triage, automated);
 
   console.log('\n--- סיווג (intake.triage) ---');
   console.log(`קטגוריות שהמודל אמר: ${triage.categories.join(', ')}`);
   console.log(
-    `קטגוריות סופיות: ${final.categories.join(', ')}${automated ? '  (שולח אוטומטי — הקוד הוריד ל-other)' : ''}`,
+    `קטגוריות סופיות: ${final.categories.join(', ')}${automated ? (final.categories.includes('invoice') ? '  (שולח אוטומטי — חשבונית בצרופה, בלי וואטסאפ ובלי כרטיס)' : '  (שולח אוטומטי — הקוד הוריד ל-other)') : ''}`,
   );
   console.log(`נכתב על ידי אדם: ${final.isPerson ? 'כן' : 'לא'}`);
   console.log(`תקציר: ${triage.summary}`);

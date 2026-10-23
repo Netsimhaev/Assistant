@@ -17,6 +17,7 @@ import { resetDatabase } from '../test/db.js';
 import { storedMail } from '../test/mailbox.js';
 import { createOwner } from './auth.js';
 import { createServer } from './server.js';
+import { DOCUMENT_LIMIT } from './mail-handlers.js';
 
 const BUSINESS = 'test-business';
 const OTHER = 'other-business';
@@ -147,12 +148,12 @@ describe('GET /mail', () => {
   });
 
   it('escapes a hostile sender name and strips bidi controls', async () => {
-    await storedMail(BUSINESS, { providerMessageId: 'PM-H', fromName: '<img src=x>‮evil' });
+    await storedMail(BUSINESS, { providerMessageId: 'PM-H', fromName: '<img src=x>\u202Eevil' });
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const html = await (await get(baseUrl, cookie, '/mail')).text();
     expect(html).toContain('&lt;img src=x&gt;evil');
-    expect(html).not.toContain('‮');
+    expect(html).not.toContain('\u202E');
   });
 
   it('filters by category and by sender', async () => {
@@ -249,7 +250,7 @@ describe('GET /documents/:id/file', () => {
   }
 
   it('serves a stored document as an attachment with safe headers', async () => {
-    await addDocument(BUSINESS, 'docA', { name: 'חשבונית‮.pdf' });
+    await addDocument(BUSINESS, 'docA', { name: 'חשבונית\u202E.pdf' });
     await writeFor(BUSINESS, 'docA');
     const baseUrl = await start();
     const cookie = await login(baseUrl);
@@ -383,23 +384,23 @@ describe('fix round 1', () => {
   });
 
   it('strips bidi controls from invoice number and amount, snippet and body', async () => {
-    const m = await storedMail(BUSINESS, { providerMessageId: 'B-1', bodyText: 'abc‮def משלוח⁧ x' });
+    const m = await storedMail(BUSINESS, { providerMessageId: 'B-1', bodyText: 'abc\u202Edef משלוח⁧ x' });
     await insertInvoice(
-      { mailId: m.mailId, supplierAddress: 's@x.example', supplierName: null, invoiceNumber: 'N‮1',
-        amountText: '9‮00', documentId: null, fileName: null, receivedAt: '2026-10-01T10:00:00.000Z' },
+      { mailId: m.mailId, supplierAddress: 's@x.example', supplierName: null, invoiceNumber: 'N\u202E1',
+        amountText: '9\u202E00', documentId: null, fileName: null, receivedAt: '2026-10-01T10:00:00.000Z' },
       { businessId: BUSINESS },
     );
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const inv = await (await get(baseUrl, cookie, '/mail/invoices')).text();
-    expect(inv).not.toContain('‮');
+    expect(inv).not.toContain('\u202E');
     expect(inv).toContain('N1');
-    const list = await (await get(baseUrl, cookie, `/mail?q=${encodeURIComponent('def‮')}`)).text();
-    expect(list).not.toContain('‮');
+    const list = await (await get(baseUrl, cookie, `/mail?q=${encodeURIComponent('def\u202E')}`)).text();
+    expect(list).not.toContain('\u202E');
     expect(list).not.toContain('⁧');
     expect(list).toContain('<mark>def</mark>');
     const detail = await (await get(baseUrl, cookie, `/mail/${m.mailId}`)).text();
-    expect(detail).not.toContain('‮');
+    expect(detail).not.toContain('\u202E');
     expect(detail).not.toContain('⁧');
   });
 
@@ -512,6 +513,80 @@ describe('PDF summaries and the documents screen', () => {
   it('requires a session', async () => {
     const baseUrl = await start();
     expect((await fetch(`${baseUrl}/mail/documents`, { redirect: 'manual' })).status).toBe(302);
+  });
+
+  it('a document id of another business never yields a download link', async () => {
+    // A mail of this business whose attachment names a document that exists
+    // only in the other business: the id is there, the link must not be.
+    await addDocument(OTHER, 'docForeign');
+    await mailWith(BUSINESS, {
+      providerMessageId: 'XB-1',
+      attachments: [att('a1', 'foreign.pdf', { docType: 'invoice', summary: 'מצביע לעסק אחר', documentId: 'docForeign' })],
+    });
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    const html = await (await get(baseUrl, cookie, '/mail/documents')).text();
+    expect(html).toContain('מצביע לעסק אחר');
+    expect(html).not.toContain('/documents/docForeign/file');
+    expect(html).toContain('אין קובץ');
+    expect((await get(baseUrl, cookie, '/documents/docForeign/file')).status).toBe(404);
+  });
+
+  it('the sender filter matches by name and address, and a % is a literal', async () => {
+    await mailWith(BUSINESS, {
+      providerMessageId: 'SF-1', fromAddress: 'dana@client.example', fromName: 'דנה',
+      attachments: [att('a1', 'd.pdf', { docType: 'quote', summary: 'מסמך של דנה' })],
+    });
+    await mailWith(BUSINESS, {
+      providerMessageId: 'SF-2', fromAddress: 'promo@shop.example', fromName: '100% שירות',
+      attachments: [att('a1', 'p.pdf', { docType: 'other', summary: 'מסמך של מאה אחוז' })],
+    });
+    // Would match '100%' if the % were a wildcard.
+    await mailWith(BUSINESS, {
+      providerMessageId: 'SF-3', fromAddress: 'x@decoy.example', fromName: '100 שקל',
+      attachments: [att('a1', 'x.pdf', { docType: 'other', summary: 'מסמך פיתיון' })],
+    });
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    const byName = await (await get(baseUrl, cookie, `/mail/documents?sender=${encodeURIComponent('דנה')}`)).text();
+    expect(byName).toContain('מסמך של דנה');
+    expect(byName).not.toContain('מסמך של מאה אחוז');
+    const byAddress = await (await get(baseUrl, cookie, '/mail/documents?sender=client.example')).text();
+    expect(byAddress).toContain('מסמך של דנה');
+    expect(byAddress).not.toContain('מסמך פיתיון');
+    const literal = await (await get(baseUrl, cookie, `/mail/documents?sender=${encodeURIComponent('100%')}`)).text();
+    expect(literal).toContain('מסמך של מאה אחוז');
+    expect(literal).not.toContain('מסמך פיתיון');
+    expect(literal).not.toContain('מסמך של דנה');
+  });
+
+  it('strips direction controls from the file name on the documents screen', async () => {
+    await mailWith(BUSINESS, {
+      providerMessageId: 'FN-1',
+      attachments: [att('a1', 'invoice\u202Efdp.exe', { docType: 'invoice', summary: 'שם קובץ הפוך' })],
+    });
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    const html = await (await get(baseUrl, cookie, '/mail/documents')).text();
+    expect(html).toContain('invoicefdp.exe');
+    expect(html).not.toMatch(/[\u202A-\u202E\u2066-\u2069]/);
+  });
+
+  it('says when the list was cut at the limit, and only then', async () => {
+    const m = await mailWith(BUSINESS, {
+      providerMessageId: 'LIM-1',
+      attachments: [att('a0', 'one.pdf', { docType: 'other', summary: 'יחיד' })],
+    });
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    expect(await (await get(baseUrl, cookie, '/mail/documents')).text()).not.toContain('האחרונים');
+    // More attachments than the screen shows: written straight to the JSON,
+    // because the stored-mail path keeps ten.
+    const many = Array.from({ length: DOCUMENT_LIMIT + 1 }, (_, i) => att(`l${i}`, `f${i}.pdf`, { docType: 'other' }));
+    await getPool().query(`UPDATE mail_messages SET attachments = $2::jsonb WHERE mail_id = $1`, [m.mailId, JSON.stringify(many)]);
+    const html = await (await get(baseUrl, cookie, '/mail/documents')).text();
+    expect(html).toContain(`מוצגים ${DOCUMENT_LIMIT} האחרונים`);
+    expect(html.match(/<tr>/g)?.length).toBe(DOCUMENT_LIMIT + 1); // header row + the limit
   });
 
   it('summary with U+202E is stripped on every surface', async () => {

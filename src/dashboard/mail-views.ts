@@ -374,8 +374,15 @@ export function renderMailDocuments(options: {
   filters: DocumentFilters;
   downloadable: ReadonlySet<string>;
   timeZone: string;
+  /** More rows matched than were fetched; the screen says so instead of looking complete. */
+  truncated?: boolean;
+  limit?: number;
 }): string {
   const { rows, filters, downloadable, timeZone } = options;
+  const cutNote =
+    options.truncated === true
+      ? `<p class="muted">מוצגים ${options.limit ?? rows.length} האחרונים — אפשר לצמצם בסינון.</p>`
+      : '';
   const typeOptions = [
     `<option value=""${filters.type === '' ? ' selected' : ''}>כל הסוגים</option>`,
     ...AttachmentDocType.options.map(
@@ -425,6 +432,7 @@ ${
 <tbody>
 ${body}
 </tbody></table>`
-}`,
+}
+${cutNote}`,
   );
 }

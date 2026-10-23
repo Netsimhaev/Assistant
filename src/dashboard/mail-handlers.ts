@@ -190,7 +190,8 @@ export async function handleInvoices(res: ServerResponse, businessId: string, ur
   html(res, 200, renderInvoices({ groups: groupInvoices(rows), filters, timeZone, csrf }));
 }
 
-const DOCUMENT_LIMIT = 200;
+/** The documents screen shows at most this many rows, and says so when it hits it. */
+export const DOCUMENT_LIMIT = 200;
 
 /** Every attachment of every mail of this business, newest mail first, filtered as the owner asked. */
 export async function handleMailDocuments(res: ServerResponse, businessId: string, url: URL): Promise<void> {
@@ -216,8 +217,10 @@ export async function handleMailDocuments(res: ServerResponse, businessId: strin
   }
   if (fromIso !== null) add((n) => `m.received_at >= $${n}::timestamptz`, fromIso);
   if (toIso !== null) add((n) => `m.received_at < $${n}::timestamptz`, toIso);
-  params.push(DOCUMENT_LIMIT);
-  const { rows } = await getPool().query<{
+  // One row past the limit, so a cut list is told apart from one that is
+  // exactly full — a silent cut reads as "these are all the documents".
+  params.push(DOCUMENT_LIMIT + 1);
+  const { rows: fetched } = await getPool().query<{
     mail_id: string;
     received_at: Date;
     from_name: string | null;
@@ -238,6 +241,8 @@ export async function handleMailDocuments(res: ServerResponse, businessId: strin
       ORDER BY m.received_at DESC, m.mail_id DESC LIMIT $${params.length}`,
     params,
   );
+  const truncated = fetched.length > DOCUMENT_LIMIT;
+  const rows = truncated ? fetched.slice(0, DOCUMENT_LIMIT) : fetched;
   const docs: DocumentRow[] = rows.map((r) => ({
     mailId: r.mail_id,
     receivedAt: r.received_at.toISOString(),
@@ -250,7 +255,7 @@ export async function handleMailDocuments(res: ServerResponse, businessId: strin
     documentId: r.document_id,
   }));
   const downloadable = await downloadableDocuments(businessId, docs.map((d) => d.documentId ?? undefined));
-  html(res, 200, renderMailDocuments({ rows: docs, filters, downloadable, timeZone }));
+  html(res, 200, renderMailDocuments({ rows: docs, filters, downloadable, timeZone, truncated, limit: DOCUMENT_LIMIT }));
 }
 
 export async function handleMailDetail(res: ServerResponse, businessId: string, mailId: string): Promise<void> {
