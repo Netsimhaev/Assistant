@@ -97,6 +97,31 @@ describe('scanInbox', () => {
     expect(rows[0]?.reason).toBeTruthy();
   });
 
+  // Ruling P7 keeps an undecodable PDF `stored` (downloadable), but for the
+  // owner's inbox folders it is a failure: it was never read, so it files
+  // under rejected/ and counts as rejected — never as ingested.
+  it('files an undecodable PDF under rejected/ and counts it as rejected, keeping the stored copy', async () => {
+    const { inbox, documentRoot } = await anInbox();
+    await writeFile(
+      join(inbox, 'broken.pdf'),
+      Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]),
+    );
+
+    const result = await scanInbox({ inbox, businessId: BUSINESS, documentRoot });
+
+    expect(result.rejected).toBe(1);
+    expect(result.ingested).toBe(0);
+    expect(await readdir(join(inbox, 'rejected'))).toEqual(['broken.pdf']);
+    expect(await readdir(join(inbox, 'processed'))).toEqual([]);
+    const { rows } = await getPool().query<{ status: string; reason: string | null; stored_path: string }>(
+      `SELECT status, reason, stored_path FROM documents WHERE business_id = $1`,
+      [BUSINESS],
+    );
+    expect(rows[0]?.status).toBe('stored');
+    expect(rows[0]?.reason).toMatch(/^הפענוח נכשל: /);
+    await expect(readFile(join(documentRoot, rows[0]!.stored_path))).resolves.toBeInstanceOf(Buffer);
+  });
+
   it('leaves the subdirectories themselves alone', async () => {
     const { inbox, documentRoot } = await anInbox();
     await writeFile(join(inbox, 'a.txt'), 'א', 'utf8');

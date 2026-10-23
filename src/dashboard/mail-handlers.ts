@@ -110,6 +110,22 @@ async function recentGapAt(businessId: string): Promise<string | null> {
   return rows[0]?.at?.toISOString() ?? null;
 }
 
+/**
+ * The documents among `ids` (this business only) kept `stored` because they
+ * could not be decoded (ruling P7), with the reason — shown next to the
+ * attachment so the owner knows it was never read.
+ */
+async function undecodableDocuments(businessId: string, ids: readonly (string | undefined)[]): Promise<Map<string, string>> {
+  const wanted = [...new Set(ids.filter((i): i is string => i !== undefined))];
+  if (wanted.length === 0) return new Map();
+  const { rows } = await getPool().query<{ document_id: string; reason: string }>(
+    `SELECT document_id, reason FROM documents
+      WHERE business_id = $1 AND document_id = ANY($2::text[]) AND status = 'stored' AND reason IS NOT NULL`,
+    [businessId, wanted],
+  );
+  return new Map(rows.map((r) => [r.document_id, r.reason]));
+}
+
 /** The subset of `ids` that belong to this business and are in a status that may be served. */
 async function downloadableDocuments(businessId: string, ids: readonly (string | undefined)[]): Promise<Set<string>> {
   const wanted = [...new Set(ids.filter((i): i is string => i !== undefined))];
@@ -289,6 +305,7 @@ export async function handleMailDetail(res: ServerResponse, businessId: string, 
       cardApprovalId,
       documents: docRows.map((r) => ({ documentId: r.document_id, fileName: r.file_name })),
       downloadable: await downloadableDocuments(businessId, mail.attachments.map((a) => a.documentId)),
+      undecodable: await undecodableDocuments(businessId, mail.attachments.map((a) => a.documentId)),
     }),
   );
 }

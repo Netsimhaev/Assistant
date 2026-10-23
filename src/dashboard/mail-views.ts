@@ -318,8 +318,10 @@ export function renderMailDetail(options: {
   cardApprovalId: string | null;
   documents: readonly { documentId: string; fileName: string | null }[];
   downloadable: ReadonlySet<string>;
+  /** Attachment documents kept `stored` because they could not be decoded, with the reason (ruling P7). */
+  undecodable: ReadonlyMap<string, string>;
 }): string {
-  const { mail, timeZone, cardApprovalId, documents, downloadable } = options;
+  const { mail, timeZone, cardApprovalId, documents, downloadable, undecodable } = options;
   const cats = categoriesCell(mail);
   const linkedIds = new Set(mail.attachments.map((a) => a.documentId).filter((d): d is string => d !== undefined));
   const docLinks = documents
@@ -339,6 +341,9 @@ export function renderMailDetail(options: {
       const extra = [
         type === '' ? '' : ` · <b>${esc(type)}</b>`,
         a.scanned === true ? ' · <span class="muted">קובץ סרוק — לא נקרא</span>' : '',
+        a.documentId !== undefined && undecodable.has(a.documentId)
+          ? ` · <span class="muted">לא ניתן לפענח: ${escLabel(undecodable.get(a.documentId) ?? '')}</span>`
+          : '',
         a.summary !== undefined && a.summary !== '' ? `<br><span class="muted">${escLabel(a.summary)}</span>` : '',
       ].join('');
       return `<li>${escLabel(a.filename)}${link}${extra}</li>`;

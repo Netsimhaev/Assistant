@@ -343,6 +343,9 @@ describe('fix round 1', () => {
     const cookie = await login(baseUrl);
     const detail = await (await get(baseUrl, cookie, `/mail/${m.mailId}`)).text();
     expect(detail).toContain(`href="/documents/${doc.documentId}/file"`);
+    // The owner is told it was not read, and why — next to the attachment.
+    const item = detail.slice(detail.indexOf('broken.pdf'));
+    expect(item.slice(0, item.indexOf('</li>'))).toContain(`לא ניתן לפענח: ${doc.reason?.slice(0, 20)}`);
     const file = await get(baseUrl, cookie, `/documents/${doc.documentId}/file`);
     expect(file.status).toBe(200);
     expect(Buffer.from(await file.arrayBuffer()).equals(bytes)).toBe(true);

@@ -106,6 +106,12 @@ export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise
     return;
   }
 
+  // Ruling P7: an undecodable PDF is kept (downloadable) but never read.
+  if (doc.status === 'stored' && doc.reason !== null) {
+    log(`לא נקרא: ${doc.reason}`);
+    return;
+  }
+
   if (doc.status === 'extracted') {
     const artifacts = await loadArtifacts(doc.documentId, options);
     for (const artifact of artifacts) {

@@ -295,12 +295,16 @@ export async function collectDigestFacts(
     [businessId, start, end],
   );
   // The column is `reason` — there is no `rejected_reason` (migration 012).
+  // A `stored` row WITH a reason is a PDF that could not be decoded (ruling
+  // P7): downloadable, never read — a failure the owner is told about. A
+  // `stored` row without one predates PDF reading and is not.
   const { rows: rejectedDocs } = await db.query<{
     original_name: string; reason: string | null; total_count: string;
   }>(
     `SELECT original_name, reason, count(*) OVER ()::text AS total_count
        FROM documents
-      WHERE business_id = $1 AND status = 'rejected'
+      WHERE business_id = $1
+        AND (status = 'rejected' OR (status = 'stored' AND reason IS NOT NULL))
         AND created_at >= $2 AND created_at < $3
       ORDER BY created_at DESC
       LIMIT ${MAX_NAMED_EXCEPTIONS}`,
