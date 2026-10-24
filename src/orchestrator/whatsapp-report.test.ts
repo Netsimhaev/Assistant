@@ -1173,7 +1173,11 @@ describe('failedText', () => {
     expect(failedText('reply_target_unknown — לא נמצא')).toBe(
       'הניסיון לבצע את ההוראה נכשל: לא נמצא המייל שאליו מבקשים לענות בתיבת העסק.',
     );
-    expect(failedText('not_a_reply — x')).not.toBe(FAILED_GENERIC_TEXT);
+    expect(failedText('not_a_reply — x')).toBe('הניסיון לבצע את ההוראה נכשל: פרטי השרשור של התשובה אינם תקינים.');
+    expect(failedText('reply_recipient_mismatch — x')).toBe(
+      'הניסיון לבצע את ההוראה נכשל: תשובה בתוך שיחה נשלחת רק לשולח המקורי.',
+    );
+    expect(failedText('reply_target_lookup_failed — x')).not.toBe(FAILED_GENERIC_TEXT);
   });
 
   it('falls through to the generic text for anything unmapped, in every shape', () => {

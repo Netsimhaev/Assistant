@@ -297,7 +297,9 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
 
   // The mailbox send adapter's reply refusals (adapters/mailbox-send.ts).
   reply_target_unknown: 'לא נמצא המייל שאליו מבקשים לענות בתיבת העסק',
-  not_a_reply: 'פרטי השרשור של התשובה לא תאמו את המייל המקורי',
+  not_a_reply: 'פרטי השרשור של התשובה אינם תקינים',
+  reply_recipient_mismatch: 'תשובה בתוך שיחה נשלחת רק לשולח המקורי',
+  reply_target_lookup_failed: 'לא ניתן היה לבדוק את המייל שאליו עונים', // retryable
 
   // run-due.ts's own plan-level rejections, under the `run_due:` namespace
   // `leadingCode` manufactures.

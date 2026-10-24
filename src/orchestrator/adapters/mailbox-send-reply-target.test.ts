@@ -73,11 +73,46 @@ describe('mailbox adapter resolves an instruction reply from the stored mail', (
     ]);
   });
 
-  it('keeps the gate-approved `to`, never the stored From', async () => {
-    await storedMail(BUSINESS, { fromAddress: 'someone-else@client.example' });
+  it('sends when `to` is the stored From, compared case-insensitively', async () => {
+    await storedMail(BUSINESS, { fromAddress: 'Dana@Client.Example' });
     const { client, sent } = fakeMailboxClient();
-    await adapterWith(client).execute(call(INSTRUCTED));
+    const result = await adapterWith(client).execute(call(INSTRUCTED));
+    expect(result).toMatchObject({ ok: true });
     expect(sent.map((r) => r.to)).toEqual([['dana@client.example']]);
+  });
+
+  it('refuses reply_recipient_mismatch when `to` is anyone but the stored From — zero sends', async () => {
+    // On Microsoft the reply quotes the original: a "reply" to Y would forward
+    // the stranger's mail to Y, priced as email.reply.
+    await storedMail(BUSINESS, { fromAddress: 'someone-else@client.example' });
+    const { client, sent, sentNew } = fakeMailboxClient();
+    const result = await adapterWith(client).execute(call(INSTRUCTED));
+    expect(result).toEqual({
+      ok: false,
+      retryable: false,
+      code: 'reply_recipient_mismatch',
+      message: 'תשובה בתוך שיחה נשלחת רק לשולח המקורי',
+    });
+    expect(sent).toHaveLength(0);
+    expect(sentNew).toHaveLength(0);
+  });
+
+  it('never answers the Reply-To address, even when it differs from From', async () => {
+    await storedMail(BUSINESS, { replyTo: 'collector@elsewhere.example' });
+    const { client, sent } = fakeMailboxClient();
+    const result = await adapterWith(client).execute(call({ ...INSTRUCTED, to: 'collector@elsewhere.example' }));
+    expect(result).toMatchObject({ ok: false, code: 'reply_recipient_mismatch' });
+    expect(sent).toHaveLength(0);
+  });
+
+  it('refuses a second recipient beside the stored From', async () => {
+    await storedMail(BUSINESS);
+    const { client, sent } = fakeMailboxClient();
+    const result = await adapterWith(client).execute(
+      call({ ...INSTRUCTED, to: ['dana@client.example', 'y@else.example'] }),
+    );
+    expect(result).toMatchObject({ ok: false, code: 'reply_recipient_mismatch' });
+    expect(sent).toHaveLength(0);
   });
 
   it('refuses reply_target_unknown when no stored mail carries that Message-ID — and sends nothing', async () => {
@@ -129,6 +164,44 @@ describe('mailbox adapter resolves an instruction reply from the stored mail', (
     const result = await adapterWith(client).execute(call({ ...INSTRUCTED, threadId: 'TH-1' }));
     expect(result).toMatchObject({ ok: true });
     expect(sent[0]).toMatchObject({ threadId: 'TH-1', providerMessageId: 'PM-1' });
+  });
+
+  it('a card reply (all three fields, built from the stored mail) still sends', async () => {
+    const mail = await storedMail(BUSINESS);
+    const { client, sent } = fakeMailboxClient();
+    const card = {
+      to: [mail.fromAddress],
+      subject: 'Re: מתי תגיע ההצעה?',
+      body: 'מחר.',
+      inReplyTo: mail.internetMessageId,
+      references: mail.references,
+      threadId: mail.threadId,
+      providerMessageId: mail.providerMessageId,
+    };
+    expect(await adapterWith(client).execute(call(card))).toMatchObject({ ok: true });
+    expect(sent[0]).toMatchObject({ threadId: 'TH-1', providerMessageId: 'PM-1', to: ['dana@client.example'] });
+  });
+
+  it('all three fields are still checked: an unknown inReplyTo is reply_target_unknown', async () => {
+    await storedMail(BUSINESS);
+    const { client, sent } = fakeMailboxClient();
+    const result = await adapterWith(client).execute(
+      call({ ...INSTRUCTED, inReplyTo: '<unknown@x>', threadId: 'TH-1', providerMessageId: 'PM-1' }),
+    );
+    expect(result).toMatchObject({ ok: false, code: 'reply_target_unknown' });
+    expect(sent).toHaveLength(0);
+  });
+
+  it('all three fields are still checked: a providerMessageId naming another message is not_a_reply', async () => {
+    // A planner-written step cannot reply-quote an arbitrary mailbox message.
+    await storedMail(BUSINESS);
+    await storedMail(BUSINESS, { providerMessageId: 'PM-SECRET', threadId: 'TH-SECRET', internetMessageId: '<s@x>' });
+    const { client, sent } = fakeMailboxClient();
+    const result = await adapterWith(client).execute(
+      call({ ...INSTRUCTED, threadId: 'TH-SECRET', providerMessageId: 'PM-SECRET' }),
+    );
+    expect(result).toMatchObject({ ok: false, code: 'not_a_reply' });
+    expect(sent).toHaveLength(0);
   });
 
   it('threading fields without an inReplyTo are still not_a_reply — there is nothing to resolve from', async () => {

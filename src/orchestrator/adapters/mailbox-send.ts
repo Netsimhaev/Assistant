@@ -33,24 +33,23 @@ const SERVED_TOOLS: readonly string[] = ['mail.send'];
  * connection), and the sign page promises the owner that all outgoing mail
  * goes from the business mailbox. So it sends both shapes (ruling R21):
  *
- *   - **A reply** — all three threading fields (`inReplyTo`, `threadId`,
- *     `providerMessageId`) present — goes to exactly one recipient: the
- *     original sender and nobody else, so a multi-address `to` is refused
- *     rather than trimmed.
+ *   - **A reply** — a non-empty `inReplyTo`, with or without `threadId` and
+ *     `providerMessageId`. EVERY reply is looked up in THIS business's stored
+ *     mail by Message-ID (`options.replyTargets`, scoped by `call.businessId`)
+ *     — a card reply carrying all three fields too, so a planner-written step
+ *     cannot name an arbitrary `providerMessageId` and reply-quote any message
+ *     in the mailbox. The instruction door's planner never knows the
+ *     provider's ids; the lookup supplies them. No stored mail →
+ *     `reply_target_unknown`, terminal: a reply-classified payload is NEVER
+ *     sent as a new mail, or an `email.reply` authorisation would buy what is
+ *     really an initiate. A supplied id that disagrees with the stored one →
+ *     `not_a_reply`; neither side is trusted over the other. Then `to` must be
+ *     exactly one address equal (case-insensitive) to the stored From — never
+ *     Reply-To — or `reply_recipient_mismatch`: on Microsoft the reply quotes
+ *     the original, so a reply to anyone else is a hidden forward.
  *   - **A new message** — none of the three present (absent, `null` or `''`)
  *     — goes to one or more recipients via the provider's plain send, with no
  *     threading. This is what an instruction-door "write to Dana" becomes.
- *   - **An instruction reply** — a non-empty `inReplyTo` without `threadId`
- *     and/or `providerMessageId`. The planner never knows the provider's ids,
- *     so the adapter resolves them from THIS business's stored mail by
- *     Message-ID (`options.replyTargets`, scoped by `call.businessId`) and
- *     sends it like a card reply. `to` stays what the gate approved — the
- *     instruction door's `authorisedRecipients` already governed it — and is
- *     never replaced by the stored From. No stored mail → `reply_target_unknown`,
- *     terminal: a reply-classified payload is NEVER sent as a new mail, or an
- *     `email.reply` authorisation would buy what is really an initiate. A
- *     supplied id that disagrees with the stored one → `not_a_reply`; neither
- *     side is trusted over the other.
  *   - **Threading fields without `inReplyTo`** are refused as `not_a_reply`:
  *     there is nothing to resolve from, and a payload that names a thread and
  *     cannot be threaded is never quietly sent as a fresh mail.
@@ -130,43 +129,41 @@ export function createMailboxSendAdapter(options: MailboxSendOptions): ExternalA
       if ((threadId === null && threading[1]) || (providerMessageId === null && threading[2])) {
         return NOT_A_REPLY;
       }
-      if (threadId === null || providerMessageId === null) {
-        let target: Awaited<ReturnType<ReplyTargetLookup>>;
-        try {
-          target = await options.replyTargets(call.businessId, inReplyTo);
-        } catch (error) {
-          // Our own database, before anything was sent: nothing was created,
-          // so `retryable: true` is an honest claim. An adapter returns, never throws.
-          return {
-            ok: false,
-            retryable: true,
-            code: 'reply_target_lookup_failed',
-            message: error instanceof Error ? error.message : String(error),
-          };
-        }
-        if (target === null) return REPLY_TARGET_UNKNOWN;
-        if (
-          (threadId !== null && threadId !== target.threadId) ||
-          (providerMessageId !== null && providerMessageId !== target.providerMessageId)
-        ) {
-          return NOT_A_REPLY;
-        }
-        threadId = target.threadId;
-        providerMessageId = target.providerMessageId;
-        references ??= target.references;
+      // EVERY reply is checked against the stored mail it answers — a card
+      // reply carrying all three fields included. Otherwise a planner-written
+      // step could name any providerMessageId and reply-quote any message in
+      // the mailbox.
+      let target: Awaited<ReturnType<ReplyTargetLookup>>;
+      try {
+        target = await options.replyTargets(call.businessId, inReplyTo);
+      } catch {
+        // Our own database, before anything was sent: nothing was created,
+        // so `retryable: true` is an honest claim. A fixed sentence, not the
+        // driver's error text. An adapter returns, never throws.
+        return REPLY_TARGET_LOOKUP_FAILED;
       }
+      if (target === null) return REPLY_TARGET_UNKNOWN;
+      if (
+        (threadId !== null && threadId !== target.threadId) ||
+        (providerMessageId !== null && providerMessageId !== target.providerMessageId)
+      ) {
+        return NOT_A_REPLY;
+      }
+      threadId = target.threadId;
+      providerMessageId = target.providerMessageId;
+      references ??= target.references;
 
       const to = readRecipients(input);
-      if (to.length !== 1) {
-        return {
-          ok: false,
-          retryable: false,
-          code: 'no_recipient',
-          message:
-            to.length === 0
-              ? 'המטען אינו נושא נמען קריא'
-              : 'תשובה נשלחת לכתובת אחת בלבד — ההודעה לא נשלחה',
-        };
+      if (to.length === 0) {
+        return { ok: false, retryable: false, code: 'no_recipient', message: 'המטען אינו נושא נמען קריא' };
+      }
+      // A reply goes to the stored mail's From and nobody else — never its
+      // Reply-To, never a second address. On Microsoft the reply quotes the
+      // original, so a "reply" to anyone else is a hidden forward of a
+      // stranger's mail priced as email.reply.
+      const [only] = to;
+      if (to.length !== 1 || only === undefined || only.toLowerCase() !== target.fromAddress.toLowerCase()) {
+        return REPLY_RECIPIENT_MISMATCH;
       }
 
       if (subject === null || body === null) return MESSAGE_INCOMPLETE;
@@ -217,7 +214,21 @@ const NOT_A_REPLY: AdapterResult = {
   ok: false,
   retryable: false,
   code: 'not_a_reply',
-  message: 'חסר חלק משדות השרשור של התשובה — ההודעה לא נשלחה',
+  message: 'פרטי השרשור של התשובה אינם תקינים',
+};
+
+const REPLY_RECIPIENT_MISMATCH: AdapterResult = {
+  ok: false,
+  retryable: false,
+  code: 'reply_recipient_mismatch',
+  message: 'תשובה בתוך שיחה נשלחת רק לשולח המקורי',
+};
+
+const REPLY_TARGET_LOOKUP_FAILED: AdapterResult = {
+  ok: false,
+  retryable: true,
+  code: 'reply_target_lookup_failed',
+  message: 'לא ניתן היה לבדוק את המייל שאליו עונים — ההודעה לא נשלחה',
 };
 
 const REPLY_TARGET_UNKNOWN: AdapterResult = {

@@ -401,6 +401,8 @@ export interface ReplyTarget {
   providerMessageId: string;
   /** The stored References header — what a card reply carries too. */
   references: string | null;
+  /** The stored From — the only address a reply may go to (never Reply-To). */
+  fromAddress: string;
 }
 
 /** The lookup the mailbox send adapter is handed; `businessId` is required. */
@@ -420,6 +422,12 @@ export type ReplyTargetLookup = (businessId: string, internetMessageId: string) 
  * arrive twice under two provider ids), so the earliest received row wins,
  * deterministically. The unrecordable placeholder has no Message-ID and can
  * never match.
+ *
+ * A Message-ID is chosen by whoever SENT the mail, so a stranger can make one
+ * collide with a real conversation's. That buys nothing: the adapter sends
+ * a reply only to this row's own `from_address`, so a colliding row can at
+ * most redirect the reply to the stranger who planted it — someone the gate
+ * already approved as the recipient, or the send is refused.
  */
 export async function replyTargetFor(
   businessId: string,
@@ -427,8 +435,13 @@ export async function replyTargetFor(
   options: { db?: Queryable } = {},
 ): Promise<ReplyTarget | null> {
   const db = options.db ?? getPool();
-  const { rows } = await db.query<{ thread_id: string; provider_message_id: string; references_header: string | null }>(
-    `SELECT thread_id, provider_message_id, references_header
+  const { rows } = await db.query<{
+    thread_id: string;
+    provider_message_id: string;
+    references_header: string | null;
+    from_address: string;
+  }>(
+    `SELECT thread_id, provider_message_id, references_header, from_address
        FROM mail_messages
       WHERE business_id = $1 AND internet_message_id = $2 AND thread_id <> ''
       ORDER BY received_at, mail_id
@@ -437,7 +450,12 @@ export async function replyTargetFor(
   );
   const row = rows[0];
   if (row === undefined) return null;
-  return { threadId: row.thread_id, providerMessageId: row.provider_message_id, references: row.references_header };
+  return {
+    threadId: row.thread_id,
+    providerMessageId: row.provider_message_id,
+    references: row.references_header,
+    fromAddress: row.from_address,
+  };
 }
 
 /**

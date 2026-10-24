@@ -23,6 +23,14 @@ function fakeClient(result: { externalId: string | null } | MailboxFailure) {
 /** No stored mail: these tests never reach the instruction-reply lookup's success path. */
 const noTargets = async () => null;
 
+/** The stored mail GOOD answers — every reply is checked against one (fix round 1). */
+const goodTarget = async () => ({
+  threadId: 'T1',
+  providerMessageId: 'M1',
+  references: '<a@b>',
+  fromAddress: 'dana@client.example',
+});
+
 const NEW_MAIL = { to: 'dana@client.example', subject: 'הצעת מחיר', body: 'מצורפת הצעה' };
 
 const GOOD = {
@@ -53,7 +61,7 @@ function call(
 describe('mailbox send adapter', () => {
   it('sends a reply with threading fields through the fake client', async () => {
     const { client, sent } = fakeClient({ externalId: 'sent-1' });
-    const adapter = createMailboxSendAdapter({ replyTargets: noTargets, system: 'mailbox', provider: 'microsoft', client });
+    const adapter = createMailboxSendAdapter({ replyTargets: goodTarget, system: 'mailbox', provider: 'microsoft', client });
     expect(adapter.channel).toBe('api');
     expect(adapter.serves).toEqual(['mail.send']);
     const result = await adapter.execute(call(GOOD));
@@ -94,17 +102,19 @@ describe('mailbox send adapter', () => {
     expect(sent).toHaveLength(0);
   });
 
-  it('refuses more than one recipient and sends nothing', async () => {
+  it('refuses a reply to anyone but the stored From, including a second recipient, and sends nothing', async () => {
     const { client, sent } = fakeClient({ externalId: 'x' });
-    const adapter = createMailboxSendAdapter({ replyTargets: noTargets, system: 'mailbox', provider: 'google', client });
-    const result = await adapter.execute(call({ ...GOOD, to: ['a@x.com', 'b@x.com'] }));
-    expect(result).toMatchObject({ ok: false, retryable: false, code: 'no_recipient' });
+    const adapter = createMailboxSendAdapter({ replyTargets: goodTarget, system: 'mailbox', provider: 'google', client });
+    const result = await adapter.execute(call({ ...GOOD, to: ['dana@client.example', 'b@x.com'] }));
+    expect(result).toMatchObject({ ok: false, retryable: false, code: 'reply_recipient_mismatch' });
+    const result2 = await adapter.execute(call({ ...GOOD, to: 'b@x.com' }));
+    expect(result2).toMatchObject({ ok: false, retryable: false, code: 'reply_recipient_mismatch' });
     expect(sent).toHaveLength(0);
   });
 
   it('maps provider failures with honest retryability', async () => {
     const run = async (f: MailboxFailure) =>
-      createMailboxSendAdapter({ replyTargets: noTargets, system: 'mailbox', provider: 'google', client: fakeClient(f).client }).execute(
+      createMailboxSendAdapter({ replyTargets: goodTarget, system: 'mailbox', provider: 'google', client: fakeClient(f).client }).execute(
         call(GOOD),
       );
     expect(await run({ failure: 'auth', status: 401, message: 'm' })).toMatchObject({
@@ -213,11 +223,10 @@ describe('mailbox send adapter', () => {
       provider: 'google',
       client,
     });
-    expect(await adapter.execute(call({ ...NEW_MAIL, inReplyTo: '<a@b>' }))).toMatchObject({
-      ok: false,
-      retryable: true,
-      code: 'reply_target_lookup_failed',
-    });
+    const failed = await adapter.execute(call({ ...NEW_MAIL, inReplyTo: '<a@b>' }));
+    expect(failed).toMatchObject({ ok: false, retryable: true, code: 'reply_target_lookup_failed' });
+    // A fixed sentence, never the raw database error.
+    expect(failed).not.toMatchObject({ message: expect.stringContaining('db down') });
     expect(sent).toHaveLength(0);
     expect(sentNew).toHaveLength(0);
   });
