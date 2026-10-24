@@ -655,6 +655,83 @@ describe('buildRuntime', () => {
   });
 
   /**
+   * Mailbox connection, Task 4: `connectionAcceptsOAuthCeremony` now accepts
+   * the `mailbox` connection (it has an OAuth profile), so the calendar
+   * registration loop must check `calendar.read` itself. A `mailbox` binding
+   * must never receive a calendar adapter.
+   */
+  it('does not register a calendar adapter for a mailbox binding', async () => {
+    await installCharter(
+      buildCharter({
+        connections: [
+          {
+            system: 'mailbox',
+            label: 'תיבת הדואר',
+            channel: 'api',
+            serves: ['mail.send'],
+            target: null,
+            subprocessor: null,
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    await upsertBinding(
+      {
+        system: 'mailbox',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OAUTH_MAILBOX',
+        provider: 'google',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { by: 'test' },
+    );
+
+    const runtime = await buildRuntime(FULL);
+    expect(runtime.registry.resolve('mailbox', 'api', 'calendar.read')).toBeNull();
+    // It gets the mailbox SEND adapter, and only that.
+    expect(runtime.registry.resolve('mailbox', 'api', 'mail.send')).not.toBeNull();
+  });
+
+  it('runtime registers mailbox-send for a microsoft mailbox binding', async () => {
+    await installCharter(
+      buildCharter({
+        connections: [
+          {
+            system: 'mailbox',
+            label: 'תיבת הדואר',
+            channel: 'api',
+            serves: ['mail.send'],
+            target: null,
+            subprocessor: null,
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    await upsertBinding(
+      {
+        system: 'mailbox',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OAUTH_MAILBOX',
+        provider: 'microsoft',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { by: 'test' },
+    );
+
+    const runtime = await buildRuntime(FULL);
+    expect(runtime.registry.resolve('mailbox', 'api', 'mail.send')).not.toBeNull();
+    expect(runtime.registry.resolve('mailbox', 'api', 'calendar.read')).toBeNull();
+    // SMTP adapter still registered for notifications.
+    expect(runtime.registry.resolve('office-mail', 'api', 'mail.send')).not.toBeNull();
+  });
+
+  /**
    * Final fix wave, item 6 (fix-round 2, finding I3) — the general case the
    * test above does not cover. There, `office-mail`'s charter connection
    * declares only `mail.send`, so the calendar loop's own `serves` check

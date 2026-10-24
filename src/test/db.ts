@@ -23,6 +23,9 @@ export async function resetDatabase(): Promise<void> {
     TRUNCATE TABLE
       audit_log,
       whatsapp_messages,
+      mail_invoices,
+      mail_messages,
+      mailbox_cursor,
       agent_envelopes,
       verification_verdicts,
       job_step_results,

@@ -63,7 +63,7 @@ export interface NotifyTarget {
  * approval and is about to move the job to `await_approval`; a failure to
  * send mail must not undo either.
  */
-async function notifyOwner(
+export async function notifyOwner(
   approvalId: string,
   target: NotifyTarget,
   context: { businessId: string; jobId: string | null; facts: ActionFacts; charterVersion: string },

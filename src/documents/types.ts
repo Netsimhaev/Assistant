@@ -16,9 +16,12 @@ export type DocumentSource = 'manual' | 'mail' | 'api';
 /**
  * `pending` — stored, not yet parsed. `extracted` — parsed; its artefacts are
  * in `document_artifacts`. `rejected` — parsing refused it; `reason` says why
- * and the original bytes are still on disk (§8).
+ * and the original bytes are still on disk (§8). `stored` — kept on disk and
+ * downloadable, never read by the conductor (migration 044): a PDF whose
+ * extraction failed after its bytes were written (`reason` says why, ruling
+ * P7), or a PDF stored before PDFs were extracted (`reason` null).
  */
-export type DocumentStatus = 'pending' | 'extracted' | 'rejected';
+export type DocumentStatus = 'pending' | 'extracted' | 'rejected' | 'stored';
 
 /** What a `document_artifacts` row's `content` column holds the shape of. */
 export type ArtifactKind = 'text' | 'table' | 'outline';

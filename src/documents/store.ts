@@ -229,6 +229,28 @@ export async function markExtracted(
   });
 }
 
+/**
+ * A stored document: terminal, no artefacts, kept downloadable and never
+ * offered to a reader (`documentsAwaitingRead` takes `extracted` only).
+ * `reason` says why it was not read — today a PDF whose extraction failed
+ * after its bytes were written (ruling P7); `null` for a row written before
+ * PDFs were extracted at all (a store-only type).
+ */
+export async function markStored(
+  documentId: string,
+  options: { businessId?: string; db?: Queryable; reason?: string } = {},
+): Promise<void> {
+  const db = options.db ?? getPool();
+  const { rowCount } = await db.query(
+    `UPDATE documents SET status = 'stored', reason = $3
+      WHERE business_id = $1 AND document_id = $2`,
+    [options.businessId ?? config.businessId, documentId, options.reason ?? null],
+  );
+  if (rowCount !== 1) {
+    throw new Error(`markStored: no document ${documentId} for business ${options.businessId ?? config.businessId}`);
+  }
+}
+
 /** Mark a document `rejected` with a human-readable reason (§8). The original bytes stay on disk. */
 export async function markRejected(
   documentId: string,
@@ -327,6 +349,20 @@ export const MAX_READ_ATTEMPTS = 3;
  * through the pipeline; asking again under a second provenance is a
  * different question than this loop asks, and would spend money on a
  * document the owner has already been told about.
+ *
+ * **Mail attachments are skipped (`source <> 'mail'`).** `intake.triage`
+ * already read the mail the attachment came with, and the mail poll raised
+ * whatever card that mail warranted (spec §5.5). Reading the attachment here
+ * a second time would be a second model call and a second card about the
+ * same mail. The only caller of this function is the conductor, so the
+ * filter changes nothing else; the document is still stored, downloadable
+ * and linked from its invoice row.
+ *
+ * **Scanned PDFs are skipped.** A PDF none of whose pages yielded text is
+ * `extracted` with `scanned_no_text` on its first artefact (ordinal 0,
+ * `extractors/pdf.ts`). Reading it would be a paid model call on a brief
+ * with nothing in it. The test is the flag's presence — a positive fact the
+ * extractor wrote — not an inference from empty artefacts.
  */
 export async function documentsAwaitingRead(
   limit: number,
@@ -340,6 +376,14 @@ export async function documentsAwaitingRead(
       WHERE d.business_id = $1
         AND d.status = 'extracted'
         AND d.read_attempts < $2
+        AND d.source <> 'mail'
+        AND NOT EXISTS (
+              SELECT 1 FROM document_artifacts a
+               WHERE a.document_id = d.document_id
+                 AND a.business_id = d.business_id
+                 AND a.ordinal = 0
+                 AND 'scanned_no_text' = ANY (a.flags)
+            )
         AND NOT EXISTS (
               SELECT 1 FROM document_readings r
                 JOIN proposals p

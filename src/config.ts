@@ -82,10 +82,17 @@ export const config = {
   documentRoot: resolve(required('DOCUMENT_ROOT')),
   documentInbox: optional('DOCUMENT_INBOX'),
   documentReadsPerDay: positiveInt('DOCUMENT_READS_PER_DAY', 20),
+  // Model reads (triage calls) of incoming mail per day. A mail pulled after
+  // the ceiling is recorded and shown as "not read — daily ceiling reached",
+  // and is read on a later pass once the count resets (spec §5.4).
+  mailReadsPerDay: positiveInt('MAIL_READS_PER_DAY', 200),
   // A billed model call per finished job. A feature that spends money with no
   // switch starts charging an existing installation on the day it upgrades —
   // which is exactly what `DOCUMENT_INBOX` did before it became a switch.
   curationRunsPerDay: positiveInt('CURATION_RUNS_PER_DAY', 20),
+  // Curation of invoice/question mail, counted apart from document curation so
+  // a busy mailbox cannot starve the document ceiling (or the reverse).
+  mailCurationPerDay: positiveInt('MAIL_CURATION_PER_DAY', 100),
   // A delegation costs at least one model call in the child. Same shape as
   // `curationRunsPerDay` and for the same reason: this project caps model cost
   // with a daily count off `audit_log`, not with a token budget — and a second,

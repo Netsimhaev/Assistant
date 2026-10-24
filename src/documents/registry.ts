@@ -6,9 +6,9 @@
  * (`src/sdk/tool-names.ts`): what has no name here does not get parsed.
  */
 
-import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, TEXT, XLSX } from './media-type.js';
+import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, PDF, TEXT, XLSX } from './media-type.js';
 
-export type ExtractorId = 'xlsx' | 'docx' | 'csv' | 'passthrough';
+export type ExtractorId = 'xlsx' | 'docx' | 'csv' | 'passthrough' | 'pdf';
 
 export const SUPPORTED: Record<string, ExtractorId> = {
   [TEXT]: 'passthrough',
@@ -17,6 +17,7 @@ export const SUPPORTED: Record<string, ExtractorId> = {
   [CSV]: 'csv',
   [XLSX]: 'xlsx',
   [DOCX]: 'docx',
+  [PDF]: 'pdf',
 };
 
 /**

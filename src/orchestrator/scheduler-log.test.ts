@@ -21,6 +21,8 @@ function cleanResult(): SchedulerPassResult {
     conduct: null,
     delegated: { resumed: [], timedOut: [], errored: [] },
     whatsappDoor: null,
+    mail: null,
+    mailError: null,
     due: { ran: [], lockedOut: [], unbound: [], phaseMoved: [], errored: [] },
     verified: {
       closed: [],
@@ -32,6 +34,8 @@ function cleanResult(): SchedulerPassResult {
       curated: [],
       curationSkipped: [],
     },
+    mailRetention: { scrubbed: 0 },
+    mailRetentionError: null,
     whatsappReport: null,
     whatsappError: null,
     autonomy: { promoted: [], demoted: [], errored: [] },
@@ -54,6 +58,35 @@ describe('logErrored', () => {
     }
   });
 
+  it('prints a mailbox cursor gap and a nonzero unnotified count', () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      logErrored({
+        ...cleanResult(),
+        mail: {
+          status: 'ok',
+          recorded: 0,
+          triaged: 0,
+          overCap: 0,
+          labelled: 0,
+          notified: 0,
+          unnotified: 3,
+          drafts: 0,
+          reraised: 0,
+          failed: 0,
+          gap: true,
+        },
+      });
+      const all = [...logSpy.mock.calls, ...errorSpy.mock.calls].map((c) => String(c[0])).join('\n');
+      expect(all).toContain('mailbox cursor expired');
+      expect(all).toContain('3 mail(s) from people had no WhatsApp channel');
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
   /**
    * The exact gap F4 named: ruling 3 is only honest once a deferred count and
    * an errored job id are actually printed somewhere an operator reads.
@@ -64,7 +97,7 @@ describe('logErrored', () => {
     try {
       const result: SchedulerPassResult = {
         ...cleanResult(),
-        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, malformedSenderCount: 0 },
+        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, mailCardReplies: 0, malformedSenderCount: 0 },
         whatsappReport: { reported: 0, deferred: 2, errored: ['job-a', 'job-b'] },
       };
       logErrored(result);
@@ -102,7 +135,7 @@ describe('logErrored', () => {
     try {
       logErrored({
         ...cleanResult(),
-        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, malformedSenderCount: 0 },
+        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, malformedSenderCount: 0 },
         whatsappError: 'reportCandidates query rejected',
       });
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');

@@ -355,6 +355,19 @@ describe('collectDigestFacts', () => {
     expect(facts.exceptions[0]?.reason).toBe('הקובץ פגום ולא ניתן לקריאה.');
   });
 
+  it('names a PDF kept stored because it could not be decoded, but not a pre-reading stored one', async () => {
+    await getPool().query(
+      `INSERT INTO documents
+         (document_id, business_id, source, original_name, media_type, sha256, byte_size, stored_path, status, reason, created_at)
+       VALUES ('DOC-U', $1, 'mail', 'נעול.pdf', 'application/pdf', $3, 12, 'p/u', 'stored', 'הפענוח נכשל: password', $2),
+              ('DOC-L', $1, 'mail', 'ישן.pdf', 'application/pdf', $4, 12, 'p/l', 'stored', NULL, $2)`,
+      [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), 'b'.repeat(64), 'c'.repeat(64)],
+    );
+
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    expect(facts.exceptions).toEqual([{ subject: 'נעול.pdf', reason: 'הפענוח נכשל: password' }]);
+  });
+
   /**
    * Fix round 1, item 4: a message is attributed to the window it was
    * actually SENT in, not the window its job later happens to close in. The

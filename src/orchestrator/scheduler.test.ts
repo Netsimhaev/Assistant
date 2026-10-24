@@ -18,6 +18,10 @@ import { AdapterRegistry } from './adapters/registry.js';
 import { envCredentials } from './credentials.js';
 import type { Runtime } from './runtime.js';
 import { MasterKeyError } from '../governance/master-key.js';
+import { getCursor, setCursor } from '../mail/inbox-store.js';
+import type { MailboxClient } from '../mail/providers/types.js';
+import type { Triage } from '../sdk/mail-triage.js';
+import { NOON as MAIL_NOON, QUESTION_TRIAGE, incomingMail, installMailboxCharter, stubDrafter } from '../test/mailbox.js';
 
 /**
  * What `perform` returns when a step produced nothing an adapter would hand
@@ -446,5 +450,74 @@ describe('the digest field on SchedulerPassResult', () => {
     expect(pass.digest?.produced).toHaveLength(1);
     expect(pass.digest?.produced[0]?.kind).toBe('daily');
     expect(pass.digest?.errored).toBeNull();
+  });
+});
+
+/**
+ * The mailbox poll inside the pass: `null` when nothing is connected (a
+ * switch, not a fault), and a real result — with the poll's own work done —
+ * when a mailbox is.
+ */
+describe('the mail field on SchedulerPassResult', () => {
+  const inert = (): Runtime => ({
+    registry: new AdapterRegistry([]),
+    credentials: envCredentials({ TEST_CRED_OAUTH_MAILBOX: 'access-token' }, 'TEST_CRED_'),
+    warnings: [],
+  });
+
+  it('is null, with no error, when no mailbox is connected', async () => {
+    await install();
+    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime: inert() });
+    expect(pass.mail).toBeNull();
+    expect(pass.mailError).toBeNull();
+  });
+
+  it('scrubs a body past its year on every pass, mailbox connected or not', async () => {
+    await install();
+    const old = new Date(NOON.getTime() - 400 * 24 * 3600_000);
+    await getPool().query(
+      `INSERT INTO mail_messages
+         (mail_id, business_id, provider_message_id, thread_id, from_address, subject, received_at, body_text)
+       VALUES ('M-old', $1, 'pm-old', 't', 'a@b.example', 's', $2, 'גוף ישן')`,
+      [BUSINESS, old.toISOString()],
+    );
+    const pass = await schedulerPass({ businessId: BUSINESS, now: NOON, inbox: null, runtime: inert() });
+    expect(pass.mailRetention).toEqual({ scrubbed: 1 });
+    expect(pass.mailRetentionError).toBeNull();
+    const { rows } = await getPool().query<{ body_text: string | null }>(
+      'SELECT body_text FROM mail_messages WHERE mail_id = $1',
+      ['M-old'],
+    );
+    expect(rows[0]?.body_text).toBeNull();
+  });
+
+  it('polls the connected mailbox and raises the reply card in the same pass', async () => {
+    await installMailboxCharter(BUSINESS);
+    await setCursor({ provider: 'google', cursor: 'C-0' }, { businessId: BUSINESS });
+    const client = {
+      initialCursor: async () => 'C-0',
+      listSince: async () => ({ messages: [incomingMail({ providerMessageId: 'PM-S' })], nextCursor: 'C-1' }),
+      fetchAttachment: async () => Buffer.alloc(0),
+      ensureLabels: async (_t: string, names: readonly string[]) => Object.fromEntries(names.map((n) => [n, `L-${n}`])),
+      addLabel: async () => true as const,
+      sendReply: async () => ({ externalId: 'SENT-1' }),
+    } as unknown as MailboxClient;
+    const triage: Triage = async () => ({ status: 'read', triage: QUESTION_TRIAGE });
+
+    const pass = await schedulerPass({
+      businessId: BUSINESS,
+      now: MAIL_NOON,
+      inbox: null,
+      runtime: inert(),
+      mailClient: client,
+      mailTriage: triage,
+      mailDrafter: stubDrafter(),
+    });
+
+    expect(pass.mailError).toBeNull();
+    expect(pass.mail).toMatchObject({ status: 'ok', recorded: 1, triaged: 1, drafts: 1 });
+    expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-1');
+    const pending = await pendingApprovals({ businessId: BUSINESS });
+    expect(pending).toHaveLength(1);
   });
 });

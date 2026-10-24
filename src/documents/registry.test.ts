@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, TEXT, XLSX } from './media-type.js';
+import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, PDF, TEXT, XLSX } from './media-type.js';
 import { SUPPORTED, extractorFor } from './registry.js';
 
 describe('the extractor registry', () => {
@@ -8,7 +8,7 @@ describe('the extractor registry', () => {
       expect(extractorFor(mediaType), mediaType).not.toBeNull();
     }
     const used = new Set(Object.values(SUPPORTED));
-    expect([...used].sort()).toEqual(['csv', 'docx', 'passthrough', 'xlsx']);
+    expect([...used].sort()).toEqual(['csv', 'docx', 'passthrough', 'pdf', 'xlsx']);
   });
 
   it('returns null for a type nobody named', () => {
@@ -29,5 +29,6 @@ describe('the extractor registry', () => {
     expect(extractorFor(TEXT)).toBe('passthrough');
     expect(extractorFor(MARKDOWN)).toBe('passthrough');
     expect(extractorFor(JSON_TYPE)).toBe('passthrough');
+    expect(extractorFor(PDF)).toBe('pdf');
   });
 });

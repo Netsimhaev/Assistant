@@ -35,7 +35,17 @@ function compareSchemaVersions(a: string, b: string): number | null {
  */
 export async function installCharter(
   charter: BusinessCharter,
-  options: { businessId?: string; activate?: boolean } = {},
+  options: {
+    businessId?: string;
+    activate?: boolean;
+    /**
+     * Join a caller's open transaction instead of opening one. For a caller
+     * that must commit the install together with something else — the
+     * dashboard's mailbox amendment writes its `charter_change` audit row in
+     * the same transaction, so a failed append rolls the install back.
+     */
+    tx?: Queryable;
+  } = {},
 ): Promise<PolicyBundle> {
   // The argument is typed as `BusinessCharter`, but a caller can construct one
   // without going through `.parse()` — an object literal, a value round-tripped
@@ -53,7 +63,7 @@ export async function installCharter(
 
   const bundle = compileCharter(parsed);
 
-  await withTransaction(async (tx) => {
+  const write = async (tx: Queryable): Promise<void> => {
     await tx.query(
       `INSERT INTO charter_versions (
          charter_version, business_id, effective_from, supersedes,
@@ -84,7 +94,10 @@ export async function installCharter(
         [businessId, parsed.charterVersion],
       );
     }
-  });
+  };
+
+  if (options.tx !== undefined) await write(options.tx);
+  else await withTransaction(write);
 
   return bundle;
 }
@@ -200,6 +213,27 @@ export async function probeActiveCharter(
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/**
+ * One stored charter version of this business, parsed — or `null` when no
+ * such version exists for it. Throws on a version this code cannot parse, the
+ * same as `loadActiveCharter`; the one caller (the dashboard's mailbox
+ * revert, which reads the version the mailbox amendment superseded) turns
+ * that into a refusal. Never a source of policy: the gate reads only the
+ * active charter.
+ */
+export async function loadCharterVersion(
+  charterVersion: string,
+  businessId: string = config.businessId,
+  db: Queryable = getPool(),
+): Promise<BusinessCharter | null> {
+  const { rows } = await db.query<{ charter: unknown }>(
+    'SELECT charter FROM charter_versions WHERE business_id = $1 AND charter_version = $2',
+    [businessId, charterVersion],
+  );
+  const row = rows[0];
+  return row ? BusinessCharter.parse(row.charter) : null;
 }
 
 /**

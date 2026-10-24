@@ -73,6 +73,17 @@ import {
   handleOAuthStart,
 } from './oauth-routes.js';
 import type { OAuthRouteOptions } from './oauth-routes.js';
+import { MAILBOX_SYSTEM, type MailProvider } from '../mail/mailbox.js';
+import type { MailboxClient } from '../mail/providers/types.js';
+import { isMailReplyJob } from '../mail/inbox-store.js';
+import { mailReplyEditRefusal, mailboxReplyRecipient } from '../mail/reply-card.js';
+import {
+  handleMailboxRevertPost,
+  handleMailboxSignGet,
+  handleMailboxSignPost,
+  handleMailboxStatus,
+} from './mailbox-connect.js';
+import { handleDocumentFile, handleInvoices, handleMailDetail, handleMailDocuments, handleMailList, notFound } from './mail-handlers.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
 import { MAX_RECALL, recallMemories } from '../memory/store.js';
@@ -174,6 +185,12 @@ export interface DashboardOptions {
    * keep. No production caller ever passes it.
    */
   oauthFetch?: typeof fetch;
+  /**
+   * Test seam for the mailbox client the OAuth callback takes the initial
+   * cursor with. No production caller passes it: absent, the callback uses
+   * the real Gmail / Graph client for the provider.
+   */
+  mailboxClientFor?: (provider: MailProvider) => MailboxClient;
 }
 
 /**
@@ -1496,6 +1513,7 @@ function planFingerprint(plan: ErasurePlan): string {
     documentIds: [...plan.documentIds].sort(),
     memoryIds: [...plan.memoryIds].sort(),
     digestIds: [...plan.digestIds].sort(),
+    mailIds: [...plan.mailIds].sort(),
     filePaths: [...plan.filePaths].sort(),
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
@@ -1857,8 +1875,30 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
       ...(verdict !== null ? { verdict } : {}),
       ...(notJudgedReason !== null ? { notJudged: notJudgedReason } : {}),
       ...(verdictUnreadable ? { verdictUnreadable: true } : {}),
+      ...(await mailReplyOptions(approval.jobId, businessId)),
     }),
   );
+}
+
+/** The card options a mailbox reply needs: the marker, and the provider when one is bound. */
+async function mailReplyOptions(
+  jobId: string | null,
+  businessId: string,
+): Promise<{ mailReply?: true; mailProvider?: string }> {
+  if (!(await isMailReplyCard(jobId, businessId))) return {};
+  const mailProvider = await mailboxProviderOf(businessId);
+  return mailProvider !== null ? { mailReply: true, mailProvider } : { mailReply: true };
+}
+
+/** The provider on the business's `mailbox` binding, or `null` when none is bound. */
+async function mailboxProviderOf(businessId: string): Promise<string | null> {
+  const bindings = await loadBindings({ businessId });
+  return bindings.find((b) => b.system === MAILBOX_SYSTEM)?.provider ?? null;
+}
+
+/** The positive marker the reply layout and the reply edit rule key on. */
+async function isMailReplyCard(jobId: string | null, businessId: string): Promise<boolean> {
+  return jobId !== null && (await isMailReplyJob(jobId, { businessId }));
 }
 
 /** JSON.parse can hand back an object, an array, a string, a number, a boolean, or null — only the first is a tool payload. */
@@ -2248,6 +2288,10 @@ async function handleDecision(
     approval.inputHash,
   );
 
+  const mailReply = await isMailReplyCard(approval.jobId, businessId);
+  const mailProvider = mailReply ? await mailboxProviderOf(businessId) : null;
+  const providerOption = mailProvider !== null ? { mailProvider } : {};
+
   if (!edit.ok) {
     return sendHtml(
       res,
@@ -2257,7 +2301,40 @@ async function handleDecision(
         csrf: issueCsrfToken(session.sessionId),
         editValue: edit.raw,
         ...(note !== undefined ? { noteValue: note } : {}),
+        ...(mailReply ? { mailReply: true } : {}),
+        ...providerOption,
         error: 'התוכן שהוזן אינו אובייקט JSON תקין. יש להזין מבנה בסגנון { "שדה": ערך } ולנסות שוב.',
+      }),
+    );
+  }
+
+  // A mailbox reply goes to the original From, always (mailbox spec 5.2):
+  // only the subject and the body may be edited — and on a Microsoft 365
+  // mailbox only the body, since Outlook sets the reply subject itself (R22).
+  // Keyed on the marker OR the reply shape of what was proposed -- the
+  // refusal only ever narrows, so the broader test is the safe one -- and
+  // checked before `decide`, so the approval stays pending and nothing can run.
+  const editRefusal =
+    edit.editedInput !== undefined &&
+    (mailReply || mailboxReplyRecipient(approval.proposedInput) !== null)
+      ? mailReplyEditRefusal(
+          approval.proposedInput,
+          edit.editedInput,
+          mailProvider ?? (await mailboxProviderOf(businessId)),
+        )
+      : null;
+  if (editRefusal !== null) {
+    return sendHtml(
+      res,
+      400,
+      renderApprovalCard({
+        approval,
+        csrf: issueCsrfToken(session.sessionId),
+        editValue: JSON.stringify(edit.editedInput, null, 2),
+        ...(note !== undefined ? { noteValue: note } : {}),
+        ...(mailReply ? { mailReply: true } : {}),
+        ...providerOption,
+        error: editRefusal,
       }),
     );
   }
@@ -2375,6 +2452,8 @@ async function handleAutonomousActionMark(
 }
 
 const CARD_PATH = /^\/a\/([^/]+)$/;
+const MAIL_PATH = /^\/mail\/([^/]+)$/;
+const DOCUMENT_FILE_PATH = /^\/documents\/([^/]+)\/file$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
 const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
 const AUTONOMOUS_ACTION_MARK_PATH = /^\/autonomy\/actions\/([^/]+)\/([^/]+)\/mark$/;
@@ -2397,7 +2476,8 @@ async function route(
   oauthOptions: OAuthRouteOptions,
 ): Promise<void> {
   const method = req.method ?? 'GET';
-  const pathname = new URL(req.url ?? '/', 'http://dashboard.local').pathname;
+  const requestUrl = new URL(req.url ?? '/', 'http://dashboard.local');
+  const pathname = requestUrl.pathname;
 
   if (method === 'GET' && pathname === '/login') return handleLoginGet(res);
   // Deliberately no CSRF check here — not an oversight. A CSRF token is
@@ -2432,6 +2512,46 @@ async function route(
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
   if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
+  // The mailbox screens: list with search, invoices by supplier, one mail, and
+  // the business-scoped document download they link to.
+  if (method === 'GET' && pathname === '/mail') {
+    return handleMailList(res, businessId, requestUrl, issueCsrfToken(session.sessionId));
+  }
+  if (method === 'GET' && pathname === '/mail/invoices') {
+    return handleInvoices(res, businessId, requestUrl, issueCsrfToken(session.sessionId));
+  }
+  // Before `MAIL_PATH`, which would read "documents" as a mail id.
+  if (method === 'GET' && pathname === '/mail/documents') return handleMailDocuments(res, businessId, requestUrl);
+  const mailMatch = MAIL_PATH.exec(pathname);
+  if (method === 'GET' && mailMatch?.[1] !== undefined) {
+    const mailId = decodePathSegment(mailMatch[1]);
+    return mailId === null ? notFound(res) : handleMailDetail(res, businessId, mailId);
+  }
+  const documentFileMatch = DOCUMENT_FILE_PATH.exec(pathname);
+  if (method === 'GET' && documentFileMatch?.[1] !== undefined) {
+    const documentId = decodePathSegment(documentFileMatch[1]);
+    return documentId === null ? notFound(res) : handleDocumentFile(res, businessId, documentId, documentRoot);
+  }
+  // Connecting the business mailbox: sign the charter amendment FIRST, then
+  // run the OAuth ceremony — see `mailbox-connect.ts` for why that order.
+  if (method === 'GET' && pathname === '/connections/mailbox') {
+    return handleMailboxStatus(res, businessId, issueCsrfToken(session.sessionId));
+  }
+  if (method === 'GET' && pathname === '/connections/mailbox/sign') {
+    return handleMailboxSignGet(
+      res,
+      businessId,
+      issueCsrfToken(session.sessionId),
+      new URL(req.url ?? '/', 'http://dashboard.local').searchParams,
+      oauthOptions.credentialKeyPath,
+    );
+  }
+  if (method === 'POST' && pathname === '/connections/mailbox/sign') {
+    return handleMailboxSignPost(res, businessId, session, await readFormBody(req), oauthOptions.credentialKeyPath);
+  }
+  if (method === 'POST' && pathname === '/connections/mailbox/revert') {
+    return handleMailboxRevertPost(res, businessId, session, await readFormBody(req));
+  }
   if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, businessId, session);
   if (method === 'POST' && pathname === '/digest/settings')
     return handleDigestSettingsPost(req, res, businessId, session);
@@ -2457,7 +2577,14 @@ async function route(
     if (raw !== undefined) {
       const system = decodePathSegment(raw);
       if (system === null) return sendHtml(res, 404, renderNotFound());
-      return handleOAuthStart(res, businessId, session, system, oauthOptions);
+      return handleOAuthStart(
+        res,
+        businessId,
+        session,
+        system,
+        oauthOptions,
+        new URL(req.url ?? '/', 'http://dashboard.local').searchParams,
+      );
     }
   }
   if (method === 'GET' && pathname === '/oauth/callback') {
@@ -2567,6 +2694,7 @@ export function createServer(options: DashboardOptions = {}): Server {
     dashboardBaseUrl:
       options.dashboardBaseUrl ?? process.env['DASHBOARD_BASE_URL'] ?? DEFAULT_DASHBOARD_BASE_URL,
     ...(options.oauthFetch !== undefined ? { fetchImpl: options.oauthFetch } : {}),
+    ...(options.mailboxClientFor !== undefined ? { mailboxClientFor: options.mailboxClientFor } : {}),
   };
 
   const server = createHttpServer((req, res) => {

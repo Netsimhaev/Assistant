@@ -41,6 +41,8 @@ import {
   JOBS_SCRUBBED_PREDICATE,
   JOBS_SCRUB_SET,
   LIVE_PHASES,
+  MAIL_INVOICES_ERASED_PREDICATE,
+  MAIL_MESSAGES_ERASED_PREDICATE,
   PROPOSALS_ERASED_PREDICATE,
   STRANDED_PARENT_PREDICATE,
   VERIFICATION_VERDICTS_ERASED_PREDICATE,
@@ -155,7 +157,7 @@ export async function executeErasure(
     );
   }
 
-  const { jobIds, documentIds, memoryIds, digestIds } = plan;
+  const { jobIds, documentIds, memoryIds, digestIds, mailIds } = plan;
   const client = await getPool().connect();
   const results: ErasureItem[] = [];
   let txError: unknown;
@@ -268,6 +270,23 @@ export async function executeErasure(
       'whatsapp_messages',
       `DELETE FROM whatsapp_messages WHERE ${WHATSAPP_MESSAGES_ERASED_PREDICATE}`,
       whatsappMessageParams(businessId, jobIds, plan.anchor),
+    );
+    // The mailbox (migrations 042/044). `mail_invoices` FIRST: its `mail_id`
+    // cascades from `mail_messages`, and a cascade that beat this statement
+    // to the row would leave it reporting zero for a table that lost rows —
+    // the `proposals`-before-`document_readings` rule from this file's
+    // header, one table pair over. Neither has a foreign key to `documents`,
+    // so their place relative to the `documents` delete below is free. Same
+    // predicates, same parameters, as `countItems` in `erasure-plan.ts`.
+    await del(
+      'mail_invoices',
+      `DELETE FROM mail_invoices WHERE ${MAIL_INVOICES_ERASED_PREDICATE}`,
+      [businessId, mailIds, documentIds],
+    );
+    await del(
+      'mail_messages',
+      `DELETE FROM mail_messages WHERE ${MAIL_MESSAGES_ERASED_PREDICATE}`,
+      [businessId, mailIds],
     );
     // `autonomy_marks.note` is owner-written content about a corrected step
     // and is not restricted to naming the counterparty the step happened to

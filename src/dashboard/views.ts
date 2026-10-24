@@ -28,6 +28,8 @@ import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibilit
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { stripBidiControls } from '../util/bidi.js';
+import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
+import { OUTLOOK_SUBJECT_NOTE, WARNING_PREFIXES, mailboxReplyRecipient, splitReplyDetail } from '../mail/reply-card.js';
 import { formatMinor } from '../util/money.js';
 
 /** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
@@ -101,7 +103,7 @@ const STYLE = `
   button.danger { background: #c0392b; color: #fff; border: 1px solid #8e2a20; font-weight: bold; }
 `;
 
-function page(title: string, body: string): string {
+export function page(title: string, body: string): string {
   return `<!doctype html>
 <html lang="he" dir="rtl">
 <head>
@@ -221,7 +223,7 @@ export function renderPendingList(options: {
   ${logoutForm(options.csrf)}
 </header>
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a></p>
 ${list}`,
   );
 }
@@ -645,7 +647,13 @@ function connectionRowHtml(row: ConnectionRow, csrf: string): string {
            <input type="hidden" name="csrf" value="${esc(csrf)}">
            <button type="submit">ביטול החיבור</button>
          </form>`
-      : connectionAcceptsOAuthCeremony(connection)
+      : connection.system === MAILBOX_SYSTEM
+        ? // The mailbox's ceremony needs a provider, and the provider must be
+          // the one the owner signed for: its own page builds that link
+          // (`mailbox-connect.ts`). A bare `/oauth/mailbox/start` here would
+          // be refused with a 400.
+          '<a href="/connections/mailbox">לחיבור</a>'
+        : connectionAcceptsOAuthCeremony(connection)
         ? `<a href="${startPath}">לחיבור</a>`
         : '<span class="muted">לא ניתן לחבר אוטומטית דרך המסך הזה</span>';
 
@@ -751,6 +759,11 @@ export function renderConnections(options: {
   הקריאה הבאה, גם אם ה-scheduler רץ כבר, כבר נכשלת.
 </p>
 ${notice}
+${
+  options.charterStatus === 'ok' && !options.connections.some((c) => c.system === MAILBOX_SYSTEM)
+    ? '<p><a href="/connections/mailbox">חיבור תיבת המייל של העסק (Gmail או Microsoft 365)</a></p>'
+    : ''
+}
 ${sections === '' && notice === '' ? '<p>התקנון הפעיל אינו מצהיר על אף חיבור.</p>' : sections}`,
   );
 }
@@ -1005,6 +1018,31 @@ function stillRunningNote(options: {
   return '<p class="muted">בבדיקה — פסיקת האימות תופיע כאן כשתהיה מוכנה.</p>';
 }
 
+/**
+ * The detail of a mailbox-reply card (`orchestrator/mail-reply.ts`).
+ *
+ * The header block is code-written (`composeReplyDetail`), so a header line
+ * that starts with one of `WARNING_PREFIXES` is a warning this code issued —
+ * a differing Reply-To, or a re-asked send that may already have gone out —
+ * and is rendered as one. The body after the blank line is the drafted reply,
+ * model text derived from a stranger's mail: it is never scanned for those
+ * prefixes, and is shown with its line breaks rather than run together, since
+ * it is exactly what will be sent. Every part goes through `escLabel`: the
+ * subject and Reply-To are sender-written.
+ */
+function mailReplyDetail(detail: string): string {
+  const { header, body } = splitReplyDetail(detail);
+  const lines = header
+    .map((line) =>
+      WARNING_PREFIXES.some((prefix) => line.startsWith(prefix))
+        ? `<p class="error">${escLabel(line)}</p>`
+        : `<p>${escLabel(line)}</p>`,
+    )
+    .join('\n  ');
+  return `${lines}
+  <div class="card" style="white-space: pre-wrap">${escLabel(body)}</div>`;
+}
+
 export function renderApprovalCard(options: {
   approval: ApprovalRequest;
   csrf: string;
@@ -1055,13 +1093,46 @@ export function renderApprovalCard(options: {
    * and this text must still reach the owner when they don't.
    */
   signError?: string;
+  /**
+   * The card's job is a mailbox reply job (`isMailReplyJob`, the mail row's
+   * `reply_job_id`) — a marker only the reply path writes. The reply layout
+   * needs it AND a payload of the reply shape; a payload that merely looks
+   * like a reply renders as before.
+   */
+  mailReply?: boolean;
+  /**
+   * The provider on the `mailbox` binding. `microsoft` adds a line saying the
+   * subject is set by Outlook (R22) — the route refuses a subject edit there.
+   */
+  mailProvider?: string;
 }): string {
   const { approval } = options;
-  const editValue = options.editValue ?? JSON.stringify(approval.proposedInput, null, 2);
+  // A pending card can carry a staged edit — the owner's replacement body for
+  // a mailbox reply, sent over WhatsApp (`stagePendingEdit`). Offer THAT, so
+  // approving here sends what he last wrote and saw, not the draft he replaced.
+  const offered =
+    approval.state === 'pending' && approval.editedInput !== null && approval.editedInput !== undefined
+      ? approval.editedInput
+      : approval.proposedInput;
+  const editValue = options.editValue ?? JSON.stringify(offered, null, 2);
   const noteValue = options.noteValue ?? '';
   const errorBlock = options.error ? `<p class="error">${esc(options.error)}</p>` : '';
   const signErrorBlock = options.signError ? `<p class="error">${esc(options.signError)}</p>` : '';
   const risk = approval.risk;
+  // Positive shape test on the payload as proposed; anything else renders
+  // exactly as before.
+  const replyRecipient =
+    options.mailReply === true ? mailboxReplyRecipient(approval.proposedInput) : null;
+  const detailBlock =
+    replyRecipient === null
+      ? `<p>${esc(approval.detail)}</p>`
+      : mailReplyDetail(approval.detail) +
+        (options.mailProvider === 'microsoft' ? `\n  <p class="muted">${esc(OUTLOOK_SUBJECT_NOTE)}</p>` : '');
+  const recipientRow =
+    replyRecipient === null
+      ? ''
+      : `
+    <tr><td class="muted">נמען התשובה</td><td>${escLabel(replyRecipient)}</td></tr>`;
 
   return page(
     approval.summary,
@@ -1072,8 +1143,8 @@ export function renderApprovalCard(options: {
 <p><a href="/">&rarr; חזרה לרשימה</a></p>
 <div class="card">
   <h2>${esc(approval.summary)}</h2>
-  <p>${esc(approval.detail)}</p>
-  <table>
+  ${detailBlock}
+  <table>${recipientRow}
     <tr><td class="muted">כלי</td><td>${esc(approval.proposedTool)}</td></tr>
     <tr><td class="muted">סוג פעולה</td><td>${esc(approval.actionClass)}</td></tr>
     <tr><td class="muted">סיכון</td><td class="band-${esc(risk.band)}">${esc(bandLabel(risk.band))} (${esc(risk.total)}) — ${esc(risk.explanation)}</td></tr>
@@ -1240,7 +1311,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/digest">מה קרה</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/digest">מה קרה</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }
@@ -1307,6 +1378,10 @@ export const TABLE_LABELS: Record<string, string> = {
   // Migration 040: the stored daily/weekly digest, which names failures —
   // a document name, a recipient, a contact — in its own rendered body.
   digests: 'תדריכים',
+  // Migrations 042/044: mail read from the connected mailbox, and the
+  // invoices extracted from it.
+  mail_messages: 'מיילים',
+  mail_invoices: 'חשבוניות ממיילים',
 };
 
 /**

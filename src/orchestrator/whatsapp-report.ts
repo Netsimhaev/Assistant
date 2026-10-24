@@ -295,6 +295,12 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   transport_error: 'אירעה תקלת תקשורת בשליחה', // retryable
   delivery_unknown: 'לא ניתן לאשר אם ההודעה נשלחה בהצלחה',
 
+  // The mailbox send adapter's reply refusals (adapters/mailbox-send.ts).
+  reply_target_unknown: 'לא נמצא המייל שאליו מבקשים לענות בתיבת העסק',
+  not_a_reply: 'פרטי השרשור של התשובה אינם תקינים',
+  reply_recipient_mismatch: 'תשובה בתוך שיחה נשלחת רק לשולח המקורי',
+  reply_target_lookup_failed: 'לא ניתן היה לבדוק את המייל שאליו עונים', // retryable
+
   // run-due.ts's own plan-level rejections, under the `run_due:` namespace
   // `leadingCode` manufactures.
   'run_due:no_plan_bound': 'לא נמצאה תוכנית פעולה למשימה',

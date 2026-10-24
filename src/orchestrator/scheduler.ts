@@ -25,11 +25,14 @@ import { loadJob, transition } from './jobs.js';
 import { evaluateAutonomy } from './promote.js';
 import type { AutonomyPassResult } from './promote.js';
 import { resumeDelegatedJobs } from './resume-delegated.js';
+import { pollMailbox } from './mail-poll.js';
+import type { MailPollResult, PollMailboxOptions } from './mail-poll.js';
 import type { ResumeResult } from './resume-delegated.js';
 import { runDueJobs } from './run-due.js';
 import type { RunDueResult } from './run-due.js';
 import { buildRuntime } from './runtime.js';
 import { closeVerifiedJobs } from './verify.js';
+import { scrubOldMailBodies } from './mail-retention.js';
 import type { CloseVerifiedResult } from './verify.js';
 import type { Runtime } from './runtime.js';
 
@@ -616,8 +619,40 @@ export interface SchedulerPassResult {
    * function's own docblock.
    */
   whatsappDoor: DoorResult | null;
+  /**
+   * Null when no mailbox is connected — no `mailbox` connection in the
+   * signed charter, no live binding, or no cursor. The same "switch, not
+   * fault" shape `scan`/`conduct`/`whatsappDoor` carry: `null` is "the poll
+   * did not run", never "it ran and found nothing".
+   *
+   * Run after `whatsappDoor` (it needs this pass's WhatsApp messenger to tell
+   * the owner about mail from real people) and before `runDueJobs`, so a
+   * reply job approved earlier and a card raised now are both visible to
+   * this very pass.
+   */
+  mail: MailPollResult | null;
+  /**
+   * `pollMailbox`'s thrown message, if it threw — a charter that will not
+   * load, a database fault. Never a per-mail failure (those settle the one
+   * mail as `failed`) and never a provider failure (those are
+   * `mail.status`). The same treatment `scanError` gets, for the same
+   * reason: a broken mailbox must not stop the plans and closes below it.
+   */
+  mailError: string | null;
   due: RunDueResult;
   verified: CloseVerifiedResult;
+  /**
+   * The 365-day mail body retention (`mail-retention.ts`), run every pass
+   * right after `closeVerifiedJobs`. Not behind the mailbox switch: a body
+   * stored while a mailbox WAS connected still ages out after it is
+   * disconnected, and the statement is one indexed `UPDATE` that finds
+   * nothing on an installation that never had mail. Null only when it threw
+   * — `mailRetentionError` then says why, the same pairing `scan`/
+   * `scanError` already use, and for the same reason: bookkeeping that
+   * failed must not take down the pass whose real work already succeeded.
+   */
+  mailRetention: { scrubbed: number } | null;
+  mailRetentionError: string | null;
   /**
    * Null under the same switch as `whatsappDoor` above. Run after
    * `closeVerifiedJobs`, not before: a job the door opened and this very pass
@@ -771,6 +806,10 @@ export async function schedulerPass(
     /** Test seam only; production leaves it unset and `runInstruction` uses the real planner. */
     whatsappPlanner?: RunInstructionOptions['planner'];
     whatsappProvider?: Parameters<typeof runWhatsAppDoor>[0]['provider'];
+    /** Test seams only; production leaves them unset and the poll uses the real client, triage and drafter. */
+    mailClient?: PollMailboxOptions['client'];
+    mailTriage?: PollMailboxOptions['triage'];
+    mailDrafter?: PollMailboxOptions['drafter'];
   } = {},
 ): Promise<SchedulerPassResult> {
   const businessId = options.businessId ?? config.businessId;
@@ -865,6 +904,37 @@ export async function schedulerPass(
     }
   }
 
+  // The mailbox poll — see `SchedulerPassResult.mail`'s own docblock. The
+  // owner's WhatsApp notice goes through THIS pass's messenger, built from
+  // this pass's own charter load above, when there is one; without a gateway
+  // `notifyBoss` is absent and the poll reports `unnotified` instead of going
+  // quiet. Approval-card email goes to the same target the conductor gets.
+  let mail: MailPollResult | null = null;
+  let mailError: string | null = null;
+  try {
+    const messenger = whatsappMessenger;
+    mail = await pollMailbox({
+      businessId,
+      runtime,
+      ...(options.mailClient !== undefined ? { client: options.mailClient } : {}),
+      ...(options.mailTriage !== undefined ? { triage: options.mailTriage } : {}),
+      ...(options.mailDrafter !== undefined ? { drafter: options.mailDrafter } : {}),
+      ...(options.now !== undefined ? { now: options.now } : {}),
+      ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
+      ...(runtime.notify !== undefined ? { notify: runtime.notify } : {}),
+      ...(messenger !== null
+        ? {
+            notifyBoss: async (text: string, jobId: string | null) => {
+              const sent = await messenger.send({ text, jobId });
+              if (!sent.ok) throw new Error(sent.error ?? 'whatsapp send failed');
+            },
+          }
+        : {}),
+    });
+  } catch (err) {
+    mailError = err instanceof Error ? err.message : String(err);
+  }
+
   // Both conductor loops run after the tick's transaction has committed, not
   // inside it — see the docblock above.
   //
@@ -917,6 +987,18 @@ export async function schedulerPass(
   // instead and every close would trail a pass behind the work that earned
   // it.
   const verified = await closeVerifiedJobs(options);
+
+  // Mail body retention — see `SchedulerPassResult.mailRetention`.
+  let mailRetention: { scrubbed: number } | null = null;
+  let mailRetentionError: string | null = null;
+  try {
+    mailRetention = await scrubOldMailBodies({
+      businessId,
+      ...(options.now !== undefined ? { now: options.now } : {}),
+    });
+  } catch (err) {
+    mailRetentionError = err instanceof Error ? err.message : String(err);
+  }
 
   // The report, right after `closeVerifiedJobs` — see
   // `SchedulerPassResult.whatsappReport`'s own docblock. Guarded on
@@ -985,8 +1067,12 @@ export async function schedulerPass(
     conduct,
     delegated,
     whatsappDoor,
+    mail,
+    mailError,
     due,
     verified,
+    mailRetention,
+    mailRetentionError,
     whatsappReport,
     whatsappError,
     autonomy,

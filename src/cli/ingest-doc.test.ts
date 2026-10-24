@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -116,5 +116,18 @@ describe('runIngestCli', () => {
     expect(out).toContain('rejected');
     expect(out).toContain('סיבת הדחייה:');
     expect(out).toContain('סוג');
+  });
+
+  it('prints why an undecodable PDF was stored without being read', async () => {
+    const path = join(ROOT, 'broken.pdf');
+    await writeFile(
+      path,
+      Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]),
+    );
+    const lines: string[] = [];
+    await runIngestCli([path], { log: (l) => lines.push(l), businessId: BUSINESS, documentRoot: ROOT });
+    const out = lines.join('\n');
+    expect(out).toContain('סטטוס: stored');
+    expect(out).toMatch(/לא נקרא: הפענוח נכשל: /);
   });
 });

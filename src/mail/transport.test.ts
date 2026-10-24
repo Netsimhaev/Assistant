@@ -298,6 +298,7 @@ describe('a real transport failure, classified through the real adapter', () => 
     input: { to: 'a@b.com', subject: 's', body: 'b' },
     credential: createCredentialHandle('OFFICE_MAIL', 'pw'),
     endpoint: null,
+    businessId: 'test-business',
     idempotencyKey: 'test-idempotency-key',
     signal: new AbortController().signal,
   };
@@ -480,6 +481,7 @@ describe('createSmtpTransport against a real SMTP conversation', () => {
       toolName: 'mail.send',
       input: { to: ['dana@example.com'], subject: 'נושא', body },
       endpoint: null,
+      businessId: 'test-business',
       credential: createCredentialHandle('OFFICE_MAIL', 'pw'),
       idempotencyKey: 'real-socket',
       signal: AbortSignal.timeout(8_000),

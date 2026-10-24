@@ -5,7 +5,7 @@
   "type": "module",
   "description": "AI personal assistant for businesses — governance spine (Phase 0)",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.15"
   },
   "allowScripts": [
     "esbuild"
@@ -34,6 +34,7 @@
     "sdk:contact-resolver": "tsx src/sdk/run-contact-resolver.ts",
     "sdk:delegate": "tsx src/sdk/run-delegate.ts",
     "sdk:judge": "tsx src/sdk/run-judge.ts",
+    "sdk:mail-triage": "tsx src/sdk/run-mail-triage.ts",
     "connector:calendar": "tsx scripts/connector-calendar.ts"
   },
   "dependencies": {
@@ -42,6 +43,7 @@
     "exceljs": "^4.4.0",
     "mammoth": "^1.12.1",
     "nodemailer": "^10.1.7",
+    "pdfjs-dist": "^6.4.299",
     "pg": "^8.16.3",
     "ulid": "^3.0.1",
     "zod": "^4.1.12"

@@ -43,26 +43,47 @@ import {
   GOOGLE_CLIENT_ID_REF,
   GOOGLE_CLIENT_SECRET_REF,
 } from '../orchestrator/adapters/google-token-http.js';
+import {
+  MICROSOFT_CLIENT_ID_REF,
+  MICROSOFT_CLIENT_SECRET_REF,
+} from '../orchestrator/adapters/microsoft-token-http.js';
+import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
+import type { MailProvider } from '../mail/mailbox.js';
+import type { CharterConnection } from '../domain/connection.js';
+import { setCursor } from '../mail/inbox-store.js';
+import { createGmailClient } from '../mail/providers/gmail.js';
+import { createGraphClient } from '../mail/providers/graph.js';
+import type { MailboxClient } from '../mail/providers/types.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
+import { mailboxProviderMatchesCharter } from '../charter/amend-mailbox.js';
 import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import { verifyCsrfToken } from './csrf.js';
-import { escapeHtml } from './views.js';
+import { escLabel, escapeHtml } from './views.js';
 import {
   buildConsentUrl,
   codeChallengeFor,
   createCodeVerifier,
+  emailFromIdToken,
   exchangeCode,
   fetchGoogleAccount,
+  fetchMicrosoftAccount,
 } from './oauth-consent.js';
+import {
+  GOOGLE_REVOKE_URL,
+  oauthProfileFor,
+} from './oauth-profiles.js';
 
-/** The one provider this ceremony authorises today. See module docblock. */
-const OAUTH_PROVIDER = 'google';
-
-/** The narrowest scope that allows the one read this subproject serves -- calendar events, read-only. Widening it is a separate decision, requiring re-consent (spec 5.3). */
-const GOOGLE_CALENDAR_READONLY_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
-
-/** Google's token revocation endpoint. No client authentication required -- the token itself is the credential being revoked. */
-const GOOGLE_REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
+/**
+ * The provider for a ceremony start. `mailbox` takes the owner's choice from
+ * the `provider` query parameter (validated against `MailProvider`); every
+ * other system is Google-only (calendar). The value is then stored on the
+ * single-use state row, and the callback reads it from there.
+ */
+function chosenProvider(system: string, query: URLSearchParams | undefined): MailProvider | null {
+  if (system !== MAILBOX_SYSTEM) return 'google';
+  const raw = query?.get('provider') ?? null;
+  return raw === 'google' || raw === 'microsoft' ? raw : null;
+}
 
 /**
  * The same default `buildRuntime` (`orchestrator/runtime.ts`) uses for
@@ -99,6 +120,18 @@ export interface OAuthRouteOptions {
   dashboardBaseUrl: string;
   /** Test seam only. No production caller ever passes it. */
   fetchImpl?: typeof fetch;
+  /**
+   * Test seam only: the mailbox client the callback takes the initial cursor
+   * with. Absent, the real Gmail / Graph client for the provider is used.
+   */
+  mailboxClientFor?: (provider: MailProvider) => MailboxClient;
+}
+
+/** How long the callback waits for the provider to hand back the initial cursor. */
+const INITIAL_CURSOR_TIMEOUT_MS = 30_000;
+
+function defaultMailboxClientFor(provider: MailProvider): MailboxClient {
+  return provider === 'microsoft' ? createGraphClient() : createGmailClient();
 }
 
 /**
@@ -268,6 +301,73 @@ function redirect(res: ServerResponse, location: string): void {
   res.end();
 }
 
+function refuseUnsupported(res: ServerResponse, system: string): void {
+  sendHtml(
+    res,
+    400,
+    page(
+      'מערכת לא נתמכת',
+      errorBlock(
+        `המערכת "${system}" אינה מוגדרת בתקנון החתום כחיבור שתהליך ההרשאה הזה יכול לשרת — ` +
+          'נדרש חיבור בערוץ API שמשרת קריאת יומן (calendar.read), או את חיבור תיבת הדואר (mailbox) שמשרת mail.send. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
+      ),
+    ),
+  );
+}
+
+const KEY_UNAVAILABLE_MESSAGE =
+  'לא ניתן להתחיל בתהליך ההרשאה: המפתח הראשי של ההתקנה אינו מוגדר או שאינו תקין.';
+
+type ProviderClient =
+  | { ok: true; clientId: { value: string } }
+  | { ok: false; message: string };
+
+/**
+ * The provider app's own client id AND secret, both resolved for this
+ * business -- the one check `handleOAuthStart` and `oauthCeremonyPreflight`
+ * share, so the sign page cannot pass a preflight the ceremony then fails.
+ */
+async function resolveProviderClient(key: Buffer, businessId: string, provider: MailProvider): Promise<ProviderClient> {
+  const credentials = storedCredentials(key);
+  const idRef = provider === 'microsoft' ? MICROSOFT_CLIENT_ID_REF : GOOGLE_CLIENT_ID_REF;
+  const secretRef = provider === 'microsoft' ? MICROSOFT_CLIENT_SECRET_REF : GOOGLE_CLIENT_SECRET_REF;
+  const [clientId, clientSecret] = await Promise.all([
+    credentials.resolve(idRef, businessId),
+    credentials.resolve(secretRef, businessId),
+  ]);
+  if (clientId === null || clientSecret === null) {
+    return {
+      ok: false,
+      message:
+        `תצורת ה-OAuth של ${provider === 'microsoft' ? 'Microsoft' : 'Google'} חסרה — יש להקציב ${idRef} ו-${secretRef} ` +
+        'במאגר הסודות לפני שאפשר להתחיל.',
+    };
+  }
+  return { ok: true, clientId };
+}
+
+/**
+ * Can the OAuth ceremony start for `provider` on this installation? `null`
+ * when it can, otherwise the Hebrew reason. Asked by the mailbox sign page
+ * BEFORE the owner signs: signing moves `mail.send` to the mailbox, so a
+ * signature the ceremony then cannot complete would cut outgoing mail off
+ * for nothing.
+ */
+export async function oauthCeremonyPreflight(
+  businessId: string,
+  provider: MailProvider,
+  credentialKeyPath: string | undefined,
+): Promise<string | null> {
+  let key: Buffer;
+  try {
+    key = await loadKeyForRequest(credentialKeyPath);
+  } catch {
+    return KEY_UNAVAILABLE_MESSAGE;
+  }
+  const client = await resolveProviderClient(key, businessId, provider);
+  return client.ok ? null : client.message;
+}
+
 /**
  * `GET /oauth/:system/start` -- requires a session (enforced by the caller,
  * `server.ts`'s `route()`, before this is ever reached). Mints a PKCE pair
@@ -301,6 +401,7 @@ export async function handleOAuthStart(
   session: OAuthSession,
   system: string,
   options: OAuthRouteOptions,
+  query?: URLSearchParams,
 ): Promise<void> {
   try {
     assertValidOAuthSystemName(system);
@@ -325,15 +426,30 @@ export async function handleOAuthStart(
     active = null;
   }
   const connection = active?.charter.connections.find((c) => c.system === system);
-  if (!connectionAcceptsOAuthCeremony(connection)) {
+  const provider = chosenProvider(system, query);
+  if (provider === null) {
+    return sendHtml(
+      res,
+      400,
+      page('ספק לא תקין', errorBlock('יש לבחור ספק דואר: google או microsoft. לא בוצעה כל פעולה.')),
+    );
+  }
+  const profile = connection === undefined ? null : oauthProfileFor(connection, provider);
+  if (connection === undefined || profile === null || !connectionAcceptsOAuthCeremony(connection)) {
+    return refuseUnsupported(res, system);
+  }
+  // The mailbox: only the provider the owner SIGNED for (the charter names it
+  // as the connection's subprocessor). Mail passing through a provider the
+  // signed charter does not name is the change the subprocessor list exists
+  // to put in front of the owner. Positive match — `mailbox-connect.ts`.
+  if (system === MAILBOX_SYSTEM && !mailboxProviderMatchesCharter(connection, provider)) {
     return sendHtml(
       res,
       400,
       page(
-        'מערכת לא נתמכת',
+        'ספק שלא נחתם',
         errorBlock(
-          `המערכת "${system}" אינה מוגדרת בתקנון החתום כחיבור שתהליך ההרשאה הזה יכול לשרת — ` +
-            'נדרש חיבור בערוץ API שמשרת קריאת יומן. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
+          'התקנון החתום מתיר לחבר את תיבת המייל רק אצל הספק שנבחר בחתימה. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
         ),
       ),
     );
@@ -348,7 +464,7 @@ export async function handleOAuthStart(
       500,
       page(
         'שגיאת תצורה',
-        errorBlock('לא ניתן להתחיל בתהליך ההרשאה: המפתח הראשי של ההתקנה אינו מוגדר או שאינו תקין.'),
+        errorBlock(KEY_UNAVAILABLE_MESSAGE),
       ),
     );
   }
@@ -359,32 +475,26 @@ export async function handleOAuthStart(
   // exchange in `handleOAuthCallback` -- AFTER the state was burned, so the
   // owner has to start the whole ceremony over having learned nothing they
   // could not have been told up front.
-  const credentials = storedCredentials(key);
-  const [clientId, clientSecret] = await Promise.all([
-    credentials.resolve(GOOGLE_CLIENT_ID_REF, businessId),
-    credentials.resolve(GOOGLE_CLIENT_SECRET_REF, businessId),
-  ]);
-  if (clientId === null || clientSecret === null) {
-    return sendHtml(
-      res,
-      500,
-      page(
-        'תצורה חסרה',
-        errorBlock(
-          `תצורת ה-OAuth של Google חסרה — יש להקציב ${GOOGLE_CLIENT_ID_REF} ו-${GOOGLE_CLIENT_SECRET_REF} ` +
-            'במאגר הסודות לפני שאפשר להתחיל.',
-        ),
-      ),
-    );
+  const client = await resolveProviderClient(key, businessId, provider);
+  if (!client.ok) {
+    return sendHtml(res, 500, page('תצורה חסרה', errorBlock(client.message)));
   }
+  const clientId = client.clientId;
 
   const codeVerifier = createCodeVerifier();
-  const state = await createState({ businessId, system, sessionId: session.sessionId, codeVerifier });
+  const state = await createState({
+    businessId,
+    system,
+    sessionId: session.sessionId,
+    codeVerifier,
+    ...(system === MAILBOX_SYSTEM ? { provider } : {}),
+  });
   const consentUrl = buildConsentUrl({
-    provider: OAUTH_PROVIDER,
+    provider,
+    authorizeUrl: profile.authorizeUrl,
     clientId: clientId.value,
     redirectUri: redirectUriFor(options.dashboardBaseUrl),
-    scopes: [GOOGLE_CALENDAR_READONLY_SCOPE],
+    scopes: profile.scopes,
     state,
     codeChallenge: codeChallengeFor(codeVerifier),
   });
@@ -426,6 +536,11 @@ export async function handleOAuthCallback(
   // Trusted from here on -- the row this session actually opened, never the
   // query string.
   const system = consumed.system;
+  // The provider the owner chose at start, from the stored row. Only the
+  // mailbox records one; everything else is the Google calendar ceremony.
+  const provider: MailProvider =
+    consumed.provider === 'microsoft' ? 'microsoft' : 'google';
+  const providerName = provider === 'microsoft' ? 'Microsoft' : 'Google';
 
   const providerError = params.get('error');
   if (providerError !== null) {
@@ -437,6 +552,32 @@ export async function handleOAuthCallback(
         errorBlock(`הבקשה לחבר את המערכת "${system}" נדחתה, ולא בוצע דבר.`),
       ),
     );
+  }
+
+  // The mailbox: the charter may have changed since `/start` (reverted, or
+  // re-signed for another provider). Re-checked against the charter NOW,
+  // before the exchange and before anything is written -- a grant for a
+  // provider the active charter does not name is mail passing through an
+  // unsigned subprocessor.
+  if (system === MAILBOX_SYSTEM) {
+    let mailbox: CharterConnection | undefined;
+    try {
+      mailbox = (await loadActiveCharter(businessId))?.charter.connections.find((c) => c.system === MAILBOX_SYSTEM);
+    } catch {
+      mailbox = undefined;
+    }
+    if (mailbox === undefined || !mailboxProviderMatchesCharter(mailbox, provider)) {
+      return sendHtml(
+        res,
+        400,
+        page(
+          'ספק שלא נחתם',
+          errorBlock(
+            'התקנון הפעיל אינו מתיר עוד לחבר את תיבת המייל אצל הספק הזה (הוא השתנה מאז שהחיבור התחיל). לא נשמר דבר.',
+          ),
+        ),
+      );
+    }
   }
 
   const code = params.get('code');
@@ -459,6 +600,7 @@ export async function handleOAuthCallback(
     code,
     codeVerifier: consumed.codeVerifier,
     redirectUri: redirectUriFor(options.dashboardBaseUrl),
+    provider,
     credentials: storedCredentials(key),
     businessId,
     ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
@@ -469,7 +611,7 @@ export async function handleOAuthCallback(
   }
 
   if (exchange.refreshToken === null) {
-    // access_type=offline + prompt=consent were both sent (buildConsentUrl's
+    // access_type=offline (Google) or offline_access (Microsoft), plus prompt=consent, were sent (buildConsentUrl's
     // own docblock) -- a missing refresh token here means something is
     // already wrong (a stale, already-authorised grant Google silently
     // re-approved before this ceremony asked for `prompt=consent`, most
@@ -480,7 +622,7 @@ export async function handleOAuthCallback(
       page(
         'ההרשאה נכשלה',
         errorBlock(
-          'Google לא החזירה אסימון רענון עבור החיבור הזה. אם המערכת כבר חוברה בעבר, יש לבטל אותה ולנסות שוב.',
+          `${providerName} לא החזיר אסימון רענון עבור החיבור הזה. אם המערכת כבר חוברה בעבר, יש לבטל אותה ולנסות שוב.`,
         ),
       ),
     );
@@ -492,8 +634,45 @@ export async function handleOAuthCallback(
   // could reassign the property.
   const refreshToken: string = exchange.refreshToken;
 
-  const account = (await fetchGoogleAccount(exchange.accessToken, options.fetchImpl)) ?? 'לא זוהה';
+  // Account label: Microsoft -> Graph /me; Google mailbox -> `openid email`
+  // id-token claim; Google calendar -> the primary calendar's id.
+  const accountLookup =
+    provider === 'microsoft'
+      ? await fetchMicrosoftAccount(exchange.accessToken, options.fetchImpl)
+      : system === MAILBOX_SYSTEM
+        ? emailFromIdToken(exchange.idToken)
+        : await fetchGoogleAccount(exchange.accessToken, options.fetchImpl);
+  const account = accountLookup ?? 'לא זוהה';
   const credentialRef = credentialRefForSystem(system);
+
+  // The mailbox's read cursor is taken NOW, at connect time, with the access
+  // token the exchange just returned: mail that arrived before this moment is
+  // never read (no backfill). Taken BEFORE the transaction below, like the
+  // other provider calls, so no pooled connection is held across a network
+  // round trip -- and a failure here writes nothing at all (no grant, no
+  // binding, no cursor): a grant with no cursor would be a live binding the
+  // poller cannot start from. The state is already consumed; the owner starts
+  // the ceremony again.
+  let mailboxCursor: string | null = null;
+  if (system === MAILBOX_SYSTEM) {
+    const client = (options.mailboxClientFor ?? defaultMailboxClientFor)(provider);
+    try {
+      mailboxCursor = await client.initialCursor(exchange.accessToken, AbortSignal.timeout(INITIAL_CURSOR_TIMEOUT_MS));
+    } catch (error) {
+      console.error('mailbox connect: could not take the initial cursor:', error instanceof Error ? error.message : error);
+      return sendHtml(
+        res,
+        502,
+        page(
+          'החיבור לא הושלם',
+          errorBlock(
+            `${providerName} לא אפשר לקבוע מאיזו נקודה לקרוא את המיילים החדשים, ולכן לא נשמר דבר — לא הרשאה ולא חיבור. ` +
+              'יש לנסות לחבר שוב בעוד כמה דקות.',
+          ),
+        ),
+      );
+    }
+  }
 
   // The grant, its audit row, and the binding write are ONE transaction --
   // not three independent commits. `appendAudit` committing separately AFTER
@@ -518,7 +697,7 @@ export async function handleOAuthCallback(
       {
         businessId,
         system,
-        provider: OAUTH_PROVIDER,
+        provider,
         credentialRef,
         account,
         scopes: exchange.grantedScopes,
@@ -539,9 +718,9 @@ export async function handleOAuthCallback(
         // `erasure.ts`'s owner-triggered actions.
         charterVersion: 'n/a',
         provenance: 'boss',
-        inputHash: canonicalHash({ businessId, system, provider: OAUTH_PROVIDER, credentialRef }),
+        inputHash: canonicalHash({ businessId, system, provider, credentialRef }),
         reason:
-          `oauth consent granted for system "${system}" (provider: ${OAUTH_PROVIDER}) by ${session.username}; ` +
+          `oauth consent granted for system "${system}" (provider: ${provider}) by ${session.username}; ` +
           `scopes: ${exchange.grantedScopes.length > 0 ? exchange.grantedScopes.join(', ') : '(none reported)'}`,
       },
       { businessId, tx },
@@ -552,19 +731,31 @@ export async function handleOAuthCallback(
     // no adapter ever registered for it. Existing operational fields
     // (`endpoint`, health) are preserved rather than reset, since
     // `upsertBinding` is a whole-row replace.
-    const existing = (await loadBindings({ businessId, db: tx })).find((b) => b.system === system) ?? null;
+    // The mailbox is a fresh connection every time (possibly to another
+    // provider than before): no operational field carries over, and its
+    // cursor is written in this same transaction, with `connectedAt` now.
+    const existing =
+      system === MAILBOX_SYSTEM
+        ? null
+        : ((await loadBindings({ businessId, db: tx })).find((b) => b.system === system) ?? null);
     await upsertBinding(
       {
         system,
         status: 'live',
         endpoint: existing?.endpoint ?? null,
         credentialRef,
-        provider: OAUTH_PROVIDER,
+        provider,
         lastOkAt: existing?.lastOkAt ?? null,
         lastError: existing?.lastError ?? null,
       },
       { businessId, by: session.username, db: tx },
     );
+    if (mailboxCursor !== null) {
+      await setCursor(
+        { provider, cursor: mailboxCursor, connectedAt: new Date().toISOString() },
+        { businessId, db: tx },
+      );
+    }
   });
 
   sendHtml(
@@ -572,12 +763,13 @@ export async function handleOAuthCallback(
     200,
     page(
       'ההרשאה הושלמה',
-      `<p>החיבור למערכת "<b>${escapeHtml(system)}</b>" אושר בהצלחה, לחשבון <b>${escapeHtml(account)}</b>.</p>` +
+      `<p>החיבור למערכת "<b>${escapeHtml(system)}</b>" אושר בהצלחה, לחשבון <b>${escLabel(account)}</b>.</p>` +
         `<p>ההיקפים שאושרו בפועל: ${
           exchange.grantedScopes.length > 0 ? escapeHtml(exchange.grantedScopes.join(', ')) : 'לא דווח היקף'
         }.</p>` +
         `<p class="muted">שימו לב: תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו. ` +
-        `אם הוא כבר רץ, החיבור החדש ייכנס לתוקף רק אחרי שהוא יופעל מחדש.</p>`,
+        `אם הוא כבר רץ, החיבור החדש ייכנס לתוקף רק אחרי שהוא יופעל מחדש.</p>` +
+        (system === MAILBOX_SYSTEM ? `<p><a href="/connections/mailbox">למצב תיבת המייל</a></p>` : ''),
     ),
   );
 }
@@ -638,17 +830,22 @@ export async function handleOAuthRevoke(
   // instead of assuming the call itself proves something was live.
   const changed = await revokeGrant(system, businessId, session.username);
 
-  type ProviderOutcome = 'revoked' | 'failed' | 'no_live_grant' | 'key_unavailable';
+  type ProviderOutcome = 'revoked' | 'failed' | 'no_live_grant' | 'key_unavailable' | 'no_revoke_endpoint';
   let providerOutcome: ProviderOutcome;
   if (keyUnavailable) {
     providerOutcome = 'key_unavailable';
   } else if (grant === null) {
     providerOutcome = 'no_live_grant';
+  } else if (grant.provider !== 'google') {
+    // Microsoft offers no token revocation endpoint for this flow: the local
+    // revoke is the whole act, and the owner can remove the app's access in
+    // their Microsoft account settings.
+    providerOutcome = 'no_revoke_endpoint';
   } else {
     providerOutcome = 'failed';
     try {
       const doFetch = options.fetchImpl ?? fetch;
-      const response = await doFetch(GOOGLE_REVOKE_ENDPOINT, {
+      const response = await doFetch(GOOGLE_REVOKE_URL, {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ token: grant.refreshToken }).toString(),
@@ -666,6 +863,7 @@ export async function handleOAuthRevoke(
     revoked: 'the provider confirmed revocation',
     failed: 'the provider-side revocation attempt failed — the local revoke is authoritative regardless',
     no_live_grant: 'no live grant was found to revoke at the provider',
+    no_revoke_endpoint: 'the provider has no token revocation endpoint — the local revoke is the whole act',
     key_unavailable:
       'could not attempt provider revocation — the master key would not open, so whether access remains at the provider is unknown',
   };

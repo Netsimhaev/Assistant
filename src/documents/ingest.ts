@@ -66,6 +66,14 @@
  * derived and stored (it is one of the dedupe INSERT's own columns), but
  * nothing exists at that path, and a caller that expects to open every
  * rejected document's stored copy must check for this one case first.
+ *
+ * **A PDF that fails extraction is `stored`, not `rejected` (ruling P7).**
+ * Once a sniffed PDF's bytes are on disk, an extraction-stage failure — a
+ * password, a content error, the timeout, the memory cap — ends in `stored`
+ * with the same Hebrew reason in `reason`: downloadable by the owner, never
+ * read (the conductor takes `extracted` only). Refusals before extraction —
+ * the size cap, an unidentified type, the archive guard — stay `rejected`,
+ * and so does an extraction failure of any other type.
  */
 
 import { createHash } from 'node:crypto';
@@ -80,6 +88,8 @@ import {
   DOCX,
   JSON as JSON_MEDIA_TYPE,
   MARKDOWN,
+  PDF,
+  STORE_ONLY_TYPES,
   TEXT,
   XLSX,
   sniffMediaType,
@@ -88,7 +98,7 @@ import { buildOutline } from './outline.js';
 import { extractorFor } from './registry.js';
 import { runExtractor } from './run-extractor.js';
 import type { ExtractOutcome, RunExtractorOptions } from './run-extractor.js';
-import { insertOrGetDocument, markExtracted, markRejected } from './store.js';
+import { insertOrGetDocument, markExtracted, markRejected, markStored } from './store.js';
 import type { DocumentRecord, DocumentSource } from './types.js';
 
 /** §3.4: the original file's own size ceiling — independent of, and checked before, the content-level caps §5.3 enforces inside the extractor. */
@@ -128,6 +138,7 @@ export const EXTENSION_BY_MEDIA_TYPE: Readonly<Record<string, string>> = {
   [TEXT]: 'txt',
   [MARKDOWN]: 'md',
   [JSON_MEDIA_TYPE]: 'json',
+  [PDF]: 'pdf',
 };
 const UNKNOWN_EXTENSION = 'bin';
 
@@ -194,7 +205,8 @@ function reasonForExtractFailure(outcome: Extract<ExtractOutcome, { ok: false }>
   switch (outcome.code) {
     case 'extractor_timeout':
     case 'extractor_output_too_large':
-      // run-extractor.ts already phrases these two in Hebrew.
+    case 'extractor_memory':
+      // run-extractor.ts already phrases these three in Hebrew.
       return outcome.detail;
     case 'extractor_crashed':
       return `תהליך הפענוח קרס: ${outcome.detail}`;
@@ -296,6 +308,16 @@ export async function ingestDocument(
     return reject('סוג הקובץ אינו מזוהה או אינו נתמך');
   }
 
+  // Store-only (no type today; a PDF until it gained an extractor): the
+  // bytes are kept and downloadable, and nothing parses them. A terminal
+  // status of its own — `rejected` would tell the owner the file was
+  // refused, and `extracted` would offer it to a reader with no artefacts
+  // to read.
+  if (STORE_ONLY_TYPES.has(sniffed)) {
+    await markStored(documentId, { businessId });
+    return { ...document, status: 'stored' };
+  }
+
   const extractorId = extractorFor(sniffed);
   if (extractorId === null) {
     // Defensive: every type `sniffMediaType` can name is registered today
@@ -312,7 +334,17 @@ export async function ingestDocument(
 
   const outcome = await runExtractor(extractorId, absolutePath, options.runExtractorOptions);
   if (!outcome.ok) {
-    return reject(reasonForExtractFailure(outcome));
+    const reason = reasonForExtractFailure(outcome);
+    // Ruling P7: a PDF that passed the sniff and is already on disk but would
+    // not decode (a password, a content error, the timeout, the memory cap)
+    // stays downloadable — `rejected` would take the owner's copy of a mailed
+    // attachment away (spec §9, "attached for download"). It is never read:
+    // the conductor takes `extracted` only. Every other type keeps `rejected`.
+    if (sniffed === PDF) {
+      await markStored(documentId, { businessId, reason });
+      return { ...document, status: 'stored', reason };
+    }
+    return reject(reason);
   }
 
   const outline = buildOutline(outcome.artifacts);

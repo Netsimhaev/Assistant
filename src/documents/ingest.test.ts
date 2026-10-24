@@ -6,8 +6,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { closePool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
+import { buildPdf } from './fixtures/build-pdf.js';
 import { guardZipArchive, ingestDocument } from './ingest.js';
-import { loadArtifacts } from './store.js';
+import { documentsAwaitingRead, loadArtifacts, loadDocument } from './store.js';
 import type { OutlineContent } from './types.js';
 
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
@@ -34,6 +35,107 @@ afterAll(async () => {
 });
 
 describe('ingestDocument', () => {
+  it('ingestDocument stores a PDF as extracted with page artifacts', async () => {
+    const path = join(ROOT, 'incoming.pdf');
+    await writeFile(path, buildPdf([['Invoice INV-17'], ['Total 1200 NIS']]));
+    const doc = await ingestDocument({ path, source: 'mail', originalName: 'invoice.pdf' }, OPTS);
+    expect(doc.status).toBe('extracted');
+    expect(doc.mediaType).toBe('application/pdf');
+    expect(doc.storedPath.endsWith('/original.pdf')).toBe(true);
+    expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
+    const artifacts = await loadArtifacts(doc.documentId, OPTS);
+    // Two page artefacts, then the outline buildOutline appends.
+    expect(artifacts.map((a) => [a.ordinal, a.kind, a.partName])).toEqual([
+      [0, 'text', 'עמוד 1'],
+      [1, 'text', 'עמוד 2'],
+      [2, 'outline', null],
+    ]);
+    expect((await loadDocument(doc.documentId, OPTS))?.status).toBe('extracted');
+  });
+
+  it('a malformed PDF is stored (downloadable, never read) with a Hebrew reason, not rejected', async () => {
+    const path = join(ROOT, 'broken.pdf');
+    await writeFile(
+      path,
+      Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]),
+    );
+    const doc = await ingestDocument({ path, source: 'manual', originalName: 'broken.pdf' }, OPTS);
+    // Ruling P7: the bytes are on disk, so the owner keeps the download.
+    expect(doc.status).toBe('stored');
+    expect(doc.reason).toMatch(/^הפענוח נכשל: /);
+    expect(await loadDocument(doc.documentId, OPTS)).toMatchObject({ status: 'stored', reason: doc.reason });
+    expect(await loadArtifacts(doc.documentId, OPTS)).toEqual([]);
+    expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
+    // A manual document is otherwise the conductor's — a stored one never is.
+    expect(await documentsAwaitingRead(10, OPTS)).toEqual([]);
+  });
+
+  it('a PDF the extractor refuses (as for a password) or that times out is stored with the reason', async () => {
+    const failPath = join(ROOT, 'locked.pdf');
+    const hangPath = join(ROOT, 'slow.pdf');
+    await writeFile(failPath, buildPdf([['Locked']]));
+    await writeFile(hangPath, buildPdf([['Slow']]));
+    const failed = await ingestDocument(
+      { path: failPath, source: 'manual' },
+      { ...OPTS, runExtractorOptions: { childPath: stubChild('fail.ts') } },
+    );
+    const timedOut = await ingestDocument(
+      { path: hangPath, source: 'manual' },
+      { ...OPTS, runExtractorOptions: { timeoutMs: 200, childPath: stubChild('hang.ts') } },
+    );
+    expect([failed.status, timedOut.status]).toEqual(['stored', 'stored']);
+    expect(failed.reason).toContain('נכשל');
+    expect(timedOut.reason?.length).toBeGreaterThan(0);
+    expect((await loadDocument(timedOut.documentId, OPTS))?.reason).toBe(timedOut.reason);
+    expect(await documentsAwaitingRead(10, OPTS)).toEqual([]);
+  }, 10_000);
+
+  it('a manually ingested PDF is offered to the conductor; a mail-sourced one is not', async () => {
+    const manualPath = join(ROOT, 'manual.pdf');
+    const mailPath = join(ROOT, 'mail.pdf');
+    await writeFile(manualPath, buildPdf([['Contract draft']]));
+    await writeFile(mailPath, buildPdf([['Contract draft']], { trailingComment: 'mail copy' }));
+    const manual = await ingestDocument({ path: manualPath, source: 'manual' }, OPTS);
+    const mail = await ingestDocument({ path: mailPath, source: 'mail' }, OPTS);
+    expect([manual.status, mail.status]).toEqual(['extracted', 'extracted']);
+
+    const offered = await documentsAwaitingRead(10, OPTS);
+    expect(offered.map((d) => d.documentId)).toEqual([manual.documentId]);
+  });
+
+  it('a scanned manual PDF is extracted, flagged, and never offered to the conductor', async () => {
+    const scanPath = join(ROOT, 'scan.pdf');
+    const textPath = join(ROOT, 'text.pdf');
+    await writeFile(scanPath, buildPdf([null, null]));
+    await writeFile(textPath, buildPdf([null, ['Signed copy']]));
+    const scan = await ingestDocument({ path: scanPath, source: 'manual' }, OPTS);
+    const withText = await ingestDocument({ path: textPath, source: 'manual' }, OPTS);
+    expect([scan.status, withText.status]).toEqual(['extracted', 'extracted']);
+    expect((await loadArtifacts(scan.documentId, OPTS))[0]?.flags).toEqual(['scanned_no_text']);
+
+    // A model call on a brief with no text would spend money to learn nothing.
+    const offered = await documentsAwaitingRead(10, OPTS);
+    expect(offered.map((d) => d.documentId)).toEqual([withText.documentId]);
+  });
+
+  it('a PDF decompression bomb is stopped for memory with a Hebrew reason, stored and not extracted', async () => {
+    const path = join(ROOT, 'bomb.pdf');
+    await writeFile(path, buildPdf([['bomb']], { flateBombMib: 2048 }));
+    const started = Date.now();
+    const doc = await ingestDocument({ path, source: 'mail', originalName: 'invoice.pdf' }, OPTS);
+    expect(doc.status).toBe('stored');
+    expect(doc.reason).toMatch(/תקרת הזיכרון/);
+    expect(await loadArtifacts(doc.documentId, OPTS)).toEqual([]);
+    expect(Date.now() - started).toBeLessThan(30_000);
+  }, 60_000);
+
+  it('still rejects binary that is not a PDF, whatever the name says', async () => {
+    const path = join(ROOT, 'fake.pdf');
+    await writeFile(path, Buffer.from([0x00, 0x01, 0xff, 0xfe, 0x80, 0x81]));
+    const doc = await ingestDocument({ path, source: 'mail', originalName: 'fake.pdf' }, OPTS);
+    expect(doc.status).toBe('rejected');
+  });
+
   it('stores, extracts and records in one pass', async () => {
     const doc = await ingestDocument({ path: fixture('tiny.xlsx'), source: 'manual' }, OPTS);
     expect(doc.status).toBe('extracted');

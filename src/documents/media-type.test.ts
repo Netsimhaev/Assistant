@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, TEXT, XLSX, sniffMediaType } from './media-type.js';
+import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, PDF, TEXT, XLSX, sniffMediaType } from './media-type.js';
 
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
 
@@ -70,5 +70,14 @@ describe('sniffMediaType', () => {
   it('reads the real docx fixture bytes as DOCX, not just a constructed header', () => {
     const head = readFileSync(fixture('tiny.docx')).subarray(0, 8);
     expect(sniffMediaType(head, 'tiny.docx')).toBe(DOCX);
+  });
+
+  it('names a PDF from its %PDF- magic, whatever the name says', () => {
+    const pdf = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x0a, 0x25, 0xe2, 0xe3, 0xcf, 0xd3, 0x0a]);
+    expect(sniffMediaType(pdf, 'invoice.pdf')).toBe(PDF);
+    expect(sniffMediaType(pdf, 'invoice.bin')).toBe(PDF);
+    // An ASCII-only PDF would otherwise read as text.
+    expect(sniffMediaType(Buffer.from('%PDF-1.4\n1 0 obj\n'), 'x.txt')).toBe(PDF);
+    expect(sniffMediaType(Buffer.from('not a %PDF- header'), 'x.pdf')).toBe(TEXT);
   });
 });

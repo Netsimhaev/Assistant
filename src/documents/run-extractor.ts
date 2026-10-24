@@ -5,19 +5,39 @@
  *
  * The parent enforces every limit; the child (`extract-child.ts`) is never
  * trusted to stop itself:
- *   - memory: a V8 heap-cap flag on the child's own command line
+ *   - memory, in three layers. A V8 heap-cap flag on the child's command
+ *     line (`memoryMb`) bounds the JavaScript heap — and only that heap:
+ *     `Buffer`s and `ArrayBuffer`s live outside it, and a 1.5MB PDF whose
+ *     FlateDecode stream inflates to 1.5GB drove a child to a 3.3GB working
+ *     set under the 256MB flag. So the resident set of the whole process is
+ *     capped too (`rssCapMb`, default twice the heap cap: 512MB — the heap
+ *     plus room for Node, tsx and the parser's own off-heap buffers). On
+ *     Linux, where it costs one file read, the parent samples
+ *     `/proc/<pid>/status` every 100ms and SIGKILLs over the cap. On every
+ *     platform the child runs a watchdog thread (`child-hardening.ts`) that
+ *     samples its own RSS every 50ms and kills itself over the cap, leaving
+ *     `MEMORY_CAP_MARKER` on stderr. Either way the outcome is
+ *     `extractor_memory`. The in-child layer is the one that holds on
+ *     Windows and macOS; a parser that could stop that thread could still
+ *     outrun it, which is why Linux, the production platform, has the
+ *     parent's layer as well.
  *   - time: a timer here that sends SIGKILL, not SIGTERM — a wedged parser
  *     does not handle signals
  *   - output: a byte counter on the stdout stream that kills once the cap
  *     is crossed, checked as bytes arrive rather than after the whole
  *     stream has been buffered (that buffering would itself be the
  *     resource exhaustion this exists to prevent)
+ *   - code generation: the child runs with
+ *     `--disallow-code-generation-from-strings`, so `eval` and
+ *     `new Function` throw inside it whatever a parsing library (or a file
+ *     steering one) attempts — the control `extractors/pdf.ts` relies on
+ *     for "no script ever runs"
  *   - environment: the child receives `PATH` and nothing else — the same
  *     rule `src/sdk/know-reader.ts` already applies to the quarantine
  *     agent's own subprocess, so the database URL and any API key never
  *     reach a process parsing an untrusted file
  *
- * Every one of the four `ExtractOutcome` failure codes is a returned value,
+ * Every one of the five `ExtractOutcome` failure codes is a returned value,
  * never a thrown error — the same rule `archive-guard.ts` follows: a
  * hostile file must not stop ingestion of the valid ones behind it.
  *
@@ -45,8 +65,10 @@
  */
 
 import { spawn } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { MEMORY_CAP_MARKER } from './child-hardening.js';
 import type { ExtractorId } from './registry.js';
 import type { DocumentArtifact } from './types.js';
 
@@ -54,13 +76,21 @@ export type ExtractOutcome =
   | { ok: true; artifacts: DocumentArtifact[] }
   | {
       ok: false;
-      code: 'extractor_timeout' | 'extractor_crashed' | 'extractor_output_too_large' | 'extractor_failed';
+      code:
+        | 'extractor_timeout'
+        | 'extractor_crashed'
+        | 'extractor_output_too_large'
+        | 'extractor_failed'
+        | 'extractor_memory';
       detail: string;
     };
 
 export interface RunExtractorOptions {
   timeoutMs?: number;
+  /** The V8 heap cap. */
   memoryMb?: number;
+  /** The whole-process resident-set cap. Defaults to twice `memoryMb`. */
+  rssCapMb?: number;
   maxOutputBytes?: number;
   /**
    * Test-only escape hatch: run a different child than `extract-child.ts`.
@@ -75,6 +105,17 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MEMORY_MB = 256;
 const DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const STDERR_DETAIL_LIMIT_BYTES = 2 * 1024;
+const RSS_SAMPLE_INTERVAL_MS = 100;
+
+/**
+ * The resident set, in bytes, from the text of a Linux `/proc/<pid>/status`
+ * (its `VmRSS:  <n> kB` line). `null` when the line is absent or does not
+ * parse — never `0`, which would read as "well under the cap".
+ */
+export function vmRssBytes(status: string): number | null {
+  const match = /^VmRSS:\s+(\d+)\s+kB\s*$/m.exec(status);
+  return match?.[1] === undefined ? null : Number(match[1]) * 1024;
+}
 
 /**
  * Derives the default child's path from the extension *this* module was
@@ -106,10 +147,11 @@ const DEFAULT_CHILD_PATH = defaultChildPath(import.meta.url);
 const TSX_LOADER = pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href;
 
 /**
- * Parses one file in an isolated, capped child process. Every one of the
- * four caps in the isolation contract above is enforced from here, not
- * inside the child; `options` lets a caller (or a test) override the
- * defaults, which are the spec §3.4 numbers.
+ * Parses one file in an isolated, capped child process. Every limit in the
+ * isolation contract above is enforced from here — the memory watchdog in
+ * the child is a second layer, never the only one on Linux. `options` lets
+ * a caller (or a test) override the defaults, which are the spec §3.4
+ * numbers.
  */
 export async function runExtractor(
   extractor: ExtractorId,
@@ -118,13 +160,24 @@ export async function runExtractor(
 ): Promise<ExtractOutcome> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const memoryMb = options.memoryMb ?? DEFAULT_MEMORY_MB;
+  const rssCapMb = options.rssCapMb ?? memoryMb * 2;
+  const rssCapBytes = rssCapMb * 1024 * 1024;
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const childPath = options.childPath ?? DEFAULT_CHILD_PATH;
 
   return new Promise<ExtractOutcome>((resolve) => {
     const child = spawn(
       process.execPath,
-      [`--max-old-space-size=${memoryMb}`, '--import', TSX_LOADER, childPath, extractor, sourcePath],
+      [
+        `--max-old-space-size=${memoryMb}`,
+        '--disallow-code-generation-from-strings',
+        '--import',
+        TSX_LOADER,
+        childPath,
+        extractor,
+        sourcePath,
+        String(rssCapMb),
+      ],
       {
         // PATH and nothing else. See the module docblock and
         // `src/sdk/know-reader.ts`, which applies the identical rule to the
@@ -139,7 +192,13 @@ export async function runExtractor(
     // the child's exit code in the `close` handler below, because a killed
     // process's exit code is meaningless (it is whatever SIGKILL produced
     // on this platform, not something the child chose).
-    let killedFor: 'timeout' | 'output' | null = null;
+    let killedFor: 'timeout' | 'output' | 'memory' | null = null;
+    // Set when the child's own watchdog announced it was killing itself
+    // for memory. Scanned on every chunk, not only within the first
+    // STDERR_DETAIL_LIMIT_BYTES kept for the detail text, and across a
+    // chunk boundary.
+    let sawMemoryMarker = false;
+    let stderrTail = '';
 
     let stdoutChunks: Buffer[] = [];
     let stdoutBytes = 0;
@@ -152,6 +211,26 @@ export async function runExtractor(
       child.kill('SIGKILL');
     }, timeoutMs);
 
+    // Linux only, where reading the resident set costs one small file read.
+    // Elsewhere the in-child watchdog is the layer that holds.
+    const pid = child.pid;
+    const rssSampler =
+      process.platform === 'linux' && pid !== undefined
+        ? setInterval(() => {
+            readFile(`/proc/${pid}/status`, 'utf8').then(
+              (status) => {
+                const rss = vmRssBytes(status);
+                if (rss !== null && rss > rssCapBytes && killedFor === null) {
+                  killedFor = 'memory';
+                  child.kill('SIGKILL');
+                }
+              },
+              // The process may already be gone; the close handler decides.
+              () => undefined,
+            );
+          }, RSS_SAMPLE_INTERVAL_MS)
+        : null;
+
     const finish = (outcome: ExtractOutcome): void => {
       if (settled) return;
       settled = true;
@@ -159,6 +238,7 @@ export async function runExtractor(
         resolve(outcome);
       } finally {
         clearTimeout(timer);
+        if (rssSampler !== null) clearInterval(rssSampler);
       }
     };
 
@@ -180,6 +260,9 @@ export async function runExtractor(
     });
 
     child.stderr.on('data', (chunk: Buffer) => {
+      const text = stderrTail + chunk.toString('latin1');
+      if (text.includes(MEMORY_CAP_MARKER)) sawMemoryMarker = true;
+      stderrTail = text.slice(-MEMORY_CAP_MARKER.length);
       if (stderrBytes >= STDERR_DETAIL_LIMIT_BYTES) return;
       stderrChunks.push(chunk);
       stderrBytes += chunk.length;
@@ -199,6 +282,14 @@ export async function runExtractor(
           ok: false,
           code: 'extractor_timeout',
           detail: `התהליך לא הסתיים תוך ${timeoutMs}ms ונהרג`,
+        });
+        return;
+      }
+      if (killedFor === 'memory' || (sawMemoryMarker && code !== 0)) {
+        finish({
+          ok: false,
+          code: 'extractor_memory',
+          detail: `התהליך חצה את תקרת הזיכרון של ${rssCapMb}MB ונהרג`,
         });
         return;
       }
