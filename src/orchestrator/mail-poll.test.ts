@@ -8,7 +8,7 @@
  * correctly (CLAUDE.md, "a negative test that holds without the code is not a
  * test").
  */
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { ingestDocument } from '../documents/ingest.js';
@@ -54,6 +54,22 @@ import type { TokenHttp } from './oauth-token.js';
 import { pollMailbox, type MailPollResult } from './mail-poll.js';
 import { buildPdf } from '../documents/fixtures/build-pdf.js';
 import type { Runtime } from './runtime.js';
+
+
+/**
+ * This file's own time limit, above the suite-wide 20 s (`vitest.config.ts`).
+ *
+ * The 20 s was sized for tests that talk to Postgres. Tests here ingest real
+ * attachments, and every attachment is a real extraction child — spawned,
+ * loaded, parsed, killed — about 0.8 s of CPU each when idle (measured
+ * 25/10), up to ten per test. Under load from a second test run on the same
+ * machine that work stretches several times over, and three tests here timed
+ * out in a full run while passing 44/44 alone: the limit, not the code, was
+ * what failed. 60 s still catches a real hang; it only stops counting a slow
+ * machine as a broken test. The hook limit rises with it because the reset in
+ * `beforeEach` was the first thing to time out under the same load.
+ */
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
 const BUSINESS = 'test-business';
 

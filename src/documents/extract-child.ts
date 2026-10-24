@@ -22,11 +22,6 @@
  */
 
 import { blockNativeCanvas, routeConsoleToStderr, startMemoryWatchdog } from './child-hardening.js';
-import { extractCsv } from './extractors/csv.js';
-import { extractDocx } from './extractors/docx.js';
-import { extractPassthrough } from './extractors/passthrough.js';
-import { extractPdf } from './extractors/pdf.js';
-import { extractXlsx } from './extractors/xlsx.js';
 import type { ExtractorId } from './registry.js';
 import type { DocumentArtifact } from './types.js';
 
@@ -39,18 +34,29 @@ function isExtractorId(value: string): value is ExtractorId {
   return (KNOWN_EXTRACTORS as readonly string[]).includes(value);
 }
 
+/**
+ * Each parser is imported here, on demand, never at the top of the file.
+ *
+ * Static imports are hoisted, so they evaluated exceljs, mammoth and the PDF
+ * module in EVERY child — before `main()` had installed the console reroute,
+ * the canvas block or the memory watchdog. A child reading a PDF loaded two
+ * libraries it would never call, ahead of the controls meant to contain
+ * whatever the file does to them; measured 25/10 that was ~350 ms of each
+ * child's start. Loaded here, a child holds one parser, and only after
+ * hardening. `extract-child-imports.test.ts` keeps it that way.
+ */
 async function dispatch(extractorId: ExtractorId, sourcePath: string): Promise<DocumentArtifact[]> {
   switch (extractorId) {
     case 'passthrough':
-      return extractPassthrough(sourcePath);
+      return (await import('./extractors/passthrough.js')).extractPassthrough(sourcePath);
     case 'xlsx':
-      return extractXlsx(sourcePath);
+      return (await import('./extractors/xlsx.js')).extractXlsx(sourcePath);
     case 'csv':
-      return extractCsv(sourcePath);
+      return (await import('./extractors/csv.js')).extractCsv(sourcePath);
     case 'docx':
-      return extractDocx(sourcePath);
+      return (await import('./extractors/docx.js')).extractDocx(sourcePath);
     case 'pdf':
-      return extractPdf(sourcePath);
+      return (await import('./extractors/pdf.js')).extractPdf(sourcePath);
   }
 }
 
