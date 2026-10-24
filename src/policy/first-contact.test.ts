@@ -140,3 +140,33 @@ describe('first contact escalates, and no origin is exempt from that', () => {
     expect((await assessRisk(withMoney, BUNDLE)).band).not.toBe('routine');
   });
 });
+
+/**
+ * The explanation becomes the approval card's summary and the digest's
+ * subject line, so the owner reads it. It names the class and the trust level
+ * in Hebrew (`domain/labels.ts`), never by the identifiers the code uses —
+ * the first digest run against real data showed "email.initiate בטווח הרגיל
+ * של העסק." to the owner.
+ */
+describe('the risk explanation the owner reads', () => {
+  it('names the action class in Hebrew on the routine band', async () => {
+    const BUNDLE = await installCharter(
+      buildCharter({ version: '2026-08-15.money-only', knownCounterpartyEmailDomain: 'example.com' }),
+      { businessId: BUSINESS },
+    );
+    const known = { ...firstContact('boss', true), counterpartyEmails: ['dana@example.com'] };
+    const risk = await assessRisk(known, BUNDLE);
+    // Proves the routine sentence is the one under test, not another branch.
+    expect(risk.band).toBe('routine');
+    expect(risk.explanation).toContain('שליחת מייל יזום');
+    expect(risk.explanation).not.toMatch(/[A-Za-z]/);
+  });
+
+  it('names an untrusted origin in Hebrew', async () => {
+    const BUNDLE = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const risk = await assessRisk(firstContact('unknown_external', true), BUNDLE);
+    expect(risk.band).not.toBe('routine');
+    expect(risk.explanation).toContain('גורם חיצוני לא מוכר');
+    expect(risk.explanation).not.toContain('unknown_external');
+  });
+});

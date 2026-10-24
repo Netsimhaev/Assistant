@@ -20,6 +20,7 @@ import type { KeptItem } from '../governance/kept-items.js';
 import type { OAuthGrantSummary } from '../governance/oauth-grants.js';
 import type { NotJudgedReason, Verdict } from '../governance/verdict-store.js';
 import type { IntentName } from '../domain/reading.js';
+import { actionClassLabel } from '../domain/labels.js';
 import type { MemoryRecord } from '../memory/store.js';
 import { AutonomyMode } from '../governance/autonomy-mode.js';
 import type { AutonomousAction } from './autonomous-actions.js';
@@ -202,7 +203,7 @@ function summaryRow(approval: ApprovalRequest): string {
     <strong><a href="/a/${esc(approval.approvalId)}">${esc(approval.summary)}</a></strong>
     <span class="band-${esc(approval.risk.band)}">${esc(bandLabel(approval.risk.band))}</span>
   </div>
-  <div class="muted">${esc(approval.actionClass)} · ${esc(amount)} · פג תוקף ${esc(approval.expiresAt)}</div>
+  <div class="muted">${esc(actionClassLabel(approval.actionClass))} · ${esc(amount)} · פג תוקף ${esc(approval.expiresAt)}</div>
 </div>`;
 }
 
@@ -476,7 +477,7 @@ export function renderAutonomousActions(actions: readonly AutonomousAction[], cs
       return `<tr>
         <td>${esc(action.completedAt.toISOString())}</td>
         <td>${title}</td>
-        <td>${esc(action.actionClass)}</td>
+        <td>${esc(actionClassLabel(action.actionClass))}</td>
         <td>${esc(action.toolName)}</td>
         <td>${recipient}</td>
         <td>${subject}</td>
@@ -1146,7 +1147,7 @@ export function renderApprovalCard(options: {
   ${detailBlock}
   <table>${recipientRow}
     <tr><td class="muted">כלי</td><td>${esc(approval.proposedTool)}</td></tr>
-    <tr><td class="muted">סוג פעולה</td><td>${esc(approval.actionClass)}</td></tr>
+    <tr><td class="muted">סוג פעולה</td><td>${esc(actionClassLabel(approval.actionClass))}</td></tr>
     <tr><td class="muted">סיכון</td><td class="band-${esc(risk.band)}">${esc(bandLabel(risk.band))} (${esc(risk.total)}) — ${esc(risk.explanation)}</td></tr>
     <tr><td class="muted">סכום</td><td>${esc(formatMinor(risk.dimensions.money.amountMinor, 'ILS'))}</td></tr>
     <tr><td class="muted">נוצר</td><td>${esc(approval.createdAt)}</td></tr>

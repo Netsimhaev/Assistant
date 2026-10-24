@@ -135,7 +135,12 @@ describe('collectDigestFacts', () => {
 
     const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
     expect(facts.permissionChanges).toHaveLength(1);
-    expect(facts.permissionChanges[0]?.subject).toContain('email.reply');
+    // The owner reads Hebrew: the class and both levels arrive translated
+    // (`domain/labels.ts`), never as the identifiers stored in the row.
+    expect(facts.permissionChanges[0]?.subject).toBe('מענה במייל');
+    expect(facts.permissionChanges[0]?.reason).toContain('פועלת אחרי אישור');
+    expect(facts.permissionChanges[0]?.reason).toContain('פועלת בלי לשאול');
+    expect(facts.permissionChanges[0]?.reason).not.toMatch(/[A-Za-z]/);
   });
 
   /**

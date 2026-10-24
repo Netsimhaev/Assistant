@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import type { Queryable } from '../db/pool.js';
+import { actionClassLabel, autonomyLevelLabel } from '../domain/labels.js';
 import { getPool } from '../db/pool.js';
 import type { DigestWindow } from './digest-window.js';
 import { failedText, isGateDenialCode, leadingCode, NOT_PERMITTED_TEXT } from './whatsapp-report.js';
@@ -369,13 +370,19 @@ export async function collectDigestFacts(
       ORDER BY at DESC`,
     [businessId, start, end],
   );
-  const permissionChanges: DigestException[] = autonomyRows.map((r) => ({
-    subject: r.action_class,
-    reason:
-      r.direction === 'promote'
-        ? `הורשתה לפעול בלי לשאול (מ-${r.from_level} ל-${r.to_level}).`
-        : `הוחזרה לשאול לפני פעולה (מ-${r.from_level} ל-${r.to_level}).`,
-  }));
+  // The row stores identifiers; the owner reads Hebrew (`domain/labels.ts`).
+  // "קודם / עכשיו" rather than "מ-X ל-Y": a level's label is a phrase, and
+  // gluing a prefix letter onto one made the sentence unreadable.
+  const permissionChanges: DigestException[] = autonomyRows.map((r) => {
+    const levels = `קודם: ${autonomyLevelLabel(r.from_level)}; עכשיו: ${autonomyLevelLabel(r.to_level)}`;
+    return {
+      subject: actionClassLabel(r.action_class),
+      reason:
+        r.direction === 'promote'
+          ? `הורשתה לפעול בלי לשאול (${levels}).`
+          : `הוחזרה לשאול לפני פעולה (${levels}).`,
+    };
+  });
 
   // ---- §3.5 cost: both measures.
   const windowMinor = await countOf(

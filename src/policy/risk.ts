@@ -3,6 +3,7 @@ import {
   BROWSER_ADDRESSED_CLASSES,
   messagesAPerson,
 } from '../domain/action.js';
+import { actionClassLabel, trustLevelLabel } from '../domain/labels.js';
 import type { ActionFacts, CompiledCeilings, PolicyBundle } from '../domain/policy.js';
 import type { RiskAssessment, RiskBand, RiskDimensions } from '../domain/risk.js';
 import {
@@ -378,7 +379,9 @@ function explain(
   ceilings: CompiledCeilings,
 ): string {
   if (band === 'routine') {
-    return `${facts.actionClass} בטווח הרגיל של העסק.`;
+    // A read-only call carries no class; it used to print "null" here.
+    const what = facts.actionClass === null ? 'הפעולה' : actionClassLabel(facts.actionClass);
+    return `${what} בטווח הרגיל של העסק.`;
   }
 
   const reasons: string[] = [];
@@ -392,7 +395,7 @@ function explain(
     reasons.push('מגע ראשון עם גורם לא מזוהה');
   }
   if (dimensions.provenance.level === 'unknown_external' || dimensions.provenance.level === 'open_web') {
-    reasons.push(`מקור לא אמין (${dimensions.provenance.level})`);
+    reasons.push(`מקור לא אמין (${trustLevelLabel(dimensions.provenance.level)})`);
   }
   if (dimensions.reversibility.class === 'irreversible') {
     reasons.push('פעולה בלתי הפיכה');
