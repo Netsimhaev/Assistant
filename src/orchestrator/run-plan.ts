@@ -686,6 +686,8 @@ async function performStep(
       // The host this binding points the connection at, or null for the
       // adapter's own default.
       endpoint: binding?.endpoint ?? null,
+      // The job's own business, as the credential above was resolved for.
+      businessId: request.job.businessId,
       // Stable across retries of this same attempt, so an ambiguous timeout
       // cannot become a second real order.
       idempotencyKey: canonicalHash({

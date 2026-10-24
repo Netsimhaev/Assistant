@@ -11,7 +11,7 @@ import { BusinessCharter } from '../domain/charter.js';
 import type { MailTriage } from '../domain/mail-triage.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
-import { recordIncoming, type IncomingMail, type StoredMail } from '../mail/inbox-store.js';
+import { recordIncoming, replyTargetFor, type IncomingMail, type StoredMail } from '../mail/inbox-store.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient, MailboxFailure, OutgoingMessage, OutgoingReply } from '../mail/providers/types.js';
 import { createMailboxSendAdapter } from '../orchestrator/adapters/mailbox-send.js';
@@ -124,7 +124,7 @@ export function fakeMailboxClient(results: SendResult[] = [{ externalId: 'SENT-1
 export function mailboxRuntime(client: MailboxClient): Runtime {
   return {
     registry: new AdapterRegistry([
-      createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client }),
+      createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client, replyTargets: replyTargetFor }),
     ]),
     credentials: envCredentials({ [`${PREFIX}OAUTH_MAILBOX`]: 'access-token' }, PREFIX),
     warnings: [],

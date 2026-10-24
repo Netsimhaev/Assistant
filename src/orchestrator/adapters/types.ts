@@ -112,6 +112,17 @@ export interface AdapterCall {
    */
   endpoint: string | null;
   /**
+   * The business whose job this step belongs to — `job.businessId`, the same
+   * value `runPlan` already passes to `CredentialSource.resolve`.
+   *
+   * Required, never defaulted to `config.businessId`, for the reason that
+   * resolve takes it: an omitted business silently read as "the configured
+   * one" is how one business acts on another's data. The mailbox adapter
+   * reads it to resolve an instruction reply's thread from THIS business's
+   * stored mail only; adapters that touch no per-business data ignore it.
+   */
+  businessId: string;
+  /**
    * A key the caller generates once per attempt at the underlying business
    * action, stable across retries of that same attempt.
    *

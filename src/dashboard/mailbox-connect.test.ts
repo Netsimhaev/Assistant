@@ -240,6 +240,10 @@ describe('GET /connections/mailbox/sign', () => {
     expect(html).toContain('העוזרת תקרא כל מייל שנכנס לתיבה מרגע החיבור');
     expect(html).toContain('היא לא תמחק, לא תעביר, לא תסמן כנקרא ולא תסמן כספאם');
     expect(html).toContain('מייל יוצא — כולל תשובות להוראות שלך — יישלח מתיבת העסק במקום משרת השליחה');
+    // Not an unconditional "only after your approval": under the `learn`
+    // freedom level an earned reply can send without a card, and the page
+    // says so rather than promising what the code does not hold.
+    expect(html).toContain('אלא אם הגדרת ברמת החופש שהעוזרת רשאית לענות לבד');
     expect(html).toContain('תיבת המשרד'); // the connection that is dropped, by its signed label
     expect(html).toContain('Google');
     expect(html).toContain('יופעל מחדש');

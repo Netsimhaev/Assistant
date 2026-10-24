@@ -546,6 +546,100 @@ describe('a new message goes out through the mailbox too, under the gate (R21)',
   });
 });
 
+describe('an instruction-door reply goes out threaded through the mailbox', () => {
+  /**
+   * The planner writes a reply as `mail.send` with `inReplyTo` only — it
+   * never knows the provider's thread or message id. Before the adapter
+   * resolved them from the stored mail, this failed `not_a_reply` even once
+   * the owner approved it.
+   */
+  async function instructedReplyJob(inReplyTo: string): Promise<string> {
+    const bundle = await installMailboxCharter();
+    const job = await createJob({ businessId: BUSINESS, charterVersion: bundle.charterVersion, provenance: 'boss' });
+    for (const to of ['understand', 'plan'] as const) {
+      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+    }
+    await bindPlanToJob(
+      job.jobId,
+      Plan.parse({
+        goal: 'answer Dana',
+        steps: [
+          {
+            id: 's1',
+            agent: 'comms.email',
+            intent: 'reply to Dana',
+            toolName: 'mail.send',
+            input: { to: 'dana@client.example', subject: 'Re: מתי תגיע ההצעה?', body: 'מחר.', inReplyTo },
+            expectedActionClass: 'email.reply',
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'test', businessId: BUSINESS });
+    return job.jobId;
+  }
+
+  async function pendingCardFor(jobId: string): Promise<string> {
+    const { rows } = await getPool().query<{ approval_id: string }>(
+      `SELECT approval_id FROM approval_requests WHERE job_id = $1 AND state = 'pending'`,
+      [jobId],
+    );
+    const id = rows[0]?.approval_id;
+    if (id === undefined) throw new Error('expected a card');
+    return id;
+  }
+
+  it('asks first, and once approved sends a reply on the stored thread', async () => {
+    await storedMail();
+    const jobId = await instructedReplyJob('<q-1@client.example>');
+    await setAutonomyMode('ask', 'p_boss', { businessId: BUSINESS });
+    const { client, sent, sentNew } = fakeClient();
+
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    // The gate ran: under `ask` the reply is approve_required, so a card.
+    expect(sent).toHaveLength(0);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+
+    await approve(await pendingCardFor(jobId));
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+
+    expect(sentNew).toHaveLength(0);
+    expect(sent).toEqual([
+      {
+        to: ['dana@client.example'],
+        subject: 'Re: מתי תגיע ההצעה?',
+        body: 'מחר.',
+        inReplyTo: '<q-1@client.example>',
+        references: '<q-0@client.example>',
+        threadId: 'TH-1',
+        providerMessageId: 'PM-1',
+      },
+    ]);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('verify');
+  });
+
+  it('an approved reply to a mail the business never received fails reply_target_unknown, sending nothing', async () => {
+    await storedMail();
+    const jobId = await instructedReplyJob('<never-received@client.example>');
+    await setAutonomyMode('ask', 'p_boss', { businessId: BUSINESS });
+    const { client, sent, sentNew } = fakeClient();
+
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    await approve(await pendingCardFor(jobId));
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+
+    expect(sent).toHaveLength(0);
+    expect(sentNew).toHaveLength(0);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = 'failed'`,
+      [jobId],
+    );
+    expect(rows.some((r) => r.reason.startsWith('reply_target_unknown'))).toBe(true);
+  });
+});
+
 describe('reraiseAfterFailedSend', () => {
   async function approvedAndRun(results: SendResult[]) {
     const bundle = await installMailboxCharter();

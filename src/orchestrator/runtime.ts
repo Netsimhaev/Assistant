@@ -15,6 +15,7 @@ import { providerTokenHttp } from './adapters/provider-token-http.js';
 import { createMailAdapter } from './adapters/mail.js';
 import { createMailboxSendAdapter } from './adapters/mailbox-send.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
+import { replyTargetFor } from '../mail/inbox-store.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
 import { AdapterRegistry } from './adapters/registry.js';
@@ -624,6 +625,7 @@ export async function buildRuntime(
       createMailboxSendAdapter({
         system: binding.system,
         provider,
+        replyTargets: replyTargetFor,
         ...(overrides.mailboxClient !== undefined ? { client: overrides.mailboxClient(provider) } : {}),
       }),
     );

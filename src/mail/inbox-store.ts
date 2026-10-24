@@ -395,6 +395,51 @@ export async function isMailReplyJob(jobId: string, options: Options = {}): Prom
   return rows.length > 0;
 }
 
+/** What a reply needs to thread onto a stored mail, beyond its Message-ID. */
+export interface ReplyTarget {
+  threadId: string;
+  providerMessageId: string;
+  /** The stored References header — what a card reply carries too. */
+  references: string | null;
+}
+
+/** The lookup the mailbox send adapter is handed; `businessId` is required. */
+export type ReplyTargetLookup = (businessId: string, internetMessageId: string) => Promise<ReplyTarget | null>;
+
+/**
+ * The stored mail an instruction-door reply answers, by its Message-ID.
+ *
+ * The planner writes a reply as `mail.send` with `inReplyTo` only — it never
+ * sees a provider's thread or message id — so the mailbox adapter resolves
+ * them here. `businessId` is REQUIRED, with no `config.businessId` fallback,
+ * for the same reason `CredentialSource.resolve` takes one: an omitted
+ * business silently read as "the configured one" is how one business answers
+ * on another's thread. The adapter passes the job's own business.
+ *
+ * `internet_message_id` is not unique (the same Message-ID can in principle
+ * arrive twice under two provider ids), so the earliest received row wins,
+ * deterministically. The unrecordable placeholder has no Message-ID and can
+ * never match.
+ */
+export async function replyTargetFor(
+  businessId: string,
+  internetMessageId: string,
+  options: { db?: Queryable } = {},
+): Promise<ReplyTarget | null> {
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<{ thread_id: string; provider_message_id: string; references_header: string | null }>(
+    `SELECT thread_id, provider_message_id, references_header
+       FROM mail_messages
+      WHERE business_id = $1 AND internet_message_id = $2 AND thread_id <> ''
+      ORDER BY received_at, mail_id
+      LIMIT 1`,
+    [businessId, internetMessageId],
+  );
+  const row = rows[0];
+  if (row === undefined) return null;
+  return { threadId: row.thread_id, providerMessageId: row.provider_message_id, references: row.references_header };
+}
+
 /**
  * Take a failed reply job off its mail, so it is re-raised at most once.
  *

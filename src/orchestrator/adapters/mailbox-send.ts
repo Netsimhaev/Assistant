@@ -2,6 +2,7 @@ import { createGmailClient } from '../../mail/providers/gmail.js';
 import { createGraphClient } from '../../mail/providers/graph.js';
 import { isFailure } from '../../mail/providers/types.js';
 import type { MailboxClient, MailboxFailure } from '../../mail/providers/types.js';
+import type { ReplyTargetLookup } from '../../mail/inbox-store.js';
 import type { MailProvider } from '../../mail/mailbox.js';
 import { readRecipients, readString } from './mail.js';
 import type { AdapterCall, AdapterResult, ExternalAdapter } from './types.js';
@@ -11,6 +12,14 @@ export interface MailboxSendOptions {
   provider: MailProvider;
   /** Test seam; defaults to the provider's real client. */
   client?: MailboxClient;
+  /**
+   * Resolves an instruction reply's missing threading fields from the
+   * business's stored mail (`replyTargetFor`). Required: a runtime that forgot
+   * it would quietly fail every instructed reply again. Injected rather than
+   * imported so the adapter holds no database handle of its own, like every
+   * other adapter.
+   */
+  replyTargets: ReplyTargetLookup;
 }
 
 const SERVED_TOOLS: readonly string[] = ['mail.send'];
@@ -31,8 +40,20 @@ const SERVED_TOOLS: readonly string[] = ['mail.send'];
  *   - **A new message** — none of the three present (absent, `null` or `''`)
  *     — goes to one or more recipients via the provider's plain send, with no
  *     threading. This is what an instruction-door "write to Dana" becomes.
- *   - **Some but not all** is refused as `not_a_reply`: a payload that names a
- *     thread and cannot be threaded is never quietly sent as a fresh mail.
+ *   - **An instruction reply** — a non-empty `inReplyTo` without `threadId`
+ *     and/or `providerMessageId`. The planner never knows the provider's ids,
+ *     so the adapter resolves them from THIS business's stored mail by
+ *     Message-ID (`options.replyTargets`, scoped by `call.businessId`) and
+ *     sends it like a card reply. `to` stays what the gate approved — the
+ *     instruction door's `authorisedRecipients` already governed it — and is
+ *     never replaced by the stored From. No stored mail → `reply_target_unknown`,
+ *     terminal: a reply-classified payload is NEVER sent as a new mail, or an
+ *     `email.reply` authorisation would buy what is really an initiate. A
+ *     supplied id that disagrees with the stored one → `not_a_reply`; neither
+ *     side is trusted over the other.
+ *   - **Threading fields without `inReplyTo`** are refused as `not_a_reply`:
+ *     there is nothing to resolve from, and a payload that names a thread and
+ *     cannot be threaded is never quietly sent as a fresh mail.
  *
  * The adapter grants nothing. A new message is `email.initiate` at the gate
  * (`refineActionClass`: no `inReplyTo`), which the charter holds at
@@ -99,15 +120,40 @@ export function createMailboxSendAdapter(options: MailboxSendOptions): ExternalA
       }
 
       const inReplyTo = readString(input, 'inReplyTo');
-      const threadId = readString(input, 'threadId');
-      const providerMessageId = readString(input, 'providerMessageId');
-      if (inReplyTo === null || threadId === null || providerMessageId === null) {
-        return {
-          ok: false,
-          retryable: false,
-          code: 'not_a_reply',
-          message: 'חסר חלק משדות השרשור של התשובה — ההודעה לא נשלחה',
-        };
+      let threadId = readString(input, 'threadId');
+      let providerMessageId = readString(input, 'providerMessageId');
+      let references = readString(input, 'references');
+      if (inReplyTo === null) return NOT_A_REPLY;
+      // A present-but-unreadable field (a number, an object) is "there" by
+      // `threadingPresence` and `null` by `readString`: refuse, never resolve
+      // over it.
+      if ((threadId === null && threading[1]) || (providerMessageId === null && threading[2])) {
+        return NOT_A_REPLY;
+      }
+      if (threadId === null || providerMessageId === null) {
+        let target: Awaited<ReturnType<ReplyTargetLookup>>;
+        try {
+          target = await options.replyTargets(call.businessId, inReplyTo);
+        } catch (error) {
+          // Our own database, before anything was sent: nothing was created,
+          // so `retryable: true` is an honest claim. An adapter returns, never throws.
+          return {
+            ok: false,
+            retryable: true,
+            code: 'reply_target_lookup_failed',
+            message: error instanceof Error ? error.message : String(error),
+          };
+        }
+        if (target === null) return REPLY_TARGET_UNKNOWN;
+        if (
+          (threadId !== null && threadId !== target.threadId) ||
+          (providerMessageId !== null && providerMessageId !== target.providerMessageId)
+        ) {
+          return NOT_A_REPLY;
+        }
+        threadId = target.threadId;
+        providerMessageId = target.providerMessageId;
+        references ??= target.references;
       }
 
       const to = readRecipients(input);
@@ -129,7 +175,7 @@ export function createMailboxSendAdapter(options: MailboxSendOptions): ExternalA
       return toAdapterResult(() =>
         client.sendReply(
           token,
-          { to, subject, body, inReplyTo, references: readString(input, 'references'), threadId, providerMessageId },
+          { to, subject, body, inReplyTo, references, threadId, providerMessageId },
           call.signal,
         ),
       );
@@ -166,6 +212,20 @@ function threadingPresence(input: Record<string, unknown>, key: string): boolean
   const value = input[key];
   return !(value === null || value === undefined || value === '');
 }
+
+const NOT_A_REPLY: AdapterResult = {
+  ok: false,
+  retryable: false,
+  code: 'not_a_reply',
+  message: 'חסר חלק משדות השרשור של התשובה — ההודעה לא נשלחה',
+};
+
+const REPLY_TARGET_UNKNOWN: AdapterResult = {
+  ok: false,
+  retryable: false,
+  code: 'reply_target_unknown',
+  message: 'לא נמצא המייל שאליו מבקשים לענות בתיבת העסק',
+};
 
 const MESSAGE_INCOMPLETE: AdapterResult = {
   ok: false,
