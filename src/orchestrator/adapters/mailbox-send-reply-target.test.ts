@@ -204,6 +204,67 @@ describe('mailbox adapter resolves an instruction reply from the stored mail', (
     expect(sent).toHaveLength(0);
   });
 
+  describe('two stored rows sharing one Message-ID', () => {
+    // Different provider ids — or a stranger reusing a real conversation's
+    // Message-ID. The row a payload names by providerMessageId is the row it
+    // is checked against, not whichever arrived first.
+    async function twoRows() {
+      const first = await storedMail(BUSINESS);
+      const second = await storedMail(BUSINESS, {
+        providerMessageId: 'PM-2',
+        threadId: 'TH-2',
+        fromAddress: 'avi@other.example',
+        receivedAt: '2026-10-21T08:30:00.000Z',
+      });
+      return { first, second };
+    }
+
+    it('a card raised from the second row sends to the second row’s From, on its thread', async () => {
+      const { second } = await twoRows();
+      const { client, sent } = fakeMailboxClient();
+      const card = {
+        to: [second.fromAddress],
+        subject: 'Re: מתי תגיע ההצעה?',
+        body: 'מחר.',
+        inReplyTo: second.internetMessageId,
+        references: second.references,
+        threadId: second.threadId,
+        providerMessageId: second.providerMessageId,
+      };
+      expect(await adapterWith(client).execute(call(card))).toMatchObject({ ok: true });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({ to: ['avi@other.example'], threadId: 'TH-2', providerMessageId: 'PM-2' });
+    });
+
+    it('naming the second row but addressing the first row’s From is refused', async () => {
+      const { first, second } = await twoRows();
+      const { client, sent, sentNew } = fakeMailboxClient();
+      const result = await adapterWith(client).execute(
+        call({ ...INSTRUCTED, to: first.fromAddress, threadId: second.threadId, providerMessageId: second.providerMessageId }),
+      );
+      expect(result).toMatchObject({ ok: false, code: 'reply_recipient_mismatch' });
+      expect(sent).toHaveLength(0);
+      expect(sentNew).toHaveLength(0);
+    });
+
+    it('with no providerMessageId supplied, the earliest row still resolves', async () => {
+      await twoRows();
+      const { client, sent } = fakeMailboxClient();
+      expect(await adapterWith(client).execute(call(INSTRUCTED))).toMatchObject({ ok: true });
+      expect(sent[0]).toMatchObject({ to: ['dana@client.example'], threadId: 'TH-1', providerMessageId: 'PM-1' });
+    });
+
+    it('the second row’s providerMessageId with the first row’s threadId is not_a_reply', async () => {
+      const { first, second } = await twoRows();
+      const { client, sent } = fakeMailboxClient();
+      const result = await adapterWith(client).execute(
+        call({ ...INSTRUCTED, to: second.fromAddress, threadId: first.threadId, providerMessageId: second.providerMessageId }),
+      );
+      expect(result).toMatchObject({ ok: false, code: 'not_a_reply' });
+      expect(sent).toHaveLength(0);
+    });
+  });
+
   it('threading fields without an inReplyTo are still not_a_reply — there is nothing to resolve from', async () => {
     await storedMail(BUSINESS);
     const { client, sent, sentNew } = fakeMailboxClient();

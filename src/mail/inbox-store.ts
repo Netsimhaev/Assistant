@@ -406,7 +406,11 @@ export interface ReplyTarget {
 }
 
 /** The lookup the mailbox send adapter is handed; `businessId` is required. */
-export type ReplyTargetLookup = (businessId: string, internetMessageId: string) => Promise<ReplyTarget | null>;
+export type ReplyTargetLookup = (
+  businessId: string,
+  internetMessageId: string,
+  providerMessageId: string | null,
+) => Promise<ReplyTarget | null>;
 
 /**
  * The stored mail an instruction-door reply answers, by its Message-ID.
@@ -418,9 +422,15 @@ export type ReplyTargetLookup = (businessId: string, internetMessageId: string) 
  * business silently read as "the configured one" is how one business answers
  * on another's thread. The adapter passes the job's own business.
  *
- * `internet_message_id` is not unique (the same Message-ID can in principle
- * arrive twice under two provider ids), so the earliest received row wins,
- * deterministically. The unrecordable placeholder has no Message-ID and can
+ * `internet_message_id` is not unique — the same Message-ID can arrive twice
+ * under two provider ids, or a stranger can reuse a real conversation's. When
+ * the caller names a `providerMessageId` (every card reply does), the row
+ * with that exact provider id is returned, so a card raised from the LATER
+ * row is checked against its own thread and From rather than dying as
+ * `not_a_reply` after the owner approved it. Only when that row does not
+ * exist, or no provider id was named, does the earliest received row win,
+ * deterministically — and the adapter then refuses any supplied id that
+ * disagrees with it. The unrecordable placeholder has no Message-ID and can
  * never match.
  *
  * A Message-ID is chosen by whoever SENT the mail, so a stranger can make one
@@ -432,6 +442,7 @@ export type ReplyTargetLookup = (businessId: string, internetMessageId: string) 
 export async function replyTargetFor(
   businessId: string,
   internetMessageId: string,
+  providerMessageId: string | null,
   options: { db?: Queryable } = {},
 ): Promise<ReplyTarget | null> {
   const db = options.db ?? getPool();
@@ -444,9 +455,9 @@ export async function replyTargetFor(
     `SELECT thread_id, provider_message_id, references_header, from_address
        FROM mail_messages
       WHERE business_id = $1 AND internet_message_id = $2 AND thread_id <> ''
-      ORDER BY received_at, mail_id
+      ORDER BY (provider_message_id = $3) IS TRUE DESC, received_at, mail_id
       LIMIT 1`,
-    [businessId, internetMessageId],
+    [businessId, internetMessageId, providerMessageId],
   );
   const row = rows[0];
   if (row === undefined) return null;

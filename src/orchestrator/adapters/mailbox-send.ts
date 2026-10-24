@@ -135,7 +135,7 @@ export function createMailboxSendAdapter(options: MailboxSendOptions): ExternalA
       // the mailbox.
       let target: Awaited<ReturnType<ReplyTargetLookup>>;
       try {
-        target = await options.replyTargets(call.businessId, inReplyTo);
+        target = await options.replyTargets(call.businessId, inReplyTo, providerMessageId);
       } catch {
         // Our own database, before anything was sent: nothing was created,
         // so `retryable: true` is an honest claim. A fixed sentence, not the
