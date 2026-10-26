@@ -588,11 +588,13 @@ export const VERIFICATION_VERDICTS_ERASED_PREDICATE = `business_id = $1 AND job_
  *
  * One row per performed step, telling the owner what the assistant did on
  * her own — `recipient`, `subject` and `body` name the person the step was
- * addressed to. Job-anchored exactly like `autonomy_marks`: deleted by
- * `job_id` membership, with no discovery query of its own, because every
- * value in a row is derived from the step's own payload, which already sits
- * in `job_plans.plan` and places the job in `jobIds` through that table's
- * discovery. The row cannot name anyone the job's plan does not.
+ * addressed to. Job-anchored exactly like `autonomy_marks`, and paired the
+ * same way: a closure target by `job_id` membership here, AND a discovery
+ * source of its own in `buildErasurePlan`. The second half is not redundant
+ * with `job_plans` discovery even though the values come from the step
+ * payload: that query matches `plan::text`, JSONB's text form, which escapes
+ * `"` and newlines — so `אלפא בע"מ` written plainly in `body` is found here
+ * and nowhere else.
  *
  * Parameters, in both places: `$1` businessId, `$2` jobIds.
  */
@@ -846,6 +848,24 @@ export async function buildErasurePlan(
       db,
       `SELECT DISTINCT job_id FROM autonomy_marks
         WHERE business_id = $1 AND note ILIKE $2 ${LIKE_ESCAPE}`,
+      [businessId, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // `action_updates` (migration 047) is a discovery source of its own, not
+    // only a closure target: its `recipient`/`subject`/`body` hold the step's
+    // values as plain text, while the `job_plans` query above matches the
+    // plan's JSONB TEXT FORM, which escapes `"` and newlines. An identifier
+    // like `אלפא בע"מ` therefore matches here and NOT in `job_plans` — without
+    // this query the job never enters `jobIds` and the update row (and the
+    // plan beside it) survive the erasure.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM action_updates
+        WHERE business_id = $1
+          AND (coalesce(recipient, '') ILIKE $2 ${LIKE_ESCAPE}
+               OR coalesce(subject, '') ILIKE $2 ${LIKE_ESCAPE}
+               OR body ILIKE $2 ${LIKE_ESCAPE})`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);

@@ -96,11 +96,11 @@ describe('what an erasure leaves behind', () => {
    * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (19; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (20; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 17 also includes tables scrubbed as a consequence of
+   * stores, while the 20 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
@@ -493,6 +493,60 @@ describe('what an erasure leaves behind', () => {
    * `job_id = ANY($2)` deletion never reaches it, and the name survives an
    * erasure of that very contact permanently.
    */
+  /**
+   * `action_updates` must be a discovery source of its own, not only a
+   * closure target (fix round 1). The job's plan holds the very same body —
+   * but `job_plans` discovery matches `plan::text`, JSONB's text form, which
+   * escapes `"` and newlines, so an ordinary Hebrew company name like
+   * `אלפא בע"מ` is NOT found there. Written plainly in `action_updates.body`
+   * it is. Without the `action_updates` discovery query in
+   * `buildErasurePlan`, this job never enters `jobIds` and both the update
+   * row and the plan beside it survive an erasure of that very name.
+   */
+  it('reaches an action update whose name only matches in plain text, not in the plan JSON', async () => {
+    const NAME = 'אלפא בע"מ';
+    // A real `"` inside the name and a real newline right after it: both are
+    // escaped in the plan's JSONB text form.
+    const BODY = `לכבוד ${NAME}\nשלום, שלחתי את ההצעה`;
+    const bundle = await installCharter(buildCharter({ version: 'update-only' }), { businessId: BUSINESS });
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'משימה רגילה שלא קשורה לאיש',
+    });
+    const db = getPool();
+    await db.query(
+      `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
+       VALUES ($1, $2, 'hp-update-only', $3::jsonb)`,
+      [BUSINESS, job.jobId, JSON.stringify({ steps: [{ id: 's1', input: { body: BODY } }] })],
+    );
+    await db.query(
+      `INSERT INTO action_updates (update_id, business_id, job_id, step_id, action_class, body)
+       VALUES ('AU-update-only', $1, $2, 's1', 'email.reply', $3)`,
+      [BUSINESS, job.jobId, BODY],
+    );
+
+    // The premise: the plan's text form does NOT contain the name, so
+    // `job_plans` discovery alone cannot reach this job.
+    const premise = await db.query(
+      `SELECT 1 FROM job_plans WHERE business_id = $1 AND job_id = $2 AND plan::text ILIKE $3`,
+      [BUSINESS, job.jobId, `%${NAME}%`],
+    );
+    expect(premise.rows).toHaveLength(0);
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: NAME }, { businessId: BUSINESS });
+    await executeErasure(plan, { businessId: BUSINESS });
+
+    const updates = await db.query('SELECT 1 FROM action_updates WHERE update_id = $1', ['AU-update-only']);
+    expect(updates.rows).toHaveLength(0);
+    const plans = await db.query('SELECT 1 FROM job_plans WHERE business_id = $1 AND job_id = $2', [
+      BUSINESS,
+      job.jobId,
+    ]);
+    expect(plans.rows).toHaveLength(0);
+  });
+
   it('reaches a correction note that names a counterparty the job otherwise never mentions', async () => {
     const bundle = await installCharter(buildCharter({ version: 'note-only' }), { businessId: BUSINESS });
     const job = await createJob({
