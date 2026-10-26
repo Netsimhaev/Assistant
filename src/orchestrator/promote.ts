@@ -18,7 +18,10 @@ import { canonicalHash } from '../util/canonical.js';
 import { ActionClass } from '../domain/action.js';
 import type { AutonomyLevel } from '../domain/trust.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
-import { STREAK_REQUIRED, approvalStreak } from '../governance/agreement.js';
+import { agreementFor, isLearned } from '../governance/agreement.js';
+
+/** TEMPORARY until Task 3 replaces promotion: the old streak length, kept only for `cleanApprovalsSince`. */
+export const STREAK_REQUIRED = 10;
 import { loadRampLevel, loadStoredRampLevel, setRampLevel } from './ramp.js';
 
 export interface AutonomyPassResult {
@@ -328,7 +331,8 @@ export async function evaluateAutonomy(
       if (mode !== 'learn') continue;
       if (level !== EARNED_STEP.from) continue;
       if ((await demotionCount(actionClass, businessId, db)) >= DEMOTIONS_BEFORE_STOP) continue;
-      if ((await approvalStreak(actionClass, { businessId, db })) < STREAK_REQUIRED) continue;
+      // TEMPORARY (Task 3 rewrites promotion): the windowed rate replaces the streak.
+      if (!isLearned(await agreementFor(actionClass, { businessId, since, db }))) continue;
       // Spec §6.3 — see `cleanApprovalsSince`. Asked only after a move.
       if (
         since !== null &&

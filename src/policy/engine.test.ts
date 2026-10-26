@@ -5,7 +5,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { queryAudit, verifyChain } from '../audit/log.js';
 import { decide, getApproval, pendingApprovals } from '../governance/approvals.js';
-import { approvalStreak } from '../governance/agreement.js';
+import { agreementFor } from '../governance/agreement.js';
 import { release, trip } from '../governance/killswitch.js';
 import { evaluateToolCall, type GateContext } from './engine.js';
 import { refineActionClass } from './classify.js';
@@ -285,11 +285,10 @@ describe('exit criterion: approval', () => {
    * and `decide` decides that by comparing rather than by the field being
    * present.
    *
-   * The pair matters more than either test alone. `approvalStreak`
-   * (`src/governance/agreement.ts`) advances only on `approved`, so a
-   * mislabel here does not fail loudly — it silently stops an owner who
-   * approves ten cards unchanged from ever earning the autonomy raise, with
-   * nothing to read that explains it.
+   * The pair matters more than either test alone. `agreementFor`
+   * (`src/governance/agreement.ts`) reads the stored state, so a mislabel
+   * here does not fail loudly — it silently skews the rate that decides the
+   * autonomy raise, with nothing to read that explains it.
    *
    * The reordered-keys case is the one a caller actually produces: a payload
    * that round-tripped through JSON with its keys in a different order is
@@ -319,8 +318,20 @@ describe('exit criterion: approval', () => {
     // guard has nothing to act on and the original input runs — which is the
     // same bytes anyway.
     expect(unchanged.editedInput).toBeNull();
-    // And the streak this would otherwise have broken keeps counting.
-    expect(await approvalStreak('purchase.place', { businessId: BUSINESS })).toBe(1);
+    // And the agreement rate this would otherwise have dented keeps counting.
+    // `agreementFor` only counts mailbox reply jobs, so the gate's job is
+    // linked to a stored mail the way a real reply job is.
+    await getPool().query(
+      `INSERT INTO mail_messages
+         (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
+          received_at, body_text, state, reply_job_id)
+       VALUES ('M-engine', $1, 'pm-engine', 'th-engine', 'a@example.com', 's', now(), 'b',
+               'triaged', 'J-TEST')`,
+      [BUSINESS],
+    );
+    expect(
+      await agreementFor('purchase.place', { businessId: BUSINESS, since: null }),
+    ).toEqual({ right: 1, counted: 1, topWrongReason: null });
   });
 
   it('refuses to decide the same approval twice', async () => {

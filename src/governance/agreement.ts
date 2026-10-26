@@ -1,6 +1,5 @@
 /**
- * How many times in a row the owner approved what the assistant proposed,
- * without changing a word.
+ * Shadow mode: how often the owner agreed with the proposed mail replies.
  *
  * Derived from `approval_requests` on every call, never accumulated. A
  * counter maintained beside its source can drift from it without anyone
@@ -8,45 +7,135 @@
  * derived number is right by construction, and right retroactively after a
  * bug is fixed. The counter columns migration 001 put on `autonomy_ramp`
  * stay empty on purpose (spec §4.1).
+ *
+ * WHAT COUNTS AS EVIDENCE is stated positively (spec §5.1, "אילו כרטיסים הם
+ * ראיה"): a card counts only when its job is a mailbox reply job — a
+ * `mail_messages` row of the same business names the job as `reply_job_id`.
+ * "Every `email.reply` card" is the negation-shaped rule this project keeps
+ * paying for: instruction-door and conductor cards share the action class but
+ * are not the assistant proposing a reply to a mail, so they would silently
+ * inflate or deflate the rate.
+ *
+ * Per job, only the FIRST decided card counts (by `created_at`): a job that
+ * was asked twice measures the first answer, not the owner's patience.
+ * Cards whose header carries `RETRY_PREFIX` / `EXPIRED_PREFIX` are skipped —
+ * they re-ask about a send that did not complete, which says nothing about
+ * the proposal.
+ *
+ * Known limitation: a re-raise relinks `reply_job_id` to the new job, so a
+ * re-raised mail drops out of measurement entirely — the original card loses
+ * its link and the re-raised card is skipped by its prefix. That undercounts,
+ * which is the safe direction.
  */
-import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
+import { EXPIRED_PREFIX, RETRY_PREFIX, splitReplyDetail } from '../mail/reply-card.js';
+import { agreementVerdict, type WrongReason } from './agreement-verdict.js';
 
-/** How long a clean run must be before a class earns a step. Spec §13. */
-export const STREAK_REQUIRED = 10;
+export const AGREEMENT_WINDOW_DAYS = 14;
+export const MIN_SAMPLES = 5;
+/** Strictly greater: exactly 80% is not yet learned. */
+export const LEARNED_THRESHOLD = 0.8;
+
+export interface Agreement {
+  right: number;
+  counted: number;
+  topWrongReason: WrongReason | null;
+}
+
+/** Tie-break order for `topWrongReason`. */
+const REASON_ORDER: readonly WrongReason[] = [
+  'recipient',
+  'number',
+  'date',
+  'too_many_words',
+  'denied',
+];
 
 /**
- * The three states that carry a verdict, named positively.
- *
- * `expired` and `cancelled` are excluded because they say nobody answered or
- * the request was withdrawn — neither is the assistant being right and
- * neither is her being wrong, so they must not count AND must not break a
- * run (spec §4.3). Excluding them in the query rather than filtering after
- * is what makes them invisible to the streak instead of fatal to it.
+ * The three states that carry a verdict, named positively. `expired` and
+ * `cancelled` say nobody answered or the request was withdrawn — neither is
+ * the assistant being right or wrong, so they are excluded in the query.
  */
 const DECIDED_STATES = ['approved', 'approved_with_edit', 'denied'] as const;
 
-export async function approvalStreak(
+interface CardRow {
+  state: string;
+  detail: string;
+  proposed_input: unknown;
+  edited_input: unknown;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+export async function agreementFor(
   actionClass: ActionClass,
-  options: { businessId?: string; db?: Queryable } = {},
-): Promise<number> {
+  options: { businessId: string; since: Date | null; now?: Date; db?: Queryable },
+): Promise<Agreement> {
   const db = options.db ?? getPool();
-  const { rows } = await db.query<{ state: string }>(
-    `SELECT state FROM approval_requests
-      WHERE business_id = $1 AND action_class = $2 AND state = ANY($3::text[])
-      ORDER BY decided_at DESC
-      LIMIT $4`,
-    [options.businessId ?? config.businessId, actionClass, [...DECIDED_STATES], STREAK_REQUIRED],
+  const now = options.now ?? new Date();
+  const { rows } = await db.query<CardRow>(
+    `SELECT state, detail, proposed_input, edited_input
+       FROM (
+         SELECT DISTINCT ON (a.job_id)
+                a.state, a.detail, a.proposed_input, a.edited_input, a.decided_at
+           FROM approval_requests a
+           JOIN mail_messages m
+             ON m.business_id = a.business_id AND m.reply_job_id = a.job_id
+          WHERE a.business_id = $1 AND a.action_class = $2
+            AND a.state = ANY($3::text[])
+          ORDER BY a.job_id, a.created_at
+       ) first_card
+      WHERE decided_at > GREATEST(
+              $4::timestamptz - make_interval(days => $5),
+              COALESCE($6::timestamptz, '-infinity'::timestamptz))`,
+    [
+      options.businessId,
+      actionClass,
+      [...DECIDED_STATES],
+      now.toISOString(),
+      AGREEMENT_WINDOW_DAYS,
+      options.since === null ? null : options.since.toISOString(),
+    ],
   );
 
-  let streak = 0;
+  let right = 0;
+  let counted = 0;
+  const reasons = new Map<WrongReason, number>();
   for (const row of rows) {
-    // Positive: only a clean approval extends the run. `approved_with_edit`
-    // and `denied` both stop it, and anything else this build does not know
-    // stops it too — an unreadable state is never a permissive one.
-    if (row.state !== 'approved') break;
-    streak += 1;
+    const header = splitReplyDetail(row.detail).header;
+    if (header.includes(RETRY_PREFIX) || header.includes(EXPIRED_PREFIX)) continue;
+
+    const { verdict, reason } = agreementVerdict({
+      state: row.state,
+      proposed: asRecord(row.proposed_input),
+      edited: row.edited_input === null ? null : asRecord(row.edited_input),
+    });
+    if (verdict === 'not_counted') continue;
+    counted += 1;
+    if (verdict === 'right') {
+      right += 1;
+    } else if (reason !== null) {
+      reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+    }
   }
-  return streak;
+
+  let topWrongReason: WrongReason | null = null;
+  let topCount = 0;
+  for (const reason of REASON_ORDER) {
+    const n = reasons.get(reason) ?? 0;
+    if (n > topCount) {
+      topCount = n;
+      topWrongReason = reason;
+    }
+  }
+  return { right, counted, topWrongReason };
+}
+
+export function isLearned(a: Agreement): boolean {
+  return a.counted >= MIN_SAMPLES && a.right / a.counted > LEARNED_THRESHOLD;
 }

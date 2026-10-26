@@ -26,7 +26,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { decide, enqueueApproval } from '../governance/approvals.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
-import { STREAK_REQUIRED } from '../governance/agreement.js';
+import { STREAK_REQUIRED } from './promote.js';
 import { assessRisk } from '../policy/risk.js';
 import { canonicalHash } from '../util/canonical.js';
 import { Plan } from '../domain/plan.js';
