@@ -2,7 +2,7 @@
  * The pass that moves a class up when it has earned it and down the moment
  * it has not.
  *
- * Everything it reads is derived: the streak from `approval_requests`, the
+ * Everything it reads is derived: the agreement rate from `approval_requests`, the
  * demotion count from `autonomy_events`, the failures from the job record.
  * Nothing here maintains a counter, so nothing here can drift — the counter
  * columns migration 001 put on `autonomy_ramp` (`samples`,
@@ -20,8 +20,6 @@ import type { AutonomyLevel } from '../domain/trust.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { agreementFor, isLearned } from '../governance/agreement.js';
 
-/** TEMPORARY until Task 3 replaces promotion: the old streak length, kept only for `cleanApprovalsSince`. */
-export const STREAK_REQUIRED = 10;
 import { loadRampLevel, loadStoredRampLevel, setRampLevel } from './ramp.js';
 
 export interface AutonomyPassResult {
@@ -101,37 +99,6 @@ async function demotionCount(
     `SELECT count(*)::text AS n FROM autonomy_events
       WHERE business_id = $1 AND action_class = $2 AND direction = 'demote'`,
     [businessId, actionClass],
-  );
-  return Number(rows[0]?.n ?? '0');
-}
-
-/**
- * Clean approvals for this class decided strictly after the last ramp move.
- *
- * This is what makes spec §6.3 — "the streak starts again" — true. Without
- * it, `approvalStreak` keeps reporting the same ten decisions that earned the
- * previous promotion, so a class demoted on an owner's mark climbs straight
- * back on the very next pass and the mark lasts one scheduler interval. It is
- * asked only when a move has already happened; a class that has never moved
- * has nothing to restart from, and the streak alone decides it.
- *
- * Only `approved` is counted, and one literal rather than a second copy of
- * `agreement.ts`'s verdict list: this asks how many clean approvals there are
- * since the move, and the streak check beside it is what proves the ten most
- * recent decisions are consecutive. Together they mean ten consecutive clean
- * approvals, all of them after the last move.
- */
-async function cleanApprovalsSince(
-  actionClass: ActionClass,
-  businessId: string,
-  since: Date,
-  db: Queryable,
-): Promise<number> {
-  const { rows } = await db.query<{ n: string }>(
-    `SELECT count(*)::text AS n FROM approval_requests
-      WHERE business_id = $1 AND action_class = $2
-        AND state = 'approved' AND decided_at > $3`,
-    [businessId, actionClass, since],
   );
   return Number(rows[0]?.n ?? '0');
 }
@@ -331,17 +298,14 @@ export async function evaluateAutonomy(
       if (mode !== 'learn') continue;
       if (level !== EARNED_STEP.from) continue;
       if ((await demotionCount(actionClass, businessId, db)) >= DEMOTIONS_BEFORE_STOP) continue;
-      // TEMPORARY (Task 3 rewrites promotion): the windowed rate replaces the streak.
-      if (!isLearned(await agreementFor(actionClass, { businessId, since, db }))) continue;
-      // Spec §6.3 — see `cleanApprovalsSince`. Asked only after a move.
-      if (
-        since !== null &&
-        (await cleanApprovalsSince(actionClass, businessId, since, db)) < STREAK_REQUIRED
-      ) {
-        continue;
-      }
+      // The owner agreed more than 80% of the time over at least five verdicts.
+      // The "starts again after a move" rule (spec §6.3) is carried by `since`:
+      // `agreementFor` only counts cards decided after the last ramp move.
+      const agreement = await agreementFor(actionClass, { businessId, since, db });
+      if (!isLearned(agreement)) continue;
 
-      // Spec §5.1.4 — no mark and no failed job inside the window of ten —
+      // Spec §5.1.4 — promotion on the windowed agreement rate (>80% of at
+      // least five owner verdicts), with no mark and no failed job —
       // has no separate check here, on purpose, not by omission. The two
       // halves are satisfied for DIFFERENT reasons, and an earlier draft of
       // this comment collapsed them into one claim that was not true of the
@@ -367,7 +331,7 @@ export async function evaluateAutonomy(
         actionClass,
         storedFrom,
         EARNED_STEP.to,
-        `${STREAK_REQUIRED} אישורים רצופים ללא שינוי`,
+        `${agreement.right} מתוך ${agreement.counted} הכרעות אחרונות (${Math.round((100 * agreement.right) / agreement.counted)}%)`,
         businessId,
       );
       promoted.push(actionClass);

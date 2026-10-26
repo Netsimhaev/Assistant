@@ -337,12 +337,12 @@ export async function decide(
   // place) reintroduces the bug with nothing to catch it.
   //
   // **What the mislabel actually costs, which is why it is a security item
-  // and not a cosmetic one.** `approvalStreak`
-  // (`src/governance/agreement.ts`) counts only `approved` — `break` on
-  // anything else, deliberately, since an edit means the owner did not
-  // accept what was proposed. So a mislabelled row silently resets the run
-  // toward promotion: an owner who approved ten cards unchanged would never
-  // earn the raise, `evaluateAutonomy` would report no streak, and nothing
+  // and not a cosmetic one.** the agreement rate
+  // (`src/governance/agreement.ts`) reads the label: `approved` is a clean
+  // agreement while `approved_with_edit` is judged by the edit itself. So a
+  // mislabelled row silently skews the rate toward not promoting: an owner
+  // who approved the cards unchanged would never earn the raise,
+  // `evaluateAutonomy` would report too little agreement, and nothing
   // anywhere would say why. That is the autonomy mechanism quietly not
   // working, which is worse than it refusing out loud. Beyond that, the
   // audit trail would assert that a human edited something they did not.

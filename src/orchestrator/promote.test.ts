@@ -26,7 +26,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { decide, enqueueApproval } from '../governance/approvals.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
-import { STREAK_REQUIRED } from './promote.js';
+import { MIN_SAMPLES } from '../governance/agreement.js';
 import { assessRisk } from '../policy/risk.js';
 import { canonicalHash } from '../util/canonical.js';
 import { Plan } from '../domain/plan.js';
@@ -56,7 +56,7 @@ let sequence = 0;
  * `autonomy_events` row this file writes through `evaluateAutonomy` (those
  * carry SQL `now()`). `FUTURE` is an hour ahead, for the one test that needs
  * decisions made AFTER a demotion. Which side of the last ramp event a card
- * falls on is load-bearing — it is the whole of "the streak starts again" —
+ * falls on is load-bearing — it is the whole of "the window starts again" —
  * so it is chosen per card rather than left to wall-clock luck.
  */
 const PAST = Date.now() - 60 * 60 * 1000;
@@ -89,51 +89,64 @@ function factsFor(actionClass: ActionClass, input: unknown): ActionFacts {
   };
 }
 
-/** Seed one decided card. `edited` produces `approved_with_edit`. */
+/**
+ * Seed one decided card on a mailbox reply job.
+ *
+ * Only cards on a job that a `mail_messages` row names as its `reply_job_id`
+ * are evidence for the agreement rate (spec §5.1), so every card here gets its
+ * own job and its own linked mail. `denied` is a wrong verdict; `approved` an
+ * unedited agreement.
+ */
 async function card(
   actionClass: ActionClass,
   outcome: 'approved' | 'denied',
-  opts: { edited?: boolean; epoch?: number } = {},
+  opts: { epoch?: number } = {},
 ): Promise<void> {
   sequence += 1;
+  const jobId = `J-promote-${sequence}`;
+  await getPool().query(
+    `INSERT INTO mail_messages
+       (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
+        received_at, body_text, state, reply_job_id)
+     VALUES ($1, $2, $3, $4, 'dana@example.com', 's', now(), 'b', 'triaged', $5)`,
+    [`M-promote-${sequence}`, BUSINESS, `pm-${sequence}`, `th-${sequence}`, jobId],
+  );
   const input = { to: 'dana@example.com', body: `card-${sequence}` };
   const facts = factsFor(actionClass, input);
   const risk = await assessRisk(facts, bundle);
   const approvalId = await enqueueApproval(
-    { facts, risk, proposedInput: input, summary: 'שליחת מייל' },
+    { facts, risk, proposedInput: input, summary: 'שליחת מייל', jobId },
     { businessId: BUSINESS },
   );
-
-  const editedInput = opts.edited ? { ...input, body: 'נוסח מחדש' } : undefined;
   await decide(
     approvalId,
     outcome,
-    {
-      by: 'p_boss',
-      channel: 'dashboard',
-      ...(editedInput !== undefined ? { editedInput } : {}),
-    },
+    { by: 'p_boss', channel: 'dashboard' },
     { businessId: BUSINESS },
   );
 
-  // `decide` stamps `decided_at` with SQL now(); two cards seeded back to back
-  // can land on the same tick and make `ORDER BY decided_at DESC` ambiguous.
-  // Overwriting with a value that strictly increases with `sequence` removes
-  // the race, and choosing the epoch places the card before or after the ramp
-  // events this file writes.
+  // `decide` stamps `decided_at` with SQL now(); overwriting with a value that
+  // strictly increases with `sequence` keeps the order unambiguous, and choosing
+  // the epoch places the card before or after the ramp events this file writes.
   await getPool().query(`UPDATE approval_requests SET decided_at = $1 WHERE approval_id = $2`, [
     new Date((opts.epoch ?? PAST) + sequence * 1_000).toISOString(),
     approvalId,
   ]);
 }
 
-/** A clean run of `n` approvals for one class. */
+/** A clean run of `n` unedited approvals for one class. */
 async function cleanRun(
   actionClass: ActionClass,
   n: number,
   opts: { epoch?: number } = {},
 ): Promise<void> {
   for (let i = 0; i < n; i += 1) await card(actionClass, 'approved', opts);
+}
+
+/** `right` approvals followed by `wrong` denials: an exact agreement rate. */
+async function verdicts(actionClass: ActionClass, right: number, wrong: number): Promise<void> {
+  await cleanRun(actionClass, right);
+  for (let i = 0; i < wrong; i += 1) await card(actionClass, 'denied');
 }
 
 /**
@@ -225,10 +238,10 @@ describe('the evaluation pass', () => {
    * history, evaluated again with nothing changed but the dial, does promote —
    * so the first evaluation demonstrably ran and the dial is what held it.
    */
-  it('does not move anything while the dial is off, however long the streak', async () => {
+  it('does not move anything while the dial is off, however clean the record', async () => {
     await setAutonomyMode('off', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED + 5);
+    await cleanRun('email.reply', MIN_SAMPLES + 5);
 
     const result = await evaluateAutonomy({ businessId: BUSINESS });
     expect(result.promoted).toEqual([]);
@@ -248,7 +261,7 @@ describe('the evaluation pass', () => {
   it('does not promote on the dial at ask — measuring is not climbing', async () => {
     await setAutonomyMode('ask', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
 
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('approve_required');
@@ -261,10 +274,10 @@ describe('the evaluation pass', () => {
   });
 
   /** Spec §5.1. The one earned rung in the system. */
-  it('promotes one step at learn once the streak is complete', async () => {
+  it('promotes one step at learn once the owner agreed enough', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
 
     const result = await evaluateAutonomy({ businessId: BUSINESS });
     expect(result.promoted).toContain('email.reply');
@@ -274,20 +287,58 @@ describe('the evaluation pass', () => {
   });
 
   /**
-   * Spec §4.4 — ten, not nine. `calendar.create` carries a complete run in the
-   * same pass and does promote, which is what proves the evaluation reached
-   * `email.reply` and declined it rather than never running.
+   * The rule: strictly more than 80% of at least five owner verdicts. Each
+   * negative case re-evaluates the SAME class after one more verdict tips it
+   * over, so the first evaluation demonstrably ran and declined (a positive
+   * control per case, not a return-value-only assertion).
    */
-  it('does not promote one short of the streak', async () => {
+  it('does not promote on four verdicts, however clean — and does on the fifth', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED - 1);
-    await cleanRun('calendar.create', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES - 1);
 
-    const result = await evaluateAutonomy({ businessId: BUSINESS });
-    expect(result.promoted).toEqual(['calendar.create']);
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('approve_required');
     expect(await events('email.reply')).toEqual([]);
+
+    await cleanRun('email.reply', 1);
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+  });
+
+  it('does not promote on 4 of 5 (80%)', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await verdicts('email.reply', 4, 1);
+
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual([]);
+    expect(await storedLevel('email.reply')).toBe('approve_required');
+    expect(await events('email.reply')).toEqual([]);
+
+    // Control: one more agreement makes it 5 of 6, which clears 80%.
+    await cleanRun('email.reply', 1);
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+  });
+
+  it('exactly 80% does not promote (8 of 10) — the threshold is strict', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await verdicts('email.reply', 8, 2);
+
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual([]);
+    expect(await storedLevel('email.reply')).toBe('approve_required');
+
+    // Control: 9 of 11 is 81.8%.
+    await cleanRun('email.reply', 1);
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+  });
+
+  it('promotes on 5 of 6, and the event row says how many and what percent', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await verdicts('email.reply', 5, 1);
+
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
+    expect(await newestReason('email.reply')).toBe('5 מתוך 6 הכרעות אחרונות (83%)');
   });
 
   /**
@@ -299,7 +350,7 @@ describe('the evaluation pass', () => {
   it('writes one event row per move, which is what the demotion count reads', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
 
     await evaluateAutonomy({ businessId: BUSINESS });
     expect(await events('email.reply')).toEqual([
@@ -341,16 +392,16 @@ describe('the evaluation pass', () => {
 
   /**
    * Spec §6.1, §6.3, §12.5. Two claims, and the second is the one an earlier
-   * draft of this pass got wrong: after a demotion the class must earn ten
-   * NEW clean approvals, not inherit the ten it already had. The final third
-   * of the test is the positive control — ten fresh approvals decided after
+   * draft of this pass got wrong: after a demotion the class must earn five
+   * NEW clean approvals, not inherit the five it already had. The final third
+   * of the test is the positive control — five fresh approvals decided after
    * the demotion do promote it again, so the middle assertion is the reset
    * biting and not the machinery being dead.
    */
   it('demotes on an owner mark, and the streak starts again', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
 
     await getPool().query(
@@ -365,7 +416,7 @@ describe('the evaluation pass', () => {
     expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
     expect(await storedLevel('email.reply')).toBe('approve_required');
 
-    // The streak starts again: the ten approvals that earned the first
+    // The streak starts again: the five approvals that earned the first
     // promotion were all decided before the demotion and must not earn a
     // second one.
     const stale = await evaluateAutonomy({ businessId: BUSINESS });
@@ -373,8 +424,8 @@ describe('the evaluation pass', () => {
     expect(await storedLevel('email.reply')).toBe('approve_required');
     expect(await events('email.reply')).toHaveLength(2);
 
-    // Positive control: ten decided after the demotion do earn it.
-    await cleanRun('email.reply', STREAK_REQUIRED, { epoch: FUTURE });
+    // Positive control: five decided after the demotion do earn it.
+    await cleanRun('email.reply', MIN_SAMPLES, { epoch: FUTURE });
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
     expect(await storedLevel('email.reply')).toBe('auto_notify');
   });
@@ -387,7 +438,7 @@ describe('the evaluation pass', () => {
   it('demotes on a failed job with no human involved at all', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
 
     await failedJobDeclaring('email.reply');
@@ -407,10 +458,10 @@ describe('the evaluation pass', () => {
   /**
    * Spec §6.4, §12.9. The two demotions are seeded BEFORE the approvals on
    * the clock, so the reset rule is satisfied and the only thing left holding
-   * the class down is the fall count. `calendar.create` climbing in the same
-   * pass on the same evidence is the positive control.
+   * the class down is the fall count. Removing one of the two falls and
+   * re-evaluating the same evidence is the positive control.
    */
-  it('stops climbing after two demotions, even on a perfect streak', async () => {
+  it('stops climbing after two demotions, even on a perfect record', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     const before = new Date(PAST - 60_000).toISOString();
@@ -422,31 +473,39 @@ describe('the evaluation pass', () => {
         [id, BUSINESS, before],
       );
     }
-    await cleanRun('email.reply', STREAK_REQUIRED);
-    await cleanRun('calendar.create', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
 
     const result = await evaluateAutonomy({ businessId: BUSINESS });
-    expect(result.promoted).toEqual(['calendar.create']);
+    expect(result.promoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('approve_required');
     expect(await events('email.reply')).toHaveLength(2);
+
+    // Control: with only one demotion on record the same evidence promotes, so
+    // the fall count is what held it and the evidence was sufficient.
+    await getPool().query(`DELETE FROM autonomy_events WHERE event_id = 'AE-2'`);
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
   });
 
   /**
    * Spec §5.4 — `auto_notify → auto` is not built, and the measurement must
-   * never reach for it. `calendar.create` is the positive control again.
+   * never reach for it. Lowering the class one rung and re-evaluating is the
+   * positive control.
    */
   it('never promotes above auto_notify', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED);
-    await cleanRun('calendar.create', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
 
     const result = await evaluateAutonomy({ businessId: BUSINESS });
-    expect(result.promoted).toEqual(['calendar.create']);
+    expect(result.promoted).toEqual([]);
     expect(result.demoted).toEqual([]);
     expect(await storedLevel('email.reply')).toBe('auto_notify');
     expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('auto_notify');
     expect(await events('email.reply')).toEqual([]);
+
+    // Control: the same evidence does move a class that sits one rung lower.
+    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toEqual(['email.reply']);
   });
 
   /**
@@ -462,7 +521,7 @@ describe('the evaluation pass', () => {
   it('is wired into schedulerPass, not merely exported', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
 
     // `inbox: null` keeps both document-conductor loops off: this test is
     // about the autonomy pass, and the conductor's half costs money.
@@ -542,7 +601,7 @@ describe('the evaluation pass', () => {
   it('rolls the level back when the audit entry cannot be written', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
 
     await getPool().query(`
       CREATE OR REPLACE FUNCTION refuse_autonomy_audit() RETURNS trigger AS $$
@@ -586,8 +645,8 @@ describe('the evaluation pass', () => {
    */
   it('isolates a class whose evaluation throws, and names it in errored', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
-    await cleanRun('email.reply', STREAK_REQUIRED);
-    await cleanRun('calendar.create', STREAK_REQUIRED);
+    await cleanRun('email.reply', MIN_SAMPLES);
+    await cleanRun('email.initiate', MIN_SAMPLES);
 
     // A connection that refuses every statement carrying this one class. The
     // cast is for `pg`'s overloaded `query` signature only — the body does no
@@ -603,7 +662,7 @@ describe('the evaluation pass', () => {
 
     const result = await evaluateAutonomy({ businessId: BUSINESS, db: refusing });
     expect(result.errored).toEqual(['email.reply']);
-    expect(result.promoted).toEqual(['calendar.create']);
+    expect(result.promoted).toEqual(['email.initiate']);
     expect(await storedLevel('email.reply')).toBeUndefined();
   });
 });

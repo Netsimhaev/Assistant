@@ -16,7 +16,7 @@
  * missing — and this module adds no third place for that fact to live. No new
  * table, no new column, no counter kept beside the source. That is this
  * project's own rule (see `CLAUDE.md` on `autonomy_ramp`'s deliberately empty
- * `samples`/`approved_without_edit` columns, and on `approvalStreak` being
+ * `samples`/`approved_without_edit` columns, and on `agreementFor` being
  * re-derived on every evaluation): a second copy of a fact can drift from the
  * first with nobody noticing, and the drift is silent in exactly the
  * direction that matters — a message read as an answer to a question that is
