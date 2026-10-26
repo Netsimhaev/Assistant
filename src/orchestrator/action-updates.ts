@@ -37,6 +37,11 @@
  * the scheduler pass seconds, not the pass itself; and each channel is caught
  * on its own, so one dead channel costs neither the other nor the row.
  *
+ * **Sends are sequential.** One update after another, email then WhatsApp,
+ * so a hanging relay costs up to `NOTIFY_TIMEOUT_MS` per chosen channel per
+ * update in this pass — bounded, never unbounded, but it adds up on a pass
+ * with many new updates.
+ *
  * **Nothing older than a day is backfilled.** The first pass after deploy
  * would otherwise find every autonomous step the installation ever ran and
  * flood the owner with history. The bound is on `completedAt` against the
@@ -146,9 +151,12 @@ export async function dispatchActionUpdates(options: {
   };
 
   const settings = await loadActionUpdateSettings({ businessId, db });
-  const since = now.getTime() - ACTION_UPDATE_BACKFILL_MS;
-  const due = (await listAutonomousActions({ businessId, db }))
-    .filter((a) => !a.fromInstruction && a.completedAt.getTime() >= since)
+  // The bound is in SQL, not a filter afterwards: `listAutonomousActions`
+  // throws on a stored plan that does not parse, and an unbounded read would
+  // let one such row anywhere in history stop every update on every pass.
+  const since = new Date(now.getTime() - ACTION_UPDATE_BACKFILL_MS);
+  const due = (await listAutonomousActions({ businessId, db, since }))
+    .filter((a) => !a.fromInstruction)
     // `listAutonomousActions` is newest first; the owner hears them in the
     // order they happened.
     .reverse();
@@ -168,7 +176,15 @@ export async function dispatchActionUpdates(options: {
     if (updateId === undefined) continue;
     result.written += 1;
 
-    const text = renderActionUpdate(a, link);
+    // The SENT text carries this update's own id; the stored `body` does not
+    // need it. Both outbound seams derive their idempotency key from the
+    // content (`sendAlert`: hash of subject + body, which becomes the
+    // Message-ID; the messenger: job id + text + minute). Two replies to the
+    // same recipient under the same subject and job title would otherwise
+    // be byte-identical, the mail server would drop the second as a
+    // duplicate while `sendAlert` reported `ok` — the exact silence the
+    // bridge alert already paid for (`runtime.ts`), and a broken H3.
+    const text = [renderActionUpdate(a, link), '', `מזהה עדכון: ${updateId}`].join('\n');
 
     let emailState: ChannelState | null = null;
     if (settings.toEmail) {

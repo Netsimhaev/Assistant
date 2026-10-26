@@ -235,6 +235,93 @@ describe('dispatchActionUpdates', () => {
   });
 });
 
+describe('dispatchActionUpdates — distinct outbound bytes and a bounded read', () => {
+  it('records email skipped_not_connected under default settings when there is no sendAlert', async () => {
+    await seedStep();
+    const result = await dispatchActionUpdates({ businessId: BUSINESS, now: NOW });
+    expect(result).toEqual({ written: 1, emailFailed: 0, whatsappFailed: 0, skippedNotConnected: 1 });
+    expect(await rows()).toEqual([
+      expect.objectContaining({ email_state: 'skipped_not_connected', whatsapp_state: null }),
+    ]);
+  });
+
+  /**
+   * `sendAlert`'s idempotency key — and so the Message-ID — is a hash of
+   * subject + body (`runtime.ts`). Two updates that render identically would
+   * share it, and the mail server would drop the second while `sendAlert`
+   * still said `ok`. The sent text carries the update id so they cannot.
+   */
+  it('hands sendAlert distinct bytes for two steps sharing recipient, subject and title', async () => {
+    await seedStep();
+    await seedStep();
+    const sent: Sent[] = [];
+
+    await dispatchActionUpdates({ businessId: BUSINESS, now: NOW, sendAlert: recordingAlert(sent) });
+    expect(sent).toHaveLength(2);
+    expect(sent[0]?.subject).toBe(sent[1]?.subject);
+    expect(JSON.stringify(sent[0])).not.toBe(JSON.stringify(sent[1]));
+  });
+
+  /** The messenger's key is job id + text + minute: two steps of ONE job must still differ. */
+  it('hands the messenger distinct texts for two steps of one job', async () => {
+    const job = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'תשובה ללקוח',
+    });
+    const step = (id: string) => ({
+      id,
+      agent: 'comms.email',
+      intent: 'reply to the customer',
+      toolName: 'mail.send',
+      input: { to: 'dana@example.com', inReplyTo: 'thread-9', subject: 'תשובה', body: 'גוף' },
+      expectedActionClass: 'email.reply',
+    });
+    const binding = await bindPlanToJob(
+      job.jobId,
+      Plan.parse({ goal: 'two replies', steps: [step('s1'), step('s2')] }),
+      { businessId: BUSINESS },
+    );
+    if (binding.status !== 'stored') throw new Error(`unexpected plan binding status ${binding.status}`);
+    for (const stepId of ['s1', 's2']) {
+      await getPool().query(
+        `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, status, performed)
+         VALUES ($1, $2, $3, $4, 'completed', true)`,
+        [BUSINESS, job.jobId, binding.planHash, stepId],
+      );
+    }
+    await saveActionUpdateSettings(
+      { toWhatsApp: true, toEmail: false, toScreen: false },
+      { businessId: BUSINESS, updatedBy: 'owner' },
+    );
+    const messages: { text: string; jobId: string | null }[] = [];
+    const messenger: BossMessenger = {
+      channel: 'whatsapp',
+      async send(input) {
+        messages.push(input);
+        return { ok: true };
+      },
+    };
+
+    await dispatchActionUpdates({ businessId: BUSINESS, now: NOW, messenger });
+    expect(messages).toHaveLength(2);
+    expect(messages[0]?.jobId).toBe(messages[1]?.jobId);
+    expect(messages[0]?.text).not.toBe(messages[1]?.text);
+  });
+
+  it('is not stopped by an unparseable stored plan older than a day', async () => {
+    const stale = await seedStep({ completedAt: new Date(NOW.getTime() - 25 * HOUR) });
+    await getPool().query(`UPDATE job_plans SET plan = '{"bogus": true}'::jsonb WHERE job_id = $1`, [stale]);
+    const fresh = await seedStep();
+    const sent: Sent[] = [];
+
+    const result = await dispatchActionUpdates({ businessId: BUSINESS, now: NOW, sendAlert: recordingAlert(sent) });
+    expect(result.written).toBe(1);
+    expect((await rows()).map((r) => r.job_id)).toEqual([fresh]);
+  });
+});
+
 describe('renderActionUpdate', () => {
   const action: AutonomousAction = {
     jobId: 'J1',

@@ -107,7 +107,17 @@ interface ActionRow {
  * listed with a fabricated class.
  */
 export async function listAutonomousActions(
-  options: { businessId?: string; db?: Queryable } = {},
+  options: {
+    businessId?: string;
+    db?: Queryable;
+    /**
+     * Only steps completed at or after this moment, bounded in SQL. Shadow
+     * mode's dispatcher passes `now - 24h`, so that one stored plan which no
+     * longer parses, anywhere in older history, cannot make this read throw
+     * on every pass. Omitted: the whole history, as the mark screen wants.
+     */
+    since?: Date;
+  } = {},
 ): Promise<AutonomousAction[]> {
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
@@ -127,6 +137,7 @@ export async function listAutonomousActions(
       WHERE r.business_id = $1
         AND r.status = 'completed'
         AND r.performed = true
+        AND ($2::timestamptz IS NULL OR r.completed_at >= $2)
         AND NOT EXISTS (
           SELECT 1 FROM approval_requests a
            WHERE a.business_id = r.business_id
@@ -134,7 +145,7 @@ export async function listAutonomousActions(
              AND a.consumed_by_step = r.step_id
         )
       ORDER BY r.completed_at DESC`,
-    [businessId],
+    [businessId, options.since ?? null],
   );
 
   const actions: AutonomousAction[] = [];

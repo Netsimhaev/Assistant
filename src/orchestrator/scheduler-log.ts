@@ -209,7 +209,7 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.actionUpdates.skippedNotConnected > 0) {
     console.error(
       `action updates: ${result.actionUpdates.skippedNotConnected} send(s) skipped — ` +
-        `a channel the owner chose is not connected`,
+        `a channel set to receive updates is not connected`,
     );
   }
 }
