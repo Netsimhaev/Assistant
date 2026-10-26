@@ -183,3 +183,54 @@ export async function listAutonomousActions(
 
   return actions;
 }
+
+/** One step's identity within a business, as a single set key. */
+export function stepKey(jobId: string, stepId: string): string {
+  return `${jobId}\u0000${stepId}`;
+}
+
+/**
+ * The `stepKey`s of the update rows the owner has not seen yet, among
+ * `actions` — shadow mode's "screen" channel (spec §5.4).
+ *
+ * Read from `action_updates` and nothing else: a step with no update row (it
+ * ran before the feature existed) is never "new", because no update ever
+ * told the owner about it in the first place.
+ */
+export async function unseenUpdateKeys(
+  actions: readonly AutonomousAction[],
+  options: { businessId: string; db?: Queryable },
+): Promise<Set<string>> {
+  if (actions.length === 0) return new Set();
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<{ job_id: string; step_id: string }>(
+    `SELECT job_id, step_id FROM action_updates
+      WHERE business_id = $1 AND seen_at IS NULL
+        AND job_id = ANY($2::text[])`,
+    [options.businessId, [...new Set(actions.map((a) => a.jobId))]],
+  );
+  const shown = new Set(actions.map((a) => stepKey(a.jobId, a.stepId)));
+  return new Set(rows.map((r) => stepKey(r.job_id, r.step_id)).filter((key) => shown.has(key)));
+}
+
+/**
+ * Marks exactly these update rows seen, in this business only — the rows the
+ * page just showed as "new". `seen_at IS NULL` keeps the first moment he saw
+ * it rather than moving it on every reload.
+ */
+export async function markUpdatesSeen(
+  keys: ReadonlySet<string>,
+  options: { businessId: string; db?: Queryable },
+): Promise<void> {
+  if (keys.size === 0) return;
+  const db = options.db ?? getPool();
+  const pairs = [...keys].map((key) => key.split('\u0000'));
+  await db.query(
+    `UPDATE action_updates u
+        SET seen_at = now()
+       FROM unnest($2::text[], $3::text[]) AS shown(job_id, step_id)
+      WHERE u.business_id = $1 AND u.seen_at IS NULL
+        AND u.job_id = shown.job_id AND u.step_id = shown.step_id`,
+    [options.businessId, pairs.map((p) => p[0]), pairs.map((p) => p[1])],
+  );
+}

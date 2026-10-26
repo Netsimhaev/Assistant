@@ -36,7 +36,13 @@ import type { InstructionTextOrigin } from '../governance/typed-recipients.js';
 import { readForgetCommand } from '../governance/forget-command.js';
 import { AutonomyMode, loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
 import { recordCorrection } from '../governance/corrections.js';
-import { listAutonomousActions } from './autonomous-actions.js';
+import { listAutonomousActions, markUpdatesSeen, unseenUpdateKeys } from './autonomous-actions.js';
+import { learningSnapshot, type LearningSnapshot } from './learning-view.js';
+import {
+  loadActionUpdateSettings,
+  saveActionUpdateSettings,
+  type ActionUpdateSettings,
+} from '../governance/action-update-settings.js';
 import { probeActiveCharter, loadActiveCharter } from '../charter/store.js';
 import type { ActiveCharter } from '../charter/store.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
@@ -2366,12 +2372,42 @@ async function handleLogout(req: IncomingMessage, res: ServerResponse, businessI
 }
 
 /**
- * The owner's dial (spec §8.4). GET shows the three positions and which one
- * is current; POST changes it.
+ * The learning level, or `null` when it cannot be read. The screen is how the
+ * owner turns the dial and picks update channels, so a charter this code
+ * cannot read (or none at all) must cost him the score, not the page.
+ */
+async function readLearning(businessId: string): Promise<LearningSnapshot | null> {
+  try {
+    return await learningSnapshot({ businessId });
+  } catch {
+    return null;
+  }
+}
+
+async function renderAutonomyScreen(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  status: number,
+  error?: string,
+  settings?: ActionUpdateSettings,
+): Promise<void> {
+  const mode = await loadAutonomyMode({ businessId });
+  const shown = settings ?? (await loadActionUpdateSettings({ businessId }));
+  sendHtml(
+    res,
+    status,
+    renderAutonomy(mode, await readLearning(businessId), shown, issueCsrfToken(session.sessionId), error),
+  );
+}
+
+/**
+ * The owner's dial (spec §8.4), the learning level above it and the update
+ * channels below it (shadow mode, spec §5.3, §5.5). GET shows them; the two
+ * POSTs change the dial and the channels.
  */
 async function handleAutonomyGet(res: ServerResponse, businessId: string, session: Session): Promise<void> {
-  const mode = await loadAutonomyMode({ businessId });
-  sendHtml(res, 200, renderAutonomy(mode, issueCsrfToken(session.sessionId)));
+  await renderAutonomyScreen(res, businessId, session, 200);
 }
 
 async function handleAutonomyModePost(
@@ -2387,8 +2423,7 @@ async function handleAutonomyModePost(
 
   const parsed = AutonomyMode.safeParse(form.get('mode'));
   if (!parsed.success) {
-    const mode = await loadAutonomyMode({ businessId });
-    return sendHtml(res, 400, renderAutonomy(mode, issueCsrfToken(session.sessionId), 'יש לבחור אחת משלוש האפשרויות.'));
+    return renderAutonomyScreen(res, businessId, session, 400, 'יש לבחור אחת משלוש האפשרויות.');
   }
 
   await setAutonomyMode(parsed.data, session.username, { businessId });
@@ -2396,12 +2431,51 @@ async function handleAutonomyModePost(
 }
 
 /**
+ * Where the per-action updates go. All three unchecked is refused by
+ * `saveActionUpdateSettings` itself, before it writes; the screen is
+ * re-rendered with its sentence and with the boxes as the owner left them,
+ * so he sees what was refused rather than the old choice silently restored.
+ */
+async function handleAutonomyUpdatesPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const settings: ActionUpdateSettings = {
+    toWhatsApp: form.get('toWhatsApp') === 'on',
+    toEmail: form.get('toEmail') === 'on',
+    toScreen: form.get('toScreen') === 'on',
+  };
+  try {
+    await saveActionUpdateSettings(settings, { businessId, updatedBy: session.username });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return renderAutonomyScreen(res, businessId, session, 400, message, settings);
+  }
+  redirect(res, '/autonomy');
+}
+
+/**
  * What the assistant did on its own (spec §8.5). GET lists it; POST records
  * that one step was wrong.
+ *
+ * With the screen chosen as an update channel, rows whose update the owner
+ * has not seen are marked "חדש", and exactly those rows are then marked
+ * seen — after the page is rendered, so the mark is what he was shown.
  */
 async function handleAutonomousActionsGet(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   const actions = await listAutonomousActions({ businessId });
-  sendHtml(res, 200, renderAutonomousActions(actions, issueCsrfToken(session.sessionId)));
+  const settings = await loadActionUpdateSettings({ businessId });
+  const fresh = settings.toScreen ? await unseenUpdateKeys(actions, { businessId }) : new Set<string>();
+  const html = renderAutonomousActions(actions, issueCsrfToken(session.sessionId), undefined, fresh);
+  await markUpdatesSeen(fresh, { businessId });
+  sendHtml(res, 200, html);
 }
 
 /**
@@ -2560,6 +2634,8 @@ async function route(
   if (method === 'GET' && pathname === '/autonomy') return handleAutonomyGet(res, businessId, session);
   if (method === 'POST' && pathname === '/autonomy/mode')
     return handleAutonomyModePost(req, res, businessId, session);
+  if (method === 'POST' && pathname === '/autonomy/updates')
+    return handleAutonomyUpdatesPost(req, res, businessId, session);
   if (method === 'GET' && pathname === '/autonomy/actions')
     return handleAutonomousActionsGet(res, businessId, session);
 

@@ -49,9 +49,18 @@ const EARNED_STEP: { from: AutonomyLevel; to: AutonomyLevel } = {
 };
 
 /** Two falls and the class waits for the owner. Spec §6.4. */
-const DEMOTIONS_BEFORE_STOP = 2;
+export const DEMOTIONS_BEFORE_STOP = 2;
 
-async function lastEventAt(
+/**
+ * When this class last moved, in either direction — the `since` the
+ * agreement rate is measured from.
+ *
+ * Exported for the learning-level screen (`dashboard/learning-view.ts`),
+ * which must ask the very same question this pass asks: a screen that
+ * measured from a different moment would say "ready" while the pass does not
+ * promote, or the reverse.
+ */
+export async function lastEventAt(
   actionClass: ActionClass,
   businessId: string,
   db: Queryable,
@@ -90,7 +99,27 @@ async function rampUpdatedAt(
   return rows[0]?.updated_at ?? null;
 }
 
-async function demotionCount(
+/**
+ * When this class was last promoted — the "acting alone since" the
+ * learning-level screen shows. `null` for a class that was never promoted by
+ * this pass (a level raised by hand with `npm run ramp:set` has no event row).
+ */
+export async function lastPromotionAt(
+  actionClass: ActionClass,
+  businessId: string,
+  db: Queryable,
+): Promise<Date | null> {
+  const { rows } = await db.query<{ at: Date }>(
+    `SELECT at FROM autonomy_events
+      WHERE business_id = $1 AND action_class = $2 AND direction = 'promote'
+      ORDER BY at DESC LIMIT 1`,
+    [businessId, actionClass],
+  );
+  return rows[0]?.at ?? null;
+}
+
+/** Exported for the learning-level screen, for the same reason as `lastEventAt`. */
+export async function demotionCount(
   actionClass: ActionClass,
   businessId: string,
   db: Queryable,

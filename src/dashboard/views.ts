@@ -23,7 +23,9 @@ import type { IntentName } from '../domain/reading.js';
 import { actionClassLabel } from '../domain/labels.js';
 import type { MemoryRecord } from '../memory/store.js';
 import { AutonomyMode } from '../governance/autonomy-mode.js';
-import type { AutonomousAction } from './autonomous-actions.js';
+import { stepKey, type AutonomousAction } from './autonomous-actions.js';
+import type { ActionUpdateSettings } from '../governance/action-update-settings.js';
+import { renderLearning, type LearningSnapshot } from './learning-view.js';
 import { CONNECTION_GROUP_ORDER, GROUP_LABELS, groupForServes } from './connection-groups.js';
 import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import type { ReadingSummary } from './readings-list.js';
@@ -408,11 +410,36 @@ const AUTONOMY_MODE_NAME: Record<AutonomyMode, string> = {
 };
 
 /**
- * The owner's dial. A form with the three positions `AutonomyMode` allows,
- * each with its own sentence, and the current one both checked AND named in
- * plain text — a radio button alone is easy to glance past.
+ * The WhatsApp note on the update-channel form.
+ *
+ * Conditional on purpose. The dashboard has no positive "WhatsApp is
+ * connected" signal to read: the gateway is built inside the scheduler's
+ * runtime (`buildRuntime`), a different process, and no table records its
+ * state. Inferring "not connected" from the absence of a signal would be the
+ * negation-shaped control this project refuses, so the sentence says what
+ * happens IF it is not, next to the box, always.
  */
-export function renderAutonomy(mode: AutonomyMode, csrf: string, error?: string): string {
+export const WHATSAPP_UPDATE_NOTE = 'אם וואטסאפ עוד לא מחובר — העדכון יירשם כלא נשלח.';
+
+function checkbox(name: string, checked: boolean, label: string): string {
+  return `<label><input type="checkbox" name="${esc(name)}"${checked ? ' checked' : ''}> ${esc(label)}</label>`;
+}
+
+/**
+ * The learning level, the owner's dial, and under it where the per-action
+ * updates go (spec §5.3, §5.5).
+ *
+ * `learning` is `null` when the snapshot could not be read (no charter, or
+ * one this code cannot parse); the dial and the channel form still render,
+ * because they are how the owner gets out of trouble, not part of it.
+ */
+export function renderAutonomy(
+  mode: AutonomyMode,
+  learning: LearningSnapshot | null,
+  settings: ActionUpdateSettings,
+  csrf: string,
+  error?: string,
+): string {
   const errorBlock = error === undefined ? '' : `<p class="error">${esc(error)}</p>`;
 
   const options = AutonomyMode.options
@@ -425,6 +452,11 @@ export function renderAutonomy(mode: AutonomyMode, csrf: string, error?: string)
     })
     .join('\n');
 
+  const learningBlock =
+    learning === null
+      ? `<p class="muted">${esc('לא ניתן להציג את רמת הלימוד כרגע — התקנון הפעיל של העסק אינו זמין לקריאה.')}</p>`
+      : renderLearning(learning);
+
   return page(
     'כמה חופש לתת',
     `<header>
@@ -433,11 +465,23 @@ export function renderAutonomy(mode: AutonomyMode, csrf: string, error?: string)
 </header>
 <p><a href="/">&rarr; חזרה לרשימה</a></p>
 ${errorBlock}
+${learningBlock}
+<h2>רמת החופש</h2>
 <p class="muted">המצב הנוכחי: <strong>${esc(AUTONOMY_MODE_NAME[mode])}</strong>.</p>
 <form method="post" action="/autonomy/mode">
   <input type="hidden" name="csrf" value="${esc(csrf)}">
   ${options}
   <button type="submit">שמירה</button>
+</form>
+<h2>עדכון על כל פעולה עצמאית</h2>
+<p>על כל פעולה שהעוזרת עושה לבד תקבל עדכון. בחר איפה.</p>
+<form method="post" action="/autonomy/updates">
+  <input type="hidden" name="csrf" value="${esc(csrf)}">
+  ${checkbox('toWhatsApp', settings.toWhatsApp, 'וואטסאפ')}
+  <span class="muted">${esc(WHATSAPP_UPDATE_NOTE)}</span>
+  ${checkbox('toEmail', settings.toEmail, 'מייל')}
+  ${checkbox('toScreen', settings.toScreen, 'מסך — פעולה שעוד לא ראית מסומנת "חדש" ב"מה נעשה בלעדיך"')}
+  <button type="submit">שמירת דרכי העדכון</button>
 </form>
 <p><a href="/autonomy/actions">מה נעשה בלעדיך</a></p>`,
   );
@@ -463,8 +507,17 @@ ${errorBlock}
  * only records that it was wrong; the sentence saying so sits once at the
  * top of the page rather than being skipped because the button's own label
  * ("זו הייתה טעות") might be read as an undo control.
+ *
+ * `newSteps` holds the `stepKey`s of the rows to mark "חדש" — the update rows
+ * the owner has not seen yet, and only when he chose the screen as a channel.
+ * The handler decides; this function only marks what it is told.
  */
-export function renderAutonomousActions(actions: readonly AutonomousAction[], csrf: string, error?: string): string {
+export function renderAutonomousActions(
+  actions: readonly AutonomousAction[],
+  csrf: string,
+  error?: string,
+  newSteps: ReadonlySet<string> = new Set(),
+): string {
   const errorBlock = error === undefined ? '' : `<p class="error">${esc(error)}</p>`;
 
   const rows = actions
@@ -474,8 +527,10 @@ export function renderAutonomousActions(actions: readonly AutonomousAction[], cs
       const subject = action.subject === null ? '—' : escLabel(action.subject);
       const markPath = `/autonomy/actions/${esc(action.jobId)}/${esc(action.stepId)}/mark`;
 
+      const isNew = newSteps.has(stepKey(action.jobId, action.stepId)) ? ' <strong>חדש</strong>' : '';
+
       return `<tr>
-        <td>${esc(action.completedAt.toISOString())}</td>
+        <td>${esc(action.completedAt.toISOString())}${isNew}</td>
         <td>${title}</td>
         <td>${esc(actionClassLabel(action.actionClass))}</td>
         <td>${esc(action.toolName)}</td>

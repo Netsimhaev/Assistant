@@ -37,6 +37,7 @@ import {
   saveInstruction,
 } from '../governance/instructions.js';
 import { DIGEST_DEFAULTS, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
+import { loadActionUpdateSettings, saveActionUpdateSettings } from '../governance/action-update-settings.js';
 import { createOwner, login } from './auth.js';
 import { issueRecoveryCodes, remainingCodes } from './recovery.js';
 import {
@@ -2988,6 +2989,157 @@ describe('GET /autonomy — the owner’s dial', () => {
     });
     expect(res.status).toBe(403);
     expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+  });
+});
+
+describe('GET /autonomy — the learning level and the update channels', () => {
+  it('shows the learning level in Hebrew, with no raw class id', async () => {
+    await installCharter(buildCharter(), { businessId: BUSINESS });
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/autonomy`, { headers: { cookie } })).text();
+    expect(body).toContain('רמת הלימוד של העוזרת');
+    expect(body).toContain('עוד אין מספיק נתונים');
+    expect(body).toContain('מענה במייל');
+    expect(body).not.toContain('email.reply');
+  });
+
+  it('still shows the dial and the channels when no charter can be read', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/autonomy`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('לא ניתן להציג את רמת הלימוד כרגע');
+    expect(body).toContain('action="/autonomy/updates"');
+  });
+
+  it('shows the three channels with the defaults checked and the WhatsApp note', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/autonomy`, { headers: { cookie } })).text();
+    expect(body).toContain('name="toWhatsApp">');
+    expect(body).toContain('name="toEmail" checked');
+    expect(body).toContain('name="toScreen" checked');
+    expect(body).toContain('אם וואטסאפ עוד לא מחובר — העדכון יירשם כלא נשלח.');
+  });
+
+  it('saves the chosen channels', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const csrf = extractCsrf(await (await fetch(`${baseUrl}/autonomy`, { headers: { cookie } })).text());
+
+    const res = await fetch(`${baseUrl}/autonomy/updates`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf, toWhatsApp: 'on' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/autonomy');
+    expect(await loadActionUpdateSettings({ businessId: BUSINESS })).toEqual({
+      toWhatsApp: true,
+      toEmail: false,
+      toScreen: false,
+    });
+  });
+
+  it('refuses all three unchecked, says so in Hebrew, and saves nothing', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const csrf = extractCsrf(await (await fetch(`${baseUrl}/autonomy`, { headers: { cookie } })).text());
+
+    const res = await fetch(`${baseUrl}/autonomy/updates`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(400);
+    const body = await res.text();
+    expect(body).toContain('חובה לבחור לפחות דרך עדכון אחת');
+    // The boxes as he left them, not the old choice silently restored.
+    expect(body).not.toContain('name="toEmail" checked');
+    const { rows } = await getPool().query('SELECT 1 FROM action_update_settings WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toHaveLength(0);
+  });
+
+  it('refuses a channel change without a CSRF token', async () => {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const res = await fetch(`${baseUrl}/autonomy/updates`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ toWhatsApp: 'on' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(403);
+    const { rows } = await getPool().query('SELECT 1 FROM action_update_settings WHERE business_id = $1', [BUSINESS]);
+    expect(rows).toHaveLength(0);
+  });
+});
+
+describe('GET /autonomy/actions — "חדש" on the screen channel', () => {
+  async function updateRow(businessId: string, jobId: string, stepId: string): Promise<void> {
+    await getPool().query(
+      `INSERT INTO action_updates (update_id, business_id, job_id, step_id, action_class, body)
+       VALUES ($1, $2, $3, $4, 'email.reply', 'עדכון')`,
+      [`AU-${ulid()}`, businessId, jobId, stepId],
+    );
+  }
+
+  async function seenAt(businessId: string, jobId: string): Promise<Date | null> {
+    const { rows } = await getPool().query<{ seen_at: Date | null }>(
+      'SELECT seen_at FROM action_updates WHERE business_id = $1 AND job_id = $2',
+      [businessId, jobId],
+    );
+    return rows[0]?.seen_at ?? null;
+  }
+
+  it('marks an unseen update "חדש" once, then records it seen — in this business only', async () => {
+    const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
+    await updateRow(BUSINESS, jobId, stepId);
+    await updateRow(OTHER_BUSINESS, jobId, stepId);
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const first = await (await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } })).text();
+    expect(first).toContain('<strong>חדש</strong>');
+    expect(await seenAt(BUSINESS, jobId)).not.toBeNull();
+    expect(await seenAt(OTHER_BUSINESS, jobId)).toBeNull();
+
+    const second = await (await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } })).text();
+    expect(second).toContain(jobId);
+    expect(second).not.toContain('<strong>חדש</strong>');
+  });
+
+  it('never marks a step that has no update row', async () => {
+    const { jobId } = await seedAutonomousAction(BUSINESS);
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } })).text();
+    expect(body).toContain(jobId);
+    expect(body).not.toContain('<strong>חדש</strong>');
+  });
+
+  it('marks nothing, and records nothing seen, when the screen is not a chosen channel', async () => {
+    const { jobId, stepId } = await seedAutonomousAction(BUSINESS);
+    await updateRow(BUSINESS, jobId, stepId);
+    await saveActionUpdateSettings(
+      { toWhatsApp: false, toEmail: true, toScreen: false },
+      { businessId: BUSINESS, updatedBy: USERNAME },
+    );
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+
+    const body = await (await fetch(`${baseUrl}/autonomy/actions`, { headers: { cookie } })).text();
+    expect(body).not.toContain('<strong>חדש</strong>');
+    expect(await seenAt(BUSINESS, jobId)).toBeNull();
   });
 });
 
