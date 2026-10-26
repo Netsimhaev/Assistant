@@ -118,7 +118,7 @@ function buildMessage(request: ApprovalRequest, link: string): { subject: string
  * the thing racing this deadline to the finish), and short enough that a
  * dead relay costs the gate almost nothing.
  */
-const NOTIFY_TIMEOUT_MS = 5_000;
+export const NOTIFY_TIMEOUT_MS = 5_000;
 
 /**
  * Bound a promise that the transport might never settle.
@@ -133,7 +133,7 @@ const NOTIFY_TIMEOUT_MS = 5_000;
  * worth sending, because it lets a *cooperating* transport give up on its
  * own socket early, but this function does not depend on that cooperation.
  */
-function withDeadline<T>(promise: Promise<T>, timeoutMs: number, what = 'השליחה'): Promise<T> {
+export function withDeadline<T>(promise: Promise<T>, timeoutMs: number, what = 'השליחה'): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(

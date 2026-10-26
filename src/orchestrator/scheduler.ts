@@ -22,6 +22,8 @@ import type { RunInstructionOptions } from './instruct.js';
 import { scanInbox } from './inbox-scan.js';
 import type { ScanResult } from './inbox-scan.js';
 import { loadJob, transition } from './jobs.js';
+import { dispatchActionUpdates } from './action-updates.js';
+import type { ActionUpdatesResult } from './action-updates.js';
 import { evaluateAutonomy } from './promote.js';
 import type { AutonomyPassResult } from './promote.js';
 import { resumeDelegatedJobs } from './resume-delegated.js';
@@ -712,6 +714,20 @@ export interface SchedulerPassResult {
    * condition the dead-last position happens to also satisfy.
    */
   digest: DigestRunResult | null;
+  /**
+   * One update per autonomous step, owner ruling H3 (26/10) — see
+   * `action-updates.ts`. Never `null`: the owner must always have at least
+   * one channel (`action_update_settings`' CHECK), so this stage always runs.
+   * Last in the pass, after the digest, because it reports on steps this very
+   * pass may have just performed.
+   */
+  actionUpdates: ActionUpdatesResult;
+  /**
+   * `dispatchActionUpdates`'s thrown message, if it threw. Null on a clean
+   * pass. The same isolation `autonomyError` gives: the stage that runs last
+   * must not hide, by rejecting the pass, the work that already succeeded.
+   */
+  actionUpdatesError: string | null;
 }
 
 /**
@@ -1060,6 +1076,30 @@ export async function schedulerPass(
     });
   }
 
+  // One update per autonomous step, dead last — see
+  // `SchedulerPassResult.actionUpdates`. The same two seams the digest gets:
+  // `runtime.notify?.sendAlert` for email, and this pass's own messenger for
+  // WhatsApp. Each send inside is caught and bounded on its own; this
+  // try/catch is for a throw outside them (a database error).
+  let actionUpdates: ActionUpdatesResult = {
+    written: 0,
+    emailFailed: 0,
+    whatsappFailed: 0,
+    skippedNotConnected: 0,
+  };
+  let actionUpdatesError: string | null = null;
+  try {
+    actionUpdates = await dispatchActionUpdates({
+      businessId,
+      ...(options.now !== undefined ? { now: options.now } : {}),
+      ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
+      ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
+      ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
+    });
+  } catch (err) {
+    actionUpdatesError = err instanceof Error ? err.message : String(err);
+  }
+
   return {
     tick: tickResult,
     scan,
@@ -1078,6 +1118,8 @@ export async function schedulerPass(
     autonomy,
     autonomyError,
     digest,
+    actionUpdates,
+    actionUpdatesError,
   };
 }
 

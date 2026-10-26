@@ -1,10 +1,16 @@
 /**
  * What the assistant did entirely on its own — spec §8.4/§8.5.
  *
- * The owner deliberately does not get a notification for every autonomous
- * step (`docs/05-approvals.md`'s "he wants to look when he wants to look").
- * Without a screen that lists exactly what ran unattended, there is nothing
- * for him to look AT, and the demotion half of the promotion mechanism
+ * This docblock used to say the owner deliberately does NOT get a
+ * notification for every autonomous step (`docs/05-approvals.md`'s "he wants
+ * to look when he wants to look"). Owner ruling H3 (26/10, shadow mode)
+ * reverses that: every step this list returns, minus those from jobs he
+ * instructed himself (`fromInstruction`), now gets its own update on the
+ * channels he picked — one per step, never batched
+ * (`orchestrator/action-updates.ts`, which reads this list). The screen is
+ * still load-bearing: an update is a pointer to it, and without a screen
+ * that lists exactly what ran unattended, there is nothing for him to mark,
+ * and the demotion half of the promotion mechanism
  * (`orchestrator/promote.ts`'s `markCount`) has no way to ever receive a
  * mark: a mark can only follow from a step the owner can actually see.
  *

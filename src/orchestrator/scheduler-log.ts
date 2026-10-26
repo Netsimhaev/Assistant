@@ -194,4 +194,22 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.digest !== null && result.digest.errored !== null) {
     console.error(`digest failed: ${result.digest.errored}`);
   }
+  // Shadow mode (H3): an update that failed or could not be sent is an
+  // autonomous action the owner may not have heard about. The row still
+  // exists and the screen still shows it, but an operator should know.
+  if (result.actionUpdatesError !== null) {
+    console.error(`action updates failed: ${result.actionUpdatesError}`);
+  }
+  if (result.actionUpdates.emailFailed > 0 || result.actionUpdates.whatsappFailed > 0) {
+    console.error(
+      `action updates: ${result.actionUpdates.emailFailed} email and ` +
+        `${result.actionUpdates.whatsappFailed} WhatsApp send(s) failed this pass`,
+    );
+  }
+  if (result.actionUpdates.skippedNotConnected > 0) {
+    console.error(
+      `action updates: ${result.actionUpdates.skippedNotConnected} send(s) skipped — ` +
+        `a channel the owner chose is not connected`,
+    );
+  }
 }

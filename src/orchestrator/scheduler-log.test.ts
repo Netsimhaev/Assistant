@@ -41,6 +41,8 @@ function cleanResult(): SchedulerPassResult {
     autonomy: { promoted: [], demoted: [], errored: [] },
     autonomyError: null,
     digest: null,
+    actionUpdates: { written: 0, emailFailed: 0, whatsappFailed: 0, skippedNotConnected: 0 },
+    actionUpdatesError: null,
   };
 }
 
@@ -165,6 +167,23 @@ describe('logErrored', () => {
       });
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
       expect(errored).toContain('digest failed: charter stored under an older schema');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('names an action-updates stage that threw, failed sends and unconnected channels', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      logErrored({
+        ...cleanResult(),
+        actionUpdates: { written: 3, emailFailed: 1, whatsappFailed: 2, skippedNotConnected: 1 },
+        actionUpdatesError: 'connection reset',
+      });
+      const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
+      expect(errored).toContain('action updates failed: connection reset');
+      expect(errored).toContain('1 email and 2 WhatsApp send(s) failed');
+      expect(errored).toContain('1 send(s) skipped');
     } finally {
       errorSpy.mockRestore();
     }

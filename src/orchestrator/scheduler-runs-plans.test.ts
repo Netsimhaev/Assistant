@@ -191,6 +191,17 @@ describe('schedulerPass', () => {
     expect(sent).toHaveLength(1);
     expect(pass.verified.closed).toContain(job.jobId);
     expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+    // Shadow mode (H3): the step this very pass performed on its own is
+    // reported in the same pass — the stage runs after the plans. No notify
+    // seam on this runtime, and email is a default channel, so the send is
+    // recorded as not connected rather than silenced.
+    expect(pass.actionUpdatesError).toBeNull();
+    expect(pass.actionUpdates).toEqual({
+      written: 1,
+      emailFailed: 0,
+      whatsappFailed: 0,
+      skippedNotConnected: 1,
+    });
   });
 
   /**
