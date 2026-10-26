@@ -43,14 +43,19 @@ export interface Agreement {
   topWrongReason: WrongReason | null;
 }
 
-/** Tie-break order for `topWrongReason`. */
-const REASON_ORDER: readonly WrongReason[] = [
-  'recipient',
-  'number',
-  'date',
-  'too_many_words',
-  'denied',
-];
+/**
+ * Tie-break order for `topWrongReason`. A `Record` over the union, so a member
+ * added to `WrongReason` without a place here is a compile error; the order is
+ * the key order.
+ */
+const REASON_ORDER_KEYS: Record<WrongReason, true> = {
+  recipient: true,
+  number: true,
+  date: true,
+  too_many_words: true,
+  denied: true,
+};
+const REASON_ORDER = Object.keys(REASON_ORDER_KEYS) as WrongReason[];
 
 /**
  * The three states that carry a verdict, named positively. `expired` and
@@ -88,7 +93,7 @@ export async function agreementFor(
              ON m.business_id = a.business_id AND m.reply_job_id = a.job_id
           WHERE a.business_id = $1 AND a.action_class = $2
             AND a.state = ANY($3::text[])
-          ORDER BY a.job_id, a.created_at
+          ORDER BY a.job_id, a.created_at, a.approval_id
        ) first_card
       WHERE decided_at > GREATEST(
               $4::timestamptz - make_interval(days => $5),

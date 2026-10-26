@@ -177,6 +177,18 @@ describe('the windowed agreement rate', () => {
     ).toEqual({ right: 0, counted: 0, topWrongReason: null });
   });
 
+  it('does not count a job whose only mail link belongs to another business', async () => {
+    await card({ jobId: 'J-shared', linked: false });
+    await getPool().query(
+      `INSERT INTO mail_messages
+         (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
+          received_at, body_text, state, reply_job_id)
+       VALUES ('M-other', 'other-business', 'pm-other', 'th-other', 'x@example.com', 's',
+               now(), 'b', 'triaged', 'J-shared')`,
+    );
+    expect(await agreement()).toEqual({ right: 0, counted: 0, topWrongReason: null });
+  });
+
   it('counts only the earliest decided card of a job', async () => {
     await card({ jobId: 'J-dup', outcome: 'denied', createdOffsetSeconds: 10 });
     await card({ jobId: 'J-dup', outcome: 'approved', createdOffsetSeconds: 20, linked: false });
