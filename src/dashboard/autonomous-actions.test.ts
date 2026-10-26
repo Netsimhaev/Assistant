@@ -11,7 +11,7 @@
  * behaviour the system actually produces rather than a shape a test invented.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -132,6 +132,24 @@ async function seedReplyJob(bundle: PolicyBundle, plan: Plan): Promise<string> {
     await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
   }
   await bindPlanToJob(job.jobId, plan, { businessId: BUSINESS });
+  return job.jobId;
+}
+
+/**
+ * A completed `mail.send` step written directly, the way `server.test.ts`'s
+ * `seedAutonomousAction` does — these tests are about the query's filters,
+ * which the real-gate tests above cannot vary (`performed` is whatever the
+ * adapter path writes).
+ */
+async function seedCompletedStep(bundle: PolicyBundle, performed: boolean | null): Promise<string> {
+  const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+  const binding = await bindPlanToJob(job.jobId, replyPlan('dana@example.com', 'תשובה'), { businessId: BUSINESS });
+  if (binding.status !== 'stored') throw new Error(`unexpected plan binding status ${binding.status}`);
+  await getPool().query(
+    `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status, performed)
+     VALUES ($1, $2, $3, 's1', 'MSG-1', 'completed', $4)`,
+    [BUSINESS, job.jobId, binding.planHash, performed],
+  );
   return job.jobId;
 }
 
@@ -299,6 +317,51 @@ describe('listAutonomousActions', () => {
     // s1 never touched a card. It must still be here, on its own.
     const afterApproval = await listAutonomousActions({ businessId: BUSINESS });
     expect(afterApproval.map((a) => a.stepId)).toEqual(['s1']);
+  });
+
+  /**
+   * Shadow mode reads this list as "what she DID on her own". A step whose
+   * row says `completed` but `performed = false` (a local tool with no
+   * implementation, `runLocalTool`'s `not_implemented`) or `performed IS
+   * NULL` (a row that does not know) did nothing anyone should be told about
+   * or could mark. Only `performed = true` is listed.
+   */
+  it('lists only steps that performed, leaving out performed = false and performed IS NULL', async () => {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), { businessId: BUSINESS });
+    const performedJob = await seedCompletedStep(bundle, true);
+    await seedCompletedStep(bundle, false);
+    await seedCompletedStep(bundle, null);
+
+    const actions = await listAutonomousActions({ businessId: BUSINESS });
+    expect(actions.map((a) => a.jobId)).toEqual([performedJob]);
+  });
+
+  it('marks a step fromInstruction only when ITS business holds a boss_instructions row for the job', async () => {
+    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), { businessId: BUSINESS });
+    const instructedJob = await seedCompletedStep(bundle, true);
+    const plainJob = await seedCompletedStep(bundle, true);
+    const foreignInstructionJob = await seedCompletedStep(bundle, true);
+
+    const db = getPool();
+    await db.query(
+      `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
+       VALUES ('INS-mine', $1, $2, 'תשיבי לדנה', 'typed')`,
+      [BUSINESS, instructedJob],
+    );
+    // Same job id, a DIFFERENT business. Without the business scope on the
+    // EXISTS, this row would make the step read as the owner's instruction.
+    await db.query(
+      `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
+       VALUES ('INS-foreign', 'other-business', $1, 'תשיבי לדנה', 'typed')`,
+      [foreignInstructionJob],
+    );
+
+    const byJob = new Map(
+      (await listAutonomousActions({ businessId: BUSINESS })).map((a) => [a.jobId, a.fromInstruction]),
+    );
+    expect(byJob.get(instructedJob)).toBe(true);
+    expect(byJob.get(plainJob)).toBe(false);
+    expect(byJob.get(foreignInstructionJob)).toBe(false);
   });
 
   it('returns an empty list for a business with no completed steps', async () => {

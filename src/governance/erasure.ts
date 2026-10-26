@@ -33,6 +33,7 @@ import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { ErasureItem, ErasurePlan, ErasureRefusal } from './erasure-plan.js';
 import {
+  ACTION_UPDATES_ERASED_PREDICATE,
   AGENT_ENVELOPES_ERASED_PREDICATE,
   APPROVAL_REQUESTS_ERASED_PREDICATE,
   APPROVAL_REQUESTS_SCRUBBED_PREDICATE,
@@ -296,6 +297,14 @@ export async function executeErasure(
     // that has no other tie to the contact. Same predicate, same parameters,
     // as `countItems` there.
     await del('autonomy_marks', 'DELETE FROM autonomy_marks WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
+    // Migration 047's record of what the owner was told about a performed
+    // step. No foreign key, so no cascade to order against. Same predicate,
+    // same parameters, as `countItems` in `erasure-plan.ts`.
+    await del(
+      'action_updates',
+      `DELETE FROM action_updates WHERE ${ACTION_UPDATES_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     // Migration 028's two tables. Neither carries a foreign key to `jobs` or

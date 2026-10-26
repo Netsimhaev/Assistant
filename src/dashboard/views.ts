@@ -1364,6 +1364,9 @@ export const TABLE_LABELS: Record<string, string> = {
   // Owner-typed free text on a corrected step (`governance/corrections.ts`) —
   // can name a counterparty the job's plan/title/instructions never do.
   autonomy_marks: 'הערות תיקון',
+  // What the owner was told about a step the assistant performed on her own
+  // (migration 047) — names the person the step was addressed to.
+  action_updates: 'עדכונים על פעולות',
   job_plans: 'תוכניות',
   job_authorizations: 'הרשאות',
   // A delegation request from one agent to another (migration 028).

@@ -59,6 +59,12 @@ export interface AutonomousAction {
   /** The provider's handle on what the step created, or `null` when it created nothing. */
   externalId: string | null;
   completedAt: Date;
+  /**
+   * The job was opened by the owner's own instruction — a `boss_instructions`
+   * row for it under THIS business. Shadow mode words the update differently
+   * for "you asked me to" than for "I did this on my own".
+   */
+  fromInstruction: boolean;
 }
 
 interface ActionRow {
@@ -68,6 +74,7 @@ interface ActionRow {
   completed_at: Date;
   job_title: string | null;
   plan: unknown;
+  from_instruction: boolean;
 }
 
 /**
@@ -80,6 +87,12 @@ interface ActionRow {
  * running (`resume-plan.test.ts` seeds exactly that shape). Matching only on
  * `job_id` would resolve such a stale row against the CURRENT plan and read a
  * step that never actually ran under it.
+ *
+ * `AND r.performed = true` (migration 037): a `completed` row whose step did
+ * nothing (`performed = false`, a local tool with no implementation) or does
+ * not know (`performed IS NULL`) is not something she DID, and shadow mode
+ * must not report it as an action. `= true` excludes NULL as well, which is
+ * the point — a row that cannot say it performed is not listed as one that did.
  *
  * A step whose tool is not classified (`classifyAction` returns `null` — a
  * `READ_ONLY_TOOLS` member, by construction never anything else) is not an
@@ -95,13 +108,19 @@ export async function listAutonomousActions(
 
   const { rows } = await db.query<ActionRow>(
     `SELECT r.job_id, r.step_id, r.external_id, r.completed_at,
-            j.title AS job_title, jp.plan AS plan
+            j.title AS job_title, jp.plan AS plan,
+            EXISTS (
+              SELECT 1 FROM boss_instructions b
+               WHERE b.business_id = r.business_id
+                 AND b.job_id = r.job_id
+            ) AS from_instruction
        FROM job_step_results r
        JOIN jobs j       ON j.job_id = r.job_id  AND j.business_id = r.business_id
        JOIN job_plans jp ON jp.job_id = r.job_id AND jp.business_id = r.business_id
                         AND jp.plan_hash = r.plan_hash
       WHERE r.business_id = $1
         AND r.status = 'completed'
+        AND r.performed = true
         AND NOT EXISTS (
           SELECT 1 FROM approval_requests a
            WHERE a.business_id = r.business_id
@@ -141,6 +160,7 @@ export async function listAutonomousActions(
       subject: typeof subjectRaw === 'string' ? subjectRaw : null,
       externalId: row.external_id,
       completedAt: row.completed_at,
+      fromInstruction: row.from_instruction,
     });
   }
 

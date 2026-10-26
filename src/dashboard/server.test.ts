@@ -183,8 +183,11 @@ async function seedAutonomousAction(
   if (binding.status !== 'stored') throw new Error(`unexpected plan binding status ${binding.status}`);
 
   await getPool().query(
-    `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status)
-     VALUES ($1, $2, $3, $4, 'MSG-1', 'completed')`,
+    // `performed = true`: `listAutonomousActions` lists only steps that
+    // actually performed (migration 037's column), as the real mail adapter
+    // path records them.
+    `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, external_id, status, performed)
+     VALUES ($1, $2, $3, $4, 'MSG-1', 'completed', true)`,
     [businessId, job.jobId, binding.planHash, 's1'],
   );
 

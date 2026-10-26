@@ -36,6 +36,8 @@ export async function resetDatabase(): Promise<void> {
       autonomy_ramp,
       autonomy_mode,
       autonomy_marks,
+      action_updates,
+      action_update_settings,
       autonomy_events,
       kill_switch,
       job_steps,

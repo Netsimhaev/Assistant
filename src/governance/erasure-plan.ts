@@ -584,6 +584,21 @@ export const AGENT_ENVELOPES_ERASED_PREDICATE = `business_id = $1
 export const VERIFICATION_VERDICTS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
 
 /**
+ * The `action_updates` rows an erasure destroys (migration 047).
+ *
+ * One row per performed step, telling the owner what the assistant did on
+ * her own — `recipient`, `subject` and `body` name the person the step was
+ * addressed to. Job-anchored exactly like `autonomy_marks`: deleted by
+ * `job_id` membership, with no discovery query of its own, because every
+ * value in a row is derived from the step's own payload, which already sits
+ * in `job_plans.plan` and places the job in `jobIds` through that table's
+ * discovery. The row cannot name anyone the job's plan does not.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const ACTION_UPDATES_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
+
+/**
  * The `digests` rows an erasure destroys, as ONE predicate.
  *
  * `digest_id = ANY ($2)` alone, the same id-list shape as
@@ -1384,6 +1399,14 @@ async function countItems(
       'delete',
       `SELECT count(*)::text AS n FROM autonomy_marks
         WHERE business_id = $1 AND job_id = ANY ($2)`,
+      [businessId, jobIds],
+    ),
+    // See `ACTION_UPDATES_ERASED_PREDICATE` above: job-anchored, like
+    // `autonomy_marks`.
+    await one(
+      'action_updates',
+      'delete',
+      `SELECT count(*)::text AS n FROM action_updates WHERE ${ACTION_UPDATES_ERASED_PREDICATE}`,
       [businessId, jobIds],
     ),
     await one(

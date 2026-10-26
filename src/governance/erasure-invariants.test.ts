@@ -88,7 +88,12 @@ describe('what an erasure leaves behind', () => {
    * `mail_invoices` (migrations 042/044)** — seeded in their own block, not
    * tied to the job, because a mail is discovered by its own columns.
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen" count is spec §5.1's own
+   * **A seventeenth, also outside spec §5.1: `action_updates` (migration
+   * 047)** — the record of what the owner was told about a step the
+   * assistant performed on her own. Job-scoped, seeded beside
+   * `autonomy_marks` and reached the same way.
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
    * tables `countItems`/the executor each name today" (19; CLAUDE.md states
@@ -309,6 +314,17 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, job.jobId, `התיקון היה בעקבות פנייה של ${PROBE}`],
     );
 
+    // --- Migration 047's record of what the owner was told. ---------------
+    //
+    // `action_updates.recipient`/`subject`/`body` describe one performed step
+    // to the owner and name the person it was addressed to. Keyed by
+    // `job_id`, exactly like `autonomy_marks` above, and reached the same way.
+    await db.query(
+      `INSERT INTO action_updates (update_id, business_id, job_id, step_id, action_class, recipient, subject, body)
+       VALUES ('AU-probe', $1, $2, 's1', 'email.reply', $3, $4, $5)`,
+      [BUSINESS, job.jobId, PROBE, `תשובה אל ${PROBE}`, `שלחתי מייל אל ${PROBE}`],
+    );
+
     // --- Migration 028's two tables. --------------------------------------
     //
     // `agent_envelopes.payload` carries the content of one agent's request to
@@ -399,6 +415,13 @@ describe('what an erasure leaves behind', () => {
     );
 
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
+    // The sweep below proves the executor deleted the row; this proves the
+    // preview the owner confirms LISTED it — `countItems` and the executor
+    // are two hand-written lists, and the sweep alone cannot catch the first
+    // one missing a table the second one has.
+    expect(
+      plan.items.find((item) => item.table === 'action_updates' && item.action === 'delete')?.count,
+    ).toBe(1);
     await executeErasure(plan, { businessId: BUSINESS });
 
     // The row the content arm's narrowness is for (fix round 2, Finding 2):
