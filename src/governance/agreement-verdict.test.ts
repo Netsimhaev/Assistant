@@ -85,10 +85,28 @@ describe('agreementVerdict', () => {
 
   it('sees date words behind a glued particle', () => {
     expect(edit('נדבר בשלישי', 'נדבר בחמישי')).toEqual({ verdict: 'wrong', reason: 'date' });
-    expect(edit('נדבר ביום שלישי', 'נדבר ביום שלישי')).toEqual({ verdict: 'right', reason: null });
+    expect(edit('נדבר בשלישי בבוקר', 'נדבר בשלישי מוקדם')).toEqual({ verdict: 'right', reason: null });
   });
 
-  it('ignores punctuation and bidi controls', () => {
-    expect(edit('שלום דנה', 'שלום, דנה!\u200F')).toEqual({ verdict: 'right', reason: null });
+  it('accepts the Hebrew maqaf after a particle', () => {
+    expect(edit('נדבר ב\u05BEשלישי', 'נדבר ב\u05BEחמישי')).toEqual({ verdict: 'wrong', reason: 'date' });
+  });
+
+  it('accepts a typographic apostrophe as geresh', () => {
+    expect(edit('ביום ג\u2019', 'ביום ד\u2019')).toEqual({ verdict: 'wrong', reason: 'date' });
+  });
+
+  it('compares numbers in order, not as a set', () => {
+    expect(edit('מקדמה 100 ויתרה 500', 'מקדמה 500 ויתרה 100')).toEqual({ verdict: 'wrong', reason: 'number' });
+    expect(edit('ב-12/11', 'ב-11/12')).toEqual({ verdict: 'wrong', reason: 'number' });
+  });
+
+  it('ignores punctuation', () => {
+    expect(edit('שלום דנה', 'שלום, דנה!')).toEqual({ verdict: 'right', reason: null });
+  });
+
+  it('ignores bidi controls inside a word', () => {
+    // Four split words: without the strip this is 4 word edits, so only the strip keeps it right.
+    expect(edit('אחד שתיים שלוש ארבע', 'א‏חד ש‏תיים ש‏לוש א‏רבע')).toEqual({ verdict: 'right', reason: null });
   });
 });

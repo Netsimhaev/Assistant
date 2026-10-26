@@ -8,6 +8,7 @@
  *
  * Unknown states are never permissive and never counted.
  */
+import { LEADING_HEBREW_PARTICLE } from './typed-recipients.js';
 import { readEmails } from '../policy/facts.js';
 import { stripBidiControls } from '../util/bidi.js';
 
@@ -26,7 +27,8 @@ const DATE_WORDS: ReadonlySet<string> = new Set([
 // The month "אב" is left out on purpose: it is also the common word "father".
 
 /** Day-letter forms: `ג'` as in "יום ג'". */
-const DAY_LETTER = /^[א-ו]['׳]$/u;
+const GERESH = /['׳’‘]/gu;
+const DAY_LETTER = /^[א-ו]['׳’‘]$/u;
 const PARTICLE_LETTERS = new Set(['ל', 'ב', 'מ', 'ה', 'ו', 'כ', 'ש']);
 const MAX_PARTICLE_LAYERS = 3;
 
@@ -36,8 +38,8 @@ const MAX_PARTICLE_LAYERS = 3;
  * particle letters ourselves, and only accept the result if it is a date word.
  */
 function dateWordOf(token: string): string | null {
-  if (DAY_LETTER.test(token)) return token.replace('׳', "'");
-  let candidate = token.replace(/^[לבמהוכש]-/u, '');
+  if (DAY_LETTER.test(token)) return token.replace(GERESH, "'");
+  let candidate = token.replace(LEADING_HEBREW_PARTICLE, '');
   for (let layer = 0; layer <= MAX_PARTICLE_LAYERS; layer += 1) {
     if (DATE_WORDS.has(candidate)) return candidate;
     const first = candidate[0];
@@ -51,9 +53,9 @@ function tokenise(text: string): string[] {
   return stripBidiControls(text)
     .split(/\s+/u)
     .map((raw) => {
-      const core = raw.replace(/^[^\p{L}\p{N}]+/u, '').replace(/[^\p{L}\p{N}'׳]+$/u, '');
+      const core = raw.replace(/^[^\p{L}\p{N}]+/u, '').replace(/[^\p{L}\p{N}'׳’‘]+$/u, '');
       // A trailing geresh belongs to a day letter only; elsewhere it is punctuation.
-      return DAY_LETTER.test(core) ? core : core.replace(/['׳]+$/u, '');
+      return DAY_LETTER.test(core) ? core : core.replace(/['׳’‘]+$/u, '');
     })
     .filter((token) => token !== '');
 }
@@ -66,15 +68,17 @@ function textOf(input: Record<string, unknown>): string {
   return `${part('subject')}\n${part('body')}`;
 }
 
+/** Digit runs IN ORDER: swapped amounts or day/month (12/11 vs 11/12) are a change. */
 function numbersOf(text: string): string[] {
-  return (stripBidiControls(text).replace(/(?<=\d),(?=\d)/gu, '').match(/\d+/gu) ?? []).sort();
+  return (stripBidiControls(text).replace(/(?<=\d),(?=\d)/gu, '').match(/\d+/gu) ?? []);
 }
 
-function sameMultiset(a: readonly string[], b: readonly string[]): boolean {
+function sameList(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((value, i) => value === b[i]);
 }
 
 function wordDistance(a: readonly string[], b: readonly string[]): number {
+  if (Math.abs(a.length - b.length) > MAX_EDITED_WORDS) return MAX_EDITED_WORDS + 1;
   let previous = Array.from({ length: b.length + 1 }, (_, j) => j);
   for (let i = 1; i <= a.length; i += 1) {
     const current = [i];
@@ -113,13 +117,13 @@ export function agreementVerdict(input: {
   }
   if (input.edited === null) return right;
 
-  if (!sameMultiset(recipientSet(input.proposed), recipientSet(input.edited))) {
+  if (!sameList(recipientSet(input.proposed), recipientSet(input.edited))) {
     return { verdict: 'wrong', reason: 'recipient' };
   }
 
   const before = textOf(input.proposed);
   const after = textOf(input.edited);
-  if (!sameMultiset(numbersOf(before), numbersOf(after))) {
+  if (!sameList(numbersOf(before), numbersOf(after))) {
     return { verdict: 'wrong', reason: 'number' };
   }
 
@@ -130,7 +134,7 @@ export function agreementVerdict(input: {
       const d = dateWordOf(t);
       return d === null ? [] : [d];
     }).sort();
-  if (!sameMultiset(dates(beforeTokens), dates(afterTokens))) {
+  if (!sameList(dates(beforeTokens), dates(afterTokens))) {
     return { verdict: 'wrong', reason: 'date' };
   }
 
