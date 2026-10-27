@@ -39,9 +39,10 @@ import { EXPIRED_PREFIX, MAY_HAVE_SENT_WARNING, RETRY_PREFIX } from '../mail/rep
 import type { Drafter } from '../sdk/mail-drafter.js';
 import { loadJob, transition } from './jobs.js';
 import { loadPlanBody } from './plan-store.js';
-import { raiseMailReply, reraiseAfterFailedSend, replySubject } from './mail-reply.js';
+import { LEARNED_NO_CARD_REASON, raiseMailReply, reraiseAfterFailedSend, replySubject } from './mail-reply.js';
 import { resumeAfterDecision } from './resume.js';
 import { runDueJobs } from './run-due.js';
+import { runPlanForJob } from './run-plan.js';
 import { setRampLevel } from './ramp.js';
 import { schedulerPass } from './scheduler.js';
 import { LEARNED_REPLY_EXEMPTION_MARKER } from '../policy/learned-reply.js';
@@ -1009,6 +1010,167 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
     if (raised === null) throw new Error('expected a reply job');
     expect(raised.approvalId).not.toBeNull();
     expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+  });
+
+  async function learnedCards(): Promise<Array<{ approval_id: string; job_id: string; detail: string }>> {
+    const { rows } = await getPool().query<{ approval_id: string; job_id: string; detail: string }>(
+      `SELECT approval_id, job_id, detail FROM approval_requests
+        WHERE business_id = $1 AND state = 'pending' ORDER BY created_at`,
+      [BUSINESS],
+    );
+    return rows;
+  }
+
+  async function raiseLearned(): Promise<{ mail: StoredMail; replyJobId: string }> {
+    const bundle = await learned({ knownDomain: 'client.example' });
+    const mail = await storedMail();
+    const raised = await raiseMailReply(
+      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+      { businessId: BUSINESS },
+    );
+    if (raised === null || raised.approvalId !== null) throw new Error('expected a card-less reply job');
+    return { mail, replyJobId: raised.replyJobId };
+  }
+
+  it('after adapter_timeout the resumed run does not send again, and one card warns it may have sent', async () => {
+    const { mail, replyJobId } = await raiseLearned();
+    if (activeBundle === null) throw new Error('unreachable');
+
+    // The provider swallows the send and never answers.
+    const hung: unknown[] = [];
+    const hanging = {
+      sendReply: async (_token: string, reply: unknown) => {
+        hung.push(reply);
+        return new Promise<never>(() => {});
+      },
+      sendNew: async () => new Promise<never>(() => {}),
+    } as unknown as Parameters<typeof runtimeWith>[0];
+    const job = await loadJob(replyJobId, { businessId: BUSINESS });
+    const stored = await loadPlanBody(replyJobId, { businessId: BUSINESS });
+    if (job === null || stored === null) throw new Error('no job or plan');
+    const runtime = runtimeWith(hanging);
+    const first = await runPlanForJob({
+      job,
+      bundle: activeBundle,
+      plan: stored.plan,
+      registry: runtime.registry,
+      credentials: runtime.credentials,
+      counterpartyTags: [],
+      rampLevel: 'auto_notify',
+      now: NOON,
+      adapterTimeoutMs: 200,
+    });
+    expect(first.status).toBe('halted');
+    expect(hung).toHaveLength(1);
+    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+
+    // Due now; one pass with a provider that would answer.
+    await getPool().query(`UPDATE jobs SET wake_at = $2 WHERE job_id = $1`, [replyJobId, new Date(NOON.getTime() - 60_000)]);
+    const { client, sent } = fakeClient();
+    await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON, inbox: null });
+    expect(sent).toHaveLength(0);
+    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    expect(await approvalCount()).toBe(0);
+
+    const result = await reraise();
+    expect(result.reraised).toBe(1);
+    const cards = await learnedCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.detail).toContain(`${RETRY_PREFIX}
+${MAY_HAVE_SENT_WARNING}`);
+    expect((await mailRow(mail.mailId)).reply_job_id).toBe(cards[0]?.job_id);
+    // At most once per job.
+    expect((await reraise()).reraised).toBe(0);
+  });
+
+  it('delivery_unknown on a learned job raises one card, warning it may have sent', async () => {
+    const { replyJobId } = await raiseLearned();
+    await runDueJobs({
+      businessId: BUSINESS,
+      runtime: runtimeWith(fakeClient([{ failure: 'transient', status: 0, message: 'socket dropped' }]).client),
+      now: NOON,
+    });
+    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+
+    expect((await reraise()).reraised).toBe(1);
+    const cards = await learnedCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.detail).toContain(`${RETRY_PREFIX}
+${MAY_HAVE_SENT_WARNING}`);
+    expect((await reraise()).reraised).toBe(0);
+  });
+
+  it('a terminal failure on a learned job raises one card, with no may-have-sent warning', async () => {
+    const { replyJobId } = await raiseLearned();
+    await runDueJobs({
+      businessId: BUSINESS,
+      runtime: runtimeWith(fakeClient([{ failure: 'rejected', status: 400, message: 'bad' }]).client),
+      now: NOON,
+    });
+    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+
+    expect((await reraise()).reraised).toBe(1);
+    const cards = await learnedCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.detail.startsWith(RETRY_PREFIX)).toBe(true);
+    expect(cards[0]?.detail).not.toContain(MAY_HAVE_SENT_WARNING);
+  });
+
+  it('the dial flipped to off between the fork and the run: no send, then one card', async () => {
+    const { replyJobId } = await raiseLearned();
+    await setAutonomyMode('off', 'owner', { businessId: BUSINESS });
+    const { client, sent } = fakeClient();
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    expect(sent).toHaveLength(0);
+    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+
+    expect((await reraise()).reraised).toBe(1);
+    expect(await learnedCards()).toHaveLength(1);
+  });
+
+  it('a learned job that succeeded is never re-raised', async () => {
+    await raiseLearned();
+    const { client, sent } = fakeClient();
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    expect(sent).toHaveLength(1);
+    expect((await reraise()).reraised).toBe(0);
+    expect(await approvalCount()).toBe(0);
+  });
+
+  it('a learned job whose send completed is not re-raised, even if it later failed', async () => {
+    const { replyJobId } = await raiseLearned();
+    const { client, sent } = fakeClient();
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
+    expect(sent).toHaveLength(1);
+    // Forced onto the failed path: every other condition of the learned
+    // branch holds, so only the completed step result refuses it.
+    await getPool().query(`UPDATE jobs SET phase = 'failed' WHERE job_id = $1`, [replyJobId]);
+    expect((await reraise()).reraised).toBe(0);
+  });
+
+  it('a failed, card-less reply job that did NOT take the learned path is not re-raised', async () => {
+    // The learned job, its marker row rewritten: only the marker separates
+    // it from a reply job that failed some other way.
+    const { replyJobId } = await raiseLearned();
+    await setAutonomyMode('off', 'owner', { businessId: BUSINESS });
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(fakeClient().client), now: NOON });
+    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+    await getPool().query(
+      `UPDATE job_steps SET reason = 'mail reply: something else' WHERE job_id = $1 AND reason = $2`,
+      [replyJobId, LEARNED_NO_CARD_REASON],
+    );
+    expect((await reraise()).reraised).toBe(0);
+  });
+
+  it('two re-raisers racing on one failed learned job raise exactly one card', async () => {
+    const { replyJobId } = await raiseLearned();
+    await setAutonomyMode('off', 'owner', { businessId: BUSINESS });
+    await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(fakeClient().client), now: NOON });
+    expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+
+    const [a, b] = await Promise.all([reraise(), reraise()]);
+    expect(a.reraised + b.reraised).toBe(1);
+    expect(await learnedCards()).toHaveLength(1);
   });
 
   it('a re-raise always gets a card, even once the class is learned', async () => {

@@ -42,7 +42,16 @@ import { readEmails } from './facts.js';
  *     Reply-To, never a second recipient — the rule the mailbox send adapter
  *     enforces too (`reply_recipient_mismatch`);
  *   - `facts.amountDeclared` is false — no money rides on a learned reply;
- *   - the payload has no own `attachments` key — a learned reply is text.
+ *   - the payload has no own `attachments` key — a learned reply is text;
+ *   - the job has NO `job_step_results` row with status `unknown`, on any
+ *     step. Such a row means a send was dispatched and no authoritative answer
+ *     came back (`adapter_timeout`): the mail may already be in the
+ *     sender's inbox. On an approved reply the spent approval stops the
+ *     re-run; this exemption needs no approval, so without this condition the
+ *     woken job passed stage 8 again and sent a SECOND time, card-less — and
+ *     the Gmail/Graph sends carry no idempotency key to deduplicate it. With
+ *     it, the re-run is refused at stage 8, the job fails, and
+ *     `reraiseAfterFailedSend` asks the owner, warning that it may have sent.
  *
  * It is a read and only a read.
  *
@@ -81,7 +90,11 @@ export async function learnedReplyCovers(
        FROM mail_messages
       WHERE business_id = $1
         AND reply_job_id = $2
-        AND lower(from_address) = $3`,
+        AND lower(from_address) = $3
+        AND NOT EXISTS (
+          SELECT 1 FROM job_step_results r
+           WHERE r.business_id = $1 AND r.job_id = $2 AND r.status = 'unknown'
+        )`,
     [businessId, ctx.jobId, recipient],
   );
   return rows[0] !== undefined;

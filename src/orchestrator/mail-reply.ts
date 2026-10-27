@@ -56,7 +56,7 @@ import { stripBidiControls } from '../util/bidi.js';
 import { assessRisk } from '../policy/risk.js';
 import type { Drafter } from '../sdk/mail-drafter.js';
 import { createJob, transition, type Job } from './jobs.js';
-import { bindPlanToJob } from './plan-store.js';
+import { bindPlanToJob, loadPlanBody } from './plan-store.js';
 import { notifyOwner, type NotifyTarget } from './proposal-approval.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { loadRampLevel } from './ramp.js';
@@ -155,6 +155,13 @@ export async function raiseMailReply(
     { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
   );
 }
+
+/**
+ * The `job_steps.reason` of a learned reply's `plan → execute` move — the
+ * positive marker `reraiseAfterFailedSend` finds a card-less reply job by.
+ * One constant, written and read, so the two can never drift apart.
+ */
+export const LEARNED_NO_CARD_REASON = 'mail reply: learned, no card';
 
 interface ReplyCardInput {
   mailId: string;
@@ -257,7 +264,7 @@ async function raiseReplyCard(
       await transition(job.jobId, {
         to: 'execute',
         actor: 'orchestrator',
-        reason: 'mail reply: learned, no card',
+        reason: LEARNED_NO_CARD_REASON,
         businessId,
       });
       await linkReplyJob(input.mailId, job.jobId, { businessId });
@@ -391,6 +398,17 @@ export interface ReraiseResult {
  *     the failure, so a job that failed for its own reason while the approval
  *     was still live is not re-asked merely because the card aged out later.
  *
+ * A third, card-less way, for a reply the assistant LEARNED to send (owner
+ * ruling H10): the job went `plan → execute` with `LEARNED_NO_CARD_REASON`
+ * and has no `approval_requests` row at all. If it failed — a terminal send
+ * failure, `delivery_unknown`, a timeout whose re-run the learned-reply
+ * exemption then refused, or a dial lowered between the fork and the run so
+ * stage 8 refused it — there was never a card to re-ask from, and without
+ * this branch the mail was left with no reply and no question. Its payload
+ * comes from the job's bound plan. Requiring NO approval row keeps the two
+ * branches disjoint: a job the gate itself queued a card for is the first
+ * branch's case or nobody's, never both.
+ *
  * An owner's denial is neither (its state is `denied`), so it is never
  * re-raised. Each failed job is re-raised at most once:
  * `claimFailedReply` takes it off the mail in one conditional UPDATE before
@@ -490,5 +508,94 @@ export async function reraiseAfterFailedSend(
       }
     }
   }
+  await reraiseLearnedReplies(input.bundle, businessId, options, result);
   return result;
+}
+
+interface FailedLearnedRow {
+  mail_id: string;
+  job_id: string;
+  original_subject: string;
+  from_name: string | null;
+  reply_to: string | null;
+  may_have_sent: boolean;
+}
+
+/**
+ * The card-less branch of `reraiseAfterFailedSend` (see its docblock).
+ * Exactly one card per failed job, `retry` always set, at most once — the
+ * same `claimFailedReply` guard the first branch takes. `mayHaveSent` when
+ * a step failed with a code in `MAY_HAVE_SENT_CODES` OR the job has an
+ * `unknown` step row: the timeout path ends here with the re-run refused at
+ * stage 8, and the earlier dispatch may well have been delivered.
+ */
+async function reraiseLearnedReplies(
+  bundle: PolicyBundle,
+  businessId: string,
+  options: RaiseMailReplyOptions,
+  result: ReraiseResult,
+): Promise<void> {
+  const { rows } = await getPool().query<FailedLearnedRow>(
+    `SELECT m.mail_id, j.job_id, m.subject AS original_subject, m.from_name, m.reply_to,
+            (EXISTS (
+               SELECT 1 FROM job_steps s
+                WHERE s.job_id = j.job_id
+                  AND split_part(s.reason, ' ', 1) = ANY($2::text[])
+             ) OR EXISTS (
+               SELECT 1 FROM job_step_results u
+                WHERE u.business_id = m.business_id AND u.job_id = j.job_id AND u.status = 'unknown'
+             )) AS may_have_sent
+       FROM mail_messages m
+       JOIN jobs j ON j.business_id = m.business_id AND j.job_id = m.reply_job_id
+      WHERE m.business_id = $1
+        AND j.phase = 'failed'
+        AND EXISTS (
+          SELECT 1 FROM job_steps l
+           WHERE l.job_id = j.job_id AND l.to_phase = 'execute' AND l.reason = $3
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM approval_requests ar
+           WHERE ar.business_id = m.business_id AND ar.job_id = j.job_id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM job_step_results r
+           WHERE r.business_id = m.business_id AND r.job_id = j.job_id AND r.status = 'completed'
+        )
+      ORDER BY m.received_at`,
+    [businessId, MAY_HAVE_SENT_CODES, LEARNED_NO_CARD_REASON],
+  );
+
+  for (const row of rows) {
+    const stored = await loadPlanBody(row.job_id, { businessId });
+    const payload = stored?.plan.steps.find((step) => step.id === 'reply')?.input;
+    if (payload === undefined || mailboxReplyRecipient(payload) === null) {
+      result.skipped += 1;
+      continue;
+    }
+    if (!(await claimFailedReply(row.mail_id, row.job_id, { businessId }))) continue;
+
+    try {
+      const raised = await raiseReplyCard(
+        {
+          mailId: row.mail_id,
+          originalSubject: row.original_subject,
+          displayName: row.from_name,
+          replyTo: row.reply_to,
+          payload: payload as Record<string, unknown>,
+          bundle,
+          retry: { mayHaveSent: row.may_have_sent, expired: false },
+        },
+        { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
+      );
+      result.reraised += 1;
+      if (raised.approvalId !== null) result.approvalIds.push(raised.approvalId);
+    } catch {
+      result.failed += 1;
+      try {
+        await noteMailError(row.mail_id, 'reraise_failed', { businessId });
+      } catch {
+        // Best effort, as in the first branch.
+      }
+    }
+  }
 }

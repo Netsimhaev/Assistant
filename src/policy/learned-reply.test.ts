@@ -94,6 +94,15 @@ async function setup(
   };
 }
 
+/** `job_step_results.job_id` has a foreign key to `jobs` only, so a row under another business is expressible. */
+async function stepResult(jobId: string, businessId: string, status: 'unknown' | 'completed'): Promise<void> {
+  await getPool().query(
+    `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, status)
+     VALUES ($1, $2, 'h-earlier', 'reply', $3)`,
+    [businessId, jobId, status],
+  );
+}
+
 async function intentRows(): Promise<{ reason: string }[]> {
   const { rows } = await getPool().query<{ reason: string }>(
     `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'intent_to_act' ORDER BY seq`,
@@ -211,6 +220,24 @@ describe('each condition, flipped alone, is refused at stage 8', () => {
   it('an attachments key is refused, even empty', async () => {
     const s = await setup();
     await expectDeniedAtStage8(await evaluateToolCall('mail.send', { ...REPLY, attachments: [] }, s.ctx));
+  });
+
+  it('a job with an unknown step result (a send that may have gone) is refused', async () => {
+    const s = await setup();
+    await stepResult(s.jobId, BUSINESS, 'unknown');
+    await expectDeniedAtStage8(await evaluateToolCall('mail.send', REPLY, s.ctx));
+  });
+
+  it('an unknown step result filed under another business does not count', async () => {
+    const s = await setup();
+    await stepResult(s.jobId, 'other-business', 'unknown');
+    await expectAllowed(await evaluateToolCall('mail.send', REPLY, s.ctx));
+  });
+
+  it('a completed step result does not count as unknown', async () => {
+    const s = await setup();
+    await stepResult(s.jobId, BUSINESS, 'completed');
+    await expectAllowed(await evaluateToolCall('mail.send', REPLY, s.ctx));
   });
 
   it('no learned reply when the dial is off', async () => {
