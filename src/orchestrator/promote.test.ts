@@ -398,7 +398,7 @@ describe('the evaluation pass', () => {
    * the demotion do promote it again, so the middle assertion is the reset
    * biting and not the machinery being dead.
    */
-  it('demotes on an owner mark, and the streak starts again', async () => {
+  it('demotes on an owner mark, and the window starts again', async () => {
     await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
@@ -416,7 +416,7 @@ describe('the evaluation pass', () => {
     expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
     expect(await storedLevel('email.reply')).toBe('approve_required');
 
-    // The streak starts again: the five approvals that earned the first
+    // The window starts again: the five approvals that earned the first
     // promotion were all decided before the demotion and must not earn a
     // second one.
     const stale = await evaluateAutonomy({ businessId: BUSINESS });

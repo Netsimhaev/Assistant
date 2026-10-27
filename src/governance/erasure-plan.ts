@@ -26,7 +26,7 @@
  * place in a job that names the person being erased. `autonomy_mode` (one
  * row per business: the owner's dial position) and
  * `autonomy_events` (a promotion/demotion ledger whose `reason` column holds
- * only counts, e.g. "10 אישורים רצופים ללא שינוי") are facts about the
+ * only counts, e.g. "5 מתוך 6 הכרעות אחרונות (83%)") are facts about the
  * SYSTEM's own permissions, not about any counterparty — neither carries a
  * job id, a contact identifier, or any column a person's name could land in
  * during ordinary use. They are left unwired for the same reason
