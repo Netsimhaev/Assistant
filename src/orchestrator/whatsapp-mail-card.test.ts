@@ -27,7 +27,7 @@ import { createBossMessenger, type BossMessenger } from '../whatsapp/messenger.j
 import { getApproval } from '../governance/approvals.js';
 import { MAIL_CARD_INSTRUCTION } from '../mail/whatsapp-notice.js';
 import { loadJob } from './jobs.js';
-import { raiseMailReply, type RaisedReply } from './mail-reply.js';
+import { raiseMailReply } from './mail-reply.js';
 import { runDueJobs } from './run-due.js';
 import { runWhatsAppDoor } from './whatsapp-door.js';
 import {
@@ -99,7 +99,7 @@ async function harness(): Promise<Harness> {
   return { bundle, gateway, messenger };
 }
 
-async function raiseAndPresent(h: Harness, n = 1): Promise<RaisedReply> {
+async function raiseAndPresent(h: Harness, n = 1): Promise<{ replyJobId: string; approvalId: string }> {
   const mail = await storedMail(BUSINESS, {
     providerMessageId: `PM-${n}`,
     internetMessageId: `<q-${n}@client.example>`,
@@ -109,7 +109,7 @@ async function raiseAndPresent(h: Harness, n = 1): Promise<RaisedReply> {
     { mail, triage: QUESTION_TRIAGE, bundle: h.bundle, drafter: stubDrafter() },
     { businessId: BUSINESS },
   );
-  if (raised === null) throw new Error('expected a card');
+  if (raised === null || raised.approvalId === null) throw new Error('expected a card');
   await presentMailCard(
     raised.approvalId,
     async (text, jobId) => {
@@ -118,7 +118,7 @@ async function raiseAndPresent(h: Harness, n = 1): Promise<RaisedReply> {
     },
     { businessId: BUSINESS },
   );
-  return raised;
+  return { replyJobId: raised.replyJobId, approvalId: raised.approvalId };
 }
 
 function door(h: Harness, planner: (r: PlanRequest) => Promise<PlanOutcome> = neverPlanned) {
@@ -381,7 +381,7 @@ describe('approve-by-WhatsApp', () => {
       { mail, triage: QUESTION_TRIAGE, bundle: h.bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
 
     let planned = 0;
     h.gateway.enqueue(textMsg(PRINCIPAL, 'שלח'));

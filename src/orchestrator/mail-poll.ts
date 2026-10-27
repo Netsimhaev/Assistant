@@ -625,7 +625,9 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
           // stale id would re-link a failed job and reopen it for re-raise.
           replyJobId = raised.replyJobId;
           result.drafts += 1;
-          await presentCardOnWhatsApp(mail, raised.approvalId, pass);
+          // A learned reply has no card to present; the owner already had
+          // this mail's notice above, and the send writes an action update.
+          if (raised.approvalId !== null) await presentCardOnWhatsApp(mail, raised.approvalId, pass);
         }
       } catch {
         await noteMailError(mail.mailId, 'reply_failed', { businessId });

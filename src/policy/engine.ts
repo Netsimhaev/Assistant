@@ -28,6 +28,7 @@ import { assessRisk, type NormsLookup } from './risk.js';
 import { inQuietHours, redactPayload } from './redact.js';
 import { mayDelegate } from '../governance/delegation.js';
 import { APPROVED_REPLY_EXEMPTION_MARKER, approvedReplyCovers } from './approved-reply.js';
+import { LEARNED_REPLY_EXEMPTION_MARKER, learnedReplyCovers } from './learned-reply.js';
 
 export interface GateContext extends FactsContext {
   agent: AgentId;
@@ -281,7 +282,17 @@ export async function evaluateToolCall(
   // bypass. `facts.inputHash` is the same hash stage 10 hands
   // `consumeApproval`, so the exemption and the claim agree on the bytes.
   const approvedReply = await approvedReplyCovers(facts, facts.toolName, facts.inputHash, ctx);
-  let effective = effectiveAutonomy(facts, ctx, { skipRampAndProvenance: approvedReply });
+  // A reply to an incoming mail the assistant has LEARNED to send (owner
+  // ruling H10): judged without the provenance ceiling — and only that one;
+  // the ramp stays, and is `auto_notify` whenever this holds. See
+  // `learnedReplyCovers`. Never alongside `approvedReply`: that one requires
+  // `ctx.approval`, this one requires its absence, and the `!` says so here.
+  const learnedReply =
+    !approvedReply && (await learnedReplyCovers(facts, isRecord(toolInput) ? toolInput : {}, ctx));
+  let effective = effectiveAutonomy(facts, ctx, {
+    skipRampAndProvenance: approvedReply,
+    skipProvenanceOnly: learnedReply,
+  });
 
   const stage8Denial = await autonomyDenial(effective, facts, ctx, currentVersion, businessId);
   if (stage8Denial !== null) return stage8Denial;
@@ -315,9 +326,12 @@ export async function evaluateToolCall(
 
   // Intent to act is recorded here, before any decision to permit — so an
   // action that crashes between this point and execution leaves a trace.
+  // A send the learned-reply exemption carried has no `approval_consumed`
+  // row to mark, so the fixed token rides on the intent row instead — a
+  // reader can find every reply that went out on what she learned alone.
   const intent = await recordIntent(facts, ctx, currentVersion, businessId, {
     kind: 'intent_to_act',
-    reason: risk.explanation,
+    reason: risk.explanation + (learnedReply ? ` ${LEARNED_REPLY_EXEMPTION_MARKER}` : ''),
     risk,
   });
 
@@ -638,18 +652,25 @@ async function autonomyDenial(
  * charter's base for the class, every counterparty override, and an
  * envelope's hard cap. Named as the two it omits, never as "everything except"
  * — a control written as a negation is how this file has lost ceilings before.
+ *
+ * `skipProvenanceOnly` drops exactly ONE of the five — the provenance
+ * ceiling — and is set only by stage 8 when `learnedReplyCovers` holds. The
+ * ramp is NOT dropped: it is the very ceiling that says the class was
+ * learned (`auto_notify` under `learn`), and the moment a demotion or the
+ * dial lowers it, the learned reply stops on it.
  */
 function effectiveAutonomy(
   facts: ActionFacts,
   ctx: GateContext,
-  options: { skipRampAndProvenance?: boolean } = {},
+  options: { skipRampAndProvenance?: boolean; skipProvenanceOnly?: boolean } = {},
 ): AutonomyLevel {
   const actionClass = facts.actionClass;
   if (actionClass === null) return 'auto';
   const skip = options.skipRampAndProvenance === true;
+  const skipProvenance = skip || options.skipProvenanceOnly === true;
 
   const ceilings: AutonomyLevel[] = [ctx.bundle.autonomyBase[actionClass]];
-  if (!skip) ceilings.push(ctx.bundle.provenanceCeiling[facts.provenance]);
+  if (!skipProvenance) ceilings.push(ctx.bundle.provenanceCeiling[facts.provenance]);
 
   // Every key that identifies the other side, each against its own bucket.
   // Keyed by entityId alone, an override written against a domain, a phone or

@@ -20,7 +20,7 @@ import { upsertBinding } from '../orchestrator/bindings.js';
 import { envCredentials } from '../orchestrator/credentials.js';
 import type { Runtime } from '../orchestrator/runtime.js';
 import type { Drafter } from '../sdk/mail-drafter.js';
-import { buildCharter } from './fixtures.js';
+import { buildCharter, type CharterOverrides } from './fixtures.js';
 
 const PREFIX = 'TEST_CRED_';
 // 09:00 UTC is noon in Asia/Jerusalem — outside the fixture's quiet hours.
@@ -39,8 +39,9 @@ export const QUESTION_TRIAGE: MailTriage = {
 export async function installMailboxCharter(
   businessId: string,
   provider: MailProvider = 'google',
+  overrides: CharterOverrides = {},
 ): Promise<PolicyBundle> {
-  const base = buildCharter({ version: `2026-08-15.${businessId}` });
+  const base = buildCharter({ version: `2026-08-15.${businessId}`, ...overrides });
   // The amendment supersedes the base version, which must exist first.
   await installCharter(base, { businessId });
   const signed = BusinessCharter.parse(

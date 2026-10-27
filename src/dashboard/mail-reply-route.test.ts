@@ -87,14 +87,14 @@ async function setup(provider: 'google' | 'microsoft' = 'google') {
     { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() },
     { businessId: BUSINESS },
   );
-  if (raised === null) throw new Error('expected a card');
+  if (raised === null || raised.approvalId === null) throw new Error('expected a card');
   const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
   const proposed = approval?.proposedInput as Record<string, unknown>;
   const baseUrl = await startServer();
   const cookie = await login(baseUrl);
   const card = await fetch(`${baseUrl}/a/${raised.approvalId}`, { headers: { cookie } });
   const html = await card.text();
-  return { raised, proposed, baseUrl, cookie, html, csrf: csrfOf(html) };
+  return { raised: { replyJobId: raised.replyJobId, approvalId: raised.approvalId }, proposed, baseUrl, cookie, html, csrf: csrfOf(html) };
 }
 
 async function submit(s: Awaited<ReturnType<typeof setup>>, edited: unknown): Promise<Response> {

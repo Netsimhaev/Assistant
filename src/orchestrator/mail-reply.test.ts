@@ -42,6 +42,9 @@ import { loadPlanBody } from './plan-store.js';
 import { raiseMailReply, reraiseAfterFailedSend, replySubject } from './mail-reply.js';
 import { resumeAfterDecision } from './resume.js';
 import { runDueJobs } from './run-due.js';
+import { setRampLevel } from './ramp.js';
+import { schedulerPass } from './scheduler.js';
+import { LEARNED_REPLY_EXEMPTION_MARKER } from '../policy/learned-reply.js';
 
 const BUSINESS = 'test-business';
 
@@ -114,7 +117,7 @@ describe('replySubject folds control characters (a subject must never break a he
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
     const subject = (approval?.proposedInput as Record<string, unknown>)['subject'];
     expect(subject).toBe('Re: Invoice Bcc: v@y.com');
@@ -138,7 +141,7 @@ describe('raiseMailReply', () => {
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter('שלום‮ דנה⁦, 500‏ ש"ח') },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
     expect((approval?.proposedInput as { body: string }).body).toBe('שלום דנה, 500 ש"ח');
     const stored = await loadPlanBody(raised.replyJobId, { businessId: BUSINESS });
@@ -151,7 +154,7 @@ describe('raiseMailReply', () => {
     const drafter = stubDrafter();
 
     const raised = await raiseMailReply({ mail, triage: TRIAGE, bundle, drafter }, { businessId: BUSINESS });
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     expect(drafter.calls).toBe(1);
 
     const job = await loadJob(raised.replyJobId, { businessId: BUSINESS });
@@ -199,7 +202,7 @@ describe('raiseMailReply', () => {
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
     expect(approval?.summary).toBe('תשובה ל-dana@client.example: מתי תגיע ההצעה?');
     expect(approval?.detail).toContain('dana@client.example');
@@ -218,7 +221,7 @@ describe('raiseMailReply', () => {
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
     expect(approval?.detail).not.toContain('שים לב');
   });
@@ -243,7 +246,7 @@ describe('raiseMailReply', () => {
         },
       },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     expect(links).toEqual([`https://dash.example/a/${raised.approvalId}`]);
     expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
     const { rows } = await getPool().query<{ reason: string }>(
@@ -318,7 +321,7 @@ describe('approve sends, under mode off', () => {
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     await approve(raised.approvalId);
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
 
@@ -339,7 +342,7 @@ describe('approve sends, under mode off', () => {
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     // R2: reach the gate without a decision — a legal move, the approval
     // stays pending.
     await transition(raised.replyJobId, {
@@ -368,7 +371,7 @@ describe('approve sends, under mode off', () => {
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
     const edited = { ...(approval?.proposedInput as Record<string, unknown>), body: 'גוף ערוך על ידי הבעלים' };
     await approve(raised.approvalId, edited);
@@ -649,10 +652,10 @@ describe('reraiseAfterFailedSend', () => {
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     await approve(raised.approvalId);
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
-    return { bundle, mail, client, sent, raised };
+    return { bundle, mail, client, sent, raised: { replyJobId: raised.replyJobId, approvalId: raised.approvalId } };
   }
 
   async function pendingCards(): Promise<Array<{ approval_id: string; job_id: string; detail: string }>> {
@@ -741,7 +744,7 @@ describe('reraiseAfterFailedSend', () => {
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     await transition(raised.replyJobId, {
       to: 'execute', actor: 'orchestrator', reason: 'test', businessId: BUSINESS,
     });
@@ -757,7 +760,7 @@ describe('reraiseAfterFailedSend', () => {
       { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     const decided = await decide(raised.approvalId, 'denied', { by: 'p_boss', channel: 'dashboard' },
       { businessId: BUSINESS });
     await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
@@ -778,12 +781,12 @@ describe('reraiseAfterFailedSend', () => {
         { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
         { businessId: BUSINESS },
       );
-      if (raised === null) throw new Error('expected a card');
+      if (raised === null || raised.approvalId === null) throw new Error('expected a card');
       await approve(raised.approvalId);
       await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NIGHT });
       expect(sent).toHaveLength(0);
       expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('followup');
-      return { mail, client, sent, raised };
+      return { mail, client, sent, raised: { replyJobId: raised.replyJobId, approvalId: raised.approvalId } };
     }
 
     async function expire(approvalId: string): Promise<void> {
@@ -836,7 +839,7 @@ describe('reraiseAfterFailedSend', () => {
         { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
         { businessId: BUSINESS },
       );
-      if (raised === null) throw new Error('expected a card');
+      if (raised === null || raised.approvalId === null) throw new Error('expected a card');
       const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
       const edited = { ...(approval?.proposedInput as Record<string, unknown>), body: 'גוף ערוך' };
       await approve(raised.approvalId, edited);
@@ -876,7 +879,7 @@ describe('reraiseAfterFailedSend', () => {
         { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
         { businessId: BUSINESS },
       );
-      if (raised === null) throw new Error('expected a card');
+      if (raised === null || raised.approvalId === null) throw new Error('expected a card');
       const decided = await decide(raised.approvalId, 'denied', { by: 'p_boss', channel: 'dashboard' },
         { businessId: BUSINESS });
       await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
@@ -912,7 +915,7 @@ describe('reraiseAfterFailedSend', () => {
         { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
         { businessId: BUSINESS },
       );
-      if (raised === null) throw new Error('expected a card');
+      if (raised === null || raised.approvalId === null) throw new Error('expected a card');
       await approve(raised.approvalId);
       failed.push(mail.mailId);
     }
@@ -929,5 +932,113 @@ describe('reraiseAfterFailedSend', () => {
     expect(result).toMatchObject({ reraised: 0, failed: 2 });
     for (const mailId of failed) expect((await mailRow(mailId)).error).toBe('reraise_failed');
     expect(await approvalCount()).toBe(2);
+  });
+});
+
+describe('a reply the assistant has LEARNED goes without a card (owner ruling H10)', () => {
+  async function learned(options: { knownDomain?: string } = {}): Promise<PolicyBundle> {
+    activeBundle = await installFor(
+      BUSINESS,
+      'google',
+      options.knownDomain !== undefined ? { knownCounterpartyEmailDomain: options.knownDomain } : {},
+    );
+    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await setAutonomyMode('learn', 'owner', { businessId: BUSINESS });
+    return activeBundle;
+  }
+
+  async function actionUpdateCount(): Promise<number> {
+    const { rows } = await getPool().query<{ n: string }>(
+      'SELECT count(*)::text AS n FROM action_updates WHERE business_id = $1',
+      [BUSINESS],
+    );
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  it('a known sender: no card, the job goes to execute, and one scheduler pass sends and updates', async () => {
+    const bundle = await learned({ knownDomain: 'client.example' });
+    const mail = await storedMail();
+
+    const raised = await raiseMailReply(
+      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+      { businessId: BUSINESS },
+    );
+    if (raised === null) throw new Error('expected a reply job');
+    expect(raised.approvalId).toBeNull();
+    expect(await approvalCount()).toBe(0);
+    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+    expect((await mailRow(mail.mailId)).reply_job_id).toBe(raised.replyJobId);
+
+    const { client, sent } = fakeClient();
+    await schedulerPass({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON, inbox: null });
+
+    expect(sent).toHaveLength(1);
+    expect(await approvalCount()).toBe(0);
+    expect(await actionUpdateCount()).toBe(1);
+    const { rows } = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'intent_to_act'`,
+      [raised.replyJobId],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.reason.endsWith(` ${LEARNED_REPLY_EXEMPTION_MARKER}`)).toBe(true);
+  });
+
+  it('a sender the charter does not know still gets a card, as today', async () => {
+    const bundle = await learned();
+    const mail = await storedMail();
+
+    const raised = await raiseMailReply(
+      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+      { businessId: BUSINESS },
+    );
+    if (raised === null) throw new Error('expected a reply job');
+    expect(raised.approvalId).not.toBeNull();
+    expect(await approvalCount()).toBe(1);
+    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+  });
+
+  it('a known sender under learn, but a class NOT yet promoted, still gets a card', async () => {
+    activeBundle = await installFor(BUSINESS, 'google', { knownCounterpartyEmailDomain: 'client.example' });
+    await setAutonomyMode('learn', 'owner', { businessId: BUSINESS });
+    const mail = await storedMail();
+
+    const raised = await raiseMailReply(
+      { mail, triage: TRIAGE, bundle: activeBundle, drafter: stubDrafter() },
+      { businessId: BUSINESS },
+    );
+    if (raised === null) throw new Error('expected a reply job');
+    expect(raised.approvalId).not.toBeNull();
+    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
+  });
+
+  it('a re-raise always gets a card, even once the class is learned', async () => {
+    // Raised and approved under `off`; the approved send fails terminally.
+    const bundle = await installFor(BUSINESS, 'google', { knownCounterpartyEmailDomain: 'client.example' });
+    activeBundle = bundle;
+    const mail = await storedMail();
+    const raised = await raiseMailReply(
+      { mail, triage: TRIAGE, bundle, drafter: stubDrafter() },
+      { businessId: BUSINESS },
+    );
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
+    await approve(raised.approvalId);
+    await runDueJobs({
+      businessId: BUSINESS,
+      runtime: runtimeWith(fakeClient([{ failure: 'rejected', status: 400, message: 'bad' }]).client),
+      now: NOON,
+    });
+    expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
+
+    // Now the class is learned, and the sender is known — every other
+    // condition for a card-less send holds.
+    await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
+    await setAutonomyMode('learn', 'owner', { businessId: BUSINESS });
+
+    const result = await reraise();
+    expect(result.reraised).toBe(1);
+    expect(result.approvalIds).toHaveLength(1);
+    const fresh = (await mailRow(mail.mailId)).reply_job_id;
+    if (fresh === null) throw new Error('mail not relinked');
+    expect((await loadJob(fresh, { businessId: BUSINESS }))?.phase).toBe('await_approval');
   });
 });

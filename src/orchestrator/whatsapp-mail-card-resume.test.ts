@@ -46,7 +46,7 @@ describe('approve-by-WhatsApp when the resume fails', () => {
       { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() },
       { businessId: BUSINESS },
     );
-    if (raised === null) throw new Error('expected a card');
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
     await presentMailCard(
       raised.approvalId,
       async (text, jobId) => void (await messenger.send({ text, jobId })),

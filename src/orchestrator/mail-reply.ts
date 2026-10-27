@@ -18,6 +18,11 @@
  *     stage-8 exemption for an approved reply (`policy/approved-reply.ts`)
  *     is what lets these exact bytes through — so there is no `RAMP_HONESTY`
  *     sentence here: approving this card does send.
+ *   - One exception to "one approval card": a reply the assistant has LEARNED
+ *     (dial `learn`, `email.reply` promoted to `auto_notify`, a sender the
+ *     charter knows, not a re-raise) goes straight to `execute` with no card,
+ *     and the gate's learned-reply exemption (`policy/learned-reply.ts`,
+ *     owner ruling H10) is what lets it send.
  *   - The recipient is the original `From`, always. A differing `Reply-To`
  *     is shown on the card and never used.
  *
@@ -53,6 +58,8 @@ import type { Drafter } from '../sdk/mail-drafter.js';
 import { createJob, transition, type Job } from './jobs.js';
 import { bindPlanToJob } from './plan-store.js';
 import { notifyOwner, type NotifyTarget } from './proposal-approval.js';
+import { loadAutonomyMode } from '../governance/autonomy-mode.js';
+import { loadRampLevel } from './ramp.js';
 
 export { replySubject } from '../mail/reply-card.js';
 
@@ -70,7 +77,15 @@ export interface RaiseMailReplyOptions {
 
 export interface RaisedReply {
   replyJobId: string;
-  approvalId: string;
+  /**
+   * The card raised for the reply, or `null` when none was: a reply the
+   * assistant has LEARNED to send (dial `learn`, `email.reply` promoted to
+   * `auto_notify`, a sender the charter knows) goes straight to `execute`,
+   * and the gate's learned-reply exemption decides it when the plan runs
+   * (`policy/learned-reply.ts`, owner ruling H10). A re-raise always has a
+   * card.
+   */
+  approvalId: string | null;
 }
 
 /** The mail.send payload a reply job binds — `providerMessageId` is required by the send adapter. */
@@ -219,6 +234,35 @@ async function raiseReplyCard(
       throw new Error(`mail reply: payload classified as ${String(facts.actionClass)}, not email.reply`);
     }
     const risk = await assessRisk(facts, input.bundle);
+
+    // A reply the assistant has LEARNED to send goes without a card (owner
+    // ruling H10, spec §5.6). Every condition positive, and each one the
+    // gate re-checks on its own when the plan runs — this fork only decides
+    // whether to ASK; the gate decides whether it SENDS:
+    //   - not a re-raise: a send that failed after the owner's "yes" is
+    //     always asked again, never sent on the strength of a promotion;
+    //   - the dial is `learn`, and the CLAMPED ramp for `email.reply` is
+    //     `auto_notify` — the class was promoted;
+    //   - the risk band is `routine` — a sender the charter knows. A
+    //     stranger is first contact (`sensitive`) and still gets a card.
+    // The owner is still told the mail exists: the poll's own WhatsApp
+    // notice about it (`mail-poll.ts`) does not depend on a card, and the
+    // send itself produces an action update (`action-updates.ts`).
+    if (
+      input.retry === undefined &&
+      (await loadAutonomyMode({ businessId })) === 'learn' &&
+      (await loadRampLevel('email.reply', { businessId })) === 'auto_notify' &&
+      risk.band === 'routine'
+    ) {
+      await transition(job.jobId, {
+        to: 'execute',
+        actor: 'orchestrator',
+        reason: 'mail reply: learned, no card',
+        businessId,
+      });
+      await linkReplyJob(input.mailId, job.jobId, { businessId });
+      return { replyJobId: job.jobId, approvalId: null };
+    }
 
     const who = displayLine(input.displayName ?? '') || recipient;
     approvalId = await enqueueApproval(
@@ -434,7 +478,9 @@ export async function reraiseAfterFailedSend(
         { businessId, ...(options.notify !== undefined ? { notify: options.notify } : {}) },
       );
       result.reraised += 1;
-      result.approvalIds.push(raised.approvalId);
+      // A re-raise always has a card (`retry` is set), so this is never
+      // null; checked rather than asserted all the same.
+      if (raised.approvalId !== null) result.approvalIds.push(raised.approvalId);
     } catch {
       result.failed += 1;
       try {
