@@ -296,6 +296,12 @@ export async function evaluateAutonomy(
       // acting either way — and a mark raised while the dial sat there is not
       // lost, because the window below is "since the last move", not "since
       // the last pass".
+      //
+      // A mark recorded for a send that happened before a demotion already in
+      // effect has no further effect: `markCount` is consulted only while the
+      // class sits at `auto_notify`, and after a re-promotion its window
+      // starts after that mark. The class is already demoted, so the mark is
+      // not counted twice.
       if (level === EARNED_STEP.to) {
         // The period this pass may judge: since the last move if there was
         // one, and otherwise since the level itself was written — see
