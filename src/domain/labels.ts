@@ -8,10 +8,11 @@
  * enum is a compile error here until someone writes its Hebrew — the same
  * forcing `CURRENT_SCHEMA_VERSION` relies on for the charter.
  *
- * `auto_notify` deliberately does not promise a report. CLAUDE.md records that
- * the "notify" half was never built and the level is enforced exactly like
- * `auto`; a label saying "ומדווחת" would tell the owner something the code
- * does not do.
+ * `auto_notify` deliberately does not promise a report. The level is enforced
+ * exactly like `auto`, and the per-action update shadow mode added
+ * (`orchestrator/action-updates.ts`, 27/10) is tied to a step running with no
+ * card, not to this level — `auto` reports the same way. A label saying
+ * "ומדווחת" would single out one of two levels the code does not tell apart.
  */
 import type { ActionClass } from './action.js';
 import type { AutonomyLevel, TrustLevel } from './trust.js';

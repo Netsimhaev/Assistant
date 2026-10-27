@@ -91,9 +91,19 @@ export async function loadRampLevel(
   // The relaxing half is the only place in the system where a ceiling is
   // loosened, and it is safe for one reason, stated rather than assumed: the
   // ramp is one of five ceilings `effectiveAutonomy` combines by minimum, and
-  // two of them — the signed charter's cap for the class, and the provenance
-  // ceiling — are ALWAYS present. `ramp-floor.test.ts` proves it through a
-  // real gate decision, because a comment claiming it would not be a control.
+  // the signed charter's cap for the class is ALWAYS present.
+  // `ramp-floor.test.ts` proves it through a real gate decision, because a
+  // comment claiming it would not be a control.
+  //
+  // The provenance ceiling is present too, with two named exceptions in
+  // `policy/engine.ts`'s stage 8, both for a mailbox reply job only:
+  // `approvedReplyCovers` (`policy/approved-reply.ts`) drops it together with
+  // this ramp, for the exact bytes the owner approved; and
+  // `learnedReplyCovers` (`policy/learned-reply.ts`, owner ruling H10) drops
+  // it alone, and only when this function answered `auto_notify` for
+  // `email.reply` — i.e. only when the dial is `learn` and the class was
+  // promoted. Neither drops the charter's cap, which is why that one is the
+  // invariant this relaxation leans on.
   const bounds = rampBoundsForMode(await loadAutonomyMode({ ...options, db }));
   return clampToDial(stored, bounds);
 }
