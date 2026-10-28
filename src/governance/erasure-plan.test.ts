@@ -485,6 +485,125 @@ describe('buildErasurePlan', () => {
     expect(plan.memoryIds).toHaveLength(1);
   });
 
+  /**
+   * A name with a `"` in it — `בע"מ` is ordinary Hebrew — is stored inside a
+   * JSONB value as `\"`, and `jsonb::text` keeps the escape. So `plan::text
+   * ILIKE '%אלפא בע"מ%'` matched nothing, the job was never discovered, and
+   * the plan copy survived a contact erasure. Each JSONB arm must also match
+   * the unescaped string values (`jsonbContentMatches`).
+   */
+  describe('finds a contact whose name only appears JSON-escaped', () => {
+    const QUOTED = 'אלפא בע"מ';
+
+    it('the premise holds: the escaped text form does not match', async () => {
+      const { rows } = await getPool().query<{ m: boolean }>(
+        `SELECT $1::jsonb::text ILIKE $2 AS m`,
+        [JSON.stringify({ body: `לכבוד ${QUOTED}\nשלום` }), `%${QUOTED}%`],
+      );
+      expect(rows[0]?.m).toBe(false);
+    });
+
+    it('via job_plans.plan', async () => {
+      const jobId = await bareJob('quoted-plan');
+      await getPool().query(
+        `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
+         VALUES ($1, $2, 'h1', $3::jsonb)`,
+        [BUSINESS, jobId, JSON.stringify({ goal: 'send', steps: [{ input: { body: `לכבוד ${QUOTED}\nשלום` } }] })],
+      );
+
+      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    it('via approval_requests.proposed_input', async () => {
+      const jobId = await bareJob('quoted-approval');
+      await getPool().query(
+        `INSERT INTO approval_requests
+           (approval_id, business_id, job_id, action_class, summary, detail, risk,
+            proposed_tool, proposed_input, input_hash, expires_at)
+         VALUES ($1, $2, $3, 'email.reply', 'שליחת מייל', 'אישור', '{}', 'mail.send', $4, 'hash-q', $5)`,
+        [
+          `AP-${ulid()}`,
+          BUSINESS,
+          jobId,
+          JSON.stringify({ body: `שלום ${QUOTED}` }),
+          new Date(Date.now() + 3600_000).toISOString(),
+        ],
+      );
+
+      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    it('an orphan approval card (no job) is counted for deletion', async () => {
+      await getPool().query(
+        `INSERT INTO approval_requests
+           (approval_id, business_id, job_id, action_class, summary, detail, risk,
+            proposed_tool, proposed_input, input_hash, expires_at)
+         VALUES ($1, $2, NULL, 'email.reply', 'שליחת מייל', 'אישור', '{}', 'mail.send', $3, 'hash-o', $4)`,
+        [
+          `AP-${ulid()}`,
+          BUSINESS,
+          JSON.stringify({ body: `שלום ${QUOTED}` }),
+          new Date(Date.now() + 3600_000).toISOString(),
+        ],
+      );
+
+      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+
+      const item = plan.items.find((i) => i.table === 'approval_requests' && i.action === 'delete');
+      expect(item?.count).toBe(1);
+    });
+
+    it('via agent_envelopes.payload', async () => {
+      const jobId = await bareJob('quoted-envelope');
+      await getPool().query(
+        `INSERT INTO agent_envelopes
+           (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
+            kind, intent, payload, context_refs, context_refs_hash, constraints, hops,
+            idempotency_key, parent_job_id)
+         VALUES ($1, $2, $2, ARRAY['office.manager'], 'office.manager', 'ops.web',
+                 'help_request', 'lookup_contact', $3::jsonb, '[]'::jsonb, 'hash-env',
+                 '{}'::jsonb, 1, $4, $5)`,
+        [BUSINESS, `ENV-${ulid()}`, JSON.stringify({ lookFor: QUOTED }), `idem-${ulid()}`, jobId],
+      );
+
+      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    it('via verification_verdicts.verdict', async () => {
+      const jobId = await bareJob('quoted-verdict');
+      await getPool().query(
+        `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3::jsonb)`,
+        [BUSINESS, jobId, JSON.stringify({ note: `נבדק מול ${QUOTED}` })],
+      );
+
+      const plan = await buildErasurePlan({ kind: 'contact', identifier: QUOTED }, { businessId: BUSINESS });
+
+      expect(plan.jobIds).toContain(jobId);
+    });
+
+    it('still treats a wildcard inside a JSON string value as a literal', async () => {
+      const jobId = await bareJob('quoted-wild');
+      await getPool().query(
+        `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
+         VALUES ($1, $2, 'h1', $3::jsonb)`,
+        [BUSINESS, jobId, JSON.stringify({ steps: [{ input: { to: 'axb@nowhere.example' } }] })],
+      );
+
+      const plan = await buildErasurePlan(
+        { kind: 'contact', identifier: 'a_b@nowhere.example' },
+        { businessId: BUSINESS },
+      );
+
+      expect(plan.jobIds).not.toContain(jobId);
+    });
+  });
+
   it('treats a wildcard character in the anchor as a literal', async () => {
     const jobId = await jobAbout(RONIT, 'ronit');
     await writeMemory({ jobId, kind: 'chunk', subjectKey: 'c_1', body: { t: 'x' } }, { businessId: BUSINESS });

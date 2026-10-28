@@ -8,7 +8,7 @@
 ## פקודות
 
 ```bash
-npm test          # vitest run — 2922 מבחנים (2921 עוברים, 1 מדולג)
+npm test          # vitest run — 2929 מבחנים (2928 עוברים, 1 מדולג)
 npm run typecheck # tsc --noEmit
 npm run build     # tsc
 npm run migrate   # מריץ מיגרציות על DATABASE_URL
@@ -573,7 +573,7 @@ npm run ramp:set -- <מחלקה> <רמה>  # מעלה מחלקת פעולה מה
 **תקרת קריאות המסמכים שנגמרה מסתובבת על טיימר שטוח, ולא תוקן.** צעד `doc.fetch` של משימת-בת שמגיע לתקרה היומית (`DOCUMENT_READS_PER_DAY`, מונה שאינו אפס) זורק `StepChannelError` עם `retryable: true`, ו-`executeStep` מרדים אותו על ברירת המחדל השטוחה של חמש דקות — כ-288 העָרות ביום עד שהדדליין של המעטפת משחרר את ההורה. התיקון הכנה הוא להעיר בגבול היום הבא, וזה דורש ש-`StepChannelError` יישא `wakeAt` משלו — שינוי התנהגות במסלול הניסיון-החוזר בסוף ענף ירוק, ותקרה שנגמרה היא מצב נדיר. נרשם כאן במקום להיות מגולה מחדש; הקוד ב-[src/orchestrator/local-tools.ts](src/orchestrator/local-tools.ts) מפנה לכאן.
 
 **מצב הצל — ארבעה פריטים שנרשמו בסקירה ולא תוקנו (27/10).**
-- **גילוי איש קשר דרך `job_plans.plan::text ILIKE` מפספס שם שמכיל `"` או שבירת שורה (קדם לענף).** הצורה הטקסטואלית של JSONB מבריחה את שניהם, ולכן `אלפא בע"מ` אינו נמצא שם, והעותק שבתוכנית **שורד מחיקה** במקרה הזה — אלא אם מקור גילוי אחר (`action_updates.body`, `boss_instructions`, `jobs.title`) מביא את ה-job. המבחן `reaches an action update whose name only matches in plain text` ב-[src/governance/erasure-invariants.test.ts](src/governance/erasure-invariants.test.ts) נועל את המקור של `action_updates` ומאשר את ההנחה; התוכנית עצמה לא תוקנה.
+- **נסגר ב-28/10: גילוי איש קשר בעמודות JSONB פספס שם שמכיל `"` או שבירת שורה.** הצורה הטקסטואלית של JSONB (`col::text`) מבריחה את שניהם, ולכן `אלפא בע"מ` לא נמצא ב-`job_plans.plan`, ב-`approval_requests.proposed_input`/`edited_input` (כולל הכרטיס היתום), ב-`agent_envelopes.payload`, ב-`verification_verdicts.verdict`, ב-`memories.body` וב-`mail_messages.attachments` — והעותק **שרד מחיקה**. `jsonbContentMatches` ([src/governance/erasure-plan.ts](src/governance/erasure-plan.ts)) מתאים עכשיו בכל אחת מהעמודות האלה גם את ערכי המחרוזת **הלא-מוברחים** (`jsonb_path_query(col, 'strict $.**')`, צמתי `string` בלבד, `#>> '{}'`), לצד ההתאמה הישנה — כך שהגילוי רחב מקודם ולעולם לא צר ממנו, ובאותו פרמטר ובאותו `LIKE_ESCAPE`, ולכן הפרדיקטים המשותפים לתצוגה ולמבצע לא שינו את רשימת הפרמטרים שלהם. חמשת המבחנים תחת `finds a contact whose name only appears JSON-escaped` ב-[src/governance/erasure-plan.test.ts](src/governance/erasure-plan.test.ts) נפלו לפני התיקון ונופלים שוב כשהזרוע החדשה מוסרת. החריג היחיד: גילוי לפי **עוגן מסמך** ב-`job_plans` נשאר `plan::text ILIKE`, כי `documentId` הוא `DOC-<ulid>` שהמערכת יצרה ואין בו תו שדורש הברחה.
 - **`GET /autonomy/actions` מסמן `seen_at`.** בקשת GET שמשנה מצב: קליק חוצה-אתרים (עוגייה `SameSite=Lax` נשלחת בניווט עליון) יכול לנקות את סימון "חדש" בלי שהבעלים ראה דבר. השפעה נמוכה — רק הסימון, לא פעולה ולא נתון.
 - **שליחה נלמדת שהסתיימה `unknown` או נכשלה אינה מקבלת שורת `action_updates`.** העדכון נגזר מ-`listAutonomousActions`, שדורש צעד `completed` עם `performed = true`; הבעלים שומע על שליחה כזו רק דרך הכרטיס ש-`reraiseLearnedReplies` מרים — והוא כן אומר "ייתכן שהמייל כבר יצא" כשיש שורת `unknown`.
 - **מבחן תקציב הצרופות ב-`mail-poll.test.ts`** (`stops ingesting a mail's attachments once its time budget is spent…`) רגיש לתזמון ונכשל תחת עומס של הרצות מקבילות; לבדו הוא עובר. אדום ממנו בהרצה חופפת הוא התנגשות, לא נסיגה.

@@ -222,6 +222,31 @@ import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
 
 export { LIKE_ESCAPE };
 
+/**
+ * A contact LIKE pattern matched against a JSONB column, in BOTH of its forms.
+ *
+ * `jsonb::text` is the JSON serialisation, which escapes `"`, `\` and control
+ * characters inside string values. A name like `אלפא בע"מ` (`בע"מ` is ordinary
+ * Hebrew), or one stored next to a line break, is therefore `אלפא בע\"מ` in
+ * that text, and `col::text ILIKE '%אלפא בע"מ%'` matched nothing: the job was
+ * never discovered and the plan copy survived the erasure the owner asked for.
+ *
+ * The second arm walks every string value (`jsonb_path_query(..., 'strict
+ * $.**')`, keeping only `string` nodes) and matches each one UNESCAPED
+ * (`#>> '{}'`). The first arm is kept as it was, so the match is a superset of
+ * the old one — keys and numbers stay findable — and never narrower. The same
+ * `$n` pattern and `LIKE_ESCAPE` serve both arms, so a predicate that uses this
+ * keeps its parameter list unchanged in the preview and in the executor.
+ *
+ * `column` and `param` are code-written identifiers, never user input.
+ */
+export function jsonbContentMatches(column: string, param: string): string {
+  return `(coalesce(${column}::text, '') ILIKE ${param} ${LIKE_ESCAPE}
+      OR EXISTS (SELECT 1 FROM jsonb_path_query(${column}, 'strict $.**') AS jv(j)
+                  WHERE jsonb_typeof(jv.j) = 'string'
+                    AND jv.j #>> '{}' ILIKE ${param} ${LIKE_ESCAPE}))`;
+}
+
 export type ErasureAnchor =
   | { kind: 'contact'; identifier: string }
   | { kind: 'window'; fromIso: string; toIso: string }
@@ -325,8 +350,8 @@ const APPROVAL_REQUESTS_MATCHED = `business_id = $1
   AND (job_id = ANY ($2)
     OR (job_id IS NULL
         AND (($3::text IS NOT NULL
-              AND (coalesce(proposed_input::text, '') ILIKE $3 ${LIKE_ESCAPE}
-                OR coalesce(edited_input::text, '')  ILIKE $3 ${LIKE_ESCAPE}
+              AND (${jsonbContentMatches('proposed_input', '$3')}
+                OR ${jsonbContentMatches('edited_input', '$3')}
                 OR summary ILIKE $3 ${LIKE_ESCAPE}
                 OR detail  ILIKE $3 ${LIKE_ESCAPE}))
           OR ($4::timestamptz IS NOT NULL
@@ -590,11 +615,13 @@ export const VERIFICATION_VERDICTS_ERASED_PREDICATE = `business_id = $1 AND job_
  * her own — `recipient`, `subject` and `body` name the person the step was
  * addressed to. Job-anchored exactly like `autonomy_marks`, and paired the
  * same way: a closure target by `job_id` membership here, AND a discovery
- * source of its own in `buildErasurePlan`. The second half is not redundant
- * with `job_plans` discovery even though the values come from the step
- * payload: that query matches `plan::text`, JSONB's text form, which escapes
- * `"` and newlines — so `אלפא בע"מ` written plainly in `body` is found here
- * and nowhere else.
+ * source of its own in `buildErasurePlan`. The second half was added when the
+ * `job_plans` discovery matched only `plan::text`, JSONB's text form, which
+ * escapes `"` and newlines — so `אלפא בע"מ` written plainly in `body` was
+ * found here and nowhere else. `jsonbContentMatches` now matches the plan's
+ * unescaped string values too; this arm stays, because `body` is rendered
+ * text (label, recipient, subject) and need not be a substring of any single
+ * plan value.
  *
  * Parameters, in both places: `$1` businessId, `$2` jobIds.
  */
@@ -694,7 +721,7 @@ const MAIL_CONTENT_MATCHES = `(from_address ILIKE $2 ${LIKE_ESCAPE}
       OR subject ILIKE $2 ${LIKE_ESCAPE}
       OR coalesce(body_text, '')  ILIKE $2 ${LIKE_ESCAPE}
       OR coalesce(summary, '')    ILIKE $2 ${LIKE_ESCAPE}
-      OR attachments::text        ILIKE $2 ${LIKE_ESCAPE})`;
+      OR ${jsonbContentMatches('attachments', '$2')})`;
 
 /**
  * The `jobs` rows an erasure scrubs, and what gets emptied on them — as
@@ -818,7 +845,7 @@ export async function buildErasurePlan(
     for (const jobId of await idsFrom(
       db,
       `SELECT DISTINCT job_id FROM job_plans
-        WHERE business_id = $1 AND plan::text ILIKE $2 ${LIKE_ESCAPE}`,
+        WHERE business_id = $1 AND ${jsonbContentMatches('plan', '$2')}`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
@@ -883,7 +910,7 @@ export async function buildErasurePlan(
     for (const jobId of await idsFrom(
       db,
       `SELECT DISTINCT parent_job_id AS job_id FROM agent_envelopes
-        WHERE business_id = $1 AND payload::text ILIKE $2 ${LIKE_ESCAPE}`,
+        WHERE business_id = $1 AND ${jsonbContentMatches('payload', '$2')}`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
@@ -903,7 +930,7 @@ export async function buildErasurePlan(
     for (const jobId of await idsFrom(
       db,
       `SELECT DISTINCT job_id FROM verification_verdicts
-        WHERE business_id = $1 AND verdict::text ILIKE $2 ${LIKE_ESCAPE}`,
+        WHERE business_id = $1 AND ${jsonbContentMatches('verdict', '$2')}`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
@@ -915,8 +942,8 @@ export async function buildErasurePlan(
       db,
       `SELECT DISTINCT job_id FROM approval_requests
         WHERE business_id = $1 AND job_id IS NOT NULL
-          AND (coalesce(proposed_input::text, '') ILIKE $2 ${LIKE_ESCAPE}
-            OR coalesce(edited_input::text, '')  ILIKE $2 ${LIKE_ESCAPE}
+          AND (${jsonbContentMatches('proposed_input', '$2')}
+            OR ${jsonbContentMatches('edited_input', '$2')}
             OR summary ILIKE $2 ${LIKE_ESCAPE}
             OR detail  ILIKE $2 ${LIKE_ESCAPE})`,
       [businessId, pattern],
@@ -1174,7 +1201,7 @@ export async function buildErasurePlan(
           `SELECT memory_id FROM memories
             WHERE business_id = $1
               AND (subject_key = $2
-                OR body::text ILIKE $3 ${LIKE_ESCAPE}
+                OR ${jsonbContentMatches('body', '$3')}
                 OR coalesce(source_ref, '') ILIKE $3 ${LIKE_ESCAPE}
                 OR written_by_job = ANY ($4))`,
           [businessId, anchor.identifier, `%${likeLiteral(anchor.identifier)}%`, [...jobIds]],
