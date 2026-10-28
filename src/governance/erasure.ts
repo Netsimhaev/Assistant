@@ -34,6 +34,8 @@ import { canonicalHash } from '../util/canonical.js';
 import type { ErasureItem, ErasurePlan, ErasureRefusal } from './erasure-plan.js';
 import {
   ACTION_UPDATES_ERASED_PREDICATE,
+  INSTRUCTION_CONFIRMATIONS_ERASED_PREDICATE,
+  CONFIRMED_STEP_CLAIMS_ERASED_PREDICATE,
   AGENT_ENVELOPES_ERASED_PREDICATE,
   APPROVAL_REQUESTS_ERASED_PREDICATE,
   APPROVAL_REQUESTS_SCRUBBED_PREDICATE,
@@ -303,6 +305,18 @@ export async function executeErasure(
     await del(
       'action_updates',
       `DELETE FROM action_updates WHERE ${ACTION_UPDATES_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    // Migration 048's two tables, no foreign keys. Same predicates, same
+    // parameters, as `countItems` in `erasure-plan.ts`.
+    await del(
+      'instruction_confirmations',
+      `DELETE FROM instruction_confirmations WHERE ${INSTRUCTION_CONFIRMATIONS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    await del(
+      'confirmed_step_claims',
+      `DELETE FROM confirmed_step_claims WHERE ${CONFIRMED_STEP_CLAIMS_ERASED_PREDICATE}`,
       [businessId, jobIds],
     );
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);

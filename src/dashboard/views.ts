@@ -1422,6 +1422,11 @@ export const TABLE_LABELS: Record<string, string> = {
   // What the owner was told about a step the assistant performed on her own
   // (migration 047) — names the person the step was addressed to.
   action_updates: 'עדכונים על פעולות',
+  // The confirmation question a boss command asked, with every option
+  // (migration 048) — names the recipients and holds the full content.
+  instruction_confirmations: 'שאלות אישור להוראות',
+  // Which steps of a confirmed command were claimed to run (migration 048).
+  confirmed_step_claims: 'סימוני ביצוע של הוראות מאושרות',
   job_plans: 'תוכניות',
   job_authorizations: 'הרשאות',
   // A delegation request from one agent to another (migration 028).
