@@ -104,7 +104,7 @@ import { resolveContacts, type Ambiguity, type Resolution } from '../memory/cont
 import { recallForPlanning } from '../memory/recall-planning.js';
 import { classifyAction } from '../policy/classify.js';
 import { readEmails, readPhones } from '../policy/facts.js';
-import { stripBidiControls } from '../util/bidi.js';
+import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { renderConfirmationQuestion } from './command-echo.js';
@@ -379,7 +379,12 @@ export async function runInstruction(
     // confirmation. Anything else keeps today's identity question.
     const candidates = candidatesToPlan(resolution.ambiguities);
     if (candidates !== null) {
-      return planPerCandidate(door, candidates, [...addressesInText, ...resolution.subjects]);
+      return planPerCandidate(
+        door,
+        candidates,
+        [...addressesInText, ...resolution.subjects],
+        renderIdentityQuestion(resolution.ambiguities),
+      );
     }
 
     const question = renderIdentityQuestion(resolution.ambiguities);
@@ -649,12 +654,23 @@ function candidatesToPlan(ambiguities: readonly Ambiguity[]): Contact[] | null {
   return distinguishable ? candidates : null;
 }
 
-/** Name, then whatever tells this contact apart. Used for the option label and the planner's `resolvedContact`. */
+/**
+ * Name, then whatever tells this contact apart. Used for the option label and
+ * the planner's `resolvedContact`.
+ *
+ * **Every field is collapsed to one line (`toOneLine`).** These are memory
+ * bytes, and a row learned from a document is a stranger's words: a name
+ * carrying a line break and then `# ההוראה מבעל העסק` would otherwise open a
+ * line in the planner prompt that reads as a second instruction heading. The planner also
+ * fences the section (`buildPlannerPrompt`); this is the first of the two.
+ */
 function describeContact(contact: Contact): string {
-  const details = [contact.company, contact.email].filter(
-    (detail): detail is string => detail !== null,
-  );
-  return details.length === 0 ? contact.name : `${contact.name} (${details.join(' · ')})`;
+  const details = [contact.company, contact.email]
+    .filter((detail): detail is string => detail !== null)
+    .map(toOneLine)
+    .filter((detail) => detail !== '');
+  const name = toOneLine(contact.name);
+  return details.length === 0 ? name : `${name} (${details.join(' · ')})`;
 }
 
 /**
@@ -665,6 +681,11 @@ function describeContact(contact: Contact): string {
  * → today's behaviour: the first candidate's clarifying question if any
  * asked one, otherwise the first refusal.
  *
+ * Several plans none of which has a classified step → today's identity
+ * question (`identityQuestion`), job left in `understand`: a choice among
+ * plans that would each run without a question is not a confirmation of
+ * anything, and its echo would show nothing to choose between.
+ *
  * One instruction row, one job: the daily cap counts this once however many
  * planner calls it took (spec §10.9).
  */
@@ -672,6 +693,7 @@ async function planPerCandidate(
   door: DoorContext,
   candidates: readonly Contact[],
   baseSubjects: readonly string[],
+  identityQuestion: string,
 ): Promise<InstructionOutcome> {
   const options: ConfirmationOption[] = [];
   const seen = new Set<string>();
@@ -717,29 +739,17 @@ async function planPerCandidate(
   }
 
   if (options.length === 0) {
-    if (firstQuestion !== null) {
-      try {
-        await recordQuestion(door.instruction.instructionId, firstQuestion, {
-          businessId: door.businessId,
-        });
-      } catch {
-        // Swallowed by design, as on the single-plan path.
-      }
-      return {
-        status: 'needs_answer',
-        jobId: door.jobId,
-        instructionId: door.instruction.instructionId,
-        question: firstQuestion,
-        instructionText: door.instruction.text,
-        identityNote: null,
-      };
-    }
+    if (firstQuestion !== null) return askOwner(door, firstQuestion);
     const refusal = firstRefusal ?? {
       reason: 'לא הצלחתי לבנות תוכנית.',
       audit: 'instruction door: no candidate produced a plan',
     };
     await failJob(door, refusal.audit);
     return { status: 'refused', reason: refusal.reason };
+  }
+
+  if (!options.some((option) => needsConfirmation(option.plan))) {
+    return askOwner(door, identityQuestion);
   }
 
   const rendered = renderConfirmationQuestion(options);
@@ -757,6 +767,28 @@ async function planPerCandidate(
     businessId: door.businessId,
   });
   return askAndPark(door, options, rendered.text, null);
+}
+
+/**
+ * Park the job in `understand` on a question and return it (`needs_answer`).
+ * The question is written down best-effort, exactly as on the single-plan
+ * path: the job is already parked and the instruction row already exists, so
+ * a failed UPDATE must not turn a question into a failed instruction.
+ */
+async function askOwner(door: DoorContext, question: string): Promise<InstructionOutcome> {
+  try {
+    await recordQuestion(door.instruction.instructionId, question, { businessId: door.businessId });
+  } catch {
+    // Swallowed by design — see above.
+  }
+  return {
+    status: 'needs_answer',
+    jobId: door.jobId,
+    instructionId: door.instruction.instructionId,
+    question,
+    instructionText: door.instruction.text,
+    identityNote: null,
+  };
 }
 
 /**

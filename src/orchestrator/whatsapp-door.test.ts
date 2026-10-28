@@ -1402,7 +1402,7 @@ describe('a recording is not typing', () => {
     return rows.map((row) => row.text_origin);
   }
 
-  it('plans a voice note but authorises nobody from it, and tells the owner why', async () => {
+  it('plans a voice note but authorises nobody from it, and the question names the recipient', async () => {
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
     gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER }));

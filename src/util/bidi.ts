@@ -67,3 +67,25 @@ export function markInvisibleControls(value: string): string {
     (ch) => `⟦U+${(ch.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}⟧`,
   );
 }
+
+/**
+ * Every control character (all of Cc, TAB included) and every line or
+ * paragraph separator. Used by `toOneLine`; written as explicit ranges for
+ * the same reason as the sets above.
+ */
+const LINE_BREAKING_CONTROLS = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]+/gu;
+
+/**
+ * Collapse a value to ONE line: bidi controls stripped, every control
+ * character and line break replaced by a single space, whitespace runs
+ * squeezed, ends trimmed. For a stranger's bytes placed into a prompt beside
+ * trusted text (boss command, `PlanRequest.resolvedContact`): a value that
+ * cannot contain a line break cannot open a line of its own, such as a forged
+ * `#` heading.
+ */
+export function toOneLine(value: string): string {
+  return stripBidiControls(value)
+    .replace(LINE_BREAKING_CONTROLS, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
