@@ -10,6 +10,25 @@
  * statement, that the chosen hash is one of the presented options, so a hash
  * the owner was never shown can never become the confirmed one.
  *
+ * **A question is answerable only while it is fresh — checked in the same
+ * UPDATE.** `confirmChoice` requires `presented_at` to be inside the question
+ * window (`config.whatsappQuestionWindowMinutes`, the setting `openMailCards`
+ * reads) as a positive condition of that one statement. Expiry by sweep alone
+ * would leave the gap between sweeps open, and the gate's 24-hour check
+ * measures `decided_at`, so a question presented weeks ago and confirmed now
+ * would otherwise look fresh. A window of `0` means what it means for
+ * `openMailCards` — nothing is open — so every confirm is refused and
+ * `expireConfirmations` expires every pending row.
+ *
+ * **One clock: the database's.** `presented_at` is written by `DEFAULT now()`,
+ * and every comparison and every `decided_at` uses the same `now()`; the app
+ * clock never meets the stored one.
+ *
+ * **The hash is the store's, not the caller's.** `createConfirmation`
+ * computes `planHashOf` for each option itself and refuses a supplied hash
+ * that disagrees, or two options with the same hash — the hash is what the
+ * gate later binds and exempts, so it must name exactly the plan presented.
+ *
  * **Claims are the exactly-once half.** The gate exemption that reads a
  * confirmed row is a read; on its own it cannot stop a second run after a
  * crash between the adapter returning and the completion being recorded.
@@ -27,6 +46,7 @@ import type { Queryable } from '../db/pool.js';
 import { getPool } from '../db/pool.js';
 import { config } from '../config.js';
 import { Plan } from '../domain/plan.js';
+import { planHashOf } from '../orchestrator/plan-store.js';
 
 export const ConfirmationOption = z.object({
   label: z.string(),
@@ -108,6 +128,17 @@ export async function createConfirmation(
 ): Promise<void> {
   const db = options.db ?? getPool();
   const parsed = ConfirmationOptions.min(1).parse(input.options);
+  const seen = new Set<string>();
+  for (const option of parsed) {
+    const computed = planHashOf(option.plan);
+    if (option.planHash !== computed) {
+      throw new Error(`confirmation option planHash does not match its plan (${option.planHash} != ${computed})`);
+    }
+    if (seen.has(computed)) {
+      throw new Error(`confirmation options repeat the same plan (${computed})`);
+    }
+    seen.add(computed);
+  }
   await db.query(
     `INSERT INTO instruction_confirmations
        (business_id, job_id, options, presented_text, channel, reask_of)
@@ -142,21 +173,25 @@ export async function loadConfirmation(
 /**
  * Flip a pending row to `confirmed` with the chosen plan. `true` only for the
  * call that flipped it; `false` for an unknown job, a row that is no longer
- * pending, or a hash that is not among the presented options.
+ * pending, a question presented outside the window, or a hash that is not
+ * among the presented options. A window of `0` or less refuses every confirm.
  */
 export async function confirmChoice(
   jobId: string,
   planHash: string,
   decidedBy: string,
-  options: Scope,
+  options: Scope & { windowMinutes?: number },
 ): Promise<boolean> {
+  const windowMinutes = options.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  if (windowMinutes <= 0) return false;
   const db = options.db ?? getPool();
   const result = await db.query(
     `UPDATE instruction_confirmations
         SET state = 'confirmed', chosen_plan_hash = $3, decided_at = now(), decided_by = $4
       WHERE business_id = $1 AND job_id = $2 AND state = 'pending'
+        AND presented_at > now() - make_interval(mins => $5)
         AND options @> jsonb_build_array(jsonb_build_object('planHash', $3::text))`,
-    [options.businessId, jobId, planHash, decidedBy],
+    [options.businessId, jobId, planHash, decidedBy, windowMinutes],
   );
   return result.rowCount === 1;
 }
@@ -178,30 +213,29 @@ export async function cancelConfirmation(
 }
 
 /**
- * Expire every pending row presented longer ago than the window, and return
- * their job ids.
+ * Expire every pending row presented at or before the window's start, and
+ * return their job ids — the exact complement of what `confirmChoice` still
+ * accepts.
  *
  * The window is `config.whatsappQuestionWindowMinutes` unless overridden, the
- * same setting and the same reading as `openMailCards`: `0` means nothing is
- * ever expired here (the setting is a switch, not a broken value).
+ * same setting and the same reading as `openMailCards`: `0` (or less) means no
+ * question is open, so every pending row of the business expires. Measured on
+ * the database clock (`now()`), the clock that wrote `presented_at`.
  */
 export async function expireConfirmations(options: {
   businessId: string;
-  now?: Date;
   windowMinutes?: number;
   db?: Queryable;
 }): Promise<string[]> {
   const windowMinutes = options.windowMinutes ?? config.whatsappQuestionWindowMinutes;
-  if (windowMinutes <= 0) return [];
   const db = options.db ?? getPool();
-  const now = options.now ?? new Date();
   const { rows } = await db.query<{ job_id: string }>(
     `UPDATE instruction_confirmations
-        SET state = 'expired', decided_at = $2
+        SET state = 'expired', decided_at = now()
       WHERE business_id = $1 AND state = 'pending'
-        AND presented_at < $2::timestamptz - make_interval(mins => $3)
+        AND ($2 <= 0 OR presented_at <= now() - make_interval(mins => $2))
       RETURNING job_id`,
-    [options.businessId, now, windowMinutes],
+    [options.businessId, windowMinutes],
   );
   return rows.map((row) => row.job_id).sort();
 }
