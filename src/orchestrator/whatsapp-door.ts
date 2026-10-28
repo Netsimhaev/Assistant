@@ -168,7 +168,7 @@ import {
 export interface DoorResult {
   /** However many messages `pollOnce` delivered to this pass, redeliveries included. */
   polled: number;
-  /** Reached `runInstruction` and came back `'planned'` or `'needs_answer'` — a job exists. */
+  /** Reached `runInstruction` and came back `'planned'`, `'needs_answer'` or `'needs_confirmation'` — a job exists. */
   instructed: number;
   /** From anyone but the one authorised sender. Stored, answered to no one. */
   recordedOnly: number;
@@ -293,6 +293,13 @@ const RECORDING_TOO_LARGE =
 function composeAck(outcome: InstructionOutcome): string {
   if (outcome.status === 'refused') return outcome.reason;
   if (outcome.status === 'needs_answer') return outcome.question;
+  // Boss command (spec §4): the confirmation question IS the ack — the owner
+  // answers it in this chat. Minimal for now; the full UX is a later task.
+  if (outcome.status === 'needs_confirmation') {
+    return outcome.identityNote === null
+      ? outcome.question
+      : [outcome.question, outcome.identityNote].join('\n\n');
+  }
   const parts = [PLANNED_ACK];
   if (outcome.grantNote !== null) parts.push(outcome.grantNote);
   // The owner's ruling of 05/10/2026, second half: an address that came only
@@ -735,6 +742,9 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         // own. Computed above, from the media kind and the joined half's
         // stored origin.
         textOrigin,
+        // The door this message came through: a confirmation question is
+        // answered where it was asked (boss command, spec §4).
+        channel: 'whatsapp',
         // Spec §7.2, and the same value the dashboard's answer route passes:
         // this is the second pass over the same chain, so the identity
         // question is suppressed even if a name is still ambiguous. The

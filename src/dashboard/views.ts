@@ -1311,6 +1311,8 @@ export function renderInstruct(options: {
   grantNote?: string | null;
   recordingNote?: string | null;
   identityNote?: string | null;
+  /** A boss command waiting on the owner's confirmation (spec §4), shown whole. */
+  confirmationQuestion?: string | null;
 }): string {
   const error =
     options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
@@ -1339,6 +1341,15 @@ export function renderInstruct(options: {
   const identityNote =
     options.identityNote == null ? '' : `<p class="muted">${escLabel(options.identityNote)}</p>`;
 
+  // `escLabel`, not `esc`: the question quotes plan values that can carry a
+  // stranger's bytes (an address from memory, a body). `pre-wrap` keeps the
+  // echo's line structure — its continuation margin is what stops a value's
+  // line from passing for a line of the question.
+  const confirmationQuestion =
+    options.confirmationQuestion == null
+      ? ''
+      : `<p class="confirm" style="white-space: pre-wrap">${escLabel(options.confirmationQuestion)}</p>`;
+
   const pending =
     options.pending == null
       ? ''
@@ -1350,6 +1361,7 @@ export function renderInstruct(options: {
      ${error}
      ${grantNote}
      ${recordingNote}
+     ${confirmationQuestion}
      ${identityNote}
      ${pending}
      <form method="POST" action="/instruct">

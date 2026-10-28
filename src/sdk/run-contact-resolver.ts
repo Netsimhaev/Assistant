@@ -179,6 +179,12 @@ function reportOutcome(outcome: Awaited<ReturnType<typeof runInstruction>>): voi
     // for text that came from a recording, which no run here produces.
     console.log(`recordingNote: ${outcome.recordingNote ?? '—'}`);
     console.log(`identityNote: ${outcome.identityNote ?? '—'}`);
+  } else if (outcome.status === 'needs_confirmation') {
+    console.log(`job:    ${outcome.jobId} · options: ${outcome.optionCount}`);
+    console.log('');
+    console.log('--- שאלת האישור ---');
+    console.log(outcome.question);
+    console.log(`identityNote: ${outcome.identityNote ?? '—'}`);
   } else {
     console.log(`reason: ${outcome.reason}`);
   }
@@ -243,7 +249,7 @@ async function main(): Promise<void> {
   // (see `RunInstructionOptions`), so a script is made to state it too.
   const outA = await runInstruction(
     { text: textA },
-    { businessId: BUSINESS, textOrigin: 'typed', planner: spyA.planner },
+    { businessId: BUSINESS, textOrigin: 'typed', channel: 'dashboard', planner: spyA.planner },
   );
   console.log(`\n(${((Date.now() - startedA) / 1000).toFixed(1)}s)`);
   reportOutcome(outA);
@@ -259,7 +265,7 @@ async function main(): Promise<void> {
 
   const outB = await runInstruction(
     { text: textB },
-    { businessId: BUSINESS, textOrigin: 'typed', planner: forbiddenPlanner },
+    { businessId: BUSINESS, textOrigin: 'typed', channel: 'dashboard', planner: forbiddenPlanner },
   );
   reportOutcome(outB);
   console.log('');
@@ -278,7 +284,7 @@ async function main(): Promise<void> {
   const startedC = Date.now();
   const outC = await runInstruction(
     { text: textC },
-    { businessId: BUSINESS, textOrigin: 'typed', identityAsked: true, planner: spyC.planner },
+    { businessId: BUSINESS, textOrigin: 'typed', channel: 'dashboard', identityAsked: true, planner: spyC.planner },
   );
   console.log(`\n(${((Date.now() - startedC) / 1000).toFixed(1)}s)`);
   reportOutcome(outC);

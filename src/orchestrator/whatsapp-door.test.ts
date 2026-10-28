@@ -94,6 +94,31 @@ function mailPlan(overrides: Partial<Plan> = {}): Plan {
   };
 }
 
+/**
+ * A plan of reads only — no classified step, so it runs without a
+ * confirmation question (boss command, spec §10.4). For tests whose subject
+ * is the door itself rather than what a side-effecting plan now waits for.
+ */
+function recallPlan(): Plan {
+  return {
+    goal: 'להיזכר',
+    assumptions: [],
+    clarifyingQuestion: null,
+    estimatedCostMinor: 0,
+    steps: [
+      {
+        id: 's1',
+        agent: 'comms.email',
+        intent: 'להיזכר',
+        toolName: 'memory.recall',
+        input: { subjectKey: 'dana@example.com' },
+        dependsOn: [],
+        expectedActionClass: null,
+      },
+    ],
+  };
+}
+
 const plannedWith = (plan: Plan) => async (): Promise<PlanOutcome> => ({ status: 'planned', plan });
 
 /** Proves a branch never reaches the planner at all — see `recordInbound`'s dedupe note below. */
@@ -188,7 +213,10 @@ describe('runWhatsAppDoor', () => {
       gateway,
       messenger,
       businessId: BUSINESS,
-      planner: plannedWith(mailPlan()),
+      // Reads only, so the job goes straight to `execute` as before; a
+      // side-effecting plan now parks on a confirmation question (see the
+      // boss-command tests at the end of this file).
+      planner: plannedWith(recallPlan()),
     });
 
     expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, malformedSenderCount: 0 });
@@ -415,6 +443,18 @@ describe('runWhatsAppDoor', () => {
       },
       { businessId: BUSINESS },
     );
+    // Four in all, so the identity question itself is asked: two or three
+    // distinguishable candidates are planned one by one instead (boss
+    // command, spec §4.2).
+    for (const [key, name, company] of [
+      ['ronit-mizrahi-delta', 'רונית מזרחי', 'דלתא דפוס'],
+      ['ronit-peretz-omega', 'רונית פרץ', 'אומגה שיווק'],
+    ] as const) {
+      await writeMemory(
+        { jobId: seedJob.jobId, kind: 'entity', subjectKey: key, body: { name, company } },
+        { businessId: BUSINESS },
+      );
+    }
 
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
@@ -1385,14 +1425,16 @@ describe('a recording is not typing', () => {
     // path and the owner sees a card before anything reaches dana.
     expect(await grants()).toHaveLength(0);
 
-    // One message, as ruling 4 requires — the transcript, the
-    // acknowledgement and this notice all ride together.
+    // One message, as ruling 4 requires — the transcript and the
+    // acknowledgement ride together. The acknowledgement of a side-effecting
+    // plan is now the confirmation question (boss command, spec §4), which
+    // names the recipient and asks for the owner's explicit word — the
+    // half of ruling 2 the recording note used to carry.
     expect(messenger.sentTexts).toHaveLength(1);
     const ack = messenger.sentTexts[0] ?? '';
     expect(ack).toContain('שמעתי:');
-    expect(ack).toContain('הקלטה');
     expect(ack).toContain('dana@example.com');
-    expect(ack).toContain('אישור מפורש');
+    expect(ack).toContain('לאישור');
   });
 
   it('treats a typed WhatsApp message as the owner own bytes', async () => {
@@ -1464,6 +1506,111 @@ describe('a recording is not typing', () => {
     // inherits its origin because one half of it was never typed.
     expect(await storedOrigins()).toEqual(['transcribed', 'transcribed']);
     expect(await grants()).toHaveLength(0);
-    expect(messenger.sentTexts[1] ?? '').toContain('הקלטה');
+    // The owner is asked before anything reaches dana (spec §4).
+    expect(messenger.sentTexts[1] ?? '').toContain('לאישור');
+  });
+});
+
+/**
+ * Boss command (spec 2026-10-28, §4): the WhatsApp door's minimal handling of
+ * a side-effecting instruction — the confirmation question is the ack — and
+ * spec §10.9's rule that one instruction counts once against the daily cap,
+ * however many candidate plans it took.
+ */
+describe('a side-effecting instruction over WhatsApp', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    await withCharter();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  async function instructionRowsToday(): Promise<number> {
+    const { rows } = await getPool().query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM audit_log WHERE business_id = $1 AND kind = 'whatsapp_instruction'`,
+      [BUSINESS],
+    );
+    return Number(rows[0]?.n ?? '0');
+  }
+
+  it('acknowledges with the confirmation question and parks the job', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    const msg = textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' });
+    gateway.enqueue(msg);
+
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan()),
+    });
+
+    expect(result.instructed).toBe(1);
+    const ack = messenger.sentTexts[0] ?? '';
+    expect(ack).toContain('dana@example.com');
+    expect(ack).toContain('לאישור');
+
+    const jobs = await openJobs(BUSINESS);
+    expect(jobs).toHaveLength(1);
+    const { rows } = await getPool().query<{ phase: string; channel: string }>(
+      `SELECT j.phase, c.channel FROM jobs j
+         JOIN instruction_confirmations c ON c.job_id = j.job_id
+        WHERE j.job_id = $1`,
+      [jobs[0]?.jobId],
+    );
+    expect(rows[0]?.phase).toBe('plan');
+    expect(rows[0]?.channel).toBe('whatsapp');
+    expect((await messageRow(msg.providerMessageId))?.state).toBe('handled');
+  });
+
+  it('counts one instruction once against the daily cap, however many candidates were planned', async () => {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    for (const [key, name, email] of [
+      ['ronit-cohen', 'רונית כהן', 'ronit@beta-log.example'],
+      ['ronit-levi', 'רונית לוי', 'ronit.levi@gamma.example'],
+    ] as const) {
+      await writeMemory(
+        { jobId: seedJob.jobId, kind: 'entity', subjectKey: key, body: { name, email } },
+        { businessId: BUSINESS },
+      );
+    }
+
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית את ההצעה' }));
+
+    let calls = 0;
+    const base = mailPlan().steps[0];
+    if (base === undefined) throw new Error('unreachable');
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async (request) => {
+        calls += 1;
+        const to = request.resolvedContact?.includes('gamma')
+          ? 'ronit.levi@gamma.example'
+          : 'ronit@beta-log.example';
+        return {
+          status: 'planned',
+          plan: mailPlan({ steps: [{ ...base, input: { to, subject: 'נושא', body: 'גוף' } }] }),
+        };
+      },
+    });
+
+    // Two planner calls really happened — one per candidate — and still one
+    // row against the cap.
+    expect(calls).toBe(2);
+    expect(await instructionRowsToday()).toBe(1);
+    expect(messenger.sentTexts[0] ?? '').toContain('למי התכוונת?');
   });
 });

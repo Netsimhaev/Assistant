@@ -1,6 +1,20 @@
 /**
  * The instruction door's pipeline: text in, a bound plan out.
  *
+ * **A plan with a side effect does not go straight to `execute` (boss
+ * command, spec 2026-10-28).** When any step is a classified action
+ * (`classifyAction(...) !== null`, §10.4) the plan is bound and the job is
+ * PARKED in `plan` — inert, since `runDueJobs` takes only `execute` (§10.1) —
+ * beside a pending `instruction_confirmations` row, and the confirmation
+ * question is returned (`needs_confirmation`). A plan of reads only runs as
+ * before. When a name fits two or three distinguishable contacts, each
+ * candidate is planned separately with its identity in
+ * `PlanRequest.resolvedContact` — never appended to `instruction`, which
+ * stays the stored text byte for byte — and the owner's pick among the plans
+ * is the confirmation, so nothing is bound until he picks (§4.2, §10.6,
+ * §10.9). The catalogue on this path is rendered at `auto` (§10.10): the
+ * question, not the planner's caution, is the control.
+ *
  * `provenance: 'boss'` is set here and is not a field on the input. A caller
  * able to ask for a provenance would be a caller able to forge an instruction,
  * and the whole authority of this path rests on the session that reached it —
@@ -66,7 +80,13 @@ import { getPool } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { ActionClass } from '../domain/action.js';
 import { planProblems, type Plan } from '../domain/plan.js';
+import type { PolicyBundle } from '../domain/policy.js';
 import { grantAuthorization } from '../governance/authorization.js';
+import {
+  createConfirmation,
+  type ConfirmationChannel,
+  type ConfirmationOption,
+} from '../governance/instruction-confirmations.js';
 import {
   MAX_INSTRUCTION_CHARS,
   recordQuestion,
@@ -79,15 +99,17 @@ import {
   recipientsOnlyInRecording,
   type InstructionTextOrigin,
 } from '../governance/typed-recipients.js';
-import { listContacts } from '../memory/contacts.js';
+import { listContacts, type Contact } from '../memory/contacts.js';
 import { resolveContacts, type Ambiguity, type Resolution } from '../memory/contact-resolver.js';
 import { recallForPlanning } from '../memory/recall-planning.js';
+import { classifyAction } from '../policy/classify.js';
 import { readEmails, readPhones } from '../policy/facts.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
+import { renderConfirmationQuestion } from './command-echo.js';
 import { createJob, transition } from './jobs.js';
-import { bindPlanToJob } from './plan-store.js';
+import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { classMismatch } from './run-plan.js';
 
 export interface RunInstructionOptions {
@@ -119,6 +141,14 @@ export interface RunInstructionOptions {
    * (`InstructionRecord.textOrigin`), positively.
    */
   textOrigin: InstructionTextOrigin;
+  /**
+   * The door the instruction arrived through — **required, no default**,
+   * for the same reason `textOrigin` is. A plan with a side effect parks on a
+   * confirmation question (boss command, spec §4), and the question is
+   * answered in the channel it was asked in; a door that said nothing would
+   * leave the question with nowhere to be answered.
+   */
+  channel: ConfirmationChannel;
   businessId?: string;
   /** The one step that costs money, injectable so the pipeline can be tested without an API key. */
   planner?: (request: PlanRequest) => Promise<PlanOutcome>;
@@ -216,6 +246,28 @@ export type InstructionOutcome =
        */
       identityNote: string | null;
     }
+  | {
+      /**
+       * Boss command, spec §4: the plan has at least one classified step, so
+       * the job is parked in `plan` (§10.1) beside a pending
+       * `instruction_confirmations` row and nothing runs until the owner
+       * answers. With one option the plan is already bound; with several
+       * (one per candidate contact, §4.2) nothing is bound until he picks.
+       */
+      status: 'needs_confirmation';
+      jobId: string;
+      /** Exactly the text stored as the row's `presented_text`. */
+      question: string;
+      optionCount: number;
+      /**
+       * The same fact as on `planned`: a name stayed ambiguous after an
+       * answer, so the plan was made without that person's memory. Carried
+       * here too, because a side-effecting instruction now ends on this
+       * outcome instead of `planned`, and dropping the note would silence
+       * spec §7.2's "ומציינת זאת" for exactly those instructions.
+       */
+      identityNote: string | null;
+    }
   | { status: 'refused'; reason: string };
 
 export async function runInstruction(
@@ -295,9 +347,11 @@ export async function runInstruction(
   // scopes the memory block, exactly as it did before the origin rule. The
   // only thing a recording stops buying is who may be contacted.
   const addressesInText = emailAddressesIn(input.text);
+  let contacts: Contact[] = [];
   let resolution: Resolution = { subjects: [], ambiguities: [] };
   try {
-    resolution = resolveContacts(input.text, await listContacts({ businessId }));
+    contacts = await listContacts({ businessId });
+    resolution = resolveContacts(input.text, contacts);
   } catch {
     // A failed contact read degrades to no memory, never to a failed
     // instruction — the same trade the recall below already makes. Spec §10
@@ -306,11 +360,28 @@ export async function runInstruction(
     // thing from recognising somebody ambiguously.
   }
 
-  // Spec §6: more than one person fits the name, so nothing is planned and
-  // nothing is sent until the owner says which. Asked once per chain (§7.2):
-  // after an answer has come back, an unresolved name proceeds without memory
-  // rather than asking again.
+  const door: DoorContext = {
+    businessId,
+    jobId: job.jobId,
+    instruction,
+    planner,
+    channel: options.channel,
+    textOrigin,
+    bundle: active.bundle,
+  };
+
+  // Spec §6: more than one person fits the name, so nothing is sent until the
+  // owner says which. Asked once per chain (§7.2): after an answer has come
+  // back, an unresolved name proceeds without memory rather than asking again.
   if (resolution.ambiguities.length > 0 && options.identityAsked !== true) {
+    // Boss command, spec §4.2: a small, distinguishable set of candidates is
+    // planned once each, and the owner's choice among the plans IS the
+    // confirmation. Anything else keeps today's identity question.
+    const candidates = candidatesToPlan(resolution.ambiguities);
+    if (candidates !== null) {
+      return planPerCandidate(door, candidates, [...addressesInText, ...resolution.subjects]);
+    }
+
     const question = renderIdentityQuestion(resolution.ambiguities);
     try {
       await recordQuestion(instruction.instructionId, question, { businessId });
@@ -341,68 +412,9 @@ export async function runInstruction(
       ? renderIdentityNote(resolution.ambiguities.map((ambiguity) => ambiguity.token))
       : null;
 
-  const subjects = [...addressesInText, ...resolution.subjects];
+  const checked = await planAndCheck(door, [...addressesInText, ...resolution.subjects], undefined);
 
-  // A failed recall degrades to no memory block rather than failing the
-  // instruction — planning without the past is worse than planning with it,
-  // but not planning at all because a read failed is worse than both. Unlike
-  // the planner call below, which throws for the ordinary failure mode of a
-  // real call and must fail the job because there is no plan without it,
-  // this one has a safe fallback and takes it instead.
-  let memoryBlock = '';
-  try {
-    memoryBlock = await recallForPlanning(subjects, { businessId });
-  } catch {
-    memoryBlock = '';
-  }
-
-  let outcome: PlanOutcome;
-  try {
-    outcome = await planner({
-      bundle: active.bundle,
-      intents: [],
-      instruction: input.text,
-      provenance: 'boss',
-      // The plan does not exist yet, so there is no per-class ramp to take a
-      // minimum over. `draft_only` is what the catalogue is rendered against —
-      // deliberately the floor, so the planner is never shown a capability the
-      // gate would refuse. `rampLevelForPlan` is applied to the real plan by
-      // `runDueJobs` when it runs.
-      rampLevel: 'draft_only',
-      ...(memoryBlock === '' ? {} : { memoryBlock }),
-    });
-  } catch (err) {
-    // `makePlan` returns `{status:'unparseable'}` for bad model OUTPUT, but it
-    // THROWS for the ordinary failure mode of a network call — a missing API
-    // key, an HTTP error, a transport drop. Left uncaught, that throw leaves
-    // the job sitting in `understand`, a phase nothing in production reads,
-    // forever. The handler below this one already covers a clean refusal;
-    // this one covers the call never returning one at all.
-    const message = err instanceof Error ? err.message : String(err);
-    await transition(job.jobId, {
-      to: 'failed',
-      actor: 'orchestrator',
-      reason: `instruction door: planner threw (${message})`,
-      businessId,
-    });
-    return { status: 'refused', reason: 'קריאת המתכנן נכשלה ולא הצלחתי לבנות תוכנית.' };
-  }
-
-  if (outcome.status !== 'planned') {
-    await transition(job.jobId, {
-      to: 'failed',
-      actor: 'orchestrator',
-      reason: `instruction door: ${outcome.reason}`,
-      businessId,
-    });
-    return { status: 'refused', reason: 'לא הצלחתי להבין את ההוראה מספיק כדי לבנות תוכנית.' };
-  }
-
-  const plan = outcome.plan;
-
-  // A question is not a plan. The job stops here and waits, and nothing is
-  // bound or granted — see spec §8.
-  if (plan.clarifyingQuestion !== null) {
+  if (checked.kind === 'question') {
     // Written down before the answer is returned, so the question outlives
     // the HTTP response that carries it (I3). Until this line the question
     // existed only in that response: a reload orphaned the job in
@@ -416,7 +428,7 @@ export async function runInstruction(
     // lists it regardless — with `QUESTION_UNAVAILABLE` in place of the text
     // that failed to save (`src/dashboard/views.ts`).
     try {
-      await recordQuestion(instruction.instructionId, plan.clarifyingQuestion, { businessId });
+      await recordQuestion(instruction.instructionId, checked.question, { businessId });
     } catch {
       // Swallowed by design — see above.
     }
@@ -424,7 +436,7 @@ export async function runInstruction(
       status: 'needs_answer',
       jobId: job.jobId,
       instructionId: instruction.instructionId,
-      question: plan.clarifyingQuestion,
+      question: checked.question,
       instructionText: instruction.text,
       // Carried, unlike the identity question's own return above: this
       // question is the PLANNER's, about something else entirely, and it is
@@ -436,15 +448,130 @@ export async function runInstruction(
     };
   }
 
+  if (checked.kind === 'refused') {
+    await failJob(door, checked.audit);
+    return { status: 'refused', reason: checked.reason };
+  }
+
+  return finishSingle(door, {
+    plan: checked.plan,
+    label: SINGLE_OPTION_LABEL,
+    contactSource: contactSourceOf(
+      contacts.filter((contact) =>
+        contact.subjectKeys.some((key) => resolution.subjects.includes(key)),
+      ),
+    ),
+    identityNote,
+  });
+}
+
+/** Everything one instruction's planning passes share. */
+interface DoorContext {
+  businessId: string;
+  jobId: string;
+  instruction: InstructionRecord;
+  planner: (request: PlanRequest) => Promise<PlanOutcome>;
+  channel: ConfirmationChannel;
+  textOrigin: InstructionTextOrigin;
+  bundle: PolicyBundle;
+}
+
+/**
+ * The label of a single-option question. Fixed text rather than the plan's
+ * `goal`: the goal is model output, and the line the owner reads above the
+ * echo must not be something the planner chose to say about its own plan.
+ */
+const SINGLE_OPTION_LABEL = 'לבצע את הפעולות הבאות?';
+
+/** The most candidates planned separately; past this, the identity question stays (spec §4.2). */
+const MAX_PLANNED_CANDIDATES = 3;
+
+type CheckedPlan =
+  | { kind: 'plan'; plan: Plan }
+  | { kind: 'question'; question: string }
+  /** `reason` is the owner's Hebrew sentence; `audit` the English `job_steps.reason`. */
+  | { kind: 'refused'; reason: string; audit: string };
+
+/**
+ * One planner call and the validation chain every plan from this door goes
+ * through — the same chain whether the plan is the only one or one of several
+ * candidates (spec §10.9). Pure apart from the recall read and the planner
+ * call: no transition, no binding, no grant; the caller decides what a
+ * refusal does to the job.
+ */
+async function planAndCheck(
+  door: DoorContext,
+  subjects: string[],
+  resolvedContact: string | undefined,
+): Promise<CheckedPlan> {
+  // A failed recall degrades to no memory block rather than failing the
+  // instruction — planning without the past is worse than planning with it,
+  // but not planning at all because a read failed is worse than both. Unlike
+  // the planner call below, which throws for the ordinary failure mode of a
+  // real call and must fail the job because there is no plan without it,
+  // this one has a safe fallback and takes it instead.
+  let memoryBlock = '';
+  try {
+    memoryBlock = await recallForPlanning(subjects, { businessId: door.businessId });
+  } catch {
+    memoryBlock = '';
+  }
+
+  let outcome: PlanOutcome;
+  try {
+    outcome = await door.planner({
+      bundle: door.bundle,
+      intents: [],
+      // The stored text, byte for byte. A candidate's identity travels in
+      // `resolvedContact` and NEVER here: this field is weighed as the
+      // owner's own words (spec §10.6, `instruction-invariants.test.ts`).
+      instruction: door.instruction.text,
+      ...(resolvedContact === undefined ? {} : { resolvedContact }),
+      provenance: 'boss',
+      // Spec §10.10: on the instruction path the confirmation question is
+      // the control, so the planner is shown the catalogue at `auto` — at
+      // `draft_only` it leaned on `mail.draft` for everything. The gate still
+      // applies the real ramp (`rampLevelForPlan`) when the plan runs.
+      rampLevel: 'auto',
+      ...(memoryBlock === '' ? {} : { memoryBlock }),
+    });
+  } catch (err) {
+    // `makePlan` returns `{status:'unparseable'}` for bad model OUTPUT, but it
+    // THROWS for the ordinary failure mode of a network call — a missing API
+    // key, an HTTP error, a transport drop. Left uncaught, that throw leaves
+    // the job sitting in `understand`, a phase nothing in production reads,
+    // forever.
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      kind: 'refused',
+      reason: 'קריאת המתכנן נכשלה ולא הצלחתי לבנות תוכנית.',
+      audit: `instruction door: planner threw (${message})`,
+    };
+  }
+
+  if (outcome.status !== 'planned') {
+    return {
+      kind: 'refused',
+      reason: 'לא הצלחתי להבין את ההוראה מספיק כדי לבנות תוכנית.',
+      audit: `instruction door: ${outcome.reason}`,
+    };
+  }
+
+  const plan = outcome.plan;
+
+  // A question is not a plan. The job stops and waits, and nothing is bound
+  // or granted — see spec §8.
+  if (plan.clarifyingQuestion !== null) {
+    return { kind: 'question', question: plan.clarifyingQuestion };
+  }
+
   const problems = planProblems(plan);
   if (problems.length > 0) {
-    await transition(job.jobId, {
-      to: 'failed',
-      actor: 'orchestrator',
-      reason: `instruction door: plan invalid (${problems.map((p) => p.kind).join(', ')})`,
-      businessId,
-    });
-    return { status: 'refused', reason: 'התוכנית שנבנתה אינה תקינה ולכן לא רצה.' };
+    return {
+      kind: 'refused',
+      reason: 'התוכנית שנבנתה אינה תקינה ולכן לא רצה.',
+      audit: `instruction door: plan invalid (${problems.map((p) => p.kind).join(', ')})`,
+    };
   }
 
   // Everything below is pure — no database, no channel — which is exactly
@@ -454,48 +581,238 @@ export async function runInstruction(
   // not move the phase on that rejection, and the job sits at the front of
   // the scheduler's window forever — the same starvation `unbound` already
   // documents (`run-due.ts`) for its own case. Catching both here means a bad
-  // plan fails once, loudly, in `understand`/`failed`, and never reaches
-  // `execute` at all.
+  // plan fails once, loudly, and never reaches `execute` at all.
   for (const step of plan.steps) {
     if (!planStepIsFeasible(step.agent, step.toolName)) {
-      await transition(job.jobId, {
-        to: 'failed',
-        actor: 'orchestrator',
-        reason: `instruction door: step ${step.id} not allowlisted (${step.agent} may not use ${step.toolName})`,
-        businessId,
-      });
-      return { status: 'refused', reason: 'התוכנית משתמשת בכלי שאינו מורשה לסוכן שנבחר.' };
+      return {
+        kind: 'refused',
+        reason: 'התוכנית משתמשת בכלי שאינו מורשה לסוכן שנבחר.',
+        audit: `instruction door: step ${step.id} not allowlisted (${step.agent} may not use ${step.toolName})`,
+      };
     }
 
     const mismatch = classMismatch(step);
     if (mismatch !== null) {
-      await transition(job.jobId, {
-        to: 'failed',
-        actor: 'orchestrator',
-        reason: `instruction door: step ${step.id} class mismatch (${mismatch})`,
-        businessId,
-      });
-      return { status: 'refused', reason: 'התוכנית סיווגה צעד אחרת ממה שהשער היה קובע בפועל.' };
+      return {
+        kind: 'refused',
+        reason: 'התוכנית סיווגה צעד אחרת ממה שהשער היה קובע בפועל.',
+        audit: `instruction door: step ${step.id} class mismatch (${mismatch})`,
+      };
     }
   }
 
+  return { kind: 'plan', plan };
+}
+
+async function failJob(door: DoorContext, reason: string): Promise<void> {
+  await transition(door.jobId, {
+    to: 'failed',
+    actor: 'orchestrator',
+    reason,
+    businessId: door.businessId,
+  });
+}
+
+/**
+ * Spec §10.4: a plan needs the owner's word when at least one step is a
+ * classified action. Deliberately narrower than what the echo renders (which
+ * also shows outbound read-only steps): a plan of pure reads runs as today.
+ */
+function needsConfirmation(plan: Plan): boolean {
+  return plan.steps.some((step) => classifyAction(step.toolName) !== null);
+}
+
+/**
+ * Where an address that came from memory came from (spec §10.6): `boss` only
+ * when every contact involved was written on the owner's own word, `null`
+ * when no contact was resolved at all. A mix reads as the less trusted one.
+ */
+function contactSourceOf(involved: readonly Contact[]): ConfirmationOption['contactSource'] {
+  if (involved.length === 0) return null;
+  return involved.every((contact) => contact.provenance === 'boss') ? 'boss' : 'unverified';
+}
+
+/**
+ * The candidates to plan one by one, or `null` when today's identity question
+ * must be asked instead: more than one ambiguous name (planning every
+ * combination is not this feature), more than `MAX_PLANNED_CANDIDATES`
+ * people, or any candidate with nothing to tell it apart — an option the
+ * owner cannot recognise is not a choice he can make (spec §4.2).
+ */
+function candidatesToPlan(ambiguities: readonly Ambiguity[]): Contact[] | null {
+  if (ambiguities.length !== 1) return null;
+  const candidates = ambiguities[0]?.candidates ?? [];
+  if (candidates.length < 2 || candidates.length > MAX_PLANNED_CANDIDATES) return null;
+  const distinguishable = candidates.every(
+    (candidate) => candidate.company !== null || candidate.email !== null,
+  );
+  return distinguishable ? candidates : null;
+}
+
+/** Name, then whatever tells this contact apart. Used for the option label and the planner's `resolvedContact`. */
+function describeContact(contact: Contact): string {
+  const details = [contact.company, contact.email].filter(
+    (detail): detail is string => detail !== null,
+  );
+  return details.length === 0 ? contact.name : `${contact.name} (${details.join(' · ')})`;
+}
+
+/**
+ * Spec §4.2 / §10.9: one planning pass per candidate, each validated by the
+ * same chain; the plans that fail are dropped. Several left → the owner picks
+ * one and that pick is the confirmation, so NOTHING is bound yet — binding
+ * waits for the choice. One left → the ordinary single-option question. None
+ * → today's behaviour: the first candidate's clarifying question if any
+ * asked one, otherwise the first refusal.
+ *
+ * One instruction row, one job: the daily cap counts this once however many
+ * planner calls it took (spec §10.9).
+ */
+async function planPerCandidate(
+  door: DoorContext,
+  candidates: readonly Contact[],
+  baseSubjects: readonly string[],
+): Promise<InstructionOutcome> {
+  const options: ConfirmationOption[] = [];
+  const seen = new Set<string>();
+  let firstQuestion: string | null = null;
+  let firstRefusal: { reason: string; audit: string } | null = null;
+
+  for (const candidate of candidates) {
+    const checked = await planAndCheck(
+      door,
+      [...baseSubjects, ...candidate.subjectKeys],
+      describeContact(candidate),
+    );
+    if (checked.kind === 'question') {
+      firstQuestion ??= checked.question;
+      continue;
+    }
+    if (checked.kind === 'refused') {
+      firstRefusal ??= { reason: checked.reason, audit: checked.audit };
+      continue;
+    }
+    const planHash = planHashOf(checked.plan);
+    // Two candidates that produced the very same plan are one choice, not
+    // two: a numbered list where two numbers do the same thing is noise, and
+    // the confirmation store refuses repeated hashes anyway.
+    if (seen.has(planHash)) continue;
+    seen.add(planHash);
+    options.push({
+      label: describeContact(candidate),
+      planHash,
+      plan: checked.plan,
+      contactSource: contactSourceOf([candidate]),
+    });
+  }
+
+  const only = options[0];
+  if (options.length === 1 && only !== undefined) {
+    return finishSingle(door, {
+      plan: only.plan,
+      label: only.label,
+      contactSource: only.contactSource,
+      identityNote: null,
+    });
+  }
+
+  if (options.length === 0) {
+    if (firstQuestion !== null) {
+      try {
+        await recordQuestion(door.instruction.instructionId, firstQuestion, {
+          businessId: door.businessId,
+        });
+      } catch {
+        // Swallowed by design, as on the single-plan path.
+      }
+      return {
+        status: 'needs_answer',
+        jobId: door.jobId,
+        instructionId: door.instruction.instructionId,
+        question: firstQuestion,
+        instructionText: door.instruction.text,
+        identityNote: null,
+      };
+    }
+    const refusal = firstRefusal ?? {
+      reason: 'לא הצלחתי לבנות תוכנית.',
+      audit: 'instruction door: no candidate produced a plan',
+    };
+    await failJob(door, refusal.audit);
+    return { status: 'refused', reason: refusal.reason };
+  }
+
+  const rendered = renderConfirmationQuestion(options);
+  if ('refused' in rendered) {
+    await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
+    return { status: 'refused', reason: rendered.refused };
+  }
+
+  // Parked in `plan` (spec §10.1) with NOTHING bound: the plan that runs is
+  // the one the owner picks, bound only after the pick (spec §4.4).
+  await transition(door.jobId, {
+    to: 'plan',
+    actor: 'orchestrator',
+    reason: `instruction door: ${options.length} candidate plans await the owner's choice`,
+    businessId: door.businessId,
+  });
+  return askAndPark(door, options, rendered.text, null);
+}
+
+/**
+ * The last step for a single plan. A plan with no classified step runs as it
+ * always has — granted, bound, moved to `execute`. One with a classified step
+ * is bound and then parked in `plan` (spec §10.1), never moved to `execute`,
+ * and the confirmation question is stored and returned.
+ */
+async function finishSingle(
+  door: DoorContext,
+  single: {
+    plan: Plan;
+    label: string;
+    contactSource: ConfirmationOption['contactSource'];
+    identityNote: string | null;
+  },
+): Promise<InstructionOutcome> {
+  const { plan } = single;
+  const confirming = needsConfirmation(plan);
+
+  // Rendered BEFORE anything is granted or bound, so a plan too long to show
+  // whole fails with nothing written behind it.
+  let question: string | null = null;
+  let option: ConfirmationOption | null = null;
+  if (confirming) {
+    option = {
+      label: single.label,
+      planHash: planHashOf(plan),
+      plan,
+      contactSource: single.contactSource,
+    };
+    const rendered = renderConfirmationQuestion([option]);
+    if ('refused' in rendered) {
+      await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
+      return { status: 'refused', reason: rendered.refused };
+    }
+    question = rendered.text;
+  }
+
   const { granted, grantNote, recordingNote } = await grantForPlan(
-    job.jobId,
+    door.jobId,
     plan,
-    input.text,
-    textOrigin,
-    active.bundle.knownCounterparties,
-    businessId,
+    door.instruction.text,
+    door.textOrigin,
+    door.bundle.knownCounterparties,
+    door.businessId,
   );
 
-  await transition(job.jobId, {
+  await transition(door.jobId, {
     to: 'plan',
     actor: 'orchestrator',
     reason: 'instruction door: plan accepted',
-    businessId,
+    businessId: door.businessId,
   });
 
-  const binding = await bindPlanToJob(job.jobId, plan, { businessId });
+  const binding = await bindPlanToJob(door.jobId, plan, { businessId: door.businessId });
   if (binding.status === 'conflict') {
     // Cannot happen for a job this function just created — this is the first
     // plan ever offered for it — but `bindPlanToJob` returns a result rather
@@ -503,29 +820,63 @@ export async function runInstruction(
     // CLAUDE.md names: an adapter (or, here, a store) hands back an outcome
     // and the caller discards it. Reading it costs nothing and means this
     // stops being true by convention instead of by construction.
-    await transition(job.jobId, {
-      to: 'failed',
-      actor: 'orchestrator',
-      reason: `instruction door: plan binding conflict (stored ${binding.storedHash.slice(0, 12)} vs offered ${binding.offeredHash.slice(0, 12)})`,
-      businessId,
-    });
+    await failJob(
+      door,
+      `instruction door: plan binding conflict (stored ${binding.storedHash.slice(0, 12)} vs offered ${binding.offeredHash.slice(0, 12)})`,
+    );
     return { status: 'refused', reason: 'התוכנית התנגשה עם תוכנית קיימת עבור העבודה הזו.' };
   }
 
-  await transition(job.jobId, {
+  if (option !== null && question !== null) {
+    // Bound, and parked: `plan` is inert (`runDueJobs` takes only `execute`),
+    // so nothing runs until the owner answers.
+    return askAndPark(door, [option], question, single.identityNote);
+  }
+
+  await transition(door.jobId, {
     to: 'execute',
     actor: 'orchestrator',
     reason: 'instruction door: bound and ready',
-    businessId,
+    businessId: door.businessId,
   });
 
   return {
     status: 'planned',
-    jobId: job.jobId,
-    instructionId: instruction.instructionId,
+    jobId: door.jobId,
+    instructionId: door.instruction.instructionId,
     granted,
     grantNote,
     recordingNote,
+    identityNote: single.identityNote,
+  };
+}
+
+/**
+ * Store the pending confirmation and return the question. A store failure
+ * fails the job rather than leaving it parked with no question anyone can
+ * answer — a job in `plan` with no confirmation row is one nothing revisits.
+ */
+async function askAndPark(
+  door: DoorContext,
+  options: ConfirmationOption[],
+  question: string,
+  identityNote: string | null,
+): Promise<InstructionOutcome> {
+  try {
+    await createConfirmation(
+      { jobId: door.jobId, options, presentedText: question, channel: door.channel },
+      { businessId: door.businessId },
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await failJob(door, `instruction door: confirmation could not be stored (${message})`);
+    return { status: 'refused', reason: 'לא הצלחתי לשמור את שאלת האישור.' };
+  }
+  return {
+    status: 'needs_confirmation',
+    jobId: door.jobId,
+    question,
+    optionCount: options.length,
     identityNote,
   };
 }

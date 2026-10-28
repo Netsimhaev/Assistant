@@ -107,6 +107,33 @@ const plannedWithMailPlan = async (_request: PlanRequest): Promise<PlanOutcome> 
   plan: mailPlan(),
 });
 
+/**
+ * A plan of reads only. Since the boss command (spec 2026-10-28, §10.4), a
+ * plan with a classified step parks on a confirmation question and does not
+ * run in the pass it was instructed in; this one runs, closes and is
+ * reported in the same pass, which is what the ordering test below needs.
+ */
+const plannedWithRecallPlan = async (_request: PlanRequest): Promise<PlanOutcome> => ({
+  status: 'planned',
+  plan: {
+    goal: 'להיזכר',
+    assumptions: [],
+    clarifyingQuestion: null,
+    estimatedCostMinor: 0,
+    steps: [
+      {
+        id: 's1',
+        agent: 'comms.email',
+        intent: 'להיזכר',
+        toolName: 'memory.recall',
+        input: { subjectKey: 'dana@example.com' },
+        dependsOn: [],
+        expectedActionClass: null,
+      },
+    ],
+  },
+});
+
 function runtimeWith(
   sent: MailMessage[],
   gateway: ReturnType<typeof createFakeGateway>,
@@ -273,13 +300,15 @@ describe('schedulerPass — WhatsApp wiring', () => {
       now: NOON,
       inbox: null,
       runtime: runtimeWith(sent, gateway),
-      whatsappPlanner: plannedWithMailPlan,
+      // Reads only: a mail plan now waits for the owner's confirmation and
+      // would not run in this pass (boss command, spec §4). The ordering
+      // under test — door, run, close, report — is the same either way.
+      whatsappPlanner: plannedWithRecallPlan,
     });
 
     expect(pass.whatsappError).toBeNull();
     expect(pass.whatsappDoor?.instructed).toBe(1);
     expect(pass.due.ran).toHaveLength(1); // ran in the SAME pass
-    expect(sent).toHaveLength(1); // the mail really went out
     const jobId = pass.due.ran[0]?.jobId;
     expect(jobId).toBeDefined();
     if (jobId !== undefined) {

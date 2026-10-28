@@ -919,6 +919,21 @@ export function renderInstructionOutcome(
     );
     return;
   }
+  // Boss command (spec §4): the job is parked on a confirmation question.
+  // Minimal for now — the question text, escaped; the answer buttons are a
+  // later task.
+  if (outcome.status === 'needs_confirmation') {
+    sendHtml(
+      res,
+      200,
+      renderInstruct({
+        csrf,
+        confirmationQuestion: outcome.question,
+        identityNote: outcome.identityNote,
+      }),
+    );
+    return;
+  }
   if (
     outcome.grantNote !== null ||
     outcome.recordingNote !== null ||
@@ -1037,7 +1052,10 @@ async function handleInstructPost(
   // that every door has to say this out loud — the WhatsApp door is the one
   // that cannot (`whatsapp-door.ts`), because a voice note's text is a
   // transcription provider's output and nobody typed it.
-  const outcome = await runInstruction({ text }, { businessId, textOrigin: 'typed' });
+  const outcome = await runInstruction(
+    { text },
+    { businessId, textOrigin: 'typed', channel: 'dashboard' },
+  );
   renderInstructionOutcome(res, session, outcome);
 }
 
@@ -1362,6 +1380,9 @@ async function answerUnderClaim(
       // this himself" one hop later, which is the whole defect the origin
       // rule closes — reached through the dashboard rather than the door.
       textOrigin: instruction.textOrigin === 'typed' ? 'typed' : 'transcribed',
+      // A confirmation question is answered where it was asked (boss
+      // command, spec §4) — this is the dashboard.
+      channel: 'dashboard',
       // Spec §7.2: asked once per chain — this is the second pass, so the
       // identity question is suppressed even if a name is still ambiguous.
       identityAsked: true,

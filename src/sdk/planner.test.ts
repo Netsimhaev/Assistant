@@ -261,4 +261,35 @@ describe('the planner prompt', () => {
       withMemory.indexOf('# ההוראה'),
     );
   });
+  /**
+   * Boss command, spec §10.6: a candidate's identity reaches the planner in
+   * its own field, in the final section — never inside the instruction, and
+   * never above the cached prefix.
+   */
+  it('renders the resolved contact after the instruction, leaving the prefix and the instruction untouched', async () => {
+    const b = await bundle();
+    const withContact = buildPlannerPrompt({
+      bundle: b,
+      intents: [],
+      instruction: 'תשיבי לרונית',
+      resolvedContact: 'רונית כהן · ronit@beta-log.example',
+      provenance: 'boss',
+      rampLevel: 'auto',
+    });
+    const without = buildPlannerPrompt({
+      bundle: b,
+      intents: [],
+      instruction: 'תשיבי לרונית',
+      provenance: 'boss',
+      rampLevel: 'auto',
+    });
+
+    const prefixOf = (text: string) => text.slice(0, text.indexOf('# ההוראה'));
+    expect(prefixOf(withContact)).toBe(prefixOf(without));
+    expect(withContact.indexOf('ronit@beta-log.example')).toBeGreaterThan(
+      withContact.indexOf('# ההוראה'),
+    );
+    // The instruction line itself is still the owner's bytes alone.
+    expect(withContact).toContain(['# ההוראה מבעל העסק', 'תשיבי לרונית', ''].join('\n'));
+  });
 });

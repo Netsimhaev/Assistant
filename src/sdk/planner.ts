@@ -29,6 +29,18 @@ export interface PlanRequest {
    */
   instruction?: string;
   /**
+   * Who a name in the instruction was resolved to, when the owner's words fit
+   * more than one contact and each candidate is planned separately (boss
+   * command, spec §4.2, §10.6).
+   *
+   * **A separate field, never appended to `instruction`.** `instruction` is
+   * the owner's own bytes and is weighed as such; an address that came from
+   * memory must not be stored, matched or trusted as something he typed. It
+   * is rendered in the final, uncached section beside the instruction, so the
+   * cached prefix is the same for every candidate.
+   */
+  resolvedContact?: string;
+  /**
    * The past, already assembled and labelled by `recallForPlanning`. Rendered
    * LAST for the cache's sake, and never re-ordered above the catalogue.
    */
@@ -107,6 +119,9 @@ export function buildPlannerPrompt(request: PlanRequest): string {
     ...(request.instruction === undefined
       ? ['# ה-intents', JSON.stringify(request.intents)]
       : ['# ההוראה מבעל העסק', request.instruction]),
+    ...(request.resolvedContact !== undefined && request.resolvedContact !== ''
+      ? ['', '# איש הקשר שההוראה מתכוונת אליו (מהזיכרון, לא מההוראה עצמה)', request.resolvedContact]
+      : []),
     ...(request.memoryBlock !== undefined && request.memoryBlock !== ''
       ? ['', request.memoryBlock]
       : []),
