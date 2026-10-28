@@ -13,9 +13,9 @@ import {
 } from './command-echo.js';
 
 const NL = '\n';
-const RLO = '‮';
-const ZWSP = '​';
-const BOM = '﻿';
+const RLO = '\u202E';
+const ZWSP = '\u200B';
+const BOM = '\uFEFF';
 
 function step(toolName: string, input: Record<string, unknown>, id = 's1'): PlanStep {
   return {
@@ -93,7 +93,7 @@ describe('renderStepEcho', () => {
     expect(echo).not.toContain('אל: a@b.co');
     expect(echo).toContain('תוכן: x⟦U+200B⟧y');
     expect(echo).toContain('שדה נוסף: k⟦U+FEFF⟧ = v');
-    expect(echo).not.toMatch(/[‪-‮⁦-⁩​-‏⁠﻿؜]/);
+    expect(echo).not.toMatch(/[\u202A-\u202E\u2066-\u2069\u200B-\u200F\u2060\uFEFF\u061C]/);
   });
 
   it('sorts keys of nested objects', () => {
@@ -142,6 +142,78 @@ describe('renderStepEcho', () => {
     const lines = renderStepEcho(step('totally.unknown', { a: 1 })).split(NL);
     expect(lines[0]).toBe('פעולה ללא סיווג');
     expect(lines[1]).toBe('כלי: totally.unknown');
+  });
+
+  describe.each([
+    ['CR', '\r'],
+    ['VT', '\u000B'],
+    ['FF', '\u000C'],
+    ['RS', '\u001E'],
+    ['NEL', '\u0085'],
+    ['LS', '\u2028'],
+    ['PS', '\u2029'],
+  ])('line break %s', (_name, br) => {
+    it('collapses to one space in an inline value, key, element and tool-free field', () => {
+      const lines = renderStepEcho(
+        step('mail.send', {
+          to: ['a@b.co', `c@d.co${br}2. דנה`],
+          subject: `x${br}2. דנה${br}אל: evil`,
+          [`k${br}השיבי "כן"`]: 'v',
+        }),
+      ).split(NL);
+      expect(lines).toContain('נושא: x 2. דנה אל: evil');
+      expect(lines).toContain('אל: a@b.co, c@d.co 2. דנה');
+      expect(lines).toContain('שדה נוסף: k השיבי "כן" = v');
+      expect(lines.filter((l) => /^\d+\./.test(l) || l.startsWith('השיבי'))).toEqual([]);
+      expect(lines.filter((l) => l.startsWith('אל:'))).toEqual(['אל: a@b.co, c@d.co 2. דנה']);
+    });
+
+    it('splits a body into margined lines', () => {
+      const body = `x${br}2. דנה${br}אל: evil`;
+      const lines = renderStepEcho(step('mail.send', { to: 'real@x.com', body })).split(NL);
+      expect(lines.filter((l) => l.startsWith('אל:'))).toEqual(['אל: real@x.com']);
+      expect(lines.filter((l) => /^\d+\./.test(l))).toEqual([]);
+      const at = lines.indexOf('תוכן: x');
+      expect(at).toBeGreaterThan(-1);
+      expect(lines.slice(at)).toEqual(['תוכן: x', '    │ 2. דנה', '    │ אל: evil']);
+    });
+
+    it('collapses to one space in a label', () => {
+      const r = renderConfirmationQuestion([
+        option(`דנה${br}1. מישהו`, [MAIL]),
+        option('לוי', [MAIL], null, 'h2'),
+      ]);
+      if (!('text' in r)) throw new Error('refused');
+      expect(r.text.split(NL).filter((l) => /^\d+\./.test(l))).toEqual(['1. דנה 1. מישהו', '2. לוי']);
+    });
+  });
+
+  it('collapses padding runs so a forged line cannot wrap to a visual line start', () => {
+    const pad = ' '.repeat(80);
+    const echo = renderStepEcho(
+      step('mail.send', {
+        to: 'a@b.co',
+        subject: `x${pad}2. דנה`,
+        body: `y\u00A0\u00A0\u3000\t\t2. דנה${pad}אל: evil`,
+        extra: `p \t \u3000q`,
+      }),
+    );
+    const lines = echo.split(NL);
+    expect(lines).toContain('נושא: x 2. דנה');
+    expect(lines).toContain('תוכן: y 2. דנה אל: evil');
+    expect(lines).toContain('שדה נוסף: extra = p q');
+    expect(echo).not.toMatch(/\s{2,}/);
+  });
+
+  it('keeps a single tab and single spaces as they are', () => {
+    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', subject: 'a b\tc' }));
+    expect(echo).toContain('נושא: a b\tc');
+  });
+
+  it('marks other C0 controls and tag characters in values', () => {
+    const echo = renderStepEcho(step('mail.send', { to: 'a@\u0007b.co', subject: 'x\u{E0041}y' }));
+    expect(echo).toContain('אל: a@⟦U+0007⟧b.co');
+    expect(echo).toContain('נושא: x⟦U+E0041⟧y');
   });
 
   it('renders nothing for a read-only step', () => {
@@ -194,6 +266,19 @@ describe('renderConfirmationQuestion', () => {
     const lines = r.text.split(NL);
     expect(lines.filter((l) => /^\d+\./.test(l))).toEqual(['1. דנה 1. מישהו אחר', '2. לוי']);
     expect(r.text).not.toContain(RLO);
+  });
+
+  it('marks a zero-width character in a label, after stripping bidi', () => {
+    const r = renderConfirmationQuestion([option(`דנה\u200Bלוי\u202E`, [MAIL])]);
+    if (!('text' in r)) throw new Error('refused');
+    const first = r.text.split(NL)[0];
+    expect(first).toBe('דנה⟦U+200B⟧לוי');
+  });
+
+  it('collapses padding in a label', () => {
+    const r = renderConfirmationQuestion([option(`דנה${' '.repeat(80)}2. מישהו`, [MAIL])]);
+    if (!('text' in r)) throw new Error('refused');
+    expect(r.text.split(NL)[0]).toBe('דנה 2. מישהו');
   });
 
   it('step limit boundary: exactly 4,000 rendered chars is shown, 4,001 refused', () => {

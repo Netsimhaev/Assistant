@@ -30,13 +30,31 @@ export function stripBidiControls(value: string): string {
 }
 
 /**
- * Zero-width characters that render as nothing and so hide a byte difference:
- * U+200B/C/D (space, non-joiner, joiner), U+2060 word joiner, U+FEFF BOM/ZWNBSP.
+ * Characters that render as nothing (or as a line break), written as explicit
+ * range strings. This is deliberately NOT derived from `BIDI_CONTROLS`: a
+ * derivation that slices another regex's source breaks silently if that regex
+ * changes shape. The bidi ranges below mirror `BIDI_CONTROLS`; a test checks
+ * that every character `stripBidiControls` removes is marked here too.
  */
-const ZERO_WIDTH = '​‌‍⁠﻿';
+const BIDI_RANGES = '\\u061C\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069';
 
-// Built from BIDI_CONTROLS' own class, never a second copy of it.
-const INVISIBLE_CONTROLS = new RegExp(`${BIDI_CONTROLS.source.slice(0, -1)}${ZERO_WIDTH}]`, 'g');
+/**
+ * Zero-width and hidden characters: U+200B/C/D, U+2060 word joiner, U+FEFF,
+ * U+00AD soft hyphen, U+034F combining grapheme joiner, U+180E Mongolian vowel
+ * separator, U+2061-U+2064 invisible operators.
+ */
+const ZERO_WIDTH_RANGES = '\\u200B-\\u200D\\u2060\\uFEFF\\u00AD\\u034F\\u180E\\u2061-\\u2064';
+
+/** Every C0/C1 control (Cc) except TAB (U+0009). */
+const CONTROL_RANGES = '\\u0000-\\u0008\\u000A-\\u001F\\u007F-\\u009F';
+
+/** Unicode tag characters U+E0000-U+E007F (needs the `u` flag). */
+const TAG_RANGE = '\\u{E0000}-\\u{E007F}';
+
+const INVISIBLE_CONTROLS = new RegExp(
+  `[${BIDI_RANGES}${ZERO_WIDTH_RANGES}${CONTROL_RANGES}${TAG_RANGE}]`,
+  'gu',
+);
 
 /**
  * Make invisible controls visible instead of removing them: each becomes

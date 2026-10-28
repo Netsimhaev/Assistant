@@ -37,16 +37,33 @@ const KNOWN_KEYS = new Set(KNOWN_FIELDS.map((f) => f.key));
 
 /** Fixed margin on every continuation line of a multi-line value. */
 const CONTINUATION_MARGIN = '    │ ';
-const LINE_BREAKS = /\r\n|[\r\n\u2028\u2029\u0085]/g;
+/**
+ * The one positive set of line breaks: CRLF, CR, LF, VT, FF, FS/GS/RS, NEL,
+ * LS and PS. Many renderers treat VT, FF and FS-RS as breaks, so all of them
+ * split a body and collapse inline. Every other control is marked, not removed.
+ */
+const LINE_BREAKS = /\r\n|[\r\n\u000B\u000C\u001C\u001D\u001E\u0085\u2028\u2029]/g;
+/** A padding run that could wrap a forged line to the start of a visual line. */
+const WHITESPACE_RUN = /\s{2,}/g;
+
+/** Display only (the bytes stay as they are): a whitespace run becomes one space. */
+function squeeze(text: string): string {
+  return text.replace(WHITESPACE_RUN, ' ');
+}
 
 /** One line: every line break becomes a single space. */
 function inline(text: string): string {
-  return text.replace(LINE_BREAKS, ' ');
+  return squeeze(text.replace(LINE_BREAKS, ' '));
 }
 
 /** A value on one line, invisible controls shown as visible markers. */
 function inlineValue(text: string): string {
   return markInvisibleControls(inline(text));
+}
+
+/** An option label: bidi controls stripped first, then whatever is left marked. */
+function labelText(label: string): string {
+  return markInvisibleControls(inline(stripBidiControls(label)));
 }
 
 /**
@@ -55,7 +72,10 @@ function inlineValue(text: string): string {
  * the question itself (a forged option, an `אל:` line, a fake hint).
  */
 function blockValue(text: string): string {
-  return markInvisibleControls(text).split(LINE_BREAKS).join('\n' + CONTINUATION_MARGIN);
+  return text
+    .split(LINE_BREAKS)
+    .map((line) => markInvisibleControls(squeeze(line)))
+    .join('\n' + CONTINUATION_MARGIN);
 }
 
 function structured(value: unknown): string {
@@ -143,7 +163,7 @@ export function renderConfirmationQuestion(
   for (const [index, option] of options.entries()) {
     const echoes = optionEchoes(option);
     if (!Array.isArray(echoes)) return echoes;
-    const head = `${multiple ? `${index + 1}. ` : ''}${inline(stripBidiControls(option.label))}${sourceMarker(option)}`;
+    const head = `${multiple ? `${index + 1}. ` : ''}${labelText(option.label)}${sourceMarker(option)}`;
     rendered.push([head, ...echoes].join('\n'));
   }
 
