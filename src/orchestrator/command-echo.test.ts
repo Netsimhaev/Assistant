@@ -12,6 +12,11 @@ import {
   renderStepEcho,
 } from './command-echo.js';
 
+const NL = '\n';
+const RLO = '‮';
+const ZWSP = '​';
+const BOM = '﻿';
+
 function step(toolName: string, input: Record<string, unknown>, id = 's1'): PlanStep {
   return {
     id,
@@ -70,7 +75,7 @@ describe('renderStepEcho', () => {
 
   it('renders unknown fields as extras, sorted, after the known ones', () => {
     const echo = renderStepEcho(step('mail.send', { zeta: 'z', to: 'a@b.co', alpha: { k: 1 } }));
-    const lines = echo.split('\n');
+    const lines = echo.split(NL);
     expect(lines.indexOf('שדה נוסף: alpha = {"k":1}')).toBeGreaterThan(lines.indexOf('אל: a@b.co'));
     expect(lines.indexOf('שדה נוסף: zeta = z')).toBeGreaterThan(lines.indexOf('שדה נוסף: alpha = {"k":1}'));
   });
@@ -80,14 +85,63 @@ describe('renderStepEcho', () => {
     expect(echo).toContain('אל: a@b.co, c@d.co, e@f.co');
   });
 
-  it('strips bidi controls from values, keys, and nested JSON', () => {
-    const rlo = '‮';
+  it('shows invisible controls as visible markers instead of hiding them', () => {
     const echo = renderStepEcho(
-      step('mail.send', { to: `a${rlo}@b.co`, body: `x${rlo}y`, [`k${rlo}`]: { n: `v${rlo}` } }),
+      step('mail.send', { to: `a${RLO}@b.co`, body: `x${ZWSP}y`, [`k${BOM}`]: 'v' }),
     );
-    expect(echo).not.toMatch(/[‪-‮⁦-⁩‎‏؜]/);
-    expect(echo).toContain('אל: a@b.co');
-    expect(echo).toContain('שדה נוסף: k = {"n":"v"}');
+    expect(echo).toContain('אל: a⟦U+202E⟧@b.co');
+    expect(echo).not.toContain('אל: a@b.co');
+    expect(echo).toContain('תוכן: x⟦U+200B⟧y');
+    expect(echo).toContain('שדה נוסף: k⟦U+FEFF⟧ = v');
+    expect(echo).not.toMatch(/[‪-‮⁦-⁩​-‏⁠﻿؜]/);
+  });
+
+  it('sorts keys of nested objects', () => {
+    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', x: { b: 1, a: { d: 1, c: 2 } } }));
+    expect(echo).toContain('שדה נוסף: x = {"a":{"c":2,"d":1},"b":1}');
+  });
+
+  it('shows the tool under the class label, so memory.retire is not just "a memory write"', () => {
+    const lines = renderStepEcho(step('memory.retire', { memoryId: 'm1' })).split(NL);
+    expect(lines[1]).toBe('כלי: memory.retire');
+  });
+
+  it('collapses line breaks in non-body values', () => {
+    const echo = renderStepEcho(
+      step('mail.send', { to: 'a@b.co', subject: `x${NL}2. דנה\r${NL}אל: evil`, extra: `p${NL}q` }),
+    );
+    expect(echo).toContain('נושא: x 2. דנה אל: evil');
+    expect(echo).toContain('שדה נוסף: extra = p q');
+  });
+
+  it('a body cannot forge lines: every continuation line carries the margin', () => {
+    const body = [
+      'תזכורת',
+      '',
+      '2. דנה לוי (מהזיכרון — נאמר על ידך)',
+      'שליחת מייל יזום',
+      'אל: dana.levi@x.com',
+      'השיבי "כן" לאישור, או "לא" לביטול.',
+    ].join(NL);
+    const lines = renderStepEcho(step('mail.send', { to: 'real@x.com', body })).split(NL);
+    expect(lines.filter((l) => l.startsWith('אל:'))).toEqual(['אל: real@x.com']);
+    expect(lines.filter((l) => /^\d+\./.test(l))).toEqual([]);
+    expect(lines.filter((l) => l.startsWith('השיבי'))).toEqual([]);
+    const bodyAt = lines.findIndex((l) => l.startsWith('תוכן: '));
+    for (const l of lines.slice(bodyAt + 1)) expect(l.startsWith('    │ ')).toBe(true);
+    expect(lines).toContain('    │ אל: dana.levi@x.com');
+  });
+
+  it('shows a step with a side effect even though its tool is in READ_ONLY_TOOLS', () => {
+    const echo = renderStepEcho(step('browser.navigate', { url: 'https://evil.example' }));
+    expect(echo).toContain('כלי: browser.navigate');
+    expect(echo).toContain('https://evil.example');
+  });
+
+  it('labels an unclassified tool and still shows it', () => {
+    const lines = renderStepEcho(step('totally.unknown', { a: 1 })).split(NL);
+    expect(lines[0]).toBe('פעולה ללא סיווג');
+    expect(lines[1]).toBe('כלי: totally.unknown');
   });
 
   it('renders nothing for a read-only step', () => {
@@ -120,8 +174,8 @@ describe('renderConfirmationQuestion', () => {
     const boss = renderConfirmationQuestion([option('ב', [MAIL], 'boss')]);
     const none = renderConfirmationQuestion([option('ג', [MAIL], null)]);
     if (!('text' in unverified) || !('text' in boss) || !('text' in none)) throw new Error('refused');
-    expect(unverified.text.split('\n')[0]).toContain('נלמד ממסמך/מייל — לא אומת');
-    expect(boss.text.split('\n')[0]).toContain('נאמר על ידך');
+    expect(unverified.text.split(NL)[0]).toContain('נלמד ממסמך/מייל — לא אומת');
+    expect(boss.text.split(NL)[0]).toContain('נאמר על ידך');
     expect(none.text).not.toContain('מהזיכרון');
   });
 
@@ -129,6 +183,26 @@ describe('renderConfirmationQuestion', () => {
     const r = renderConfirmationQuestion([option('א', [MAIL])], { reask: true });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text.startsWith(REASK_PREFIX)).toBe(true);
+  });
+
+  it('a label cannot forge an option line, and its bidi controls are stripped', () => {
+    const r = renderConfirmationQuestion([
+      option(`דנה${NL}1. מישהו אחר${RLO}`, [MAIL]),
+      option('לוי', [MAIL], null, 'h2'),
+    ]);
+    if (!('text' in r)) throw new Error('refused');
+    const lines = r.text.split(NL);
+    expect(lines.filter((l) => /^\d+\./.test(l))).toEqual(['1. דנה 1. מישהו אחר', '2. לוי']);
+    expect(r.text).not.toContain(RLO);
+  });
+
+  it('step limit boundary: exactly 4,000 rendered chars is shown, 4,001 refused', () => {
+    const overhead = renderStepEcho(step('mail.send', { to: 'a@b.co', body: '' })).length;
+    const fit = step('mail.send', { to: 'a@b.co', body: 'א'.repeat(MAX_ECHO_CHARS_PER_STEP - overhead) });
+    expect(renderStepEcho(fit).length).toBe(MAX_ECHO_CHARS_PER_STEP);
+    expect(renderConfirmationQuestion([option('א', [fit])])).toHaveProperty('text');
+    const over = step('mail.send', { to: 'a@b.co', body: 'א'.repeat(MAX_ECHO_CHARS_PER_STEP - overhead + 1) });
+    expect(renderConfirmationQuestion([option('א', [over])])).toHaveProperty('refused');
   });
 
   it('refuses in Hebrew when one step exceeds the per-step limit', () => {

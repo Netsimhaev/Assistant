@@ -1,8 +1,9 @@
 import type { PlanStep } from '../domain/plan.js';
 import { actionClassLabel } from '../domain/labels.js';
 import type { ConfirmationOption } from '../governance/instruction-confirmations.js';
-import { classifyAction, refineActionClass } from '../policy/classify.js';
-import { stripBidiControls } from '../util/bidi.js';
+import { READ_ONLY_TOOLS, classifyAction, isOutbound, refineActionClass } from '../policy/classify.js';
+import { markInvisibleControls, stripBidiControls } from '../util/bidi.js';
+import { canonicalJson } from '../util/canonical.js';
 import { formatMinor } from '../util/money.js';
 
 /**
@@ -34,12 +35,43 @@ const KNOWN_FIELDS: readonly { key: string; name: string }[] = [
 ];
 const KNOWN_KEYS = new Set(KNOWN_FIELDS.map((f) => f.key));
 
+/** Fixed margin on every continuation line of a multi-line value. */
+const CONTINUATION_MARGIN = '    │ ';
+const LINE_BREAKS = /\r\n|[\r\n\u2028\u2029\u0085]/g;
+
+/** One line: every line break becomes a single space. */
+function inline(text: string): string {
+  return text.replace(LINE_BREAKS, ' ');
+}
+
+/** A value on one line, invisible controls shown as visible markers. */
+function inlineValue(text: string): string {
+  return markInvisibleControls(inline(text));
+}
+
+/**
+ * A multi-line value (the body). Every line after the first carries the fixed
+ * margin, so no line of a value can start at column 0 and pass for a line of
+ * the question itself (a forged option, an `אל:` line, a fake hint).
+ */
+function blockValue(text: string): string {
+  return markInvisibleControls(text).split(LINE_BREAKS).join('\n' + CONTINUATION_MARGIN);
+}
+
+function structured(value: unknown): string {
+  try {
+    return canonicalJson(value);
+  } catch {
+    return JSON.stringify(value) ?? String(value);
+  }
+}
+
 function renderScalar(value: unknown): string {
-  if (typeof value === 'string') return stripBidiControls(value);
+  if (typeof value === 'string') return inlineValue(value);
   if (value === null || typeof value === 'number' || typeof value === 'boolean') {
     return String(value);
   }
-  return stripBidiControls(JSON.stringify(value) ?? String(value));
+  return inlineValue(structured(value));
 }
 
 function renderValue(value: unknown): string {
@@ -53,15 +85,23 @@ function renderKnown(key: string, value: unknown): string {
   if (key === 'amountMinor' && typeof value === 'number' && Number.isSafeInteger(value)) {
     return formatMinor(value, 'ILS');
   }
+  if (key === 'body' && typeof value === 'string') return blockValue(value);
   return renderValue(value);
 }
 
-/** The echo of one side-effecting step; empty string for a read-only step. */
+const UNCLASSIFIED_LABEL = 'פעולה ללא סיווג';
+
+/** Hidden only when positively known harmless: read-only AND not outbound. */
+function isHidden(toolName: string): boolean {
+  return READ_ONLY_TOOLS.has(toolName) && !isOutbound(toolName);
+}
+
+/** The echo of one step; empty string only for a positively read-only step. */
 export function renderStepEcho(step: PlanStep): string {
+  if (isHidden(step.toolName)) return '';
   const base = classifyAction(step.toolName);
-  if (base === null) return '';
-  const refined = refineActionClass(base, step.input);
-  const lines: string[] = [actionClassLabel(refined)];
+  const label = base === null ? UNCLASSIFIED_LABEL : actionClassLabel(refineActionClass(base, step.input));
+  const lines: string[] = [label, `כלי: ${inlineValue(step.toolName)}`];
 
   for (const { key, name } of KNOWN_FIELDS) {
     if (!Object.hasOwn(step.input, key)) continue;
@@ -71,7 +111,7 @@ export function renderStepEcho(step: PlanStep): string {
     .filter((key) => !KNOWN_KEYS.has(key))
     .sort();
   for (const key of extras) {
-    lines.push(`שדה נוסף: ${stripBidiControls(key)} = ${renderValue(step.input[key])}`);
+    lines.push(`שדה נוסף: ${inlineValue(key)} = ${renderValue(step.input[key])}`);
   }
   return lines.join('\n');
 }
@@ -103,7 +143,7 @@ export function renderConfirmationQuestion(
   for (const [index, option] of options.entries()) {
     const echoes = optionEchoes(option);
     if (!Array.isArray(echoes)) return echoes;
-    const head = `${multiple ? `${index + 1}. ` : ''}${stripBidiControls(option.label)}${sourceMarker(option)}`;
+    const head = `${multiple ? `${index + 1}. ` : ''}${inline(stripBidiControls(option.label))}${sourceMarker(option)}`;
     rendered.push([head, ...echoes].join('\n'));
   }
 

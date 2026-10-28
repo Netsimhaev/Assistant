@@ -28,3 +28,24 @@ const BIDI_CONTROLS = /[؜‎‏‪-‮⁦-⁩]/g;
 export function stripBidiControls(value: string): string {
   return value.replace(BIDI_CONTROLS, '');
 }
+
+/**
+ * Zero-width characters that render as nothing and so hide a byte difference:
+ * U+200B/C/D (space, non-joiner, joiner), U+2060 word joiner, U+FEFF BOM/ZWNBSP.
+ */
+const ZERO_WIDTH = '​‌‍⁠﻿';
+
+// Built from BIDI_CONTROLS' own class, never a second copy of it.
+const INVISIBLE_CONTROLS = new RegExp(`${BIDI_CONTROLS.source.slice(0, -1)}${ZERO_WIDTH}]`, 'g');
+
+/**
+ * Make invisible controls visible instead of removing them: each becomes
+ * `⟦U+202E⟧`. For a value the owner is about to approve, stripping would show
+ * `a@b.co` for bytes that are not `a@b.co`; the marker shows that they differ.
+ */
+export function markInvisibleControls(value: string): string {
+  return value.replace(
+    INVISIBLE_CONTROLS,
+    (ch) => `⟦U+${(ch.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}⟧`,
+  );
+}
