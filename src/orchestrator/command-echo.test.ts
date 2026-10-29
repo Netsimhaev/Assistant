@@ -49,7 +49,7 @@ const MAIL = step('mail.send', {
 
 describe('renderStepEcho', () => {
   it('shows the refined class label, not the raw id, and every known field', () => {
-    const echo = renderStepEcho(MAIL);
+    const echo = renderStepEcho(MAIL, 'ILS');
     expect(echo).toContain(ACTION_CLASS_HE['email.reply']);
     expect(echo).not.toContain('email.reply');
     expect(echo).toContain('אל: ronit@beta.co.il');
@@ -59,36 +59,49 @@ describe('renderStepEcho', () => {
   });
 
   it('labels the REFINED class: no inReplyTo is an initiate', () => {
-    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', body: 'x' }));
+    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', body: 'x' }), 'ILS');
     expect(echo).toContain(ACTION_CLASS_HE['email.initiate']);
     expect(echo).not.toContain('בתשובה ל');
   });
 
   it('renders a 3,000-char body whole', () => {
     const body = 'א'.repeat(3000);
-    expect(renderStepEcho(step('mail.send', { to: 'a@b.co', body }))).toContain(`תוכן: ${body}`);
+    expect(renderStepEcho(step('mail.send', { to: 'a@b.co', body }), 'ILS')).toContain(`תוכן: ${body}`);
   });
 
   it('renders amountMinor through formatMinor', () => {
-    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', amountMinor: 300000 }));
+    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', amountMinor: 300000 }), 'ILS');
     expect(echo).toContain(`סכום: ${formatMinor(300000, 'ILS')}`);
   });
 
+  it("renders amountMinor in the charter's currency, never a hard-coded shekel", () => {
+    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', amountMinor: 300000 }), 'USD');
+    expect(echo).toContain(`סכום: ${formatMinor(300000, 'USD')}`);
+    expect(echo).not.toContain('₪');
+    const r = renderConfirmationQuestion([option('א', [step('mail.send', { to: 'a@b.co', amountMinor: 1250 })])], {
+      currency: 'EUR',
+    });
+    if (!('text' in r)) throw new Error('refused');
+    expect(r.text).toContain(`סכום: ${formatMinor(1250, 'EUR')}`);
+    expect(r.text).not.toContain('₪');
+  });
+
   it('renders unknown fields as extras, sorted, after the known ones', () => {
-    const echo = renderStepEcho(step('mail.send', { zeta: 'z', to: 'a@b.co', alpha: { k: 1 } }));
+    const echo = renderStepEcho(step('mail.send', { zeta: 'z', to: 'a@b.co', alpha: { k: 1 } }), 'ILS');
     const lines = echo.split(NL);
     expect(lines.indexOf('שדה נוסף: alpha = {"k":1}')).toBeGreaterThan(lines.indexOf('אל: a@b.co'));
     expect(lines.indexOf('שדה נוסף: zeta = z')).toBeGreaterThan(lines.indexOf('שדה נוסף: alpha = {"k":1}'));
   });
 
   it('renders every array element', () => {
-    const echo = renderStepEcho(step('mail.send', { to: ['a@b.co', 'c@d.co', 'e@f.co'] }));
+    const echo = renderStepEcho(step('mail.send', { to: ['a@b.co', 'c@d.co', 'e@f.co'] }), 'ILS');
     expect(echo).toContain('אל: a@b.co, c@d.co, e@f.co');
   });
 
   it('shows invisible controls as visible markers instead of hiding them', () => {
     const echo = renderStepEcho(
       step('mail.send', { to: `a${RLO}@b.co`, body: `x${ZWSP}y`, [`k${BOM}`]: 'v' }),
+      'ILS',
     );
     expect(echo).toContain('אל: a⟦U+202E⟧@b.co');
     expect(echo).not.toContain('אל: a@b.co');
@@ -98,18 +111,19 @@ describe('renderStepEcho', () => {
   });
 
   it('sorts keys of nested objects', () => {
-    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', x: { b: 1, a: { d: 1, c: 2 } } }));
+    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', x: { b: 1, a: { d: 1, c: 2 } } }), 'ILS');
     expect(echo).toContain('שדה נוסף: x = {"a":{"c":2,"d":1},"b":1}');
   });
 
   it('shows the tool under the class label, so memory.retire is not just "a memory write"', () => {
-    const lines = renderStepEcho(step('memory.retire', { memoryId: 'm1' })).split(NL);
+    const lines = renderStepEcho(step('memory.retire', { memoryId: 'm1' }), 'ILS').split(NL);
     expect(lines[1]).toBe('כלי: memory.retire');
   });
 
   it('collapses line breaks in non-body values', () => {
     const echo = renderStepEcho(
       step('mail.send', { to: 'a@b.co', subject: `x${NL}2. דנה\r${NL}אל: evil`, extra: `p${NL}q` }),
+      'ILS',
     );
     expect(echo).toContain('נושא: x 2. דנה אל: evil');
     expect(echo).toContain('שדה נוסף: extra = p q');
@@ -124,7 +138,7 @@ describe('renderStepEcho', () => {
       'אל: dana.levi@x.com',
       'השיבי "כן" לאישור, או "לא" לביטול.',
     ].join(NL);
-    const lines = renderStepEcho(step('mail.send', { to: 'real@x.com', body })).split(NL);
+    const lines = renderStepEcho(step('mail.send', { to: 'real@x.com', body }), 'ILS').split(NL);
     expect(lines.filter((l) => l.startsWith('אל:'))).toEqual(['אל: real@x.com']);
     expect(lines.filter((l) => /^\d+\./.test(l))).toEqual([]);
     expect(lines.filter((l) => l.startsWith('השיבי'))).toEqual([]);
@@ -134,13 +148,13 @@ describe('renderStepEcho', () => {
   });
 
   it('shows a step with a side effect even though its tool is in READ_ONLY_TOOLS', () => {
-    const echo = renderStepEcho(step('browser.navigate', { url: 'https://evil.example' }));
+    const echo = renderStepEcho(step('browser.navigate', { url: 'https://evil.example' }), 'ILS');
     expect(echo).toContain('כלי: browser.navigate');
     expect(echo).toContain('https://evil.example');
   });
 
   it('labels an unclassified tool and still shows it', () => {
-    const lines = renderStepEcho(step('totally.unknown', { a: 1 })).split(NL);
+    const lines = renderStepEcho(step('totally.unknown', { a: 1 }), 'ILS').split(NL);
     expect(lines[0]).toBe('פעולה ללא סיווג');
     expect(lines[1]).toBe('כלי: totally.unknown');
   });
@@ -161,6 +175,7 @@ describe('renderStepEcho', () => {
           subject: `x${br}2. דנה${br}אל: evil`,
           [`k${br}השיבי "כן"`]: 'v',
         }),
+        'ILS',
       ).split(NL);
       expect(lines).toContain('נושא: x 2. דנה אל: evil');
       expect(lines).toContain('אל: a@b.co, c@d.co 2. דנה');
@@ -171,7 +186,7 @@ describe('renderStepEcho', () => {
 
     it('splits a body into margined lines', () => {
       const body = `x${br}2. דנה${br}אל: evil`;
-      const lines = renderStepEcho(step('mail.send', { to: 'real@x.com', body })).split(NL);
+      const lines = renderStepEcho(step('mail.send', { to: 'real@x.com', body }), 'ILS').split(NL);
       expect(lines.filter((l) => l.startsWith('אל:'))).toEqual(['אל: real@x.com']);
       expect(lines.filter((l) => /^\d+\./.test(l))).toEqual([]);
       const at = lines.indexOf('תוכן: x');
@@ -183,7 +198,7 @@ describe('renderStepEcho', () => {
       const r = renderConfirmationQuestion([
         option(`דנה${br}1. מישהו`, [MAIL]),
         option('לוי', [MAIL], null, 'h2'),
-      ]);
+      ], { currency: 'ILS' });
       if (!('text' in r)) throw new Error('refused');
       expect(r.text.split(NL).filter((l) => /^\d+\./.test(l))).toEqual(['1. דנה 1. מישהו', '2. לוי']);
     });
@@ -198,6 +213,7 @@ describe('renderStepEcho', () => {
         body: `y\u00A0\u00A0\u3000\t\t2. דנה${pad}אל: evil`,
         extra: `p \t \u3000q`,
       }),
+      'ILS',
     );
     const lines = echo.split(NL);
     expect(lines).toContain('נושא: x 2. דנה');
@@ -207,24 +223,24 @@ describe('renderStepEcho', () => {
   });
 
   it('keeps a single tab and single spaces as they are', () => {
-    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', subject: 'a b\tc' }));
+    const echo = renderStepEcho(step('mail.send', { to: 'a@b.co', subject: 'a b\tc' }), 'ILS');
     expect(echo).toContain('נושא: a b\tc');
   });
 
   it('marks other C0 controls and tag characters in values', () => {
-    const echo = renderStepEcho(step('mail.send', { to: 'a@\u0007b.co', subject: 'x\u{E0041}y' }));
+    const echo = renderStepEcho(step('mail.send', { to: 'a@\u0007b.co', subject: 'x\u{E0041}y' }), 'ILS');
     expect(echo).toContain('אל: a@⟦U+0007⟧b.co');
     expect(echo).toContain('נושא: x⟦U+E0041⟧y');
   });
 
   it('renders nothing for a read-only step', () => {
-    expect(renderStepEcho(step('memory.recall', { topic: 'secret' }))).toBe('');
+    expect(renderStepEcho(step('memory.recall', { topic: 'secret' }), 'ILS')).toBe('');
   });
 });
 
 describe('renderConfirmationQuestion', () => {
   it('one option: label, echo, and the confirm hint last', () => {
-    const r = renderConfirmationQuestion([option('לשלוח לרונית', [MAIL])]);
+    const r = renderConfirmationQuestion([option('לשלוח לרונית', [MAIL])], { currency: 'ILS' });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text.startsWith('לשלוח לרונית')).toBe(true);
     expect(r.text).toContain('אל: ronit@beta.co.il');
@@ -233,7 +249,7 @@ describe('renderConfirmationQuestion', () => {
 
   it('two options: numbered, echo under each, choice hint last', () => {
     const second = step('mail.send', { to: 'dana@x.com', body: 'שונה' });
-    const r = renderConfirmationQuestion([option('דנה חיוט', [MAIL]), option('דנה לוי', [second])]);
+    const r = renderConfirmationQuestion([option('דנה חיוט', [MAIL]), option('דנה לוי', [second])], { currency: 'ILS' });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text).toContain('1. דנה חיוט');
     expect(r.text).toContain('2. דנה לוי');
@@ -243,9 +259,9 @@ describe('renderConfirmationQuestion', () => {
   });
 
   it('marks the contact source next to the label', () => {
-    const unverified = renderConfirmationQuestion([option('א', [MAIL], 'unverified')]);
-    const boss = renderConfirmationQuestion([option('ב', [MAIL], 'boss')]);
-    const none = renderConfirmationQuestion([option('ג', [MAIL], null)]);
+    const unverified = renderConfirmationQuestion([option('א', [MAIL], 'unverified')], { currency: 'ILS' });
+    const boss = renderConfirmationQuestion([option('ב', [MAIL], 'boss')], { currency: 'ILS' });
+    const none = renderConfirmationQuestion([option('ג', [MAIL], null)], { currency: 'ILS' });
     if (!('text' in unverified) || !('text' in boss) || !('text' in none)) throw new Error('refused');
     expect(unverified.text.split(NL)[0]).toContain('נלמד ממסמך/מייל — לא אומת');
     expect(boss.text.split(NL)[0]).toContain('נאמר על ידך');
@@ -253,7 +269,7 @@ describe('renderConfirmationQuestion', () => {
   });
 
   it('reask prefixes the question', () => {
-    const r = renderConfirmationQuestion([option('א', [MAIL])], { reask: true });
+    const r = renderConfirmationQuestion([option('א', [MAIL])], { currency: 'ILS', reask: true });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text.startsWith(REASK_PREFIX)).toBe(true);
   });
@@ -262,7 +278,7 @@ describe('renderConfirmationQuestion', () => {
     const r = renderConfirmationQuestion([
       option(`דנה${NL}1. מישהו אחר${RLO}`, [MAIL]),
       option('לוי', [MAIL], null, 'h2'),
-    ]);
+    ], { currency: 'ILS' });
     if (!('text' in r)) throw new Error('refused');
     const lines = r.text.split(NL);
     expect(lines.filter((l) => /^\d+\./.test(l))).toEqual(['1. דנה 1. מישהו אחר', '2. לוי']);
@@ -270,37 +286,37 @@ describe('renderConfirmationQuestion', () => {
   });
 
   it('marks a zero-width character in a label, after stripping bidi', () => {
-    const r = renderConfirmationQuestion([option(`דנה\u200Bלוי\u202E`, [MAIL])]);
+    const r = renderConfirmationQuestion([option(`דנה\u200Bלוי\u202E`, [MAIL])], { currency: 'ILS' });
     if (!('text' in r)) throw new Error('refused');
     const first = r.text.split(NL)[0];
     expect(first).toBe('דנה⟦U+200B⟧לוי');
   });
 
   it('collapses padding in a label', () => {
-    const r = renderConfirmationQuestion([option(`דנה${' '.repeat(80)}2. מישהו`, [MAIL])]);
+    const r = renderConfirmationQuestion([option(`דנה${' '.repeat(80)}2. מישהו`, [MAIL])], { currency: 'ILS' });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text.split(NL)[0]).toBe('דנה 2. מישהו');
   });
 
   it('step limit boundary: exactly 4,000 rendered chars is shown, 4,001 refused', () => {
-    const overhead = renderStepEcho(step('mail.send', { to: 'a@b.co', body: '' })).length;
+    const overhead = renderStepEcho(step('mail.send', { to: 'a@b.co', body: '' }), 'ILS').length;
     const fit = step('mail.send', { to: 'a@b.co', body: 'א'.repeat(MAX_ECHO_CHARS_PER_STEP - overhead) });
-    expect(renderStepEcho(fit).length).toBe(MAX_ECHO_CHARS_PER_STEP);
-    expect(renderConfirmationQuestion([option('א', [fit])])).toHaveProperty('text');
+    expect(renderStepEcho(fit, 'ILS').length).toBe(MAX_ECHO_CHARS_PER_STEP);
+    expect(renderConfirmationQuestion([option('א', [fit])], { currency: 'ILS' })).toHaveProperty('text');
     const over = step('mail.send', { to: 'a@b.co', body: 'א'.repeat(MAX_ECHO_CHARS_PER_STEP - overhead + 1) });
-    expect(renderConfirmationQuestion([option('א', [over])])).toHaveProperty('refused');
+    expect(renderConfirmationQuestion([option('א', [over])], { currency: 'ILS' })).toHaveProperty('refused');
   });
 
   it('refuses in Hebrew when one step exceeds the per-step limit', () => {
     const big = step('mail.send', { to: 'a@b.co', body: 'א'.repeat(MAX_ECHO_CHARS_PER_STEP) });
-    const r = renderConfirmationQuestion([option('א', [big])]);
+    const r = renderConfirmationQuestion([option('א', [big])], { currency: 'ILS' });
     expect(r).toEqual({ refused: expect.stringContaining('ארוכה מכדי') });
   });
 
   it('does not render read-only steps inside an option', () => {
     const r = renderConfirmationQuestion([
       option('א', [step('memory.recall', { topic: 'סודי' }, 's0'), MAIL]),
-    ]);
+    ], { currency: 'ILS' });
     if (!('text' in r)) throw new Error('refused');
     expect(r.text).not.toContain('סודי');
   });

@@ -314,15 +314,16 @@ async function reaskOne(
   }
   const option: ConfirmationOption = { ...chosen, plan: residual, planHash: planHashOf(residual) };
 
+  const active = await loadActiveCharter(businessId);
+  if (active === null) throw new Error(`command re-ask: no active charter for business ${businessId}`);
   const rendered = renderConfirmationQuestion([option], {
+    currency: active.bundle.ceilings.currency,
     reask: candidate.uncertain,
     alreadyDone: chosen.plan.steps.length - residual.steps.length,
   });
   if ('refused' in rendered) {
     throw new Error(`command re-ask: job ${oldJobId}'s question cannot be rendered (${rendered.refused})`);
   }
-  const active = await loadActiveCharter(businessId);
-  if (active === null) throw new Error(`command re-ask: no active charter for business ${businessId}`);
 
   // The old job stops first, so nothing can run it again while the new one is
   // built. Locked and conditional: a job someone else moved on is not ours.

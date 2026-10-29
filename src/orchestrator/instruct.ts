@@ -761,7 +761,7 @@ async function planPerCandidate(
     return askOwner(door, identityQuestion);
   }
 
-  const rendered = renderConfirmationQuestion(options);
+  const rendered = renderConfirmationQuestion(options, { currency: door.bundle.ceilings.currency });
   if ('refused' in rendered) {
     await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
     return { status: 'refused', reason: rendered.refused };
@@ -829,7 +829,7 @@ async function finishSingle(
       plan,
       contactSource: single.contactSource,
     };
-    const rendered = renderConfirmationQuestion([option]);
+    const rendered = renderConfirmationQuestion([option], { currency: door.bundle.ceilings.currency });
     if ('refused' in rendered) {
       await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
       return { status: 'refused', reason: rendered.refused };

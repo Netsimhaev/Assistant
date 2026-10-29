@@ -108,9 +108,9 @@ function renderValue(value: unknown): string {
   return renderScalar(value);
 }
 
-function renderKnown(key: string, value: unknown): string {
+function renderKnown(key: string, value: unknown, currency: string): string {
   if (key === 'amountMinor' && typeof value === 'number' && Number.isSafeInteger(value)) {
-    return formatMinor(value, 'ILS');
+    return formatMinor(value, currency);
   }
   if (key === 'body' && typeof value === 'string') return blockValue(value);
   return renderValue(value);
@@ -123,8 +123,14 @@ function isHidden(toolName: string): boolean {
   return READ_ONLY_TOOLS.has(toolName) && !isOutbound(toolName);
 }
 
-/** The echo of one step; empty string only for a positively read-only step. */
-export function renderStepEcho(step: PlanStep): string {
+/**
+ * The echo of one step; empty string only for a positively read-only step.
+ *
+ * `currency` is the active charter's (`bundle.ceilings.currency`), required
+ * and with no default: an amount shown in a currency the charter does not
+ * keep is an amount the owner did not see.
+ */
+export function renderStepEcho(step: PlanStep, currency: string): string {
   if (isHidden(step.toolName)) return '';
   const base = classifyAction(step.toolName);
   const label = base === null ? UNCLASSIFIED_LABEL : actionClassLabel(refineActionClass(base, step.input));
@@ -132,7 +138,7 @@ export function renderStepEcho(step: PlanStep): string {
 
   for (const { key, name } of KNOWN_FIELDS) {
     if (!Object.hasOwn(step.input, key)) continue;
-    lines.push(`${name}: ${renderKnown(key, step.input[key])}`);
+    lines.push(`${name}: ${renderKnown(key, step.input[key], currency)}`);
   }
   const extras = Object.keys(step.input)
     .filter((key) => !KNOWN_KEYS.has(key))
@@ -150,10 +156,10 @@ function sourceMarker(option: ConfirmationOption): string {
 }
 
 /** Echoes of an option's side-effecting steps, or the refusal if one is too long. */
-function optionEchoes(option: ConfirmationOption): string[] | { refused: string } {
+function optionEchoes(option: ConfirmationOption, currency: string): string[] | { refused: string } {
   const echoes: string[] = [];
   for (const step of option.plan.steps) {
-    const echo = renderStepEcho(step);
+    const echo = renderStepEcho(step, currency);
     if (echo === '') continue;
     if (echo.length > MAX_ECHO_CHARS_PER_STEP) return { refused: TOO_LONG };
     echoes.push(echo);
@@ -163,7 +169,9 @@ function optionEchoes(option: ConfirmationOption): string[] | { refused: string 
 
 export function renderConfirmationQuestion(
   options: ConfirmationOption[],
-  opts?: {
+  opts: {
+    /** The active charter's currency (`bundle.ceilings.currency`) — every amount is shown in it. */
+    currency: string;
     reask?: boolean;
     /** Steps of the original plan that completed and were dropped from this one; shown when > 0. */
     alreadyDone?: number;
@@ -172,15 +180,15 @@ export function renderConfirmationQuestion(
   const multiple = options.length > 1;
   const rendered: string[] = [];
   for (const [index, option] of options.entries()) {
-    const echoes = optionEchoes(option);
+    const echoes = optionEchoes(option, opts.currency);
     if (!Array.isArray(echoes)) return echoes;
     const head = `${multiple ? `${index + 1}. ` : ''}${labelText(option.label)}${sourceMarker(option)}`;
     rendered.push([head, ...echoes].join('\n'));
   }
 
   const parts: string[] = [];
-  if (opts?.reask === true) parts.push(REASK_PREFIX);
-  if (opts?.alreadyDone !== undefined && opts.alreadyDone > 0) parts.push(alreadyDoneLine(opts.alreadyDone));
+  if (opts.reask === true) parts.push(REASK_PREFIX);
+  if (opts.alreadyDone !== undefined && opts.alreadyDone > 0) parts.push(alreadyDoneLine(opts.alreadyDone));
   if (multiple) parts.push(CHOICE_HEADER);
   parts.push(rendered.join('\n\n'));
   parts.push(multiple ? CHOICE_HINT : CONFIRM_HINT);

@@ -83,6 +83,24 @@ describe('runInstruction', () => {
     expect(stored?.text).toBe('תשלחי ל-dana@example.com את ההצעה');
   });
 
+  it("shows an amount in the question in the charter's currency, never a hard-coded shekel", async () => {
+    await installCharter(
+      buildCharter({ version: '2026-08-15.usd', currency: 'USD', connections: [MAIL_CONNECTION] }),
+      { businessId: BUSINESS },
+    );
+    const base = mailPlan('dana@example.com');
+    const step = base.steps[0];
+    if (step === undefined) throw new Error('unreachable');
+    const plan: Plan = { ...base, steps: [{ ...step, input: { ...step.input, amountMinor: 12_500 } }] };
+    const result = await runInstruction(
+      { text: 'תשלחי ל-dana@example.com את ההצעה' },
+      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan }) },
+    );
+    if (result.status !== 'needs_confirmation') throw new Error(`unexpected ${result.status}`);
+    expect(result.question).toContain('סכום: USD 125');
+    expect(result.question).not.toContain('₪');
+  });
+
   it('grants a standing authorisation for the address the owner typed', async () => {
     const result = await runInstruction(
       { text: 'תשלחי ל-dana@example.com את ההצעה' },
