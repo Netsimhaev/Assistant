@@ -8,13 +8,14 @@
  * `runDueJobs`.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withTransaction } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { saveInstruction } from '../governance/instructions.js';
 import { confirmChoice, createConfirmation, loadConfirmation } from '../governance/instruction-confirmations.js';
-import { Plan } from '../domain/plan.js';
+import { Plan, planProblems } from '../domain/plan.js';
+import { recordInbound, settleMessage } from '../whatsapp/store.js';
 import type { CharterConnection } from '../domain/connection.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
@@ -23,10 +24,10 @@ import { createMailAdapter, type MailMessage } from './adapters/mail.js';
 import type { AdapterResult, ExternalAdapter } from './adapters/types.js';
 import { upsertBinding } from './bindings.js';
 import { envCredentials } from './credentials.js';
-import { REASK_PREFIX } from './command-echo.js';
-import { REASK_REASON, reaskFailedCommands } from './command-reask.js';
-import { createJob, loadJob, transition } from './jobs.js';
-import { bindPlanToJob, loadStoredPlan, planHashOf } from './plan-store.js';
+import { REASK_PREFIX, alreadyDoneLine } from './command-echo.js';
+import { REASK_REASON, reaskFailedCommands, residualPlan } from './command-reask.js';
+import { createJob, linkWhatsAppMessage, loadJob, transition } from './jobs.js';
+import { bindPlanToJob, loadStoredPlan, planHashOf, recordStepCompletion } from './plan-store.js';
 import { runDueJobs } from './run-due.js';
 import { runPlanForJob } from './run-plan.js';
 import type { Runtime } from './runtime.js';
@@ -61,6 +62,46 @@ const PLAN: Plan = Plan.parse({
   ],
 });
 const PLAN_HASH = planHashOf(PLAN);
+
+/** The reviewer's probe: two sends, the second depending on the first. */
+const TWO_STEP: Plan = Plan.parse({
+  goal: 'לשלוח שתי הודעות',
+  steps: [
+    {
+      id: 's1',
+      agent: 'comms.email',
+      intent: 'send the first',
+      toolName: 'mail.send',
+      input: { to: 'first@nowhere.example', subject: 'ראשון', body: 'אחת' },
+      expectedActionClass: 'email.initiate',
+    },
+    {
+      id: 's2',
+      agent: 'comms.email',
+      intent: 'send the second',
+      toolName: 'mail.send',
+      input: { to: 'second@nowhere.example', subject: 'שני', body: 'שתיים' },
+      dependsOn: ['s1'],
+      expectedActionClass: 'email.initiate',
+    },
+  ],
+});
+
+/** Sends the first message, then never answers again. */
+function firstThenStall(sent: MailMessage[]): AdapterRegistry {
+  return new AdapterRegistry([
+    createMailAdapter({
+      system: 'office-mail',
+      transport: {
+        async send(message) {
+          if (sent.length > 0) return new Promise<never>(() => {});
+          sent.push(message);
+          return { messageId: `MSG-${sent.length}` };
+        },
+      },
+    }),
+  ]);
+}
 const CREDENTIALS = envCredentials({ [`${PREFIX}OFFICE_MAIL`]: 'pw' }, PREFIX);
 
 function sendingRuntime(sent: MailMessage[]): Runtime {
@@ -111,8 +152,11 @@ let charterCounter = 0;
 async function seedCommand(o: {
   businessId?: string;
   channel?: 'whatsapp' | 'dashboard';
+  plan?: Plan;
 } = {}): Promise<{ jobId: string; bundle: PolicyBundle }> {
   const businessId = o.businessId ?? BUSINESS;
+  const plan = o.plan ?? PLAN;
+  const planHash = planHashOf(plan);
   charterCounter += 1;
   const bundle = await installCharter(
     buildCharter({ version: `2026-08-15.reask-${charterCounter}`, connections: [MAIL_CONNECTION] }),
@@ -128,17 +172,17 @@ async function seedCommand(o: {
   for (const to of ['understand', 'plan'] as const) {
     await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId });
   }
-  await bindPlanToJob(job.jobId, PLAN, { businessId });
+  await bindPlanToJob(job.jobId, plan, { businessId });
   await createConfirmation(
     {
       jobId: job.jobId,
-      options: [{ label: 'לשלוח', planHash: PLAN_HASH, plan: PLAN, contactSource: null }],
+      options: [{ label: 'לשלוח', planHash, plan, contactSource: null }],
       presentedText: 'לשלוח?',
       channel: o.channel ?? 'whatsapp',
     },
     { businessId },
   );
-  expect(await confirmChoice(job.jobId, PLAN_HASH, 'p_boss', { businessId })).toBe(true);
+  expect(await confirmChoice(job.jobId, planHash, 'p_boss', { businessId })).toBe(true);
   await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup', businessId });
   await upsertBinding(
     {
@@ -185,6 +229,40 @@ async function reasksOf(oldJobId: string): Promise<Array<{ job_id: string; busin
     [oldJobId],
   );
   return rows;
+}
+
+/** The door's WhatsApp bookkeeping: an inbound message recorded, linked to the job, settled. */
+async function linkToWhatsApp(jobId: string): Promise<string> {
+  const message = await recordInbound(
+    {
+      providerMessageId: `PM-${jobId}`,
+      senderNumber: '+972500000000',
+      senderKind: 'principal',
+      body: INSTRUCTION,
+      mediaKind: null,
+      providerTimestamp: new Date().toISOString(),
+    },
+    { businessId: BUSINESS },
+  );
+  if (message === null) throw new Error('setup: duplicate inbound message id');
+  await linkWhatsAppMessage(jobId, message.id, { businessId: BUSINESS });
+  await settleMessage(message.id, 'handled', {}, { businessId: BUSINESS });
+  return message.id;
+}
+
+async function whatsappLink(jobId: string): Promise<string | null> {
+  const { rows } = await getPool().query<{ whatsapp_message_id: string | null }>(
+    'SELECT whatsapp_message_id FROM jobs WHERE job_id = $1',
+    [jobId],
+  );
+  return rows[0]?.whatsapp_message_id ?? null;
+}
+
+async function backdateDecision(jobId: string): Promise<void> {
+  await getPool().query(
+    `UPDATE instruction_confirmations SET decided_at = now() - interval '25 hours' WHERE job_id = $1`,
+    [jobId],
+  );
 }
 
 async function jobCount(): Promise<number> {
@@ -408,8 +486,9 @@ describe('reaskFailedCommands', () => {
 
   it('a re-ask moved to failed but not yet asked is asked on the next pass', async () => {
     const { jobId } = await seedCommand();
-    // The state a crash right after the move leaves: failed for the re-ask,
-    // with an old confirmation and nothing claimed.
+    // The state a crash right after moving a (c) job leaves: failed for the
+    // re-ask, an old confirmation, nothing claimed.
+    await backdateDecision(jobId);
     await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: REASK_REASON, businessId: BUSINESS });
     const result = await reaskFailedCommands({ businessId: BUSINESS });
     expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
@@ -436,5 +515,160 @@ describe('reaskFailedCommands', () => {
     expect(pass.reaskError).toBeNull();
     expect(pass.reasked.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
     expect(sent).toEqual([]);
+  });
+
+  it('the reviewer’s probe: s1 sent, s2 timed out, "yes" sends only s2', async () => {
+    const { jobId, bundle } = await seedCommand({ plan: TWO_STEP });
+    const sent: MailMessage[] = [];
+    const job = await loadJob(jobId, { businessId: BUSINESS });
+    if (job === null) throw new Error('no job');
+    const outcome = await runPlanForJob({
+      job,
+      bundle,
+      plan: TWO_STEP,
+      registry: firstThenStall(sent),
+      credentials: CREDENTIALS,
+      counterpartyTags: [],
+      rampLevel: 'draft_only',
+      now: NOON,
+      adapterTimeoutMs: 25,
+    });
+    expect(outcome.status).toBe('halted');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.to).toContain('first@nowhere.example');
+
+    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    expect(result.errored).toEqual([]);
+    const newJobId = result.reasked[0]?.newJobId ?? '';
+    const confirmation = await loadConfirmation(newJobId, { businessId: BUSINESS });
+    const option = confirmation?.options[0];
+    if (confirmation === null || option === undefined) throw new Error('no re-ask');
+    // Only s2, its edge to the completed s1 pruned, and a valid plan.
+    expect(option.plan.steps.map((st) => st.id)).toEqual(['s2']);
+    expect(option.plan.steps[0]?.dependsOn).toEqual([]);
+    expect(option.planHash).toBe(planHashOf(option.plan));
+    expect((await loadStoredPlan(newJobId, { businessId: BUSINESS }))?.planHash).toBe(option.planHash);
+    expect(confirmation.presentedText.startsWith(`${REASK_PREFIX}\n\n${alreadyDoneLine(1)}`)).toBe(true);
+    expect(confirmation.presentedText).not.toContain('first@nowhere.example');
+
+    // The owner says yes; the new job runs.
+    expect(await confirmChoice(newJobId, option.planHash, 'p_boss', { businessId: BUSINESS })).toBe(true);
+    await transition(newJobId, { to: 'execute', actor: 'human', reason: 'command: confirmed', businessId: BUSINESS });
+    const after: MailMessage[] = [];
+    const ran = await runDueJobs({ businessId: BUSINESS, runtime: sendingRuntime(after), now: NOON });
+    expect(ran.ran).toEqual([{ jobId: newJobId, status: 'done', detail: null }]);
+    expect(after).toHaveLength(1);
+    expect(after[0]?.to).toContain('second@nowhere.example');
+    expect(after.some((m) => String(m.to).includes('first@nowhere.example'))).toBe(false);
+  });
+
+  it('arm (c) with s1 completed: the prefix and the already-done line, only s2 asked', async () => {
+    const { jobId } = await seedCommand({ plan: TWO_STEP });
+    await withTransaction(async (tx) => {
+      await recordStepCompletion(tx, {
+        jobId, businessId: BUSINESS, planHash: planHashOf(TWO_STEP), stepId: 's1',
+        externalId: 'MSG-1', status: 'completed', performed: true,
+      });
+    });
+    await transition(jobId, {
+      to: 'followup',
+      actor: 'orchestrator',
+      reason: 'quiet_hours',
+      wakeAt: new Date(Date.now() + 3_600_000),
+      businessId: BUSINESS,
+    });
+    await backdateDecision(jobId);
+
+    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: true }]);
+    const confirmation = await loadConfirmation(result.reasked[0]?.newJobId ?? '', { businessId: BUSINESS });
+    expect(confirmation?.presentedText.startsWith(`${REASK_PREFIX}\n\n${alreadyDoneLine(1)}`)).toBe(true);
+    expect(confirmation?.options[0]?.plan.steps.map((st) => st.id)).toEqual(['s2']);
+  });
+
+  it('residualPlan prunes edges to dropped steps and keeps the plan valid', () => {
+    const three = Plan.parse({
+      ...TWO_STEP,
+      steps: [
+        ...TWO_STEP.steps,
+        { ...TWO_STEP.steps[1], id: 's3', dependsOn: ['s1', 's2'] },
+      ],
+    });
+    const residual = residualPlan(three, new Set(['s1']));
+    expect(residual?.steps.map((st) => [st.id, st.dependsOn])).toEqual([
+      ['s2', []],
+      ['s3', ['s2']],
+    ]);
+    expect(residual?.goal).toBe(three.goal);
+    expect(residual !== null && planProblems(residual)).toEqual([]);
+    expect(residualPlan(three, new Set(['s1', 's2', 's3']))).toBeNull();
+  });
+
+  it('an expiry the job woke into within the same pass is re-asked once, plainly', async () => {
+    const { jobId } = await seedCommand({ channel: 'dashboard' });
+    await transition(jobId, {
+      to: 'followup',
+      actor: 'orchestrator',
+      reason: 'quiet_hours',
+      wakeAt: new Date(NOON.getTime() - 60_000),
+      businessId: BUSINESS,
+    });
+    await backdateDecision(jobId);
+
+    const sent: MailMessage[] = [];
+    const pass = await schedulerPass({ businessId: BUSINESS, runtime: sendingRuntime(sent), now: NOON, inbox: null });
+    expect(sent).toEqual([]);
+    // Woken, run, refused on the stale "yes", failed — then re-asked.
+    expect(await lastReason(jobId)).toContain('draft_only');
+    expect(pass.reasked.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
+    const confirmation = await loadConfirmation(pass.reasked.reasked[0]?.newJobId ?? '', { businessId: BUSINESS });
+    expect(confirmation?.presentedText.includes(REASK_PREFIX)).toBe(false);
+
+    const next = await schedulerPass({ businessId: BUSINESS, runtime: sendingRuntime(sent), now: NOON, inbox: null });
+    expect(next.reasked.reasked).toEqual([]);
+    expect(await reasksOf(jobId)).toHaveLength(1);
+  });
+
+  it('a fresh confirmation that failed for another reason is not re-asked', async () => {
+    const { jobId } = await seedCommand();
+    await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: 'forbidden:x', businessId: BUSINESS });
+    expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [], errored: [] });
+  });
+
+  it('the successor carries the old job’s WhatsApp message', async () => {
+    const { jobId, bundle } = await seedCommand();
+    const messageId = await linkToWhatsApp(jobId);
+    await timeOut(jobId, bundle);
+    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    expect(await whatsappLink(result.reasked[0]?.newJobId ?? '')).toBe(messageId);
+  });
+
+  it('the confirmation and the link land together: a failed link leaves no confirmation', async () => {
+    const { jobId, bundle } = await seedCommand();
+    await linkToWhatsApp(jobId);
+    await timeOut(jobId, bundle);
+    await getPool().query(`
+      CREATE OR REPLACE FUNCTION reask_test_refuse_link() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.whatsapp_message_id IS DISTINCT FROM OLD.whatsapp_message_id AND NEW.job_id <> '${jobId}' THEN
+          RAISE EXCEPTION 'link refused';
+        END IF;
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql`);
+    await getPool().query(
+      'CREATE TRIGGER reask_test_refuse_link BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION reask_test_refuse_link()',
+    );
+    try {
+      const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+      expect(result.reasked).toEqual([]);
+      expect(result.errored.map((e) => e.jobId)).toEqual([jobId]);
+      expect(await reasksOf(jobId)).toEqual([]);
+    } finally {
+      await getPool().query('DROP TRIGGER reask_test_refuse_link ON jobs');
+      await getPool().query('DROP FUNCTION reask_test_refuse_link()');
+    }
+    // Nothing is lost: the next pass asks.
+    const again = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    expect(again.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
   });
 });

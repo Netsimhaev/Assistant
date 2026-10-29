@@ -20,6 +20,11 @@ export const CONFIRM_HINT = 'השיבי "כן" לאישור, או "לא" לבי�
 export const CHOICE_HINT = 'השיבי במספר או בשם — וזה גם האישור. "לא" לביטול.';
 export const REASK_PREFIX = 'ייתכן שזה כבר בוצע — לבצע שוב?';
 
+/** The line a re-ask shows when some steps already completed and will not run again (spec §10.3). */
+export function alreadyDoneLine(count: number): string {
+  return `כבר בוצע: ${count} צעדים — הם לא יבוצעו שוב.`;
+}
+
 const TOO_LONG = 'הפעולה ארוכה מכדי להציג אותה בשאלה אחת — נסח/י את ההוראה בקצרה יותר.';
 const CHOICE_HEADER = 'למי התכוונת?';
 const SOURCE_BOSS = '(מהזיכרון — נאמר על ידך)';
@@ -156,7 +161,11 @@ function optionEchoes(option: ConfirmationOption): string[] | { refused: string 
 
 export function renderConfirmationQuestion(
   options: ConfirmationOption[],
-  opts?: { reask?: boolean },
+  opts?: {
+    reask?: boolean;
+    /** Steps of the original plan that completed and were dropped from this one; shown when > 0. */
+    alreadyDone?: number;
+  },
 ): { text: string } | { refused: string } {
   const multiple = options.length > 1;
   const rendered: string[] = [];
@@ -169,6 +178,7 @@ export function renderConfirmationQuestion(
 
   const parts: string[] = [];
   if (opts?.reask === true) parts.push(REASK_PREFIX);
+  if (opts?.alreadyDone !== undefined && opts.alreadyDone > 0) parts.push(alreadyDoneLine(opts.alreadyDone));
   if (multiple) parts.push(CHOICE_HEADER);
   parts.push(rendered.join('\n\n'));
   parts.push(multiple ? CHOICE_HINT : CONFIRM_HINT);

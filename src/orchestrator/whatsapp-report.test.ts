@@ -1287,6 +1287,8 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     const confirmed = await seed({ instruction: true, confirm: true });
     await close(confirmed);
     expect(asReport(await classifyJob(confirmed, 'closed', BUSINESS)).outcome).toBe('performed_on_confirmation');
+    // Closed only: a halted job, even with every step done, is not "done on your word".
+    expect(asReport(await classifyJob(confirmed, 'halted', BUSINESS)).outcome).toBe('performed');
     await linkToWhatsApp(noInstruction);
     const messenger = fakeMessenger();
     await reportWhatsAppJobs({ messenger, businessId: BUSINESS });

@@ -13,7 +13,8 @@
  * `instruction_confirmations` row. A mail reply job with an `unknown` row has
  * neither, and is the mail re-raise's (`reraiseAfterFailedSend`), never this.
  *
- * **What qualifies** (any one):
+ * **What qualifies** — always with a step still to run (`steps_left`), and
+ * then any one of:
  *   (a) `failed`, and a step was claimed with no `completed` row for it —
  *       "claimed, outcome unknown or nothing done". This is also where a lost
  *       claim lands (`confirmed_step_already_claimed`), and where a
@@ -27,14 +28,26 @@
  *   (c) `followup`, the confirmation decided 24 hours ago or more (the
  *       exemption's own window, `confirmed-command.ts`), and a step still to
  *       run. Nothing was claimed-and-lost here, so the question is plain;
- *   (d) `failed` with `REASK_REASON` as its last move — this module moved it
- *       there and the re-ask is still owed (a crash after the move). Without
- *       this a (c)-only job, no longer in `followup`, would be lost.
+ *   (d) `failed`, the confirmation decided 24 hours ago or more. The expiry
+ *       case once the job woke first: `tick` wakes it, `runDueJobs` runs it,
+ *       the exemption refuses the stale "כן", the step dies at stage 8 and
+ *       the job fails — all before this stage looks. Bounded to the expiry:
+ *       a job that failed on a fresh confirmation for any other reason is not
+ *       re-asked here, and the successor guard stops any loop. It also covers
+ *       a crash after this module moved a (c) job to `failed`.
+ *
+ * **Only what has not run is asked again.** The new job's plan is the
+ * RESIDUAL plan: the chosen plan's steps that have no `completed` row, with
+ * `dependsOn` edges to the dropped steps pruned (they are satisfied), checked
+ * by `Plan.safeParse` and `planProblems`. A "כן" therefore never re-sends a
+ * step that is recorded as done. Its hash is the store's (`createConfirmation`
+ * recomputes it), and that is the hash the exemption later binds.
  *
  * **The prefix follows the record, not the path that found the job.**
- * `REASK_PREFIX` is shown exactly when (a) or (b) holds — a claim without a
- * completion, or an `unknown` row. Those facts survive the move to `failed`,
- * so a retry after a crash asks the same question.
+ * `REASK_PREFIX` is shown whenever ANY step was claimed or has a result row —
+ * something may already have happened. When steps completed, the question
+ * also says how many and that they will not run again (`alreadyDoneLine`).
+ * Those facts survive the move to `failed`, so a retry asks the same question.
  *
  * **Once per old job, held by the schema.** Migration 049's partial UNIQUE
  * index on `(business_id, reask_of)` means one confirmation row may ever name
@@ -45,8 +58,8 @@
  *
  * **The new job is the old one's twin:** provenance `boss` (a literal, as at
  * the door), the same title, a new `boss_instructions` row with the old text
- * and origin, phase `plan`, the same plan bound (so the same hash), and a
- * confirmation with only the chosen option, `reask_of` = the old job, on the
+ * and origin, phase `plan`, the residual plan bound, and a confirmation
+ * with only the residual of the chosen option, `reask_of` = the old job, on the
  * old channel. It carries the old job's opening WhatsApp message link
  * (`linkWhatsAppMessage`, its only writer), so the report owed on that
  * message is delivered by the job that actually runs; the old job is kept out
@@ -58,8 +71,9 @@
  */
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withTransaction } from '../db/pool.js';
 import { JobPhase } from '../domain/job.js';
+import { Plan, planProblems } from '../domain/plan.js';
 import { loadInstructionForJob, saveInstruction } from '../governance/instructions.js';
 import {
   ConfirmationOption,
@@ -69,9 +83,12 @@ import {
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { renderConfirmationQuestion } from './command-echo.js';
 import { PhaseMovedError, createJob, linkWhatsAppMessage, transition } from './jobs.js';
-import { bindPlanToJob } from './plan-store.js';
+import { bindPlanToJob, completedSteps, planHashOf } from './plan-store.js';
 
-/** The reason an old job is moved to `failed` with when it is re-asked (case (d) reads it back). */
+/**
+ * The reason an old job is moved to `failed` with when it is re-asked. The
+ * report reads it back (`whatsapp-report.ts`) to keep such a job out.
+ */
 export const REASK_REASON = 'command: re-asking';
 
 const UNIQUE_VIOLATION = '23505';
@@ -125,6 +142,13 @@ const CANDIDATES_SQL = `
                  AND u.status = 'unknown'
             )) AS has_unknown,
            (EXISTS (
+              SELECT 1 FROM confirmed_step_claims k
+               WHERE k.business_id = j.business_id AND k.job_id = j.job_id
+            ) OR EXISTS (
+              SELECT 1 FROM job_step_results a
+               WHERE a.business_id = j.business_id AND a.job_id = j.job_id
+            )) AS any_progress,
+           (EXISTS (
               SELECT 1 FROM job_plans p, jsonb_array_elements(p.plan -> 'steps') s
                WHERE p.business_id = j.business_id AND p.job_id = j.job_id
                  AND NOT EXISTS (
@@ -133,10 +157,7 @@ const CANDIDATES_SQL = `
                       AND r.plan_hash = p.plan_hash AND r.step_id = s ->> 'id'
                       AND r.status = 'completed'
                  )
-            )) AS steps_left,
-           ((SELECT st.reason FROM job_steps st
-              WHERE st.job_id = j.job_id
-              ORDER BY st.at DESC, st.id DESC LIMIT 1) = $3) AS moved_for_reask
+            )) AS steps_left
       FROM jobs j
       JOIN instruction_confirmations c
         ON c.business_id = j.business_id AND c.job_id = j.job_id AND c.state = 'confirmed'
@@ -153,17 +174,20 @@ const CANDIDATES_SQL = `
        )
   )
   SELECT job_id, phase, title, whatsapp_message_id, options, chosen_plan_hash, channel,
-         (claim_uncertain OR has_unknown) AS uncertain
+         any_progress AS uncertain
     FROM command
-   WHERE (phase = 'failed' AND claim_uncertain)
-      OR has_unknown
-      OR (phase = 'followup' AND decided_at <= now() - interval '24 hours' AND steps_left)
-      OR (phase = 'failed' AND moved_for_reask)
+   WHERE steps_left
+     AND (
+           (phase = 'failed' AND claim_uncertain)
+        OR has_unknown
+        OR (phase = 'followup' AND decided_at <= now() - interval '24 hours')
+        OR (phase = 'failed' AND decided_at <= now() - interval '24 hours')
+     )
    ORDER BY job_id
-   LIMIT $4`;
+   LIMIT $3`;
 
 async function readCandidates(businessId: string, jobId: string | null, limit: number): Promise<CandidateRow[]> {
-  const { rows } = await getPool().query<CandidateRow>(CANDIDATES_SQL, [businessId, jobId, REASK_REASON, limit]);
+  const { rows } = await getPool().query<CandidateRow>(CANDIDATES_SQL, [businessId, jobId, limit]);
   return rows;
 }
 
@@ -245,7 +269,28 @@ async function reaskOne(
   const instruction = await loadInstructionForJob(oldJobId, { businessId });
   if (instruction === null) throw new Error(`command re-ask: job ${oldJobId} has no instruction`);
 
-  const rendered = renderConfirmationQuestion([chosen], { reask: candidate.uncertain });
+  const done = await completedSteps(oldJobId, chosen.planHash, { businessId });
+  const residual = residualPlan(chosen.plan, new Set(done.keys()));
+  if (residual === null) {
+    // Nothing left to run, so nothing to ask. A `followup` job is closed;
+    // one already `failed` stays where it is.
+    if (JobPhase.parse(candidate.phase) === 'followup') {
+      await transition(oldJobId, {
+        to: 'closed',
+        actor: 'orchestrator',
+        reason: 'command: nothing left to re-ask',
+        businessId,
+        expectFrom: 'followup',
+      });
+    }
+    return null;
+  }
+  const option: ConfirmationOption = { ...chosen, plan: residual, planHash: planHashOf(residual) };
+
+  const rendered = renderConfirmationQuestion([option], {
+    reask: candidate.uncertain,
+    alreadyDone: chosen.plan.steps.length - residual.steps.length,
+  });
   if ('refused' in rendered) {
     throw new Error(`command re-ask: job ${oldJobId}'s question cannot be rendered (${rendered.refused})`);
   }
@@ -290,21 +335,29 @@ async function reaskOne(
         businessId,
       });
     }
-    const binding = await bindPlanToJob(job.jobId, chosen.plan, { businessId });
-    if (binding.status !== 'stored' || binding.planHash !== chosen.planHash) {
-      throw new Error(`command re-ask: job ${job.jobId} could not be bound to plan ${chosen.planHash}`);
+    const binding = await bindPlanToJob(job.jobId, option.plan, { businessId });
+    if (binding.status !== 'stored' || binding.planHash !== option.planHash) {
+      throw new Error(`command re-ask: job ${job.jobId} could not be bound to plan ${option.planHash}`);
     }
+    // The confirmation and the WhatsApp link land together or not at all: a
+    // confirmation without the link would leave the successor's report with
+    // no message to go to — the owner would never hear how it ended.
     try {
-      await createConfirmation(
-        {
-          jobId: job.jobId,
-          options: [chosen],
-          presentedText: rendered.text,
-          channel: candidate.channel,
-          reaskOf: oldJobId,
-        },
-        { businessId },
-      );
+      await withTransaction(async (tx) => {
+        await createConfirmation(
+          {
+            jobId: job.jobId,
+            options: [option],
+            presentedText: rendered.text,
+            channel: candidate.channel,
+            reaskOf: oldJobId,
+          },
+          { businessId, db: tx },
+        );
+        if (candidate.whatsapp_message_id !== null) {
+          await linkWhatsAppMessage(job.jobId, candidate.whatsapp_message_id, { businessId, db: tx });
+        }
+      });
     } catch (err) {
       if ((err as { code?: unknown }).code === UNIQUE_VIOLATION) {
         throw new Error(`command re-ask: job ${oldJobId} was already re-asked`);
@@ -328,13 +381,30 @@ async function reaskOne(
     }
   }
 
-  if (candidate.whatsapp_message_id !== null) {
-    await linkWhatsAppMessage(job.jobId, candidate.whatsapp_message_id, { businessId });
-  }
-
   const reasked = { oldJobId, newJobId: job.jobId, uncertain: candidate.uncertain };
   if (candidate.channel !== 'whatsapp') return { reasked, delivery: 'dashboard' };
   if (messenger === undefined) return { reasked, delivery: 'not_connected' };
   const sent = await messenger.send({ text: rendered.text, jobId: job.jobId });
   return { reasked, delivery: sent.ok ? 'sent' : 'failed' };
+}
+
+/**
+ * The steps of `plan` that are not in `done`, with every `dependsOn` edge to a
+ * dropped step removed — a completed step is a satisfied dependency. Order,
+ * goal and everything else as they were. `null` when nothing is left. Throws
+ * when the result is not a valid plan: a re-ask must never present a plan the
+ * executor would refuse.
+ */
+export function residualPlan(plan: Plan, done: ReadonlySet<string>): Plan | null {
+  const steps = plan.steps
+    .filter((step) => !done.has(step.id))
+    .map((step) => ({ ...step, dependsOn: step.dependsOn.filter((dep) => !done.has(dep)) }));
+  if (steps.length === 0) return null;
+  const parsed = Plan.safeParse({ ...plan, steps });
+  if (!parsed.success) throw new Error(`command re-ask: residual plan does not parse (${parsed.error.message})`);
+  const problems = planProblems(parsed.data);
+  if (problems.length > 0) {
+    throw new Error(`command re-ask: residual plan is not a valid DAG (${problems.map((p) => p.kind).join(', ')})`);
+  }
+  return parsed.data;
 }
