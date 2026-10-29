@@ -29,6 +29,8 @@ import { inQuietHours, redactPayload } from './redact.js';
 import { mayDelegate } from '../governance/delegation.js';
 import { APPROVED_REPLY_EXEMPTION_MARKER, approvedReplyCovers } from './approved-reply.js';
 import { LEARNED_REPLY_EXEMPTION_MARKER, learnedReplyCovers } from './learned-reply.js';
+import { CONFIRMED_COMMAND_EXEMPTION_MARKER, confirmedCommandCovers } from './confirmed-command.js';
+import { claimConfirmedStep } from '../governance/instruction-confirmations.js';
 
 export interface GateContext extends FactsContext {
   agent: AgentId;
@@ -55,6 +57,15 @@ export interface GateContext extends FactsContext {
    * second request, and the step never runs however many times it is approved.
    */
   approval?: { approvalId: string; stepId: string };
+  /**
+   * The plan step this call executes. Set by `executeStep` and by NOTHING
+   * else: the SDK gate-hook (`sdk/gate-hook.ts`) never sets it, so an agent
+   * running directly through the SDK can never be carried by the
+   * confirmed-command exemption (`confirmedCommandCovers`), which requires it.
+   * A call the gate cannot tie to a step of the confirmed plan is not
+   * something the owner confirmed.
+   */
+  stepId?: string;
   /**
    * Whether to consult a standing authorisation for this job at all.
    *
@@ -117,6 +128,11 @@ export interface GateContext extends FactsContext {
  *   8. autonomy         — the combined ceiling from five independent sources
  *   9. budget           — money ceilings, denied rather than escalated
  *  10. risk             — score, then band, then allow or queue for approval
+ *
+ * One exemption skips stages 5–10's gating outright: a step of a boss command
+ * the owner confirmed (`confirmedCommandCovers`), consulted between stages 4
+ * and 5. Stages 1–4 always run before it; see `confirmedCommand` for what it
+ * still enforces.
  *
  * Intent is written to the audit log *before* the call is permitted, so a crash
  * between decision and execution is visible rather than silent.
@@ -224,6 +240,18 @@ export async function evaluateToolCall(
       effectiveAutonomy: 'auto',
       redactedInput: redactPayload(toolInput, ctx.bundle),
     };
+  }
+
+  // A boss command the owner confirmed (spec 2026-10-28 §4.5, §10; owner
+  // ruling 28/10: "the command overrides everything"). Consulted here — after
+  // stages 1–3, which always run, and after stage 4, which needs no exemption
+  // for a call it allows anyway — and before stage 5. When it holds, stages
+  // 5–9 and `needsApproval` are skipped entirely; see `confirmedCommand` for
+  // the little that still runs. `confirmedCommandCovers` itself refuses any
+  // call carrying `ctx.approval`, so the approval path is never mixed in.
+  const confirmed = await confirmedCommandCovers(facts, ctx);
+  if (confirmed !== null) {
+    return confirmedCommand(confirmed, facts, toolInput, outbound, ctx, currentVersion, businessId, db);
   }
 
   // 5. Hard prohibitions ---------------------------------------------------
@@ -347,7 +375,7 @@ export async function evaluateToolCall(
   // call would leak. One expression is what keeps those two returns from
   // drifting the way `approvalId`'s redaction and the plain allow's already
   // had.
-  const permittedInput = outbound ? redactPayload(toolInput, ctx.bundle) : toolInput;
+  const permittedInput = permittedInputFor(toolInput, outbound, ctx.bundle);
 
   // An approval a person already granted is spent here, before the gate asks
   // for another one. Placed after the `blocked` check on purpose: an approval
@@ -638,6 +666,83 @@ async function autonomyDenial(
   }
 
   return null;
+}
+
+/**
+ * The payload an `allow` hands the executor. One function for every `allow`
+ * past stage 4 — the approval spend, the unattended allow and the
+ * confirmed-command exemption — so the three can never redact differently: a
+ * confirmed command that skipped redaction on an outbound call would leak the
+ * very values the charter says never leave.
+ */
+function permittedInputFor(toolInput: unknown, outbound: boolean, bundle: PolicyBundle): unknown {
+  return outbound ? redactPayload(toolInput, bundle) : toolInput;
+}
+
+/**
+ * The gate's answer for a step of a confirmed boss command
+ * (`confirmedCommandCovers` held). Stages 5–9 and `needsApproval` do not run.
+ * What does, in this order:
+ *
+ *   1. `amount_unreadable` — an amount that could not be read was never shown
+ *      in the confirmation question, so it was never confirmed. Refused and
+ *      recorded exactly as stage 9 refuses and records it;
+ *   2. `intent_to_act`, ending in `CONFIRMED_COMMAND_EXEMPTION_MARKER`, so
+ *      every execution that ran on the owner's confirmation can be found
+ *      (§10.12). Written BEFORE the claim, so the trail exists even when the
+ *      claim then loses. The risk is assessed only for this record — it gates
+ *      nothing here;
+ *   3. the claim (`claimConfirmedStep`, §10.2). A lost claim means this step
+ *      was already claimed — it may already have run — and it must not run
+ *      again without asking;
+ *   4. `allow` at `auto`, with the payload redacted exactly as every other
+ *      allow redacts it (`permittedInputFor`).
+ */
+async function confirmedCommand(
+  confirmed: { stepId: string; planHash: string },
+  facts: ActionFacts,
+  toolInput: unknown,
+  outbound: boolean,
+  ctx: GateContext,
+  currentVersion: string,
+  businessId: string,
+  db: Queryable,
+): Promise<PolicyDecision> {
+  const actionClass = facts.actionClass;
+  if (actionClass !== null && AMOUNT_REQUIRED_CLASSES.has(actionClass) && !facts.amountDeclared) {
+    await recordIntent(facts, ctx, currentVersion, businessId, {
+      kind: 'policy_denial',
+      reason: `${DENY_CODES.amountUnreadable}: ${actionClass}`,
+    });
+    return deny(
+      DENY_CODES.amountUnreadable,
+      `${actionClass} חייב לשאת amountMinor — בלעדיו אי אפשר לאכוף תקרה`,
+    );
+  }
+
+  const risk = await assessRisk(facts, ctx.bundle, ctx.norms ? { norms: ctx.norms } : {});
+  await recordIntent(facts, ctx, currentVersion, businessId, {
+    kind: 'intent_to_act',
+    reason: `${risk.explanation} ${CONFIRMED_COMMAND_EXEMPTION_MARKER}`,
+    risk,
+  });
+
+  const claimed = await claimConfirmedStep(
+    { jobId: ctx.jobId ?? '', stepId: confirmed.stepId, planHash: confirmed.planHash },
+    { businessId, db },
+  );
+  if (!claimed) {
+    return deny(
+      DENY_CODES.confirmedStepAlreadyClaimed,
+      'הצעד הזה כבר נתבע לביצוע — לא אבצע אותו שוב בלי לשאול.',
+    );
+  }
+
+  return {
+    outcome: 'allow',
+    effectiveAutonomy: 'auto',
+    redactedInput: permittedInputFor(toolInput, outbound, ctx.bundle),
+  };
 }
 
 /**
