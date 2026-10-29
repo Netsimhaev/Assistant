@@ -148,7 +148,15 @@ import { runInstruction, type InstructionOutcome, type RunInstructionOptions } f
 import { linkWhatsAppMessage } from './jobs.js';
 import { handleMailCardMessage, isMailCardAction, openMailCards } from './whatsapp-mail-card.js';
 import {
+  applyConfirmation,
+  openConfirmations,
+  readConfirmation,
+  type ConfirmOutcome,
+  type ConfirmReading,
+} from './command-confirm.js';
+import {
   ambiguousQuestion,
+  answerableWhatsAppQuestions,
   claimAsAnswer,
   closureConfirmation,
   decideWhatsAppRoute,
@@ -197,6 +205,23 @@ export interface DoorResult {
    * under `closed`, exactly as on the instruction path.
    */
   mailCardReplies: number;
+  /**
+   * The owner answered an open boss-command confirmation question
+   * (`command-confirm.ts`) with a confirm, a pick or a cancel, and the
+   * answer was applied — or found already decided. Counted apart from
+   * `instructed` for the reason `mailCardReplies` gives: no instruction ran
+   * and no job was opened. A collision refusal, an unclear pick or a thrown
+   * apply counts under `refused`.
+   */
+  confirmationReplies: number;
+  /**
+   * A confirmation answer `applyConfirmation` threw on — decided or not, not
+   * applied (a bound-hash mismatch, a transient transition error). The owner
+   * was told to retry on the dashboard, and `settleDecidedConfirmations`
+   * moves the job on next pass; this is the operator's trace of it, printed
+   * by `logErrored` (`scheduler-log.ts`).
+   */
+  confirmErrored: Array<{ jobId: string; error: string }>;
   /**
    * Counted separately from `recordedOnly` — fix round B, finding 3. A
    * `senderNumber` that fails `authorityNumberKey` outright is a GATEWAY
@@ -294,7 +319,10 @@ function composeAck(outcome: InstructionOutcome): string {
   if (outcome.status === 'refused') return outcome.reason;
   if (outcome.status === 'needs_answer') return outcome.question;
   // Boss command (spec §4): the confirmation question IS the ack — the owner
-  // answers it in this chat. Minimal for now; the full UX is a later task.
+  // answers it in this chat (`handleConfirmationMessage`). It is sent only
+  // after `runInstruction` returned, so the `instruction_confirmations` row —
+  // whose `presented_at` the strict-after check reads — already exists: no
+  // reply can be dated before the question it answers was recorded.
   if (outcome.status === 'needs_confirmation') {
     return outcome.identityNote === null
       ? outcome.question
@@ -400,6 +428,8 @@ interface ProcessContext {
    * side-channel signal would touch every `return` in this function.
    */
   reportMalformedSender: () => void;
+  /** Called when `applyConfirmation` throws — into `DoorResult.confirmErrored`. */
+  reportConfirmError: (jobId: string, error: string) => void;
   /**
    * Overrides `config.whatsappQuestionWindowMinutes` for one call. Production
    * leaves it unset — the same escape hatch `pollTimeoutMs` and
@@ -410,7 +440,31 @@ interface ProcessContext {
   questionWindowMinutes?: number;
 }
 
-type ProcessOutcome = 'recordedOnly' | 'instructed' | 'refused' | 'closed' | 'mailCard' | 'skipped';
+type ProcessOutcome =
+  | 'recordedOnly'
+  | 'instructed'
+  | 'refused'
+  | 'closed'
+  | 'mailCard'
+  | 'confirmation'
+  | 'skipped';
+
+/** Spec §10.11, verbatim: more than one thing is open, and the answer cannot say which. */
+export const SEVERAL_OPEN_REFUSAL = 'יש כמה שאלות פתוחות — עני בדשבורד';
+/** The answer to a confirmation, applied: the job runs; its result is the report pass's to tell. */
+export const CONFIRM_EXECUTING = 'מבצעת.';
+export const CONFIRM_CANCELLED = 'בוטל.';
+export const CONFIRM_ALREADY_DECIDED = 'כבר טופל.';
+export const CONFIRM_UNCLEAR = 'לא הבנתי למי התכוונת — השיבי במספר האפשרות או בשם המלא.';
+/** `applyConfirmation` threw after the answer was read — the settle sweep takes the job from here. */
+export const CONFIRM_FAILED = 'לא הצלחתי לבצע — נסי שוב בדשבורד.';
+
+const CONFIRM_REPLY: Record<ConfirmOutcome, string> = {
+  executing: CONFIRM_EXECUTING,
+  cancelled: CONFIRM_CANCELLED,
+  already_decided: CONFIRM_ALREADY_DECIDED,
+  unclear: CONFIRM_UNCLEAR,
+};
 
 /**
  * Tells the owner something and closes the message out — no job involved, no
@@ -428,6 +482,104 @@ async function tellOwnerAndSettle(
 ): Promise<void> {
   await ctx.messenger.send({ text, jobId: null });
   await settleMessage(messageId, 'failed', {}, { businessId: ctx.businessId });
+}
+
+/**
+ * The owner's TYPED message while at least one boss-command confirmation is
+ * open on WhatsApp (spec §4.3, §10.11). Runs FIRST for a principal's typed
+ * message — before the mail card and before routing.
+ *
+ * Returns `'passthrough'`, claiming and settling nothing, when the message is
+ * not an answer to the question at all (`readConfirmation` → `none`): a new
+ * instruction, an answer to something else, or "שלח" for a mail card — and
+ * the confirmation stays pending. Otherwise the message is claimed FIRST, so
+ * a redelivered or raced copy of the same "כן" cannot decide twice, and:
+ *
+ *   - **the collision rule**: an answer with more than one thing open across
+ *     confirmations, mail cards and clarifying questions inside their windows
+ *     (or more than one confirmation) is refused with `SEVERAL_OPEN_REFUSAL`,
+ *     and nothing changes. "כן" does not say which;
+ *   - `unclear` → `CONFIRM_UNCLEAR`; the question stays open;
+ *   - `confirm`/`cancel` → `applyConfirmation`, and the reply for its
+ *     outcome. A throw is caught, told as `CONFIRM_FAILED` and reported to
+ *     the operator; the settle sweep moves the job on.
+ *
+ * With several confirmations open the message is read against each, and it
+ * is an answer if any of them reads it as one — so the collision is refused
+ * rather than passed through as a new instruction.
+ */
+async function handleConfirmationMessage(input: {
+  msg: NormalizedInboundMessage;
+  storedId: string;
+  ctx: ProcessContext;
+}): Promise<'confirmation' | 'refused' | 'skipped' | 'passthrough'> {
+  const { msg, storedId, ctx } = input;
+  // Typed only: a transcript or a caption is not the owner's keystrokes.
+  if (msg.mediaKind !== null) return 'passthrough';
+  if (msg.body === null) return 'passthrough';
+  const text = msg.body;
+  const windowOverride =
+    ctx.questionWindowMinutes !== undefined ? { windowMinutes: ctx.questionWindowMinutes } : {};
+
+  const confirmations = await openConfirmations({
+    businessId: ctx.businessId,
+    channel: 'whatsapp',
+    inboundAt: new Date(msg.providerTimestamp),
+    ...windowOverride,
+  });
+  if (confirmations.length === 0) return 'passthrough';
+
+  const readings: ConfirmReading[] = confirmations.map((c) => readConfirmation(text, c.options));
+  if (readings.every((r) => r.kind === 'none')) return 'passthrough';
+
+  const claimed = await claimMessage(storedId, { businessId: ctx.businessId });
+  if (!claimed) return 'skipped';
+
+  const reply = async (
+    replyText: string,
+    state: 'handled' | 'failed',
+    jobId: string | null,
+  ): Promise<void> => {
+    await ctx.messenger.send({ text: replyText, jobId: null });
+    await settleMessage(storedId, state, jobId !== null ? { jobId } : {}, {
+      businessId: ctx.businessId,
+    });
+  };
+
+  const cards = await openMailCards({
+    businessId: ctx.businessId,
+    excludeMessageId: storedId,
+    inboundAt: msg.providerTimestamp,
+    ...windowOverride,
+  });
+  const questions = await answerableWhatsAppQuestions({
+    businessId: ctx.businessId,
+    ...windowOverride,
+  });
+  const only = confirmations.length === 1 ? confirmations[0] : undefined;
+  const reading = readings[0];
+  if (only === undefined || reading === undefined || cards.length + questions.length > 0) {
+    await reply(SEVERAL_OPEN_REFUSAL, 'failed', null);
+    return 'refused';
+  }
+
+  if (reading.kind !== 'confirm' && reading.kind !== 'cancel') {
+    await reply(CONFIRM_UNCLEAR, 'failed', null);
+    return 'refused';
+  }
+
+  const by = `whatsapp:${authorityNumberKey(msg.senderNumber) ?? msg.senderNumber}`;
+  let outcome: ConfirmOutcome;
+  try {
+    outcome = await applyConfirmation(only.jobId, reading, by, { businessId: ctx.businessId });
+  } catch (error) {
+    ctx.reportConfirmError(only.jobId, error instanceof Error ? error.message : String(error));
+    await reply(CONFIRM_FAILED, 'failed', only.jobId);
+    return 'refused';
+  }
+  const applied = outcome !== 'unclear';
+  await reply(CONFIRM_REPLY[outcome], applied ? 'handled' : 'failed', only.jobId);
+  return applied ? 'confirmation' : 'refused';
 }
 
 /**
@@ -526,7 +678,17 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
 
     const isAudio = msg.mediaKind === 'audio';
 
-    // An open mailbox reply card is read FIRST — before transcription, the
+    // A boss-command confirmation question is read FIRST of all (spec
+    // §10.11) — before the mail card, transcription and routing — and only
+    // for TYPED text: a voice note or a caption that looks like "כן" never
+    // confirms; it goes on through the door below as a new instruction, and
+    // the question stays pending (§4.3). The typed-only check is the first
+    // line of `handleConfirmationMessage`, the one place it lives. A message
+    // that is not an answer ("שלח" included) falls through untouched.
+    const confirmAnswer = await handleConfirmationMessage({ msg, storedId: stored.id, ctx });
+    if (confirmAnswer !== 'passthrough') return confirmAnswer;
+
+    // An open mailbox reply card is read next — before transcription, the
     // instruction cap and `pendingQuestions` — but only for TYPED text that
     // is one of the three mail-card actions ("שלח", a closure word,
     // "נוסח: …"), only inside the card's window, and only for a message sent
@@ -969,7 +1131,15 @@ export async function runWhatsAppDoor(options: {
   const ordered = [...collected].sort(compareInbound);
 
   const result: DoorResult = {
-    polled, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, malformedSenderCount: 0,
+    polled,
+    instructed: 0,
+    recordedOnly: 0,
+    refused: 0,
+    closed: 0,
+    mailCardReplies: 0,
+    confirmationReplies: 0,
+    confirmErrored: [],
+    malformedSenderCount: 0,
   };
 
   const ctx: ProcessContext = {
@@ -981,6 +1151,9 @@ export async function runWhatsAppDoor(options: {
     // a callback rather than a field on `ProcessOutcome`.
     reportMalformedSender: () => {
       result.malformedSenderCount += 1;
+    },
+    reportConfirmError: (jobId, error) => {
+      result.confirmErrored.push({ jobId, error });
     },
     ...(options.provider !== undefined ? { provider: options.provider } : {}),
     ...(options.planner !== undefined ? { planner: options.planner } : {}),
@@ -1007,6 +1180,7 @@ export async function runWhatsAppDoor(options: {
     else if (outcome === 'refused') result.refused += 1;
     else if (outcome === 'closed') result.closed += 1;
     else if (outcome === 'mailCard') result.mailCardReplies += 1;
+    else if (outcome === 'confirmation') result.confirmationReplies += 1;
     // 'skipped' — a redelivery, a race on the claim, or a failure before the
     // message was ever claimed — adds to none of the four buckets.
   }

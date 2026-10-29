@@ -158,6 +158,14 @@ export function logErrored(result: SchedulerPassResult): void {
         `senderNumber the gateway contract does not allow — check the gateway, not the sender`,
     );
   }
+  // A boss-command confirmation the owner answered on WhatsApp that could not
+  // be applied. He was told to retry on the dashboard, and the settle sweep
+  // moves the job on; this is the only trace of why.
+  if (result.whatsappDoor !== null) {
+    for (const job of result.whatsappDoor.confirmErrored) {
+      console.error(`WhatsApp confirmation for job ${job.jobId} could not be applied: ${job.error}`);
+    }
+  }
   // Task 8's own report-round ruling: counting `deferred` is what stops a job
   // permanently stuck on a crashed resume from becoming invisible silence —
   // but that justification is only true once something actually reads the

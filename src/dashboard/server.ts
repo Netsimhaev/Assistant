@@ -25,6 +25,8 @@ import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
 import { runInstruction } from '../orchestrator/instruct.js';
+import { applyConfirmation, dashboardConfirmations } from '../orchestrator/command-confirm.js';
+import { loadConfirmation } from '../governance/instruction-confirmations.js';
 import { loadJob, transition } from '../orchestrator/jobs.js';
 import {
   MAX_INSTRUCTION_CHARS,
@@ -896,11 +898,12 @@ async function handleDigestSettingsPost(
  * below is: this route cannot inject a planner, so the only way to prove the
  * `needs_answer` branch really passes the note on is to call it directly.
  */
-export function renderInstructionOutcome(
+export async function renderInstructionOutcome(
   res: ServerResponse,
   session: Session,
   outcome: Awaited<ReturnType<typeof runInstruction>>,
-): void {
+  businessId: string,
+): Promise<void> {
   const csrf = issueCsrfToken(session.sessionId);
 
   if (outcome.status === 'refused') {
@@ -919,16 +922,28 @@ export function renderInstructionOutcome(
     );
     return;
   }
-  // Boss command (spec §4): the job is parked on a confirmation question.
-  // Minimal for now — the question text, escaped; the answer buttons are a
-  // later task.
+  // Boss command (spec §4.3): the job is parked on a confirmation question.
+  // The question, whole, with one button per option — each posting the
+  // `planHash` it was shown with — and a cancel. The options come from the
+  // stored row, the same row `POST /instruct/:jobId/confirm` checks against.
   if (outcome.status === 'needs_confirmation') {
+    const confirmation = await loadConfirmation(outcome.jobId, { businessId });
     sendHtml(
       res,
       200,
       renderInstruct({
         csrf,
-        confirmationQuestion: outcome.question,
+        ...(confirmation === null
+          ? { confirmationQuestion: outcome.question }
+          : {
+              confirmations: [
+                {
+                  jobId: outcome.jobId,
+                  question: outcome.question,
+                  options: confirmation.options.map((o) => ({ label: o.label, planHash: o.planHash })),
+                },
+              ],
+            }),
         identityNote: outcome.identityNote,
       }),
     );
@@ -971,11 +986,19 @@ async function handleInstructGet(
   session: Session,
 ): Promise<void> {
   const waiting = await pendingQuestions({ businessId });
+  // Boss commands waiting on confirmation, on either channel: the WhatsApp
+  // collision refusal sends the owner here to answer (spec §10.11).
+  const confirmations = await dashboardConfirmations({ businessId });
   sendHtml(
     res,
     200,
     renderInstruct({
       csrf: issueCsrfToken(session.sessionId),
+      confirmations: confirmations.map((c) => ({
+        jobId: c.jobId,
+        question: c.presentedText,
+        options: c.options.map((o) => ({ label: o.label, planHash: o.planHash })),
+      })),
       pending: waiting.map((row) => ({
         jobId: row.jobId,
         question: row.question,
@@ -1056,7 +1079,7 @@ async function handleInstructPost(
     { text },
     { businessId, textOrigin: 'typed', channel: 'dashboard' },
   );
-  renderInstructionOutcome(res, session, outcome);
+  await renderInstructionOutcome(res, session, outcome, businessId);
 }
 
 /**
@@ -1286,6 +1309,61 @@ async function handleInstructAnswer(
   }
 }
 
+/** Said when a confirmation was already confirmed, cancelled or expired — by either channel. */
+const CONFIRMATION_ALREADY_DECIDED = 'כבר טופל.';
+/** Said when the posted `planHash` is not one the question offered; nothing moves. */
+const CONFIRMATION_UNKNOWN_OPTION = 'האפשרות שנבחרה אינה אחת מהאפשרויות שהוצגו. לא שיניתי דבר.';
+
+/**
+ * The owner's answer to a boss-command confirmation, from the dashboard
+ * (spec §4.3): a `planHash` he clicked, or `cancel=1`.
+ *
+ * CSRF first (403). The confirmation is loaded scoped to `businessId` — a job
+ * of another business is a 404, like `handleInstructAnswer`'s. A posted
+ * `planHash` must be among the STORED options, or the request is refused
+ * (400) before anything moves: the button carries what was presented, and a
+ * hash that was never presented is not something the owner confirmed.
+ *
+ * No WhatsApp freshness or strict-after check here: there is no inbound
+ * message to date, `confirmChoice` enforces the window in SQL, and a question
+ * presented on WhatsApp must be answerable here — the collision refusal sends
+ * the owner here. A second POST meets `applyConfirmation`'s own guards (the
+ * phase, then `UPDATE ... WHERE state = 'pending'`) and moves nothing.
+ */
+async function handleInstructConfirm(
+  req: IncomingMessage,
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  jobId: string,
+): Promise<void> {
+  const form = await readFormBody(req);
+  if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
+    return sendHtml(res, 403, renderForbidden());
+  }
+
+  const confirmation = await loadConfirmation(jobId, { businessId });
+  if (confirmation === null) return sendHtml(res, 404, renderNotFound());
+
+  const csrf = issueCsrfToken(session.sessionId);
+  let reading: { kind: 'confirm'; planHash: string } | { kind: 'cancel' };
+  if (form.get('cancel') === '1') {
+    reading = { kind: 'cancel' };
+  } else {
+    const planHash = form.get('planHash') ?? '';
+    if (!confirmation.options.some((option) => option.planHash === planHash)) {
+      return sendHtml(res, 400, renderInstruct({ csrf, error: CONFIRMATION_UNKNOWN_OPTION }));
+    }
+    reading = { kind: 'confirm', planHash };
+  }
+
+  const outcome = await applyConfirmation(jobId, reading, `dashboard:${session.username}`, {
+    businessId,
+  });
+  if (outcome === 'executing' || outcome === 'cancelled') return redirect(res, '/');
+  sendHtml(res, 409, renderInstruct({ csrf, error: CONFIRMATION_ALREADY_DECIDED }));
+}
+
 /**
  * The body of `handleInstructAnswer`, run while this request holds the job's
  * claim — never called from anywhere else.
@@ -1417,7 +1495,7 @@ async function answerUnderClaim(
     businessId,
   });
 
-  renderInstructionOutcome(res, session, outcome);
+  await renderInstructionOutcome(res, session, outcome, businessId);
 }
 
 // --- The erasure screen (spec §4, §6, §7). --------------------------------
@@ -2551,6 +2629,7 @@ const MAIL_PATH = /^\/mail\/([^/]+)$/;
 const DOCUMENT_FILE_PATH = /^\/documents\/([^/]+)\/file$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
 const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
+const INSTRUCT_CONFIRM_PATH = /^\/instruct\/([^/]+)\/confirm$/;
 const AUTONOMOUS_ACTION_MARK_PATH = /^\/autonomy\/actions\/([^/]+)\/([^/]+)\/mark$/;
 const OAUTH_START_PATH = /^\/oauth\/([^/]+)\/start$/;
 const OAUTH_REVOKE_PATH = /^\/oauth\/([^/]+)\/revoke$/;
@@ -2706,6 +2785,12 @@ async function route(
   if (method === 'POST' && instructAnswerMatch) {
     const jobId = instructAnswerMatch[1];
     if (jobId !== undefined) return handleInstructAnswer(req, res, businessId, session, jobId);
+  }
+
+  const instructConfirmMatch = INSTRUCT_CONFIRM_PATH.exec(pathname);
+  if (method === 'POST' && instructConfirmMatch) {
+    const jobId = instructConfirmMatch[1];
+    if (jobId !== undefined) return handleInstructConfirm(req, res, businessId, session, jobId);
   }
 
   const markMatch = AUTONOMOUS_ACTION_MARK_PATH.exec(pathname);

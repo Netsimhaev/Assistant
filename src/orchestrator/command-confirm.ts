@@ -203,6 +203,41 @@ export async function openConfirmations(o: {
 }
 
 /**
+ * The confirmation questions the dashboard can answer: pending, inside the
+ * window, the job still parked in `plan` and born at the instruction door —
+ * on EITHER channel. No strict-after check: there is no inbound message to
+ * date, and a question presented on WhatsApp must be answerable here,
+ * because the collision refusal sends the owner here. Read-only;
+ * `confirmChoice` still enforces the window when the answer lands.
+ */
+export async function dashboardConfirmations(o: {
+  businessId: string;
+  windowMinutes?: number;
+  db?: Queryable;
+}): Promise<InstructionConfirmation[]> {
+  const windowMinutes = o.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  if (windowMinutes <= 0) return [];
+  const db = o.db ?? getPool();
+  const { rows } = await db.query<ConfirmationRow>(
+    `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.channel, c.state,
+            c.chosen_plan_hash, c.decided_at, c.decided_by, c.reask_of
+       FROM instruction_confirmations c
+       JOIN jobs j
+         ON j.business_id = c.business_id AND j.job_id = c.job_id AND j.phase = 'plan'
+      WHERE c.business_id = $1
+        AND c.state = 'pending'
+        AND c.presented_at > now() - make_interval(mins => $2)
+        AND EXISTS (
+          SELECT 1 FROM boss_instructions b
+           WHERE b.business_id = c.business_id AND b.job_id = c.job_id
+        )
+      ORDER BY c.presented_at DESC`,
+    [o.businessId, windowMinutes],
+  );
+  return rows.map(toConfirmation);
+}
+
+/**
  * Bind the confirmed plan to a job that was parked with several options and
  * nothing bound. One transaction: the job row and the confirmation row are
  * locked and re-read — the row must still exist, be `confirmed`, and carry

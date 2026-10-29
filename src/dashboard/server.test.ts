@@ -11,7 +11,8 @@ import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import { recordInbound, recordOutbound } from '../whatsapp/store.js';
-import { bindPlanToJob } from '../orchestrator/plan-store.js';
+import { bindPlanToJob, planHashOf } from '../orchestrator/plan-store.js';
+import { createConfirmation, loadConfirmation, type ConfirmationOption } from '../governance/instruction-confirmations.js';
 import { Plan } from '../domain/plan.js';
 import { writeMemory } from '../memory/store.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
@@ -975,7 +976,7 @@ describe('renderInstructionOutcome - the note on a needs_answer outcome', () => 
       },
     } as unknown as ServerResponse;
 
-    renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome);
+    void renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, BUSINESS);
     return body;
   }
 
@@ -1038,7 +1039,7 @@ describe('renderInstruct and renderInstructionOutcome - recordingNote', () => {
       },
     } as unknown as ServerResponse;
 
-    renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome);
+    void renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, BUSINESS);
     return body;
   }
 
@@ -3521,5 +3522,252 @@ describe('digest screen', () => {
     const settings = await loadDigestSettings({ businessId: BUSINESS });
     expect(settings.schedule).toBe('off');
     expect(settings.dailyHour).toBe(8);
+  });
+});
+
+/**
+ * Boss command, the dashboard half (spec §4.3, Task 5): the question with one
+ * button per option, and `POST /instruct/:jobId/confirm` behind CSRF and the
+ * session. The confirmation rows are seeded the way `runInstruction` leaves
+ * them — a boss job parked in `plan` with an instruction row — because this
+ * route cannot inject a planner.
+ */
+describe('boss-command confirmation on the dashboard', () => {
+  function planTo(address: string): Plan {
+    return {
+      goal: `מייל אל ${address}`,
+      assumptions: [],
+      clarifyingQuestion: null,
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'send',
+          toolName: 'mail.send',
+          input: { to: address, subject: 'תזכורת', body: 'שלום' },
+          dependsOn: [],
+          expectedActionClass: 'email.initiate',
+        },
+      ],
+      estimatedCostMinor: 0,
+    };
+  }
+  const PLAN_A = planTo('dana@chayut.example');
+  const PLAN_B = planTo('dana.levi@x.example');
+  const OPTION_A: ConfirmationOption = {
+    label: 'דנה חיוט (dana@chayut.example)',
+    planHash: planHashOf(PLAN_A),
+    plan: PLAN_A,
+    contactSource: 'boss',
+    contactName: 'דנה חיוט',
+  };
+  const OPTION_B: ConfirmationOption = {
+    label: 'דנה לוי (dana.levi@x.example)',
+    planHash: planHashOf(PLAN_B),
+    plan: PLAN_B,
+    contactSource: 'boss',
+    contactName: 'דנה לוי',
+  };
+  const SINGLE: ConfirmationOption = {
+    label: 'לבצע?',
+    planHash: planHashOf(PLAN_A),
+    plan: PLAN_A,
+    contactSource: null,
+  };
+  const QUESTION = 'לשלוח לדנה חיוט (dana@chayut.example) מייל בנושא "תזכורת"? השיבי "כן" לאישור.';
+
+  /** A boss job parked in `plan` on a confirmation, the shape `runInstruction` leaves. */
+  async function heldCommand(
+    options: ConfirmationOption[],
+    channel: 'whatsapp' | 'dashboard' = 'dashboard',
+  ): Promise<string> {
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    await saveInstruction(
+      { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה תזכורת' },
+      { businessId: BUSINESS },
+    );
+    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    await transition(job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    const only = options.length === 1 ? options[0] : undefined;
+    if (only !== undefined) await bindPlanToJob(job.jobId, only.plan, { businessId: BUSINESS });
+    await createConfirmation(
+      { jobId: job.jobId, options, presentedText: QUESTION, channel },
+      { businessId: BUSINESS },
+    );
+    return job.jobId;
+  }
+
+  async function confirmPost(
+    baseUrl: string,
+    cookie: string,
+    jobId: string,
+    fields: Record<string, string>,
+  ): Promise<Response> {
+    return fetch(`${baseUrl}/instruct/${jobId}/confirm`, {
+      method: 'POST',
+      headers: cookie === '' ? {} : { cookie },
+      body: new URLSearchParams(fields),
+      redirect: 'manual',
+    });
+  }
+
+  async function signedIn(): Promise<{ baseUrl: string; cookie: string; csrf: string }> {
+    const baseUrl = await startServer(BUSINESS);
+    const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
+    const page = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
+    return { baseUrl, cookie, csrf: extractCsrf(await page.text()) };
+  }
+
+  async function executeMoves(jobId: string): Promise<number> {
+    const { rows } = await getPool().query(
+      "SELECT 1 FROM job_steps WHERE job_id = $1 AND to_phase = 'execute'",
+      [jobId],
+    );
+    return rows.length;
+  }
+
+  type Outcome = Parameters<typeof renderInstructionOutcome>[2];
+
+  async function capture(outcome: Outcome): Promise<string> {
+    let body = '';
+    const res = {
+      writeHead: () => undefined,
+      end: (chunk?: unknown) => {
+        body = typeof chunk === 'string' ? chunk : '';
+      },
+    } as unknown as ServerResponse;
+    await renderInstructionOutcome(
+      res,
+      { sessionId: 'S1', username: 'owner', mustChangePassword: false },
+      outcome,
+      BUSINESS,
+    );
+    return body;
+  }
+
+  function confirmationOutcome(jobId: string, optionCount: number): Outcome {
+    return {
+      status: 'needs_confirmation',
+      jobId,
+      question: QUESTION,
+      optionCount,
+      identityNote: null,
+    };
+  }
+
+  it('renders the question with one button per option, each posting its planHash, and a cancel', async () => {
+    const jobId = await heldCommand([OPTION_A, OPTION_B]);
+    const html = await capture(confirmationOutcome(jobId, 2));
+
+    expect(html).toContain('white-space: pre-wrap');
+    expect(html).toContain('dana@chayut.example');
+    const forms = html.match(new RegExp(`action="/instruct/${jobId}/confirm"`, 'g')) ?? [];
+    expect(forms).toHaveLength(3);
+    expect(html).toContain(`name="planHash" value="${OPTION_A.planHash}"`);
+    expect(html).toContain(`name="planHash" value="${OPTION_B.planHash}"`);
+    expect(html).toContain('אשר: דנה חיוט (dana@chayut.example)');
+    expect(html).toContain('אשר: דנה לוי (dana.levi@x.example)');
+    expect(html).toContain('name="cancel" value="1"');
+    expect(html).toContain('>בטל</button>');
+  });
+
+  it('labels the one button "אשר" when there is a single option', async () => {
+    const jobId = await heldCommand([SINGLE]);
+    const html = await capture(confirmationOutcome(jobId, 1));
+    expect(html).toContain('<button>אשר</button>');
+    expect(html).not.toContain('אשר:');
+  });
+
+  it('lists a question presented on WhatsApp on GET /instruct, with its buttons', async () => {
+    const jobId = await heldCommand([SINGLE], 'whatsapp');
+    const { baseUrl, cookie } = await signedIn();
+    const html = await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text();
+    expect(html).toContain(`action="/instruct/${jobId}/confirm"`);
+    expect(html).toContain(`value="${SINGLE.planHash}"`);
+  });
+
+  it('refuses a POST without CSRF with 403, and nothing changes', async () => {
+    const jobId = await heldCommand([SINGLE]);
+    const { baseUrl, cookie } = await signedIn();
+    const res = await confirmPost(baseUrl, cookie, jobId, { planHash: SINGLE.planHash });
+    expect(res.status).toBe(403);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('plan');
+    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('pending');
+  });
+
+  it('refuses without a session', async () => {
+    const jobId = await heldCommand([SINGLE]);
+    const baseUrl = await startServer(BUSINESS);
+    const res = await confirmPost(baseUrl, '', jobId, { planHash: SINGLE.planHash });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('plan');
+  });
+
+  it('refuses a planHash that is not among the options with 400, and nothing changes', async () => {
+    const jobId = await heldCommand([OPTION_A, OPTION_B]);
+    const { baseUrl, cookie, csrf } = await signedIn();
+    const res = await confirmPost(baseUrl, cookie, jobId, {
+      csrf,
+      planHash: planHashOf(planTo('evil@x.example')),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('אינה אחת מהאפשרויות');
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('plan');
+    const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
+    expect(stored?.state).toBe('pending');
+    expect(stored?.chosenPlanHash).toBeNull();
+  });
+
+  it('confirms the chosen option, redirects home, and a second POST moves nothing', async () => {
+    const jobId = await heldCommand([OPTION_A, OPTION_B]);
+    const { baseUrl, cookie, csrf } = await signedIn();
+
+    const first = await confirmPost(baseUrl, cookie, jobId, { csrf, planHash: OPTION_B.planHash });
+    expect(first.status).toBe(302);
+    expect(first.headers.get('location')).toBe('/');
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+    const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
+    expect(stored?.state).toBe('confirmed');
+    expect(stored?.chosenPlanHash).toBe(OPTION_B.planHash);
+    expect(stored?.decidedBy).toBe(`dashboard:${USERNAME}`);
+
+    const second = await confirmPost(baseUrl, cookie, jobId, { csrf, planHash: OPTION_A.planHash });
+    expect(second.status).toBe(409);
+    expect(await second.text()).toContain('כבר טופל.');
+    expect(await executeMoves(jobId)).toBe(1);
+    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.chosenPlanHash).toBe(OPTION_B.planHash);
+  });
+
+  it('confirms a single option bound before the question', async () => {
+    const jobId = await heldCommand([SINGLE]);
+    const { baseUrl, cookie, csrf } = await signedIn();
+    const res = await confirmPost(baseUrl, cookie, jobId, { csrf, planHash: SINGLE.planHash });
+    expect(res.status).toBe(302);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+  });
+
+  it('answers a question presented on WhatsApp: the dashboard needs no WhatsApp freshness', async () => {
+    const jobId = await heldCommand([SINGLE], 'whatsapp');
+    const { baseUrl, cookie, csrf } = await signedIn();
+    const res = await confirmPost(baseUrl, cookie, jobId, { csrf, planHash: SINGLE.planHash });
+    expect(res.status).toBe(302);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('execute');
+  });
+
+  it('cancels with cancel=1: the job is closed, not failed', async () => {
+    const jobId = await heldCommand([OPTION_A, OPTION_B]);
+    const { baseUrl, cookie, csrf } = await signedIn();
+    const res = await confirmPost(baseUrl, cookie, jobId, { csrf, cancel: '1' });
+    expect(res.status).toBe(302);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('closed');
+    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('cancelled');
+  });
+
+  it('returns 404 for a job with no confirmation in this business', async () => {
+    const { baseUrl, cookie, csrf } = await signedIn();
+    const res = await confirmPost(baseUrl, cookie, 'J-NOT-HERE', { csrf, planHash: SINGLE.planHash });
+    expect(res.status).toBe(404);
   });
 });

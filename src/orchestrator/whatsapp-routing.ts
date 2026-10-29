@@ -139,6 +139,31 @@ function withinQuestionWindow(
 }
 
 /**
+ * The clarifying questions open on WhatsApp that a message arriving now could
+ * answer: `pendingQuestions` on this channel, inside the window — exactly the
+ * set `decideWhatsAppRoute` calls `answerable`. Read-only.
+ *
+ * Exported for the boss-command confirm reader's collision rule
+ * (`whatsapp-door.ts`, spec §10.11): a "כן" with a confirmation AND a
+ * clarifying question open cannot say which it answers.
+ */
+export async function answerableWhatsAppQuestions(input: {
+  businessId: string;
+  now?: number;
+  windowMinutes?: number;
+  db?: Queryable;
+}): Promise<InstructionRecord[]> {
+  const nowMs = input.now ?? Date.now();
+  const windowMinutes = input.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  const open = await pendingQuestions({
+    businessId: input.businessId,
+    channel: 'whatsapp',
+    ...(input.db !== undefined ? { db: input.db } : {}),
+  });
+  return open.filter((record) => withinQuestionWindow(record, nowMs, windowMinutes));
+}
+
+/**
  * Reads the record and decides. Does not write anything and does not call the
  * planner — the door claims and re-runs only once it knows which of the four
  * routes this is.
