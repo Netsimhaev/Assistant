@@ -10,8 +10,9 @@
  *
  * **Fixed word lists, never a model**, for the same reason `closure-command.ts`
  * and `forget-command.ts` give: whether the owner just authorised an action
- * must be an inspectable question. Whole messages only, after
- * `stripBidiControls` and `trim`. `CONFIRM_WORDS` is disjoint from the
+ * must be an inspectable question. Compared after one normalisation shared
+ * with names — `stripBidiControls`, `trim`, trailing punctuation — and the
+ * first token decides: a cancel word cancels whatever follows it. `CONFIRM_WORDS` is disjoint from the
  * cancel words, `FORGET_VERBS` and the mail-card words "שלח"/"שלחי"; the test
  * intersects the exported lists.
  *
@@ -21,7 +22,8 @@
  * **Names are matched against the stored `contactName`, never parsed out of
  * the label** — the label also carries the company and the address. A pick
  * by name must belong to exactly one option; a name two options share is
- * `unclear`.
+ * `unclear`. A reply word (confirm, cancel, `REPLY_STOPLIST`) is never a name,
+ * and an unverified option is picked only by number or full name.
  *
  * **Applying is gated by the store, not by this module.** `confirmChoice` and
  * `cancelConfirmation` are single `UPDATE ... WHERE state = 'pending'`
@@ -45,7 +47,10 @@ import { stripBidiControls } from '../util/bidi.js';
 import { PhaseMovedError, loadJob, transition } from './jobs.js';
 import { bindPlanToJob, loadStoredPlan } from './plan-store.js';
 
-/** Whole-message words that confirm (spec §4.3). */
+/**
+ * Words that confirm (spec §4.3) — only as the whole message, and only the
+ * first token is ever compared (see `readConfirmation`).
+ */
 export const CONFIRM_WORDS: readonly string[] = [
   'כן',
   'אשר',
@@ -58,11 +63,27 @@ export const CONFIRM_WORDS: readonly string[] = [
 ];
 
 /**
- * Whole-message words that cancel: "לא", and every closure verb taken from
- * the exported list rather than re-typed. "לא" cancels only here, on a
- * confirmation question (§10.11).
+ * Words that cancel when they OPEN the reply: "לא", every closure verb taken
+ * from the exported list rather than re-typed, and the plain cancel and stop
+ * verbs an owner types to refuse. "לא" and the cancel verbs cancel only here,
+ * on a confirmation question (§10.11) — `closure-command.ts` excludes
+ * "תבטלי" from its own list for its own reasons, which do not apply to a
+ * question whose only other answers are a yes or a pick.
+ *
+ * Disjoint from `FORGET_VERBS` and the mail-card words (a test intersects the
+ * exported lists).
  */
-export const CANCEL_WORDS: readonly string[] = ['לא', ...CLOSURE_VERB_WORDS];
+export const CANCEL_WORDS: readonly string[] = [
+  'לא',
+  ...CLOSURE_VERB_WORDS,
+  'בטל',
+  'בטלי',
+  'תבטלי',
+  'ביטול',
+  'עצור',
+  'עצרי',
+  'תעצרי',
+];
 
 export type ConfirmReading =
   | { kind: 'confirm'; planHash: string }
@@ -72,12 +93,48 @@ export type ConfirmReading =
 
 export type ConfirmOutcome = 'executing' | 'cancelled' | 'already_decided' | 'unclear';
 
-/** Whitespace-split tokens, with trailing punctuation stripped, case-folded for Latin names. */
-function nameTokens(value: string): string[] {
-  return value
+/**
+ * Ordinary replies that are never a name, even when a contact happens to
+ * carry one ("דנה טוב"): a reply the owner types to mean "fine" or "thanks"
+ * must not pick a person. Disjoint from `CONFIRM_WORDS` (a test intersects
+ * them) — a confirm word has its own, stricter handling.
+ */
+export const REPLY_STOPLIST: readonly string[] = ['תודה', 'טוב', 'אוקי', 'בסדר', 'סבבה', 'יופי'];
+
+/**
+ * One token, normalised the same way everywhere this module compares one: the
+ * trailing punctuation a reply carries ("לא.", "כן!", "חיוט,") is stripped,
+ * and Latin is case-folded. Confirm and cancel words go through exactly this,
+ * so "לא!" can never fall through to name matching as an unknown word.
+ */
+function normaliseToken(token: string): string {
+  return token.replace(/[)'"»,.;:!?…]+$/, '').toLocaleLowerCase();
+}
+
+/** Bidi-stripped, trimmed, whitespace-split, normalised, empties dropped. */
+function tokensOf(value: string): string[] {
+  return stripBidiControls(value)
+    .trim()
     .split(/\s+/)
-    .map((token) => token.replace(/[)'"»,.;:!?]+$/, '').toLocaleLowerCase())
+    .map(normaliseToken)
     .filter((token) => token !== '');
+}
+
+/** A token that is a reply word, never a name: confirm, cancel, or the stoplist. */
+function isReplyWord(token: string): boolean {
+  return CONFIRM_WORDS.includes(token) || CANCEL_WORDS.includes(token) || REPLY_STOPLIST.includes(token);
+}
+
+/**
+ * True when a contact name carries a cancel word as one of its tokens
+ * ("דנה בטל"). `planPerCandidate` leaves such a candidate out of the options
+ * altogether: no real person's name is a cancel word, and a memory row that
+ * says so was planted so that the owner's own refusal would read as a pick.
+ * Confirm words and the stoplist are NOT checked here — "אשר" and "טוב" are
+ * real names — and the reader already refuses them as name picks.
+ */
+export function nameCarriesCancelWord(name: string): boolean {
+  return tokensOf(name).some((token) => CANCEL_WORDS.includes(token));
 }
 
 /** The shortest token a typed name may consist of: one letter is never a name. */
@@ -92,67 +149,85 @@ function sameTokens(a: readonly string[], b: readonly string[]): boolean {
 }
 
 /**
- * Whether the typed tokens name this option: its FULL name, or its surname
- * (the last token of `contactName`) alone. A first name alone never selects —
- * it is exactly what two candidates share, and selecting on it would turn the
- * ambiguity the question exists for back into a guess.
+ * Whether the typed tokens name this option: its FULL name, or — only for an
+ * option whose address the owner vouched for (`contactSource !== 'unverified'`)
+ * — its surname (the last token) alone. A first name alone never selects. An
+ * unverified option is picked only by its number or its full name: a contact
+ * learned from a document is a stranger's words, and a surname is the
+ * shortest thing he could choose to collide with a reply.
+ *
+ * A one-token name has no separate surname: its one token IS the full name,
+ * so the surname path adds nothing there, and a one-word "דנה" shared with a
+ * "דנה לוי" is kept from picking by the candidate count in
+ * `readConfirmation` (two options contain the token → `unclear`), not here.
  */
 function namesOption(typed: readonly string[], option: ConfirmationOption): boolean {
   if (option.contactName === undefined) return false;
-  const name = nameTokens(option.contactName);
-  const surname = name[name.length - 1];
+  const name = tokensOf(option.contactName);
   if (sameTokens(typed, name)) return true;
-  return typed.length === 1 && name.length > 1 && typed[0] === surname;
+  if (option.contactSource === 'unverified') return false;
+  return typed.length === 1 && typed[0] === name[name.length - 1];
 }
 
 /**
  * The owner's answer to a confirmation question with these options.
  *
- * In order:
- *   - a confirm word: one option → that one; several → `unclear`;
- *   - a cancel word → `cancel`;
- *   - a canonical integer (`/^[1-9]\d*$/`, so "01" is not one): 1..N → that
- *     option, out of range → `unclear`;
- *   - a name: every token at least two characters, and the message is one
- *     option's full name or its surname alone. Exactly one option → that
- *     one; two → `unclear`. Tokens that all belong to some option's name but
- *     name none of them (a first name alone) → `unclear`: it is an attempt
- *     to answer, not a new instruction;
+ * The message is bidi-stripped, trimmed, split and normalised once
+ * (`tokensOf`), and **the first token decides before anything else**:
+ *
+ *   - a cancel word → `cancel`, whatever follows ("לא, תודה", "בטל!");
+ *   - a confirm word → with nothing after it, one option → that one and
+ *     several → `unclear`; with anything after it → `unclear`. "כן" never
+ *     picks between options, and "כן תשלחי גם לרונית" is not a confirmation;
+ *
+ * neither ever reaches number or name matching. Then:
+ *
+ *   - a single canonical integer (`/^[1-9]\d*$/`, so "01" is not one): 1..N →
+ *     that option, out of range → `unclear`;
+ *   - a name: every token at least two characters and none a reply word
+ *     (confirm, cancel, `REPLY_STOPLIST`); the options whose names contain
+ *     every typed token are the candidates, and only when there is exactly
+ *     one, and the message is its full name or (see `namesOption`) its
+ *     surname, is it picked. Several candidates → `unclear` ("דנה" when one
+ *     option is "דנה" and another "דנה לוי"). Tokens that belong to a name
+ *     but pick nothing → `unclear`: an attempt to answer, not an instruction;
  *   - anything else → `none`.
+ *
+ * Why the order: a hostile document can plant a contact named "דנה בטל" —
+ * read by surname, the owner's "בטל" would have confirmed the very option he
+ * was refusing. A reply word is read as a reply first, and never as a name.
  */
 export function readConfirmation(text: string, options: readonly ConfirmationOption[]): ConfirmReading {
-  const clean = stripBidiControls(text).trim();
-  if (clean === '') return { kind: 'none' };
+  const tokens = tokensOf(text);
+  const first = tokens[0];
+  if (first === undefined) return { kind: 'none' };
 
-  if (CONFIRM_WORDS.includes(clean)) {
+  if (CANCEL_WORDS.includes(first)) return { kind: 'cancel' };
+  if (CONFIRM_WORDS.includes(first)) {
     const only = options[0];
-    return options.length === 1 && only !== undefined
+    return tokens.length === 1 && options.length === 1 && only !== undefined
       ? { kind: 'confirm', planHash: only.planHash }
       : { kind: 'unclear' };
   }
 
-  if (CANCEL_WORDS.includes(clean)) return { kind: 'cancel' };
-
-  if (/^\d+$/.test(clean)) {
-    const picked = /^[1-9]\d*$/.test(clean) ? options[Number(clean) - 1] : undefined;
+  if (tokens.length === 1 && /^\d+$/.test(first)) {
+    const picked = /^[1-9]\d*$/.test(first) ? options[Number(first) - 1] : undefined;
     return picked !== undefined ? { kind: 'confirm', planHash: picked.planHash } : { kind: 'unclear' };
   }
 
-  const typed = nameTokens(clean);
-  if (typed.length === 0 || typed.some((token) => token.length < MIN_NAME_TOKEN_CHARS)) {
-    return { kind: 'none' };
-  }
-  const matching = options.filter((option) => namesOption(typed, option));
-  const match = matching[0];
-  if (matching.length === 1 && match !== undefined) return { kind: 'confirm', planHash: match.planHash };
-  if (matching.length > 1) return { kind: 'unclear' };
+  const partOfAName = (option: ConfirmationOption): boolean =>
+    option.contactName !== undefined &&
+    tokens.every((token) => tokensOf(option.contactName ?? '').includes(token));
+  const candidates = options.filter(partOfAName);
 
-  const partOfAName = typed.every((token) =>
-    options.some(
-      (option) => option.contactName !== undefined && nameTokens(option.contactName).includes(token),
-    ),
-  );
-  return partOfAName ? { kind: 'unclear' } : { kind: 'none' };
+  if (tokens.some((token) => token.length < MIN_NAME_TOKEN_CHARS || isReplyWord(token))) {
+    return candidates.length > 0 ? { kind: 'unclear' } : { kind: 'none' };
+  }
+  const only = candidates[0];
+  if (candidates.length === 1 && only !== undefined && namesOption(tokens, only)) {
+    return { kind: 'confirm', planHash: only.planHash };
+  }
+  return candidates.length > 0 ? { kind: 'unclear' } : { kind: 'none' };
 }
 
 /**

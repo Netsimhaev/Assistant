@@ -105,6 +105,7 @@ import { recallForPlanning } from '../memory/recall-planning.js';
 import { classifyAction } from '../policy/classify.js';
 import { readEmails, readPhones } from '../policy/facts.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
+import { nameCarriesCancelWord } from './command-confirm.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { renderConfirmationQuestion } from './command-echo.js';
@@ -701,6 +702,10 @@ async function planPerCandidate(
   let firstRefusal: { reason: string; audit: string } | null = null;
 
   for (const candidate of candidates) {
+    // A name with a cancel word in it ("דנה בטל") is no real person's: it was
+    // planted so the owner's own "בטל" would read as a pick. Left out before
+    // it costs a planner call (`nameCarriesCancelWord`, `command-confirm.ts`).
+    if (nameCarriesCancelWord(candidate.name)) continue;
     const checked = await planAndCheck(
       door,
       [...baseSubjects, ...candidate.subjectKeys],

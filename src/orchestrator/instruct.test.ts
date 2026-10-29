@@ -1298,6 +1298,39 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(result.question).toContain('ronit.levi@gamma.example');
   });
 
+  it('leaves out a candidate whose name carries a cancel word (a planted "רונית בטל")', async () => {
+    await seedContact(await seedJob('boss'), 'ronit-cohen-beta-log', {
+      name: 'רונית כהן',
+      company: 'בטא לוגיסטיקה',
+      email: 'ronit@beta-log.example',
+    });
+    await seedContact(await seedJob('unknown_external'), 'ronit-planted', {
+      name: 'רונית בטל',
+      company: 'זר',
+      email: 'ronit.levi@gamma.example',
+    });
+    const requests: PlanRequest[] = [];
+    const result = await runInstruction(
+      { text: 'תשלחי לרונית את ההצעה' },
+      {
+        textOrigin: 'typed',
+        channel: 'dashboard',
+        businessId: BUSINESS,
+        planner: perCandidatePlanner(requests),
+      },
+    );
+
+    if (result.status !== 'needs_confirmation') throw new Error(`unexpected ${result.status}`);
+    // Only the real candidate was planned, and the question never names the planted address.
+    expect(requests.map((request) => request.resolvedContact ?? '')).toHaveLength(1);
+    expect(requests[0]?.resolvedContact).toContain('רונית כהן');
+    expect(result.question).not.toContain('ronit.levi@gamma.example');
+    const confirmation = await loadConfirmation(result.jobId, { businessId: BUSINESS });
+    expect(confirmation?.options.map((option) => option.planHash)).toEqual([
+      planHashOf(mailPlan('ronit@beta-log.example')),
+    ]);
+  });
+
   it('marks a candidate read from a non-boss memory row as unverified', async () => {
     await seedTwoRonits('unknown_external');
     const result = await runInstruction(

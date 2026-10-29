@@ -25,6 +25,8 @@ import { envCredentials } from './credentials.js';
 import {
   CANCEL_WORDS,
   CONFIRM_WORDS,
+  REPLY_STOPLIST,
+  nameCarriesCancelWord,
   applyConfirmation,
   UNAPPLIABLE_REASON,
   bindChosenPlan,
@@ -189,8 +191,23 @@ describe('word lists', () => {
     expect(CONFIRM_WORDS.filter((word) => CLOSURE_VERB_WORDS.includes(word))).toEqual([]);
   });
 
-  it('cancel words are "לא" plus every closure verb, taken from the exported list', () => {
-    expect(CANCEL_WORDS).toEqual(['לא', ...CLOSURE_VERB_WORDS]);
+  it('cancel words are "לא", every closure verb from the exported list, and the cancel/stop verbs', () => {
+    expect(CANCEL_WORDS).toEqual([
+      'לא',
+      ...CLOSURE_VERB_WORDS,
+      'בטל',
+      'בטלי',
+      'תבטלי',
+      'ביטול',
+      'עצור',
+      'עצרי',
+      'תעצרי',
+    ]);
+  });
+
+  it('the reply stoplist is disjoint from the confirm and cancel words', () => {
+    expect(REPLY_STOPLIST.filter((word) => CONFIRM_WORDS.includes(word))).toEqual([]);
+    expect(REPLY_STOPLIST.filter((word) => CANCEL_WORDS.includes(word))).toEqual([]);
   });
 });
 
@@ -207,8 +224,76 @@ describe('readConfirmation', () => {
     expect(readConfirmation('כן', [OPTION_A, OPTION_B])).toEqual({ kind: 'unclear' });
   });
 
-  it('a confirm word inside a sentence is not a confirmation', () => {
-    expect(readConfirmation('כן תשלחי גם לרונית', [SINGLE])).toEqual({ kind: 'none' });
+  it('a confirm word that opens a longer message is unclear, never a confirmation', () => {
+    expect(readConfirmation('כן תשלחי גם לרונית', [SINGLE])).toEqual({ kind: 'unclear' });
+    // ... and it never reaches name matching: "כן חיוט" is not a pick.
+    expect(readConfirmation('כן חיוט', [OPTION_A, OPTION_B])).toEqual({ kind: 'unclear' });
+  });
+
+  it('"כן!" confirms one option and is unclear with two', () => {
+    expect(readConfirmation('כן!', [SINGLE])).toEqual({ kind: 'confirm', planHash: HASH_A });
+    expect(readConfirmation('כן!', [OPTION_A, OPTION_B])).toEqual({ kind: 'unclear' });
+  });
+
+  it('"לא." "לא!" and "לא, תודה" cancel', () => {
+    for (const reply of ['לא.', 'לא!', 'לא, תודה', 'בטל…']) {
+      expect(readConfirmation(reply, [OPTION_A, OPTION_B]), reply).toEqual({ kind: 'cancel' });
+    }
+  });
+
+  it('the exploit: "בטל" cancels even when an unverified option is named "דנה בטל"', () => {
+    const planted: ConfirmationOption = {
+      label: 'דנה בטל (attacker@evil.example)',
+      planHash: HASH_B,
+      plan: PLAN_B,
+      contactSource: 'unverified',
+      contactName: 'דנה בטל',
+    };
+    for (const reply of ['בטל', 'בטל.', 'ביטול', 'עצור']) {
+      expect(readConfirmation(reply, [OPTION_A, planted]), reply).toEqual({ kind: 'cancel' });
+    }
+    // Its full name contains a reply word, so even that never selects it.
+    expect(readConfirmation('דנה בטל', [OPTION_A, planted])).toEqual({ kind: 'unclear' });
+    // A number is an explicit pick and still works.
+    expect(readConfirmation('2', [OPTION_A, planted])).toEqual({ kind: 'confirm', planHash: HASH_B });
+  });
+
+  it('"תודה" and the other stoplist replies never confirm', () => {
+    const thanks: ConfirmationOption = { ...OPTION_A, contactName: 'דנה תודה' };
+    for (const reply of REPLY_STOPLIST) {
+      const reading = readConfirmation(reply, [thanks, OPTION_B]);
+      expect(reading.kind, reply).not.toBe('confirm');
+      expect(readConfirmation(reply, [SINGLE]).kind, reply).toBe('none');
+    }
+  });
+
+  it('an unverified option is picked by number or full name, never by surname alone', () => {
+    const stranger: ConfirmationOption = { ...OPTION_B, contactSource: 'unverified' };
+    expect(readConfirmation('לוי', [OPTION_A, stranger])).toEqual({ kind: 'unclear' });
+    expect(readConfirmation('דנה לוי', [OPTION_A, stranger])).toEqual({ kind: 'confirm', planHash: HASH_B });
+    expect(readConfirmation('2', [OPTION_A, stranger])).toEqual({ kind: 'confirm', planHash: HASH_B });
+    // The vouched-for option keeps its surname pick.
+    expect(readConfirmation('חיוט', [OPTION_A, stranger])).toEqual({ kind: 'confirm', planHash: HASH_A });
+  });
+
+  it('a one-word name shared with another option is not picked by it', () => {
+    const bare: ConfirmationOption = { ...OPTION_A, contactName: 'דנה' };
+    expect(readConfirmation('דנה', [bare, OPTION_B])).toEqual({ kind: 'unclear' });
+  });
+
+  it('a one-token name has no surname to pick by', () => {
+    const levi: ConfirmationOption = { ...OPTION_B, contactName: 'לוי' };
+    const chayut: ConfirmationOption = { ...OPTION_A, contactName: 'חיוט' };
+    // Full name of a one-token name still selects; there is no separate surname path.
+    expect(readConfirmation('לוי', [chayut, levi])).toEqual({ kind: 'confirm', planHash: HASH_B });
+  });
+
+  it('nameCarriesCancelWord flags a planted name and no real one', () => {
+    expect(nameCarriesCancelWord('דנה בטל')).toBe(true);
+    expect(nameCarriesCancelWord('דנה לא')).toBe(true);
+    expect(nameCarriesCancelWord('אשר כהן')).toBe(false);
+    expect(nameCarriesCancelWord('שמעון טוב')).toBe(false);
+    expect(nameCarriesCancelWord('דנה חיוט')).toBe(false);
   });
 
   it('only a canonical number picks: "01" does not', () => {
@@ -222,8 +307,8 @@ describe('readConfirmation', () => {
   });
 
   it('a one-letter token is never a name', () => {
-    const ad: ConfirmationOption = { ...OPTION_A, contactName: 'א דנה' };
-    expect(readConfirmation('א', [ad, OPTION_B])).toEqual({ kind: 'none' });
+    const ad: ConfirmationOption = { ...OPTION_A, contactName: 'דנה א' };
+    expect(readConfirmation('א', [ad, OPTION_B]).kind).not.toBe('confirm');
   });
 
   it('a first name alone never selects, even when only one option carries it', () => {
@@ -235,9 +320,10 @@ describe('readConfirmation', () => {
     expect(readConfirmation('חיוט דנה', [OPTION_A, OPTION_B])).toEqual({ kind: 'confirm', planHash: HASH_A });
   });
 
-  it('a surname that is also an ordinary word selects (accepted, see the report)', () => {
+  it('a surname that is also an ordinary reply ("טוב") never selects; the number does', () => {
     const tov: ConfirmationOption = { ...OPTION_A, contactName: 'דנה טוב' };
-    expect(readConfirmation('טוב', [tov, OPTION_B])).toEqual({ kind: 'confirm', planHash: HASH_A });
+    expect(readConfirmation('טוב', [tov, OPTION_B])).toEqual({ kind: 'unclear' });
+    expect(readConfirmation('1', [tov, OPTION_B])).toEqual({ kind: 'confirm', planHash: HASH_A });
   });
 
   it('a number picks that option, and one out of range is unclear', () => {
