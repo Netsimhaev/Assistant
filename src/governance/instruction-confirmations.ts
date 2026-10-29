@@ -58,6 +58,14 @@ export const ConfirmationOption = z.object({
    * (`unverified`), or no contact involved (`null`).
    */
   contactSource: z.enum(['boss', 'unverified']).nullable(),
+  /**
+   * The name of the contact this option is about, one line, when the option
+   * is one candidate of an ambiguous name (`planPerCandidate`). Stored so the
+   * confirm reader (`command-confirm.ts`) can match "דנה חיוט" or "חיוט"
+   * against the name itself rather than parse it back out of `label`, which
+   * also carries the company and the address. Absent on a single option.
+   */
+  contactName: z.string().min(1).optional(),
 });
 export type ConfirmationOption = z.infer<typeof ConfirmationOption>;
 

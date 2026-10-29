@@ -720,11 +720,15 @@ async function planPerCandidate(
     // the confirmation store refuses repeated hashes anyway.
     if (seen.has(planHash)) continue;
     seen.add(planHash);
+    // The name alone, one line, for the confirm reader to match a typed name
+    // against (`command-confirm.ts`) without parsing it out of the label.
+    const contactName = toOneLine(candidate.name);
     options.push({
       label: describeContact(candidate),
       planHash,
       plan: checked.plan,
       contactSource: contactSourceOf([candidate]),
+      ...(contactName !== '' ? { contactName } : {}),
     });
   }
 

@@ -50,6 +50,11 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.mailRetentionError !== null) {
     console.error(`mail body retention failed: ${result.mailRetentionError}`);
   }
+  // Boss-command confirmation expiry: a failed pass leaves a stale question's
+  // job parked in `plan` until the next pass closes it.
+  if (result.expiredConfirmationsError !== null) {
+    console.error(`confirmation expiry failed: ${result.expiredConfirmationsError}`);
+  }
   if (result.mail !== null && result.mail.status !== 'ok') {
     console.error(`mailbox poll: ${result.mail.status}${result.mail.error !== undefined ? ` (${result.mail.error})` : ''}`);
   }

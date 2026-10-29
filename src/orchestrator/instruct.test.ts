@@ -1290,6 +1290,10 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       ].sort(),
     );
     expect(confirmation?.options.map((option) => option.contactSource)).toEqual(['boss', 'boss']);
+    // The name alone, for the confirm reader — never the label with the address.
+    expect(confirmation?.options.map((option) => option.contactName).sort()).toEqual(
+      ['רונית כהן', 'רונית לוי'].sort(),
+    );
     expect(result.question).toContain('ronit@beta-log.example');
     expect(result.question).toContain('ronit.levi@gamma.example');
   });

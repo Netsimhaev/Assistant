@@ -3,6 +3,7 @@ import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
+import { expireConfirmations } from '../governance/instruction-confirmations.js';
 import { loadDigestSettings } from '../governance/digest-settings.js';
 import { principalWhatsAppKey } from '../governance/principal-number.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -117,6 +118,40 @@ async function expireApprovals(businessId: string, limit: number): Promise<strin
     });
   }
   return ids;
+}
+
+/**
+ * Expire boss-command confirmation questions past their window and close each
+ * job still parked on one: `plan → closed`, not `failed` — nobody answered,
+ * which is not a fault (spec §4.3). The expiry is one `UPDATE ... RETURNING`
+ * (`expireConfirmations`); each job is then moved on its own, and a job that
+ * is no longer in `plan` is left alone, so one stale row cannot abort the rest.
+ * A transition that throws is collected and re-thrown once every job has been
+ * tried, so the pass reports it without skipping the others.
+ */
+async function closeExpiredConfirmations(businessId: string): Promise<string[]> {
+  const expired = await expireConfirmations({ businessId });
+  const closed: string[] = [];
+  const errors: string[] = [];
+  for (const jobId of expired) {
+    try {
+      const job = await loadJob(jobId, { businessId });
+      if (job === null || job.phase !== 'plan') continue;
+      await transition(jobId, {
+        to: 'closed',
+        actor: 'system',
+        reason: 'command: confirmation expired',
+        businessId,
+      });
+      closed.push(jobId);
+    } catch (err) {
+      errors.push(`${jobId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (errors.length > 0) {
+    throw new Error(`closing expired confirmations failed for ${errors.join('; ')}`);
+  }
+  return closed;
 }
 
 /** Return every job whose wake time has come to `execute`. */
@@ -613,6 +648,17 @@ export interface SchedulerPassResult {
    */
   delegated: ResumeResult;
   /**
+   * Boss-command confirmation questions that expired this pass and whose job
+   * was closed (`plan → closed`, reason `command: confirmation expired`).
+   * Run right after `delegated`, before the WhatsApp door.
+   */
+  expiredConfirmations: string[];
+  /**
+   * The expiry stage's thrown message, if it threw — isolated like
+   * `scanError`, so a fault here cannot stop the door, the plans or the closes.
+   */
+  expiredConfirmationsError: string | null;
+  /**
    * Null when no WhatsApp gateway is configured (`runtime.whatsapp ===
    * undefined`) — the same "switch, not fault" shape `scan`/`conduct` already
    * carry. Run right after `delegated` and before the conductor loops: an
@@ -836,6 +882,17 @@ export async function schedulerPass(
   // in this very pass through `runDueJobs` below. Run it after the plans
   // instead and every delegation would cost a full extra interval.
   const delegated = await resumeDelegatedJobs(options);
+
+  // Before the WhatsApp door, so a question past its window is closed before
+  // an answer to it could be read this pass (`confirmChoice` refuses a stale
+  // one on its own; this is what moves the job out of `plan`).
+  let expiredConfirmations: string[] = [];
+  let expiredConfirmationsError: string | null = null;
+  try {
+    expiredConfirmations = await closeExpiredConfirmations(businessId);
+  } catch (err) {
+    expiredConfirmationsError = err instanceof Error ? err.message : String(err);
+  }
 
   // Built once per pass and reused everywhere below — `due` and the
   // conductor loops need it too, and a second `buildRuntime()` call here
@@ -1106,6 +1163,8 @@ export async function schedulerPass(
     scanError,
     conduct,
     delegated,
+    expiredConfirmations,
+    expiredConfirmationsError,
     whatsappDoor,
     mail,
     mailError,

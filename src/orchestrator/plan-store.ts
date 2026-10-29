@@ -117,12 +117,21 @@ export type PlanBinding =
 export async function bindPlanToJob(
   jobId: string,
   plan: Plan,
-  options: { businessId?: string } = {},
+  options: {
+    businessId?: string;
+    /**
+     * Run inside the caller's transaction instead of opening one. For a
+     * caller whose own check must hold in the same transaction as the bind —
+     * the boss-command confirm reader re-reads its confirmation row
+     * (`command-confirm.ts`). Every statement below is the same either way.
+     */
+    tx?: Queryable;
+  } = {},
 ): Promise<PlanBinding> {
   const businessId = options.businessId ?? config.businessId;
   const offeredHash = planHashOf(plan);
 
-  return withTransaction(async (tx) => {
+  const bind = async (tx: Queryable): Promise<PlanBinding> => {
     const inserted = await tx.query<PlanRow>(
       `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
        VALUES ($1, $2, $3, $4)
@@ -166,7 +175,8 @@ export async function bindPlanToJob(
       [businessId, jobId, offeredHash, JSON.stringify(plan)],
     );
     return { status: 'replaced', previousHash: stored.plan_hash, planHash: offeredHash };
-  });
+  };
+  return options.tx !== undefined ? bind(options.tx) : withTransaction(bind);
 }
 
 /** The plan hash a job is bound to, or null when it is not bound yet. */

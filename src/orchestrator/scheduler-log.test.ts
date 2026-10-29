@@ -20,6 +20,8 @@ function cleanResult(): SchedulerPassResult {
     scanError: null,
     conduct: null,
     delegated: { resumed: [], timedOut: [], errored: [] },
+    expiredConfirmations: [],
+    expiredConfirmationsError: null,
     whatsappDoor: null,
     mail: null,
     mailError: null,
@@ -56,6 +58,16 @@ describe('logErrored', () => {
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
       logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('prints a failed confirmation expiry', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      logErrored({ ...cleanResult(), expiredConfirmationsError: 'boom' });
+      expect(errorSpy).toHaveBeenCalledWith('confirmation expiry failed: boom');
+    } finally {
       errorSpy.mockRestore();
     }
   });
