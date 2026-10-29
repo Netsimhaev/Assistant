@@ -40,8 +40,9 @@ import {
   type ConfirmationRow,
   type InstructionConfirmation,
 } from '../governance/instruction-confirmations.js';
+import { JobPhase } from '../domain/job.js';
 import { stripBidiControls } from '../util/bidi.js';
-import { loadJob, transition } from './jobs.js';
+import { PhaseMovedError, loadJob, transition } from './jobs.js';
 import { bindPlanToJob, loadStoredPlan } from './plan-store.js';
 
 /** Whole-message words that confirm (spec §4.3). */
@@ -223,9 +224,9 @@ export async function bindChosenPlan(
       'SELECT phase FROM jobs WHERE business_id = $1 AND job_id = $2 FOR UPDATE',
       [o.businessId, jobId],
     );
-    if (job.rows[0]?.phase !== 'plan') {
-      throw new Error(`command confirm: job ${jobId} is no longer parked in plan`);
-    }
+    const phase = job.rows[0]?.phase;
+    if (phase === undefined) throw new Error(`command confirm: unknown job ${jobId}`);
+    if (phase !== 'plan') throw new PhaseMovedError(jobId, 'plan', JobPhase.parse(phase));
     const { rows } = await tx.query<{ options: unknown }>(
       `SELECT options FROM instruction_confirmations
         WHERE business_id = $1 AND job_id = $2
@@ -322,6 +323,12 @@ export async function applyConfirmation(
   return 'executing';
 }
 
+/**
+ * Every move this module makes is out of `plan`, and only out of `plan`:
+ * `expectFrom` makes the phase check and the move one locked step, so a
+ * decision taken on an earlier read can never move a job someone else
+ * already moved on (`PhaseMovedError` instead).
+ */
 async function moveTo(
   jobId: string,
   to: 'execute' | 'closed' | 'failed',
@@ -329,7 +336,7 @@ async function moveTo(
   actor: 'human' | 'system',
   businessId: string,
 ): Promise<void> {
-  await transition(jobId, { to, actor, reason, businessId });
+  await transition(jobId, { to, actor, reason, businessId, expectFrom: 'plan' });
 }
 
 async function phaseIs(jobId: string, phase: string, businessId: string): Promise<boolean> {
@@ -338,6 +345,12 @@ async function phaseIs(jobId: string, phase: string, businessId: string): Promis
 
 export interface SettleResult {
   settled: Array<{ jobId: string; to: 'execute' | 'closed' | 'failed' }>;
+  /**
+   * Jobs that left `plan` between the sweep's read and its move — settled by
+   * someone else (the owner's own `applyConfirmation`, another scheduler).
+   * Not a failure: nothing is moved and nothing is logged as an error.
+   */
+  skipped: string[];
   errored: Array<{ jobId: string; error: string }>;
 }
 
@@ -363,6 +376,14 @@ export const UNAPPLIABLE_REASON = 'command: could not apply confirmation';
  * Only jobs born at the instruction door (a `boss_instructions` row). Each job
  * on its own: one that throws is reported in `errored`, the rest go on, and
  * it is found again next pass.
+ *
+ * **Every move is conditional on the job still being in `plan`**, checked under
+ * the job's lock in the move's own transaction (`transition`'s `expectFrom`).
+ * The decision is taken on an earlier read, and the owner's dashboard is
+ * another process: without the guard, a sweep that read "confirmed, nothing
+ * bound" while `applyConfirmation` bound and moved the job to `execute` would
+ * see its own bind refused and fail a job the owner had just confirmed
+ * (`execute → failed` is legal). A job that moved on is `skipped`.
  */
 export async function settleDecidedConfirmations(o: {
   businessId: string;
@@ -385,13 +406,17 @@ export async function settleDecidedConfirmations(o: {
     [o.businessId, o.limit ?? 50],
   );
 
-  const result: SettleResult = { settled: [], errored: [] };
+  const result: SettleResult = { settled: [], skipped: [], errored: [] };
   for (const row of rows) {
     const jobId = row.job_id;
     try {
       const to = await settleOne(toConfirmation(row), o.businessId);
       result.settled.push({ jobId, to });
     } catch (err) {
+      if (err instanceof PhaseMovedError) {
+        result.skipped.push(jobId);
+        continue;
+      }
       result.errored.push({ jobId, error: err instanceof Error ? err.message : String(err) });
     }
   }
@@ -423,7 +448,11 @@ async function settleOne(
       let bound = true;
       try {
         await bindChosenPlan(jobId, chosen, { businessId });
-      } catch {
+      } catch (err) {
+        // A refusal is a reason to fail the job only while it is still
+        // parked here; one that moved on was settled by someone else.
+        const now = (await loadJob(jobId, { businessId }))?.phase;
+        if (now !== undefined && now !== 'plan') throw new PhaseMovedError(jobId, 'plan', now);
         bound = false;
       }
       if (bound) {

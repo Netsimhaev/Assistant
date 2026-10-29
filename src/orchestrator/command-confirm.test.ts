@@ -511,7 +511,7 @@ describe('scheduler expiry', () => {
     const result = await schedulerPass({ businessId: BUSINESS, runtime: inertRuntime(), inbox: null });
 
     expect(result.expiredConfirmations).toEqual([stale]);
-    expect(result.settledConfirmations).toEqual({ settled: [{ jobId: stale, to: 'closed' }], errored: [] });
+    expect(result.settledConfirmations).toEqual({ settled: [{ jobId: stale, to: 'closed' }], skipped: [], errored: [] });
     expect(result.expiredConfirmationsError).toBeNull();
     expect(await phaseOf(stale)).toBe('closed');
     const { rows } = await getPool().query<{ reason: string }>(
@@ -532,7 +532,7 @@ describe('scheduler expiry', () => {
     const result = await schedulerPass({ businessId: BUSINESS, runtime: inertRuntime(), inbox: null });
 
     expect(result.expiredConfirmations).toEqual([gone]);
-    expect(result.settledConfirmations).toEqual({ settled: [], errored: [] });
+    expect(result.settledConfirmations).toEqual({ settled: [], skipped: [], errored: [] });
     expect(result.expiredConfirmationsError).toBeNull();
     expect(await transitionsTo(gone, 'closed')).toBe(1);
   });
@@ -545,7 +545,7 @@ describe('settleDecidedConfirmations', () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
     expect(await cancelConfirmation(jobId, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'closed' }], errored: [] });
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'closed' }], skipped: [], errored: [] });
     expect(await reasonsTo(jobId, 'closed')).toEqual(['command: cancelled']);
   });
 
@@ -553,7 +553,7 @@ describe('settleDecidedConfirmations', () => {
     const jobId = await parkedJob();
     await ask(jobId, [SINGLE]);
     expect(await expireConfirmations({ businessId: BUSINESS, windowMinutes: 0 })).toEqual([jobId]);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'closed' }], errored: [] });
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'closed' }], skipped: [], errored: [] });
     expect(await reasonsTo(jobId, 'closed')).toEqual(['command: confirmation expired']);
   });
 
@@ -562,7 +562,7 @@ describe('settleDecidedConfirmations', () => {
     await bindPlanToJob(jobId, PLAN_A, by);
     await ask(jobId, [SINGLE]);
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'execute' }], errored: [] });
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'execute' }], skipped: [], errored: [] });
     expect(await reasonsTo(jobId, 'execute')).toEqual(['command: confirmed']);
   });
 
@@ -570,7 +570,7 @@ describe('settleDecidedConfirmations', () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
     expect(await confirmChoice(jobId, HASH_B, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'execute' }], errored: [] });
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'execute' }], skipped: [], errored: [] });
     expect((await loadStoredPlan(jobId, by))?.planHash).toBe(HASH_B);
   });
 
@@ -579,7 +579,7 @@ describe('settleDecidedConfirmations', () => {
     await bindPlanToJob(jobId, PLAN_C, by);
     await ask(jobId, [SINGLE]);
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], errored: [] });
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], skipped: [], errored: [] });
     expect(await reasonsTo(jobId, 'failed')).toEqual([UNAPPLIABLE_REASON]);
     expect(await transitionsTo(jobId, 'execute')).toBe(0);
   });
@@ -588,7 +588,7 @@ describe('settleDecidedConfirmations', () => {
     const jobId = await parkedJob();
     await ask(jobId, [SINGLE]);
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], errored: [] });
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], skipped: [], errored: [] });
   });
 
   it('confirmed, several options, a bind that refuses → failed', async () => {
@@ -596,7 +596,7 @@ describe('settleDecidedConfirmations', () => {
     await ask(jobId, [OPTION_A, OPTION_B]);
     await tamperFirstOption(jobId);
     expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], errored: [] });
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], skipped: [], errored: [] });
     expect(await loadStoredPlan(jobId, by)).toBeNull();
   });
 
@@ -620,7 +620,7 @@ describe('settleDecidedConfirmations', () => {
     await transition(orphan, { to: 'plan', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
     await ask(orphan, [SINGLE]);
     await cancelConfirmation(orphan, 'owner', by);
-    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [], errored: [] });
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [], skipped: [], errored: [] });
     expect(await phaseOf(orphan)).toBe('plan');
     expect(await phaseOf(pending)).toBe('plan');
   });

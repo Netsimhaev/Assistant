@@ -126,6 +126,32 @@ export interface TransitionInput {
    * below and `recordStepCompletion`.
    */
   completedStep?: StepCompletion;
+  /**
+   * Move only if the job is still in this phase, read under the same
+   * `FOR UPDATE` as the move; otherwise throw `PhaseMovedError` and write
+   * nothing. For a caller that decided on the move from an earlier read — the
+   * boss-command settle sweep (`command-confirm.ts`) — and must not move a job
+   * someone else already moved on (`execute → failed` is legal, so without
+   * this a stale decision would silently fail a running job). Omitted, the
+   * move behaves exactly as it always has.
+   */
+  expectFrom?: JobPhase;
+}
+
+/**
+ * Thrown by `transition` when `expectFrom` was given and the job is no longer
+ * in that phase. Typed so a caller can tell "someone else moved it" from a
+ * real failure without matching strings.
+ */
+export class PhaseMovedError extends Error {
+  constructor(
+    readonly jobId: string,
+    readonly expected: JobPhase,
+    readonly actual: JobPhase,
+  ) {
+    super(`job ${jobId} is in ${actual}, not ${expected}`);
+    this.name = 'PhaseMovedError';
+  }
 }
 
 /**
@@ -160,6 +186,9 @@ export async function transition(
     if (!current) throw new Error(`unknown job ${jobId}`);
 
     const from = JobPhase.parse(current.phase);
+    if (input.expectFrom !== undefined && from !== input.expectFrom) {
+      throw new PhaseMovedError(jobId, input.expectFrom, from);
+    }
     if (!canTransition(from, input.to)) {
       throw new Error(
         `illegal job transition ${from} → ${input.to} for ${jobId}; see LEGAL_TRANSITIONS`,

@@ -21,7 +21,7 @@ function cleanResult(): SchedulerPassResult {
     conduct: null,
     delegated: { resumed: [], timedOut: [], errored: [] },
     expiredConfirmations: [],
-    settledConfirmations: { settled: [], errored: [] },
+    settledConfirmations: { settled: [], skipped: [], errored: [] },
     expiredConfirmationsError: null,
     whatsappDoor: null,
     mail: null,
@@ -69,7 +69,7 @@ describe('logErrored', () => {
       logErrored({
         ...cleanResult(),
         expiredConfirmationsError: 'boom',
-        settledConfirmations: { settled: [], errored: [{ jobId: 'J-1', error: 'bang' }] },
+        settledConfirmations: { settled: [], skipped: [], errored: [{ jobId: 'J-1', error: 'bang' }] },
       });
       expect(errorSpy).toHaveBeenCalledWith('confirmation expiry failed: boom');
       expect(errorSpy).toHaveBeenCalledWith('confirmation for job J-1 could not be settled: bang');

@@ -865,7 +865,7 @@ export async function schedulerPass(
   // a transient transition error, an expiry whose close failed last pass).
   // Expiry first, so a job it expires is closed in this same pass.
   let expiredConfirmations: string[] = [];
-  let settledConfirmations: SettleResult = { settled: [], errored: [] };
+  let settledConfirmations: SettleResult = { settled: [], skipped: [], errored: [] };
   let expiredConfirmationsError: string | null = null;
   try {
     expiredConfirmations = await expireConfirmations({ businessId });
