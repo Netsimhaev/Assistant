@@ -151,9 +151,12 @@ import {
   applyConfirmation,
   openConfirmations,
   readConfirmation,
+  WHATSAPP_MESSAGE_MAX_CHARS,
+  WHATSAPP_QUESTION_TOO_LONG,
   type ConfirmOutcome,
   type ConfirmReading,
 } from './command-confirm.js';
+import { markConfirmationDelivered } from '../governance/instruction-confirmations.js';
 import {
   ambiguousQuestion,
   answerableWhatsAppQuestions,
@@ -320,9 +323,10 @@ function composeAck(outcome: InstructionOutcome): string {
   if (outcome.status === 'needs_answer') return outcome.question;
   // Boss command (spec §4): the confirmation question IS the ack — the owner
   // answers it in this chat (`handleConfirmationMessage`). It is sent only
-  // after `runInstruction` returned, so the `instruction_confirmations` row —
-  // whose `presented_at` the strict-after check reads — already exists: no
-  // reply can be dated before the question it answers was recorded.
+  // after `runInstruction` returned, so the `instruction_confirmations` row
+  // already exists, and the row is stamped `delivered_at` only after the send
+  // came back `ok` — the stamp the strict-after check reads, so no reply can
+  // be dated before the question it answers was delivered.
   if (outcome.status === 'needs_confirmation') {
     return outcome.identityNote === null
       ? outcome.question
@@ -573,7 +577,10 @@ async function handleConfirmationMessage(input: {
   const by = `whatsapp:${authorityNumberKey(msg.senderNumber) ?? msg.senderNumber}`;
   let outcome: ConfirmOutcome;
   try {
-    outcome = await applyConfirmation(only.jobId, reading, by, { businessId: ctx.businessId });
+    outcome = await applyConfirmation(only.jobId, reading, by, {
+      businessId: ctx.businessId,
+      whatsappInboundAt: new Date(msg.providerTimestamp),
+    });
   } catch (error) {
     ctx.reportConfirmError(only.jobId, error instanceof Error ? error.message : String(error));
     await reply(CONFIRM_FAILED, 'failed', only.jobId);
@@ -968,17 +975,35 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       extra.push(STILL_NEEDS_ANSWER_HINT);
     }
 
-    const fullText = withTranscriptEcho(
+    let fullText = withTranscriptEcho(
       isAudio,
       heard,
       [routeNotice, ack, ...extra].join('\n\n'),
     );
+    // A confirmation question counts as presented on WhatsApp only once it
+    // was delivered (`markConfirmationDelivered`, below). Too long for one
+    // message, it is never truncated: a pointer to the dashboard goes out
+    // instead, and the row stays undelivered — answerable there, never here.
+    let questionSent = outcome.status === 'needs_confirmation';
+    if (questionSent && fullText.length > WHATSAPP_MESSAGE_MAX_CHARS) {
+      questionSent = false;
+      fullText = withTranscriptEcho(
+        isAudio,
+        heard,
+        [routeNotice, WHATSAPP_QUESTION_TOO_LONG, ...extra].join('\n\n'),
+      );
+    }
 
     // Ack BEFORE the link write — fix round 1, Important 5. A link failure
     // below must not leave the owner silent about a job that will really
     // run; ruling 2's own requirement (link before settle) is unaffected,
     // since the link still lands before the settle three lines down.
-    await ctx.messenger.send({ text: fullText, jobId });
+    const sent = await ctx.messenger.send({ text: fullText, jobId });
+    // Only an `ok` send stamps the question: a failed send left the owner
+    // with nothing to answer, and a later "כן" must not confirm it.
+    if (questionSent && sent.ok && jobId !== null) {
+      await markConfirmationDelivered(jobId, { businessId: ctx.businessId });
+    }
 
     // The answered question's own job is retired only now, for the
     // `planned`/`needs_answer` outcomes: a replacement job exists and is

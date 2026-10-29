@@ -1048,7 +1048,7 @@ export async function schedulerPass(
   // this very pass timed out on, or failed on a spent claim, is asked again
   // now (`command-reask.ts`), so the report below sees the re-ask and does
   // not also tell the owner it failed. Isolated like every other stage.
-  let reasked: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, lockedOut: [], errored: [] };
+  let reasked: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] };
   let reaskError: string | null = null;
   try {
     reasked = await reaskFailedCommands({

@@ -20,6 +20,14 @@
  * `openMailCards` — nothing is open — so every confirm is refused and
  * `expireConfirmations` expires every pending row.
  *
+ * **A WhatsApp question counts only once it was delivered.** `presented_at`
+ * is written at INSERT, before the send; `delivered_at` is stamped by
+ * `markConfirmationDelivered` only after an `ok` send. A WhatsApp answer
+ * (`confirmChoice` with `whatsappInboundAt`) requires a WhatsApp row with
+ * `delivered_at` set and strictly before the message — otherwise a failed
+ * send followed by a later "כן" confirmed a plan the owner never saw. The
+ * dashboard renders the row itself and needs no delivery.
+ *
  * **One clock: the database's.** `presented_at` is written by `DEFAULT now()`,
  * and every comparison and every `decided_at` uses the same `now()`; the app
  * clock never meets the stored one.
@@ -79,6 +87,12 @@ export interface InstructionConfirmation {
   options: ConfirmationOption[];
   presentedText: string;
   presentedAt: Date;
+  /**
+   * When a WhatsApp question was actually sent — stamped only after an `ok`
+   * send (`markConfirmationDelivered`). `null` on a dashboard row, and on a
+   * WhatsApp row whose send failed, never ran, or was refused as too long.
+   */
+  deliveredAt: Date | null;
   channel: ConfirmationChannel;
   state: ConfirmationState;
   chosenPlanHash: string | null;
@@ -93,6 +107,7 @@ export interface ConfirmationRow {
   options: unknown;
   presented_text: string;
   presented_at: Date;
+  delivered_at: Date | null;
   channel: ConfirmationChannel;
   state: ConfirmationState;
   chosen_plan_hash: string | null;
@@ -111,6 +126,7 @@ export function toConfirmation(row: ConfirmationRow): InstructionConfirmation {
     options: ConfirmationOptions.parse(row.options),
     presentedText: row.presented_text,
     presentedAt: row.presented_at,
+    deliveredAt: row.delivered_at,
     channel: row.channel,
     state: row.state,
     chosenPlanHash: row.chosen_plan_hash,
@@ -169,7 +185,7 @@ export async function loadConfirmation(
 ): Promise<InstructionConfirmation | null> {
   const db = options.db ?? getPool();
   const { rows } = await db.query<ConfirmationRow>(
-    `SELECT job_id, options, presented_text, presented_at, channel, state,
+    `SELECT job_id, options, presented_text, presented_at, delivered_at, channel, state,
             chosen_plan_hash, decided_at, decided_by, reask_of
        FROM instruction_confirmations
       WHERE business_id = $1 AND job_id = $2`,
@@ -184,23 +200,52 @@ export async function loadConfirmation(
  * call that flipped it; `false` for an unknown job, a row that is no longer
  * pending, a question presented outside the window, or a hash that is not
  * among the presented options. A window of `0` or less refuses every confirm.
+ *
+ * `whatsappInboundAt` marks an answer that arrived on WhatsApp, dated by the
+ * provider. It adds, in the same statement: the row is a WhatsApp question,
+ * it was delivered, and it was delivered strictly before the answer — the
+ * re-check of `openConfirmations`' read, so a row whose delivery was never
+ * stamped can never be confirmed from WhatsApp. An unreadable date confirms
+ * nothing. Absent (the dashboard), none of this applies.
  */
 export async function confirmChoice(
   jobId: string,
   planHash: string,
   decidedBy: string,
-  options: Scope & { windowMinutes?: number },
+  options: Scope & { windowMinutes?: number; whatsappInboundAt?: Date },
 ): Promise<boolean> {
   const windowMinutes = options.windowMinutes ?? config.whatsappQuestionWindowMinutes;
   if (windowMinutes <= 0) return false;
+  const inboundAt = options.whatsappInboundAt;
+  if (inboundAt !== undefined && Number.isNaN(inboundAt.getTime())) return false;
   const db = options.db ?? getPool();
   const result = await db.query(
     `UPDATE instruction_confirmations
         SET state = 'confirmed', chosen_plan_hash = $3, decided_at = now(), decided_by = $4
       WHERE business_id = $1 AND job_id = $2 AND state = 'pending'
         AND presented_at > now() - make_interval(mins => $5)
-        AND options @> jsonb_build_array(jsonb_build_object('planHash', $3::text))`,
-    [options.businessId, jobId, planHash, decidedBy, windowMinutes],
+        AND options @> jsonb_build_array(jsonb_build_object('planHash', $3::text))
+        AND ($6::timestamptz IS NULL
+             OR (channel = 'whatsapp' AND delivered_at IS NOT NULL AND delivered_at < $6::timestamptz))`,
+    [options.businessId, jobId, planHash, decidedBy, windowMinutes, inboundAt ?? null],
+  );
+  return result.rowCount === 1;
+}
+
+/**
+ * Record that a WhatsApp question was sent — call it only after an `ok`
+ * send. `true` only for the call that stamped it: the row must be a pending
+ * WhatsApp row not yet stamped, in this business. On the database clock, the
+ * one `openConfirmations` compares the provider's date against.
+ */
+export async function markConfirmationDelivered(jobId: string, options: Scope): Promise<boolean> {
+  const db = options.db ?? getPool();
+  const result = await db.query(
+    `UPDATE instruction_confirmations
+        SET delivered_at = now()
+      WHERE business_id = $1 AND job_id = $2
+        AND channel = 'whatsapp' AND state = 'pending' AND delivered_at IS NULL`,
+    [options.businessId, jobId],
   );
   return result.rowCount === 1;
 }

@@ -236,9 +236,12 @@ export function readConfirmation(text: string, options: readonly ConfirmationOpt
  * second check in code would hide the SQL one from its tests:
  *
  *   - pending, on this channel, in this business;
- *   - presented strictly before the message (`inboundAt === null` — a
- *     timestamp nobody could read — answers nothing; a "כן" typed for an
- *     earlier question and delivered late must not confirm a later one);
+ *   - DELIVERED, strictly before the message (`delivered_at`, stamped only
+ *     after an `ok` send — a question whose send failed, never ran, or was
+ *     refused as too long was never seen here and answers nothing;
+ *     `inboundAt === null` — a timestamp nobody could read — answers
+ *     nothing; a "כן" typed for an earlier question and delivered late must
+ *     not confirm a later one);
  *   - presented inside the question window, on the database clock that wrote
  *     `presented_at` (`<= 0` means nothing is open — `openMailCards`' reading);
  *   - the job is still parked in `plan` and was born at the instruction door
@@ -257,7 +260,7 @@ export async function openConfirmations(o: {
   const db = o.db ?? getPool();
 
   const { rows } = await db.query<ConfirmationRow>(
-    `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.channel, c.state,
+    `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.delivered_at, c.channel, c.state,
             c.chosen_plan_hash, c.decided_at, c.decided_by, c.reask_of
        FROM instruction_confirmations c
        JOIN jobs j
@@ -265,7 +268,8 @@ export async function openConfirmations(o: {
       WHERE c.business_id = $1
         AND c.channel = $2
         AND c.state = 'pending'
-        AND c.presented_at < $3
+        AND c.delivered_at IS NOT NULL
+        AND c.delivered_at < $3
         AND c.presented_at > now() - make_interval(mins => $4)
         AND EXISTS (
           SELECT 1 FROM boss_instructions b
@@ -280,7 +284,8 @@ export async function openConfirmations(o: {
 /**
  * The confirmation questions the dashboard can answer: pending, inside the
  * window, the job still parked in `plan` and born at the instruction door —
- * on EITHER channel. No strict-after check: there is no inbound message to
+ * on EITHER channel, delivered or not: the dashboard renders the question
+ * itself, so a WhatsApp question whose send failed is answerable here. No strict-after check: there is no inbound message to
  * date, and a question presented on WhatsApp must be answerable here,
  * because the collision refusal sends the owner here. Read-only;
  * `confirmChoice` still enforces the window when the answer lands.
@@ -294,7 +299,7 @@ export async function dashboardConfirmations(o: {
   if (windowMinutes <= 0) return [];
   const db = o.db ?? getPool();
   const { rows } = await db.query<ConfirmationRow>(
-    `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.channel, c.state,
+    `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.delivered_at, c.channel, c.state,
             c.chosen_plan_hash, c.decided_at, c.decided_by, c.reask_of
        FROM instruction_confirmations c
        JOIN jobs j
@@ -370,6 +375,8 @@ export async function bindChosenPlan(
  *   - The job must still be parked in `plan`; otherwise `already_decided`,
  *     before anything is flipped.
  *   - `confirm`: `confirmChoice` flips the row (false → `already_decided`).
+ *     An answer from WhatsApp passes `whatsappInboundAt`, and the flip then
+ *     also requires the question to have been delivered before it.
  *     With several options the chosen plan is bound now (`bindChosenPlan`);
  *     with one it was bound before the question, and the bound hash must
  *     equal the chosen one. Then `plan → execute`.
@@ -388,7 +395,7 @@ export async function applyConfirmation(
   jobId: string,
   reading: ConfirmReading,
   by: string,
-  o: { businessId: string },
+  o: { businessId: string; whatsappInboundAt?: Date },
 ): Promise<ConfirmOutcome> {
   if (reading.kind !== 'confirm' && reading.kind !== 'cancel') return 'unclear';
 
@@ -407,7 +414,10 @@ export async function applyConfirmation(
     return 'cancelled';
   }
 
-  const confirmed = await confirmChoice(jobId, reading.planHash, by, { businessId: o.businessId });
+  const confirmed = await confirmChoice(jobId, reading.planHash, by, {
+    businessId: o.businessId,
+    ...(o.whatsappInboundAt !== undefined ? { whatsappInboundAt: o.whatsappInboundAt } : {}),
+  });
   if (!confirmed) return 'already_decided';
 
   try {
@@ -466,6 +476,23 @@ export interface SettleResult {
 
 /** The reason a decided confirmation that cannot be applied fails its job with. */
 export const UNAPPLIABLE_REASON = 'command: could not apply confirmation';
+
+/**
+ * The longest text a confirmation question may be sent as on WhatsApp. No
+ * other WhatsApp message in this code carries a size limit, so this is the
+ * project's own cap, set at the instruction cap (`MAX_INSTRUCTION_CHARS`).
+ *
+ * **Over the cap the question is never truncated** — a byte the owner
+ * confirms without seeing is a byte he did not confirm. `WHATSAPP_QUESTION_TOO_LONG`
+ * is sent instead, the row is left undelivered, and so it answers no
+ * WhatsApp message: the dashboard, which renders the full question itself,
+ * is where it is answered.
+ */
+export const WHATSAPP_MESSAGE_MAX_CHARS = 4_000;
+
+/** Sent in place of a confirmation question longer than `WHATSAPP_MESSAGE_MAX_CHARS`. */
+export const WHATSAPP_QUESTION_TOO_LONG =
+  'שאלת האישור ארוכה מדי להודעת וואטסאפ אחת — אפשר לקרוא ולאשר אותה רק בדשבורד.';
 
 /**
  * Move on every job still parked in `plan` whose confirmation is no longer

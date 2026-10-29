@@ -26,6 +26,7 @@ import { upsertBinding } from './bindings.js';
 import { envCredentials } from './credentials.js';
 import { REASK_PREFIX, alreadyDoneLine } from './command-echo.js';
 import { REASK_REASON, reaskFailedCommands, residualPlan } from './command-reask.js';
+import { WHATSAPP_MESSAGE_MAX_CHARS, WHATSAPP_QUESTION_TOO_LONG } from './command-confirm.js';
 import { createJob, linkWhatsAppMessage, loadJob, transition } from './jobs.js';
 import { bindPlanToJob, loadStoredPlan, planHashOf, recordStepCompletion } from './plan-store.js';
 import { runDueJobs } from './run-due.js';
@@ -325,10 +326,12 @@ describe('reaskFailedCommands', () => {
     expect(confirmation?.options.map((o) => o.planHash)).toEqual([PLAN_HASH]);
     expect(confirmation?.presentedText.startsWith(REASK_PREFIX)).toBe(true);
     expect(messenger.sent).toEqual([{ text: confirmation?.presentedText, jobId: newJobId }]);
+    // Sent, so delivered: a WhatsApp "כן" may now answer it.
+    expect(confirmation?.deliveredAt).toBeInstanceOf(Date);
 
     // A second pass asks nothing more.
     const again = await reaskFailedCommands({ businessId: BUSINESS, messenger });
-    expect(again).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, lockedOut: [], errored: [] });
+    expect(again).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
     expect(await jobCount()).toBe(2);
     expect(messenger.sent).toHaveLength(1);
     expect(await reasksOf(jobId)).toHaveLength(1);
@@ -425,6 +428,56 @@ describe('reaskFailedCommands', () => {
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
   });
 
+  it('a WhatsApp re-ask that was not sent stays undelivered — no messenger, or a failed send', async () => {
+    const first = await seedCommand();
+    await timeOut(first.jobId, first.bundle);
+    const unsent = await reaskFailedCommands({ businessId: BUSINESS });
+    expect(unsent.notConnected).toBe(1);
+    const unsentJob = unsent.reasked[0]?.newJobId ?? '';
+    expect((await loadConfirmation(unsentJob, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
+
+    const second = await seedCommand();
+    await timeOut(second.jobId, second.bundle);
+    const failing: BossMessenger = {
+      channel: 'whatsapp',
+      async send() {
+        return { ok: false, error: 'down' };
+      },
+    };
+    const failed = await reaskFailedCommands({ businessId: BUSINESS, messenger: failing });
+    expect(failed.sendFailed).toBe(1);
+    const failedJob = failed.reasked[0]?.newJobId ?? '';
+    expect((await loadConfirmation(failedJob, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
+  });
+
+  it('a WhatsApp re-ask too long for one message sends a pointer to the dashboard instead, and stays undelivered', async () => {
+    const long = 'ב'.repeat(2_500);
+    const plan = Plan.parse({
+      ...TWO_STEP,
+      steps: TWO_STEP.steps.map((step) => ({ ...step, input: { ...step.input, body: long } })),
+    });
+    const { jobId } = await seedCommand({ plan });
+    await transition(jobId, {
+      to: 'followup',
+      actor: 'orchestrator',
+      reason: 'quiet_hours',
+      wakeAt: new Date(Date.now() + 3_600_000),
+      businessId: BUSINESS,
+    });
+    await backdateDecision(jobId);
+
+    const messenger = fakeMessenger();
+    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger });
+    expect(result.errored).toEqual([]);
+    const newJobId = result.reasked[0]?.newJobId ?? '';
+    const confirmation = await loadConfirmation(newJobId, { businessId: BUSINESS });
+    expect(confirmation?.presentedText.length).toBeGreaterThan(WHATSAPP_MESSAGE_MAX_CHARS);
+    expect(confirmation?.deliveredAt).toBeNull();
+    expect(messenger.sent).toEqual([{ text: WHATSAPP_QUESTION_TOO_LONG, jobId: newJobId }]);
+    expect(result.tooLong).toBe(1);
+    expect(result.sent).toBe(0);
+  });
+
   it('a confirmation within 24 hours in followup is left to run', async () => {
     const { jobId } = await seedCommand();
     await transition(jobId, {
@@ -466,7 +519,7 @@ describe('reaskFailedCommands', () => {
 
     const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
     // Not found at all — not found and then failed on the missing row.
-    expect(result).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, lockedOut: [], errored: [] });
+    expect(result).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('followup');
   });
 
@@ -475,7 +528,7 @@ describe('reaskFailedCommands', () => {
     await timeOut(jobId, bundle, OTHER);
 
     const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
-    expect(result).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, lockedOut: [], errored: [] });
+    expect(result).toEqual({ reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] });
     expect((await loadJob(jobId, { businessId: OTHER }))?.phase).toBe('followup');
     expect(await reasksOf(jobId)).toEqual([]);
 

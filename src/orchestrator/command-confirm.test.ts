@@ -13,6 +13,7 @@ import {
   createConfirmation,
   expireConfirmations,
   loadConfirmation,
+  markConfirmationDelivered,
   type ConfirmationOption,
 } from '../governance/instruction-confirmations.js';
 import { createJob, loadJob, transition } from './jobs.js';
@@ -30,6 +31,7 @@ import {
   applyConfirmation,
   UNAPPLIABLE_REASON,
   bindChosenPlan,
+  dashboardConfirmations,
   openConfirmations,
   readConfirmation,
   settleDecidedConfirmations,
@@ -119,8 +121,23 @@ async function ask(
   );
 }
 
+/**
+ * Dates the question. A WhatsApp row is also marked delivered at the same
+ * moment — what a successful send leaves — so the tests below that are about
+ * the window or strict-after read the delivered question they mean.
+ */
 async function presentedAt(jobId: string, at: Date): Promise<void> {
-  await getPool().query('UPDATE instruction_confirmations SET presented_at = $2 WHERE job_id = $1', [
+  await getPool().query(
+    `UPDATE instruction_confirmations
+        SET presented_at = $2,
+            delivered_at = CASE WHEN channel = 'whatsapp' THEN $2::timestamptz ELSE NULL END
+      WHERE job_id = $1`,
+    [jobId, at],
+  );
+}
+
+async function deliveredAt(jobId: string, at: Date | null): Promise<void> {
+  await getPool().query('UPDATE instruction_confirmations SET delivered_at = $2 WHERE job_id = $1', [
     jobId,
     at,
   ]);
@@ -424,6 +441,94 @@ describe('openConfirmations', () => {
     expect(
       await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: new Date() }),
     ).toEqual([]);
+  });
+});
+
+describe('a WhatsApp question counts only once it was delivered', () => {
+  it('an undelivered WhatsApp question answers no WhatsApp message, and is still listed on the dashboard', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [SINGLE]);
+    await getPool().query(
+      'UPDATE instruction_confirmations SET presented_at = $2 WHERE job_id = $1',
+      [jobId, new Date(Date.now() - 60_000)],
+    );
+    expect(
+      await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: new Date() }),
+    ).toEqual([]);
+    expect((await dashboardConfirmations({ businessId: BUSINESS })).map((c) => c.jobId)).toEqual([jobId]);
+  });
+
+  it('strict-after is measured from delivery: a message between presentation and delivery answers nothing', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [SINGLE]);
+    const shown = new Date(Date.now() - 120_000);
+    const delivered = new Date(Date.now() - 60_000);
+    await getPool().query('UPDATE instruction_confirmations SET presented_at = $2 WHERE job_id = $1', [
+      jobId,
+      shown,
+    ]);
+    await deliveredAt(jobId, delivered);
+    const between = new Date(delivered.getTime() - 30_000);
+    expect(await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: between })).toEqual([]);
+    expect(
+      (await openConfirmations({ businessId: BUSINESS, channel: 'whatsapp', inboundAt: new Date() })).map(
+        (c) => c.jobId,
+      ),
+    ).toEqual([jobId]);
+  });
+
+  it('markConfirmationDelivered stamps a pending WhatsApp row once, and never a dashboard row', async () => {
+    const whatsapp = await parkedJob();
+    await ask(whatsapp, [SINGLE]);
+    const dashboard = await parkedJob();
+    await ask(dashboard, [SINGLE], { channel: 'dashboard' });
+
+    expect(await markConfirmationDelivered(whatsapp, { businessId: BUSINESS })).toBe(true);
+    expect(await markConfirmationDelivered(whatsapp, { businessId: BUSINESS })).toBe(false);
+    expect(await markConfirmationDelivered(dashboard, { businessId: BUSINESS })).toBe(false);
+    expect(await markConfirmationDelivered(whatsapp, { businessId: OTHER })).toBe(false);
+
+    expect((await loadConfirmation(whatsapp, { businessId: BUSINESS }))?.deliveredAt).toBeInstanceOf(Date);
+    expect((await loadConfirmation(dashboard, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
+  });
+
+  it('confirmChoice from WhatsApp refuses an undelivered row and a message dated before delivery; the dashboard confirms it', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [SINGLE]);
+    const by = { businessId: BUSINESS };
+
+    expect(await confirmChoice(jobId, HASH_A, 'owner', { ...by, whatsappInboundAt: new Date() })).toBe(false);
+    const delivered = new Date(Date.now() - 10_000);
+    await deliveredAt(jobId, delivered);
+    expect(
+      await confirmChoice(jobId, HASH_A, 'owner', { ...by, whatsappInboundAt: new Date(delivered.getTime() - 1) }),
+    ).toBe(false);
+    expect((await loadConfirmation(jobId, by))?.state).toBe('pending');
+
+    await deliveredAt(jobId, null);
+    expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
+  });
+
+  it('confirmChoice from WhatsApp never confirms a dashboard question', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [SINGLE], { channel: 'dashboard' });
+    expect(
+      await confirmChoice(jobId, HASH_A, 'owner', { businessId: BUSINESS, whatsappInboundAt: new Date() }),
+    ).toBe(false);
+  });
+
+  it('applyConfirmation from WhatsApp is already_decided on an undelivered row, and moves nothing', async () => {
+    const jobId = await parkedJob();
+    await bindPlanToJob(jobId, PLAN_A, { businessId: BUSINESS });
+    await ask(jobId, [SINGLE]);
+    expect(
+      await applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', {
+        businessId: BUSINESS,
+        whatsappInboundAt: new Date(),
+      }),
+    ).toBe('already_decided');
+    expect(await phaseOf(jobId)).toBe('plan');
+    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('pending');
   });
 });
 

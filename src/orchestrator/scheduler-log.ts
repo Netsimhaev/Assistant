@@ -69,9 +69,9 @@ export function logErrored(result: SchedulerPassResult): void {
   for (const job of result.reasked.errored) {
     console.error(`command job ${job.jobId} could not be re-asked: ${job.error}`);
   }
-  if (result.reasked.notConnected > 0 || result.reasked.sendFailed > 0) {
+  if (result.reasked.notConnected > 0 || result.reasked.sendFailed > 0 || result.reasked.tooLong > 0) {
     console.error(
-      `${result.reasked.notConnected + result.reasked.sendFailed} re-ask question(s) did not reach WhatsApp — the dashboard lists them`,
+      `${result.reasked.notConnected + result.reasked.sendFailed + result.reasked.tooLong} re-ask question(s) did not reach WhatsApp — the dashboard lists them`,
     );
   }
   if (result.mail !== null && result.mail.status !== 'ok') {

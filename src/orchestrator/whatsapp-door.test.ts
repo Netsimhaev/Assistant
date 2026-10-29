@@ -31,8 +31,14 @@ import { saveInstruction } from '../governance/instructions.js';
 import {
   createConfirmation,
   loadConfirmation,
+  markConfirmationDelivered,
   type ConfirmationOption,
 } from '../governance/instruction-confirmations.js';
+import {
+  WHATSAPP_MESSAGE_MAX_CHARS,
+  WHATSAPP_QUESTION_TOO_LONG,
+  dashboardConfirmations,
+} from './command-confirm.js';
 import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { raiseMailReply } from './mail-reply.js';
 import { presentMailCard } from './whatsapp-mail-card.js';
@@ -1695,6 +1701,8 @@ describe('confirming a held command over WhatsApp', () => {
       { jobId: job.jobId, options, presentedText: 'שאלה', channel: 'whatsapp' },
       { businessId: BUSINESS },
     );
+    // What a successful send of the question leaves behind.
+    await markConfirmationDelivered(job.jobId, { businessId: BUSINESS });
     return job.jobId;
   }
 
@@ -1772,6 +1780,56 @@ describe('confirming a held command over WhatsApp', () => {
     expect(await confirmationState(jobId)).toBe('confirmed');
     expect(lastSent()).toBe(CONFIRM_EXECUTING);
     expect((await messageRow(yes.providerMessageId))?.state).toBe('handled');
+  });
+
+  it('stamps the question delivered only after the send succeeded', async () => {
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' }));
+    await pass(plannedWith(mailPlan()));
+    const jobId = (await openJobs(BUSINESS))[0]?.jobId ?? '';
+    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.deliveredAt).toBeInstanceOf(Date);
+  });
+
+  it('a question whose send failed is never confirmed by a later "כן" on WhatsApp — the dashboard still lists it', async () => {
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' }));
+    gateway.failNextSend();
+    await pass(plannedWith(mailPlan()));
+    const jobId = (await openJobs(BUSINESS))[0]?.jobId ?? '';
+    expect(await phase(jobId)).toBe('plan');
+    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
+
+    gateway.enqueue(reply('כן'));
+    const result = await pass(async () => ({ status: 'planned', plan: recallPlan() }));
+
+    expect(result.confirmationReplies).toBe(0);
+    expect(await confirmationState(jobId)).toBe('pending');
+    expect(await phase(jobId)).toBe('plan');
+    expect((await dashboardConfirmations({ businessId: BUSINESS })).map((c) => c.jobId)).toEqual([jobId]);
+  });
+
+  it('a question too long for one WhatsApp message is not sent: a pointer to the dashboard instead, and it stays undelivered', async () => {
+    const long = 'א'.repeat(2_500);
+    const step = mailPlan().steps[0] as Plan['steps'][number];
+    const plan = mailPlan({
+      steps: [
+        { ...step, id: 's1', input: { to: 'dana@example.com', subject: 'נושא', body: long } },
+        { ...step, id: 's2', input: { to: 'dana@example.com', subject: 'נושא 2', body: long } },
+      ],
+    });
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' }));
+    await pass(plannedWith(plan));
+
+    const jobId = (await openJobs(BUSINESS))[0]?.jobId ?? '';
+    const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
+    expect(stored?.presentedText.length).toBeGreaterThan(WHATSAPP_MESSAGE_MAX_CHARS);
+    expect(stored?.deliveredAt).toBeNull();
+    expect(lastSent()).toContain(WHATSAPP_QUESTION_TOO_LONG);
+    expect(lastSent()).not.toContain(long);
+    expect(lastSent().length).toBeLessThanOrEqual(WHATSAPP_MESSAGE_MAX_CHARS);
+
+    gateway.enqueue(reply('כן'));
+    await pass(async () => ({ status: 'planned', plan: recallPlan() }));
+    expect(await confirmationState(jobId)).toBe('pending');
+    expect((await dashboardConfirmations({ businessId: BUSINESS })).map((c) => c.jobId)).toEqual([jobId]);
   });
 
   it('a typed "כן" dated BEFORE the question was presented never confirms it', async () => {

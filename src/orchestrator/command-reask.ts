@@ -67,10 +67,14 @@
  * (`linkWhatsAppMessage`, its only writer), so the report owed on that
  * message is delivered by the job that actually runs; the old job is kept out
  * of the report (`whatsapp-report.ts`), because the question already told the
- * owner. The WhatsApp question is sent only after the row exists, so the
- * owner's answer can never be dated before it. With no messenger the row
- * still exists and the dashboard lists it (`dashboardConfirmations`); it is
- * counted in `notConnected`, not silenced.
+ * owner. The WhatsApp question is sent only after the row exists, and the
+ * row is stamped delivered only after an `ok` send — only then can a
+ * WhatsApp "כן" answer it, and never one dated before the delivery. With no
+ * messenger, a failed send, or a question longer than one WhatsApp message
+ * (a pointer to the dashboard is sent instead, never a truncated question),
+ * the row still exists undelivered and the dashboard lists it
+ * (`dashboardConfirmations`); each is counted (`notConnected`, `sendFailed`,
+ * `tooLong`), not silenced.
  */
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
@@ -81,10 +85,12 @@ import { loadInstructionForJob, saveInstruction } from '../governance/instructio
 import {
   ConfirmationOption,
   createConfirmation,
+  markConfirmationDelivered,
   type ConfirmationChannel,
 } from '../governance/instruction-confirmations.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { renderConfirmationQuestion } from './command-echo.js';
+import { WHATSAPP_MESSAGE_MAX_CHARS, WHATSAPP_QUESTION_TOO_LONG } from './command-confirm.js';
 import { PhaseMovedError, createJob, linkWhatsAppMessage, transition } from './jobs.js';
 import { bindPlanToJob, completedSteps, loadStoredPlan, planHashOf } from './plan-store.js';
 
@@ -105,6 +111,12 @@ export interface ReaskResult {
   notConnected: number;
   /** Re-asks whose WhatsApp send came back `{ ok: false }` — the row exists, the dashboard lists it. */
   sendFailed: number;
+  /**
+   * Re-asks whose question was too long for one WhatsApp message
+   * (`WHATSAPP_MESSAGE_MAX_CHARS`): a pointer to the dashboard was sent
+   * instead, and the row stays undelivered — answerable there only.
+   */
+  tooLong: number;
   /** Old jobs another pass was re-asking at the same moment. */
   lockedOut: string[];
   errored: Array<{ jobId: string; error: string }>;
@@ -206,7 +218,7 @@ export async function reaskFailedCommands(o: {
   limit?: number;
 }): Promise<ReaskResult> {
   const businessId = o.businessId ?? config.businessId;
-  const result: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, lockedOut: [], errored: [] };
+  const result: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] };
 
   const candidates = await readCandidates(businessId, null, o.limit ?? 20);
   for (const candidate of candidates) {
@@ -236,6 +248,7 @@ export async function reaskFailedCommands(o: {
       if (outcome.delivery === 'sent') result.sent += 1;
       if (outcome.delivery === 'not_connected') result.notConnected += 1;
       if (outcome.delivery === 'failed') result.sendFailed += 1;
+      if (outcome.delivery === 'too_long') result.tooLong += 1;
     } catch (err) {
       result.errored.push({ jobId: oldJobId, error: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -256,7 +269,7 @@ export async function reaskFailedCommands(o: {
 
 interface ReaskOneOutcome {
   reasked: ReaskResult['reasked'][number];
-  delivery: 'sent' | 'not_connected' | 'failed' | 'dashboard';
+  delivery: 'sent' | 'not_connected' | 'failed' | 'too_long' | 'dashboard';
 }
 
 async function reaskOne(
@@ -398,8 +411,18 @@ async function reaskOne(
   const reasked = { oldJobId, newJobId: job.jobId, uncertain: candidate.uncertain };
   if (candidate.channel !== 'whatsapp') return { reasked, delivery: 'dashboard' };
   if (messenger === undefined) return { reasked, delivery: 'not_connected' };
+  // Never truncated: a question the owner cannot read in full on WhatsApp is
+  // answered on the dashboard, and the row stays undelivered so no WhatsApp
+  // reply can confirm it.
+  if (rendered.text.length > WHATSAPP_MESSAGE_MAX_CHARS) {
+    await messenger.send({ text: WHATSAPP_QUESTION_TOO_LONG, jobId: job.jobId });
+    return { reasked, delivery: 'too_long' };
+  }
   const sent = await messenger.send({ text: rendered.text, jobId: job.jobId });
-  return { reasked, delivery: sent.ok ? 'sent' : 'failed' };
+  if (!sent.ok) return { reasked, delivery: 'failed' };
+  // Only now does a WhatsApp "כן" answer it (`openConfirmations`).
+  await markConfirmationDelivered(job.jobId, { businessId });
+  return { reasked, delivery: 'sent' };
 }
 
 /**
