@@ -45,6 +45,8 @@ describe('the contacts the resolver may match against', () => {
     expect(contacts).toHaveLength(1);
     expect(contacts[0]?.name).toBe('רונית כהן');
     expect(contacts[0]?.company).toBe('בטא לוגיסטיקה');
+    // Whose word the record is — read from the row, never assumed.
+    expect(contacts[0]?.provenance).toBe('boss');
     // Both keys: the entity id it is stored under, and the address the curator
     // writes under. Spec §8 — the same person is split across the two today.
     expect(contacts[0]?.subjectKeys).toEqual(

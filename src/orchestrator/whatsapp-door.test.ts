@@ -12,8 +12,36 @@ import type { NormalizedInboundMessage, WhatsAppGateway } from '../whatsapp/gate
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { createFakeMessenger } from '../whatsapp/fake-messenger.js';
 import { writeMemory } from '../memory/store.js';
-import { createJob } from './jobs.js';
-import { compareInbound, runWhatsAppDoor } from './whatsapp-door.js';
+import { createJob, loadJob, transition } from './jobs.js';
+import {
+  CONFIRM_CANCELLED,
+  CONFIRM_EXECUTING,
+  CONFIRM_FAILED,
+  CONFIRM_UNCLEAR,
+  SEVERAL_OPEN_REFUSAL,
+  compareInbound,
+  runWhatsAppDoor,
+} from './whatsapp-door.js';
+import type { PolicyBundle } from '../domain/policy.js';
+import type { FakeGateway } from '../whatsapp/fake-gateway.js';
+import { createBossMessenger, type BossMessenger } from '../whatsapp/messenger.js';
+import { QUESTION_TRIAGE, installMailboxCharter, storedMail, stubDrafter } from '../test/mailbox.js';
+import { getApproval } from '../governance/approvals.js';
+import { saveInstruction } from '../governance/instructions.js';
+import {
+  createConfirmation,
+  loadConfirmation,
+  markConfirmationDelivered,
+  type ConfirmationOption,
+} from '../governance/instruction-confirmations.js';
+import {
+  WHATSAPP_MESSAGE_MAX_CHARS,
+  WHATSAPP_QUESTION_TOO_LONG,
+  dashboardConfirmations,
+} from './command-confirm.js';
+import { bindPlanToJob, planHashOf } from './plan-store.js';
+import { raiseMailReply } from './mail-reply.js';
+import { presentMailCard } from './whatsapp-mail-card.js';
 
 const BUSINESS = 'test-business';
 // `buildCharter`'s default principal (`src/test/fixtures.ts`) carries this
@@ -91,6 +119,31 @@ function mailPlan(overrides: Partial<Plan> = {}): Plan {
       },
     ],
     ...overrides,
+  };
+}
+
+/**
+ * A plan of reads only — no classified step, so it runs without a
+ * confirmation question (boss command, spec §10.4). For tests whose subject
+ * is the door itself rather than what a side-effecting plan now waits for.
+ */
+function recallPlan(): Plan {
+  return {
+    goal: 'להיזכר',
+    assumptions: [],
+    clarifyingQuestion: null,
+    estimatedCostMinor: 0,
+    steps: [
+      {
+        id: 's1',
+        agent: 'comms.email',
+        intent: 'להיזכר',
+        toolName: 'memory.recall',
+        input: { subjectKey: 'dana@example.com' },
+        dependsOn: [],
+        expectedActionClass: null,
+      },
+    ],
   };
 }
 
@@ -188,10 +241,13 @@ describe('runWhatsAppDoor', () => {
       gateway,
       messenger,
       businessId: BUSINESS,
-      planner: plannedWith(mailPlan()),
+      // Reads only, so the job goes straight to `execute` as before; a
+      // side-effecting plan now parks on a confirmation question (see the
+      // boss-command tests at the end of this file).
+      planner: plannedWith(recallPlan()),
     });
 
-    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
     expect(messenger.sentTexts).toHaveLength(1);
     expect(messenger.sentTexts[0]).toContain('קיבלתי');
 
@@ -415,6 +471,18 @@ describe('runWhatsAppDoor', () => {
       },
       { businessId: BUSINESS },
     );
+    // Four in all, so the identity question itself is asked: two or three
+    // distinguishable candidates are planned one by one instead (boss
+    // command, spec §4.2).
+    for (const [key, name, company] of [
+      ['ronit-mizrahi-delta', 'רונית מזרחי', 'דלתא דפוס'],
+      ['ronit-peretz-omega', 'רונית פרץ', 'אומגה שיווק'],
+    ] as const) {
+      await writeMemory(
+        { jobId: seedJob.jobId, kind: 'entity', subjectKey: key, body: { name, company } },
+        { businessId: BUSINESS },
+      );
+    }
 
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
@@ -1195,7 +1263,7 @@ describe('runWhatsAppDoor', () => {
       },
     });
 
-    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
     expect(seenInstructions).toEqual(['ראשונה (מוקדמת)', 'שנייה (מאוחרת)']);
   });
 
@@ -1362,7 +1430,7 @@ describe('a recording is not typing', () => {
     return rows.map((row) => row.text_origin);
   }
 
-  it('plans a voice note but authorises nobody from it, and tells the owner why', async () => {
+  it('plans a voice note but authorises nobody from it, and the question names the recipient', async () => {
     const gateway = createFakeGateway();
     const messenger = createFakeMessenger();
     gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER }));
@@ -1385,14 +1453,16 @@ describe('a recording is not typing', () => {
     // path and the owner sees a card before anything reaches dana.
     expect(await grants()).toHaveLength(0);
 
-    // One message, as ruling 4 requires — the transcript, the
-    // acknowledgement and this notice all ride together.
+    // One message, as ruling 4 requires — the transcript and the
+    // acknowledgement ride together. The acknowledgement of a side-effecting
+    // plan is now the confirmation question (boss command, spec §4), which
+    // names the recipient and asks for the owner's explicit word — the
+    // half of ruling 2 the recording note used to carry.
     expect(messenger.sentTexts).toHaveLength(1);
     const ack = messenger.sentTexts[0] ?? '';
     expect(ack).toContain('שמעתי:');
-    expect(ack).toContain('הקלטה');
     expect(ack).toContain('dana@example.com');
-    expect(ack).toContain('אישור מפורש');
+    expect(ack).toContain('לאישור');
   });
 
   it('treats a typed WhatsApp message as the owner own bytes', async () => {
@@ -1464,6 +1534,484 @@ describe('a recording is not typing', () => {
     // inherits its origin because one half of it was never typed.
     expect(await storedOrigins()).toEqual(['transcribed', 'transcribed']);
     expect(await grants()).toHaveLength(0);
-    expect(messenger.sentTexts[1] ?? '').toContain('הקלטה');
+    // The owner is asked before anything reaches dana (spec §4).
+    expect(messenger.sentTexts[1] ?? '').toContain('לאישור');
+  });
+});
+
+/**
+ * Boss command (spec 2026-10-28, §4): the WhatsApp door's minimal handling of
+ * a side-effecting instruction — the confirmation question is the ack — and
+ * spec §10.9's rule that one instruction counts once against the daily cap,
+ * however many candidate plans it took.
+ */
+describe('a side-effecting instruction over WhatsApp', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    await withCharter();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  async function instructionRowsToday(): Promise<number> {
+    const { rows } = await getPool().query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM audit_log WHERE business_id = $1 AND kind = 'whatsapp_instruction'`,
+      [BUSINESS],
+    );
+    return Number(rows[0]?.n ?? '0');
+  }
+
+  it('acknowledges with the confirmation question and parks the job', async () => {
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    const msg = textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' });
+    gateway.enqueue(msg);
+
+    const result = await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: plannedWith(mailPlan()),
+    });
+
+    expect(result.instructed).toBe(1);
+    const ack = messenger.sentTexts[0] ?? '';
+    expect(ack).toContain('dana@example.com');
+    expect(ack).toContain('לאישור');
+
+    const jobs = await openJobs(BUSINESS);
+    expect(jobs).toHaveLength(1);
+    const { rows } = await getPool().query<{ phase: string; channel: string }>(
+      `SELECT j.phase, c.channel FROM jobs j
+         JOIN instruction_confirmations c ON c.job_id = j.job_id
+        WHERE j.job_id = $1`,
+      [jobs[0]?.jobId],
+    );
+    expect(rows[0]?.phase).toBe('plan');
+    expect(rows[0]?.channel).toBe('whatsapp');
+    expect((await messageRow(msg.providerMessageId))?.state).toBe('handled');
+  });
+
+  it('counts one instruction once against the daily cap, however many candidates were planned', async () => {
+    const active = await loadActiveCharter(BUSINESS);
+    if (active === null) throw new Error('unreachable');
+    const seedJob = await createJob({
+      charterVersion: active.charter.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    for (const [key, name, email] of [
+      ['ronit-cohen', 'רונית כהן', 'ronit@beta-log.example'],
+      ['ronit-levi', 'רונית לוי', 'ronit.levi@gamma.example'],
+    ] as const) {
+      await writeMemory(
+        { jobId: seedJob.jobId, kind: 'entity', subjectKey: key, body: { name, email } },
+        { businessId: BUSINESS },
+      );
+    }
+
+    const gateway = createFakeGateway();
+    const messenger = createFakeMessenger();
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי לרונית את ההצעה' }));
+
+    let calls = 0;
+    const base = mailPlan().steps[0];
+    if (base === undefined) throw new Error('unreachable');
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      planner: async (request) => {
+        calls += 1;
+        const to = request.resolvedContact?.includes('gamma')
+          ? 'ronit.levi@gamma.example'
+          : 'ronit@beta-log.example';
+        return {
+          status: 'planned',
+          plan: mailPlan({ steps: [{ ...base, input: { to, subject: 'נושא', body: 'גוף' } }] }),
+        };
+      },
+    });
+
+    // Two planner calls really happened — one per candidate — and still one
+    // row against the cap.
+    expect(calls).toBe(2);
+    expect(await instructionRowsToday()).toBe(1);
+    expect(messenger.sentTexts[0] ?? '').toContain('למי התכוונת?');
+  });
+});
+
+/**
+ * Boss command over WhatsApp (spec §4.3, §10.11, Task 5): the confirm reader
+ * runs FIRST for a principal's TYPED message — before the mail card and
+ * before routing — and refuses to guess when more than one thing is open.
+ *
+ * A REAL `createBossMessenger` over the fake gateway, not the fake
+ * messenger: the mail-card collision needs the outbound row the real one
+ * writes (`openMailCards` derives "presented" from it), and every reply is
+ * then read off `gateway.sent`.
+ */
+describe('confirming a held command over WhatsApp', () => {
+  let bundle: PolicyBundle;
+  let gateway: FakeGateway;
+  let messenger: BossMessenger;
+
+  beforeEach(async () => {
+    await resetDatabase();
+    bundle = await installMailboxCharter(BUSINESS);
+    gateway = createFakeGateway();
+    messenger = createBossMessenger({ gateway, contactId: PRINCIPAL_NUMBER, businessId: BUSINESS });
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  const PLAN_A = mailPlan();
+  const PLAN_B = mailPlan({
+    steps: [{ ...(mailPlan().steps[0] as Plan['steps'][number]), input: { to: 'dana.levi@x.example', subject: 'נושא', body: 'גוף' } }],
+  });
+  const SINGLE: ConfirmationOption = { label: 'לבצע?', planHash: planHashOf(PLAN_A), plan: PLAN_A, contactSource: null };
+  const OPTION_A: ConfirmationOption = {
+    label: 'דנה חיוט (dana@example.com)',
+    planHash: planHashOf(PLAN_A),
+    plan: PLAN_A,
+    contactSource: 'boss',
+    contactName: 'דנה חיוט',
+  };
+  const OPTION_B: ConfirmationOption = {
+    label: 'דנה לוי (dana.levi@x.example)',
+    planHash: planHashOf(PLAN_B),
+    plan: PLAN_B,
+    contactSource: 'boss',
+    contactName: 'דנה לוי',
+  };
+
+  /** A boss job parked in `plan` on a WhatsApp confirmation — what `runInstruction` leaves. */
+  async function held(options: ConfirmationOption[], bind = true): Promise<string> {
+    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    await saveInstruction({ jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
+    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    await transition(job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    const only = options.length === 1 ? options[0] : undefined;
+    if (bind && only !== undefined) await bindPlanToJob(job.jobId, only.plan, { businessId: BUSINESS });
+    await createConfirmation(
+      { jobId: job.jobId, options, presentedText: 'שאלה', channel: 'whatsapp' },
+      { businessId: BUSINESS },
+    );
+    // What a successful send of the question leaves behind.
+    await markConfirmationDelivered(job.jobId, { businessId: BUSINESS });
+    return job.jobId;
+  }
+
+  /** The owner's typed reply, sent after the question (strictly after, by `offsetMs`). */
+  function reply(body: string, offsetMs = 1_000): NormalizedInboundMessage {
+    return textMsg({
+      senderNumber: PRINCIPAL_NUMBER,
+      body,
+      providerTimestamp: new Date(Date.now() + offsetMs).toISOString(),
+    });
+  }
+
+  function pass(planner: (r: PlanRequest) => Promise<PlanOutcome> = neverCalled) {
+    return runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, planner });
+  }
+
+  function lastSent(): string {
+    return gateway.sent.at(-1)?.body ?? '';
+  }
+
+  async function phase(jobId: string): Promise<string | undefined> {
+    return (await loadJob(jobId, { businessId: BUSINESS }))?.phase;
+  }
+
+  async function confirmationState(jobId: string): Promise<string | undefined> {
+    return (await loadConfirmation(jobId, { businessId: BUSINESS }))?.state;
+  }
+
+  async function raiseMailCard(): Promise<string> {
+    const mail = await storedMail(BUSINESS, {
+      providerMessageId: 'PM-1',
+      internetMessageId: '<q-1@client.example>',
+      threadId: 'TH-1',
+    });
+    const raised = await raiseMailReply(
+      { mail, triage: QUESTION_TRIAGE, bundle, drafter: stubDrafter() },
+      { businessId: BUSINESS },
+    );
+    if (raised === null || raised.approvalId === null) throw new Error('expected a card');
+    await presentMailCard(
+      raised.approvalId,
+      async (text, jobId) => {
+        const sent = await messenger.send({ text, jobId });
+        if (!sent.ok) throw new Error(sent.error ?? 'send failed');
+      },
+      { businessId: BUSINESS },
+    );
+    return raised.approvalId;
+  }
+
+  it('sends the question as the ack of a side-effecting instruction, never the generic one', async () => {
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' }));
+    const result = await pass(plannedWith(mailPlan()));
+
+    expect(result.instructed).toBe(1);
+    expect(lastSent()).toContain('dana@example.com');
+    expect(lastSent()).toContain('לאישור');
+    expect(lastSent()).not.toContain('קיבלתי, אני מטפלת בזה.');
+  });
+
+  it('a typed "כן" after the question moves the job to execute and says so', async () => {
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' }));
+    await pass(plannedWith(mailPlan()));
+    const jobs = await openJobs(BUSINESS);
+    const jobId = jobs[0]?.jobId ?? '';
+    expect(await phase(jobId)).toBe('plan');
+
+    const yes = reply('כן');
+    gateway.enqueue(yes);
+    const result = await pass();
+
+    expect(result.confirmationReplies).toBe(1);
+    expect(result.instructed).toBe(0);
+    expect(await phase(jobId)).toBe('execute');
+    expect(await confirmationState(jobId)).toBe('confirmed');
+    expect(lastSent()).toBe(CONFIRM_EXECUTING);
+    expect((await messageRow(yes.providerMessageId))?.state).toBe('handled');
+  });
+
+  it('stamps the question delivered only after the send succeeded', async () => {
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' }));
+    await pass(plannedWith(mailPlan()));
+    const jobId = (await openJobs(BUSINESS))[0]?.jobId ?? '';
+    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.deliveredAt).toBeInstanceOf(Date);
+  });
+
+  it('a question whose send failed is never confirmed by a later "כן" on WhatsApp — the dashboard still lists it', async () => {
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' }));
+    gateway.failNextSend();
+    await pass(plannedWith(mailPlan()));
+    const jobId = (await openJobs(BUSINESS))[0]?.jobId ?? '';
+    expect(await phase(jobId)).toBe('plan');
+    expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.deliveredAt).toBeNull();
+
+    gateway.enqueue(reply('כן'));
+    const result = await pass(async () => ({ status: 'planned', plan: recallPlan() }));
+
+    expect(result.confirmationReplies).toBe(0);
+    expect(await confirmationState(jobId)).toBe('pending');
+    expect(await phase(jobId)).toBe('plan');
+    expect((await dashboardConfirmations({ businessId: BUSINESS })).map((c) => c.jobId)).toEqual([jobId]);
+  });
+
+  it('a question too long for one WhatsApp message is not sent: a pointer to the dashboard instead, and it stays undelivered', async () => {
+    const long = 'א'.repeat(2_500);
+    const step = mailPlan().steps[0] as Plan['steps'][number];
+    const plan = mailPlan({
+      steps: [
+        { ...step, id: 's1', input: { to: 'dana@example.com', subject: 'נושא', body: long } },
+        { ...step, id: 's2', input: { to: 'dana@example.com', subject: 'נושא 2', body: long } },
+      ],
+    });
+    gateway.enqueue(textMsg({ senderNumber: PRINCIPAL_NUMBER, body: 'תשלחי ל-dana@example.com את ההצעה' }));
+    await pass(plannedWith(plan));
+
+    const jobId = (await openJobs(BUSINESS))[0]?.jobId ?? '';
+    const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
+    expect(stored?.presentedText.length).toBeGreaterThan(WHATSAPP_MESSAGE_MAX_CHARS);
+    expect(stored?.deliveredAt).toBeNull();
+    expect(lastSent()).toContain(WHATSAPP_QUESTION_TOO_LONG);
+    expect(lastSent()).not.toContain(long);
+    expect(lastSent().length).toBeLessThanOrEqual(WHATSAPP_MESSAGE_MAX_CHARS);
+
+    gateway.enqueue(reply('כן'));
+    await pass(async () => ({ status: 'planned', plan: recallPlan() }));
+    expect(await confirmationState(jobId)).toBe('pending');
+    expect((await dashboardConfirmations({ businessId: BUSINESS })).map((c) => c.jobId)).toEqual([jobId]);
+  });
+
+  it('a typed "כן" dated BEFORE the question was presented never confirms it', async () => {
+    const jobId = await held([SINGLE]);
+    gateway.enqueue(reply('כן', -5_000));
+    await pass(async () => ({ status: 'planned', plan: recallPlan() }));
+
+    expect(await confirmationState(jobId)).toBe('pending');
+    expect(await phase(jobId)).toBe('plan');
+  });
+
+  it('links the confirm reply to the job it answered', async () => {
+    const jobId = await held([SINGLE]);
+    gateway.enqueue(reply('כן'));
+    await pass();
+
+    const { rows } = await getPool().query<{ job_id: string | null }>(
+      `SELECT job_id FROM whatsapp_messages
+        WHERE business_id = $1 AND direction = 'outbound' AND body = $2`,
+      [BUSINESS, CONFIRM_EXECUTING],
+    );
+    expect(rows.map((r) => r.job_id)).toEqual([jobId]);
+  });
+
+  it('a voice "כן" never confirms: it goes to the door as an instruction and the question stays pending', async () => {
+    const jobId = await held([SINGLE]);
+    gateway.enqueue({ ...audioMsg({ senderNumber: PRINCIPAL_NUMBER }), providerTimestamp: new Date(Date.now() + 1_000).toISOString() });
+
+    let planned = 0;
+    await runWhatsAppDoor({
+      gateway,
+      messenger,
+      businessId: BUSINESS,
+      provider: async () => ({ text: 'כן' }),
+      planner: async () => {
+        planned += 1;
+        return { status: 'planned', plan: recallPlan() };
+      },
+    });
+
+    expect(planned).toBe(1);
+    expect(await phase(jobId)).toBe('plan');
+    expect(await confirmationState(jobId)).toBe('pending');
+  });
+
+  it('a caption "כן" on an image never confirms', async () => {
+    const jobId = await held([SINGLE]);
+    gateway.enqueue({ ...reply('כן'), mediaKind: 'image' });
+    await pass(async () => ({ status: 'planned', plan: recallPlan() }));
+
+    expect(await phase(jobId)).toBe('plan');
+    expect(await confirmationState(jobId)).toBe('pending');
+  });
+
+  it('a typed "לא" cancels: the job is closed', async () => {
+    const jobId = await held([SINGLE]);
+    gateway.enqueue(reply('לא'));
+    const result = await pass();
+
+    expect(result.confirmationReplies).toBe(1);
+    expect(await phase(jobId)).toBe('closed');
+    expect(lastSent()).toBe(CONFIRM_CANCELLED);
+  });
+
+  it('picks by number when there are several options, and "כן" alone is unclear', async () => {
+    const jobId = await held([OPTION_A, OPTION_B]);
+    gateway.enqueue(reply('כן'));
+    const unclear = await pass();
+    expect(unclear.refused).toBe(1);
+    expect(lastSent()).toBe(CONFIRM_UNCLEAR);
+    expect(await confirmationState(jobId)).toBe('pending');
+
+    gateway.enqueue(reply('2', 2_000));
+    await pass();
+    expect(await phase(jobId)).toBe('execute');
+    const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
+    expect(stored?.chosenPlanHash).toBe(OPTION_B.planHash);
+  });
+
+  it('a second "כן" for an already-decided question changes nothing', async () => {
+    const jobId = await held([SINGLE]);
+    gateway.enqueue(reply('כן'));
+    await pass();
+    expect(await phase(jobId)).toBe('execute');
+
+    // Decided, so no longer open: the second "כן" is not read as an answer
+    // to it at all, and nothing moves the job a second time.
+    gateway.enqueue(reply('כן', 2_000));
+    await pass(async () => ({ status: 'planned', plan: recallPlan() }));
+    const { rows } = await getPool().query(
+      "SELECT 1 FROM job_steps WHERE job_id = $1 AND to_phase = 'execute'",
+      [jobId],
+    );
+    expect(rows).toHaveLength(1);
+  });
+
+  it('tells the owner to retry on the dashboard, and reports it, when applying throws', async () => {
+    // A single option with nothing bound: the confirm flips, then the bound
+    // hash cannot match and `applyConfirmation` throws.
+    const jobId = await held([SINGLE], false);
+    gateway.enqueue(reply('כן'));
+    const result = await pass();
+
+    expect(lastSent()).toBe(CONFIRM_FAILED);
+    expect(result.confirmErrored).toHaveLength(1);
+    expect(result.confirmErrored[0]?.jobId).toBe(jobId);
+    expect(await phase(jobId)).toBe('plan');
+  });
+
+  it('"שלח" with only a confirmation open is not consumed by the confirm reader', async () => {
+    const jobId = await held([SINGLE]);
+    gateway.enqueue(reply('שלח'));
+    let planned = 0;
+    await pass(async () => {
+      planned += 1;
+      return { status: 'planned', plan: recallPlan() };
+    });
+
+    expect(planned).toBe(1);
+    expect(await confirmationState(jobId)).toBe('pending');
+    expect(await phase(jobId)).toBe('plan');
+  });
+
+  it('"שלח" with a confirmation and a mail card open reaches the mail card', async () => {
+    const jobId = await held([SINGLE]);
+    const approvalId = await raiseMailCard();
+    gateway.enqueue(reply('שלח'));
+    const result = await pass();
+
+    expect(result.mailCardReplies).toBe(1);
+    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('approved');
+    expect(await confirmationState(jobId)).toBe('pending');
+  });
+
+  for (const word of ['כן', 'לא', 'סגרנו']) {
+    it(`refuses "${word}" with a confirmation AND a mail card open, and changes nothing`, async () => {
+      const jobId = await held([SINGLE]);
+      const approvalId = await raiseMailCard();
+      const msg = reply(word);
+      gateway.enqueue(msg);
+      const result = await pass();
+
+      expect(result.refused).toBe(1);
+      expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+      expect(await phase(jobId)).toBe('plan');
+      expect(await confirmationState(jobId)).toBe('pending');
+      expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+      expect((await messageRow(msg.providerMessageId))?.state).toBe('failed');
+    });
+  }
+
+  for (const word of ['כן', 'לא', 'סגרנו']) {
+    it(`refuses "${word}" with a confirmation AND a clarifying question open`, async () => {
+      const jobId = await held([SINGLE]);
+      // A clarifying question raised on WhatsApp: the instruction is not an
+      // answer to the confirmation, so it passes through and parks.
+      gateway.enqueue(reply('תשלחי לרונית', 500));
+      await pass(plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })));
+      const questionJobs = (await openJobs(BUSINESS)).filter((j) => j.jobId !== jobId);
+      expect(questionJobs).toHaveLength(1);
+      const questionJob = questionJobs[0]?.jobId ?? '';
+      expect(await phase(questionJob)).toBe('understand');
+
+      gateway.enqueue(reply(word, 2_000));
+      const result = await pass();
+
+      expect(result.refused).toBe(1);
+      expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+      expect(await phase(jobId)).toBe('plan');
+      expect(await confirmationState(jobId)).toBe('pending');
+      expect(await phase(questionJob)).toBe('understand');
+    });
+  }
+
+  it('refuses "כן" with two confirmations open', async () => {
+    const first = await held([SINGLE]);
+    const second = await held([OPTION_B]);
+    gateway.enqueue(reply('כן'));
+    await pass();
+
+    expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+    expect(await confirmationState(first)).toBe('pending');
+    expect(await confirmationState(second)).toBe('pending');
   });
 });

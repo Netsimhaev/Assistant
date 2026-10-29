@@ -98,11 +98,13 @@ import { JobPhase } from '../domain/job.js';
 import { pendingApprovalForJob } from '../governance/approvals.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { claimForReport } from '../whatsapp/store.js';
+import { REASK_REASON } from './command-reask.js';
 import { jobHistory } from './jobs.js';
 import { loadPlanBody, stepResults } from './plan-store.js';
 
 export type ReportOutcome =
   | 'performed'
+  | 'performed_on_confirmation'
   | 'not_implemented'
   | 'failed'
   | 'not_permitted'
@@ -139,6 +141,13 @@ export const NOT_IMPLEMENTED_TEXT =
   'סיימתי לטפל בהוראה, אבל חלק מהפעולות בה לא בוצע: עדיין אין לי אפשרות טכנית לבצע אותן באופן אוטומטי. אפשר לראות בדשבורד בדיוק אילו.';
 
 export const PERFORMED_TEXT = 'סיימתי — מה שביקשת בוצע בהצלחה.';
+
+/**
+ * A boss command the owner confirmed, closed with every step `completed` and
+ * `performed` (spec §4.6). Takes precedence over `PERFORMED_TEXT` for those
+ * jobs only — see `classifyJob`, branch 3.
+ */
+export const PERFORMED_ON_CONFIRMATION_TEXT = 'בוצע לפי אישורך.';
 
 export const FAILED_GENERIC_TEXT = 'הניסיון לבצע את ההוראה נכשל. אפשר לראות פרטים בדשבורד.';
 
@@ -404,6 +413,15 @@ interface ReportCandidate {
  * job or an unlinked one. See `whatsapp-report.test.ts`'s own test for a
  * linked job left in `execute`, and the matching mutation in the task report.
  *
+ * **A command job that was re-asked is not a candidate** (`command-reask.ts`):
+ * it has a successor (a confirmation whose `reask_of` names it), or this
+ * module's sibling moved it to `failed` for a re-ask still being built
+ * (`REASK_REASON` as its last move). The re-ask question already told the
+ * owner what happened; a "failed" sentence on top would tell him twice. The
+ * successor carries the same opening message link, so the one report owed on
+ * that message is the successor's. Both exclusions key on a positive fact
+ * about the job; missing one costs a duplicate sentence, never a lost one.
+ *
  * `'halted'` has no production writer today (`grep -rn "to: 'halted'" src/`
  * returns nothing — a kill-switch halt is not wired up to move a job there
  * yet). Listed anyway because the phase exists in `JobPhase` and is
@@ -425,8 +443,18 @@ async function reportCandidates(
         AND j.whatsapp_message_id IS NOT NULL
         AND m.state IN ('handled', 'failed', 'reported_interim')
         AND j.phase IN ('closed', 'failed', 'halted', 'await_approval')
+        AND NOT EXISTS (
+          SELECT 1 FROM instruction_confirmations r
+           WHERE r.business_id = j.business_id AND r.reask_of = j.job_id
+        )
+        AND NOT (
+          j.phase = 'failed'
+          AND (SELECT st.reason FROM job_steps st
+                WHERE st.job_id = j.job_id
+                ORDER BY st.at DESC, st.id DESC LIMIT 1) = $2
+        )
       ORDER BY j.updated_at ASC`,
-    [businessId],
+    [businessId, REASK_REASON],
   );
   return rows.map((row) => ({
     jobId: row.job_id,
@@ -479,7 +507,10 @@ export type JobVerdict =
  *    or `failed` with the last `job_steps.reason` (mapped to Hebrew by
  *    `failedText`, never forwarded raw).
  * 3. A bound plan whose every declared step has a `completed` row →
- *    `performed`.
+ *    `performed` — or, for a `closed` boss command the owner confirmed (a
+ *    `boss_instructions` row AND a `confirmed` confirmation) whose every
+ *    recorded step is also `performed === true`, `performed_on_confirmation`
+ *    ("בוצע לפי אישורך."). Every other job keeps `performed`.
  * 4. Anything else → `failed`, with `failReason: null` (generic text) —
  *    never the last `job_steps.reason`: for a `closed`/`halted` job that
  *    reason is routinely a non-failure sentence (`'closed after the curator
@@ -540,11 +571,32 @@ export async function classifyJob(
       (step) => byStep.get(step.id)?.status === 'completed',
     );
     if (everyStepCompleted) {
+      const everyStepPerformed = recorded.length > 0 && recorded.every((step) => step.performed === true);
+      if (phase === 'closed' && everyStepPerformed && (await isConfirmedCommand(jobId, businessId))) {
+        return { status: 'report', outcome: 'performed_on_confirmation', failReason: null, approvalId: null };
+      }
       return { status: 'report', outcome: 'performed', failReason: null, approvalId: null };
     }
   }
 
   return { status: 'report', outcome: 'failed', failReason: null, approvalId: null };
+}
+
+/**
+ * A job born at the instruction door (a `boss_instructions` row) whose
+ * confirmation the owner said "כן" to — both positive facts, both required.
+ */
+async function isConfirmedCommand(jobId: string, businessId: string): Promise<boolean> {
+  const { rows } = await getPool().query(
+    `SELECT 1 FROM instruction_confirmations c
+      WHERE c.business_id = $1 AND c.job_id = $2 AND c.state = 'confirmed'
+        AND EXISTS (
+          SELECT 1 FROM boss_instructions b
+           WHERE b.business_id = c.business_id AND b.job_id = c.job_id
+        )`,
+    [businessId, jobId],
+  );
+  return rows.length === 1;
 }
 
 /** The text of one report, given what `classifyJob` decided — the `'report'` status only. */
@@ -557,6 +609,8 @@ function composeText(
       return NOT_IMPLEMENTED_TEXT;
     case 'performed':
       return PERFORMED_TEXT;
+    case 'performed_on_confirmation':
+      return PERFORMED_ON_CONFIRMATION_TEXT;
     case 'not_permitted':
       return NOT_PERMITTED_TEXT;
     case 'failed':

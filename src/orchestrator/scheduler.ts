@@ -3,6 +3,10 @@ import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
+import { expireConfirmations } from '../governance/instruction-confirmations.js';
+import { settleDecidedConfirmations } from './command-confirm.js';
+import type { SettleResult } from './command-confirm.js';
+import { reaskFailedCommands, type ReaskResult } from './command-reask.js';
 import { loadDigestSettings } from '../governance/digest-settings.js';
 import { principalWhatsAppKey } from '../governance/principal-number.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -613,6 +617,25 @@ export interface SchedulerPassResult {
    */
   delegated: ResumeResult;
   /**
+   * Job ids whose boss-command confirmation question expired this pass
+   * (`expireConfirmations`). Run right after `delegated`, before the WhatsApp
+   * door. Closing their jobs is `settledConfirmations`' work.
+   */
+  expiredConfirmations: string[];
+  /**
+   * Jobs parked in `plan` on a confirmation that is no longer pending, moved
+   * on this pass (`settleDecidedConfirmations`): expired or cancelled →
+   * `closed`, confirmed → `execute`, unappliable → `failed`. A job that threw
+   * is in `errored` and is found again next pass.
+   */
+  settledConfirmations: SettleResult;
+  /**
+   * The confirmation stage's thrown message (the expiry statement or the
+   * sweep's query), if it threw — isolated like `scanError`, so a fault here
+   * cannot stop the door, the plans or the closes.
+   */
+  expiredConfirmationsError: string | null;
+  /**
    * Null when no WhatsApp gateway is configured (`runtime.whatsapp ===
    * undefined`) — the same "switch, not fault" shape `scan`/`conduct` already
    * carry. Run right after `delegated` and before the conductor loops: an
@@ -642,6 +665,14 @@ export interface SchedulerPassResult {
    */
   mailError: string | null;
   due: RunDueResult;
+  /**
+   * Confirmed boss commands asked again this pass (`reaskFailedCommands`):
+   * a timeout, a spent claim with no completion, or a confirmation older
+   * than 24 hours with steps still to run. Run right after `runDueJobs`.
+   */
+  reasked: ReaskResult;
+  /** `reaskFailedCommands`' own thrown message (its candidate read), if it threw. */
+  reaskError: string | null;
   verified: CloseVerifiedResult;
   /**
    * The 365-day mail body retention (`mail-retention.ts`), run every pass
@@ -837,6 +868,21 @@ export async function schedulerPass(
   // instead and every delegation would cost a full extra interval.
   const delegated = await resumeDelegatedJobs(options);
 
+  // Before the WhatsApp door: expire questions past their window, then move
+  // on every job parked in `plan` whose confirmation is no longer pending —
+  // just expired, or decided earlier and not applied (a throw after the flip,
+  // a transient transition error, an expiry whose close failed last pass).
+  // Expiry first, so a job it expires is closed in this same pass.
+  let expiredConfirmations: string[] = [];
+  let settledConfirmations: SettleResult = { settled: [], skipped: [], errored: [] };
+  let expiredConfirmationsError: string | null = null;
+  try {
+    expiredConfirmations = await expireConfirmations({ businessId });
+    settledConfirmations = await settleDecidedConfirmations({ businessId });
+  } catch (err) {
+    expiredConfirmationsError = err instanceof Error ? err.message : String(err);
+  }
+
   // Built once per pass and reused everywhere below — `due` and the
   // conductor loops need it too, and a second `buildRuntime()` call here
   // would both waste the work and risk two registries disagreeing.
@@ -997,6 +1043,21 @@ export async function schedulerPass(
   // on. `verifier` rides along and is ignored — `runDueJobs` declares no such
   // field, and the judging step reads `judge` alone.
   const due = await runDueJobs({ ...options, runtime });
+
+  // Right after the plans, and before the report: a confirmed command that
+  // this very pass timed out on, or failed on a spent claim, is asked again
+  // now (`command-reask.ts`), so the report below sees the re-ask and does
+  // not also tell the owner it failed. Isolated like every other stage.
+  let reasked: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] };
+  let reaskError: string | null = null;
+  try {
+    reasked = await reaskFailedCommands({
+      businessId,
+      ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
+    });
+  } catch (err) {
+    reaskError = err instanceof Error ? err.message : String(err);
+  }
   // Last, and the order matters as much as the rest: a job `runDueJobs` just
   // finished is sitting in `verify` by the time this looks, so it closes in
   // the same pass instead of waiting a full interval. Run before the plans
@@ -1106,10 +1167,15 @@ export async function schedulerPass(
     scanError,
     conduct,
     delegated,
+    expiredConfirmations,
+    settledConfirmations,
+    expiredConfirmationsError,
     whatsappDoor,
     mail,
     mailError,
     due,
+    reasked,
+    reaskError,
     verified,
     mailRetention,
     mailRetentionError,

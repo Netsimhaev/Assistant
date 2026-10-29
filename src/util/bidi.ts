@@ -28,3 +28,64 @@ const BIDI_CONTROLS = /[؜‎‏‪-‮⁦-⁩]/g;
 export function stripBidiControls(value: string): string {
   return value.replace(BIDI_CONTROLS, '');
 }
+
+/**
+ * Characters that render as nothing (or as a line break), written as explicit
+ * range strings. This is deliberately NOT derived from `BIDI_CONTROLS`: a
+ * derivation that slices another regex's source breaks silently if that regex
+ * changes shape. The bidi ranges below mirror `BIDI_CONTROLS`; a test checks
+ * that every character `stripBidiControls` removes is marked here too.
+ */
+const BIDI_RANGES = '\\u061C\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069';
+
+/**
+ * Zero-width and hidden characters: U+200B/C/D, U+2060 word joiner, U+FEFF,
+ * U+00AD soft hyphen, U+034F combining grapheme joiner, U+180E Mongolian vowel
+ * separator, U+2061-U+2064 invisible operators.
+ */
+const ZERO_WIDTH_RANGES = '\\u200B-\\u200D\\u2060\\uFEFF\\u00AD\\u034F\\u180E\\u2061-\\u2064';
+
+/** Every C0/C1 control (Cc) except TAB (U+0009). */
+const CONTROL_RANGES = '\\u0000-\\u0008\\u000A-\\u001F\\u007F-\\u009F';
+
+/** Unicode tag characters U+E0000-U+E007F (needs the `u` flag). */
+const TAG_RANGE = '\\u{E0000}-\\u{E007F}';
+
+const INVISIBLE_CONTROLS = new RegExp(
+  `[${BIDI_RANGES}${ZERO_WIDTH_RANGES}${CONTROL_RANGES}${TAG_RANGE}]`,
+  'gu',
+);
+
+/**
+ * Make invisible controls visible instead of removing them: each becomes
+ * `⟦U+202E⟧`. For a value the owner is about to approve, stripping would show
+ * `a@b.co` for bytes that are not `a@b.co`; the marker shows that they differ.
+ */
+export function markInvisibleControls(value: string): string {
+  return value.replace(
+    INVISIBLE_CONTROLS,
+    (ch) => `⟦U+${(ch.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}⟧`,
+  );
+}
+
+/**
+ * Every control character (all of Cc, TAB included) and every line or
+ * paragraph separator. Used by `toOneLine`; written as explicit ranges for
+ * the same reason as the sets above.
+ */
+const LINE_BREAKING_CONTROLS = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]+/gu;
+
+/**
+ * Collapse a value to ONE line: bidi controls stripped, every control
+ * character and line break replaced by a single space, whitespace runs
+ * squeezed, ends trimmed. For a stranger's bytes placed into a prompt beside
+ * trusted text (boss command, `PlanRequest.resolvedContact`): a value that
+ * cannot contain a line break cannot open a line of its own, such as a forged
+ * `#` heading.
+ */
+export function toOneLine(value: string): string {
+  return stripBidiControls(value)
+    .replace(LINE_BREAKING_CONTROLS, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}

@@ -4,6 +4,7 @@ import { resolveContacts } from './contact-resolver.js';
 
 const RONIT: Contact = {
   subjectKeys: ['ronit-cohen-beta-log', 'ronit@beta-log.example'],
+  provenance: 'boss',
   name: 'רונית כהן',
   company: 'בטא לוגיסטיקה',
   email: 'ronit@beta-log.example',
@@ -11,6 +12,7 @@ const RONIT: Contact = {
 
 const RONIT_TWO: Contact = {
   subjectKeys: ['ronit-levi-gamma'],
+  provenance: 'boss',
   name: 'רונית לוי',
   company: 'גמא הרמה',
   email: 'ronit@gamma-lift.example',
@@ -18,6 +20,7 @@ const RONIT_TWO: Contact = {
 
 const DANI: Contact = {
   subjectKeys: ['dani-cohen-delta'],
+  provenance: 'boss',
   name: 'דני כהן',
   company: 'דלתא',
   email: 'dani@delta.example',
@@ -25,6 +28,7 @@ const DANI: Contact = {
 
 const RONIT_ONLY: Contact = {
   subjectKeys: ['ronit-solo'],
+  provenance: 'boss',
   name: 'רונית',
   company: null,
   email: 'ronit@solo.example',
@@ -32,6 +36,7 @@ const RONIT_ONLY: Contact = {
 
 const RONIT_ONLY_TWO: Contact = {
   subjectKeys: ['ronit-solo-two'],
+  provenance: 'boss',
   name: 'רונית',
   company: null,
   email: 'ronit2@solo.example',
@@ -240,6 +245,7 @@ describe('a name ending a sentence', () => {
 describe('narrowing by company', () => {
   const RONIT_LIFT: Contact = {
     subjectKeys: ['ronit-cohen-lift'],
+    provenance: 'boss',
     name: 'רונית כהן',
     company: 'הרמה',
     email: null,
@@ -247,6 +253,7 @@ describe('narrowing by company', () => {
 
   const RONIT_BETA: Contact = {
     subjectKeys: ['ronit-levi-beta'],
+    provenance: 'boss',
     name: 'רונית לוי',
     company: 'בטא לוגיסטיקה',
     email: null,
@@ -254,6 +261,7 @@ describe('narrowing by company', () => {
 
   const DANA_DELTA: Contact = {
     subjectKeys: ['dana-delta'],
+    provenance: 'boss',
     name: 'דנה',
     company: 'דלתא',
     email: null,
@@ -261,6 +269,7 @@ describe('narrowing by company', () => {
 
   const DANA_OMEGA: Contact = {
     subjectKeys: ['dana-omega'],
+    provenance: 'boss',
     name: 'דנה',
     company: 'אומגה',
     email: null,
@@ -325,6 +334,7 @@ describe('narrowing by company', () => {
 describe('narrowing by a company the owner wrote with a particle', () => {
   const RONIT_BETA: Contact = {
     subjectKeys: ['ronit-levi-beta'],
+    provenance: 'boss',
     name: 'רונית לוי',
     company: 'בטא לוגיסטיקה',
     email: null,
@@ -332,6 +342,7 @@ describe('narrowing by a company the owner wrote with a particle', () => {
 
   const RONIT_DELTA: Contact = {
     subjectKeys: ['ronit-barak-delta'],
+    provenance: 'boss',
     name: 'רונית ברק',
     company: 'דלתא דפוס',
     email: null,
@@ -362,6 +373,7 @@ describe('narrowing by a company the owner wrote with a particle', () => {
   it('still asks for a one-word company carrying a particle in the text', () => {
     const RONIT_LIFT: Contact = {
       subjectKeys: ['ronit-cohen-lift'],
+      provenance: 'boss',
       name: 'רונית כהן',
       company: 'הרמה',
       email: null,
@@ -381,12 +393,14 @@ describe('narrowing by a company the owner wrote with a particle', () => {
   it('still asks when the company only appears inside a longer word', () => {
     const DANA_DELTA: Contact = {
       subjectKeys: ['dana-delta'],
+      provenance: 'boss',
       name: 'דנה',
       company: 'דלתא',
       email: null,
     };
     const DANA_OMEGA: Contact = {
       subjectKeys: ['dana-omega'],
+      provenance: 'boss',
       name: 'דנה',
       company: 'אומגה',
       email: null,

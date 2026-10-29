@@ -132,7 +132,15 @@ export async function demotionCount(
   return Number(rows[0]?.n ?? '0');
 }
 
-/** Owner marks on this class since the last move. Spec §6.1. */
+/**
+ * Owner marks on this class since the last move. Spec §6.1.
+ *
+ * A mark on a job born at the instruction door (a `boss_instructions` row in
+ * the same business) is not counted: owner rule B4 — a boss command is not
+ * measured in shadow mode. Such a step is on the autonomous-actions screen
+ * (`fromInstruction`), so a mark CAN land on it; it says nothing about what
+ * the assistant learned to do on its own.
+ */
 async function markCount(
   actionClass: ActionClass,
   businessId: string,
@@ -140,9 +148,13 @@ async function markCount(
   db: Queryable,
 ): Promise<number> {
   const { rows } = await db.query<{ n: string }>(
-    `SELECT count(*)::text AS n FROM autonomy_marks
-      WHERE business_id = $1 AND action_class = $2
-        AND ($3::timestamptz IS NULL OR marked_at > $3)`,
+    `SELECT count(*)::text AS n FROM autonomy_marks m
+      WHERE m.business_id = $1 AND m.action_class = $2
+        AND ($3::timestamptz IS NULL OR m.marked_at > $3)
+        AND NOT EXISTS (
+          SELECT 1 FROM boss_instructions b
+           WHERE b.business_id = m.business_id AND b.job_id = m.job_id
+        )`,
     [businessId, actionClass, since],
   );
   return Number(rows[0]?.n ?? '0');
@@ -161,6 +173,14 @@ async function markCount(
  * Attribution is deliberately broad (spec §6.1.1): a plan that declares the
  * class counts, even when another step is what actually failed. Broad here
  * means the assistant goes back to asking, which is the safe direction.
+ *
+ * With one exclusion, written as a positive fact about the job: a job born at
+ * the instruction door (a `boss_instructions` row in the same business) is
+ * not counted. Owner rule B4 — a boss command is not measured in shadow mode;
+ * it ran on the owner's own "כן", past the ramp, so its failure (a timeout, a
+ * lost claim, a channel down) says nothing about what the class earned, and
+ * counting it would demote — and after two, lock — a learned class for a
+ * command the owner gave.
  */
 async function failureCount(
   actionClass: ActionClass,
@@ -175,7 +195,11 @@ async function failureCount(
       WHERE jp.business_id = $1
         AND js.to_phase = 'failed'
         AND ($3::timestamptz IS NULL OR js.at > $3)
-        AND jp.plan @> $2::jsonb`,
+        AND jp.plan @> $2::jsonb
+        AND NOT EXISTS (
+          SELECT 1 FROM boss_instructions b
+           WHERE b.business_id = jp.business_id AND b.job_id = jp.job_id
+        )`,
     [businessId, JSON.stringify({ steps: [{ expectedActionClass: actionClass }] }), since],
   );
   return Number(rows[0]?.n ?? '0');

@@ -270,4 +270,5 @@ export const DENY_CODES = {
   recipientUnreadable: 'recipient_unreadable',
   notAllowlisted: 'tool_not_allowlisted',
   delegationNotPermitted: 'delegation_not_permitted',
+  confirmedStepAlreadyClaimed: 'confirmed_step_already_claimed',
 } as const;

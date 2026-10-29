@@ -289,6 +289,10 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     // never `NEVER_FULLY_AUTONOMOUS`.
     useStandingAuthorization: true,
     now,
+    // The step this call executes. Only this caller sets it — the SDK
+    // gate-hook does not — so only a plan step can ever be carried by the
+    // confirmed-command exemption (`confirmedCommandCovers`).
+    stepId: request.stepId,
     ...(request.approvalId !== undefined
       ? { approval: { approvalId: request.approvalId, stepId: request.stepId } }
       : {}),

@@ -20,10 +20,15 @@ function cleanResult(): SchedulerPassResult {
     scanError: null,
     conduct: null,
     delegated: { resumed: [], timedOut: [], errored: [] },
+    expiredConfirmations: [],
+    settledConfirmations: { settled: [], skipped: [], errored: [] },
+    expiredConfirmationsError: null,
     whatsappDoor: null,
     mail: null,
     mailError: null,
     due: { ran: [], lockedOut: [], unbound: [], phaseMoved: [], errored: [] },
+    reasked: { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, tooLong: 0, lockedOut: [], errored: [] },
+    reaskError: null,
     verified: {
       closed: [],
       failed: [],
@@ -56,6 +61,21 @@ describe('logErrored', () => {
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
       logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('prints a failed confirmation expiry', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      logErrored({
+        ...cleanResult(),
+        expiredConfirmationsError: 'boom',
+        settledConfirmations: { settled: [], skipped: [], errored: [{ jobId: 'J-1', error: 'bang' }] },
+      });
+      expect(errorSpy).toHaveBeenCalledWith('confirmation expiry failed: boom');
+      expect(errorSpy).toHaveBeenCalledWith('confirmation for job J-1 could not be settled: bang');
+    } finally {
       errorSpy.mockRestore();
     }
   });
@@ -99,7 +119,7 @@ describe('logErrored', () => {
     try {
       const result: SchedulerPassResult = {
         ...cleanResult(),
-        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, mailCardReplies: 0, malformedSenderCount: 0 },
+        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, mailCardReplies: 0, confirmationReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
         whatsappReport: { reported: 0, deferred: 2, errored: ['job-a', 'job-b'] },
       };
       logErrored(result);
@@ -132,12 +152,30 @@ describe('logErrored', () => {
     }
   });
 
+  it('names every WhatsApp confirmation that could not be applied', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      logErrored({
+        ...cleanResult(),
+        whatsappDoor: {
+          polled: 1, instructed: 0, recordedOnly: 0, refused: 1, closed: 0, mailCardReplies: 0,
+          confirmationReplies: 0, confirmErrored: [{ jobId: 'job-c', error: 'bound to nothing' }],
+          malformedSenderCount: 0,
+        },
+      });
+      const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
+      expect(errored).toContain('WhatsApp confirmation for job job-c could not be applied: bound to nothing');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it('says the report failed after the door ran, when the door has a result', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       logErrored({
         ...cleanResult(),
-        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, malformedSenderCount: 0 },
+        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
         whatsappError: 'reportCandidates query rejected',
       });
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');

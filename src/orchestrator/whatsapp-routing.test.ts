@@ -269,7 +269,7 @@ describe('decideWhatsAppRoute', () => {
   it('ignores a parked question that was never asked over WhatsApp', async () => {
     const outcome = await runInstruction(
       { text: 'תשלחי לרונית' },
-      { businessId: BUSINESS, textOrigin: 'typed', planner: asks('למי בדיוק?') },
+      { businessId: BUSINESS, textOrigin: 'typed', channel: 'dashboard', planner: asks('למי בדיוק?') },
     );
     expect(outcome.status).toBe('needs_answer');
 

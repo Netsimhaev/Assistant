@@ -50,6 +50,30 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.mailRetentionError !== null) {
     console.error(`mail body retention failed: ${result.mailRetentionError}`);
   }
+  // Boss-command confirmations: the expiry statement or the settle sweep's
+  // query threw. Nothing is lost — expiry and the sweep both read the record
+  // again next pass, and the sweep closes, runs or fails every job parked in
+  // `plan` on a non-pending confirmation, however many passes it missed.
+  if (result.expiredConfirmationsError !== null) {
+    console.error(`confirmation expiry failed: ${result.expiredConfirmationsError}`);
+  }
+  // One job the sweep could not move this pass; it is found again next pass.
+  for (const job of result.settledConfirmations.errored) {
+    console.error(`confirmation for job ${job.jobId} could not be settled: ${job.error}`);
+  }
+  // Boss-command re-asks (`command-reask.ts`): a job that threw is found
+  // again next pass; one with no WhatsApp channel is listed on the dashboard.
+  if (result.reaskError !== null) {
+    console.error(`command re-ask failed: ${result.reaskError}`);
+  }
+  for (const job of result.reasked.errored) {
+    console.error(`command job ${job.jobId} could not be re-asked: ${job.error}`);
+  }
+  if (result.reasked.notConnected > 0 || result.reasked.sendFailed > 0 || result.reasked.tooLong > 0) {
+    console.error(
+      `${result.reasked.notConnected + result.reasked.sendFailed + result.reasked.tooLong} re-ask question(s) did not reach WhatsApp — the dashboard lists them`,
+    );
+  }
   if (result.mail !== null && result.mail.status !== 'ok') {
     console.error(`mailbox poll: ${result.mail.status}${result.mail.error !== undefined ? ` (${result.mail.error})` : ''}`);
   }
@@ -146,6 +170,14 @@ export function logErrored(result: SchedulerPassResult): void {
       `${result.whatsappDoor.malformedSenderCount} WhatsApp message(s) this pass arrived with a ` +
         `senderNumber the gateway contract does not allow — check the gateway, not the sender`,
     );
+  }
+  // A boss-command confirmation the owner answered on WhatsApp that could not
+  // be applied. He was told to retry on the dashboard, and the settle sweep
+  // moves the job on; this is the only trace of why.
+  if (result.whatsappDoor !== null) {
+    for (const job of result.whatsappDoor.confirmErrored) {
+      console.error(`WhatsApp confirmation for job ${job.jobId} could not be applied: ${job.error}`);
+    }
   }
   // Task 8's own report-round ruling: counting `deferred` is what stops a job
   // permanently stuck on a crashed resume from becoming invisible silence —

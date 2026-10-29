@@ -103,8 +103,13 @@ export function mailCardApproved(recipient: string): string {
   return `אישרתי. התשובה יוצאת ל-${stripBidiControls(recipient).trim()}.`;
 }
 
-/** The only words that approve, compared after `stripBidiControls` and `trim`. */
-const APPROVE_WORDS: ReadonlySet<string> = new Set(['שלח', 'שלחי']);
+/**
+ * The only words that approve, compared after `stripBidiControls` and `trim`.
+ * Exported so the boss-command confirm reader's disjointness test
+ * (`command-confirm.test.ts`) intersects this list rather than a re-typed copy.
+ */
+export const MAIL_CARD_APPROVE_WORDS: readonly string[] = ['שלח', 'שלחי'];
+const APPROVE_WORDS: ReadonlySet<string> = new Set(MAIL_CARD_APPROVE_WORDS);
 
 export function isApproveWord(text: string): boolean {
   return APPROVE_WORDS.has(stripBidiControls(text).trim());

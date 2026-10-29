@@ -93,14 +93,20 @@ describe('what an erasure leaves behind', () => {
    * assistant performed on her own. Job-scoped, seeded beside
    * `autonomy_marks` and reached the same way.
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen" count is spec §5.1's own
+   * **An eighteenth, also outside spec §5.1: `instruction_confirmations`
+   * (migration 048)** — the confirmation question a boss command asked, with
+   * every option. Job-scoped and a discovery source of its own; seeded in
+   * both `presented_text` and `options`. Its sibling `confirmed_step_claims`
+   * holds no content and is asserted deleted directly, not through the sweep.
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (20; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (22; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 20 also includes tables scrubbed as a consequence of
+   * stores, while the 22 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
@@ -325,6 +331,28 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, job.jobId, PROBE, `תשובה אל ${PROBE}`, `שלחתי מייל אל ${PROBE}`],
     );
 
+    // --- Migration 048: the boss-command confirmation. --------------------
+    //
+    // `instruction_confirmations.presented_text` is the question as the owner
+    // saw it, and `options` carries every plan he could choose — both name the
+    // recipient. `confirmed_step_claims` holds only ids and a hash; it is
+    // seeded so the job-anchored delete is proven below, not by the sweep.
+    await db.query(
+      `INSERT INTO instruction_confirmations (business_id, job_id, options, presented_text, channel)
+       VALUES ($1, $2, $3::jsonb, $4, 'whatsapp')`,
+      [
+        BUSINESS,
+        job.jobId,
+        JSON.stringify([{ label: PROBE, planHash: 'hp', plan: { steps: [{ input: { to: PROBE } }] }, contactSource: 'boss' }]),
+        `לשלוח מייל אל ${PROBE}?`,
+      ],
+    );
+    await db.query(
+      `INSERT INTO confirmed_step_claims (business_id, job_id, step_id, plan_hash)
+       VALUES ($1, $2, 's1', 'hp')`,
+      [BUSINESS, job.jobId],
+    );
+
     // --- Migration 028's two tables. --------------------------------------
     //
     // `agent_envelopes.payload` carries the content of one agent's request to
@@ -422,7 +450,19 @@ describe('what an erasure leaves behind', () => {
     expect(
       plan.items.find((item) => item.table === 'action_updates' && item.action === 'delete')?.count,
     ).toBe(1);
+    expect(
+      plan.items.find((item) => item.table === 'instruction_confirmations' && item.action === 'delete')?.count,
+    ).toBe(1);
+    expect(
+      plan.items.find((item) => item.table === 'confirmed_step_claims' && item.action === 'delete')?.count,
+    ).toBe(1);
     await executeErasure(plan, { businessId: BUSINESS });
+
+    const claims = await db.query('SELECT 1 FROM confirmed_step_claims WHERE business_id = $1 AND job_id = $2', [
+      BUSINESS,
+      job.jobId,
+    ]);
+    expect(claims.rows).toHaveLength(0);
 
     // The row the content arm's narrowness is for (fix round 2, Finding 2):
     // job-less, under the same contact anchor as everything else in this
@@ -528,6 +568,86 @@ describe('what an erasure leaves behind', () => {
       job.jobId,
     ]);
     expect(plans.rows).toHaveLength(0);
+  });
+
+  /**
+   * `instruction_confirmations` must be a discovery source of its own
+   * (migration 048). A job with nothing else tying it to the contact — no
+   * plan, no instruction, a title that never names it — whose name appears
+   * ONLY in the presented question, or ONLY inside an unchosen option (never
+   * bound to `job_plans`), escaped in the JSONB text form. Without the
+   * discovery query in `buildErasurePlan`, neither job enters `jobIds` and
+   * both rows, and the claim beside the first, survive the erasure.
+   */
+  it('reaches a confirmation whose name appears only in the question or only JSON-escaped in an option', async () => {
+    const NAME = 'אלפא בע"מ';
+    const bundle = await installCharter(buildCharter({ version: 'confirmation-only' }), { businessId: BUSINESS });
+    const db = getPool();
+    const textJob = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'משימה רגילה שלא קשורה לאיש',
+    });
+    const optionJob = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'משימה רגילה אחרת',
+    });
+    const unrelatedJob = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'משימה שלישית',
+    });
+    const plainOption = JSON.stringify([{ label: 'אפשרות', planHash: 'h1', plan: { steps: [] }, contactSource: null }]);
+    await db.query(
+      `INSERT INTO instruction_confirmations (business_id, job_id, options, presented_text, channel)
+       VALUES ($1, $2, $3::jsonb, $4, 'dashboard')`,
+      [BUSINESS, textJob.jobId, plainOption, `לשלוח מייל אל ${NAME}?`],
+    );
+    await db.query(
+      `INSERT INTO confirmed_step_claims (business_id, job_id, step_id, plan_hash)
+       VALUES ($1, $2, 's1', 'h1')`,
+      [BUSINESS, textJob.jobId],
+    );
+    await db.query(
+      `INSERT INTO instruction_confirmations (business_id, job_id, options, presented_text, channel)
+       VALUES ($1, $2, $3::jsonb, $4, 'whatsapp')`,
+      [
+        BUSINESS,
+        optionJob.jobId,
+        JSON.stringify([
+          { label: '1', planHash: 'h1', plan: { steps: [{ input: { body: `לכבוד ${NAME}
+שלום` } }] }, contactSource: 'unverified' },
+        ]),
+        'לאיזו מהשתיים?',
+      ],
+    );
+    await db.query(
+      `INSERT INTO instruction_confirmations (business_id, job_id, options, presented_text, channel)
+       VALUES ($1, $2, $3::jsonb, 'לשלוח מייל לספר?', 'dashboard')`,
+      [BUSINESS, unrelatedJob.jobId, plainOption],
+    );
+
+    // The premise: the option's JSONB text form does NOT contain the name.
+    const premise = await db.query(
+      `SELECT 1 FROM instruction_confirmations WHERE job_id = $1 AND options::text ILIKE $2`,
+      [optionJob.jobId, `%${NAME}%`],
+    );
+    expect(premise.rows).toHaveLength(0);
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: NAME }, { businessId: BUSINESS });
+    await executeErasure(plan, { businessId: BUSINESS });
+
+    const left = await db.query<{ job_id: string }>(
+      'SELECT job_id FROM instruction_confirmations WHERE business_id = $1',
+      [BUSINESS],
+    );
+    expect(left.rows.map((row) => row.job_id)).toEqual([unrelatedJob.jobId]);
+    const claims = await db.query('SELECT 1 FROM confirmed_step_claims WHERE business_id = $1', [BUSINESS]);
+    expect(claims.rows).toHaveLength(0);
   });
 
   /**

@@ -5,9 +5,19 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { closePool } from '../db/pool.js';
+import { installCharter } from '../charter/store.js';
 import { ActionClass } from '../domain/action.js';
+import type { Plan } from '../domain/plan.js';
+import { loadInstructionForJob } from '../governance/instructions.js';
 import { TYPED_RECIPIENT_CLASSES } from '../governance/typed-recipients.js';
+import { writeMemory } from '../memory/store.js';
+import type { PlanRequest } from '../sdk/planner.js';
+import { resetDatabase } from '../test/db.js';
+import { buildCharter } from '../test/fixtures.js';
+import { runInstruction } from './instruct.js';
+import { createJob } from './jobs.js';
 
 const SRC = join(process.cwd(), 'src');
 const source = (rel: string): string => readFileSync(join(SRC, rel), 'utf8');
@@ -209,5 +219,96 @@ describe('grantAuthorization is reachable only through authorisedRecipients', ()
     // reach in the first place.
     const grantBlock = callBlock(instruct.slice(authorisedAt), 'grantAuthorization');
     expect(grantBlock).toMatch(/recipients/);
+  });
+});
+
+/**
+ * Boss command, spec §10.6: when a name fits several people, each candidate
+ * is planned with its identity in `PlanRequest.resolvedContact` — and the
+ * `instruction` the planner receives is still the stored text, byte for byte.
+ * `instruction` is the channel the planner trusts as the owner's own words;
+ * an address appended to it from memory would be laundered into "the owner
+ * typed this".
+ *
+ * Behavioural on purpose, not a grep: a stub planner records every request
+ * the real door builds, so any way of building `instruction` other than the
+ * stored text — a template, a join, a helper — fails here.
+ */
+describe('the planner never receives an instruction the owner did not write', () => {
+  const BUSINESS = 'test-business';
+
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  function mailTo(to: string): Plan {
+    return {
+      goal: 'לשלוח את ההצעה',
+      assumptions: [],
+      clarifyingQuestion: null,
+      estimatedCostMinor: 0,
+      steps: [
+        {
+          id: 's1',
+          agent: 'comms.email',
+          intent: 'לשלוח',
+          toolName: 'mail.send',
+          input: { to, subject: 'הצעה', body: 'מצורף' },
+          dependsOn: [],
+          expectedActionClass: 'email.initiate',
+        },
+      ],
+    };
+  }
+
+  it('passes the stored text unchanged to every candidate planning pass', async () => {
+    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const seed = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+    });
+    for (const [key, name, email] of [
+      ['ronit-cohen', 'רונית כהן', 'ronit@beta-log.example'],
+      ['ronit-levi', 'רונית לוי', 'ronit.levi@gamma.example'],
+    ] as const) {
+      await writeMemory(
+        { jobId: seed.jobId, kind: 'entity', subjectKey: key, body: { name, email } },
+        { businessId: BUSINESS },
+      );
+    }
+
+    const requests: PlanRequest[] = [];
+    const text = 'תשלחי לרונית את ההצעה';
+    const outcome = await runInstruction(
+      { text },
+      {
+        textOrigin: 'typed',
+        channel: 'dashboard',
+        businessId: BUSINESS,
+        planner: async (request) => {
+          requests.push(request);
+          const to = request.resolvedContact?.includes('gamma') ? 'ronit.levi@gamma.example' : 'ronit@beta-log.example';
+          return { status: 'planned', plan: mailTo(to) };
+        },
+      },
+    );
+
+    // The ambiguity path really ran: one pass per candidate, each carrying
+    // its candidate. Without this, a regression that skipped the path would
+    // leave the assertions below vacuously true.
+    expect(requests).toHaveLength(2);
+    expect(requests.every((request) => (request.resolvedContact ?? '') !== '')).toBe(true);
+    if (outcome.status !== 'needs_confirmation') throw new Error(`unexpected ${outcome.status}`);
+
+    const stored = await loadInstructionForJob(outcome.jobId, { businessId: BUSINESS });
+    expect(stored?.text).toBe(text);
+    for (const request of requests) {
+      expect(request.instruction).toBe(stored?.text);
+    }
   });
 });

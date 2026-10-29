@@ -1304,6 +1304,47 @@ function pendingCard(item: PendingQuestion, csrf: string): string {
          </article>`;
 }
 
+/**
+ * A boss command parked on the owner's confirmation (spec §4.3): the question,
+ * and one button per option, each posting the `planHash` it was presented
+ * with. `question` is the full question text — every byte of every step.
+ */
+export interface PendingConfirmation {
+  jobId: string;
+  question: string;
+  options: ReadonlyArray<{ label: string; planHash: string }>;
+}
+
+/**
+ * The question (`escLabel`, `pre-wrap`), one form per option and one to
+ * cancel. Every form carries the CSRF token; the route checks the posted
+ * `planHash` is among the stored options before anything moves. A single
+ * option reads "אשר"; several read "אשר: <label>", because "אשר" alone would
+ * not say which.
+ */
+function confirmationCard(item: PendingConfirmation, csrf: string): string {
+  const action = `/instruct/${esc(item.jobId)}/confirm`;
+  const single = item.options.length === 1;
+  const optionForms = item.options
+    .map(
+      (option) => `<form method="POST" action="${action}">
+             <input type="hidden" name="csrf" value="${esc(csrf)}">
+             <input type="hidden" name="planHash" value="${esc(option.planHash)}">
+             <button>${single ? 'אשר' : `אשר: ${escLabel(option.label)}`}</button>
+           </form>`,
+    )
+    .join('\n');
+  return `<article class="card">
+           <p class="confirm" style="white-space: pre-wrap">${escLabel(item.question)}</p>
+           ${optionForms}
+           <form method="POST" action="${action}">
+             <input type="hidden" name="csrf" value="${esc(csrf)}">
+             <input type="hidden" name="cancel" value="1">
+             <button>בטל</button>
+           </form>
+         </article>`;
+}
+
 export function renderInstruct(options: {
   csrf: string;
   error?: string;
@@ -1311,6 +1352,14 @@ export function renderInstruct(options: {
   grantNote?: string | null;
   recordingNote?: string | null;
   identityNote?: string | null;
+  /**
+   * A boss command waiting on the owner's confirmation (spec §4), shown whole.
+   * Used when the question has no row to answer against (it should always
+   * have one; this is the read-only fallback).
+   */
+  confirmationQuestion?: string | null;
+  /** Boss commands waiting on the owner's confirmation, each with its buttons. */
+  confirmations?: PendingConfirmation[] | null;
 }): string {
   const error =
     options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
@@ -1339,6 +1388,20 @@ export function renderInstruct(options: {
   const identityNote =
     options.identityNote == null ? '' : `<p class="muted">${escLabel(options.identityNote)}</p>`;
 
+  // `escLabel`, not `esc`: the question quotes plan values that can carry a
+  // stranger's bytes (an address from memory, a body). `pre-wrap` keeps the
+  // echo's line structure — its continuation margin is what stops a value's
+  // line from passing for a line of the question.
+  const confirmationQuestion =
+    options.confirmationQuestion == null
+      ? ''
+      : `<p class="confirm" style="white-space: pre-wrap">${escLabel(options.confirmationQuestion)}</p>`;
+
+  const confirmations =
+    options.confirmations == null
+      ? ''
+      : options.confirmations.map((item) => confirmationCard(item, options.csrf)).join('\n');
+
   const pending =
     options.pending == null
       ? ''
@@ -1350,6 +1413,8 @@ export function renderInstruct(options: {
      ${error}
      ${grantNote}
      ${recordingNote}
+     ${confirmationQuestion}
+     ${confirmations}
      ${identityNote}
      ${pending}
      <form method="POST" action="/instruct">
@@ -1422,6 +1487,11 @@ export const TABLE_LABELS: Record<string, string> = {
   // What the owner was told about a step the assistant performed on her own
   // (migration 047) — names the person the step was addressed to.
   action_updates: 'עדכונים על פעולות',
+  // The confirmation question a boss command asked, with every option
+  // (migration 048) — names the recipients and holds the full content.
+  instruction_confirmations: 'שאלות אישור להוראות',
+  // Which steps of a confirmed command were claimed to run (migration 048).
+  confirmed_step_claims: 'סימוני ביצוע של הוראות מאושרות',
   job_plans: 'תוכניות',
   job_authorizations: 'הרשאות',
   // A delegation request from one agent to another (migration 028).

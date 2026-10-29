@@ -25,6 +25,7 @@ import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { decide, enqueueApproval } from '../governance/approvals.js';
+import { saveInstruction } from '../governance/instructions.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { MIN_SAMPLES } from '../governance/agreement.js';
 import { assessRisk } from '../policy/risk.js';
@@ -453,6 +454,58 @@ describe('the evaluation pass', () => {
       [BUSINESS],
     );
     expect(rows[0]?.n).toBe('0');
+  });
+
+  /**
+   * Owner rule B4: a boss command is not measured in shadow mode. The pair is
+   * the proof — the same failed job, with and without a `boss_instructions`
+   * row, and only the one without demotes.
+   */
+  it('a failed boss command does not demote; the same failure without an instruction does', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await cleanRun('email.reply', MIN_SAMPLES);
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
+
+    const command = await failedJobDeclaring('email.reply');
+    await saveInstruction({ jobId: command, text: 'תעני לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
+
+    const held = await evaluateAutonomy({ businessId: BUSINESS });
+    expect(held.demoted).toEqual([]);
+    expect(await storedLevel('email.reply')).toBe('auto_notify');
+
+    await failedJobDeclaring('email.reply');
+    const fall = await evaluateAutonomy({ businessId: BUSINESS });
+    expect(fall.demoted).toContain('email.reply');
+    expect(await storedLevel('email.reply')).toBe('approve_required');
+  });
+
+  it('a mark on a boss-command step does not demote; the same mark on another job does', async () => {
+    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
+    await cleanRun('email.reply', MIN_SAMPLES);
+    expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
+
+    const command = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    await saveInstruction({ jobId: command.jobId, text: 'תעני לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
+    const mark = async (markId: string, jobId: string): Promise<void> => {
+      await getPool().query(
+        `INSERT INTO autonomy_marks
+           (mark_id, business_id, job_id, step_id, action_class, note, marked_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [markId, BUSINESS, jobId, 's1', 'email.reply', 'זו הייתה טעות', 'p_boss'],
+      );
+    };
+    await mark('MK-cmd', command.jobId);
+
+    const held = await evaluateAutonomy({ businessId: BUSINESS });
+    expect(held.demoted).toEqual([]);
+    expect(await storedLevel('email.reply')).toBe('auto_notify');
+
+    await mark('MK-other', 'J-other');
+    const fall = await evaluateAutonomy({ businessId: BUSINESS });
+    expect(fall.demoted).toContain('email.reply');
+    expect(await storedLevel('email.reply')).toBe('approve_required');
   });
 
   /**

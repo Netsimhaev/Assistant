@@ -38,6 +38,8 @@ export async function resetDatabase(): Promise<void> {
       autonomy_marks,
       action_updates,
       action_update_settings,
+      instruction_confirmations,
+      confirmed_step_claims,
       autonomy_events,
       kill_switch,
       job_steps,

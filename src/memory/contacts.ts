@@ -14,6 +14,7 @@
 import type { Queryable } from '../db/pool.js';
 import { getPool } from '../db/pool.js';
 import { config } from '../config.js';
+import { TrustLevel } from '../domain/trust.js';
 
 export interface Contact {
   /**
@@ -26,11 +27,19 @@ export interface Contact {
   name: string;
   company: string | null;
   email: string | null;
+  /**
+   * The trust level of the memory row this contact was read from — whose word
+   * the name and address are. A confirmation question shows it beside an
+   * address that came from memory (boss command, spec §10.6), so the owner
+   * can tell "you told me this" from "a document said this".
+   */
+  provenance: TrustLevel;
 }
 
 interface ContactRow {
   subject_key: string;
   body: Record<string, unknown>;
+  provenance: string;
 }
 
 function readString(body: Record<string, unknown>, field: string): string | null {
@@ -45,7 +54,7 @@ export async function listContacts(
   const db = options.db ?? getPool();
 
   const { rows } = await db.query<ContactRow>(
-    `SELECT subject_key, body FROM memories
+    `SELECT subject_key, body, provenance FROM memories
       WHERE business_id = $1 AND kind = 'entity' AND retired_at IS NULL
       ORDER BY created_at DESC`,
     [businessId],
@@ -55,6 +64,9 @@ export async function listContacts(
   for (const row of rows) {
     const name = readString(row.body, 'name');
     if (name === null) continue;
+    // A value that does not parse as a trust level is read as the least
+    // trusted one: an unreadable value is never the permissive one.
+    const provenance = TrustLevel.safeParse(row.provenance);
 
     const email = readString(row.body, 'email');
     const keys = [row.subject_key];
@@ -67,6 +79,7 @@ export async function listContacts(
       name,
       company: readString(row.body, 'company'),
       email: email === null ? null : email.toLowerCase(),
+      provenance: provenance.success ? provenance.data : 'open_web',
     });
   }
 

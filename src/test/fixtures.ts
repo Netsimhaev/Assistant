@@ -72,6 +72,8 @@ export interface CharterOverrides {
   knownCounterpartyEmailDomain?: string;
   /** Connections the charter declares. Empty by default. */
   connections?: CharterConnection[];
+  /** The charter's currency. `ILS` by default. */
+  currency?: string;
   /**
    * Replaces the default `forbidden` list wholesale rather than appending to
    * it — a test that needs a charter *without* `no_customer_data_export`
@@ -210,7 +212,7 @@ export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter 
     connections: overrides.connections ?? [],
 
     money: {
-      currency: 'ILS',
+      currency: overrides.currency ?? 'ILS',
       singleActionCeilingMinor: overrides.singleActionCeilingMinor ?? 300_000, // ₪3,000
       dailyCeilingMinor: overrides.dailyCeilingMinor ?? 1_000_000, // ₪10,000
       monthlyCeilingMinor: 10_000_000, // ₪100,000

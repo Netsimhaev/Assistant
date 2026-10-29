@@ -628,6 +628,33 @@ export const VERIFICATION_VERDICTS_ERASED_PREDICATE = `business_id = $1 AND job_
 export const ACTION_UPDATES_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
 
 /**
+ * The `instruction_confirmations` rows an erasure destroys (migration 048).
+ *
+ * One row per boss-command job: the confirmation question exactly as it was
+ * presented (`presented_text`, never truncated — recipients, subject, body)
+ * and every plan the owner could choose between (`options`). Content about a
+ * person, so job-anchored like `action_updates` AND a discovery source of its
+ * own in `buildErasurePlan` (`presented_text` ILIKE, `options` through
+ * `jsonbContentMatches`): an option the owner did NOT choose is never bound to
+ * `job_plans`, so a name that appears only in an unchosen option is found
+ * here and nowhere else.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const INSTRUCTION_CONFIRMATIONS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
+
+/**
+ * The `confirmed_step_claims` rows an erasure destroys (migration 048).
+ *
+ * Ids and a plan hash only — no content about anyone — so it is NOT a
+ * discovery source; it is deleted by `job_id` together with the job it
+ * belongs to, so no row is left pointing at a job that is gone.
+ *
+ * Parameters, in both places: `$1` businessId, `$2` jobIds.
+ */
+export const CONFIRMED_STEP_CLAIMS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
+
+/**
  * The `digests` rows an erasure destroys, as ONE predicate.
  *
  * `digest_id = ANY ($2)` alone, the same id-list shape as
@@ -893,6 +920,23 @@ export async function buildErasurePlan(
           AND (coalesce(recipient, '') ILIKE $2 ${LIKE_ESCAPE}
                OR coalesce(subject, '') ILIKE $2 ${LIKE_ESCAPE}
                OR body ILIKE $2 ${LIKE_ESCAPE})`,
+      [businessId, pattern],
+      'job_id',
+    )) jobIds.add(jobId);
+
+    // `instruction_confirmations` (migration 048) is a discovery source of its
+    // own: the question holds the full step content as the owner saw it, and
+    // an option he did not choose is never bound to `job_plans` at all — a
+    // name only in that option, or only in the rendered `presented_text`, is
+    // found here and nowhere else. `options` goes through
+    // `jsonbContentMatches` so a name with `"` or a newline (escaped in the
+    // JSONB text form) is still matched.
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT DISTINCT job_id FROM instruction_confirmations
+        WHERE business_id = $1
+          AND (presented_text ILIKE $2 ${LIKE_ESCAPE}
+               OR ${jsonbContentMatches('options', '$2')})`,
       [businessId, pattern],
       'job_id',
     )) jobIds.add(jobId);
@@ -1454,6 +1498,21 @@ async function countItems(
       'action_updates',
       'delete',
       `SELECT count(*)::text AS n FROM action_updates WHERE ${ACTION_UPDATES_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    // See `INSTRUCTION_CONFIRMATIONS_ERASED_PREDICATE` and
+    // `CONFIRMED_STEP_CLAIMS_ERASED_PREDICATE` above: both job-anchored; only
+    // the first is also a discovery source.
+    await one(
+      'instruction_confirmations',
+      'delete',
+      `SELECT count(*)::text AS n FROM instruction_confirmations WHERE ${INSTRUCTION_CONFIRMATIONS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'confirmed_step_claims',
+      'delete',
+      `SELECT count(*)::text AS n FROM confirmed_step_claims WHERE ${CONFIRMED_STEP_CLAIMS_ERASED_PREDICATE}`,
       [businessId, jobIds],
     ),
     await one(
