@@ -540,7 +540,9 @@ async function handleConfirmationMessage(input: {
     state: 'handled' | 'failed',
     jobId: string | null,
   ): Promise<void> => {
-    await ctx.messenger.send({ text: replyText, jobId: null });
+    // Linked to the job when one is known, so the outbound row says which
+    // held command it answered.
+    await ctx.messenger.send({ text: replyText, jobId });
     await settleMessage(storedId, state, jobId !== null ? { jobId } : {}, {
       businessId: ctx.businessId,
     });

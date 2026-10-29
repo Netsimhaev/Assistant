@@ -23,7 +23,7 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { Proposal } from '../domain/proposal.js';
 import { canonicalHash } from '../util/canonical.js';
 import { buildCharter } from '../test/fixtures.js';
-import { installCharter } from '../charter/store.js';
+import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { insertOrGetDocument } from '../documents/store.js';
 import { saveReading } from '../documents/reading-store.js';
 import { saveProposal } from '../orchestrator/proposal-store.js';
@@ -967,7 +967,7 @@ describe('renderInstruct - identityNote (spec 7.2)', () => {
  * response that captures both is the whole environment it needs.
  */
 describe('renderInstructionOutcome - the note on a needs_answer outcome', () => {
-  function capture(outcome: Parameters<typeof renderInstructionOutcome>[2]): string {
+  async function capture(outcome: Parameters<typeof renderInstructionOutcome>[2]): Promise<string> {
     let body = '';
     const res = {
       writeHead: () => undefined,
@@ -976,12 +976,12 @@ describe('renderInstructionOutcome - the note on a needs_answer outcome', () => 
       },
     } as unknown as ServerResponse;
 
-    void renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, BUSINESS);
+    await renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, BUSINESS);
     return body;
   }
 
-  it('renders the identity note beside the question card', () => {
-    const html = capture({
+  it('renders the identity note beside the question card', async () => {
+    const html = await capture({
       status: 'needs_answer',
       jobId: 'J-1',
       instructionId: 'INS-1',
@@ -998,8 +998,8 @@ describe('renderInstructionOutcome - the note on a needs_answer outcome', () => 
    * The identity question's own return carries `null`, because that question
    * already is the notice. Nothing extra must appear beside it.
    */
-  it('renders no note when the outcome carries none', () => {
-    const html = capture({
+  it('renders no note when the outcome carries none', async () => {
+    const html = await capture({
       status: 'needs_answer',
       jobId: 'J-1',
       instructionId: 'INS-1',
@@ -1030,7 +1030,7 @@ describe('renderInstructionOutcome - the note on a needs_answer outcome', () => 
  * a real planned outcome.
  */
 describe('renderInstruct and renderInstructionOutcome - recordingNote', () => {
-  function capture(outcome: Parameters<typeof renderInstructionOutcome>[2]): string {
+  async function capture(outcome: Parameters<typeof renderInstructionOutcome>[2]): Promise<string> {
     let body = '';
     const res = {
       writeHead: () => undefined,
@@ -1039,7 +1039,7 @@ describe('renderInstruct and renderInstructionOutcome - recordingNote', () => {
       },
     } as unknown as ServerResponse;
 
-    void renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, BUSINESS);
+    await renderInstructionOutcome(res, { sessionId: 'S1', username: 'owner', mustChangePassword: false }, outcome, BUSINESS);
     return body;
   }
 
@@ -1071,8 +1071,8 @@ describe('renderInstruct and renderInstructionOutcome - recordingNote', () => {
    * condition, such an outcome redirected the owner home — a silent
    * withholding, which is this branch's other recurring defect.
    */
-  it('renders the page rather than redirecting when a planned outcome carries only this note', () => {
-    const html = capture({
+  it('renders the page rather than redirecting when a planned outcome carries only this note', async () => {
+    const html = await capture({
       status: 'planned',
       jobId: 'J-1',
       instructionId: 'INS-1',
@@ -3580,20 +3580,25 @@ describe('boss-command confirmation on the dashboard', () => {
   async function heldCommand(
     options: ConfirmationOption[],
     channel: 'whatsapp' | 'dashboard' = 'dashboard',
+    businessId: string = BUSINESS,
   ): Promise<string> {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
-    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    // One charter per business: installing the same one twice collides.
+    const active = await loadActiveCharter(businessId);
+    const charterVersion =
+      active?.charter.charterVersion ??
+      (await installCharter(buildCharter(), { businessId })).charterVersion;
+    const job = await createJob({ charterVersion, provenance: 'boss', businessId });
     await saveInstruction(
       { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה תזכורת' },
-      { businessId: BUSINESS },
+      { businessId },
     );
-    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
-    await transition(job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 't', businessId });
+    await transition(job.jobId, { to: 'plan', actor: 'orchestrator', reason: 't', businessId });
     const only = options.length === 1 ? options[0] : undefined;
-    if (only !== undefined) await bindPlanToJob(job.jobId, only.plan, { businessId: BUSINESS });
+    if (only !== undefined) await bindPlanToJob(job.jobId, only.plan, { businessId });
     await createConfirmation(
       { jobId: job.jobId, options, presentedText: QUESTION, channel },
-      { businessId: BUSINESS },
+      { businessId },
     );
     return job.jobId;
   }
@@ -3713,7 +3718,10 @@ describe('boss-command confirmation on the dashboard', () => {
       planHash: planHashOf(planTo('evil@x.example')),
     });
     expect(res.status).toBe(400);
-    expect(await res.text()).toContain('אינה אחת מהאפשרויות');
+    const body = await res.text();
+    expect(body).toContain('אינה אחת מהאפשרויות');
+    // The refusal keeps the buttons: the question is still open.
+    expect(body).toContain(`action="/instruct/${jobId}/confirm"`);
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('plan');
     const stored = await loadConfirmation(jobId, { businessId: BUSINESS });
     expect(stored?.state).toBe('pending');
@@ -3763,6 +3771,50 @@ describe('boss-command confirmation on the dashboard', () => {
     expect(res.status).toBe(302);
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('closed');
     expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.state).toBe('cancelled');
+  });
+
+  it('keeps the other open confirmations on the 409 page', async () => {
+    const decided = await heldCommand([SINGLE]);
+    const stillOpen = await heldCommand([OPTION_A, OPTION_B]);
+    const { baseUrl, cookie, csrf } = await signedIn();
+    await confirmPost(baseUrl, cookie, decided, { csrf, planHash: SINGLE.planHash });
+    const again = await confirmPost(baseUrl, cookie, decided, { csrf, planHash: SINGLE.planHash });
+    expect(again.status).toBe(409);
+    expect(await again.text()).toContain(`action="/instruct/${stillOpen}/confirm"`);
+  });
+
+  it("changes nothing and returns 404 for an existing job of another business", async () => {
+    const otherJob = await heldCommand([SINGLE], 'dashboard', OTHER_BUSINESS);
+    const { baseUrl, cookie, csrf } = await signedIn();
+    const res = await confirmPost(baseUrl, cookie, otherJob, { csrf, planHash: SINGLE.planHash });
+    expect(res.status).toBe(404);
+    expect((await loadJob(otherJob, { businessId: OTHER_BUSINESS }))?.phase).toBe('plan');
+    expect((await loadConfirmation(otherJob, { businessId: OTHER_BUSINESS }))?.state).toBe('pending');
+  });
+
+  it('escapes the label, the question and the hidden inputs, and strips bidi controls', () => {
+    const html = renderInstruct({
+      csrf: 'tok',
+      confirmations: [
+        {
+          jobId: 'J"><b>job',
+          question: 'שאלה <img src=x onerror=alert(1)> ‮סוף',
+          options: [
+            { label: 'x"><script>alert(1)</script>', planHash: 'h1"><i>' },
+            { label: 'שני ‮הפוך', planHash: 'h2' },
+          ],
+        },
+      ],
+    });
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('x&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    expect(html).not.toContain('‮');
+    expect(html).not.toContain('"><b>');
+    expect(html).toContain('action="/instruct/J&quot;&gt;&lt;b&gt;job/confirm"');
+    expect(html).not.toContain('"><i>');
+    expect(html).toContain('value="h1&quot;&gt;&lt;i&gt;"');
   });
 
   it('returns 404 for a job with no confirmation in this business', async () => {

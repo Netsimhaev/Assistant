@@ -128,7 +128,7 @@ import {
   renderReadings,
   renderServerError,
 } from './views.js';
-import type { CharterReadStatus } from './views.js';
+import type { CharterReadStatus, PendingConfirmation, PendingQuestion } from './views.js';
 import type { ErasurePrefill } from './views.js';
 
 const SESSION_COOKIE = 'sid';
@@ -985,27 +985,40 @@ async function handleInstructGet(
   businessId: string,
   session: Session,
 ): Promise<void> {
-  const waiting = await pendingQuestions({ businessId });
-  // Boss commands waiting on confirmation, on either channel: the WhatsApp
-  // collision refusal sends the owner here to answer (spec §10.11).
-  const confirmations = await dashboardConfirmations({ businessId });
   sendHtml(
     res,
     200,
     renderInstruct({
       csrf: issueCsrfToken(session.sessionId),
-      confirmations: confirmations.map((c) => ({
-        jobId: c.jobId,
-        question: c.presentedText,
-        options: c.options.map((o) => ({ label: o.label, planHash: o.planHash })),
-      })),
-      pending: waiting.map((row) => ({
-        jobId: row.jobId,
-        question: row.question,
-        text: row.text,
-      })),
+      ...(await openOnInstructScreen(businessId)),
     }),
   );
+}
+
+/**
+ * Everything still waiting on the owner that the instruct screen lists: boss
+ * commands waiting on confirmation, on either channel (the WhatsApp collision
+ * refusal sends the owner here, spec §10.11), and clarifying questions. Shared
+ * by `GET /instruct` and the confirm route's refusal pages, so a refusal
+ * never takes the buttons away.
+ */
+async function openOnInstructScreen(
+  businessId: string,
+): Promise<{ confirmations: PendingConfirmation[]; pending: PendingQuestion[] }> {
+  const waiting = await pendingQuestions({ businessId });
+  const confirmations = await dashboardConfirmations({ businessId });
+  return {
+    confirmations: confirmations.map((c) => ({
+      jobId: c.jobId,
+      question: c.presentedText,
+      options: c.options.map((o) => ({ label: o.label, planHash: o.planHash })),
+    })),
+    pending: waiting.map((row) => ({
+      jobId: row.jobId,
+      question: row.question,
+      text: row.text,
+    })),
+  };
 }
 
 /**
@@ -1352,7 +1365,11 @@ async function handleInstructConfirm(
   } else {
     const planHash = form.get('planHash') ?? '';
     if (!confirmation.options.some((option) => option.planHash === planHash)) {
-      return sendHtml(res, 400, renderInstruct({ csrf, error: CONFIRMATION_UNKNOWN_OPTION }));
+      return sendHtml(
+        res,
+        400,
+        renderInstruct({ csrf, error: CONFIRMATION_UNKNOWN_OPTION, ...(await openOnInstructScreen(businessId)) }),
+      );
     }
     reading = { kind: 'confirm', planHash };
   }
@@ -1361,7 +1378,11 @@ async function handleInstructConfirm(
     businessId,
   });
   if (outcome === 'executing' || outcome === 'cancelled') return redirect(res, '/');
-  sendHtml(res, 409, renderInstruct({ csrf, error: CONFIRMATION_ALREADY_DECIDED }));
+  sendHtml(
+    res,
+    409,
+    renderInstruct({ csrf, error: CONFIRMATION_ALREADY_DECIDED, ...(await openOnInstructScreen(businessId)) }),
+  );
 }
 
 /**

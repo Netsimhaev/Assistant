@@ -1774,6 +1774,28 @@ describe('confirming a held command over WhatsApp', () => {
     expect((await messageRow(yes.providerMessageId))?.state).toBe('handled');
   });
 
+  it('a typed "כן" dated BEFORE the question was presented never confirms it', async () => {
+    const jobId = await held([SINGLE]);
+    gateway.enqueue(reply('כן', -5_000));
+    await pass(async () => ({ status: 'planned', plan: recallPlan() }));
+
+    expect(await confirmationState(jobId)).toBe('pending');
+    expect(await phase(jobId)).toBe('plan');
+  });
+
+  it('links the confirm reply to the job it answered', async () => {
+    const jobId = await held([SINGLE]);
+    gateway.enqueue(reply('כן'));
+    await pass();
+
+    const { rows } = await getPool().query<{ job_id: string | null }>(
+      `SELECT job_id FROM whatsapp_messages
+        WHERE business_id = $1 AND direction = 'outbound' AND body = $2`,
+      [BUSINESS, CONFIRM_EXECUTING],
+    );
+    expect(rows.map((r) => r.job_id)).toEqual([jobId]);
+  });
+
   it('a voice "כן" never confirms: it goes to the door as an instruction and the question stays pending', async () => {
     const jobId = await held([SINGLE]);
     gateway.enqueue({ ...audioMsg({ senderNumber: PRINCIPAL_NUMBER }), providerTimestamp: new Date(Date.now() + 1_000).toISOString() });
