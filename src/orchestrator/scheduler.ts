@@ -6,6 +6,7 @@ import { expireOverdue } from '../governance/approvals.js';
 import { expireConfirmations } from '../governance/instruction-confirmations.js';
 import { settleDecidedConfirmations } from './command-confirm.js';
 import type { SettleResult } from './command-confirm.js';
+import { reaskFailedCommands, type ReaskResult } from './command-reask.js';
 import { loadDigestSettings } from '../governance/digest-settings.js';
 import { principalWhatsAppKey } from '../governance/principal-number.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -664,6 +665,14 @@ export interface SchedulerPassResult {
    */
   mailError: string | null;
   due: RunDueResult;
+  /**
+   * Confirmed boss commands asked again this pass (`reaskFailedCommands`):
+   * a timeout, a spent claim with no completion, or a confirmation older
+   * than 24 hours with steps still to run. Run right after `runDueJobs`.
+   */
+  reasked: ReaskResult;
+  /** `reaskFailedCommands`' own thrown message (its candidate read), if it threw. */
+  reaskError: string | null;
   verified: CloseVerifiedResult;
   /**
    * The 365-day mail body retention (`mail-retention.ts`), run every pass
@@ -1034,6 +1043,21 @@ export async function schedulerPass(
   // on. `verifier` rides along and is ignored — `runDueJobs` declares no such
   // field, and the judging step reads `judge` alone.
   const due = await runDueJobs({ ...options, runtime });
+
+  // Right after the plans, and before the report: a confirmed command that
+  // this very pass timed out on, or failed on a spent claim, is asked again
+  // now (`command-reask.ts`), so the report below sees the re-ask and does
+  // not also tell the owner it failed. Isolated like every other stage.
+  let reasked: ReaskResult = { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, lockedOut: [], errored: [] };
+  let reaskError: string | null = null;
+  try {
+    reasked = await reaskFailedCommands({
+      businessId,
+      ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
+    });
+  } catch (err) {
+    reaskError = err instanceof Error ? err.message : String(err);
+  }
   // Last, and the order matters as much as the rest: a job `runDueJobs` just
   // finished is sitting in `verify` by the time this looks, so it closes in
   // the same pass instead of waiting a full interval. Run before the plans
@@ -1150,6 +1174,8 @@ export async function schedulerPass(
     mail,
     mailError,
     due,
+    reasked,
+    reaskError,
     verified,
     mailRetention,
     mailRetentionError,

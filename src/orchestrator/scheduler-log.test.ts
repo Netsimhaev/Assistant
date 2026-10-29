@@ -27,6 +27,8 @@ function cleanResult(): SchedulerPassResult {
     mail: null,
     mailError: null,
     due: { ran: [], lockedOut: [], unbound: [], phaseMoved: [], errored: [] },
+    reasked: { reasked: [], sent: 0, notConnected: 0, sendFailed: 0, lockedOut: [], errored: [] },
+    reaskError: null,
     verified: {
       closed: [],
       failed: [],

@@ -61,6 +61,19 @@ export function logErrored(result: SchedulerPassResult): void {
   for (const job of result.settledConfirmations.errored) {
     console.error(`confirmation for job ${job.jobId} could not be settled: ${job.error}`);
   }
+  // Boss-command re-asks (`command-reask.ts`): a job that threw is found
+  // again next pass; one with no WhatsApp channel is listed on the dashboard.
+  if (result.reaskError !== null) {
+    console.error(`command re-ask failed: ${result.reaskError}`);
+  }
+  for (const job of result.reasked.errored) {
+    console.error(`command job ${job.jobId} could not be re-asked: ${job.error}`);
+  }
+  if (result.reasked.notConnected > 0 || result.reasked.sendFailed > 0) {
+    console.error(
+      `${result.reasked.notConnected + result.reasked.sendFailed} re-ask question(s) did not reach WhatsApp — the dashboard lists them`,
+    );
+  }
   if (result.mail !== null && result.mail.status !== 'ok') {
     console.error(`mailbox poll: ${result.mail.status}${result.mail.error !== undefined ? ` (${result.mail.error})` : ''}`);
   }

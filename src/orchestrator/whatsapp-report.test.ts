@@ -17,6 +17,9 @@ import { applyDecision } from './resume.js';
 import { decide } from '../governance/approvals.js';
 import { bindPlanToJob, planHashOf, recordStepCompletion } from './plan-store.js';
 import { recordInbound, settleMessage } from '../whatsapp/store.js';
+import { saveInstruction } from '../governance/instructions.js';
+import { confirmChoice, createConfirmation } from '../governance/instruction-confirmations.js';
+import { REASK_REASON } from './command-reask.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import {
   awaitingApprovalText,
@@ -25,6 +28,7 @@ import {
   FAILED_GENERIC_TEXT,
   NOT_IMPLEMENTED_TEXT,
   NOT_PERMITTED_TEXT,
+  PERFORMED_ON_CONFIRMATION_TEXT,
   PERFORMED_TEXT,
   reportWhatsAppJobs,
   type JobVerdict,
@@ -1185,5 +1189,138 @@ describe('failedText', () => {
     expect(failedText('some_future_code — details')).toBe(FAILED_GENERIC_TEXT);
     expect(failedText('a sentence with no code shape at all')).toBe(FAILED_GENERIC_TEXT);
     expect(failedText('run_due: some_future_run_due_code')).toBe(FAILED_GENERIC_TEXT);
+  });
+});
+
+describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    charterCounter = 0;
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  const SEND_PLAN = Plan.parse({
+    goal: 'לשלוח',
+    steps: [
+      {
+        id: 's1',
+        agent: 'comms.email',
+        intent: 'send',
+        toolName: 'mail.send',
+        input: { to: 'dana@example.com', subject: 'x', body: 'y' },
+        expectedActionClass: 'email.initiate',
+      },
+    ],
+  });
+
+  /**
+   * A job walked to `execute` with `SEND_PLAN` bound and `s1` recorded
+   * completed + performed. `instruction` adds the door's row; `confirm`
+   * adds a confirmation and says "כן" to it; `reaskOf` names an old job.
+   */
+  async function seed(o: {
+    instruction: boolean;
+    confirm: boolean;
+    reaskOf?: string;
+  }): Promise<string> {
+    const bundle = await install();
+    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    if (o.instruction) {
+      await saveInstruction({ jobId: job.jobId, text: 'תשלחי לדנה', textOrigin: 'typed' }, { businessId: BUSINESS });
+    }
+    for (const to of ['understand', 'plan'] as const) {
+      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    }
+    const binding = await bindPlanToJob(job.jobId, SEND_PLAN, { businessId: BUSINESS });
+    if (binding.status === 'conflict') throw new Error('setup: plan conflict');
+    await createConfirmation(
+      {
+        jobId: job.jobId,
+        options: [{ label: 'לשלוח', planHash: binding.planHash, plan: SEND_PLAN, contactSource: null }],
+        presentedText: 'לשלוח?',
+        channel: 'whatsapp',
+        ...(o.reaskOf !== undefined ? { reaskOf: o.reaskOf } : {}),
+      },
+      { businessId: BUSINESS },
+    );
+    if (o.confirm) {
+      expect(await confirmChoice(job.jobId, binding.planHash, 'p_boss', { businessId: BUSINESS })).toBe(true);
+    }
+    await transition(job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    await withTransaction(async (tx) => {
+      await recordStepCompletion(tx, {
+        jobId: job.jobId, businessId: BUSINESS, planHash: binding.planHash, stepId: 's1',
+        externalId: 'MSG-1', status: 'completed', performed: true,
+      });
+    });
+    return job.jobId;
+  }
+
+  async function close(jobId: string): Promise<void> {
+    for (const to of ['verify', 'remember', 'closed'] as const) {
+      await transition(jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    }
+  }
+
+  it('a confirmed command that performed is reported "בוצע לפי אישורך."', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await close(jobId);
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    expect(PERFORMED_ON_CONFIRMATION_TEXT).toBe('בוצע לפי אישורך.');
+    expect(messenger.sentTexts).toEqual([PERFORMED_ON_CONFIRMATION_TEXT]);
+  });
+
+  it('the confirmation sentence is for confirmed commands only', async () => {
+    // A job with no door row, and a door job whose confirmation is still
+    // pending: both keep the ordinary sentence.
+    const noInstruction = await seed({ instruction: false, confirm: true });
+    const notConfirmed = await seed({ instruction: true, confirm: false });
+    for (const jobId of [noInstruction, notConfirmed]) {
+      await close(jobId);
+      expect(asReport(await classifyJob(jobId, 'closed', BUSINESS)).outcome).toBe('performed');
+    }
+    const confirmed = await seed({ instruction: true, confirm: true });
+    await close(confirmed);
+    expect(asReport(await classifyJob(confirmed, 'closed', BUSINESS)).outcome).toBe('performed_on_confirmation');
+    await linkToWhatsApp(noInstruction);
+    const messenger = fakeMessenger();
+    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    expect(messenger.sentTexts).toEqual([PERFORMED_TEXT]);
+  });
+
+  it('a re-asked job is not reported; its successor reports once on the same message', async () => {
+    const oldJobId = await seed({ instruction: true, confirm: true });
+    await transition(oldJobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout', businessId: BUSINESS });
+    const { messageId } = await linkToWhatsApp(oldJobId);
+    const newJobId = await seed({ instruction: true, confirm: true, reaskOf: oldJobId });
+    await linkWhatsAppMessage(newJobId, messageId, { businessId: BUSINESS });
+
+    // The old job has failed and the successor is still running: nothing.
+    const messenger = fakeMessenger();
+    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    expect(messenger.sentTexts).toEqual([]);
+    expect(await messageState(messageId)).toBe('handled');
+
+    await close(newJobId);
+    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    expect(messenger.sentTexts).toEqual([PERFORMED_ON_CONFIRMATION_TEXT]);
+    expect(messenger.sentJobIds).toEqual([newJobId]);
+    expect(await messageState(messageId)).toBe('reported');
+  });
+
+  it('a job failed for a re-ask still being built is not reported as failed', async () => {
+    const jobId = await seed({ instruction: true, confirm: true });
+    await transition(jobId, { to: 'followup', actor: 'orchestrator', reason: 'x', businessId: BUSINESS });
+    await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: REASK_REASON, businessId: BUSINESS });
+    await linkToWhatsApp(jobId);
+    const messenger = fakeMessenger();
+    await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    expect(messenger.sentTexts).toEqual([]);
   });
 });
