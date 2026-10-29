@@ -4,6 +4,8 @@ import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
 import { expireConfirmations } from '../governance/instruction-confirmations.js';
+import { settleDecidedConfirmations } from './command-confirm.js';
+import type { SettleResult } from './command-confirm.js';
 import { loadDigestSettings } from '../governance/digest-settings.js';
 import { principalWhatsAppKey } from '../governance/principal-number.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -118,40 +120,6 @@ async function expireApprovals(businessId: string, limit: number): Promise<strin
     });
   }
   return ids;
-}
-
-/**
- * Expire boss-command confirmation questions past their window and close each
- * job still parked on one: `plan → closed`, not `failed` — nobody answered,
- * which is not a fault (spec §4.3). The expiry is one `UPDATE ... RETURNING`
- * (`expireConfirmations`); each job is then moved on its own, and a job that
- * is no longer in `plan` is left alone, so one stale row cannot abort the rest.
- * A transition that throws is collected and re-thrown once every job has been
- * tried, so the pass reports it without skipping the others.
- */
-async function closeExpiredConfirmations(businessId: string): Promise<string[]> {
-  const expired = await expireConfirmations({ businessId });
-  const closed: string[] = [];
-  const errors: string[] = [];
-  for (const jobId of expired) {
-    try {
-      const job = await loadJob(jobId, { businessId });
-      if (job === null || job.phase !== 'plan') continue;
-      await transition(jobId, {
-        to: 'closed',
-        actor: 'system',
-        reason: 'command: confirmation expired',
-        businessId,
-      });
-      closed.push(jobId);
-    } catch (err) {
-      errors.push(`${jobId}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-  if (errors.length > 0) {
-    throw new Error(`closing expired confirmations failed for ${errors.join('; ')}`);
-  }
-  return closed;
 }
 
 /** Return every job whose wake time has come to `execute`. */
@@ -648,14 +616,22 @@ export interface SchedulerPassResult {
    */
   delegated: ResumeResult;
   /**
-   * Boss-command confirmation questions that expired this pass and whose job
-   * was closed (`plan → closed`, reason `command: confirmation expired`).
-   * Run right after `delegated`, before the WhatsApp door.
+   * Job ids whose boss-command confirmation question expired this pass
+   * (`expireConfirmations`). Run right after `delegated`, before the WhatsApp
+   * door. Closing their jobs is `settledConfirmations`' work.
    */
   expiredConfirmations: string[];
   /**
-   * The expiry stage's thrown message, if it threw — isolated like
-   * `scanError`, so a fault here cannot stop the door, the plans or the closes.
+   * Jobs parked in `plan` on a confirmation that is no longer pending, moved
+   * on this pass (`settleDecidedConfirmations`): expired or cancelled →
+   * `closed`, confirmed → `execute`, unappliable → `failed`. A job that threw
+   * is in `errored` and is found again next pass.
+   */
+  settledConfirmations: SettleResult;
+  /**
+   * The confirmation stage's thrown message (the expiry statement or the
+   * sweep's query), if it threw — isolated like `scanError`, so a fault here
+   * cannot stop the door, the plans or the closes.
    */
   expiredConfirmationsError: string | null;
   /**
@@ -883,13 +859,17 @@ export async function schedulerPass(
   // instead and every delegation would cost a full extra interval.
   const delegated = await resumeDelegatedJobs(options);
 
-  // Before the WhatsApp door, so a question past its window is closed before
-  // an answer to it could be read this pass (`confirmChoice` refuses a stale
-  // one on its own; this is what moves the job out of `plan`).
+  // Before the WhatsApp door: expire questions past their window, then move
+  // on every job parked in `plan` whose confirmation is no longer pending —
+  // just expired, or decided earlier and not applied (a throw after the flip,
+  // a transient transition error, an expiry whose close failed last pass).
+  // Expiry first, so a job it expires is closed in this same pass.
   let expiredConfirmations: string[] = [];
+  let settledConfirmations: SettleResult = { settled: [], errored: [] };
   let expiredConfirmationsError: string | null = null;
   try {
-    expiredConfirmations = await closeExpiredConfirmations(businessId);
+    expiredConfirmations = await expireConfirmations({ businessId });
+    settledConfirmations = await settleDecidedConfirmations({ businessId });
   } catch (err) {
     expiredConfirmationsError = err instanceof Error ? err.message : String(err);
   }
@@ -1164,6 +1144,7 @@ export async function schedulerPass(
     conduct,
     delegated,
     expiredConfirmations,
+    settledConfirmations,
     expiredConfirmationsError,
     whatsappDoor,
     mail,

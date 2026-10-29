@@ -21,6 +21,7 @@ function cleanResult(): SchedulerPassResult {
     conduct: null,
     delegated: { resumed: [], timedOut: [], errored: [] },
     expiredConfirmations: [],
+    settledConfirmations: { settled: [], errored: [] },
     expiredConfirmationsError: null,
     whatsappDoor: null,
     mail: null,
@@ -65,8 +66,13 @@ describe('logErrored', () => {
   it('prints a failed confirmation expiry', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      logErrored({ ...cleanResult(), expiredConfirmationsError: 'boom' });
+      logErrored({
+        ...cleanResult(),
+        expiredConfirmationsError: 'boom',
+        settledConfirmations: { settled: [], errored: [{ jobId: 'J-1', error: 'bang' }] },
+      });
       expect(errorSpy).toHaveBeenCalledWith('confirmation expiry failed: boom');
+      expect(errorSpy).toHaveBeenCalledWith('confirmation for job J-1 could not be settled: bang');
     } finally {
       errorSpy.mockRestore();
     }

@@ -50,10 +50,16 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.mailRetentionError !== null) {
     console.error(`mail body retention failed: ${result.mailRetentionError}`);
   }
-  // Boss-command confirmation expiry: a failed pass leaves a stale question's
-  // job parked in `plan` until the next pass closes it.
+  // Boss-command confirmations: the expiry statement or the settle sweep's
+  // query threw. Nothing is lost — expiry and the sweep both read the record
+  // again next pass, and the sweep closes, runs or fails every job parked in
+  // `plan` on a non-pending confirmation, however many passes it missed.
   if (result.expiredConfirmationsError !== null) {
     console.error(`confirmation expiry failed: ${result.expiredConfirmationsError}`);
+  }
+  // One job the sweep could not move this pass; it is found again next pass.
+  for (const job of result.settledConfirmations.errored) {
+    console.error(`confirmation for job ${job.jobId} could not be settled: ${job.error}`);
   }
   if (result.mail !== null && result.mail.status !== 'ok') {
     console.error(`mailbox poll: ${result.mail.status}${result.mail.error !== undefined ? ` (${result.mail.error})` : ''}`);

@@ -36,10 +36,12 @@ import {
   cancelConfirmation,
   confirmChoice,
   loadConfirmation,
+  toConfirmation,
+  type ConfirmationRow,
   type InstructionConfirmation,
 } from '../governance/instruction-confirmations.js';
 import { stripBidiControls } from '../util/bidi.js';
-import { transition } from './jobs.js';
+import { loadJob, transition } from './jobs.js';
 import { bindPlanToJob, loadStoredPlan } from './plan-store.js';
 
 /** Whole-message words that confirm (spec §4.3). */
@@ -77,14 +79,45 @@ function nameTokens(value: string): string[] {
     .filter((token) => token !== '');
 }
 
+/** The shortest token a typed name may consist of: one letter is never a name. */
+const MIN_NAME_TOKEN_CHARS = 2;
+
+/** Same tokens, any order, same count — "דנה חיוט" and "חיוט דנה" are the full name. */
+function sameTokens(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const left = [...a].sort();
+  const right = [...b].sort();
+  return left.every((token, i) => token === right[i]);
+}
+
+/**
+ * Whether the typed tokens name this option: its FULL name, or its surname
+ * (the last token of `contactName`) alone. A first name alone never selects —
+ * it is exactly what two candidates share, and selecting on it would turn the
+ * ambiguity the question exists for back into a guess.
+ */
+function namesOption(typed: readonly string[], option: ConfirmationOption): boolean {
+  if (option.contactName === undefined) return false;
+  const name = nameTokens(option.contactName);
+  const surname = name[name.length - 1];
+  if (sameTokens(typed, name)) return true;
+  return typed.length === 1 && name.length > 1 && typed[0] === surname;
+}
+
 /**
  * The owner's answer to a confirmation question with these options.
  *
- * In order: a confirm word (one option → that one; several → `unclear`); a
- * cancel word; an integer (1..N → that option, anything else → `unclear`);
- * a name — every token of the message is a token of exactly one option's
- * `contactName` (so the full name and a surname both work). Two options
- * matching → `unclear`; nothing matching → `none`.
+ * In order:
+ *   - a confirm word: one option → that one; several → `unclear`;
+ *   - a cancel word → `cancel`;
+ *   - a canonical integer (`/^[1-9]\d*$/`, so "01" is not one): 1..N → that
+ *     option, out of range → `unclear`;
+ *   - a name: every token at least two characters, and the message is one
+ *     option's full name or its surname alone. Exactly one option → that
+ *     one; two → `unclear`. Tokens that all belong to some option's name but
+ *     name none of them (a first name alone) → `unclear`: it is an attempt
+ *     to answer, not a new instruction;
+ *   - anything else → `none`.
  */
 export function readConfirmation(text: string, options: readonly ConfirmationOption[]): ConfirmReading {
   const clean = stripBidiControls(text).trim();
@@ -100,29 +133,31 @@ export function readConfirmation(text: string, options: readonly ConfirmationOpt
   if (CANCEL_WORDS.includes(clean)) return { kind: 'cancel' };
 
   if (/^\d+$/.test(clean)) {
-    const picked = options[Number(clean) - 1];
+    const picked = /^[1-9]\d*$/.test(clean) ? options[Number(clean) - 1] : undefined;
     return picked !== undefined ? { kind: 'confirm', planHash: picked.planHash } : { kind: 'unclear' };
   }
 
   const typed = nameTokens(clean);
-  const matching = options.filter((option) => {
-    if (option.contactName === undefined) return false;
-    const name = new Set(nameTokens(option.contactName));
-    return typed.every((token) => name.has(token));
-  });
+  if (typed.length === 0 || typed.some((token) => token.length < MIN_NAME_TOKEN_CHARS)) {
+    return { kind: 'none' };
+  }
+  const matching = options.filter((option) => namesOption(typed, option));
   const match = matching[0];
   if (matching.length === 1 && match !== undefined) return { kind: 'confirm', planHash: match.planHash };
   if (matching.length > 1) return { kind: 'unclear' };
-  return { kind: 'none' };
-}
 
-interface ConfirmationRow {
-  job_id: string;
+  const partOfAName = typed.every((token) =>
+    options.some(
+      (option) => option.contactName !== undefined && nameTokens(option.contactName).includes(token),
+    ),
+  );
+  return partOfAName ? { kind: 'unclear' } : { kind: 'none' };
 }
 
 /**
  * The confirmation questions a message arriving at `inboundAt` can answer.
- * Read-only. Every condition is positive:
+ * Read-only. Every condition is positive, and every one is in the SQL — a
+ * second check in code would hide the SQL one from its tests:
  *
  *   - pending, on this channel, in this business;
  *   - presented strictly before the message (`inboundAt === null` — a
@@ -146,7 +181,8 @@ export async function openConfirmations(o: {
   const db = o.db ?? getPool();
 
   const { rows } = await db.query<ConfirmationRow>(
-    `SELECT c.job_id
+    `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.channel, c.state,
+            c.chosen_plan_hash, c.decided_at, c.decided_by, c.reask_of
        FROM instruction_confirmations c
        JOIN jobs j
          ON j.business_id = c.business_id AND j.job_id = c.job_id AND j.phase = 'plan'
@@ -162,13 +198,7 @@ export async function openConfirmations(o: {
       ORDER BY c.presented_at`,
     [o.businessId, o.channel, o.inboundAt, windowMinutes],
   );
-
-  const open: InstructionConfirmation[] = [];
-  for (const row of rows) {
-    const loaded = await loadConfirmation(row.job_id, { businessId: o.businessId, db });
-    if (loaded !== null && loaded.state === 'pending') open.push(loaded);
-  }
-  return open;
+  return rows.map(toConfirmation);
 }
 
 /**
@@ -225,17 +255,23 @@ export async function bindChosenPlan(
 /**
  * Apply the owner's answer.
  *
+ *   - `unclear` / `none`: nothing changes.
+ *   - The job must still be parked in `plan`; otherwise `already_decided`,
+ *     before anything is flipped.
  *   - `confirm`: `confirmChoice` flips the row (false → `already_decided`).
  *     With several options the chosen plan is bound now (`bindChosenPlan`);
  *     with one it was bound before the question, and the bound hash must
  *     equal the chosen one. Then `plan → execute`.
  *   - `cancel`: `cancelConfirmation` (false → `already_decided`), then
  *     `plan → closed` — closed, not failed: the owner said no.
- *   - `unclear` / `none`: nothing changes.
  *
- * A bound hash that is not the chosen one throws and leaves the job in
- * `plan`: running a plan the owner did not pick is the one outcome this must
- * never produce, and a job left parked runs nothing.
+ * **The flip commits first, so whatever fails after it is left to
+ * `settleDecidedConfirmations`**, which the scheduler runs every pass: a row
+ * that is no longer pending on a job still in `plan` is moved on from the
+ * record, never left parked. A throw here therefore means "decided, not yet
+ * applied". One case is read back rather than thrown: when the job is already
+ * where this call was taking it (the sweep, or another channel, got there
+ * first), the answer did take effect.
  */
 export async function applyConfirmation(
   jobId: string,
@@ -243,43 +279,159 @@ export async function applyConfirmation(
   by: string,
   o: { businessId: string },
 ): Promise<ConfirmOutcome> {
+  if (reading.kind !== 'confirm' && reading.kind !== 'cancel') return 'unclear';
+
+  const job = await loadJob(jobId, { businessId: o.businessId });
+  if (job?.phase !== 'plan') return 'already_decided';
+
   if (reading.kind === 'cancel') {
     const cancelled = await cancelConfirmation(jobId, by, { businessId: o.businessId });
     if (!cancelled) return 'already_decided';
-    await transition(jobId, {
-      to: 'closed',
-      actor: 'human',
-      reason: 'command: cancelled',
-      businessId: o.businessId,
-    });
+    try {
+      await moveTo(jobId, 'closed', 'command: cancelled', 'human', o.businessId);
+    } catch (err) {
+      if (await phaseIs(jobId, 'closed', o.businessId)) return 'cancelled';
+      throw err;
+    }
     return 'cancelled';
   }
-
-  if (reading.kind !== 'confirm') return 'unclear';
 
   const confirmed = await confirmChoice(jobId, reading.planHash, by, { businessId: o.businessId });
   if (!confirmed) return 'already_decided';
 
-  const confirmation = await loadConfirmation(jobId, { businessId: o.businessId });
-  if (confirmation === null) {
-    throw new Error(`command confirm: job ${jobId} lost its confirmation row`);
+  try {
+    const confirmation = await loadConfirmation(jobId, { businessId: o.businessId });
+    if (confirmation === null) {
+      throw new Error(`command confirm: job ${jobId} lost its confirmation row`);
+    }
+    if (confirmation.options.length > 1) {
+      await bindChosenPlan(jobId, reading.planHash, o);
+    } else {
+      const stored = await loadStoredPlan(jobId, { businessId: o.businessId });
+      if (stored?.planHash !== reading.planHash) {
+        throw new Error(
+          `command confirm: job ${jobId} is bound to ${stored?.planHash ?? 'nothing'}, not the confirmed plan ${reading.planHash}`,
+        );
+      }
+    }
+    await moveTo(jobId, 'execute', 'command: confirmed', 'human', o.businessId);
+  } catch (err) {
+    if (await phaseIs(jobId, 'execute', o.businessId)) return 'executing';
+    throw err;
   }
-  if (confirmation.options.length > 1) {
-    await bindChosenPlan(jobId, reading.planHash, o);
-  } else {
-    const stored = await loadStoredPlan(jobId, { businessId: o.businessId });
-    if (stored?.planHash !== reading.planHash) {
-      throw new Error(
-        `command confirm: job ${jobId} is bound to ${stored?.planHash ?? 'nothing'}, not the confirmed plan ${reading.planHash}`,
-      );
+  return 'executing';
+}
+
+async function moveTo(
+  jobId: string,
+  to: 'execute' | 'closed' | 'failed',
+  reason: string,
+  actor: 'human' | 'system',
+  businessId: string,
+): Promise<void> {
+  await transition(jobId, { to, actor, reason, businessId });
+}
+
+async function phaseIs(jobId: string, phase: string, businessId: string): Promise<boolean> {
+  return (await loadJob(jobId, { businessId }))?.phase === phase;
+}
+
+export interface SettleResult {
+  settled: Array<{ jobId: string; to: 'execute' | 'closed' | 'failed' }>;
+  errored: Array<{ jobId: string; error: string }>;
+}
+
+/** The reason a decided confirmation that cannot be applied fails its job with. */
+export const UNAPPLIABLE_REASON = 'command: could not apply confirmation';
+
+/**
+ * Move on every job still parked in `plan` whose confirmation is no longer
+ * pending — the answer was recorded but not applied: `applyConfirmation`
+ * threw after its flip committed, a transient transition error, or an expiry
+ * whose close failed. Without this the job sits in `plan` forever, because
+ * every other reader takes `pending` rows only.
+ *
+ *   - `cancelled` / `expired` → `plan → closed`;
+ *   - `confirmed`, and the bound plan's hash equals `chosen_plan_hash` →
+ *     `plan → execute`;
+ *   - `confirmed`, nothing bound, several options → bind the chosen plan
+ *     (`bindChosenPlan`, with its re-check), then `execute`;
+ *   - anything else — a hash mismatch, a single option with nothing bound, a
+ *     bind that refuses — → `plan → failed` (`UNAPPLIABLE_REASON`). Never
+ *     `execute` on a plan the owner did not pick.
+ *
+ * Only jobs born at the instruction door (a `boss_instructions` row). Each job
+ * on its own: one that throws is reported in `errored`, the rest go on, and
+ * it is found again next pass.
+ */
+export async function settleDecidedConfirmations(o: {
+  businessId: string;
+  limit?: number;
+}): Promise<SettleResult> {
+  const { rows } = await getPool().query<ConfirmationRow>(
+    `SELECT c.job_id, c.options, c.presented_text, c.presented_at, c.channel, c.state,
+            c.chosen_plan_hash, c.decided_at, c.decided_by, c.reask_of
+       FROM instruction_confirmations c
+       JOIN jobs j
+         ON j.business_id = c.business_id AND j.job_id = c.job_id AND j.phase = 'plan'
+      WHERE c.business_id = $1
+        AND c.state <> 'pending'
+        AND EXISTS (
+          SELECT 1 FROM boss_instructions b
+           WHERE b.business_id = c.business_id AND b.job_id = c.job_id
+        )
+      ORDER BY c.decided_at, c.job_id
+      LIMIT $2`,
+    [o.businessId, o.limit ?? 50],
+  );
+
+  const result: SettleResult = { settled: [], errored: [] };
+  for (const row of rows) {
+    const jobId = row.job_id;
+    try {
+      const to = await settleOne(toConfirmation(row), o.businessId);
+      result.settled.push({ jobId, to });
+    } catch (err) {
+      result.errored.push({ jobId, error: err instanceof Error ? err.message : String(err) });
     }
   }
+  return result;
+}
 
-  await transition(jobId, {
-    to: 'execute',
-    actor: 'human',
-    reason: 'command: confirmed',
-    businessId: o.businessId,
-  });
-  return 'executing';
+async function settleOne(
+  confirmation: InstructionConfirmation,
+  businessId: string,
+): Promise<'execute' | 'closed' | 'failed'> {
+  const { jobId } = confirmation;
+  if (confirmation.state === 'cancelled') {
+    await moveTo(jobId, 'closed', 'command: cancelled', 'system', businessId);
+    return 'closed';
+  }
+  if (confirmation.state === 'expired') {
+    await moveTo(jobId, 'closed', 'command: confirmation expired', 'system', businessId);
+    return 'closed';
+  }
+
+  const chosen = confirmation.state === 'confirmed' ? confirmation.chosenPlanHash : null;
+  if (chosen !== null) {
+    const stored = await loadStoredPlan(jobId, { businessId });
+    if (stored?.planHash === chosen) {
+      await moveTo(jobId, 'execute', 'command: confirmed', 'system', businessId);
+      return 'execute';
+    }
+    if (stored === null && confirmation.options.length > 1) {
+      let bound = true;
+      try {
+        await bindChosenPlan(jobId, chosen, { businessId });
+      } catch {
+        bound = false;
+      }
+      if (bound) {
+        await moveTo(jobId, 'execute', 'command: confirmed', 'system', businessId);
+        return 'execute';
+      }
+    }
+  }
+  await moveTo(jobId, 'failed', UNAPPLIABLE_REASON, 'system', businessId);
+  return 'failed';
 }

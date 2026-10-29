@@ -87,7 +87,8 @@ export interface InstructionConfirmation {
   reaskOf: string | null;
 }
 
-interface ConfirmationRow {
+/** The `instruction_confirmations` columns `toConfirmation` reads. Exported for readers that select rows themselves. */
+export interface ConfirmationRow {
   job_id: string;
   options: unknown;
   presented_text: string;
@@ -104,7 +105,7 @@ interface ConfirmationRow {
  * Options are parsed back, not cast: a stored value that no longer reads as
  * the options the owner was shown is not something to confirm against.
  */
-function toConfirmation(row: ConfirmationRow): InstructionConfirmation {
+export function toConfirmation(row: ConfirmationRow): InstructionConfirmation {
   return {
     jobId: row.job_id,
     options: ConfirmationOptions.parse(row.options),

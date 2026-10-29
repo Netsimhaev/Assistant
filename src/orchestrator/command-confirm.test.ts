@@ -8,8 +8,10 @@ import { CLOSURE_VERB_WORDS } from '../governance/closure-command.js';
 import { FORGET_VERBS } from '../governance/forget-command.js';
 import { saveInstruction } from '../governance/instructions.js';
 import {
+  cancelConfirmation,
   confirmChoice,
   createConfirmation,
+  expireConfirmations,
   loadConfirmation,
   type ConfirmationOption,
 } from '../governance/instruction-confirmations.js';
@@ -24,9 +26,11 @@ import {
   CANCEL_WORDS,
   CONFIRM_WORDS,
   applyConfirmation,
+  UNAPPLIABLE_REASON,
   bindChosenPlan,
   openConfirmations,
   readConfirmation,
+  settleDecidedConfirmations,
 } from './command-confirm.js';
 
 const BUSINESS = 'test-business';
@@ -132,6 +136,31 @@ async function transitionsTo(jobId: string, to: string): Promise<number> {
   return rows.length;
 }
 
+async function tamperFirstOption(jobId: string): Promise<void> {
+  await getPool().query(
+    `UPDATE instruction_confirmations
+        SET options = jsonb_set(options, '{0,plan,goal}', '"tampered"')
+      WHERE job_id = $1`,
+    [jobId],
+  );
+}
+
+function inertRuntime(): Runtime {
+  return {
+    registry: new AdapterRegistry([]),
+    credentials: envCredentials({}, 'TEST_CRED_'),
+    warnings: [],
+  };
+}
+
+async function reasonsTo(jobId: string, to: string): Promise<string[]> {
+  const { rows } = await getPool().query<{ reason: string }>(
+    'SELECT reason FROM job_steps WHERE job_id = $1 AND to_phase = $2',
+    [jobId, to],
+  );
+  return rows.map((r) => r.reason);
+}
+
 beforeEach(async () => {
   await resetDatabase();
   versions.clear();
@@ -180,6 +209,35 @@ describe('readConfirmation', () => {
 
   it('a confirm word inside a sentence is not a confirmation', () => {
     expect(readConfirmation('כן תשלחי גם לרונית', [SINGLE])).toEqual({ kind: 'none' });
+  });
+
+  it('only a canonical number picks: "01" does not', () => {
+    expect(readConfirmation('01', [OPTION_A, OPTION_B])).toEqual({ kind: 'unclear' });
+    expect(readConfirmation('01', [SINGLE])).toEqual({ kind: 'unclear' });
+  });
+
+  it('a message of punctuation alone names nobody', () => {
+    expect(readConfirmation('?!', [OPTION_A])).toEqual({ kind: 'none' });
+    expect(readConfirmation('. ,', [OPTION_A, OPTION_B])).toEqual({ kind: 'none' });
+  });
+
+  it('a one-letter token is never a name', () => {
+    const ad: ConfirmationOption = { ...OPTION_A, contactName: 'א דנה' };
+    expect(readConfirmation('א', [ad, OPTION_B])).toEqual({ kind: 'none' });
+  });
+
+  it('a first name alone never selects, even when only one option carries it', () => {
+    const ronit: ConfirmationOption = { ...OPTION_B, contactName: 'רונית לוי' };
+    expect(readConfirmation('דנה', [OPTION_A, ronit])).toEqual({ kind: 'unclear' });
+  });
+
+  it('the full name in either order selects', () => {
+    expect(readConfirmation('חיוט דנה', [OPTION_A, OPTION_B])).toEqual({ kind: 'confirm', planHash: HASH_A });
+  });
+
+  it('a surname that is also an ordinary word selects (accepted, see the report)', () => {
+    const tov: ConfirmationOption = { ...OPTION_A, contactName: 'דנה טוב' };
+    expect(readConfirmation('טוב', [tov, OPTION_B])).toEqual({ kind: 'confirm', planHash: HASH_A });
   });
 
   it('a number picks that option, and one out of range is unclear', () => {
@@ -388,6 +446,31 @@ describe('applyConfirmation', () => {
     expect(await loadStoredPlan(jobId, { businessId: BUSINESS })).toBeNull();
   });
 
+  it('a job no longer in plan is already decided, and its row is not flipped', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [OPTION_A, OPTION_B]);
+    await transition(jobId, { to: 'closed', actor: 'system', reason: 't', businessId: BUSINESS });
+    const by = { businessId: BUSINESS };
+    expect(await applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', by)).toBe(
+      'already_decided',
+    );
+    expect(await applyConfirmation(jobId, { kind: 'cancel' }, 'owner', by)).toBe('already_decided');
+    expect((await loadConfirmation(jobId, by))?.state).toBe('pending');
+  });
+
+  it('refuses to bind when the stored option no longer hashes to its planHash (several options)', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [OPTION_A, OPTION_B]);
+    // The stored plan of option 1 changed under its recorded hash: binding it
+    // would run bytes the owner was never shown.
+    await tamperFirstOption(jobId);
+    await expect(
+      applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', { businessId: BUSINESS }),
+    ).rejects.toThrow(/could not be bound/);
+    expect(await loadStoredPlan(jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await phaseOf(jobId)).toBe('plan');
+  });
+
   it('cancel: closes the job, once', async () => {
     const jobId = await parkedJob();
     await ask(jobId, [OPTION_A, OPTION_B]);
@@ -425,14 +508,10 @@ describe('scheduler expiry', () => {
     const fresh = await parkedJob();
     await ask(fresh, [SINGLE]);
 
-    const runtime: Runtime = {
-      registry: new AdapterRegistry([]),
-      credentials: envCredentials({}, 'TEST_CRED_'),
-      warnings: [],
-    };
-    const result = await schedulerPass({ businessId: BUSINESS, runtime, inbox: null });
+    const result = await schedulerPass({ businessId: BUSINESS, runtime: inertRuntime(), inbox: null });
 
     expect(result.expiredConfirmations).toEqual([stale]);
+    expect(result.settledConfirmations).toEqual({ settled: [{ jobId: stale, to: 'closed' }], errored: [] });
     expect(result.expiredConfirmationsError).toBeNull();
     expect(await phaseOf(stale)).toBe('closed');
     const { rows } = await getPool().query<{ reason: string }>(
@@ -442,5 +521,137 @@ describe('scheduler expiry', () => {
     expect(rows.map((r) => r.reason)).toEqual(['command: confirmation expired']);
     expect((await loadConfirmation(stale, { businessId: BUSINESS }))?.state).toBe('expired');
     expect(await phaseOf(fresh)).toBe('plan');
+  });
+
+  it('leaves a job that already left plan alone when its question expires', async () => {
+    const gone = await parkedJob();
+    await ask(gone, [SINGLE]);
+    await presentedAt(gone, new Date(Date.now() - 31 * 60_000));
+    await transition(gone, { to: 'closed', actor: 'system', reason: 'other', businessId: BUSINESS });
+
+    const result = await schedulerPass({ businessId: BUSINESS, runtime: inertRuntime(), inbox: null });
+
+    expect(result.expiredConfirmations).toEqual([gone]);
+    expect(result.settledConfirmations).toEqual({ settled: [], errored: [] });
+    expect(result.expiredConfirmationsError).toBeNull();
+    expect(await transitionsTo(gone, 'closed')).toBe(1);
+  });
+});
+
+describe('settleDecidedConfirmations', () => {
+  const by = { businessId: BUSINESS };
+
+  it('cancelled, job still in plan → closed', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [OPTION_A, OPTION_B]);
+    expect(await cancelConfirmation(jobId, 'owner', by)).toBe(true);
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'closed' }], errored: [] });
+    expect(await reasonsTo(jobId, 'closed')).toEqual(['command: cancelled']);
+  });
+
+  it('expired, job still in plan (a failed close last pass) → closed', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [SINGLE]);
+    expect(await expireConfirmations({ businessId: BUSINESS, windowMinutes: 0 })).toEqual([jobId]);
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'closed' }], errored: [] });
+    expect(await reasonsTo(jobId, 'closed')).toEqual(['command: confirmation expired']);
+  });
+
+  it('confirmed and bound to the chosen plan → execute', async () => {
+    const jobId = await parkedJob();
+    await bindPlanToJob(jobId, PLAN_A, by);
+    await ask(jobId, [SINGLE]);
+    expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'execute' }], errored: [] });
+    expect(await reasonsTo(jobId, 'execute')).toEqual(['command: confirmed']);
+  });
+
+  it('confirmed, several options, nothing bound → binds the chosen plan, then execute', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [OPTION_A, OPTION_B]);
+    expect(await confirmChoice(jobId, HASH_B, 'owner', by)).toBe(true);
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'execute' }], errored: [] });
+    expect((await loadStoredPlan(jobId, by))?.planHash).toBe(HASH_B);
+  });
+
+  it('confirmed but bound to another plan → failed', async () => {
+    const jobId = await parkedJob();
+    await bindPlanToJob(jobId, PLAN_C, by);
+    await ask(jobId, [SINGLE]);
+    expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], errored: [] });
+    expect(await reasonsTo(jobId, 'failed')).toEqual([UNAPPLIABLE_REASON]);
+    expect(await transitionsTo(jobId, 'execute')).toBe(0);
+  });
+
+  it('confirmed, single option, nothing bound → failed', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [SINGLE]);
+    expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], errored: [] });
+  });
+
+  it('confirmed, several options, a bind that refuses → failed', async () => {
+    const jobId = await parkedJob();
+    await ask(jobId, [OPTION_A, OPTION_B]);
+    await tamperFirstOption(jobId);
+    expect(await confirmChoice(jobId, HASH_A, 'owner', by)).toBe(true);
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [{ jobId, to: 'failed' }], errored: [] });
+    expect(await loadStoredPlan(jobId, by)).toBeNull();
+  });
+
+  it('an applyConfirmation that threw after its flip is finished by the sweep', async () => {
+    const jobId = await parkedJob();
+    await bindPlanToJob(jobId, PLAN_C, by);
+    await ask(jobId, [SINGLE]);
+    await expect(applyConfirmation(jobId, { kind: 'confirm', planHash: HASH_A }, 'owner', by)).rejects.toThrow();
+    expect(await phaseOf(jobId)).toBe('plan');
+    await settleDecidedConfirmations(by);
+    expect(await phaseOf(jobId)).toBe('failed');
+  });
+
+  it('ignores pending rows and jobs without an instruction row', async () => {
+    const pending = await parkedJob();
+    await ask(pending, [SINGLE]);
+    const orphan = (
+      await createJob({ charterVersion: await charterVersion(BUSINESS), provenance: 'boss', businessId: BUSINESS })
+    ).jobId;
+    await transition(orphan, { to: 'understand', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    await transition(orphan, { to: 'plan', actor: 'orchestrator', reason: 't', businessId: BUSINESS });
+    await ask(orphan, [SINGLE]);
+    await cancelConfirmation(orphan, 'owner', by);
+    expect(await settleDecidedConfirmations(by)).toEqual({ settled: [], errored: [] });
+    expect(await phaseOf(orphan)).toBe('plan');
+    expect(await phaseOf(pending)).toBe('plan');
+  });
+
+  it("one job's failure does not stop another's", async () => {
+    const broken = await parkedJob();
+    await ask(broken, [SINGLE]);
+    await cancelConfirmation(broken, 'owner', by);
+    const fine = await parkedJob();
+    await ask(fine, [SINGLE]);
+    await cancelConfirmation(fine, 'owner', by);
+
+    await getPool().query(`
+      CREATE FUNCTION test_refuse_job_step() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.job_id = '${broken}' THEN RAISE EXCEPTION 'refused for test'; END IF;
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql`);
+    await getPool().query(
+      'CREATE TRIGGER test_refuse_job_step BEFORE INSERT ON job_steps FOR EACH ROW EXECUTE FUNCTION test_refuse_job_step()',
+    );
+    try {
+      const result = await settleDecidedConfirmations(by);
+      expect(result.settled).toEqual([{ jobId: fine, to: 'closed' }]);
+      expect(result.errored.map((e) => e.jobId)).toEqual([broken]);
+      expect(result.errored[0]?.error).toContain('refused for test');
+    } finally {
+      await getPool().query('DROP TRIGGER test_refuse_job_step ON job_steps');
+      await getPool().query('DROP FUNCTION test_refuse_job_step()');
+    }
+    expect(await phaseOf(fine)).toBe('closed');
+    expect(await phaseOf(broken)).toBe('plan');
   });
 });
