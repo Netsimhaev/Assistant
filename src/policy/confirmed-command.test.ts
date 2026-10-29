@@ -25,6 +25,7 @@ import { bindPlanToJob, planHashOf } from '../orchestrator/plan-store.js';
 import { loadRampLevel } from '../orchestrator/ramp.js';
 import { Plan } from '../domain/plan.js';
 import type { TrustLevel } from '../domain/trust.js';
+import type { AgentId } from '../domain/audit.js';
 import { DENY_CODES, type PolicyBundle } from '../domain/policy.js';
 import { evaluateToolCall, type GateContext } from './engine.js';
 import { redactPayload } from './redact.js';
@@ -62,6 +63,7 @@ interface SetupOptions {
   confirmationBusiness?: string;
   confirm?: boolean;
   toolName?: string;
+  stepAgent?: AgentId;
   input?: Record<string, unknown>;
 }
 
@@ -72,11 +74,16 @@ interface Setup {
   ctx: GateContext;
 }
 
-function planOf(toolName: string, input: Record<string, unknown>, goal = 'לשלוח לדנה'): Plan {
+function planOf(
+  toolName: string,
+  input: Record<string, unknown>,
+  goal = 'לשלוח לדנה',
+  agent: AgentId = 'comms.email',
+): Plan {
   return Plan.parse({
     goal,
     steps: [
-      { id: STEP_ID, agent: 'comms.email', intent: 'send', toolName, input },
+      { id: STEP_ID, agent, intent: 'send', toolName, input },
     ],
   });
 }
@@ -101,7 +108,7 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
       { businessId: options.instructionBusiness ?? BUSINESS },
     );
   }
-  const plan = planOf(options.toolName ?? 'mail.send', options.input ?? SEND);
+  const plan = planOf(options.toolName ?? 'mail.send', options.input ?? SEND, undefined, options.stepAgent);
   const planHash = planHashOf(plan);
   await bindPlanToJob(job.jobId, plan, { businessId: options.planBusiness ?? BUSINESS });
 
@@ -311,6 +318,13 @@ describe('each condition, flipped alone, falls to the normal path', () => {
     );
   });
 
+  it('a step planned for another agent is not exempt', async () => {
+    // Same id, tool and bytes; the bound step names `comms.whatsapp`, while
+    // `comms.email` is the agent making the call.
+    const s = await setup({ stepAgent: 'comms.whatsapp' });
+    await expectNormalPathDraftOnly(await evaluateToolCall('mail.send', SEND, s.ctx), s.jobId);
+  });
+
   it('a step whose tool is another tool is not exempt', async () => {
     // The plan's s1 is `wa.send_message` with the very same input; the call
     // judged is `mail.send`. `inputHash` is of the input alone, so the tool
@@ -430,6 +444,30 @@ describe('the command overrides the brakes on the assistant', () => {
 });
 
 describe('what the command never overrides', () => {
+  it('a stale charter still denies, before the exemption is consulted', async () => {
+    const s = await setup();
+    const stale = { ...s.ctx, bundle: { ...s.bundle, charterVersion: '2026-01-01.old' } };
+    expectDenied(await evaluateToolCall('mail.send', SEND, stale), DENY_CODES.stalePolicy);
+    expect(await claims(s.jobId)).toBe(0);
+  });
+
+  it('a confirmed step whose tool is outside the agent allowlist is refused', async () => {
+    // `wa.send_message` is a known, classified tool that `comms.email` does
+    // not hold. The bound step names exactly this agent, tool and bytes, so
+    // every condition of the exemption holds — only stage 3 refuses it.
+    const s = await setup({ toolName: 'wa.send_message' });
+    expectDenied(await evaluateToolCall('wa.send_message', SEND, s.ctx), DENY_CODES.notAllowlisted);
+    expect(await claims(s.jobId)).toBe(0);
+  });
+
+  it('a confirmed step naming an unowned tool is refused', async () => {
+    // `contract.sign` is in UNOWNED_TOOLS: no agent's allowlist holds it.
+    const input = { documentId: 'D-1' };
+    const s = await setup({ toolName: 'contract.sign', input });
+    expectDenied(await evaluateToolCall('contract.sign', input, s.ctx), DENY_CODES.notAllowlisted);
+    expect(await claims(s.jobId)).toBe(0);
+  });
+
   it('the kill switch still denies', async () => {
     const s = await setup();
     await trip('outbound', 'p_boss', 'בדיקה', { businessId: BUSINESS });
@@ -462,8 +500,25 @@ describe('what the command never overrides', () => {
     expectDenied(second, 'confirmed_step_already_claimed');
     if (second.outcome !== 'deny') throw new Error('unreachable');
     expect(second.reason).toBe('הצעד הזה כבר נתבע לביצוע — לא אבצע אותו שוב בלי לשאול.');
-    // The second attempt still left its intent row before losing the claim.
-    expect(await auditRows(s.jobId, 'intent_to_act')).toHaveLength(2);
+    // Both attempts wrote a marker row (intent before claim), and the loser
+    // also wrote a denial citing its own marker row by seq. Executions are the
+    // marker rows no such denial cites: exactly one.
+    const { rows } = await getPool().query<{ seq: string; kind: string; reason: string }>(
+      `SELECT seq::text AS seq, kind, reason FROM audit_log
+        WHERE job_id = $1 AND kind IN ('intent_to_act', 'policy_denial') ORDER BY seq`,
+      [s.jobId],
+    );
+    const markers = rows.filter(
+      (r) => r.kind === 'intent_to_act' && r.reason.endsWith(` ${CONFIRMED_COMMAND_EXEMPTION_MARKER}`),
+    );
+    const denials = rows.filter((r) => r.kind === 'policy_denial');
+    expect(markers).toHaveLength(2);
+    expect(denials.map((r) => r.reason)).toEqual([
+      `confirmed_step_already_claimed (intent seq ${markers[1]?.seq})`,
+    ]);
+    const cited = new Set(denials.map((r) => /intent seq (\d+)/.exec(r.reason)?.[1]));
+    const executions = markers.filter((m) => !cited.has(m.seq));
+    expect(executions.map((m) => m.seq)).toEqual([markers[0]?.seq]);
     expect(await claims(s.jobId)).toBe(1);
   });
 });

@@ -694,7 +694,9 @@ function permittedInputFor(toolInput: unknown, outbound: boolean, bundle: Policy
  *      nothing here;
  *   3. the claim (`claimConfirmedStep`, §10.2). A lost claim means this step
  *      was already claimed — it may already have run — and it must not run
- *      again without asking;
+ *      again without asking. The loser also writes a `policy_denial` row
+ *      citing its marker row's seq, so a marker row alone never reads as an
+ *      execution: executions are the marker rows no such denial cites;
  *   4. `allow` at `auto`, with the payload redacted exactly as every other
  *      allow redacts it (`permittedInputFor`).
  */
@@ -721,7 +723,7 @@ async function confirmedCommand(
   }
 
   const risk = await assessRisk(facts, ctx.bundle, ctx.norms ? { norms: ctx.norms } : {});
-  await recordIntent(facts, ctx, currentVersion, businessId, {
+  const intent = await recordIntent(facts, ctx, currentVersion, businessId, {
     kind: 'intent_to_act',
     reason: `${risk.explanation} ${CONFIRMED_COMMAND_EXEMPTION_MARKER}`,
     risk,
@@ -732,6 +734,14 @@ async function confirmedCommand(
     { businessId, db },
   );
   if (!claimed) {
+    // The marker row above is already written, and on its own it would read as
+    // one more execution on the owner's confirmation. This row, citing it by
+    // seq, says the attempt was refused — so counting executions is counting
+    // marker rows that no `confirmed_step_already_claimed` denial cites.
+    await recordIntent(facts, ctx, currentVersion, businessId, {
+      kind: 'policy_denial',
+      reason: `${DENY_CODES.confirmedStepAlreadyClaimed} (intent seq ${intent.seq})`,
+    });
     return deny(
       DENY_CODES.confirmedStepAlreadyClaimed,
       'הצעד הזה כבר נתבע לביצוע — לא אבצע אותו שוב בלי לשאול.',

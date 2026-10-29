@@ -38,8 +38,9 @@ import type { GateContext } from './engine.js';
  *     carry a transfer the owner may no longer want;
  *   - `chosen_plan_hash` equals the hash of the plan bound to the job
  *     (`job_plans`): the plan about to run is the plan he chose;
- *   - that plan has a step with id `ctx.stepId`, whose `toolName` is the tool
- *     the gate is judging and whose `canonicalHash(input)` equals
+ *   - that plan has a step with id `ctx.stepId`, whose `agent` is the agent
+ *     making this call (`ctx.agent`), whose `toolName` is the tool the gate
+ *     is judging and whose `canonicalHash(input)` equals
  *     `facts.inputHash` — the same `canonicalHash` `buildFacts` uses — so the
  *     bytes about to run are the bytes he was shown. Editing a confirmed
  *     command is therefore impossible by construction (§4.5);
@@ -104,6 +105,7 @@ export async function confirmedCommandCovers(
   const stepId = ctx.stepId;
   const step = parsed.data.steps.find((candidate) => candidate.id === stepId);
   if (step === undefined) return null;
+  if (step.agent !== ctx.agent) return null;
   if (step.toolName !== facts.toolName) return null;
   if (canonicalHash(step.input) !== facts.inputHash) return null;
 
