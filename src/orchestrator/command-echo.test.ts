@@ -9,6 +9,7 @@ import {
   MAX_ECHO_CHARS_PER_STEP,
   REASK_PREFIX,
   renderConfirmationQuestion,
+  alreadyDoneLine,
   renderStepEcho,
 } from './command-echo.js';
 
@@ -302,5 +303,13 @@ describe('renderConfirmationQuestion', () => {
     ]);
     if (!('text' in r)) throw new Error('refused');
     expect(r.text).not.toContain('סודי');
+  });
+});
+
+describe('alreadyDoneLine', () => {
+  it('says "one step" in the singular and counts from two', () => {
+    expect(alreadyDoneLine(1)).toBe('כבר בוצע: צעד אחד — הוא לא יבוצע שוב.');
+    expect(alreadyDoneLine(2)).toBe('כבר בוצע: 2 צעדים — הם לא יבוצעו שוב.');
+    expect(alreadyDoneLine(5)).toBe('כבר בוצע: 5 צעדים — הם לא יבוצעו שוב.');
   });
 });

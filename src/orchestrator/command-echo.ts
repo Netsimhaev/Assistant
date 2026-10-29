@@ -22,7 +22,9 @@ export const REASK_PREFIX = 'ייתכן שזה כבר בוצע — לבצע שו
 
 /** The line a re-ask shows when some steps already completed and will not run again (spec §10.3). */
 export function alreadyDoneLine(count: number): string {
-  return `כבר בוצע: ${count} צעדים — הם לא יבוצעו שוב.`;
+  return count === 1
+    ? 'כבר בוצע: צעד אחד — הוא לא יבוצע שוב.'
+    : `כבר בוצע: ${count} צעדים — הם לא יבוצעו שוב.`;
 }
 
 const TOO_LONG = 'הפעולה ארוכה מכדי להציג אותה בשאלה אחת — נסח/י את ההוראה בקצרה יותר.';

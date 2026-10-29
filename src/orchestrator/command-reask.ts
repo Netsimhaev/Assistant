@@ -28,12 +28,15 @@
  *   (c) `followup`, the confirmation decided 24 hours ago or more (the
  *       exemption's own window, `confirmed-command.ts`), and a step still to
  *       run. Nothing was claimed-and-lost here, so the question is plain;
- *   (d) `failed`, the confirmation decided 24 hours ago or more. The expiry
- *       case once the job woke first: `tick` wakes it, `runDueJobs` runs it,
- *       the exemption refuses the stale "כן", the step dies at stage 8 and
- *       the job fails — all before this stage looks. Bounded to the expiry:
- *       a job that failed on a fresh confirmation for any other reason is not
- *       re-asked here, and the successor guard stops any loop. It also covers
+ *   (d) `failed`, and the move to `failed` happened at or after
+ *       `decided_at + 24 hours` — the failure itself came after the "כן"
+ *       expired. The expiry case once the job woke first: `tick` wakes it,
+ *       `runDueJobs` runs it, the exemption refuses the stale "כן", the step
+ *       dies at stage 8 and the job fails — all before this stage looks.
+ *       Measured on the failure's own time (`job_steps.at`), never on the
+ *       pass's clock: a job that failed INSIDE its 24 hours (a `forbidden:`
+ *       refusal, a credential failure) is not re-asked once the day passes,
+ *       and a deploy does not re-ask every old failed command. It also covers
  *       a crash after this module moved a (c) job to `failed`.
  *
  * **Only what has not run is asked again.** The new job's plan is the
@@ -83,7 +86,7 @@ import {
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { renderConfirmationQuestion } from './command-echo.js';
 import { PhaseMovedError, createJob, linkWhatsAppMessage, transition } from './jobs.js';
-import { bindPlanToJob, completedSteps, planHashOf } from './plan-store.js';
+import { bindPlanToJob, completedSteps, loadStoredPlan, planHashOf } from './plan-store.js';
 
 /**
  * The reason an old job is moved to `failed` with when it is re-asked. The
@@ -157,7 +160,9 @@ const CANDIDATES_SQL = `
                       AND r.plan_hash = p.plan_hash AND r.step_id = s ->> 'id'
                       AND r.status = 'completed'
                  )
-            )) AS steps_left
+            )) AS steps_left,
+           (SELECT max(st.at) FROM job_steps st
+             WHERE st.job_id = j.job_id AND st.to_phase = 'failed') AS failed_at
       FROM jobs j
       JOIN instruction_confirmations c
         ON c.business_id = j.business_id AND c.job_id = j.job_id AND c.state = 'confirmed'
@@ -181,7 +186,7 @@ const CANDIDATES_SQL = `
            (phase = 'failed' AND claim_uncertain)
         OR has_unknown
         OR (phase = 'followup' AND decided_at <= now() - interval '24 hours')
-        OR (phase = 'failed' AND decided_at <= now() - interval '24 hours')
+        OR (phase = 'failed' AND failed_at >= decided_at + interval '24 hours')
      )
    ORDER BY job_id
    LIMIT $3`;
@@ -269,6 +274,15 @@ async function reaskOne(
   const instruction = await loadInstructionForJob(oldJobId, { businessId });
   if (instruction === null) throw new Error(`command re-ask: job ${oldJobId} has no instruction`);
 
+  // One fact, one hash: the plan the old job is bound to must be the one the
+  // owner chose. If they differ, which steps "completed" is a question about
+  // a plan nobody confirmed — refuse rather than guess.
+  const bound = await loadStoredPlan(oldJobId, { businessId });
+  if (bound?.planHash !== chosen.planHash) {
+    throw new Error(
+      `command re-ask: job ${oldJobId} is bound to ${bound?.planHash ?? 'nothing'}, not the confirmed plan ${chosen.planHash}`,
+    );
+  }
   const done = await completedSteps(oldJobId, chosen.planHash, { businessId });
   const residual = residualPlan(chosen.plan, new Set(done.keys()));
   if (residual === null) {

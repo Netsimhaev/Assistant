@@ -671,4 +671,53 @@ describe('reaskFailedCommands', () => {
     const again = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
     expect(again.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
   });
+
+  /**
+   * A command that failed at `failedAgo` after a "כן" given at `decidedAgo`
+   * (Postgres intervals, back from now), with its step still to run.
+   */
+  async function failedAt(decidedAgo: string, failedAgo: string): Promise<string> {
+    const { jobId } = await seedCommand();
+    await transition(jobId, { to: 'failed', actor: 'orchestrator', reason: 'forbidden:x', businessId: BUSINESS });
+    await getPool().query(
+      `UPDATE instruction_confirmations SET decided_at = now() - $2::interval WHERE job_id = $1`,
+      [jobId, decidedAgo],
+    );
+    await getPool().query(
+      `UPDATE job_steps SET at = now() - $2::interval WHERE job_id = $1 AND to_phase = 'failed'`,
+      [jobId, failedAgo],
+    );
+    return jobId;
+  }
+
+  it('a command that failed inside its 24 hours is not re-asked once the day has passed', async () => {
+    const jobId = await failedAt('25 hours', '24 hours 30 minutes');
+    expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [], errored: [] });
+    expect(await reasksOf(jobId)).toEqual([]);
+  });
+
+  it('a command that failed early, 30 days ago, is not re-asked on deploy', async () => {
+    const jobId = await failedAt('30 days 1 hour', '30 days');
+    expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [], errored: [] });
+    expect(await reasksOf(jobId)).toEqual([]);
+  });
+
+  it('a failure after the 24-hour boundary is re-asked', async () => {
+    const jobId = await failedAt('26 hours', '1 hour');
+    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    expect(result.reasked).toEqual([{ oldJobId: jobId, newJobId: expect.any(String), uncertain: false }]);
+  });
+
+  it('a job bound to a plan other than the confirmed one is refused, not re-asked', async () => {
+    const { jobId, bundle } = await seedCommand();
+    await timeOut(jobId, bundle);
+    await getPool().query(`UPDATE job_plans SET plan_hash = 'not-the-chosen-hash' WHERE job_id = $1`, [jobId]);
+    const result = await reaskFailedCommands({ businessId: BUSINESS });
+    expect(result.reasked).toEqual([]);
+    expect(result.errored).toEqual([
+      { jobId, error: `command re-ask: job ${jobId} is bound to not-the-chosen-hash, not the confirmed plan ${PLAN_HASH}` },
+    ]);
+    expect(await reasksOf(jobId)).toEqual([]);
+    expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('followup');
+  });
 });
