@@ -99,14 +99,14 @@ describe('what an erasure leaves behind', () => {
    * both `presented_text` and `options`. Its sibling `confirmed_step_claims`
    * holds no content and is asserted deleted directly, not through the sweep.
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen" count is spec §5.1's own
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
    * tables `countItems`/the executor each name today" (22; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 20 also includes tables scrubbed as a consequence of
+   * stores, while the 22 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
