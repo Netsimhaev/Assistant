@@ -129,11 +129,14 @@ export interface TransitionInput {
   /**
    * Move only if the job is still in this phase, read under the same
    * `FOR UPDATE` as the move; otherwise throw `PhaseMovedError` and write
-   * nothing. For a caller that decided on the move from an earlier read — the
-   * boss-command settle sweep (`command-confirm.ts`) — and must not move a job
-   * someone else already moved on (`execute → failed` is legal, so without
-   * this a stale decision would silently fail a running job). Omitted, the
-   * move behaves exactly as it always has.
+   * nothing. For a caller that decided on the move from an earlier read and
+   * must not move a job someone else already moved on (`execute → failed` is
+   * legal, so without this a stale decision would silently fail a running
+   * job). Two callers: the boss-command confirm and settle paths
+   * (`command-confirm.ts`, every move out of `plan`), and the re-ask
+   * (`command-reask.ts`), which moves an old command job out of `followup`
+   * only if a scheduler pass has not woken it first. Omitted, the move
+   * behaves exactly as it always has.
    */
   expectFrom?: JobPhase;
 }
