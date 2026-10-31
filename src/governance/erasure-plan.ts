@@ -289,6 +289,11 @@ export interface ErasurePlan {
   documentIds: string[];
   memoryIds: string[];
   digestIds: string[];
+  /**
+   * `charter_interview_drafts` rows found by a contact anchor — see
+   * `CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE`.
+   */
+  draftIds: string[];
   /** `mail_messages` rows found by the anchor itself — see this module's header. */
   mailIds: string[];
   filePaths: string[];
@@ -670,6 +675,26 @@ export const CONFIRMED_STEP_CLAIMS_ERASED_PREDICATE = `business_id = $1 AND job_
 export const DIGESTS_ERASED_PREDICATE = `business_id = $1 AND digest_id = ANY ($2)`;
 
 /**
+ * The `charter_interview_drafts` rows an erasure destroys (migration 051), as
+ * ONE predicate — the id-list shape of `DIGESTS_ERASED_PREDICATE`.
+ *
+ * A draft holds what the owner typed during the setup interview: names,
+ * email domains and phone numbers of known parties and of do-not-contact
+ * entries. It has no job and no document, so like `digests` it is discovered
+ * by its own content alone (`answers`, through `jsonbContentMatches`). Only a
+ * CONTACT anchor reaches it: a draft records no real-world event a window
+ * could bracket (`updated_at` is when the owner last saved a step, not when
+ * anything about a person happened), and it carries no document reference of
+ * any kind — the same honesty `approval_requests` states for its orphan card.
+ * The whole row goes, not just the matching entry: the draft is a working
+ * copy the owner can answer again, and scrubbing one array element out of
+ * JSON would be a second, hand-written notion of "the part about this person".
+ *
+ * Parameters, in both places: `$1` businessId, `$2` draftIds.
+ */
+export const CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE = `business_id = $1 AND draft_id = ANY ($2)`;
+
+/**
  * The `mail_messages` rows an erasure destroys: exactly the `mailIds` the
  * plan's discovery found, the same id-list shape as `DIGESTS_ERASED_PREDICATE`.
  * A mail has no job-membership arm — it is never reached BY a job (a job in
@@ -855,6 +880,7 @@ export async function buildErasurePlan(
   const jobIds = new Set<string>();
   const documentIds = new Set<string>();
   const digestIds = new Set<string>();
+  const draftIds = new Set<string>();
   const mailIds = new Set<string>();
 
   if (anchor.kind === 'contact') {
@@ -1045,6 +1071,17 @@ export async function buildErasurePlan(
       [businessId, pattern],
       'digest_id',
     )) digestIds.add(digestId);
+
+    // The interview draft, by its own `answers` — no job or document leads to
+    // it. See `CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE` for why only this
+    // anchor reaches it.
+    for (const draftId of await idsFrom(
+      db,
+      `SELECT draft_id FROM charter_interview_drafts
+        WHERE business_id = $1 AND ${jsonbContentMatches('answers', '$2')}`,
+      [businessId, pattern],
+      'draft_id',
+    )) draftIds.add(draftId);
 
     // The mailbox, by its own content — see this module's header. Two
     // sources: the mail row's own columns, and its invoice rows (the
@@ -1346,9 +1383,10 @@ export async function buildErasurePlan(
   }
 
   const digestList = [...digestIds];
+  const draftList = [...draftIds];
   const mailList = [...mailIds];
   const items = await countItems(
-    db, businessId, anchor, jobList, documentList, memoryIds, digestList, mailList,
+    db, businessId, anchor, jobList, documentList, memoryIds, digestList, draftList, mailList,
   );
 
   return {
@@ -1357,6 +1395,7 @@ export async function buildErasurePlan(
     documentIds: documentList,
     memoryIds,
     digestIds: digestList,
+    draftIds: draftList,
     mailIds: mailList,
     filePaths,
     items,
@@ -1380,6 +1419,7 @@ async function countItems(
   documentIds: string[],
   memoryIds: string[],
   digestIds: string[],
+  draftIds: string[],
   mailIds: string[],
 ): Promise<ErasureItem[]> {
   const one = async (
@@ -1410,6 +1450,13 @@ async function countItems(
       'delete',
       `SELECT count(*)::text AS n FROM digests WHERE ${DIGESTS_ERASED_PREDICATE}`,
       [businessId, digestIds],
+    ),
+    // Like `digests`: ids from discovery directly, no job or document order.
+    await one(
+      'charter_interview_drafts',
+      'delete',
+      `SELECT count(*)::text AS n FROM charter_interview_drafts WHERE ${CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE}`,
+      [businessId, draftIds],
     ),
     await one(
       'documents',

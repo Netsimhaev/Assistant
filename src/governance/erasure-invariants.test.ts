@@ -212,6 +212,30 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS],
     );
 
+    // --- Migration 051: the charter interview draft. ----------------------
+    //
+    // No job and no document — a draft belongs to the business — so, like
+    // `digests`, it is its own probe site, found only by its own `answers`.
+    // The probe sits where a real owner would type it: a do-not-contact label.
+    await db.query(
+      `INSERT INTO charter_interview_drafts (draft_id, business_id, answers)
+       VALUES ('DR-probe', $1, $2::jsonb)`,
+      [
+        BUSINESS,
+        JSON.stringify({
+          counterparties: { known: [], doNotContact: [{ label: PROBE, emailDomain: 'nowhere.example' }] },
+        }),
+      ],
+    );
+    // The narrowness control, in another business so the UNIQUE on
+    // `business_id` allows it: a predicate that dropped `business_id` would
+    // delete it.
+    await db.query(
+      `INSERT INTO charter_interview_drafts (draft_id, business_id, answers)
+       VALUES ('DR-unrelated', 'other-business', $1::jsonb)`,
+      [JSON.stringify({ counterparties: { known: [], doNotContact: [{ label: PROBE, emailDomain: 'x.example' }] } })],
+    );
+
     // --- The other seven stores of spec §5.1. ----------------------------
     //
     // The document chain first. It is reached from the job the way production
@@ -456,7 +480,18 @@ describe('what an erasure leaves behind', () => {
     expect(
       plan.items.find((item) => item.table === 'confirmed_step_claims' && item.action === 'delete')?.count,
     ).toBe(1);
+    expect(
+      plan.items.find((item) => item.table === 'charter_interview_drafts' && item.action === 'delete')?.count,
+    ).toBe(1);
     await executeErasure(plan, { businessId: BUSINESS });
+
+    const draft = await db.query('SELECT 1 FROM charter_interview_drafts WHERE draft_id = $1', ['DR-probe']);
+    expect(draft.rows).toHaveLength(0);
+    // The other business's draft is the only row the sweep below must skip:
+    // it carries the probe by design, to prove the predicate is scoped.
+    const otherDraft = await db.query('SELECT 1 FROM charter_interview_drafts WHERE draft_id = $1', ['DR-unrelated']);
+    expect(otherDraft.rows).toHaveLength(1);
+    await db.query(`DELETE FROM charter_interview_drafts WHERE draft_id = 'DR-unrelated'`);
 
     const claims = await db.query('SELECT 1 FROM confirmed_step_claims WHERE business_id = $1 AND job_id = $2', [
       BUSINESS,

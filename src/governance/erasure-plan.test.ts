@@ -409,6 +409,55 @@ describe('buildErasurePlan', () => {
     expect(digestItem).toEqual({ table: 'digests', action: 'delete', count: 1 });
   });
 
+  /**
+   * Migration 051: the interview draft holds names, domains and phones the
+   * owner typed — a do-not-contact entry is a person by definition — and it
+   * has no job and no document, so its own `answers` is the only way a
+   * contact erasure reaches it. The label carries `"` (`בע"מ`) on purpose:
+   * it is JSON-escaped in `answers::text`, so only the unescaped arm of
+   * `jsonbContentMatches` finds it.
+   */
+  it('discovers an interview draft by a name in its answers, and counts it for deletion', async () => {
+    const name = `${RONIT} בע"מ`;
+    await getPool().query(
+      `INSERT INTO charter_interview_drafts (draft_id, business_id, answers)
+       VALUES ('DR-ronit', $1, $2::jsonb)`,
+      [BUSINESS, JSON.stringify({ counterparties: { known: [], doNotContact: [{ label: name, phone: '+972541234567' }] } })],
+    );
+    await getPool().query(
+      `INSERT INTO charter_interview_drafts (draft_id, business_id, answers)
+       VALUES ('DR-other', 'other-business', $1::jsonb)`,
+      [JSON.stringify({ counterparties: { known: [], doNotContact: [{ label: name, phone: '+972541234567' }] } })],
+    );
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: name }, { businessId: BUSINESS });
+
+    expect(plan.draftIds).toEqual(['DR-ronit']);
+    expect(plan.items.find((i) => i.table === 'charter_interview_drafts')).toEqual({
+      table: 'charter_interview_drafts',
+      action: 'delete',
+      count: 1,
+    });
+  });
+
+  /**
+   * Window and document anchors reach no draft: the draft has no time a
+   * real-world event happened at, and no document reference of any kind.
+   */
+  it('reaches no interview draft from a window or a document anchor', async () => {
+    await getPool().query(
+      `INSERT INTO charter_interview_drafts (draft_id, business_id, answers) VALUES ('DR-any', $1, '{}')`,
+      [BUSINESS],
+    );
+    const window = await buildErasurePlan(
+      { kind: 'window', fromIso: '2000-01-01T00:00:00Z', toIso: '2100-01-01T00:00:00Z' },
+      { businessId: BUSINESS },
+    );
+    expect(window.draftIds).toEqual([]);
+    const document = await buildErasurePlan({ kind: 'document', documentId: 'DOC-none' }, { businessId: BUSINESS });
+    expect(document.draftIds).toEqual([]);
+  });
+
   it('classifies items as delete or scrub correctly', async () => {
     const jobId = await jobAbout(RONIT, 'action-classification');
     await writeMemory(
