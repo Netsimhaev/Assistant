@@ -27,7 +27,7 @@ export const DataClass = z.enum([
 ]);
 export type DataClass = z.infer<typeof DataClass>;
 
-const TimeOfDay = z
+export const TimeOfDay = z
   .string()
   .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'expected HH:MM in 24-hour form');
 
@@ -42,7 +42,7 @@ const IsoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD');
  * would not go out at 22:30 went out. A zone we cannot resolve should fail the
  * charter, not the promise.
  */
-function isResolvableTimeZone(zone: string): boolean {
+export function isResolvableTimeZone(zone: string): boolean {
   try {
     new Intl.DateTimeFormat('en-GB', { timeZone: zone });
     return true;
@@ -87,7 +87,7 @@ const DOMAIN_SHAPE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-
  * `rival.co.il`, teaches the owner nothing and leaves them guessing at
  * syntax the next time.
  */
-function emailDomainProblem(domain: string): string | null {
+export function emailDomainProblem(domain: string): string | null {
   const normalised = normaliseDomainString(domain);
   if (normalised === null) {
     return `emailDomain "${domain}" is empty once normalised, so it can never match an address`;
