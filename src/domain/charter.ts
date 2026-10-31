@@ -87,32 +87,70 @@ const DOMAIN_SHAPE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-
  * `rival.co.il`, teaches the owner nothing and leaves them guessing at
  * syntax the next time.
  */
-export function emailDomainProblem(domain: string): string | null {
-  const normalised = normaliseDomainString(domain);
-  if (normalised === null) {
-    return `emailDomain "${domain}" is empty once normalised, so it can never match an address`;
-  }
-  if (DOMAIN_SHAPE.test(normalised)) return null;
+/**
+ * The one classification behind both messages below. Each wording is a
+ * rendering of the same verdict, so the English (signing, `compileCharter`)
+ * and Hebrew (the owner-facing setup interview) validators can never
+ * disagree on what is accepted.
+ */
+type EmailDomainIssue =
+  | { kind: 'empty' }
+  | { kind: 'wildcard'; bare: string }
+  | { kind: 'address' }
+  | { kind: 'malformed' };
 
-  if (normalised.startsWith('*.')) {
-    // Not normalised away to the bare domain: an owner who writes a wildcard
-    // should learn that the plain form already does what they meant.
-    return (
-      `emailDomain "${domain}" is not a domain — write "${normalised.slice(2)}" instead. ` +
-      'A bare domain already covers every subdomain of it, because the match is anchored ' +
-      'on the label boundary'
-    );
+function emailDomainIssue(domain: string): EmailDomainIssue | null {
+  const normalised = normaliseDomainString(domain);
+  if (normalised === null) return { kind: 'empty' };
+  if (DOMAIN_SHAPE.test(normalised)) return null;
+  // Not normalised away to the bare domain: an owner who writes a wildcard
+  // should learn that the plain form already does what they meant.
+  if (normalised.startsWith('*.')) return { kind: 'wildcard', bare: normalised.slice(2) };
+  if (normalised.includes('@')) return { kind: 'address' };
+  return { kind: 'malformed' };
+}
+
+export function emailDomainProblem(domain: string): string | null {
+  const issue = emailDomainIssue(domain);
+  if (issue === null) return null;
+  switch (issue.kind) {
+    case 'empty':
+      return `emailDomain "${domain}" is empty once normalised, so it can never match an address`;
+    case 'wildcard':
+      return (
+        `emailDomain "${domain}" is not a domain — write "${issue.bare}" instead. ` +
+        'A bare domain already covers every subdomain of it, because the match is anchored ' +
+        'on the label boundary'
+      );
+    case 'address':
+      return `emailDomain "${domain}" is an address, not a domain — write the part after the "@"`;
+    case 'malformed':
+      return (
+        `emailDomain "${domain}" is not a domain: expected at least two labels of letters, ` +
+        'digits and inner hyphens (for example "rival.co.il"), with no scheme, path, "*" or ' +
+        'leading dot'
+      );
   }
-  if (normalised.includes('@')) {
-    return (
-      `emailDomain "${domain}" is an address, not a domain — write the part after the "@"`
-    );
+}
+
+/**
+ * `emailDomainProblem` in Hebrew, for the owner typing a domain into the
+ * setup interview. Same classification, same accept/reject — only the words
+ * differ. Signing and `compileCharter` keep the English validator.
+ */
+export function emailDomainProblemHe(domain: string): string | null {
+  const issue = emailDomainIssue(domain);
+  if (issue === null) return null;
+  switch (issue.kind) {
+    case 'empty':
+      return `הדומיין "${domain}" ריק, ולכן לעולם לא יתאים לאף כתובת.`;
+    case 'wildcard':
+      return `"${domain}" אינו דומיין — כתבו "${issue.bare}" במקום. דומיין חשוף כבר מכסה את כל תתי-הדומיינים שלו.`;
+    case 'address':
+      return `"${domain}" היא כתובת מייל, לא דומיין — כתבו רק את מה שאחרי ה-"@".`;
+    case 'malformed':
+      return `"${domain}" אינו דומיין: יש לכתוב לפחות שני חלקים מופרדים בנקודה, באותיות לועזיות, ספרות ומקפים (לדוגמה "rival.co.il"), בלי http, בלי "/", בלי "*" ובלי נקודה בהתחלה.`;
   }
-  return (
-    `emailDomain "${domain}" is not a domain: expected at least two labels of letters, ` +
-    'digits and inner hyphens (for example "rival.co.il"), with no scheme, path, "*" or ' +
-    'leading dot'
-  );
 }
 
 /** Rejects a redaction pattern the engine could not compile. */

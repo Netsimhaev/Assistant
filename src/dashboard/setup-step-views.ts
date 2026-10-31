@@ -39,6 +39,7 @@ import {
   type SetupIssue,
 } from './setup-forms.js';
 import { STEP_TAGS, STEP_TITLES, STEP_WHY, issuesAt, issuesBox, setupPage } from './setup-views.js';
+import { canonicalHash } from '../util/canonical.js';
 import { escLabel, escapeHtml as esc } from './views.js';
 
 /** Maximum length of one stage-10 sentence; `AcceptedRule.text` is capped at the same. */
@@ -416,9 +417,16 @@ function ruleLine(rule: AcceptedRule): string {
   return `${escLabel(describeRule(rule))}${rule.kind === 'guidance' ? ` <span class="tag">${esc(GUIDANCE_TAG)}</span>` : ''}`;
 }
 
-function ruleButton(csrf: string, i: number, choice: string, label: string): string {
+/**
+ * Each button names an index AND the hash of the rule it was rendered beside.
+ * The index alone shifts after any splice — a double click or a stale tab
+ * would act on the neighbour — so the route refuses when the server's rule at
+ * that index no longer hashes to what the owner saw.
+ */
+function ruleButton(csrf: string, i: number, rule: AcceptedRule, choice: string, label: string): string {
   return `<form method="post" action="/setup/rule/${i}" style="display:inline">
   <input type="hidden" name="csrf" value="${esc(csrf)}">
+  <input type="hidden" name="ruleHash" value="${esc(canonicalHash(rule))}">
   <button type="submit" name="choice" value="${esc(choice)}">${esc(label)}</button>
 </form>`;
 }
@@ -431,17 +439,17 @@ function step10(view: StepView): string {
     accepted.length === 0
       ? ''
       : `<div class="card"><h3>מה כבר הוספת</h3><ul>${accepted
-          .map((r, i) => `<li>${ruleLine(r)} ${ruleButton(view.csrf, i, 'remove', 'הסר')}</li>`)
+          .map((r, i) => `<li>${ruleLine(r)} ${ruleButton(view.csrf, i, r, 'remove', 'הסר')}</li>`)
           .join('')}</ul></div>`;
   const pendingHtml = pending
     .map(
       (r, i) => `<div class="card">
 <p>כתבת: „${escLabel(r.text)}”</p>
 <p>הבנתי: ${ruleLine(r)}. נכון?</p>
-${ruleButton(view.csrf, i, 'accept', 'כן')}
-${ruleButton(view.csrf, i, 'fix', 'תקן')}
-${ruleButton(view.csrf, i, 'guidance', 'שמור רק כהנחיה')}
-${ruleButton(view.csrf, i, 'delete', 'מחק')}
+${ruleButton(view.csrf, i, r, 'accept', 'כן')}
+${ruleButton(view.csrf, i, r, 'fix', 'תקן')}
+${ruleButton(view.csrf, i, r, 'guidance', 'שמור רק כהנחיה')}
+${ruleButton(view.csrf, i, r, 'delete', 'מחק')}
 </div>`,
     )
     .join('');

@@ -6,7 +6,7 @@ import { closePool, getPool } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { activeCharterVersion, installCharter } from '../charter/store.js';
-import { emailDomainProblem } from '../domain/charter.js';
+import { emailDomainProblemHe } from '../domain/charter.js';
 import { loadDraft, saveSection } from '../charter/interview/draft-store.js';
 import { completeAnswers } from '../charter/interview/test-answers.js';
 import type { AcceptedRule } from '../charter/interview/answers.js';
@@ -53,6 +53,14 @@ async function login(baseUrl: string): Promise<string> {
   const pair = (res.headers.get('set-cookie') ?? '').split(';')[0];
   if (!pair) throw new Error('no session cookie');
   return pair;
+}
+
+/** The `ruleHash` on the buttons of rule `index` (every button of a rule carries the same one). */
+function ruleHashOf(html: string, index: number): string {
+  const re = new RegExp(String.raw`action="/setup/rule/${index}"[\s\S]*?name="ruleHash" value="([0-9a-f]+)"`);
+  const match = re.exec(html);
+  if (!match?.[1]) throw new Error(`no ruleHash for rule ${index}`);
+  return match[1];
 }
 
 function csrfOf(html: string): string {
@@ -162,7 +170,8 @@ describe('the interview steps', () => {
     });
     expect(res.status).toBe(400);
     const body = await res.text();
-    expect(body).toContain(escapeHtml(emailDomainProblem('*.rival.co.il') ?? 'missing'));
+    expect(body).toContain(escapeHtml(emailDomainProblemHe('*.rival.co.il') ?? 'missing'));
+    expect(body).toContain('כתבו &quot;rival.co.il&quot; במקום');
     // What was typed is shown back.
     expect(body).toContain('value="*.rival.co.il"');
     expect((await loadDraft(BUSINESS))?.answers.counterparties).toBeUndefined();
@@ -262,6 +271,7 @@ describe('stage 10', () => {
     // The form names an index only; any rule fields it smuggles are ignored.
     const chosen = await post(baseUrl, cookie, '/setup/rule/0', {
       csrf: csrfOf(page),
+      ruleHash: ruleHashOf(page, 0),
       choice: 'accept',
       kind: 'forbid',
       actionClasses: 'purchase.place',
@@ -270,6 +280,37 @@ describe('stage 10', () => {
     const extra = (await loadDraft(BUSINESS))?.answers.extra;
     expect(extra?.pending).toEqual([]);
     expect(extra?.accepted).toEqual([{ kind: 'forbid', text: 'לעולם לא לפרסם מחירים', actionClasses: ['media.publish'] }]);
+  });
+
+  it('a choice repeated on a shifted index is refused and the other rule is untouched', async () => {
+    const baseUrl = await startServer(async (text) => ({ kind: 'guidance', text }));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    await post(baseUrl, cookie, '/setup/rule', { csrf, text: 'ראשון' });
+    await post(baseUrl, cookie, '/setup/rule', { csrf, text: 'שני' });
+    const page = await (await get(baseUrl, cookie, '/setup/step/10')).text();
+    const choice = { csrf, ruleHash: ruleHashOf(page, 0), choice: 'delete' };
+
+    // A double click: the same form, posted twice.
+    expect((await post(baseUrl, cookie, '/setup/rule/0', choice)).status).toBe(303);
+    const second = await post(baseUrl, cookie, '/setup/rule/0', choice);
+    expect(second.status).toBe(409);
+    expect(await second.text()).toContain('לא בוצעה כל פעולה');
+
+    expect((await loadDraft(BUSINESS))?.answers.extra).toEqual({
+      accepted: [],
+      pending: [{ kind: 'guidance', text: 'שני' }],
+    });
+  });
+
+  it('refuses a choice without the rule hash', async () => {
+    const baseUrl = await startServer(async (text) => ({ kind: 'guidance', text }));
+    const cookie = await login(baseUrl);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
+    await post(baseUrl, cookie, '/setup/rule', { csrf, text: 'ראשון' });
+    const res = await post(baseUrl, cookie, '/setup/rule/0', { csrf, choice: 'accept' });
+    expect(res.status).toBe(409);
+    expect((await loadDraft(BUSINESS))?.answers.extra?.pending).toHaveLength(1);
   });
 
   it('refuses a sentence over 500 characters before calling the proposer', async () => {
@@ -291,7 +332,8 @@ describe('stage 10', () => {
     const cookie = await login(baseUrl);
     const csrf = await csrfFor(baseUrl, cookie, '/setup/step/10');
     await post(baseUrl, cookie, '/setup/rule', { csrf, text: 'לא להגיד שאנחנו זולים' });
-    await post(baseUrl, cookie, '/setup/rule/0', { csrf, choice: 'guidance' });
+    const page = await (await get(baseUrl, cookie, '/setup/step/10')).text();
+    await post(baseUrl, cookie, '/setup/rule/0', { csrf, ruleHash: ruleHashOf(page, 0), choice: 'guidance' });
     expect((await loadDraft(BUSINESS))?.answers.extra?.accepted).toEqual([
       { kind: 'guidance', text: 'לא להגיד שאנחנו זולים' },
     ]);

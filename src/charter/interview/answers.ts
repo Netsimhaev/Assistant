@@ -4,7 +4,7 @@ import {
   CharterVoice,
   TimeOfDay,
   Weekday,
-  emailDomainProblem,
+  emailDomainProblemHe,
   isResolvableTimeZone,
 } from '../../domain/charter.js';
 import { AutonomyMode } from '../../governance/autonomy-mode.js';
@@ -22,7 +22,7 @@ export type InterviewLevel = z.infer<typeof InterviewLevel>;
 
 /**
  * A person or company named by the owner. The domain is checked with the
- * charter's own validator (same message), and the phone must survive
+ * charter's own classification, in Hebrew (`emailDomainProblemHe` accepts exactly what `emailDomainProblem` accepts), and the phone must survive
  * `authorityNumberKey` — a form that merely "normalises to something" would be
  * signed and then never match anything.
  */
@@ -40,7 +40,7 @@ export const CounterpartyEntry = z
       });
     }
     if (entry.emailDomain !== undefined) {
-      const problem = emailDomainProblem(entry.emailDomain);
+      const problem = emailDomainProblemHe(entry.emailDomain);
       if (problem !== null) {
         ctx.addIssue({ code: 'custom', path: ['emailDomain'], message: problem });
       }

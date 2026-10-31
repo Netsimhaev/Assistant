@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { emailDomainProblem } from '../../domain/charter.js';
+import { emailDomainProblem, emailDomainProblemHe } from '../../domain/charter.js';
 import {
   CounterpartyEntry,
   INTERVIEW_SECTIONS,
@@ -26,12 +26,33 @@ const principal = (whatsapp: string | null) => ({
 });
 
 describe('interview answers schema', () => {
-  it("rejects a wildcard domain with the charter's own message", () => {
+  it('rejects a wildcard domain in Hebrew, naming the bare domain to write instead', () => {
     const r = CounterpartyEntry.safeParse({ label: 'מתחרה', emailDomain: '*.rival.co.il' });
     expect(r.success).toBe(false);
-    const expected = emailDomainProblem('*.rival.co.il');
-    expect(expected).not.toBeNull();
+    const expected = emailDomainProblemHe('*.rival.co.il');
+    expect(expected).toContain('כתבו "rival.co.il" במקום');
     expect(r.error?.issues.map((i) => i.message)).toContain(expected);
+  });
+
+  it('the Hebrew and the English domain validators accept and reject exactly the same inputs', () => {
+    const inputs = [
+      'rival.co.il',
+      'RIVAL.co.il.',
+      '@rival.co.il',
+      '*.rival.co.il',
+      'dana@rival.co.il',
+      '.rival.co.il',
+      'https://rival.co.il',
+      'rival.co.il/',
+      'rival',
+      '',
+      '   ',
+      'a-b.example.com',
+      '-bad.example.com',
+    ];
+    for (const input of inputs) {
+      expect(emailDomainProblemHe(input) === null, input).toBe(emailDomainProblem(input) === null);
+    }
   });
 
   it('rejects a principal WhatsApp number in local form', () => {

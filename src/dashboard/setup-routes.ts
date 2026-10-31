@@ -245,7 +245,10 @@ const RULE_CHOICES = new Set(['accept', 'guidance', 'delete', 'fix', 'remove']);
 
 /**
  * `POST /setup/rule/:i` — the owner's choice on proposal `i`. The rule moved
- * is the server's `pending[i]`, never anything from the form. `fix` ("תקן")
+ * is the server's `pending[i]`, never anything from the form — and only if it
+ * still hashes to the `ruleHash` the button was rendered with: after any
+ * splice the index names a different rule, and a double click or a stale tab
+ * must be refused (409), not applied to the neighbour. `fix` ("תקן")
  * deletes the proposal and shows its sentence back in the box to re-submit;
  * `remove` takes back an accepted rule.
  */
@@ -265,9 +268,10 @@ export async function handleRuleChoice(
   const extra = extraOf(draft);
   const list = choice === 'remove' ? extra.accepted : extra.pending;
   const rule = list[index];
-  if (rule === undefined) {
+  // The index is only a position; the hash says WHICH rule the owner saw.
+  if (rule === undefined || canonicalHash(rule) !== form.get('ruleHash')) {
     return renderStep10(res, 409, businessId, session, {
-      ruleError: 'ההצעה הזו כבר לא קיימת — אולי כבר החלטת עליה. לא בוצעה כל פעולה.',
+      ruleError: 'ההצעה הזו כבר השתנתה או לא קיימת — אולי כבר החלטת עליה. לא בוצעה כל פעולה; זו הרשימה כפי שהיא עכשיו.',
     });
   }
   list.splice(index, 1);
