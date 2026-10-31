@@ -10,12 +10,17 @@
  *
  * The step bodies live in `setup-step-views.ts`; this file is the frame.
  */
-import type { CharterSummary } from '../charter/interview/summary.js';
+import type { CharterSummary, SummaryCounterparty, SummaryPrincipal } from '../charter/interview/summary.js';
 import {
   AUTHORITY_NOTE,
+  AUTONOMY_MODE_INTERVIEW_HE,
   BOSS_COMMAND_NOTE,
   GUIDANCE_TAG,
+  NO_CHANGES_NOTE,
 } from '../charter/interview/summary.js';
+import type { AutonomyMode } from '../governance/autonomy-mode.js';
+import { MAIL_PROVIDER_NAME } from '../mail/mailbox.js';
+import { MAILBOX_AUTHORISATION_TEXT, RESTART_NOTE } from './mailbox-connect.js';
 import type { InterviewAnswersDraft } from '../charter/interview/answers.js';
 import { INTERVIEW_SECTIONS } from '../charter/interview/answers.js';
 import type { SetupIssue } from './setup-forms.js';
@@ -143,6 +148,40 @@ function lineList(lines: readonly { label: string; levelHe: string }[], empty: s
   return `<ul>${lines.map((l) => `<li>${escLabel(l.label)} <span class="muted">(${escLabel(l.levelHe)})</span></li>`).join('')}</ul>`;
 }
 
+/** "Whose instructions I take" — every channel the charter names, typed values through `escLabel`. */
+function principalCard(principal: SummaryPrincipal | null): string {
+  const body =
+    principal === null
+      ? '<p class="muted">לא הוגדר בעלים.</p>'
+      : `<ul><li>שם: ${escLabel(principal.displayName)}</li>
+<li>וואטסאפ: ${principal.whatsapp === null ? 'לא הוגדר' : `<bdi>${escLabel(principal.whatsapp)}</bdi>`}</li>
+<li>מייל: ${principal.email === null ? 'לא הוגדר' : `<bdi>${escLabel(principal.email)}</bdi>`}</li></ul>`;
+  return `<div class="card"><h2>ממי אני מקבלת הוראות</h2>${body}</div>`;
+}
+
+/** "Known customers and suppliers" — each with the domain/phone that makes a recipient count as known. */
+function knownCard(known: readonly SummaryCounterparty[]): string {
+  const items = known.map((c) => {
+    const handles = [c.emailDomain, c.phone].filter((h): h is string => h !== null);
+    const tail = handles.length === 0 ? '' : ` — ${handles.map((h) => `<bdi>${escLabel(h)}</bdi>`).join(', ')}`;
+    return `<li>${escLabel(c.label)}${tail}</li>`;
+  });
+  const body = items.length === 0 ? '<p class="muted">אין.</p>' : `<ul>${items.join('')}</ul>`;
+  return `<div class="card"><h2>לקוחות וספקים מוכרים</h2>${body}</div>`;
+}
+
+/**
+ * A mailbox this signature adds: the same two statements the connections
+ * screen's own mailbox sign page carries (`mailbox-connect.ts`) — what
+ * reading and labelling it authorises, and that the scheduler must restart.
+ */
+function mailboxCard(summary: CharterSummary): string {
+  if (summary.mailboxAdded === null) return '';
+  return `<div class="card"><h2>תיבת המייל של העסק — ${esc(MAIL_PROVIDER_NAME[summary.mailboxAdded])}</h2>
+<p>${esc(MAILBOX_AUTHORISATION_TEXT)}</p>
+<p class="muted">${esc(RESTART_NOTE)}</p></div>`;
+}
+
 /**
  * The summary and the sign form. Everything here comes from `summarizeCharter`
  * of the UNSIGNED charter the frozen draft builds — the same object whose hash
@@ -155,12 +194,14 @@ export function renderSummary(options: {
   csrf: string;
   /** Who the rules bind, from the same unsigned charter — names the owner typed. */
   business: { legalName: string; tradeName: string; principal: string | null };
+  /** The dial applied right after signing (step 9) — not part of the rules, but bound by the hash. */
+  mode: AutonomyMode;
 }): string {
   const { summary, business } = options;
   const changes =
     summary.changes === null
       ? ''
-      : `<div class="card"><h2>מה משתנה לעומת הכללים הנוכחיים</h2>${bulletList(summary.changes, 'אין שינויים בכללים שנשאלו כאן.')}</div>`;
+      : `<div class="card"><h2>מה משתנה לעומת הכללים הנוכחיים</h2>${bulletList(summary.changes, NO_CHANGES_NOTE)}</div>`;
   const preserved =
     summary.preserved.length === 0
       ? ''
@@ -183,6 +224,7 @@ export function renderSummary(options: {
       business.principal === null ? '' : `, בחתימת ${escLabel(business.principal)}`
     }.</p>
 ${changes}
+${principalCard(summary.principal)}
 <div class="columns">
   <div class="card"><h3>מה אני יכולה לעשות</h3>${lineList(summary.can, 'אין.')}</div>
   <div class="card"><h3>מותר, אבל עוד לא פועל</h3>${lineList(summary.notYetWorking, 'אין.')}</div>
@@ -190,6 +232,9 @@ ${changes}
   <div class="card"><h3>דברים שאני לא יודעת לעשות בכלל</h3>${bulletList(summary.cannotAtAll, 'אין.')}</div>
 </div>
 <div class="card"><h2>גבולות</h2>${bulletList(summary.limits, 'לא נקבעו גבולות נוספים.')}</div>
+${knownCard(summary.knownCounterparties)}
+${mailboxCard(summary)}
+<p class="note">רמת החופש אחרי החתימה: <b>${esc(AUTONOMY_MODE_INTERVIEW_HE[options.mode])}</b> — לא חלק מהכללים; אפשר לשנות בכל רגע במסך „כמה חופש לתת”.</p>
 <div class="card"><h2>מה ידוע לי על העסק</h2>${guidance}</div>
 ${defaults}
 ${preserved}

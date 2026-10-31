@@ -19,12 +19,16 @@ import {
 import {
   CEILING_NOTE,
   DOCUMENTS_NOTE,
+  EMOJI_POLICY_HE,
   GUIDANCE_TAG,
   NEVER_ALONE_NOTE,
   ONLY_YOU_APPROVE_NOTE,
+  REGISTER_HE,
   REPLY_ALONE_NOTE,
+  WEEKDAY_HE,
   WHATSAPP_NOTE,
 } from '../charter/interview/summary.js';
+import type { AutonomyMode } from '../governance/autonomy-mode.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { Weekday } from '../domain/charter.js';
 import { ACTION_CLASS_HE } from '../domain/labels.js';
@@ -63,6 +67,11 @@ export interface StepView {
   /** Step 10: text to prefill (a "fix"), and an error on the proposal form. */
   ruleText?: string;
   ruleError?: string;
+  /**
+   * Step 9: the dial as it stands now, preselected while the section is
+   * unsaved — on an edit the owner starts from what is live, not from `off`.
+   */
+  currentMode?: AutonomyMode;
 }
 
 function obj(v: unknown): Record<string, unknown> {
@@ -183,17 +192,8 @@ ${field('מה כתובת המייל שלך?', 'email', str(v['email']), view.iss
   );
 }
 
-const REGISTER_HE = [
-  ['formal', 'רשמי'],
-  ['professional', 'מקצועי'],
-  ['warm', 'חם'],
-  ['casual', 'קליל'],
-] as const;
-const EMOJI_HE = [
-  ['never', 'אף פעם'],
-  ['sparingly', 'במשורה'],
-  ['match_counterparty', 'כמו הצד השני'],
-] as const;
+const REGISTER_CHOICES = Object.entries(REGISTER_HE);
+const EMOJI_CHOICES = Object.entries(EMOJI_POLICY_HE);
 
 function step3(view: StepView): string {
   const v = obj(view.value);
@@ -201,23 +201,13 @@ function step3(view: StepView): string {
     view,
     form(
       view,
-      `<fieldset><legend>איך לדבר עם לקוחות?</legend>${radios('register', REGISTER_HE, str(v['register']) || 'professional')}${issuesAt(view.issues, ['register'])}</fieldset>
+      `<fieldset><legend>איך לדבר עם לקוחות?</legend>${radios('register', REGISTER_CHOICES, str(v['register']) || 'professional')}${issuesAt(view.issues, ['register'])}</fieldset>
 ${field('איך לחתום על הודעות?', 'signOff', str(v['signOff']), view.issues)}
-<fieldset><legend>אימוג׳ים?</legend>${radios('emojiPolicy', EMOJI_HE, str(v['emojiPolicy']) || 'never')}${issuesAt(view.issues, ['emojiPolicy'])}</fieldset>
+<fieldset><legend>אימוג׳ים?</legend>${radios('emojiPolicy', EMOJI_CHOICES, str(v['emojiPolicy']) || 'never')}${issuesAt(view.issues, ['emojiPolicy'])}</fieldset>
 ${area('מילים או הבטחות שאסור לי לומר לעולם?', 'mustNeverSay', strList(v['mustNeverSay']).join('\n'), view.issues, 'שורה לכל ביטוי. זו התאמת מילים. מה שבאמת חשוב לחסום — חסום בשלב 6.')}`,
     ),
   );
 }
-
-const WEEKDAY_HE: Readonly<Record<Weekday, string>> = {
-  sun: 'א׳',
-  mon: 'ב׳',
-  tue: 'ג׳',
-  wed: 'ד׳',
-  thu: 'ה׳',
-  fri: 'ו׳',
-  sat: 'ש׳',
-};
 
 /** Step 4's prefill when the section is unsaved (Task 8 brief). */
 export const HOURS_PREFILL = {
@@ -405,7 +395,7 @@ function step9(view: StepView): string {
     form(
       view,
       `<fieldset><legend>האם אתה רוצה שאלמד את העסק עם הזמן, ואתחיל לבצע לבד סוגי פעולות שהוכחתי בהם?</legend>
-${radios('mode', MODE_CHOICES, str(v['mode']) || 'off')}
+${radios('mode', MODE_CHOICES, str(v['mode']) || view.currentMode || 'off')}
 <p class="muted">אפשר לשנות את זה בכל רגע במסך „כמה חופש לתת”.</p>${issuesAt(view.issues, ['mode'])}</fieldset>`,
     ),
   );

@@ -1,16 +1,20 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../../db/pool.js';
+import { closePool, getPool, type Queryable } from '../../db/pool.js';
 import { loadAutonomyMode } from '../../governance/autonomy-mode.js';
 import { resetDatabase } from '../../test/db.js';
 import { buildCharter } from '../../test/fixtures.js';
 import { activeCharterVersion, installCharter, loadCharterVersion } from '../store.js';
 import { InterviewAnswers } from './answers.js';
 import { freezeDraft, loadDraft, replaceDraft, saveSection } from './draft-store.js';
-import { shownHashFor, signAndInstallInterview } from './install.js';
+import { previousForDraft, shownHashFor, signAndInstallInterview } from './install.js';
 import { completeAnswers } from './test-answers.js';
 
 const A = 'business-a';
 const OWNER = 'dana';
+/** No test here adds a mailbox unless it says so; a preflight that is reached fails the test. */
+const NO_PREFLIGHT = async (): Promise<string | null> => {
+  throw new Error('mailbox preflight reached');
+};
 
 async function count(sql: string, params: unknown[]): Promise<number> {
   const { rows } = await getPool().query<{ n: string }>(sql, params);
@@ -49,7 +53,7 @@ describe('signAndInstallInterview', () => {
   it('first install activates the charter, writes one charter_change row, deletes the draft', async () => {
     const shownHash = await frozenDraft();
 
-    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, shownHash });
+    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash });
 
     expect(outcome.outcome).toBe('installed');
     if (outcome.outcome !== 'installed') return;
@@ -78,7 +82,7 @@ describe('signAndInstallInterview', () => {
     const shownHash = await frozenDraft(answers);
     expect(await loadAutonomyMode({ businessId: A })).toBe('off');
 
-    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, shownHash });
+    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash });
 
     expect(outcome).toMatchObject({ outcome: 'installed', modeApplied: true });
     expect(await loadAutonomyMode({ businessId: A })).toBe('learn');
@@ -92,7 +96,7 @@ describe('signAndInstallInterview', () => {
     await freezeDraft(A, new Date('2026-10-31T11:00:00.000Z'));
     expect((await loadDraft(A))?.frozenAt?.getTime()).not.toBe(draft?.frozenAt?.getTime());
 
-    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, shownHash });
+    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash });
 
     expect(outcome).toEqual({ outcome: 'hash_mismatch' });
     expect(await charterRows()).toBe(0);
@@ -101,18 +105,18 @@ describe('signAndInstallInterview', () => {
   });
 
   it('refuses an unfrozen draft and a missing or partial one', async () => {
-    expect(await signAndInstallInterview({ businessId: A, username: OWNER, shownHash: 'x' })).toEqual({
+    expect(await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash: 'x' })).toEqual({
       outcome: 'incomplete',
     });
 
     await saveSection(A, 'business', completeAnswers().business);
     await freezeDraft(A, new Date('2026-10-31T10:00:00.000Z'));
-    expect(await signAndInstallInterview({ businessId: A, username: OWNER, shownHash: 'x' })).toEqual({
+    expect(await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash: 'x' })).toEqual({
       outcome: 'incomplete',
     });
 
     await replaceDraft(A, completeAnswers(), null);
-    expect(await signAndInstallInterview({ businessId: A, username: OWNER, shownHash: 'x' })).toEqual({
+    expect(await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash: 'x' })).toEqual({
       outcome: 'not_frozen',
     });
     expect(await charterRows()).toBe(0);
@@ -123,7 +127,7 @@ describe('signAndInstallInterview', () => {
     // Someone installed a charter after this draft started from "none".
     await installCharter(buildCharter({ version: 'other-1' }), { businessId: A });
 
-    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, shownHash });
+    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash });
 
     expect(outcome).toEqual({ outcome: 'stale' });
     expect(await activeCharterVersion(A)).toBe('other-1');
@@ -138,7 +142,7 @@ describe('signAndInstallInterview', () => {
     await replaceDraft(A, completeAnswers(), 'gone-1');
     await freezeDraft(A, new Date('2026-10-31T10:00:00.000Z'));
 
-    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, shownHash });
+    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash });
 
     expect(outcome).toEqual({ outcome: 'stale' });
     expect(await activeCharterVersion(A)).toBe('base-1');
@@ -159,7 +163,7 @@ describe('signAndInstallInterview', () => {
     if (draft === null) throw new Error('draft missing');
     const shownHash = shownHashFor(draft, A, null);
 
-    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, shownHash });
+    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash });
 
     expect(outcome.outcome).toBe('installed');
     if (outcome.outcome !== 'installed') return;
@@ -170,8 +174,8 @@ describe('signAndInstallInterview', () => {
     const shownHash = await frozenDraft();
 
     const outcomes = await Promise.all([
-      signAndInstallInterview({ businessId: A, username: OWNER, shownHash }),
-      signAndInstallInterview({ businessId: A, username: OWNER, shownHash }),
+      signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash }),
+      signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash }),
     ]);
 
     const kinds = outcomes.map((o) => o.outcome).sort();
@@ -183,13 +187,13 @@ describe('signAndInstallInterview', () => {
   });
 
   it('an edit supersedes the previous charter', async () => {
-    const first = await signAndInstallInterview({ businessId: A, username: OWNER, shownHash: await frozenDraft() });
+    const first = await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash: await frozenDraft() });
     if (first.outcome !== 'installed') throw new Error(`first install: ${first.outcome}`);
 
     const edited = completeAnswers();
     edited.business.employees = 9;
     const shownHash = await frozenDraft(edited, first.charterVersion);
-    const second = await signAndInstallInterview({ businessId: A, username: OWNER, shownHash });
+    const second = await signAndInstallInterview({ businessId: A, username: OWNER, mailboxPreflight: NO_PREFLIGHT, shownHash });
 
     expect(second.outcome).toBe('installed');
     if (second.outcome !== 'installed') return;
@@ -204,5 +208,73 @@ describe('signAndInstallInterview', () => {
     expect(rows[1]?.reason).toBe(
       `charter signed through the setup interview by ${OWNER}, superseding ${first.charterVersion}`,
     );
+  });
+});
+
+describe('a mailbox the signature adds', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  it('a failing preflight refuses, and nothing is installed or deleted', async () => {
+    const answers = completeAnswers();
+    answers.reading = { mailbox: 'google', documents: false };
+    const shownHash = await frozenDraft(answers);
+    const asked: string[] = [];
+
+    const outcome = await signAndInstallInterview({
+      businessId: A,
+      username: OWNER,
+      shownHash,
+      mailboxPreflight: async (provider) => {
+        asked.push(provider);
+        return 'חסר GOOGLE_OAUTH_CLIENT_SECRET.';
+      },
+    });
+
+    expect(outcome).toEqual({ outcome: 'preflight_failed', reason: 'חסר GOOGLE_OAUTH_CLIENT_SECRET.' });
+    expect(asked).toEqual(['google']);
+    expect(await activeCharterVersion(A)).toBeNull();
+    expect(await charterRows()).toBe(0);
+    expect(await changeRows()).toBe(0);
+    expect(await draftRows()).toBe(1);
+  });
+
+  it('a passing preflight installs', async () => {
+    const answers = completeAnswers();
+    answers.reading = { mailbox: 'microsoft', documents: false };
+    const shownHash = await frozenDraft(answers);
+    const outcome = await signAndInstallInterview({
+      businessId: A,
+      username: OWNER,
+      shownHash,
+      mailboxPreflight: async () => null,
+    });
+    expect(outcome.outcome).toBe('installed');
+  });
+});
+
+describe('previousForDraft', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  it('reads an unparsable base as "no previous" — and only a parse failure', async () => {
+    await installCharter(buildCharter({ version: 'broken-1' }), { businessId: A });
+    await getPool().query(
+      `UPDATE charter_versions SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
+        WHERE business_id = $1`,
+      [A],
+    );
+    expect(await previousForDraft({ baseCharterVersion: 'broken-1' }, A)).toEqual({ ok: true, previous: null });
+  });
+
+  it('rethrows an error that is not a parse failure', async () => {
+    const down: Queryable = {
+      query: async () => {
+        throw new Error('connection terminated');
+      },
+    } as unknown as Queryable;
+    await expect(previousForDraft({ baseCharterVersion: 'v1' }, A, down)).rejects.toThrow('connection terminated');
   });
 });

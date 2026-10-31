@@ -2743,7 +2743,7 @@ async function route(
   if (method === 'GET' && pathname === '/setup/edit') return handleSetupEdit(res, businessId, session);
   if (method === 'GET' && pathname === '/setup/summary') return handleSummaryGet(res, businessId, session);
   if (method === 'POST' && pathname === '/setup/sign') {
-    return handleSignPost(res, businessId, session, await readFormBody(req));
+    return handleSignPost(res, businessId, session, await readFormBody(req), setupOptions);
   }
   if (method === 'POST' && pathname === '/setup/rule') {
     return handleRulePost(res, businessId, session, await readFormBody(req), setupOptions);
@@ -2961,7 +2961,10 @@ export function createServer(options: DashboardOptions = {}): Server {
   };
 
   const server = createHttpServer((req, res) => {
-    const setupOptions: SetupOptions = options.ruleProposer !== undefined ? { ruleProposer: options.ruleProposer } : {};
+    const setupOptions: SetupOptions = {
+      credentialKeyPath: oauthOptions.credentialKeyPath,
+      ...(options.ruleProposer !== undefined ? { ruleProposer: options.ruleProposer } : {}),
+    };
     route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {

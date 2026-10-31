@@ -5,6 +5,12 @@ export const MAILBOX_SYSTEM = 'mailbox';
 
 export type MailProvider = 'google' | 'microsoft';
 
+/** Owner-facing provider names. */
+export const MAIL_PROVIDER_NAME: Readonly<Record<MailProvider, string>> = {
+  google: 'Google (Gmail)',
+  microsoft: 'Microsoft 365 (Outlook)',
+};
+
 /** The closed label set. Nothing else is ever written to a mailbox as a label. */
 export const MAIL_LABELS = { invoice: 'חשבוניות', question: 'ממתין לתשובה' } as const;
 

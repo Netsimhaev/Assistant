@@ -1,4 +1,6 @@
 import { once } from 'node:events';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -11,7 +13,9 @@ import { loadDraft, saveSection } from '../charter/interview/draft-store.js';
 import { completeAnswers } from '../charter/interview/test-answers.js';
 import type { AcceptedRule } from '../charter/interview/answers.js';
 import type { RuleProposer } from '../charter/interview/rule-proposal.js';
-import { loadAutonomyMode } from '../governance/autonomy-mode.js';
+import { loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
+import { NO_CHANGES_NOTE } from '../charter/interview/summary.js';
+import { MAILBOX_AUTHORISATION_TEXT, PREFLIGHT_REFUSAL_TITLE, RESTART_NOTE } from './mailbox-connect.js';
 import { escapeHtml } from './views.js';
 import { createOwner } from './auth.js';
 import { createServer } from './server.js';
@@ -474,5 +478,109 @@ describe('edit the rules', () => {
     const cookie = await login(baseUrl);
     const res = await get(baseUrl, cookie, '/setup/edit');
     expect(res.headers.get('location')).toBe('/setup');
+  });
+});
+
+async function signViaSummary(baseUrl: string, cookie: string): Promise<Response> {
+  const html = await (await get(baseUrl, cookie, '/setup/summary')).text();
+  const shownHash = /name="shownHash" value="([0-9a-f]+)"/.exec(html)?.[1] ?? '';
+  return post(baseUrl, cookie, '/setup/sign', { csrf: csrfOf(html), shownHash });
+}
+
+describe('final review fixes', () => {
+  it('the summary shows whose instructions I take and the known counterparties, escaped', async () => {
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    await completeViaPosts(baseUrl, cookie);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/8');
+    await post(baseUrl, cookie, '/setup/step/8', {
+      ...stepForms()[8],
+      csrf,
+      known0_label: '<i>‮ספק',
+    });
+    const body = await (await get(baseUrl, cookie, '/setup/summary')).text();
+    expect(body).toContain('ממי אני מקבלת הוראות');
+    expect(body).toContain('+972541234567');
+    expect(body).toContain('dana@example.co.il');
+    expect(body).toContain('לקוחות וספקים מוכרים');
+    expect(body).toContain('&lt;i&gt;ספק');
+    expect(body).toContain('supplier.co.il');
+    expect(body).not.toContain('‮');
+    expect(body).toContain('רמת החופש אחרי החתימה: <b>שואלת תמיד</b>');
+  });
+
+  it('a newly chosen mailbox puts the mailbox-signing text on the summary', async () => {
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    await completeViaPosts(baseUrl, cookie);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/5');
+    await post(baseUrl, cookie, '/setup/step/5', { csrf, mailbox: 'google', documents: 'no' });
+    const body = await (await get(baseUrl, cookie, '/setup/summary')).text();
+    expect(body).toContain(escapeHtml(MAILBOX_AUTHORISATION_TEXT));
+    expect(body).toContain(escapeHtml(RESTART_NOTE));
+
+    const without = await (async () => {
+      await post(baseUrl, cookie, '/setup/step/5', { csrf, mailbox: 'none', documents: 'no' });
+      return (await get(baseUrl, cookie, '/setup/summary')).text();
+    })();
+    expect(without).not.toContain(escapeHtml(MAILBOX_AUTHORISATION_TEXT));
+  });
+
+  it('a sign that adds a mailbox is refused when the preflight fails, and nothing changes', async () => {
+    server = createServer({ businessId: BUSINESS, port: 0, credentialKeyPath: join(tmpdir(), 'no-such-dir-xyz', 'master.key') });
+    await once(server, 'listening');
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const cookie = await login(baseUrl);
+    await completeViaPosts(baseUrl, cookie);
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/5');
+    await post(baseUrl, cookie, '/setup/step/5', { csrf, mailbox: 'microsoft', documents: 'no' });
+
+    const res = await signViaSummary(baseUrl, cookie);
+    expect(res.status).toBe(409);
+    const body = await res.text();
+    expect(body).toContain(escapeHtml(PREFLIGHT_REFUSAL_TITLE));
+    expect(body).toContain('לא בוצעה כל פעולה');
+    expect(await activeCharterVersion(BUSINESS)).toBeNull();
+    expect(await loadDraft(BUSINESS)).not.toBeNull();
+  });
+
+  it('a step with an active charter and no draft goes to /setup/edit first', async () => {
+    await installCharter(buildCharter(), { businessId: BUSINESS });
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    const getRes = await get(baseUrl, cookie, '/setup/step/3');
+    expect(getRes.status).toBe(303);
+    expect(getRes.headers.get('location')).toBe('/setup/edit');
+
+    // The CSRF token is per session, so one rendered elsewhere is valid here.
+    const csrf = csrfOf(await (await get(baseUrl, cookie, '/autonomy')).text());
+    const postRes = await post(baseUrl, cookie, '/setup/step/3', { ...stepForms()[3], csrf });
+    expect(postRes.status).toBe(303);
+    expect(postRes.headers.get('location')).toBe('/setup/edit');
+    expect(await loadDraft(BUSINESS)).toBeNull();
+  });
+
+  it('an edit: step 9 preselects the live dial, and an unchanged edit says nothing changed', async () => {
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    await completeViaPosts(baseUrl, cookie);
+    expect((await signViaSummary(baseUrl, cookie)).status).toBe(303);
+    await setAutonomyMode('learn', USERNAME, { businessId: BUSINESS });
+
+    await get(baseUrl, cookie, '/setup/edit');
+    const step9 = await (await get(baseUrl, cookie, '/setup/step/9')).text();
+    expect(step9).toContain('value="learn" checked');
+    expect(step9).not.toContain('value="off" checked');
+
+    await post(baseUrl, cookie, '/setup/step/9', { csrf: csrfOf(step9), mode: 'learn' });
+    // Step 5's documents answer is not in the charter; re-confirm it as the first pass did.
+    const unchanged = await (await get(baseUrl, cookie, '/setup/summary')).text();
+    expect(unchanged).toContain(NO_CHANGES_NOTE);
+
+    const csrf = await csrfFor(baseUrl, cookie, '/setup/step/2');
+    await post(baseUrl, cookie, '/setup/step/2', { ...stepForms()[2], csrf, whatsapp: '+972549998877' });
+    const changed = await (await get(baseUrl, cookie, '/setup/summary')).text();
+    expect(changed).not.toContain(NO_CHANGES_NOTE);
+    expect(changed).toContain('הוואטסאפ של הבעלים: +972541234567 ← +972549998877');
   });
 });

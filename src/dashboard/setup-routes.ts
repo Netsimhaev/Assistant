@@ -32,10 +32,13 @@ import { summarizeCharter } from '../charter/interview/summary.js';
 import { signedMailboxProvider } from '../charter/amend-mailbox.js';
 import { activeCharterVersion, probeActiveCharter } from '../charter/store.js';
 import type { BusinessCharter } from '../domain/charter.js';
+import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { MAILBOX_SYSTEM, type MailProvider } from '../mail/mailbox.js';
 import { proposeRuleWithModel } from '../sdk/interview-rule.js';
 import { canonicalHash } from '../util/canonical.js';
 import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
+import { PREFLIGHT_REFUSAL_TITLE, preflightRefusalMessage } from './mailbox-connect.js';
+import { oauthCeremonyPreflight } from './oauth-routes.js';
 import {
   candidateFromForm,
   firstUnsavedStep,
@@ -54,6 +57,11 @@ export interface SetupSession {
 export interface SetupOptions {
   /** Test seam: the stage-10 proposer. Production leaves it unset and the model proposes. */
   ruleProposer?: RuleProposer;
+  /**
+   * The master-key file the mailbox preflight loads — the same value the
+   * connections screen's mailbox sign receives (`OAuthRouteOptions`).
+   */
+  credentialKeyPath?: string | undefined;
 }
 
 const SECURITY_HEADERS = { 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY' } as const;
@@ -123,6 +131,8 @@ async function stepView(
     const provider = answers.reading?.mailbox ?? 'none';
     view.connections = buildConnections(provider === 'none' ? null : provider, previous).connections;
   }
+  // Step 9 preselects the dial as it is now: on an edit, the live position.
+  if (step === 9) view.currentMode = await loadAutonomyMode({ businessId });
   return view;
 }
 
@@ -139,6 +149,17 @@ export async function handleSetupIndex(res: ServerResponse, businessId: string):
 
 // --- GET/POST /setup/step/:n -------------------------------------------------
 
+/**
+ * A charter is active and no interview is in flight: an edit must start from
+ * the prefill (`/setup/edit`), never from an empty draft a step would create —
+ * a sign from there would drop everything the owner signed that was not
+ * re-typed. The same rule `handleSetupIndex` applies, at every door that can
+ * create a draft.
+ */
+async function editMustStartFromPrefill(draft: InterviewDraft | null, businessId: string): Promise<boolean> {
+  return draft === null && (await activeCharterVersion(businessId)) !== null;
+}
+
 export async function handleSetupStepGet(
   res: ServerResponse,
   businessId: string,
@@ -147,6 +168,7 @@ export async function handleSetupStepGet(
   query: URLSearchParams,
 ): Promise<void> {
   const draft = await loadDraft(businessId);
+  if (await editMustStartFromPrefill(draft, businessId)) return seeOther(res, '/setup/edit');
   const view = await stepView(businessId, session, step, draft, step === 1 && query.get('more') === '1' ? { followUp: true } : {});
   sendHtml(res, 200, renderStep(view));
 }
@@ -161,6 +183,7 @@ export async function handleSetupStepPost(
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
   const section = sectionOf(step);
   const draft = await loadDraft(businessId);
+  if (await editMustStartFromPrefill(draft, businessId)) return seeOther(res, '/setup/edit');
   let candidate = candidateFromForm(section, form, draft?.answers ?? {});
 
   // Step 5: a mailbox the base charter already declares is not the form's to
@@ -231,6 +254,7 @@ export async function handleRulePost(
       ruleError: `המשפט ארוך מדי — עד ${RULE_TEXT_MAX} תווים. אפשר לפצל אותו לכמה משפטים.`,
     });
   }
+  if (await editMustStartFromPrefill(await loadDraft(businessId), businessId)) return seeOther(res, '/setup/edit');
   const proposer = options.ruleProposer ?? proposeRuleWithModel;
   const proposal = await proposer(text);
   const draft = await loadDraft(businessId);
@@ -317,6 +341,7 @@ export async function handleSummaryGet(res: ServerResponse, businessId: string, 
         tradeName: unsigned.identity.tradeName,
         principal: unsigned.people.find((p) => p.isPrincipal)?.displayName ?? null,
       },
+      mode: parsed.data.autonomy.mode,
     }),
   );
 }
@@ -334,19 +359,35 @@ const REFUSAL: Readonly<Record<'incomplete' | 'not_frozen' | 'hash_mismatch' | '
   ],
 };
 
+/**
+ * A charter that adds the mailbox is preflighted exactly as the connections
+ * screen's mailbox sign is (`oauthCeremonyPreflight`, same key path): the
+ * signature moves `mail.send` to the mailbox, and a ceremony that cannot
+ * start would leave the business with no outgoing mail. A refusal changes
+ * nothing.
+ */
 export async function handleSignPost(
   res: ServerResponse,
   businessId: string,
   session: SetupSession,
   form: URLSearchParams,
+  options: SetupOptions,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
   const outcome = await signAndInstallInterview({
     businessId,
     username: session.username,
     shownHash: form.get('shownHash') ?? '',
+    mailboxPreflight: (provider) => oauthCeremonyPreflight(businessId, provider, options.credentialKeyPath),
   });
   if (outcome.outcome === 'installed') return seeOther(res, outcome.modeApplied ? '/' : '/?mode=failed');
+  if (outcome.outcome === 'preflight_failed') {
+    return sendHtml(
+      res,
+      409,
+      renderSetupRefusal(PREFLIGHT_REFUSAL_TITLE, preflightRefusalMessage(outcome.reason), TO_SUMMARY),
+    );
+  }
   const [title, message] = REFUSAL[outcome.outcome];
   sendHtml(res, 409, renderSetupRefusal(title, message, TO_SUMMARY));
 }
