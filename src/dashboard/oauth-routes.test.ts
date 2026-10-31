@@ -997,15 +997,17 @@ describe('GET /connections', () => {
     expect(body).toContain('לא ניתן לקרוא את התקנון');
   });
 
-  it('says plainly that no charter is installed at all, rather than an empty page indistinguishable from "nothing declared"', async () => {
+  it('sends the owner to the setup interview when no charter is installed at all', async () => {
     // No `installCharter` call in this test at all — `charter_active` has no
-    // row for this business.
+    // row for this business. Until the setup interview's gate (spec §6.1)
+    // this screen said "no charter installed"; now no screen but the
+    // interview is reachable in that state — an unreadable charter, above,
+    // still reaches this screen and is told so.
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
-    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    expect(body).toContain('לא הותקן עדיין תקנון פעיל');
+    const res = await fetch(`${baseUrl}/connections`, { headers: { cookie }, redirect: 'manual' });
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toBe('/setup');
   });
 });
 

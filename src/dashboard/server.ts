@@ -45,7 +45,21 @@ import {
   saveActionUpdateSettings,
   type ActionUpdateSettings,
 } from '../governance/action-update-settings.js';
-import { probeActiveCharter, loadActiveCharter } from '../charter/store.js';
+import { activeCharterVersion, probeActiveCharter, loadActiveCharter } from '../charter/store.js';
+import type { RuleProposer } from '../charter/interview/rule-proposal.js';
+import {
+  handleRuleChoice,
+  handleRulePost,
+  handleSetupEdit,
+  handleSetupIndex,
+  handleSetupStepGet,
+  handleSetupStepPost,
+  handleSignPost,
+  handleSummaryGet,
+  parseStep,
+  seeOther,
+  type SetupOptions,
+} from './setup-routes.js';
 import type { ActiveCharter } from '../charter/store.js';
 import { DigestSchedule, loadDigestSettings, setDigestSettings } from '../governance/digest-settings.js';
 import type { DigestSettings } from '../governance/digest-settings.js';
@@ -199,6 +213,11 @@ export interface DashboardOptions {
    * the real Gmail / Graph client for the provider.
    */
   mailboxClientFor?: (provider: MailProvider) => MailboxClient;
+  /**
+   * Test seam for the setup interview's stage-10 proposer. No production
+   * caller passes it: absent, the model proposes (`proposeRuleWithModel`).
+   */
+  ruleProposer?: RuleProposer;
 }
 
 /**
@@ -507,7 +526,12 @@ async function handlePasswordPost(
   redirect(res, '/', { 'Set-Cookie': sessionCookie(token) });
 }
 
-async function handlePendingList(res: ServerResponse, businessId: string, session: Session): Promise<void> {
+async function handlePendingList(
+  res: ServerResponse,
+  businessId: string,
+  session: Session,
+  modeFailed = false,
+): Promise<void> {
   const [approvals, remaining] = await Promise.all([
     pendingApprovals({ businessId }),
     remainingCodes(session.username, { businessId }),
@@ -515,7 +539,7 @@ async function handlePendingList(res: ServerResponse, businessId: string, sessio
   sendHtml(
     res,
     200,
-    renderPendingList({ approvals, remainingCodes: remaining, csrf: issueCsrfToken(session.sessionId) }),
+    renderPendingList({ approvals, remainingCodes: remaining, csrf: issueCsrfToken(session.sessionId), modeFailed }),
   );
 }
 
@@ -2647,6 +2671,8 @@ async function handleAutonomousActionMark(
 }
 
 const CARD_PATH = /^\/a\/([^/]+)$/;
+const SETUP_STEP_PATH = /^\/setup\/step\/([^/]+)$/;
+const SETUP_RULE_PATH = /^\/setup\/rule\/(\d{1,3})$/;
 const MAIL_PATH = /^\/mail\/([^/]+)$/;
 const DOCUMENT_FILE_PATH = /^\/documents\/([^/]+)\/file$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
@@ -2670,6 +2696,7 @@ async function route(
   trustProxy: boolean,
   documentRoot: string | undefined,
   oauthOptions: OAuthRouteOptions,
+  setupOptions: SetupOptions = {},
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const requestUrl = new URL(req.url ?? '/', 'http://dashboard.local');
@@ -2704,7 +2731,39 @@ async function route(
   // `/` nor leave the owner stuck with no way to sign out.
   if (session.mustChangePassword) return redirect(res, '/password');
 
-  if (method === 'GET' && pathname === '/') return handlePendingList(res, businessId, session);
+  // No active charter: every page but the interview itself sends the owner to
+  // it (spec §6.1). Absence is read from the pointer column, never by parsing
+  // — a charter that exists but does not parse is NOT absent, and is reached
+  // through the banner that leads to "edit the rules" instead.
+  if (!pathname.startsWith('/setup') && (await activeCharterVersion(businessId)) === null) {
+    return seeOther(res, '/setup');
+  }
+
+  if (method === 'GET' && pathname === '/setup') return handleSetupIndex(res, businessId);
+  if (method === 'GET' && pathname === '/setup/edit') return handleSetupEdit(res, businessId, session);
+  if (method === 'GET' && pathname === '/setup/summary') return handleSummaryGet(res, businessId, session);
+  if (method === 'POST' && pathname === '/setup/sign') {
+    return handleSignPost(res, businessId, session, await readFormBody(req));
+  }
+  if (method === 'POST' && pathname === '/setup/rule') {
+    return handleRulePost(res, businessId, session, await readFormBody(req), setupOptions);
+  }
+  const setupStepMatch = SETUP_STEP_PATH.exec(pathname);
+  const setupStep = setupStepMatch?.[1] === undefined ? null : parseStep(setupStepMatch[1]);
+  if (setupStep !== null && method === 'GET') {
+    return handleSetupStepGet(res, businessId, session, setupStep, requestUrl.searchParams);
+  }
+  if (setupStep !== null && method === 'POST') {
+    return handleSetupStepPost(res, businessId, session, setupStep, await readFormBody(req));
+  }
+  const ruleChoiceMatch = SETUP_RULE_PATH.exec(pathname);
+  if (method === 'POST' && ruleChoiceMatch?.[1] !== undefined) {
+    return handleRuleChoice(res, businessId, session, Number(ruleChoiceMatch[1]), await readFormBody(req));
+  }
+
+  if (method === 'GET' && pathname === '/') {
+    return handlePendingList(res, businessId, session, requestUrl.searchParams.get('mode') === 'failed');
+  }
   if (method === 'GET' && pathname === '/readings') return handleReadings(res, businessId, session);
   if (method === 'GET' && pathname === '/memory') return handleMemory(res, businessId, session);
   if (method === 'GET' && pathname === '/connections') return handleConnections(res, businessId, session);
@@ -2902,7 +2961,8 @@ export function createServer(options: DashboardOptions = {}): Server {
   };
 
   const server = createHttpServer((req, res) => {
-    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions).catch((err: unknown) => {
+    const setupOptions: SetupOptions = options.ruleProposer !== undefined ? { ruleProposer: options.ruleProposer } : {};
+    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {
         sendHtml(res, 500, renderServerError());
