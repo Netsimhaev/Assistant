@@ -68,7 +68,13 @@ export interface MailboxAmendmentDiff {
   readonly subprocessorAdded: boolean;
 }
 
-function splitConnections(connections: readonly CharterConnection[]): {
+/**
+ * Removes `mail.send` from every connection: `kept` is what remains (a
+ * connection that still serves something, narrowed), `narrowed` and `dropped`
+ * describe the change. Exported for the setup interview's builder, which
+ * applies the same change when a first charter names a mailbox.
+ */
+export function splitConnections(connections: readonly CharterConnection[]): {
   kept: CharterConnection[];
   narrowed: CharterConnection[];
   dropped: CharterConnection[];
@@ -90,6 +96,18 @@ function splitConnections(connections: readonly CharterConnection[]): {
     }
   }
   return { kept, narrowed, dropped };
+}
+
+/** The mailbox connection for `provider`: serves `mail.send` only, names the provider as subprocessor. */
+export function mailboxConnection(provider: MailProvider): CharterConnection {
+  return {
+    system: MAILBOX_SYSTEM,
+    label: MAILBOX_CONNECTION_LABEL,
+    channel: 'api',
+    serves: [SEND_TOOL],
+    target: null,
+    subprocessor: MAILBOX_SUBPROCESSOR[provider],
+  };
 }
 
 function assertNoMailbox(active: BusinessCharter): void {
@@ -126,14 +144,7 @@ export function buildMailboxAmendment(
   const { kept } = splitConnections(active.connections);
   const subprocessor = MAILBOX_SUBPROCESSOR[provider];
 
-  const mailbox: CharterConnection = {
-    system: MAILBOX_SYSTEM,
-    label: MAILBOX_CONNECTION_LABEL,
-    channel: 'api',
-    serves: [SEND_TOOL],
-    target: null,
-    subprocessor,
-  };
+  const mailbox = mailboxConnection(provider);
 
   return {
     ...rest,
