@@ -235,7 +235,8 @@ function buildPrincipal(answers: InterviewAnswers, previous: CharterPerson | und
  * through the connections screen's revert, §6.6); otherwise a chosen provider
  * applies the same change `buildMailboxAmendment` does.
  */
-function buildConnections(
+/** Exported so the interview's action table labels availability against the same connections the build will sign. */
+export function buildConnections(
   provider: MailProvider | null,
   previous: BusinessCharter | null,
 ): { connections: CharterConnection[]; addedSubprocessors: string[] } {

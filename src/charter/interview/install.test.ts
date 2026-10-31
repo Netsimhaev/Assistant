@@ -144,6 +144,28 @@ describe('signAndInstallInterview', () => {
     expect(await activeCharterVersion(A)).toBe('base-1');
   });
 
+  it('replaces an active charter that no longer parses (the "edit the rules" door)', async () => {
+    await installCharter(buildCharter({ version: 'broken-1' }), { businessId: A });
+    await getPool().query(
+      `UPDATE charter_versions
+          SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
+        WHERE business_id = $1 AND charter_version = 'broken-1'`,
+      [A],
+    );
+    // The summary computes the hash with no previous charter: none can be read.
+    await replaceDraft(A, completeAnswers(), 'broken-1');
+    await freezeDraft(A, new Date('2026-10-31T10:00:00.000Z'));
+    const draft = await loadDraft(A);
+    if (draft === null) throw new Error('draft missing');
+    const shownHash = shownHashFor(draft, A, null);
+
+    const outcome = await signAndInstallInterview({ businessId: A, username: OWNER, shownHash });
+
+    expect(outcome.outcome).toBe('installed');
+    if (outcome.outcome !== 'installed') return;
+    expect(await activeCharterVersion(A)).toBe(outcome.charterVersion);
+  });
+
   it('two concurrent first installs: exactly one wins', async () => {
     const shownHash = await frozenDraft();
 

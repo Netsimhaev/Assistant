@@ -104,7 +104,9 @@ export const InterviewAnswers = z.object({
     open: TimeOfDay,
     close: TimeOfDay,
     quietHours: z.object({ from: TimeOfDay, to: TimeOfDay }).nullable(),
-    timezone: z.string().refine(isResolvableTimeZone, 'unknown IANA time zone'),
+    timezone: z
+      .string()
+      .refine(isResolvableTimeZone, 'אזור הזמן אינו מוכר — יש לכתוב שם אזור זמן תקני, לדוגמה "Asia/Jerusalem"'),
   }),
   reading: z.object({
     mailbox: z.enum(['none', 'google', 'microsoft']),

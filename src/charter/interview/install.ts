@@ -57,6 +57,37 @@ export function shownHashFor(draft: InterviewDraft, businessId: string, previous
   return canonicalHash(buildCharterFromInterview(answers, { businessId, frozenAt: draft.frozenAt, previous }));
 }
 
+/**
+ * The charter a draft was started from, as the summary and the sign step both
+ * read it — one function, so the hash the summary shows and the hash the sign
+ * rebuilds can never disagree about `previous`.
+ *
+ *   - no base (a first install) → `previous: null`;
+ *   - a base row that is GONE → `{ ok: false }`: a starting point the owner
+ *     can no longer have been shown, so the sign is `stale`;
+ *   - a base row that exists but does NOT PARSE under this code →
+ *     `previous: null`. This is the "edit the rules" door for an unreadable
+ *     charter (spec §6.1, §6.6): the interview reopens empty and the
+ *     signature replaces the charter nobody can read. Refusing here (as this
+ *     code did until Task 8) would leave that installation with no way out —
+ *     the exact trap `probeActiveCharter` exists to avoid. Nothing of the
+ *     unreadable charter can be preserved, because nothing of it can be read;
+ *     the locked check still requires the active pointer to be that version.
+ */
+export async function previousForDraft(
+  draft: Pick<InterviewDraft, 'baseCharterVersion'>,
+  businessId: string,
+): Promise<{ ok: true; previous: BusinessCharter | null } | { ok: false }> {
+  if (draft.baseCharterVersion === null) return { ok: true, previous: null };
+  let previous: BusinessCharter | null;
+  try {
+    previous = await loadCharterVersion(draft.baseCharterVersion, businessId);
+  } catch {
+    return { ok: true, previous: null };
+  }
+  return previous === null ? { ok: false } : { ok: true, previous };
+}
+
 class Refused extends Error {
   constructor(readonly outcome: 'incomplete' | 'stale') {
     super(outcome);
@@ -104,17 +135,9 @@ export async function signAndInstallInterview(input: {
   const answers = parsed.data;
   if (draft.frozenAt === null) return { outcome: 'not_frozen' };
 
-  // A base that no longer loads (gone, or unparseable under this code) is a
-  // starting point the owner can no longer have been shown: stale.
-  let previous: BusinessCharter | null = null;
-  if (draft.baseCharterVersion !== null) {
-    try {
-      previous = await loadCharterVersion(draft.baseCharterVersion, businessId);
-    } catch {
-      return { outcome: 'stale' };
-    }
-    if (previous === null) return { outcome: 'stale' };
-  }
+  const base = await previousForDraft(draft, businessId);
+  if (!base.ok) return { outcome: 'stale' };
+  const { previous } = base;
 
   const unsigned = buildCharterFromInterview(answers, { businessId, frozenAt: draft.frozenAt, previous });
   if (canonicalHash(unsigned) !== input.shownHash) return { outcome: 'hash_mismatch' };
