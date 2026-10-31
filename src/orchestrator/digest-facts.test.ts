@@ -177,7 +177,9 @@ describe('collectDigestFacts', () => {
    * happened to run. 25 days back is never inside the current calendar
    * month on ANY day of a 28-to-31-day month, so this holds year-round. The
    * decoy at 40 days back pins the OTHER edge — a rolling window that
-   * silently widened past 30 days would still pass without it.
+   * silently widened past 30 days would still pass without it. The window is
+   * relative to now, not the fixed `WINDOW`, because the fixed 2026-10-06
+   * window collided with the 25-day seed on 2026-10-31.
    */
   it('counts spend from before the first of the month inside the rolling window, year-round', async () => {
     const twentyFiveDaysAgo = new Date(Date.now() - 25 * 24 * 60 * 60 * 1000);
@@ -190,7 +192,14 @@ describe('collectDigestFacts', () => {
       [BUSINESS, twentyFiveDaysAgo, fortyDaysAgo],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    // A one-day window ending an hour ago can never contain a row seeded 25
+    // days back, so `windowMinor` is 0 on every date, unlike the fixed WINDOW.
+    const window = {
+      ...WINDOW,
+      start: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      end: new Date(Date.now() - 60 * 60 * 1000),
+    };
+    const facts = await collectDigestFacts(window, CEILINGS, { businessId: BUSINESS });
     expect(facts.cost.rolling30Minor).toBe(700);
     expect(facts.cost.windowMinor).toBe(0);
   });
