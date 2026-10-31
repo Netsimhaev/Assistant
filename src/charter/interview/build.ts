@@ -132,7 +132,7 @@ function counterpartyFrom(
  * valid interview entry. Everything else is preserved untouched on edit.
  * Positive: a shape not listed here is kept, never rewritten.
  */
-function isInterviewCounterparty(cp: CharterCounterparty): boolean {
+export function isInterviewCounterparty(cp: CharterCounterparty): boolean {
   const matchKeys = Object.keys(cp.match).filter(
     (k) => cp.match[k as keyof typeof cp.match] !== undefined,
   );

@@ -13,59 +13,12 @@ import { installCharter } from '../store.js';
 import { MAILBOX_SUBPROCESSOR } from '../amend-mailbox.js';
 import type { InterviewAnswers } from './answers.js';
 import { INTERVIEW_NEVER_PREFIX, buildCharterFromInterview, prefillFromCharter } from './build.js';
-import { INTERVIEW_ROWS, MONEY_ROWS, ROW_DEFAULTS } from './rows.js';
+import { INTERVIEW_ROWS, MONEY_ROWS } from './rows.js';
+import { completeAnswers } from './test-answers.js';
 
 const BUSINESS = 'test-business';
 const FROZEN = new Date('2026-10-31T10:00:00.000Z');
 const NOON = new Date('2026-08-18T09:00:00.000Z');
-
-function completeAnswers(): InterviewAnswers {
-  return {
-    business: {
-      description: 'מספרה לגברים בחולון.',
-      legalName: 'דוגמה תספורות בע"מ',
-      tradeName: 'דוגמה תספורות',
-      vertical: 'מספרה',
-      employees: 3,
-      expectations: 'לקבוע תורים ולענות ללקוחות.',
-      notDone: ['צביעת שיער'],
-      keyFacts: [{ q: 'יש חניה?', a: 'כן, ברחוב.' }],
-    },
-    principal: {
-      displayName: 'דנה לוי',
-      role: 'בעלים',
-      whatsapp: '+972541234567',
-      email: 'dana@example.co.il',
-    },
-    voice: {
-      register: 'warm',
-      signOff: 'תודה, דנה',
-      emojiPolicy: 'sparingly',
-      mustNeverSay: ['מובטח'],
-    },
-    hours: {
-      workweek: ['sun', 'mon', 'tue', 'wed', 'thu'],
-      open: '09:00',
-      close: '19:00',
-      quietHours: { from: '21:00', to: '08:00' },
-      timezone: 'Asia/Jerusalem',
-    },
-    reading: { mailbox: 'none', documents: false },
-    // Every row stated, so the round trip compares like with like; the money
-    // row is opened so the money section is not zeroed.
-    actions: { ...ROW_DEFAULTS, 'quote.issue': 'approve', 'calendar.create': 'alone' },
-    money: { singleMinor: 100_000, dailyMinor: 300_000, monthlyMinor: 2_000_000, maxDiscountPercent: 5 },
-    counterparties: {
-      known: [{ label: 'ספק מוצרים', emailDomain: 'supplier.co.il' }],
-      doNotContact: [{ label: 'מתחרה', phone: '+972501112233' }],
-    },
-    autonomy: { mode: 'off' },
-    extra: {
-      accepted: [{ kind: 'forbid', text: 'לעולם לא לפרסם מחירים.', actionClasses: ['media.publish'] }],
-      pending: [],
-    },
-  };
-}
 
 function build(a: InterviewAnswers, previous: BusinessCharter | null = null) {
   return buildCharterFromInterview(a, { businessId: BUSINESS, frozenAt: FROZEN, previous });
