@@ -99,14 +99,20 @@ describe('what an erasure leaves behind', () => {
    * both `presented_text` and `options`. Its sibling `confirmed_step_claims`
    * holds no content and is asserted deleted directly, not through the sweep.
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen" count is spec §5.1's own
+   * **A nineteenth, also outside spec §5.1: `charter_interview_drafts`
+   * (migration 051)** — the setup interview's answers, which hold names
+   * (do-not-contact labels, the principal's name) and domains. Business-scoped
+   * with no job or document, so it is its own probe site (seeded in
+   * `answers`, with a second-business row as the narrowness control).
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (22; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (23; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 22 also includes tables scrubbed as a consequence of
+   * stores, while the 23 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
@@ -210,6 +216,30 @@ describe('what an erasure leaves behind', () => {
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
        VALUES ('DG-unrelated', $1, 'daily', '2026-01-02T00:00:00Z', '2026-01-03T00:00:00Z', 'תדריך יומי · הכל תקין', true)`,
       [BUSINESS],
+    );
+
+    // --- Migration 051: the charter interview draft. ----------------------
+    //
+    // No job and no document — a draft belongs to the business — so, like
+    // `digests`, it is its own probe site, found only by its own `answers`.
+    // The probe sits where a real owner would type it: a do-not-contact label.
+    await db.query(
+      `INSERT INTO charter_interview_drafts (draft_id, business_id, answers)
+       VALUES ('DR-probe', $1, $2::jsonb)`,
+      [
+        BUSINESS,
+        JSON.stringify({
+          counterparties: { known: [], doNotContact: [{ label: PROBE, emailDomain: 'nowhere.example' }] },
+        }),
+      ],
+    );
+    // The narrowness control, in another business so the UNIQUE on
+    // `business_id` allows it: a predicate that dropped `business_id` would
+    // delete it.
+    await db.query(
+      `INSERT INTO charter_interview_drafts (draft_id, business_id, answers)
+       VALUES ('DR-unrelated', 'other-business', $1::jsonb)`,
+      [JSON.stringify({ counterparties: { known: [], doNotContact: [{ label: PROBE, emailDomain: 'x.example' }] } })],
     );
 
     // --- The other seven stores of spec §5.1. ----------------------------
@@ -456,7 +486,18 @@ describe('what an erasure leaves behind', () => {
     expect(
       plan.items.find((item) => item.table === 'confirmed_step_claims' && item.action === 'delete')?.count,
     ).toBe(1);
+    expect(
+      plan.items.find((item) => item.table === 'charter_interview_drafts' && item.action === 'delete')?.count,
+    ).toBe(1);
     await executeErasure(plan, { businessId: BUSINESS });
+
+    const draft = await db.query('SELECT 1 FROM charter_interview_drafts WHERE draft_id = $1', ['DR-probe']);
+    expect(draft.rows).toHaveLength(0);
+    // The other business's draft is the only row the sweep below must skip:
+    // it carries the probe by design, to prove the predicate is scoped.
+    const otherDraft = await db.query('SELECT 1 FROM charter_interview_drafts WHERE draft_id = $1', ['DR-unrelated']);
+    expect(otherDraft.rows).toHaveLength(1);
+    await db.query(`DELETE FROM charter_interview_drafts WHERE draft_id = 'DR-unrelated'`);
 
     const claims = await db.query('SELECT 1 FROM confirmed_step_claims WHERE business_id = $1 AND job_id = $2', [
       BUSINESS,

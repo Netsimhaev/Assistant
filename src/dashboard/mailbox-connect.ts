@@ -50,7 +50,7 @@ import { oauthCeremonyPreflight } from './oauth-routes.js';
 import type { BusinessCharter } from '../domain/charter.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { listGrants } from '../governance/oauth-grants.js';
-import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
+import { MAIL_PROVIDER_NAME, MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import { canonicalHash } from '../util/canonical.js';
 import { verifyCsrfToken } from './csrf.js';
@@ -61,11 +61,7 @@ export interface MailboxSession {
   username: string;
 }
 
-/** Owner-facing provider names. */
-const PROVIDER_NAME: Readonly<Record<MailProvider, string>> = {
-  google: 'Google (Gmail)',
-  microsoft: 'Microsoft 365 (Outlook)',
-};
+const PROVIDER_NAME = MAIL_PROVIDER_NAME;
 
 /**
  * What signing authorises, verbatim. Reading and labelling are not tools a
@@ -77,7 +73,7 @@ export const MAILBOX_AUTHORISATION_TEXT =
   'היא לא תמחק, לא תעביר, לא תסמן כנקרא ולא תסמן כספאם. ' +
   'מייל יוצא — כולל תשובות להוראות שלך — יישלח מתיבת העסק במקום משרת השליחה, ורק אחרי אישורך, אלא אם הגדרת ברמת החופש שהעוזרת רשאית לענות לבד.';
 
-const RESTART_NOTE =
+export const RESTART_NOTE =
   'שימו לב: תזמון המשימות (ה-scheduler) קורא את התקנון ואת רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו. ' +
   'השליחה תעבור לתיבת העסק רק אחרי שהחיבור לספק יושלם והתזמון יופעל מחדש.';
 
@@ -324,11 +320,15 @@ ${narrowed}
  * ceremony then cannot complete would stop outgoing mail for nothing. The
  * sign page and the sign POST both ask first.
  */
+export const PREFLIGHT_REFUSAL_TITLE = 'אי אפשר לחתום עדיין';
+
+/** Why a sign that would add the mailbox is refused; shared with the setup interview's sign. */
+export function preflightRefusalMessage(reason: string): string {
+  return `לא ניתן לחבר כרגע את התיבה אצל הספק, ולכן החתימה לא תתבצע — היא הייתה עוצרת את המייל היוצא בלי שאפשר להשלים את החיבור. ${reason} לא בוצעה כל פעולה.`;
+}
+
 function preflightRefusal(reason: string): string {
-  return errorPage(
-    'אי אפשר לחתום עדיין',
-    `לא ניתן לחבר כרגע את התיבה אצל הספק, ולכן החתימה לא תתבצע — היא הייתה עוצרת את המייל היוצא בלי שאפשר להשלים את החיבור. ${reason} לא בוצעה כל פעולה.`,
-  );
+  return errorPage(PREFLIGHT_REFUSAL_TITLE, preflightRefusalMessage(reason));
 }
 
 class StaleBaseError extends Error {}

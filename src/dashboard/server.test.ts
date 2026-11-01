@@ -63,6 +63,16 @@ afterAll(async () => {
   await closePool();
 });
 
+/**
+ * Every dashboard page but the interview redirects to `/setup` while the
+ * business has no active charter (spec §6.1). The screens under test here are
+ * screens of an installed business, so one is installed first — under its
+ * own version, so a test that installs `buildCharter()` itself still can.
+ */
+async function installGateCharter(businessId: string): Promise<void> {
+  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId });
+}
+
 let server: Server | null = null;
 
 afterEach(async () => {
@@ -423,6 +433,7 @@ function unescapeHtml(s: string): string {
 
 beforeEach(async () => {
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+  await installGateCharter(BUSINESS);
 });
 
 describe('GET /', () => {
@@ -3007,6 +3018,14 @@ describe('GET /autonomy — the learning level and the update channels', () => {
   });
 
   it('still shows the dial and the channels when no charter can be read', async () => {
+    // A charter that exists but does not parse: the gate lets it through (it
+    // is not absent), and the learning level cannot be computed from it.
+    await getPool().query(
+      `UPDATE charter_versions
+          SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
+        WHERE business_id = $1`,
+      [BUSINESS],
+    );
     const baseUrl = await startServer(BUSINESS);
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -3404,16 +3423,20 @@ describe('digest screen', () => {
    * not 500 — it is the ordinary state of a brand-new installation, and
    * neither `recentDigests` nor `loadDigestSettings` ever needed the charter.
    */
-  it('renders 200 with the history and the form when no charter has been signed yet', async () => {
+  /**
+   * Until the setup interview's gate (spec §6.1) this screen rendered its own
+   * "no charter signed yet" state. No dashboard page but the interview is
+   * reachable without a charter now; the digest screen's no-charter branch
+   * is kept for the unreadable case below and pinned at the view level.
+   */
+  it('sends the owner to the setup interview when no charter has been signed yet', async () => {
+    await getPool().query('DELETE FROM charter_active WHERE business_id = $1', [BUSINESS]);
     const baseUrl = await startServer(BUSINESS);
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
-    const res = await fetch(`${baseUrl}/digest`, { headers: { cookie } });
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    expect(body).toContain('טרם נחתם תקנון עסקי');
-    expect(body).toContain('לא נוצר עדיין שום תדריך');
-    expect(body).toContain('name="dailyHour"');
+    const res = await fetch(`${baseUrl}/digest`, { headers: { cookie }, redirect: 'manual' });
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toBe('/setup');
   });
 
   /**

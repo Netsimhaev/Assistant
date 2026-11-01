@@ -209,10 +209,21 @@ function summaryRow(approval: ApprovalRequest): string {
 </div>`;
 }
 
+/**
+ * Shown on `/` after the interview installed a charter but the dial could not
+ * be applied (`signAndInstallInterview` → `modeApplied: false`). The charter
+ * is live; the dial stayed where it was — `off` on a fresh business, the safe
+ * direction — and the owner is told so rather than left to find it.
+ */
+export const MODE_NOT_APPLIED_NOTICE =
+  'הכללים נחתמו ונכנסו לתוקף, אבל רמת החופש שבחרת לא הוחלה — היא נשארה כפי שהייתה. אפשר לקבוע אותה שוב במסך „כמה חופש לתת”.';
+
 export function renderPendingList(options: {
   approvals: ApprovalRequest[];
   remainingCodes: number;
   csrf: string;
+  /** The interview's install could not apply the chosen dial. */
+  modeFailed?: boolean;
 }): string {
   const list =
     options.approvals.length === 0
@@ -225,8 +236,9 @@ export function renderPendingList(options: {
   <h1>בקשות ממתינות</h1>
   ${logoutForm(options.csrf)}
 </header>
+${options.modeFailed === true ? `<p class="error" role="alert">${esc(MODE_NOT_APPLIED_NOTICE)} <a href="/autonomy">כמה חופש לתת</a></p>` : ''}
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a></p>
 ${list}`,
   );
 }
@@ -778,7 +790,7 @@ export function renderConnections(options: {
 }): string {
   const notice =
     options.charterStatus === 'unreadable'
-      ? `<p class="error">${esc(CHARTER_UNREADABLE_NOTICE)}</p>`
+      ? `<p class="error">${esc(CHARTER_UNREADABLE_NOTICE)} <a href="/setup/edit">ערוך את הכללים</a></p>`
       : options.charterStatus === 'none'
         ? `<p class="muted">${esc(CHARTER_MISSING_NOTICE)}</p>`
         : '';
@@ -1507,6 +1519,7 @@ export const TABLE_LABELS: Record<string, string> = {
   // Migration 040: the stored daily/weekly digest, which names failures —
   // a document name, a recipient, a contact — in its own rendered body.
   digests: 'תדריכים',
+  charter_interview_drafts: 'טיוטת ראיון ההקמה',
   // Migrations 042/044: mail read from the connected mailbox, and the
   // invoices extracted from it.
   mail_messages: 'מיילים',

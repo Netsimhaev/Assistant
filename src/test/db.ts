@@ -64,6 +64,7 @@ export async function resetDatabase(): Promise<void> {
       charter_versions,
       digest_settings,
       digests,
+      charter_interview_drafts,
       dashboard_sessions,
       dashboard_recovery_codes,
       dashboard_unknown_user_throttle,

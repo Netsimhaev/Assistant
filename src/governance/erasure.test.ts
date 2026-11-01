@@ -329,6 +329,7 @@ describe('executeErasure', () => {
       documentIds: [documentId],
       memoryIds: [memory.memoryId],
       digestIds: [],
+      draftIds: [],
       mailIds: [],
       filePaths: [],
       items: [],
@@ -487,6 +488,11 @@ describe('executeErasure', () => {
        VALUES ($1, $2, 'daily', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z', 'x', true)`,
       [digestId, BUSINESS],
     );
+    const draftId = `DR-${ulid()}`;
+    await getPool().query(
+      `INSERT INTO charter_interview_drafts (draft_id, business_id, answers) VALUES ($1, $2, '{}')`,
+      [draftId, BUSINESS],
+    );
 
     const plan: ErasurePlan = {
       anchor: { kind: 'document', documentId },
@@ -494,6 +500,7 @@ describe('executeErasure', () => {
       documentIds: [documentId],
       memoryIds: [memory.memoryId],
       digestIds: [digestId],
+      draftIds: [draftId],
       mailIds: [],
       filePaths: [],
       items: [],
@@ -522,6 +529,7 @@ describe('executeErasure', () => {
     expect(byStatement.get('verification_verdicts:delete')).toEqual({ table: 'verification_verdicts', action: 'delete', count: 1 });
     expect(byStatement.get('documents:delete')).toEqual({ table: 'documents', action: 'delete', count: 1 });
     expect(byStatement.get('digests:delete')).toEqual({ table: 'digests', action: 'delete', count: 1 });
+    expect(byStatement.get('charter_interview_drafts:delete')).toEqual({ table: 'charter_interview_drafts', action: 'delete', count: 1 });
     expect(byStatement.get('jobs:scrub')).toEqual({ table: 'jobs', action: 'scrub', count: 1 });
     expect(byStatement.get('job_steps:scrub')?.action).toBe('scrub');
     expect(byStatement.get('job_steps:scrub')?.count ?? 0).toBeGreaterThan(0);
@@ -539,6 +547,7 @@ describe('executeErasure', () => {
       ['verification_verdicts', 'job_id', jobId],
       ['documents', 'document_id', documentId],
       ['digests', 'digest_id', digestId],
+      ['charter_interview_drafts', 'draft_id', draftId],
     ];
     for (const [table, column, value] of deletedChecks) {
       const { rows } = await getPool().query(`SELECT 1 FROM ${table} WHERE ${column} = $1`, [value]);
@@ -1180,6 +1189,7 @@ describe('executeErasure', () => {
       documentIds: [documentId],
       memoryIds: [],
       digestIds: [],
+      draftIds: [],
       mailIds: [],
       filePaths: [],
       items: [],

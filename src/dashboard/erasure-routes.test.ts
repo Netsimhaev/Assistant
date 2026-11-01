@@ -39,11 +39,22 @@ const USERNAME = 'owner';
 const PASSWORD = 'correct horse battery staple';
 const RONIT = 'ronit@beta-log.example';
 
+/**
+ * Every dashboard page but the interview redirects to `/setup` while the
+ * business has no active charter (spec §6.1). The screens under test here are
+ * screens of an installed business, so one is installed first — under its
+ * own version, so a test that installs `buildCharter()` itself still can.
+ */
+async function installGateCharter(businessId: string): Promise<void> {
+  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId });
+}
+
 let server: Server | null = null;
 
 beforeEach(async () => {
   await resetDatabase();
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+  await installGateCharter(BUSINESS);
 });
 
 afterEach(async () => {
@@ -162,6 +173,7 @@ describe('the erasure screen', () => {
         documentIds: [],
         memoryIds: [],
         digestIds: [],
+        draftIds: [],
         mailIds: [],
         filePaths: [],
         items: [],
@@ -187,6 +199,7 @@ describe('the erasure screen', () => {
         documentIds: [],
         memoryIds: [],
         digestIds: [],
+        draftIds: [],
         mailIds: [],
         filePaths: [],
         items: [],
@@ -868,6 +881,7 @@ describe('the smaller things the screen owes the owner', () => {
         documentIds: [],
         memoryIds: [],
         digestIds: [],
+        draftIds: [],
         mailIds: [],
         filePaths: [],
         items: [],

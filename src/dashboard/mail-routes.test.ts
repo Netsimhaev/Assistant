@@ -16,6 +16,8 @@ import { annotateAttachment, insertInvoice, linkAttachmentDocument, markOverCap,
 import { resetDatabase } from '../test/db.js';
 import { storedMail } from '../test/mailbox.js';
 import { ingestDocument } from '../documents/ingest.js';
+import { installCharter } from '../charter/store.js';
+import { buildCharter } from '../test/fixtures.js';
 import { createOwner } from './auth.js';
 import { createServer } from './server.js';
 import { DOCUMENT_LIMIT } from './mail-handlers.js';
@@ -25,6 +27,16 @@ const OTHER = 'other-business';
 const USERNAME = 'owner';
 const PASSWORD = 'correct horse battery staple';
 
+/**
+ * Every dashboard page but the interview redirects to `/setup` while the
+ * business has no active charter (spec §6.1). The screens under test here are
+ * screens of an installed business, so one is installed first — under its
+ * own version, so a test that installs `buildCharter()` itself still can.
+ */
+async function installGateCharter(businessId: string): Promise<void> {
+  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId });
+}
+
 let server: Server | null = null;
 let root: string;
 
@@ -32,6 +44,7 @@ beforeEach(async () => {
   await resetDatabase();
   root = await mkdtemp(join(tmpdir(), 'mail-routes-'));
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
+  await installGateCharter(BUSINESS);
 });
 afterEach(async () => {
   if (server) {

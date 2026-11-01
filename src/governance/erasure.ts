@@ -41,6 +41,7 @@ import {
   APPROVAL_REQUESTS_SCRUBBED_PREDICATE,
   APPROVAL_REQUESTS_SCRUB_SET,
   DIGESTS_ERASED_PREDICATE,
+  CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE,
   JOBS_SCRUBBED_PREDICATE,
   JOBS_SCRUB_SET,
   LIVE_PHASES,
@@ -160,7 +161,7 @@ export async function executeErasure(
     );
   }
 
-  const { jobIds, documentIds, memoryIds, digestIds, mailIds } = plan;
+  const { jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds } = plan;
   const client = await getPool().connect();
   const results: ErasureItem[] = [];
   let txError: unknown;
@@ -244,6 +245,13 @@ export async function executeErasure(
       'digests',
       `DELETE FROM digests WHERE ${DIGESTS_ERASED_PREDICATE}`,
       [businessId, digestIds],
+    );
+    // The interview draft: no job, no document, so no ordering constraint —
+    // same predicate and parameters as `countItems`.
+    await del(
+      'charter_interview_drafts',
+      `DELETE FROM charter_interview_drafts WHERE ${CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE}`,
+      [businessId, draftIds],
     );
     await del(
       'proposals',
