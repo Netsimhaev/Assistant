@@ -6,8 +6,8 @@
  * other evaluator is a supply-chain surface for a grammar this small. The
  * evaluator exists to recompute every formula of a built workbook and to
  * write cached results, so a disagreement with Excel is a wrong number the
- * owner sees — where we cannot match Excel exactly we fail closed (an error
- * value), never with a plausible number.
+ * owner sees. The aim is to fail closed (an error value) where we cannot
+ * match Excel exactly; the two known exceptions are listed below.
  *
  * Grammar: numbers, strings, TRUE/FALSE, `+ - * / ^ & = <> < <= > >=`, unary
  * `-`/`+`, postfix `%`, refs `A1`/`$A$1`, ranges `A1:B9`, sheet refs
@@ -16,15 +16,27 @@
  * WEBSERVICE, CALL among them — none is whitelisted), an external workbook
  * `[x]`, a defined name, or a syntax error.
  *
- * Known, deliberate deviations from Excel (all toward an error, never toward
- * a different number):
+ * Known, deliberate deviations from Excel that yield an error where Excel
+ * yields a value:
  * - Text in arithmetic is #VALUE! even when it looks numeric (Excel: "5"+1=6).
  * - A multi-cell range in scalar context is #VALUE! (no implicit intersection),
  *   so array idioms like SUMPRODUCT((A1:A3>1)*B1:B3) are #VALUE!.
+ * - IFERROR over a multi-cell range is a #VALUE! that no IFERROR swallows
+ *   (Excel 365 would spill an array).
  * - SUMIF's sum_range must have the criteria range's shape (Excel resizes).
- * - Approximate MATCH/VLOOKUP scan linearly and stop at the first greater
- *   value; on sorted data this equals Excel's binary search.
+ * - Approximate MATCH/VLOOKUP verify the lookup column is sorted (by Excel
+ *   type rank) and return #N/A when it is not; Excel's binary search returns
+ *   an arbitrary row there.
+ * - IFERROR never catches #CIRC!: a cycle is never rescued into a number.
  * - A formula that does not parse evaluates to #NAME? (Excel cannot store it).
+ *
+ * Known deviations that can yield a DIFFERENT VALUE (parked, not fixed):
+ * - Text ordering for < > and criteria/lookup order is lowercase code-unit
+ *   order, not Excel's locale collation (punctuation, digits vs letters and
+ *   Hebrew niqqud may sort differently).
+ * - Number-to-text (`&`, text criteria) uses 15 significant digits with JS
+ *   formatting (exponent at 1e21 / 1e-7), not Excel's General format (which
+ *   switches to exponent notation past 11 characters).
  */
 
 export const FORMULA_FUNCTIONS = [
@@ -580,6 +592,17 @@ type Operand = Cell | RangeOp;
 
 const mkErr = (error: FormulaErrorCode): EvalError => ({ error });
 
+/**
+ * Errors no IFERROR may swallow, tracked by identity (errors propagate as the
+ * same object). A shape we refuse must surface, not turn into the fallback.
+ */
+const UNCATCHABLE = new WeakSet<EvalError>();
+function refuseShape(): EvalError {
+  const e = mkErr('#VALUE!');
+  UNCATCHABLE.add(e);
+  return e;
+}
+
 function isErr(v: unknown): v is EvalError {
   return typeof v === 'object' && v !== null && 'error' in v;
 }
@@ -633,6 +656,14 @@ function toText(v: Cell): string | EvalError {
   if (typeof v === 'number') return formatNumber(v);
   if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
   return v;
+}
+
+/**
+ * Excel returns 0 when an add/subtract cancels to within floating-point noise
+ * of its operands (0.3-(0.1+0.2) = 0, not -5.55e-17).
+ */
+function snapCancellation(result: number, a: number, b: number): number {
+  return Math.abs(result) < 2 ** -50 * Math.max(Math.abs(a), Math.abs(b)) ? 0 : result;
 }
 
 function finish(n: number): number | EvalError {
@@ -721,10 +752,19 @@ function escapeRegex(ch: string): string {
   return ch.replace(/[\\^$.*+?()[\]{}|/-]/g, '\\$&');
 }
 
+const STRICT_DECIMAL = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?%?$/;
+
+/**
+ * Text that reads as a number in criteria and in COUNT's direct arguments: a
+ * strict decimal with an optional exponent and trailing % (÷100). Anything
+ * else — hex, padding, thousands separators — is text.
+ */
 function numericText(s: string): number | null {
-  if (s.trim() === '') return null;
-  const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+  if (!STRICT_DECIMAL.test(s)) return null;
+  const pct = s.endsWith('%');
+  const n = Number(pct ? s.slice(0, -1) : s);
+  if (!Number.isFinite(n)) return null;
+  return pct ? n / 100 : n;
 }
 
 type Criterion = (c: Cell) => boolean;
@@ -781,9 +821,11 @@ function makeCriterion(crit: Cell): Criterion | EvalError {
     return (c) => typeof c === 'boolean' && test(compareValues(c, b));
   }
   if (rest === '') {
-    const isBlank = (c: Cell) => c === null || c === '';
-    if (op === '=') return isBlank;
-    if (op === '<>') return (c) => !isBlank(c);
+    // "" matches empty cells and ="" results; "=" only truly empty cells;
+    // "<>" every cell that holds anything, an ="" result included.
+    if (crit === '') return (c) => c === null || c === '';
+    if (op === '=') return (c) => c === null;
+    if (op === '<>') return (c) => c !== null;
     return () => false;
   }
   if (op === '=' || op === '<>') {
@@ -810,6 +852,13 @@ function lookupIndex(values: Cell[], lookup: number | string | boolean, type: -1
       return values.findIndex((v) => typeof v === 'string' && re.test(v));
     }
     return values.findIndex((v) => v !== null && !isErr(v) && typeRank(v) === typeRank(lookup) && compareValues(v, lookup) === 0);
+  }
+  // Excel's binary search silently returns a wrong row on unsorted data; we
+  // refuse instead. Order is by Excel type rank, then value.
+  const present = values.filter((v): v is number | string | boolean => v !== null && !isErr(v));
+  for (let i = 1; i < present.length; i++) {
+    const cmp = compareValues(present[i - 1]!, present[i]!);
+    if ((type === 1 && cmp > 0) || (type === -1 && cmp < 0)) return -1;
   }
   let found = -1;
   for (let i = 0; i < values.length; i++) {
@@ -1076,9 +1125,9 @@ class Workbook {
     if (isErr(y)) return y;
     switch (op) {
       case '+':
-        return finish(x + y);
+        return finish(snapCancellation(x + y, x, y));
       case '-':
-        return finish(x - y);
+        return finish(snapCancellation(x - y, x, y));
       case '*':
         return finish(x * y);
       case '/':
@@ -1171,7 +1220,13 @@ class Workbook {
       }
       case 'IFERROR': {
         const v = this.arg(args, 0, sheet);
-        return isErr(toScalar(v)) ? this.arg(args, 1, sheet) : v;
+        // A multi-cell range would be an array in Excel 365; we refuse the
+        // shape with an error IFERROR itself does not swallow.
+        if (isRange(v) && (v.rows !== 1 || v.cols !== 1)) return refuseShape();
+        const s = toScalar(v);
+        // A cycle is never rescued into a number, nor is a refused shape.
+        if (isErr(s) && (s.error === '#CIRC!' || UNCATCHABLE.has(s))) return s;
+        return isErr(s) ? this.arg(args, 1, sheet) : v;
       }
       case 'AND':
       case 'OR': {
@@ -1211,7 +1266,12 @@ class Workbook {
           for (const c of values) {
             if (name === 'COUNTA') {
               if (c !== null) count++;
-            } else if (typeof c === 'number' || (direct && typeof c === 'boolean')) count++;
+            } else if (
+              typeof c === 'number' ||
+              (direct && (typeof c === 'boolean' || (typeof c === 'string' && numericText(c) !== null)))
+            ) {
+              count++;
+            }
           }
         }
         return count;
@@ -1339,7 +1399,8 @@ class Workbook {
         const firstColumn: Cell[] = [];
         for (let r = 0; r < table.rows; r++) firstColumn.push(table.at(r, 0));
         const i = lookupIndex(firstColumn, lookup, approx ? 1 : 0);
-        return i < 0 ? mkErr('#N/A') : scalarRange(table.at(i, col - 1));
+        // A value, not a reference (unlike INDEX).
+        return i < 0 ? mkErr('#N/A') : table.at(i, col - 1);
       }
     }
   }

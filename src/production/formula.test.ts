@@ -332,3 +332,75 @@ describe('large ranges', () => {
     expect(calc('MIN(A1:A100000)', cells)).toBe(3);
   });
 });
+
+describe('fix round 1 — no plausible wrong number', () => {
+  it('IFERROR over a multi-cell range refuses the shape with an uncaught #VALUE!', () => {
+    const cells = { A1: 1, A2: 2, A3: 3 };
+    expect(calc('SUM(IFERROR(A1:A3,0))', cells)).toEqual(err('#VALUE!'));
+    expect(calc('IFERROR(IFERROR(A1:A3,0),5)', cells)).toEqual(err('#VALUE!'));
+    // A single-cell ref still works and is still caught.
+    expect(calc('IFERROR(A1,0)', cells)).toBe(1);
+  });
+
+  it('IFERROR does not rescue a cycle into a number', () => {
+    const result = evaluateWorkbook([sheet('S', { A1: { f: 'A1+1' }, B1: { f: 'IFERROR(A1,0)' } })]);
+    expect(result.get('S!A1')).toEqual(err('#CIRC!'));
+    expect(result.get('S!B1')).toEqual(err('#CIRC!'));
+  });
+
+  it('VLOOKUP returns a value, not a reference: TRUE → 1, text → #VALUE! under SUM', () => {
+    const cells = { A1: 'a', B1: true, A2: 'b', B2: 'טקסט' };
+    expect(calc('SUM(VLOOKUP("a",A1:B2,2,FALSE))', cells)).toBe(1);
+    expect(calc('SUM(VLOOKUP("b",A1:B2,2,FALSE))', cells)).toEqual(err('#VALUE!'));
+  });
+
+  it('INDEX stays a reference: SUM ignores the text/boolean it points at', () => {
+    const cells = { A1: true, A2: 'טקסט' };
+    expect(calc('SUM(INDEX(A1:A2,1))', cells)).toBe(0);
+    expect(calc('SUM(INDEX(A1:A2,2))', cells)).toBe(0);
+  });
+
+  it('criteria numbers are strict decimals; % divides by 100', () => {
+    const cells = { A1: 0.4, A2: 0.6, A3: 16 };
+    expect(calc('COUNTIF(A1:A3,">50%")', { A1: 0.4, A2: 0.6 })).toBe(1);
+    expect(calc('COUNTIF(A1:A2,">50%")', { A1: 0.4, A2: 0.6 })).toBe(1);
+    expect(calc('SUMIF(A1:A2,">50%")', { A1: 0.4, A2: 0.6 })).toBe(0.6);
+    expect(calc('COUNTIF(A1:A3,">0x10")', cells)).toBe(0);
+    expect(calc('COUNTIF(A1:A3,"= 16")', cells)).toBe(0);
+    expect(calc('COUNTIF(A1:A3,"1,000")', { A1: 1000 })).toBe(0);
+    expect(calc('COUNTIF(A1:A3,">=1e1")', cells)).toBe(1);
+  });
+
+  it('add/subtract cancellation snaps to 0 like Excel', () => {
+    expect(calc('0.3-(0.1+0.2)')).toBe(0);
+    const result = evaluateWorkbook([sheet('S', { C1: { f: '0.3-(0.1+0.2)' }, D1: { f: 'C1=0' } })]);
+    expect(result.get('S!D1')).toBe(true);
+    // A genuinely small difference is not snapped.
+    expect(calc('1e-20-0')).toBe(1e-20);
+  });
+
+  it('approximate MATCH/VLOOKUP on an unsorted column → #N/A', () => {
+    const unsorted = { A1: 10, B1: 'a', A2: 30, B2: 'b', A3: 20, B3: 'c' };
+    expect(calc('MATCH(25,A1:A3)', unsorted)).toEqual(err('#N/A'));
+    expect(calc('VLOOKUP(25,A1:B3,2)', unsorted)).toEqual(err('#N/A'));
+    expect(calc('MATCH(25,A1:A3,-1)', { A1: 10, A2: 30, A3: 20 })).toEqual(err('#N/A'));
+    // Sorted still works (control).
+    expect(calc('MATCH(25,A1:A3)', { A1: 10, A2: 20, A3: 30 })).toBe(2);
+    // Exact match does not need sorting.
+    expect(calc('MATCH(20,A1:A3,0)', unsorted)).toBe(3);
+  });
+
+  it('COUNT counts numeric text passed directly', () => {
+    expect(calc('COUNT("5",1)')).toBe(2);
+    expect(calc('COUNT("x",1)')).toBe(1);
+    // In a range, numeric text is still not counted.
+    expect(calc('COUNT(A1:A2)', { A1: '5', A2: 1 })).toBe(1);
+  });
+
+  it('"<>" counts ="" formula cells; "=" matches truly empty only; "" matches both', () => {
+    const cells = { A1: { f: '""' }, A2: null, A3: 'x' };
+    expect(calc('COUNTIF(A1:A4,"<>")', cells)).toBe(2);
+    expect(calc('COUNTIF(A1:A4,"=")', cells)).toBe(2); // A2 and A4 are truly empty
+    expect(calc('COUNTIF(A1:A4,"")', cells)).toBe(3);
+  });
+});
