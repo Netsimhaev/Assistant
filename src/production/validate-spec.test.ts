@@ -232,9 +232,12 @@ describe('validateSpec — free text', () => {
     ]);
     const inBody = docx([
       { type: 'clause', title: 'מבוא', text: 'הצדדים מסכימים' },
-      { type: 'clause', title: 'תשלום', text: 'בהתאם לסעיף 1 לעיל' },
+      { type: 'clause', title: 'תשלום', text: 'בהתאם לסעיף 1 לעיל, תוך 2 ימים' },
     ]);
-    expect(validateSpec(inBody, sources(), TODAY).map((p) => p.where)).toEqual(['block 2']);
+    // A cross-reference to an existing clause is exempt (round 2); a bare 2 is not.
+    expect(validateSpec(inBody, sources(), TODAY).map((p) => [p.where, p.detail])).toEqual([
+      ['block 2', 'מספר או תאריך שאין לו מקור: 2'],
+    ]);
   });
 
   it("today's date is structural; another year is not", () => {
@@ -578,8 +581,8 @@ describe('fix round 1', () => {
       expect(codes(validateSpec(para('שעה 10:99'), sources(), TODAY))).toEqual(['ungrounded_number']);
     });
 
-    it('full date shapes and times are exempt; impossible dates are not', () => {
-      for (const text of ['עד 12/11/2026', 'ב-1.5.2027', 'נכון ל-2030-01-31', 'בשעה 10:30', 'ב-9/3/27']) {
+    it('times are exempt; impossible dates are checked as numbers', () => {
+      for (const text of ['בשעה 10:30', 'בין 9:00 ל-17:45:00']) {
         expect(validateSpec(para(text), sources(), TODAY)).toEqual([]);
       }
       expect(codes(validateSpec(para('עד 45/45/2026'), sources(), TODAY))).toEqual(['ungrounded_number']);
@@ -727,6 +730,55 @@ describe('fix round 1', () => {
       const p = docx([{ type: 'paragraph', text: 'יתרה -500' }]);
       expect(codes(validateSpec(p, sources({ instructionText: 'יתרה 500' }), TODAY))).toEqual(['ungrounded_number']);
       expect(validateSpec(p, sources({ instructionText: 'יתרה 500-' }), TODAY)).toEqual([]);
+    });
+  });
+});
+
+describe('fix round 2', () => {
+  const para = (text: string) => docx([{ type: 'paragraph', text }]);
+  const sevenClauses = Array.from({ length: 7 }, (_, i) => ({ type: 'clause', title: `נושא`, text: `תוכן ${'א'.repeat(i + 1)}` }));
+
+  describe('clause cross-references', () => {
+    const withRef = (text: string) => docx([...sevenClauses, { type: 'paragraph', text }]);
+    it('a reference to an existing clause passes, in every allowed form', () => {
+      for (const text of ['בהתאם לסעיף 4', 'כאמור בסעיף 4.2 לעיל', 'ראו סעיף 7', 'see Clause 3', 'under Section 6.1']) {
+        expect(validateSpec(withRef(text), sources(), TODAY)).toEqual([]);
+      }
+    });
+    it('"סעיף 9" with 7 clauses is refused', () => {
+      const problems = validateSpec(withRef('בהתאם לסעיף 9'), sources(), TODAY);
+      expect(problems.map((p) => [p.code, p.where])).toEqual([['ungrounded_number', 'block 8']]);
+      expect(problems[0]!.detail).toContain('9');
+    });
+    it('"מחיר 4" with 7 clauses is refused', () => {
+      expect(codes(validateSpec(withRef('מחיר 4'), sources(), TODAY))).toEqual(['ungrounded_number']);
+    });
+    it('a reference with no clauses at all is refused', () => {
+      expect(codes(validateSpec(para('בהתאם לסעיף 1'), sources(), TODAY))).toEqual(['ungrounded_number']);
+    });
+  });
+
+  describe('dates in free text are grounded like date cells', () => {
+    it('an invented "15/12/2026" is refused', () => {
+      const problems = validateSpec(para('התשלום עד 15/12/2026'), sources(), TODAY);
+      expect(codes(problems)).toEqual(['ungrounded_number']);
+      expect(problems[0]!.detail).toContain('15/12/2026');
+    });
+    it('the same date present in the instruction passes, in any of the forms', () => {
+      for (const instructionText of ['עד 15/12/2026', 'עד 15.12.2026', 'עד 2026-12-15', 'עד 15 בדצמבר 2026']) {
+        expect(validateSpec(para('התשלום עד 15/12/2026'), sources({ instructionText }), TODAY)).toEqual([]);
+      }
+      expect(validateSpec(para('עד 2026-12-15'), sources({ instructionText: 'עד 15/12/2026' }), TODAY)).toEqual([]);
+      expect(validateSpec(para('עד 15.12.26'.replace('.26', '.2026')), sources({ instructionText: 'עד 15/12/26' }), TODAY)).toEqual([]);
+    });
+    it("today's date passes in every shape", () => {
+      for (const text of ['נכון ל-04/11/2026', 'נכון ל-4.11.2026', 'נכון ל-2026-11-04', 'נכון ל-4/11/26', 'נכון ל-4 בנובמבר 2026']) {
+        expect(validateSpec(para(text), sources(), TODAY)).toEqual([]);
+      }
+    });
+    it('an invented date in words is refused', () => {
+      const problems = validateSpec(para('עד 20 בדצמבר 2026'), sources(), TODAY);
+      expect(codes(problems)).toEqual(['ungrounded_number']);
     });
   });
 });

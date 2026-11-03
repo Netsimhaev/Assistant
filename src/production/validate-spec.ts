@@ -9,12 +9,16 @@
  * "-500" or "500-", never on "500"). That module is advisory and drops every
  * digit run touching `/`, `-` or `:`; here that would let "12,000/חודש" or
  * "3000-4000" through unchecked, so both draft and source text go through
- * `prepare` first:
- *   - full date shapes (`d/m/yy`, `d/m/yyyy`, `d.m.yyyy`, ISO `yyyy-mm-dd`,
- *     with valid day and month) and times (`h:mm`, `h:mm:ss`, valid hour and
- *     minute) are blanked in DRAFT text — exempt;
- *   - a date written in words ("4 בנובמבר 2026") is blanked only when it is
- *     TODAY — the only place today's day, month and year are structural;
+ * the steps of `Collector.text` first:
+ *   - a cross-reference to one of THIS spec's clauses — exactly `סעיף N` or
+ *     `סעיף N.M` (glued particles allowed: "לסעיף 4"), "Clause N",
+ *     "Section N", with 1 ≤ N ≤ the clause count — is blanked. Only N is
+ *     verifiable: sub-clauses are not modelled, so M is not checked;
+ *   - every full date shape (`d/m/yy(yy)`, `d.m.yy(yy)`, ISO, or a date in
+ *     words such as "4 בנובמבר 2026") whose date exists is grounded exactly
+ *     like a `{d}` cell — it must equal `today` or be a date some source
+ *     writes in any of these shapes — and reported as a whole when not;
+ *   - times (`h:mm`, `h:mm:ss`, valid hour and minute) are exempt;
  *   - then every `/` or `:` touching a digit, and every `-` between a digit
  *     and a letter or digit, becomes a space — each side of a range is its
  *     own number. A leading or trailing minus sign is untouched.
@@ -25,8 +29,9 @@
  * displayed ×100 form must ground ("15%"/"15"), and the raw fraction is also
  * accepted when it is not an integer and the source writes it ("0.15") — so
  * `{v: 15}`, which would display 1500%, does not ground on "15%". A `{d}`
- * cell must equal `today` or appear in some source as ISO, `d/m/yyyy` or
- * `d.m.yyyy`. A pointer that does not resolve is `source_not_found`.
+ * cell must equal `today` or be a date some source writes (ISO, `d/m/yyyy`,
+ * `d.m.yyyy`, two-digit years as 20yy, or in words). A pointer that does not
+ * resolve is `source_not_found`.
  *
  * **Free text** — the title, the filename, sheet names, headings,
  * paragraphs, list items, clause titles and text, table and slide headers,
@@ -35,7 +40,8 @@
  * must ground in some source or in an untainted formula result. Structural
  * numbers are exempt only where structural: a clause or slide title that is
  * just its own number, or starts with "סעיף N" / "N." where N is that
- * clause's (or slide's) own position. Never in body text, cells or bullets.
+ * clause's (or slide's) own position — and the clause cross-references
+ * above. Any other number in body text, cells or bullets is checked.
  *
  * **Formulas** live in workbooks only (a `{f}` in a docx/pdf/pptx table has
  * no addresses: `formula_problem`). In a workbook:
@@ -229,14 +235,13 @@ function parseIsoDate(value: string): [number, number, number] | null {
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d ? [y, mo, d] : null;
 }
 
-const validDayMonth = (d: string, m: string) => Number(d) >= 1 && Number(d) <= 31 && Number(m) >= 1 && Number(m) <= 12;
 
 // Not inside a longer number or separator run (a particle dash like "ל-" is fine).
 const BEFORE = String.raw`(?<![\d.,/:]|\d-)`;
 const AFTER = String.raw`(?![\d/:-]|[.,]\d)`;
-const SLASH_DATE = new RegExp(`${BEFORE}(\\d{1,2})/(\\d{1,2})/(?:\\d{4}|\\d{2})${AFTER}`, 'g');
-const DOT_DATE = new RegExp(`${BEFORE}(\\d{1,2})\\.(\\d{1,2})\\.\\d{4}${AFTER}`, 'g');
-const ISO_DATE = new RegExp(`${BEFORE}\\d{4}-\\d{2}-\\d{2}${AFTER}`, 'g');
+const SLASH_DATE = new RegExp(`${BEFORE}(\\d{1,2})/(\\d{1,2})/(\\d{4}|\\d{2})${AFTER}`, 'g');
+const DOT_DATE = new RegExp(`${BEFORE}(\\d{1,2})\\.(\\d{1,2})\\.(\\d{4}|\\d{2})${AFTER}`, 'g');
+const ISO_DATE = new RegExp(`${BEFORE}(\\d{4})-(\\d{2})-(\\d{2})${AFTER}`, 'g');
 const TIME = new RegExp(`${BEFORE}(?:[01]?\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?${AFTER}`, 'g');
 
 const MONTH_NAMES: readonly (readonly string[])[] = [
@@ -258,17 +263,59 @@ const WORD_DATE = new RegExp(
   'giu',
 );
 
-/** Blank exempt date and time shapes in DRAFT text; today in words too. */
-function blankDates(text: string, today: [number, number, number]): string {
+const pad2 = (n: number) => String(n).padStart(2, '0');
+
+/** `YYYY-MM-DD` for parts, or null when the date does not exist. A 2-digit year is 20yy. */
+function isoOf(y: string, m: string, d: string): string | null {
+  const year = y.length === 2 ? 2000 + Number(y) : Number(y);
+  const iso = `${year}-${pad2(Number(m))}-${pad2(Number(d))}`;
+  return parseIsoDate(iso) === null ? null : iso;
+}
+
+const monthNumber = (name: string) => MONTH_NAMES.findIndex((names) => names.includes(name.toLowerCase())) + 1;
+
+/**
+ * Every full date shape in `text` — `d/m/yy(yy)`, `d.m.yy(yy)`, ISO, and a
+ * date in words — whose date exists, mapped through `replace` (given its ISO
+ * form). A shape whose date does not exist stays as written, so its digits
+ * are then checked as plain numbers.
+ */
+function replaceDates(text: string, replace: (iso: string, raw: string) => string): string {
+  const via = (all: string, y: string, m: string, d: string) => {
+    const iso = isoOf(y, m, d);
+    return iso === null ? all : replace(iso, all);
+  };
   return text
-    .replace(SLASH_DATE, (all, d: string, m: string) => (validDayMonth(d, m) ? ' ' : all))
-    .replace(DOT_DATE, (all, d: string, m: string) => (validDayMonth(d, m) ? ' ' : all))
-    .replace(ISO_DATE, (all: string) => (parseIsoDate(all) !== null ? ' ' : all))
-    .replace(TIME, ' ')
-    .replace(WORD_DATE, (all, d: string, month: string, y: string) => {
-      const mi = MONTH_NAMES.findIndex((names) => names.includes(month.toLowerCase()));
-      return Number(d) === today[2] && mi + 1 === today[1] && Number(y) === today[0] ? ' ' : all;
+    .replace(SLASH_DATE, (all, d: string, m: string, y: string) => via(all, y, m, d))
+    .replace(DOT_DATE, (all, d: string, m: string, y: string) => via(all, y, m, d))
+    .replace(ISO_DATE, (all, y: string, m: string, d: string) => via(all, y, m, d))
+    .replace(WORD_DATE, (all, d: string, month: string, y: string) => via(all, y, String(monthNumber(month)), d));
+}
+
+/** Every date (ISO form) some source writes, in any of the date shapes. */
+function datesIn(texts: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const t of texts) {
+    replaceDates(t, (iso) => {
+      out.add(iso);
+      return ' ';
     });
+  }
+  return out;
+}
+
+const CLAUSE_REF = /(?<!\p{L})(?:[ולבמהכש]{0,3}סעיף|clause|section)\s+(\d+)(?:\.(\d+))?(?!\d|\.\d)/giu;
+
+/**
+ * Blank cross-references to this spec's own clauses: exactly `סעיף N` or
+ * `סעיף N.M` (glued Hebrew particles allowed: "לסעיף 4"), or "Clause N" /
+ * "Section N" (and N.M), where 1 ≤ N ≤ the clause count. A reference to a
+ * clause that does not exist stays and is checked as a number. Sub-clauses
+ * are not modelled in a spec, so only N is verifiable, not M.
+ */
+function blankClauseRefs(text: string, clauses: number): string {
+  if (clauses === 0) return text;
+  return text.replace(CLAUSE_REF, (all, n: string) => (Number(n) >= 1 && Number(n) <= clauses ? ' ' : all));
 }
 
 /** Split separators touching digits so each side is its own number. */
@@ -322,15 +369,6 @@ const allSourceTexts = (s: GroundingSources): string[] => [
   ...s.memories.map((m) => m.body),
 ];
 
-function dateGrounded(date: string, today: string, texts: string[]): boolean {
-  if (date === today) return true;
-  const parts = parseIsoDate(date);
-  if (parts === null) return false;
-  const [y, m, d] = parts;
-  const iso = new RegExp(`(?<!\\d)${date}(?!\\d)`);
-  const dmy = new RegExp(`(?<!\\d)0?${d}[/.]0?${m}[/.]${y}(?!\\d)`);
-  return texts.some((t) => iso.test(t) || dmy.test(t));
-}
 
 // ---------------------------------------------------------------- collector
 
@@ -339,19 +377,31 @@ class Collector {
   constructor(
     private readonly sources: GroundingSources,
     private readonly today: string,
-    private readonly todayParts: [number, number, number],
+    /** Every date some source writes, ISO form. */
+    private readonly sourceDates: ReadonlySet<string>,
+    /** Clauses in this spec, for cross-references. */
+    private readonly clauses: number,
     /** Prepared source texts plus untainted formula results. */
     private readonly pool: string[],
   ) {}
+
+  private dateGrounded(iso: string): boolean {
+    return iso === this.today || this.sourceDates.has(iso);
+  }
 
   add(code: SpecProblemCode, where: string, detail: string): void {
     this.problems.push({ code, where, detail });
   }
 
   text(where: string, text: string): void {
-    const missing = ungroundedNumbers(splitSeparators(blankDates(text, this.todayParts)), this.pool);
+    const dates: string[] = [];
+    const rest = replaceDates(blankClauseRefs(text, this.clauses), (iso, raw) => {
+      if (!this.dateGrounded(iso)) dates.push(raw.trim());
+      return ' ';
+    }).replace(TIME, ' ');
+    const missing = [...new Set([...dates, ...ungroundedNumbers(splitSeparators(rest), this.pool)])];
     if (missing.length > 0) {
-      this.add('ungrounded_number', where, `מספר שאין לו מקור: ${[...new Set(missing)].join(', ')}`);
+      this.add('ungrounded_number', where, `מספר או תאריך שאין לו מקור: ${missing.join(', ')}`);
     }
   }
 
@@ -373,7 +423,7 @@ class Collector {
   }
 
   dateCell(where: string, date: string): void {
-    if (!dateGrounded(date, this.today, allSourceTexts(this.sources))) {
+    if (!this.dateGrounded(date)) {
       this.add('ungrounded_number', where, `התאריך ${date} לא נמצא באף מקור`);
     }
   }
@@ -697,7 +747,10 @@ export function validateSpec(
 
   const sourcePool = allSourceTexts(sources).map(splitSeparators);
   const workbook = spec.format === 'xlsx' ? checkWorkbook(spec.sheets, sourcePool, add) : null;
-  const c = new Collector(sources, today, todayParts, [...sourcePool, ...(workbook?.results ?? [])]);
+  const c = new Collector(sources, today, datesIn(allSourceTexts(sources)), clauseCount(spec), [
+    ...sourcePool,
+    ...(workbook?.results ?? []),
+  ]);
 
   c.text('title', spec.title);
   if (filenameIssue === null) c.text('filename', filename);
