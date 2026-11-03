@@ -1091,6 +1091,7 @@ describe('renderInstruct and renderInstructionOutcome - recordingNote', () => {
       grantNote: null,
       recordingNote: 'ההוראה הזו כוללת טקסט שהגיע מהקלטה, צריך אישור מפורש ממך.',
       identityNote: null,
+      ledgerEcho: null,
     });
 
     expect(html).toContain('שהגיע מהקלטה');
@@ -1116,6 +1117,7 @@ describe('reasonForSupersededJob (fix round 1, I2; narrowed in fix round 2, N1/N
         grantNote: null,
         recordingNote: null,
         identityNote: null,
+      ledgerEcho: null,
       }),
     ).toContain('J-REPLACEMENT');
 

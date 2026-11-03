@@ -12,6 +12,8 @@ import { writeMemory } from '../memory/store.js';
 import { runInstruction } from './instruct.js';
 import type { Plan } from '../domain/plan.js';
 import { buildPlannerPrompt, type PlanRequest } from '../sdk/planner.js';
+import { createLedgerItem } from '../ledger/store.js';
+import { runDueJobs } from './run-due.js';
 
 const BUSINESS = 'test-business';
 
@@ -1569,5 +1571,202 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     expect(jobs.rows[0]?.phase).toBe('failed');
     const rows = await getPool().query('SELECT 1 FROM instruction_confirmations');
     expect(rows.rows).toHaveLength(0);
+  });
+
+  describe('task ledger context and echo', () => {
+    function ledgerPlan(): Plan {
+      return {
+        goal: 'לרשום בפנקס',
+        assumptions: [],
+        clarifyingQuestion: null,
+        estimatedCostMinor: 0,
+        steps: [
+          {
+            id: 's1',
+            agent: 'ops.tasks',
+            intent: 'לרשום',
+            toolName: 'ledger.add',
+            input: { family: 'money_in', description: 'חשבונית ללקוח', critical: true },
+            dependsOn: [],
+            expectedActionClass: null,
+          },
+        ],
+      };
+    }
+
+    it('hands the planner the open ledger items AFTER the memory block, to every planner call', async () => {
+      const active = await loadActiveCharter(BUSINESS);
+      const job = await createJob({ charterVersion: active!.charter.charterVersion, provenance: 'boss', businessId: BUSINESS, title: 't' });
+      const existing = await createLedgerItem(
+        {
+          family: 'money_in', description: 'פנקס קיים', dueAt: null, dueIsDateOnly: true, importance: 'normal',
+          importanceManual: false, counterpartyName: null, counterpartyEmail: null, counterpartyEmailVerified: false,
+          counterpartyDomain: null, reference: null, amountMinor: null, stages: [], proposedStages: null,
+          originJobId: job.jobId,
+        },
+        { businessId: BUSINESS, by: 'test' },
+      );
+
+      const seen: PlanRequest[] = [];
+      const result = await runInstruction(
+        { text: 'תרשמי חשבונית עבור dana@example.com' },
+        {
+          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+          planner: async (req) => { seen.push(req); return { status: 'planned', plan: ledgerPlan() }; },
+        },
+      );
+      expect(result.status).toBe('planned');
+      expect(seen).toHaveLength(1);
+      const req = seen[0]!;
+      expect(req.ledgerBlock).toContain(existing.itemId);
+      const prompt = buildPlannerPrompt({ ...req, memoryBlock: 'MEMORY-MARK' });
+      expect(prompt.indexOf('MEMORY-MARK')).toBeGreaterThan(-1);
+      expect(prompt.indexOf('MEMORY-MARK')).toBeLessThan(prompt.indexOf('# הפנקס'));
+    });
+
+    it('carries a non-null ledgerEcho on a planned outcome with a ledger.add step', async () => {
+      const result = await runInstruction(
+        { text: 'תרשמי חשבונית' },
+        {
+          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+          planner: async () => ({ status: 'planned', plan: ledgerPlan() }),
+        },
+      );
+      expect(result.status).toBe('planned');
+      if (result.status !== 'planned') throw new Error('unreachable');
+      // F-I4b: future tense — the echo is rendered before the steps run.
+      expect(result.ledgerEcho).toContain('ארשום:');
+      expect(result.ledgerEcho).not.toContain('רשמתי');
+      expect(result.ledgerEcho).toContain('קריטי');
+    });
+
+    function ledgerStepPlan(toolName: string, input: Record<string, unknown>): Plan {
+      return {
+        goal: 'פנקס',
+        assumptions: [],
+        clarifyingQuestion: null,
+        estimatedCostMinor: 0,
+        steps: [{ id: 's1', agent: 'ops.tasks', intent: 'x', toolName, input, dependsOn: [], expectedActionClass: null }],
+      };
+    }
+
+    async function anItem(description: string): Promise<string> {
+      const active = await loadActiveCharter(BUSINESS);
+      const job = await createJob({ charterVersion: active!.charter.charterVersion, provenance: 'boss', businessId: BUSINESS, title: 't' });
+      const created = await createLedgerItem(
+        {
+          family: 'awaiting_reply', description, dueAt: null, dueIsDateOnly: false, importance: 'normal',
+          importanceManual: false, counterpartyName: null, counterpartyEmail: null, counterpartyEmailVerified: false,
+          counterpartyDomain: null, reference: null, amountMinor: null, stages: [], proposedStages: null,
+          originJobId: job.jobId,
+        },
+        { businessId: BUSINESS, by: 'test' },
+      );
+      return created.itemId;
+    }
+
+    async function ledgerRows(): Promise<number> {
+      const { rows } = await getPool().query<{ n: number }>(`SELECT count(*)::int AS n FROM ledger_items`);
+      return rows[0]?.n ?? -1;
+    }
+
+    it('F-I4a: a ledger step the handler would refuse is refused up front, in Hebrew, before anything runs', async () => {
+      const before = await ledgerRows();
+      for (const plan of [
+        ledgerStepPlan('ledger.add', { family: 'projects', description: 'אתר בלי מועד' }), // cross-field rule
+        ledgerStepPlan('ledger.add', { family: 'money_in', description: 'x', dueTime: '10:00' }), // dueTime alone
+        ledgerStepPlan('ledger.add', { family: 'money_in', description: 'x', bogus: 1 }), // schema (strict)
+        ledgerStepPlan('ledger.update', { itemId: 'LI-nope', note: 'x' }), // no such item
+      ]) {
+        const result = await runInstruction(
+          { text: 'תרשמי' },
+          { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan }) },
+        );
+        expect(result.status).toBe('refused');
+        if (result.status !== 'refused') throw new Error('unreachable');
+        expect(result.reason).toMatch(/פנקס/);
+      }
+      expect(await ledgerRows()).toBe(before);
+      const { rows } = await getPool().query<{ phase: string }>(`SELECT phase FROM jobs WHERE title = 'תרשמי'`);
+      expect(rows.map((r) => r.phase)).toEqual(['failed', 'failed', 'failed', 'failed']);
+      // Control: a valid add of the same shape is planned.
+      const ok = await runInstruction(
+        { text: 'תרשמי' },
+        {
+          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+          planner: async () => ({ status: 'planned', plan: ledgerStepPlan('ledger.add', { family: 'projects', description: 'אתר', dueDate: '2026-12-01' }) }),
+        },
+      );
+      expect(ok.status).toBe('planned');
+    });
+
+    it('F-I4a: an update whose stage does not exist is refused up front', async () => {
+      const itemId = await anItem('תשובה מדנה');
+      const result = await runInstruction(
+        { text: 'סמני שלב 3' },
+        {
+          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+          planner: async () => ({ status: 'planned', plan: ledgerStepPlan('ledger.update', { itemId, stagesDone: [3] }) }),
+        },
+      );
+      expect(result.status).toBe('refused');
+    });
+
+    it('F-I4b/c: an update echo is future tense and names the item by its description', async () => {
+      const itemId = await anItem('תשובה מדנה\nעל ההצעה');
+      const result = await runInstruction(
+        { text: 'עדכני' },
+        {
+          textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS,
+          planner: async () => ({ status: 'planned', plan: ledgerStepPlan('ledger.update', { itemId, critical: true }) }),
+        },
+      );
+      expect(result.status).toBe('planned');
+      if (result.status !== 'planned') throw new Error('unreachable');
+      expect(result.ledgerEcho).toContain('אעדכן:');
+      expect(result.ledgerEcho).toContain('תשובה מדנה על ההצעה');
+      expect(result.ledgerEcho).not.toContain('עדכנתי');
+    });
+
+    it('F-I4d: an address the charter knows is not flagged unverified in the echo, as the handler stores it', async () => {
+      await installCharter(
+        buildCharter({ version: 'known-acme', connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'acme.example' }),
+        { businessId: BUSINESS },
+      );
+      const plan = ledgerStepPlan('ledger.add', { family: 'awaiting_reply', description: 'תשובה', counterpartyEmail: 'dana@acme.example' });
+      const result = await runInstruction(
+        { text: 'תרשמי שמחכה לתשובה מדנה' }, // the address is NOT typed
+        { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan }) },
+      );
+      expect(result.status).toBe('planned');
+      if (result.status !== 'planned') throw new Error('unreachable');
+      expect(result.ledgerEcho).toContain('ארשום:');
+      expect(result.ledgerEcho).not.toContain('כתובת לא מאומתת');
+      await runDueJobs({ businessId: BUSINESS });
+      const { rows } = await getPool().query<{ v: boolean }>(
+        `SELECT counterparty_email_verified AS v FROM ledger_items WHERE counterparty_email = 'dana@acme.example'`,
+      );
+      expect(rows).toEqual([{ v: true }]);
+    });
+
+    it('T6: a mixed plan asks the confirmation WITH the ledger echo', async () => {
+      const plan = mailPlan('dana@example.com');
+      plan.steps.push({
+        id: 's2', agent: 'ops.tasks', intent: 'x', toolName: 'ledger.add',
+        input: { family: 'awaiting_reply', description: 'תשובה מדנה' }, dependsOn: [], expectedActionClass: null,
+      });
+      const result = await runInstruction(
+        { text: 'תשלחי ל-dana@example.com ותרשמי שמחכה לתשובה' },
+        { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan }) },
+      );
+      expect(result.status).toBe('needs_confirmation');
+      if (result.status !== 'needs_confirmation') throw new Error('unreachable');
+      expect(result.question).toContain('ארשום: ממתינים לצד שני · תשובה מדנה');
+      const { rows } = await getPool().query<{ presented_text: string }>(
+        `SELECT presented_text FROM instruction_confirmations WHERE job_id = $1`,
+        [result.jobId],
+      );
+      expect(rows[0]?.presented_text).toBe(result.question);
+    });
   });
 });

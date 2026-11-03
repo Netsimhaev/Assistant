@@ -44,6 +44,12 @@ import {
   CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE,
   JOBS_SCRUBBED_PREDICATE,
   JOBS_SCRUB_SET,
+  LEDGER_CRITICAL_RULES_ERASED_PREDICATE,
+  LEDGER_EVENTS_ERASED_PREDICATE,
+  LEDGER_ITEMS_ERASED_PREDICATE,
+  LEDGER_REMINDERS_ERASED_PREDICATE,
+  LEDGER_WHATSAPP_BATCHES_SCRUBBED_PREDICATE,
+  LEDGER_WHATSAPP_BATCHES_SCRUB_SET,
   LIVE_PHASES,
   MAIL_INVOICES_ERASED_PREDICATE,
   MAIL_MESSAGES_ERASED_PREDICATE,
@@ -161,7 +167,7 @@ export async function executeErasure(
     );
   }
 
-  const { jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds } = plan;
+  const { jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds, ledgerItemIds, ledgerRuleIds } = plan;
   const client = await getPool().connect();
   const results: ErasureItem[] = [];
   let txError: unknown;
@@ -326,6 +332,40 @@ export async function executeErasure(
       'confirmed_step_claims',
       `DELETE FROM confirmed_step_claims WHERE ${CONFIRMED_STEP_CLAIMS_ERASED_PREDICATE}`,
       [businessId, jobIds],
+    );
+    // The task ledger (migration 052). `ledger_events` and `ledger_reminders`
+    // FIRST: both cascade from `ledger_items`, and a cascade that beat these
+    // statements to the row would leave them reporting zero for tables that
+    // really lost rows — the `proposals`-before-`document_readings` rule.
+    // Then the WhatsApp batches (ids only): each erased id becomes '' IN
+    // PLACE and no batch is deleted, so the numbers the owner already saw
+    // keep pointing at the same items — see `LEDGER_WHATSAPP_BATCHES_SCRUB_SET`.
+    // Same predicates, same parameters, as `countItems` in `erasure-plan.ts`.
+    await del(
+      'ledger_events',
+      `DELETE FROM ledger_events WHERE ${LEDGER_EVENTS_ERASED_PREDICATE}`,
+      [businessId, ledgerItemIds],
+    );
+    await del(
+      'ledger_reminders',
+      `DELETE FROM ledger_reminders WHERE ${LEDGER_REMINDERS_ERASED_PREDICATE}`,
+      [businessId, ledgerItemIds],
+    );
+    await scrub(
+      'ledger_whatsapp_batches',
+      `UPDATE ledger_whatsapp_batches SET ${LEDGER_WHATSAPP_BATCHES_SCRUB_SET}
+        WHERE ${LEDGER_WHATSAPP_BATCHES_SCRUBBED_PREDICATE}`,
+      [businessId, ledgerItemIds],
+    );
+    await del(
+      'ledger_items',
+      `DELETE FROM ledger_items WHERE ${LEDGER_ITEMS_ERASED_PREDICATE}`,
+      [businessId, ledgerItemIds],
+    );
+    await del(
+      'ledger_critical_rules',
+      `DELETE FROM ledger_critical_rules WHERE ${LEDGER_CRITICAL_RULES_ERASED_PREDICATE}`,
+      [businessId, ledgerRuleIds],
     );
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);

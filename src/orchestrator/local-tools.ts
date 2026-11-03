@@ -67,6 +67,33 @@ import {
 import { requestHelp } from './delegate.js';
 import { loadJob, transition } from './jobs.js';
 import { StepChannelError } from './step-error.js';
+import { getPool } from '../db/pool.js';
+import type { Importance, LedgerStage } from '../domain/ledger.js';
+import { loadActiveCharter } from '../charter/store.js';
+import { loadInstructionForJob } from '../governance/instructions.js';
+import {
+  LEADING_HEBREW_PARTICLE,
+  TRAILING_PUNCTUATION,
+} from '../governance/typed-recipients.js';
+import type { InstructionRecord } from '../governance/instructions.js';
+import {
+  createLedgerItem,
+  loadLedgerItem,
+  updateLedgerItem,
+  LedgerItemNotFoundError,
+  type LedgerPatch,
+} from '../ledger/store.js';
+import {
+  counterpartyEmailIsVerified,
+  LedgerAddInput,
+  ledgerAddRuleProblem,
+  LedgerUpdateInput,
+  ledgerUpdateRuleProblem,
+  normalisedCounterpartyEmail,
+} from '../ledger/ledger-input.js';
+import { listCriticalRules, loadLedgerSettings, matchesCriticalRule } from '../ledger/settings.js';
+import { extractDomain, normaliseDomainString } from '../util/address.js';
+import { localParts, localToInstant } from '../util/local-time.js';
 
 export interface LocalToolContext {
   jobId: string;
@@ -329,10 +356,253 @@ async function write(
 }
 
 /**
+ * The ledger's one boundary: only a job the owner himself opened may write it.
+ *
+ * `ledger.add`/`ledger.update` sit in `READ_ONLY_TOOLS` (spec §7.1 — a
+ * classified tool would enter the boss-command path and ask a confirmation
+ * question L1 forbids), so stages 5–9 of the gate never see them. This check
+ * is what stands in their place, and it reads BOTH facts from the database by
+ * `(business_id, job_id)` — never from the tool input and never from a
+ * context claim: the stored `jobs.provenance` must be `boss`, and a
+ * `boss_instructions` row must exist for the job (born at the instruction
+ * door, not some other path that happens to stamp `boss`). Same reasoning as
+ * `writeMemory` and `confirmedCommandCovers`.
+ */
+export async function assertLedgerWriter(jobId: string, businessId: string, db: Queryable): Promise<void> {
+  const { rows } = await db.query<{ ok: boolean }>(
+    `SELECT (j.provenance = 'boss'
+             AND EXISTS (SELECT 1 FROM boss_instructions i
+                          WHERE i.business_id = j.business_id AND i.job_id = j.job_id)) AS ok
+       FROM jobs j
+      WHERE j.business_id = $1 AND j.job_id = $2`,
+    [businessId, jobId],
+  );
+  if (rows[0]?.ok !== true) {
+    throw new StepChannelError(
+      'ledger_not_boss_instruction',
+      `ledger writes are only for a job opened by the owner's instruction (job ${jobId})`,
+      false,
+    );
+  }
+}
+
+interface LedgerEnv {
+  db: Queryable;
+  timeZone: string;
+  dailyHour: number;
+  bundle: PolicyBundle;
+}
+
+async function ledgerEnv(ctx: LocalToolContext): Promise<LedgerEnv> {
+  const db = ctx.db ?? getPool();
+  await assertLedgerWriter(ctx.jobId, ctx.businessId, db);
+  const active = await loadActiveCharter(ctx.businessId, db);
+  if (active === null) throw new Error(`runLocalTool: ledger tools need an active charter (${ctx.businessId})`);
+  const settings = await loadLedgerSettings({ businessId: ctx.businessId, db });
+  return { db, timeZone: active.charter.identity.timezone, dailyHour: settings.dailyHour, bundle: active.bundle };
+}
+
+function dailyTime(hour: number): string {
+  return `${String(hour).padStart(2, '0')}:00`;
+}
+
+function ledgerBadInput(tool: string, why: string): StepChannelError {
+  return new StepChannelError('local_tool_bad_input', `${tool} (${why})`, false);
+}
+
+function toStages(titles: string[]): LedgerStage[] {
+  return titles.map((title) => ({ title, done: false }));
+}
+
+/** Does `domain` appear as a whole token (or an address's domain) in this text? */
+function domainTypedIn(domain: string, text: string): boolean {
+  return text.split(/\s+/).some((raw) => {
+    const token = raw.replace(LEADING_HEBREW_PARTICLE, '').replace(TRAILING_PUNCTUATION, '');
+    if (token === '') return false;
+    if (normaliseDomainString(token) === domain) return true;
+    return token.includes('@') && extractDomain(token) === domain;
+  });
+}
+
+/**
+ * Whether a planner-supplied domain may be stored on the row.
+ *
+ * The domain later decides evidence closure (a mail from it closes the item),
+ * so it is authority, and the planner may have lifted it from a memory block
+ * a stranger's document wrote. Kept only from a positive source: typed
+ * verbatim in a TYPED instruction, known to the charter (exact, like
+ * `knownToCharter`), or EQUAL to a VERIFIED email's domain. Never a parent of
+ * it: `co.il` from `dana@acme.co.il` would let any .co.il sender close the item.
+ * Anything else is dropped to NULL — the item itself still stands.
+ */
+function domainIsVouched(
+  domain: string,
+  instruction: InstructionRecord | null,
+  verifiedEmail: string | null,
+  env: LedgerEnv,
+): boolean {
+  if (env.bundle.knownCounterparties.emailDomains.includes(domain)) return true;
+  if (instruction !== null && instruction.textOrigin === 'typed' && domainTypedIn(domain, instruction.text)) {
+    return true;
+  }
+  const emailDomain = verifiedEmail === null ? null : extractDomain(verifiedEmail);
+  return emailDomain !== null && emailDomain === domain;
+}
+
+/**
  * The handlers, by tool name. A positive list: a tool absent from it is
  * unimplemented, and `runLocalTool` says so rather than guessing.
  */
 const HANDLERS: Record<string, LocalHandler> = {
+  /**
+   * A row in the task ledger, written straight from the owner's instruction —
+   * no question asked (spec L1). `assertLedgerWriter` runs FIRST, before the
+   * payload is even parsed, so a non-boss job learns nothing about the shape.
+   */
+  'ledger.add': async (input, ctx) => {
+    const env = await ledgerEnv(ctx);
+    const parsed = parseOrFail(LedgerAddInput, input, 'ledger.add');
+
+    const ruleProblem = ledgerAddRuleProblem(parsed);
+    if (ruleProblem !== null) throw ledgerBadInput('ledger.add', ruleProblem);
+    const counterpartyEmail = normalisedCounterpartyEmail(parsed.counterpartyEmail);
+
+    const suppliedDomain =
+      parsed.counterpartyDomain === undefined ? null : normaliseDomainString(parsed.counterpartyDomain);
+
+    const instruction = await loadInstructionForJob(ctx.jobId, { businessId: ctx.businessId, db: env.db });
+    const counterpartyEmailVerified =
+      counterpartyEmail === null
+        ? false
+        : counterpartyEmailIsVerified(counterpartyEmail, instruction, env.bundle.knownCounterparties);
+    const counterpartyDomain =
+      suppliedDomain !== null &&
+      domainIsVouched(suppliedDomain, instruction, counterpartyEmailVerified ? counterpartyEmail : null, env)
+        ? suppliedDomain
+        : null;
+    const counterpartyDomainDropped = suppliedDomain !== null && counterpartyDomain === null;
+
+    const dueAt =
+      parsed.dueDate === undefined
+        ? null
+        : localToInstant(parsed.dueDate, parsed.dueTime ?? dailyTime(env.dailyHour), env.timeZone);
+
+    const facts = {
+      family: parsed.family,
+      amountMinor: parsed.amountMinor ?? null,
+      counterpartyName: parsed.counterpartyName ?? null,
+      counterpartyEmail,
+      counterpartyDomain,
+    };
+    let importance: Importance;
+    let importanceManual = false;
+    if (parsed.critical === true) {
+      importance = 'critical';
+      importanceManual = true;
+    } else {
+      const rules = await listCriticalRules({ businessId: ctx.businessId, db: env.db });
+      importance = matchesCriticalRule(facts, rules) ? 'critical' : 'normal';
+    }
+
+    const item = await createLedgerItem(
+      {
+        ...facts,
+        description: parsed.description,
+        dueAt,
+        dueIsDateOnly: dueAt !== null && parsed.dueTime === undefined,
+        importance,
+        importanceManual,
+        counterpartyEmailVerified,
+        reference: parsed.reference ?? null,
+        stages: toStages(parsed.stages ?? []),
+        proposedStages: parsed.proposedStages === undefined ? null : toStages(parsed.proposedStages),
+        originJobId: ctx.jobId,
+      },
+      { businessId: ctx.businessId, by: 'boss', db: env.db },
+    );
+    return {
+      performed: true,
+      itemId: item.itemId,
+      family: item.family,
+      dueAt: item.dueAt === null ? null : item.dueAt.toISOString(),
+      importance: item.importance,
+      counterpartyEmailVerified: item.counterpartyEmailVerified,
+      counterpartyDomainDropped,
+    };
+  },
+
+  /**
+   * A change to an existing row: a stage done, a new date, a correction.
+   * Status is never touched — a new date on a `stuck` or closed item does not
+   * reopen it; reopening is the owner's command, not a planner step.
+   */
+  'ledger.update': async (input, ctx) => {
+    const env = await ledgerEnv(ctx);
+    const parsed = parseOrFail(LedgerUpdateInput, input, 'ledger.update');
+    const opts = { businessId: ctx.businessId, db: env.db };
+
+    const item = await loadLedgerItem(parsed.itemId, opts);
+    if (item === null) {
+      throw new StepChannelError('ledger_item_not_found', `ledger.update: no item ${parsed.itemId}`, false);
+    }
+    const ruleProblem = ledgerUpdateRuleProblem(parsed, item);
+    if (ruleProblem !== null) throw ledgerBadInput('ledger.update', ruleProblem);
+
+    const patch: LedgerPatch = {};
+    if (parsed.description !== undefined) patch.description = parsed.description;
+    if (parsed.reference !== undefined) patch.reference = parsed.reference;
+    if (parsed.amountMinor !== undefined) patch.amountMinor = parsed.amountMinor;
+    if (parsed.critical !== undefined) {
+      patch.importance = parsed.critical ? 'critical' : 'normal';
+      patch.importanceManual = true;
+    }
+
+    if (parsed.dueDate !== undefined || parsed.dueTime !== undefined) {
+      // A time alone moves the hour on the date already set; a date alone keeps
+      // the existing hour of a timed item (rescheduling a 14:30 meeting does
+      // not quietly move it to the morning reminder hour).
+      const current = item.dueAt === null ? null : localParts(item.dueAt, env.timeZone);
+      const date = parsed.dueDate ?? current?.date;
+      if (date === undefined) throw ledgerBadInput('ledger.update', 'dueTime on an item with no date');
+      const keptTime = item.dueIsDateOnly ? undefined : current?.time;
+      const time = parsed.dueTime ?? keptTime;
+      patch.dueAt = localToInstant(date, time ?? dailyTime(env.dailyHour), env.timeZone);
+      patch.dueIsDateOnly = time === undefined;
+    }
+
+    if (parsed.stages !== undefined || parsed.stagesDone !== undefined) {
+      const stages = parsed.stages !== undefined ? toStages(parsed.stages) : item.stages.map((s) => ({ ...s }));
+      for (const n of parsed.stagesDone ?? []) {
+        const stage = stages[n - 1];
+        if (stage === undefined) throw ledgerBadInput('ledger.update', `stage ${n} does not exist`);
+        stage.done = true;
+      }
+      patch.stages = stages;
+    }
+
+    let updated;
+    try {
+      updated = await updateLedgerItem(
+        parsed.itemId,
+        patch,
+        { kind: 'updated', by: 'boss', jobId: ctx.jobId, ...(parsed.note !== undefined ? { note: parsed.note } : {}) },
+        opts,
+      );
+    } catch (err) {
+      if (err instanceof LedgerItemNotFoundError) {
+        throw new StepChannelError('ledger_item_not_found', `ledger.update: no item ${parsed.itemId}`, false);
+      }
+      throw err;
+    }
+    return {
+      performed: true,
+      itemId: updated.itemId,
+      family: updated.family,
+      status: updated.status,
+      dueAt: updated.dueAt === null ? null : updated.dueAt.toISOString(),
+    };
+  },
+
   'memory.write_entity': async (input, ctx) => {
     const parsed = parseOrFail(WriteEntityInput, input, 'memory.write_entity');
     return write('entity', ctx, {
@@ -902,6 +1172,26 @@ export function implementedLocalTools(): string[] {
  */
 export const LOCAL_TOOL_CONTRACTS: readonly { toolName: string; payload: string }[] = [
   {
+    toolName: 'ledger.add',
+    payload:
+      'שורה בפנקס המשימות — רק כשיש מועד או התחייבות — אחרת זה זיכרון (`memory.*`). ' +
+      '`{"family": "money_in"|"money_out"|"meetings"|"warm_leads"|"awaiting_reply"|"projects", ' +
+      '"description": עד 500 תווים, "dueDate": "YYYY-MM-DD" (רשות; חובה ל-projects), ' +
+      '"dueTime": "HH:MM" (רשות), "critical": true (רשות, רק כשהבעלים אמר שזה קריטי), ' +
+      '"counterpartyName": טקסט (רשות), "counterpartyEmail": כתובת (רשות — רק כפי שהבעלים כתב אותה), ' +
+      '"counterpartyDomain": דומיין (רשות), "reference": אסמכתא (רשות), "amountMinor": סכום באגורות (רשות), ' +
+      '"stages": מערך שלבים שהבעלים נתן (רשות), "proposedStages": הצעה לשלבים (רשות)}` — ' +
+      'נכתב רק ממשימה שהבעלים עצמו הורה עליה.',
+  },
+  {
+    toolName: 'ledger.update',
+    payload:
+      'עדכון שורה קיימת בפנקס — רק כשיש מועד או התחייבות — אחרת זה זיכרון (`memory.*`). ' +
+      '`{"itemId": מזהה השורה, "description", "dueDate": "YYYY-MM-DD", "dueTime": "HH:MM", "critical", ' +
+      '"reference", "amountMinor", "stagesDone": מספרי שלבים (מ-1) שהושלמו, "stages": רשימת שלבים חדשה, ' +
+      '"note": הערה}` — כל השדות מלבד `itemId` רשות. אינו פותח מחדש שורה שנסגרה.',
+  },
+  {
     toolName: 'memory.write_entity',
     payload:
       '`{"entityId": מזהה יציב וקצר, "attributes": אובייקט, "sourceRef": טקסט (רשות)}` — ' +
@@ -954,13 +1244,33 @@ export const LOCAL_TOOL_CONTRACTS: readonly { toolName: string; payload: string 
 ];
 
 /**
+ * Tools an agent holds that have NO handler, and where to go instead.
+ *
+ * Kept apart from `LOCAL_TOOL_CONTRACTS` because that list's invariant is
+ * "declared == implemented" (`local-tools.test.ts`), and these three are
+ * deliberately not implemented: `tasks.read` is `ingestsExternalContent =
+ * true`, so a ledger behind it would mark every job that reads the ledger as
+ * having swallowed outside content (spec §11). Rendered into the same prompt
+ * section so the planner, holding `ops.tasks`'s old names, is pointed at the
+ * ledger rather than writing a step that silently returns `not_implemented`.
+ */
+export const LOCAL_TOOL_REDIRECTS: readonly { toolName: string; payload: string }[] = [
+  'tasks.read',
+  'tasks.update_state',
+  'followup.schedule',
+].map((toolName) => ({
+  toolName,
+  payload: 'לא ממומש — לפנקס השתמשי ב-ledger.add / ledger.update',
+}));
+
+/**
  * The contracts as the text a prompt carries.
  *
  * A stable, sorted rendering: this sits in the cacheable prefix of both
  * prompts, and a byte that moves between calls invalidates the whole prefix.
  */
 export function renderLocalToolContracts(): string {
-  return [...LOCAL_TOOL_CONTRACTS]
+  return [...LOCAL_TOOL_CONTRACTS, ...LOCAL_TOOL_REDIRECTS]
     .sort((a, b) => a.toolName.localeCompare(b.toolName))
     .map((c) => `- \`${c.toolName}\` — ${c.payload}`)
     .join('\n');

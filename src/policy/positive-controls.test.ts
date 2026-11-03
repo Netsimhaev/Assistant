@@ -5,7 +5,7 @@ import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { compileCharter } from '../charter/compile.js';
-import { BusinessCharter } from '../domain/charter.js';
+import { BusinessCharter, KNOWN_TOOL_NAMES } from '../domain/charter.js';
 import { addresseeOf, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
 import { AGENT_ALLOWLISTS, isToolPermitted } from '../charter/capabilities.js';
 import {
@@ -276,6 +276,18 @@ describe('constants that must fail closed as the system grows', () => {
       classified.filter((tool) => readOnly.has(tool)).sort();
 
     expect(overlapOf(READ_ONLY_TOOLS)).toEqual([]);
+
+    // The ledger writers sit on the read-only side by design (spec §7.1: a
+    // classified tool would enter the boss-command path and ask a question
+    // L1 forbids). Their boundary is the provenance check inside the handler
+    // (`assertLedgerWriter`), so they must never ALSO carry a class — that
+    // would be exactly the both-tables shape above — and they must stay
+    // known, or the charter would refuse an allowlist that names them.
+    for (const tool of ['ledger.add', 'ledger.update']) {
+      expect(READ_ONLY_TOOLS.has(tool), tool).toBe(true);
+      expect(classified.includes(tool), tool).toBe(false);
+      expect(KNOWN_TOOL_NAMES.has(tool), tool).toBe(true);
+    }
 
     // The one line a future change would add. `mail.send` is classified; were
     // it also read-only, `rampLevelForPlan` would skip it and the step would

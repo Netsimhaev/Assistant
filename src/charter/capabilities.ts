@@ -90,6 +90,8 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
     'tasks.read',
     'tasks.update_state',
     'followup.schedule',
+    'ledger.add',
+    'ledger.update',
     'memory.recall',
     'agent.request_help',
   ],

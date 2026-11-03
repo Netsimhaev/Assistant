@@ -3,6 +3,7 @@ import type { Queryable } from '../db/pool.js';
 import { actionClassLabel, autonomyLevelLabel } from '../domain/labels.js';
 import { getPool } from '../db/pool.js';
 import type { DigestWindow } from './digest-window.js';
+import { isLedgerOverdue } from '../domain/ledger.js';
 import { failedText, isGateDenialCode, leadingCode, NOT_PERMITTED_TEXT } from './whatsapp-report.js';
 
 /** One thing that did not go smoothly, already phrased in Hebrew. */
@@ -70,6 +71,81 @@ export interface DigestFacts {
     rolling30Minor: number;
     ceilingMinor: number;
     currency: string;
+  };
+  /**
+   * The task ledger's section (spec §7.9, decision 13). `open`, `overdue` and
+   * `stuck` are point-in-time, like `waiting`; `closedByEvidence` counts the
+   * `closed_by_evidence` EVENTS inside the window. `overdue` is a subset of
+   * `open` and is decided in the charter zone — see `ledgerFacts`.
+   * `topStuck` is at most `MAX_NAMED_STUCK` descriptions, critical first.
+   */
+  ledger: {
+    open: number;
+    overdue: number;
+    stuck: number;
+    closedByEvidence: number;
+    topStuck: readonly string[];
+  };
+}
+
+/** How many stuck ledger rows the digest names; the rest are counted. */
+export const MAX_NAMED_STUCK = 5;
+
+/**
+ * The ledger's numbers, from plain SQL on its own tables.
+ *
+ * **Deliberately not `ledger/store.ts`'s helpers and nothing under
+ * `ledger/` at all.** The digest must reach no model at any depth
+ * (`digest-invariants.test.ts` walks the whole import graph), and the
+ * follow-up loop's modules sit one import away from the nudge drafter. Four
+ * counts and one short list are cheaper to write here than to keep that
+ * boundary true across someone else's refactor.
+ *
+ * **Overdue is decided in the charter zone, the way the reminder schedule
+ * decides it** — by `isLedgerOverdue` (`domain/ledger.ts`), the one definition
+ * the dashboard shares (`ledger/schedule.ts`: the first `overdue` slot is the local
+ * day AFTER the due date). A date-only due stores the daily hour on that
+ * local date, so it is overdue once the local date has passed — not once
+ * that hour has passed, and never by the UTC date or the database session's
+ * zone. A timed due is overdue once its instant has passed.
+ */
+async function ledgerFacts(
+  db: Queryable,
+  businessId: string,
+  window: DigestWindow,
+  timeZone: string,
+  now: Date,
+): Promise<DigestFacts['ledger']> {
+  const { rows: open } = await db.query<{ due_at: Date | null; due_is_date_only: boolean }>(
+    `SELECT due_at, due_is_date_only FROM ledger_items
+      WHERE business_id = $1 AND status = 'open'`,
+    [businessId],
+  );
+  const overdue = open.filter((row) =>
+    isLedgerOverdue({ status: 'open', dueAt: row.due_at, dueIsDateOnly: row.due_is_date_only }, now, timeZone),
+  ).length;
+
+  const { rows: stuckRows } = await db.query<{ description: string; total_count: string }>(
+    `SELECT description, count(*) OVER ()::text AS total_count
+       FROM ledger_items
+      WHERE business_id = $1 AND status = 'stuck'
+      ORDER BY (importance = 'critical') DESC, updated_at DESC, item_id ASC
+      LIMIT ${MAX_NAMED_STUCK}`,
+    [businessId],
+  );
+  const closedByEvidence = await countOf(
+    db,
+    `SELECT count(*)::text AS n FROM ledger_events
+      WHERE business_id = $1 AND kind = 'closed_by_evidence' AND at >= $2 AND at < $3`,
+    [businessId, window.start, window.end],
+  );
+
+  return {
+    open: open.length,
+    overdue,
+    stuck: stuckRows.length === 0 ? 0 : Number(stuckRows[0]?.total_count ?? '0'),
+    closedByEvidence,
+    topStuck: stuckRows.map((row) => row.description),
   };
 }
 
@@ -159,7 +235,7 @@ function reasonInHebrew(rawReason: string | null): string {
 export async function collectDigestFacts(
   window: DigestWindow,
   ceilings: { monthlyMinor: number; currency: string; timeZone: string },
-  options: { businessId?: string; db?: Queryable } = {},
+  options: { businessId?: string; db?: Queryable; now?: Date } = {},
 ): Promise<DigestFacts> {
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
@@ -403,6 +479,8 @@ export async function collectDigestFacts(
     [businessId],
   );
 
+  const ledger = await ledgerFacts(db, businessId, window, ceilings.timeZone, options.now ?? new Date());
+
   return {
     window,
     timeZone: ceilings.timeZone,
@@ -417,6 +495,7 @@ export async function collectDigestFacts(
       ceilingMinor: ceilings.monthlyMinor,
       currency: ceilings.currency,
     },
+    ledger,
   };
 }
 

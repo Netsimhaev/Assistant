@@ -213,6 +213,27 @@
  * (`list_<failure>`, `cursor_expired_gap`, `record_failed:<hash>:<n>`, the
  * hash being of a provider id, never an address). Nothing in it can name a
  * counterparty, so it is left out for the same reason `autonomy_mode` is.
+ *
+ * **Migration 052 added the task ledger: five of its six tables are wired in
+ * below, and `ledger_settings` is not.** `ledger_items` holds a free
+ * description, the counterparty's name, address and domain, a reference and
+ * the project stages; `ledger_events.note` and `ledger_reminders.body` are
+ * text written about that item and its counterparty. All three are discovery
+ * sources by their own content (the contact anchor), and the item is also
+ * reached by its own `created_at` (the window anchor) and by job membership
+ * (`origin_job_id = ANY(jobIds)`). Every item found then drags the jobs it
+ * produced into `jobIds` — its origin, its nudge (`nudge_job_id`) and every
+ * event's `job_id` — because a nudge job's plan carries the counterparty's
+ * address, and erasing the row while that plan survives keeps exactly what
+ * the owner asked to forget. `ledger_critical_rules` of kind `counterparty`
+ * hold a `match` that is a person's name, address or domain: a discovery and
+ * deletion target of its own (`ledgerRuleIds`), contact anchor only.
+ * `ledger_whatsapp_batches.items` holds item ids and nothing else — no text a
+ * name could land in — so it is NOT a discovery source. Each erased id is
+ * replaced IN PLACE by '' (a placeholder no item id can equal), and no batch
+ * is ever deleted — see `LEDGER_WHATSAPP_BATCHES_SCRUB_SET` for why. `ledger_settings` is one row per business of channels, hours
+ * and modes: nothing in it can name anyone, so it is left out for the same
+ * reason `autonomy_mode` is.
  */
 import { join } from 'node:path';
 import { config } from '../config.js';
@@ -296,6 +317,10 @@ export interface ErasurePlan {
   draftIds: string[];
   /** `mail_messages` rows found by the anchor itself — see this module's header. */
   mailIds: string[];
+  /** `ledger_items` rows to erase — see this module's header (migration 052). */
+  ledgerItemIds: string[];
+  /** `ledger_critical_rules` of kind `counterparty` whose `match` names the contact. */
+  ledgerRuleIds: string[];
   filePaths: string[];
   items: ErasureItem[];
   excluded: KeptExclusion[];
@@ -748,6 +773,65 @@ export const MAIL_INVOICES_ERASED_PREDICATE = `business_id = $1
   AND (mail_id = ANY ($2) OR document_id = ANY ($3))`;
 
 /**
+ * The task ledger's predicates (migration 052). Each one is interpolated
+ * verbatim by `countItems` and by the executor, with the same parameters, so
+ * the preview and the destruction cannot differ in text or in values.
+ *
+ * `ledger_events` and `ledger_reminders` cascade from `ledger_items`, and are
+ * deleted EXPLICITLY, before it — the `proposals`-before-`document_readings`
+ * lesson: a cascade that beat the explicit statement to the row would leave
+ * it reporting zero for a table that really lost rows.
+ *
+ * Parameters, in all three: `$1` businessId, `$2` ledgerItemIds.
+ */
+export const LEDGER_ITEMS_ERASED_PREDICATE = `business_id = $1 AND item_id = ANY ($2)`;
+export const LEDGER_EVENTS_ERASED_PREDICATE = `business_id = $1 AND item_id = ANY ($2)`;
+export const LEDGER_REMINDERS_ERASED_PREDICATE = `business_id = $1 AND item_id = ANY ($2)`;
+
+/**
+ * `ledger_whatsapp_batches` holds only item ids, in the order the owner saw
+ * them numbered, and `handleLedgerWhatsApp` resolves "2 בוצע" as
+ * `items[2 - 1]` of the latest delivered batch. So an erasure must keep
+ * every POSITION: removing an id would renumber the list and "2 בוצע" would
+ * close the item that used to be third; deleting an emptied batch would make
+ * the next reply resolve against an older batch. Each erased id is therefore
+ * replaced in place by '' — no item id is ever '' (they are `LI-<ulid>`), so
+ * `loadLedgerItem('')` is null and the reply is the existing not-found — and
+ * no batch row is ever deleted. A batch that lists no erased id is never
+ * touched; one already scrubbed lists '' and so is not matched again.
+ *
+ * Parameters, in both: `$1` businessId, `$2` ledgerItemIds.
+ */
+export const LEDGER_WHATSAPP_BATCHES_SCRUBBED_PREDICATE = `business_id = $1
+  AND items && $2::text[]`;
+
+export const LEDGER_WHATSAPP_BATCHES_SCRUB_SET = `items = ARRAY(
+    SELECT CASE WHEN u.x = ANY ($2::text[]) THEN '' ELSE u.x END
+      FROM unnest(items) WITH ORDINALITY AS u(x, n)
+     ORDER BY u.n)`;
+
+/**
+ * `ledger_critical_rules` of kind `counterparty`: the `match` is a person's
+ * name, address or domain. Found by a contact anchor only (a rule is the
+ * owner's configuration, not an event a window brackets). Parameters: `$1`
+ * businessId, `$2` ledgerRuleIds.
+ */
+export const LEDGER_CRITICAL_RULES_ERASED_PREDICATE = `business_id = $1 AND rule_id = ANY ($2)`;
+
+/**
+ * A ledger item's own content, matched against a contact pattern (`$2`).
+ * `stages`/`proposed_stages` go through `jsonbContentMatches`, so a name with
+ * `"` or a line break — escaped in the JSONB text form — is still found.
+ */
+const LEDGER_ITEM_CONTENT_MATCHES = `(description ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(counterparty_name, '')   ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(counterparty_email, '')  ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(counterparty_domain, '') ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(reference, '')           ILIKE $2 ${LIKE_ESCAPE}
+      OR ${jsonbContentMatches('stages', '$2')}
+      OR ${jsonbContentMatches('proposed_stages', '$2')})`;
+
+/**
  * A mail's content columns, matched against a contact pattern (`$2`). Every
  * column a person's identity or words can land in: sender, display name,
  * reply-to, recipients, subject, body, the model's summary, and the
@@ -882,6 +966,8 @@ export async function buildErasurePlan(
   const digestIds = new Set<string>();
   const draftIds = new Set<string>();
   const mailIds = new Set<string>();
+  const ledgerItemIds = new Set<string>();
+  const ledgerRuleIds = new Set<string>();
 
   if (anchor.kind === 'contact') {
     const pattern = `%${likeLiteral(anchor.identifier)}%`;
@@ -1106,6 +1192,31 @@ export async function buildErasurePlan(
       [businessId, pattern],
       'mail_id',
     )) mailIds.add(mailId);
+
+    // The task ledger, by its own content: the item's columns, any event's
+    // note, any reminder's body. See this module's header (migration 052).
+    for (const itemId of await idsFrom(
+      db,
+      `SELECT item_id FROM ledger_items li
+        WHERE li.business_id = $1
+          AND (${LEDGER_ITEM_CONTENT_MATCHES}
+            OR EXISTS (SELECT 1 FROM ledger_events e
+                        WHERE e.business_id = $1 AND e.item_id = li.item_id
+                          AND coalesce(e.note, '') ILIKE $2 ${LIKE_ESCAPE})
+            OR EXISTS (SELECT 1 FROM ledger_reminders r
+                        WHERE r.business_id = $1 AND r.item_id = li.item_id
+                          AND r.body ILIKE $2 ${LIKE_ESCAPE}))`,
+      [businessId, pattern],
+      'item_id',
+    )) ledgerItemIds.add(itemId);
+
+    for (const ruleId of await idsFrom(
+      db,
+      `SELECT rule_id FROM ledger_critical_rules
+        WHERE business_id = $1 AND kind = 'counterparty' AND match ILIKE $2 ${LIKE_ESCAPE}`,
+      [businessId, pattern],
+      'rule_id',
+    )) ledgerRuleIds.add(ruleId);
   }
 
   if (anchor.kind === 'window') {
@@ -1132,6 +1243,15 @@ export async function buildErasurePlan(
       [businessId, anchor.fromIso, anchor.toIso],
       'digest_id',
     )) digestIds.add(digestId);
+
+    // `created_at`: when the owner said it — the row's own instant, the
+    // convention every other window predicate here keeps.
+    for (const itemId of await idsFrom(
+      db,
+      `SELECT item_id FROM ledger_items WHERE business_id = $1 AND created_at >= $2 AND created_at < $3`,
+      [businessId, anchor.fromIso, anchor.toIso],
+      'item_id',
+    )) ledgerItemIds.add(itemId);
   }
 
   if (anchor.kind === 'document') {
@@ -1188,6 +1308,37 @@ export async function buildErasurePlan(
       [businessId, mailList],
       'document_id',
     )) documentIds.add(documentId);
+  }
+
+  // The task ledger, by job membership, then what every erased item
+  // produced. Runs after the mail closure (its jobs can be an item's origin)
+  // and BEFORE the job→document and memory closures below, because the
+  // nudge and event jobs it adds are exactly what those read. One pass, not
+  // a fixpoint: an item reached here drags its own jobs, and those jobs do
+  // not in turn reach further items — the same one-step reach every other
+  // closure in this function has.
+  if (jobIds.size > 0) {
+    for (const itemId of await idsFrom(
+      db,
+      `SELECT item_id FROM ledger_items WHERE business_id = $1 AND origin_job_id = ANY ($2)`,
+      [businessId, [...jobIds]],
+      'item_id',
+    )) ledgerItemIds.add(itemId);
+  }
+  if (ledgerItemIds.size > 0) {
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT origin_job_id AS job_id FROM ledger_items
+        WHERE business_id = $1 AND item_id = ANY ($2)
+       UNION
+       SELECT nudge_job_id AS job_id FROM ledger_items
+        WHERE business_id = $1 AND item_id = ANY ($2) AND nudge_job_id IS NOT NULL
+       UNION
+       SELECT job_id FROM ledger_events
+        WHERE business_id = $1 AND item_id = ANY ($2) AND job_id IS NOT NULL`,
+      [businessId, [...ledgerItemIds]],
+      'job_id',
+    )) jobIds.add(jobId);
   }
 
   // Documents reached through the jobs that read them.
@@ -1385,8 +1536,11 @@ export async function buildErasurePlan(
   const digestList = [...digestIds];
   const draftList = [...draftIds];
   const mailList = [...mailIds];
+  const ledgerItemList = [...ledgerItemIds];
+  const ledgerRuleList = [...ledgerRuleIds];
   const items = await countItems(
     db, businessId, anchor, jobList, documentList, memoryIds, digestList, draftList, mailList,
+    ledgerItemList, ledgerRuleList,
   );
 
   return {
@@ -1397,6 +1551,8 @@ export async function buildErasurePlan(
     digestIds: digestList,
     draftIds: draftList,
     mailIds: mailList,
+    ledgerItemIds: ledgerItemList,
+    ledgerRuleIds: ledgerRuleList,
     filePaths,
     items,
     excluded,
@@ -1421,6 +1577,8 @@ async function countItems(
   digestIds: string[],
   draftIds: string[],
   mailIds: string[],
+  ledgerItemIds: string[],
+  ledgerRuleIds: string[],
 ): Promise<ErasureItem[]> {
   const one = async (
     table: string,
@@ -1561,6 +1719,38 @@ async function countItems(
       'delete',
       `SELECT count(*)::text AS n FROM confirmed_step_claims WHERE ${CONFIRMED_STEP_CLAIMS_ERASED_PREDICATE}`,
       [businessId, jobIds],
+    ),
+    // The task ledger (migration 052): events and reminders before items,
+    // matching the executor's order — see `LEDGER_ITEMS_ERASED_PREDICATE`.
+    await one(
+      'ledger_events',
+      'delete',
+      `SELECT count(*)::text AS n FROM ledger_events WHERE ${LEDGER_EVENTS_ERASED_PREDICATE}`,
+      [businessId, ledgerItemIds],
+    ),
+    await one(
+      'ledger_reminders',
+      'delete',
+      `SELECT count(*)::text AS n FROM ledger_reminders WHERE ${LEDGER_REMINDERS_ERASED_PREDICATE}`,
+      [businessId, ledgerItemIds],
+    ),
+    await one(
+      'ledger_whatsapp_batches',
+      'scrub',
+      `SELECT count(*)::text AS n FROM ledger_whatsapp_batches WHERE ${LEDGER_WHATSAPP_BATCHES_SCRUBBED_PREDICATE}`,
+      [businessId, ledgerItemIds],
+    ),
+    await one(
+      'ledger_items',
+      'delete',
+      `SELECT count(*)::text AS n FROM ledger_items WHERE ${LEDGER_ITEMS_ERASED_PREDICATE}`,
+      [businessId, ledgerItemIds],
+    ),
+    await one(
+      'ledger_critical_rules',
+      'delete',
+      `SELECT count(*)::text AS n FROM ledger_critical_rules WHERE ${LEDGER_CRITICAL_RULES_ERASED_PREDICATE}`,
+      [businessId, ledgerRuleIds],
     ),
     await one(
       'job_plans',

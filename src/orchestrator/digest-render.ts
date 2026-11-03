@@ -69,7 +69,7 @@ function namedExceptionsList(items: readonly DigestException[], hiddenCount: num
 }
 
 export function renderDigest(facts: DigestFacts): RenderedDigest {
-  const { window: w, waiting, done, exceptions, permissionChanges, cost, timeZone } = facts;
+  const { window: w, waiting, done, exceptions, permissionChanges, cost, timeZone, ledger } = facts;
   const lines: string[] = [];
 
   lines.push(`${KIND_LABEL[w.kind]} · ${day(w.start, timeZone)}–${day(w.end, timeZone)}`);
@@ -115,6 +115,23 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
     lines.push('', 'מה השתנה בהרשאות שלי:', ...namedList(permissionChanges));
   }
 
+  // The ledger (spec §7.9). Omitted when every number is zero. Open rows are
+  // listed for orientation, but they are not news on their own — see
+  // `hadContent` below.
+  const ledgerTotal = ledger.open + ledger.overdue + ledger.stuck + ledger.closedByEvidence;
+  if (ledgerTotal > 0) {
+    lines.push('', 'הפנקס:');
+    if (ledger.open > 0) lines.push(`· ${ledger.open} שורות פתוחות.`);
+    if (ledger.overdue > 0) lines.push(`· ${ledger.overdue} מהן באיחור.`);
+    if (ledger.closedByEvidence > 0) lines.push(`· ${ledger.closedByEvidence} נסגרו לפי ראיה בתקופה.`);
+    if (ledger.stuck > 0) {
+      lines.push(`· ${ledger.stuck} תקועות:`);
+      for (const description of ledger.topStuck) lines.push(`  · ${safe(description)}`);
+      const hidden = ledger.stuck - ledger.topStuck.length;
+      if (hidden > 0) lines.push(`  · ועוד ${hidden}.`);
+    }
+  }
+
   // §3.5 — both measures: what it cost, and how much is left.
   //
   // **"ב-30 הימים האחרונים", never "החודש".** The ceiling beside it is
@@ -142,7 +159,13 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
     doneTotal > 0 ||
     exceptions.length > 0 ||
     permissionChanges.length > 0 ||
-    cost.windowMinor > 0;
+    cost.windowMinor > 0 ||
+    // The ledger is news when something needs him or something changed —
+    // never merely because rows are open, or every day would be "content"
+    // and the empty-day rule (spec §2 decision 3) would never fire.
+    ledger.overdue > 0 ||
+    ledger.stuck > 0 ||
+    ledger.closedByEvidence > 0;
 
   // Spec §2 decision 3: an empty day is SAID. The screen still gets it so the
   // record stays continuous; `hadContent` is what keeps it out of his inbox.

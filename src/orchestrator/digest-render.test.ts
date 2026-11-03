@@ -17,6 +17,7 @@ function facts(over: Partial<DigestFacts> = {}): DigestFacts {
     exceptionsHiddenCount: 0,
     permissionChanges: [],
     cost: { windowMinor: 0, rolling30Minor: 0, ceilingMinor: 50000, currency: 'ILS' },
+    ledger: { open: 0, overdue: 0, stuck: 0, closedByEvidence: 0, topStuck: [] },
     ...over,
   };
 }
@@ -277,5 +278,57 @@ describe('renderDigest', () => {
       cost: { windowMinor: 0, rolling30Minor: 500, ceilingMinor: 50000, currency: 'ILS' },
     }));
     expect(out.hadContent).toBe(false);
+  });
+
+  describe('the ledger section', () => {
+    const LEDGER = { open: 0, overdue: 0, stuck: 0, closedByEvidence: 0, topStuck: [] as string[] };
+
+    it('is omitted entirely when every ledger number is zero', () => {
+      const out = renderDigest(facts());
+      expect(out.body).not.toContain('הפנקס');
+    });
+
+    it('states open, overdue, closed by evidence and stuck, and names the stuck ones on one line each', () => {
+      const out = renderDigest(
+        facts({
+          ledger: {
+            open: 7,
+            overdue: 2,
+            stuck: 6,
+            closedByEvidence: 3,
+            topStuck: ['חשבונית דנה\n· מזויף', 'פגישה עם ‮רונית', 'ג', 'ד', 'ה'],
+          },
+        }),
+      );
+      expect(out.body).toContain('הפנקס:');
+      expect(out.body).toContain('· 7 שורות פתוחות.');
+      expect(out.body).toContain('· 2 מהן באיחור.');
+      expect(out.body).toContain('· 3 נסגרו לפי ראיה בתקופה.');
+      expect(out.body).toContain('· 6 תקועות:');
+      // One line per name: a newline inside a description cannot forge a bullet.
+      expect(out.body).toContain('  · חשבונית דנה · מזויף');
+      expect(out.body).not.toContain('\n· מזויף');
+      // Direction controls are stripped from what the owner reads.
+      expect(out.body).not.toContain('‮');
+      expect(out.body).toContain('  · ועוד 1.');
+      expect(out.hadContent).toBe(true);
+    });
+
+    it('open rows alone are not news: a day with only open rows still says nothing happened', () => {
+      const out = renderDigest(facts({ ledger: { ...LEDGER, open: 4 } }));
+      expect(out.body).toContain('· 4 שורות פתוחות.');
+      expect(out.hadContent).toBe(false);
+      expect(out.body).toContain('לא קרה');
+    });
+
+    it.each([
+      ['overdue', { overdue: 1, open: 1 }],
+      ['stuck', { stuck: 1, topStuck: ['x'] }],
+      ['closedByEvidence', { closedByEvidence: 1 }],
+    ] as const)('%s alone is content', (_name, over) => {
+      const out = renderDigest(facts({ ledger: { ...LEDGER, ...over } }));
+      expect(out.hadContent).toBe(true);
+      expect(out.body).toContain('הפנקס:');
+    });
   });
 });

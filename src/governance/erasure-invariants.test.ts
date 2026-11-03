@@ -105,14 +105,22 @@ describe('what an erasure leaves behind', () => {
    * with no job or document, so it is its own probe site (seeded in
    * `answers`, with a second-business row as the narrowness control).
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen" count is spec §5.1's own
+   * **A twentieth, also outside spec §5.1: the task ledger (migration 052)**
+   * — `ledger_items` (description, counterparty name/address/domain,
+   * reference, stages), `ledger_events.note`, `ledger_reminders.body` and the
+   * `match` of a counterparty `ledger_critical_rules` row, counted as one
+   * store. Seeded on an item whose origin job names nothing, so only the
+   * ledger's own discovery can reach it. `ledger_whatsapp_batches` holds ids
+   * only and is asserted directly (kept, the erased id replaced by '' in place); `ledger_settings` holds no person content.
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (23; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (28 since migration 052; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 23 also includes tables scrubbed as a consequence of
+   * stores, while the 28 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
@@ -472,7 +480,60 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS],
     );
 
+    // --- Migration 052: the task ledger. ---------------------------------
+    //
+    // An item owned by a job that names nothing — so only the ledger's own
+    // discovery can reach it — with the probe in its description and
+    // counterparty name, in one event's note and one reminder's body, plus a
+    // counterparty critical rule whose match is the probe. The WhatsApp
+    // batch holds the item's id only and is checked directly below.
+    const ledgerOrigin = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'שורה בפנקס',
+    });
+    await db.query(
+      `INSERT INTO ledger_items
+         (item_id, business_id, family, description, counterparty_name, counterparty_email,
+          counterparty_domain, reference, stages, origin_job_id)
+       VALUES ('LI-probe', $1, 'money_in', $2, $3, $3, 'nowhere.example', $5, $6::jsonb, $4)`,
+      [
+        BUSINESS,
+        `חשבונית של ${PROBE}`,
+        PROBE,
+        ledgerOrigin.jobId,
+        `הזמנה ${PROBE}`,
+        // A `"` beside the probe, so `stages::text` escapes it and the JSON
+        // path of `jsonbContentMatches` is the arm that has to find it.
+        JSON.stringify([{ name: `חוזה "מסגרת" מול ${PROBE}`, done: false }]),
+      ],
+    );
+    await db.query(
+      `INSERT INTO ledger_events (event_id, business_id, item_id, kind, note, by_whom)
+       VALUES ('LE-probe', $1, 'LI-probe', 'updated', $2, 'owner')`,
+      [BUSINESS, `דיברתי עם ${PROBE}`],
+    );
+    await db.query(
+      `INSERT INTO ledger_reminders (reminder_id, business_id, item_id, slot, kind, body)
+       VALUES ('LR-probe', $1, 'LI-probe', 'due:2026-01-01', 'due', $2)`,
+      [BUSINESS, `תזכורת: לגבות מ-${PROBE}`],
+    );
+    await db.query(
+      `INSERT INTO ledger_critical_rules (rule_id, business_id, kind, match, created_by)
+       VALUES ('LC-probe', $1, 'counterparty', $2, 'owner')`,
+      [BUSINESS, PROBE],
+    );
+    await db.query(
+      `INSERT INTO ledger_whatsapp_batches (batch_id, business_id, items)
+       VALUES ('LW-probe', $1, ARRAY['LI-probe'])`,
+      [BUSINESS],
+    );
+
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
+    expect(
+      plan.items.find((item) => item.table === 'ledger_items' && item.action === 'delete')?.count,
+    ).toBe(1);
     // The sweep below proves the executor deleted the row; this proves the
     // preview the owner confirms LISTED it — `countItems` and the executor
     // are two hand-written lists, and the sweep alone cannot catch the first
@@ -504,6 +565,14 @@ describe('what an erasure leaves behind', () => {
       job.jobId,
     ]);
     expect(claims.rows).toHaveLength(0);
+
+    // The ledger batch is kept, its position holding the never-resolving
+    // placeholder — never deleted, never renumbered.
+    const batch = await db.query<{ items: string[] }>(
+      'SELECT items FROM ledger_whatsapp_batches WHERE batch_id = $1',
+      ['LW-probe'],
+    );
+    expect(batch.rows).toEqual([{ items: [''] }]);
 
     // The row the content arm's narrowness is for (fix round 2, Finding 2):
     // job-less, under the same contact anchor as everything else in this

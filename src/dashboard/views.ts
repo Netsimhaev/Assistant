@@ -238,7 +238,7 @@ export function renderPendingList(options: {
 </header>
 ${options.modeFailed === true ? `<p class="error" role="alert">${esc(MODE_NOT_APPLIED_NOTICE)} <a href="/autonomy">כמה חופש לתת</a></p>` : ''}
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a></p>
 ${list}`,
   );
 }
@@ -1364,6 +1364,8 @@ export function renderInstruct(options: {
   grantNote?: string | null;
   recordingNote?: string | null;
   identityNote?: string | null;
+  /** What the plan's ledger steps will record (`renderLedgerEcho`); owner/planner text, so `escLabel`. */
+  ledgerEcho?: string | null;
   /**
    * A boss command waiting on the owner's confirmation (spec §4), shown whole.
    * Used when the question has no row to answer against (it should always
@@ -1400,6 +1402,11 @@ export function renderInstruct(options: {
   const identityNote =
     options.identityNote == null ? '' : `<p class="muted">${escLabel(options.identityNote)}</p>`;
 
+  const ledgerEcho =
+    options.ledgerEcho == null
+      ? ''
+      : `<p class="muted" style="white-space: pre-wrap">${escLabel(options.ledgerEcho)}</p>`;
+
   // `escLabel`, not `esc`: the question quotes plan values that can carry a
   // stranger's bytes (an address from memory, a body). `pre-wrap` keeps the
   // echo's line structure — its continuation margin is what stops a value's
@@ -1425,6 +1432,7 @@ export function renderInstruct(options: {
      ${error}
      ${grantNote}
      ${recordingNote}
+     ${ledgerEcho}
      ${confirmationQuestion}
      ${confirmations}
      ${identityNote}
@@ -1444,7 +1452,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/digest">מה קרה</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/digest">מה קרה</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }
@@ -1524,6 +1532,14 @@ export const TABLE_LABELS: Record<string, string> = {
   // invoices extracted from it.
   mail_messages: 'מיילים',
   mail_invoices: 'חשבוניות ממיילים',
+  // Migration 052: the task ledger — its rows, their history and reminders,
+  // the numbered WhatsApp lists that point at them, and "critical" rules
+  // that name a person.
+  ledger_items: 'שורות בפנקס',
+  ledger_events: 'היסטוריה של שורות בפנקס',
+  ledger_reminders: 'תזכורות מהפנקס',
+  ledger_whatsapp_batches: 'רשימות פנקס ממוספרות בוואטסאפ',
+  ledger_critical_rules: 'כללי "קריטי" שנוקבים באדם',
 };
 
 /**

@@ -244,4 +244,22 @@ export function logErrored(result: SchedulerPassResult): void {
         `a channel set to receive updates is not connected`,
     );
   }
+  if (result.ledgerEvidenceError !== null) {
+    console.error(`ledger evidence failed: ${result.ledgerEvidenceError}`);
+  }
+  if (result.ledgerError !== null) {
+    console.error(`ledger pass failed: ${result.ledgerError}`);
+  }
+  if (result.ledgerEvidence !== null && result.ledgerEvidence.errored.length > 0) {
+    console.error(
+      `ledger evidence: ${result.ledgerEvidence.errored.length} item(s) errored: ` +
+        result.ledgerEvidence.errored.map((e) => `${e.itemId}: ${e.error}`).join('; '),
+    );
+  }
+  if (result.ledger !== null && result.ledger.errored.length > 0) {
+    console.error(
+      `ledger pass: ${result.ledger.errored.length} item(s) errored: ` +
+        result.ledger.errored.map((e) => `${e.itemId}: ${e.error}`).join('; '),
+    );
+  }
 }

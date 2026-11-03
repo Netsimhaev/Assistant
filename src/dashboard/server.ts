@@ -105,6 +105,14 @@ import {
   handleMailboxSignPost,
   handleMailboxStatus,
 } from './mailbox-connect.js';
+import {
+  handleLedgerAction,
+  handleLedgerGet,
+  handleLedgerRuleDelete,
+  handleLedgerRulePost,
+  handleLedgerSettingsGet,
+  handleLedgerSettingsPost,
+} from './ledger-routes.js';
 import { handleDocumentFile, handleInvoices, handleMailDetail, handleMailDocuments, handleMailList, notFound } from './mail-handlers.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { recentReadings } from './readings-list.js';
@@ -976,7 +984,8 @@ export async function renderInstructionOutcome(
   if (
     outcome.grantNote !== null ||
     outcome.recordingNote !== null ||
-    outcome.identityNote !== null
+    outcome.identityNote !== null ||
+    outcome.ledgerEcho !== null
   ) {
     sendHtml(
       res,
@@ -986,6 +995,7 @@ export async function renderInstructionOutcome(
         grantNote: outcome.grantNote,
         recordingNote: outcome.recordingNote,
         identityNote: outcome.identityNote,
+        ledgerEcho: outcome.ledgerEcho,
       }),
     );
     return;
@@ -1665,6 +1675,8 @@ function planFingerprint(plan: ErasurePlan): string {
     digestIds: [...plan.digestIds].sort(),
     draftIds: [...plan.draftIds].sort(),
     mailIds: [...plan.mailIds].sort(),
+    ledgerItemIds: [...plan.ledgerItemIds].sort(),
+    ledgerRuleIds: [...plan.ledgerRuleIds].sort(),
     filePaths: [...plan.filePaths].sort(),
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
@@ -2673,6 +2685,8 @@ async function handleAutonomousActionMark(
 const CARD_PATH = /^\/a\/([^/]+)$/;
 const SETUP_STEP_PATH = /^\/setup\/step\/([^/]+)$/;
 const SETUP_RULE_PATH = /^\/setup\/rule\/(\d{1,3})$/;
+const LEDGER_ACTION_PATH = /^\/ledger\/([^/]+)\/action$/;
+const LEDGER_RULE_DELETE_PATH = /^\/ledger\/rules\/([^/]+)\/delete$/;
 const MAIL_PATH = /^\/mail\/([^/]+)$/;
 const DOCUMENT_FILE_PATH = /^\/documents\/([^/]+)\/file$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
@@ -2819,6 +2833,28 @@ async function route(
     return handleAutonomyUpdatesPost(req, res, businessId, session);
   if (method === 'GET' && pathname === '/autonomy/actions')
     return handleAutonomousActionsGet(res, businessId, session);
+
+  // The task ledger ("הפנקס"): list + owner actions, settings, critical rules.
+  if (method === 'GET' && pathname === '/ledger') return handleLedgerGet(res, businessId, session, requestUrl);
+  if (method === 'GET' && pathname === '/ledger/settings') return handleLedgerSettingsGet(res, businessId, session);
+  if (method === 'POST' && pathname === '/ledger/settings') {
+    return handleLedgerSettingsPost(res, businessId, session, await readFormBody(req));
+  }
+  if (method === 'POST' && pathname === '/ledger/rules') {
+    return handleLedgerRulePost(res, businessId, session, await readFormBody(req));
+  }
+  const ledgerRuleDeleteMatch = LEDGER_RULE_DELETE_PATH.exec(pathname);
+  if (method === 'POST' && ledgerRuleDeleteMatch?.[1] !== undefined) {
+    const ruleId = decodePathSegment(ledgerRuleDeleteMatch[1]);
+    if (ruleId === null) return notFound(res);
+    return handleLedgerRuleDelete(res, businessId, session, ruleId, await readFormBody(req));
+  }
+  const ledgerActionMatch = LEDGER_ACTION_PATH.exec(pathname);
+  if (method === 'POST' && ledgerActionMatch?.[1] !== undefined) {
+    const itemId = decodePathSegment(ledgerActionMatch[1]);
+    if (itemId === null) return notFound(res);
+    return handleLedgerAction(res, businessId, session, itemId, await readFormBody(req));
+  }
 
   if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
   if (method === 'POST' && pathname === '/instruct')
