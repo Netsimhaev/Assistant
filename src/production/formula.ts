@@ -17,8 +17,15 @@
  * `[x]`, a defined name, or a syntax error.
  *
  * Known, deliberate deviations from Excel that yield an error where Excel
- * yields a value:
+ * yields a value. Every one of them is raised through `refuse()`, so no
+ * IFERROR — in the same cell or a cell that reads it — turns it into the
+ * fallback; errors Excel itself raises stay plain and catchable:
  * - Text in arithmetic is #VALUE! even when it looks numeric (Excel: "5"+1=6).
+ *   Text containing any digit is refused (Excel may coerce it); text with no
+ *   digit is a plain #VALUE!, as in Excel.
+ * - A function argument that must be a range but is not (Excel rejects the
+ *   formula outright).
+ * - INDEX asked for a whole row/column of a 2-D range (Excel: an array).
  * - A multi-cell range in scalar context is #VALUE! (no implicit intersection),
  *   so array idioms like SUMPRODUCT((A1:A3>1)*B1:B3) are #VALUE!.
  * - IFERROR over a multi-cell range is a #VALUE! that no IFERROR swallows
@@ -37,6 +44,10 @@
  * - Number-to-text (`&`, text criteria) uses 15 significant digits with JS
  *   formatting (exponent at 1e21 / 1e-7), not Excel's General format (which
  *   switches to exponent notation past 11 characters).
+ * - The add/subtract cancellation snap (a result below 2^-50 × the larger
+ *   operand becomes 0) applies to every intermediate + and -, not only the
+ *   final operation of the formula as in Excel. So (0.3-(0.1+0.2))*1e20 is 0
+ *   here; Excel gives about -5.55e3.
  */
 
 export const FORMULA_FUNCTIONS = [
@@ -593,12 +604,15 @@ type Operand = Cell | RangeOp;
 const mkErr = (error: FormulaErrorCode): EvalError => ({ error });
 
 /**
- * Errors no IFERROR may swallow, tracked by identity (errors propagate as the
- * same object). A shape we refuse must surface, not turn into the fallback.
+ * Deviation errors: ones WE return where Excel would return a value (see the
+ * module docblock). No IFERROR may swallow them, or the fallback becomes a
+ * plausible wrong number. Tracked by identity — errors propagate as the same
+ * object, also across cells (a cell stores the object it evaluated to).
+ * Errors Excel itself raises stay plain and catchable.
  */
 const UNCATCHABLE = new WeakSet<EvalError>();
-function refuseShape(): EvalError {
-  const e = mkErr('#VALUE!');
+function refuse(code: FormulaErrorCode): EvalError {
+  const e = mkErr(code);
   UNCATCHABLE.add(e);
   return e;
 }
@@ -617,14 +631,17 @@ function scalarRange(value: Cell): RangeOp {
 function toScalar(op: Operand): Cell {
   if (!isRange(op)) return op;
   if (op.rows === 1 && op.cols === 1) return op.at(0, 0);
-  return mkErr('#VALUE!');
+  // Excel would intersect or compute an array here.
+  return refuse('#VALUE!');
 }
 
 function toNumber(v: Cell): number | EvalError {
   if (v === null) return 0;
   if (typeof v === 'number') return v;
   if (typeof v === 'boolean') return v ? 1 : 0;
-  if (typeof v === 'string') return mkErr('#VALUE!');
+  // Excel coerces numeric-looking text ("5", "1,000", "$5"); we refuse it as
+  // a deviation. Text with no digit at all is #VALUE! in Excel too.
+  if (typeof v === 'string') return /\p{Nd}/u.test(v) ? refuse('#VALUE!') : mkErr('#VALUE!');
   return v;
 }
 
@@ -844,7 +861,10 @@ function cellsOf(range: RangeOp): Cell[] {
   return out;
 }
 
-/** Returns a 0-based index, or -1. `type` is MATCH's match_type. */
+/** -2: an approximate lookup over an unsorted column (a deviation, see docblock). */
+const UNSORTED = -2;
+
+/** Returns a 0-based index, -1 (not found) or UNSORTED. `type` is MATCH's match_type. */
 function lookupIndex(values: Cell[], lookup: number | string | boolean, type: -1 | 0 | 1): number {
   if (type === 0) {
     if (typeof lookup === 'string') {
@@ -858,7 +878,7 @@ function lookupIndex(values: Cell[], lookup: number | string | boolean, type: -1
   const present = values.filter((v): v is number | string | boolean => v !== null && !isErr(v));
   for (let i = 1; i < present.length; i++) {
     const cmp = compareValues(present[i - 1]!, present[i]!);
-    if ((type === 1 && cmp > 0) || (type === -1 && cmp < 0)) return -1;
+    if ((type === 1 && cmp > 0) || (type === -1 && cmp < 0)) return UNSORTED;
   }
   let found = -1;
   for (let i = 0; i < values.length; i++) {
@@ -1039,7 +1059,7 @@ class Workbook {
 
   private evaluateNode(idx: number): EvalValue {
     const node = this.nodes[idx]!;
-    if (!node.parsed.ok) return mkErr('#NAME?');
+    if (!node.parsed.ok) return refuse('#NAME?');
     const v = toScalar(this.eval(node.parsed.ast, node.sheet));
     if (v === null) return 0;
     if (typeof v === 'number') {
@@ -1174,7 +1194,8 @@ class Workbook {
     const op = this.arg(args, i, sheet);
     if (isRange(op)) return op;
     if (isErr(op)) return op;
-    return mkErr('#VALUE!');
+    // Excel will not accept a non-range here at all.
+    return refuse('#VALUE!');
   }
 
   private call(name: FormulaFunction, args: FormulaAst[], sheet: number): Operand {
@@ -1222,7 +1243,7 @@ class Workbook {
         const v = this.arg(args, 0, sheet);
         // A multi-cell range would be an array in Excel 365; we refuse the
         // shape with an error IFERROR itself does not swallow.
-        if (isRange(v) && (v.rows !== 1 || v.cols !== 1)) return refuseShape();
+        if (isRange(v) && (v.rows !== 1 || v.cols !== 1)) return refuse('#VALUE!');
         const s = toScalar(v);
         // A cycle is never rescued into a number, nor is a refused shape.
         if (isErr(s) && (s.error === '#CIRC!' || UNCATCHABLE.has(s))) return s;
@@ -1290,6 +1311,8 @@ class Workbook {
         if (isErr(crit)) return crit;
         const sumRange = args.length > 2 ? this.rangeArg(args, 2, sheet) : range;
         if (isErr(sumRange)) return sumRange;
+        // Excel resizes SUMIF's sum_range; we refuse a different shape.
+        if (sumRange.rows !== range.rows || sumRange.cols !== range.cols) return refuse('#VALUE!');
         return this.conditionalSum(sumRange, [[range, crit]]);
       }
       case 'SUMIFS': {
@@ -1348,15 +1371,16 @@ class Workbook {
           row = Math.trunc(a);
           col = 1;
         } else {
-          return mkErr('#VALUE!');
+          // Excel returns the whole row as an array.
+          return refuse('#VALUE!');
         }
         if (row < 0 || col < 0) return mkErr('#VALUE!');
         if (row === 0) {
-          if (range.rows !== 1) return mkErr('#VALUE!');
+          if (range.rows !== 1) return refuse('#VALUE!');
           row = 1;
         }
         if (col === 0) {
-          if (range.cols !== 1) return mkErr('#VALUE!');
+          if (range.cols !== 1) return refuse('#VALUE!');
           col = 1;
         }
         if (row > range.rows || col > range.cols) return mkErr('#REF!');
@@ -1377,6 +1401,7 @@ class Workbook {
           type = t > 0 ? 1 : t < 0 ? -1 : 0;
         }
         const i = lookupIndex(cellsOf(range), lookup, type);
+        if (i === UNSORTED) return refuse('#N/A');
         return i < 0 ? mkErr('#N/A') : i + 1;
       }
       case 'VLOOKUP': {
@@ -1400,6 +1425,7 @@ class Workbook {
         for (let r = 0; r < table.rows; r++) firstColumn.push(table.at(r, 0));
         const i = lookupIndex(firstColumn, lookup, approx ? 1 : 0);
         // A value, not a reference (unlike INDEX).
+        if (i === UNSORTED) return refuse('#N/A');
         return i < 0 ? mkErr('#N/A') : table.at(i, col - 1);
       }
     }

@@ -404,3 +404,69 @@ describe('fix round 1 — no plausible wrong number', () => {
     expect(calc('COUNTIF(A1:A4,"")', cells)).toBe(3);
   });
 });
+
+describe('fix round 2 — IFERROR never launders a deviation error', () => {
+  const nums = { A1: 1, A2: 2, A3: 3, B1: 4, B2: 5, B3: 6 };
+
+  it('multi-cell range in scalar context', () => {
+    expect(calc('SUM(IFERROR(A1:A3*1,0))', nums)).toEqual(err('#VALUE!'));
+    expect(calc('IFERROR(ABS(A1:A3),0)', nums)).toEqual(err('#VALUE!'));
+  });
+
+  it('SUMPRODUCT array arithmetic', () => {
+    expect(calc('IFERROR(SUMPRODUCT((A1:A3>1)*B1:B3),0)', nums)).toEqual(err('#VALUE!'));
+  });
+
+  it('numeric-looking text in arithmetic, literal and via a cell', () => {
+    expect(calc('IFERROR("5"+1,0)')).toEqual(err('#VALUE!'));
+    expect(calc('IFERROR(A1+1,0)', { A1: '5' })).toEqual(err('#VALUE!'));
+    // Where Excel itself errors, IFERROR still catches (control).
+    expect(calc('IFERROR("a"*2,0)')).toBe(0);
+  });
+
+  it('IFERROR over a multi-cell range (already uncatchable)', () => {
+    expect(calc('IFERROR(IFERROR(A1:A3,0),9)', nums)).toEqual(err('#VALUE!'));
+  });
+
+  it('SUMIF sum-range shape mismatch', () => {
+    expect(calc('IFERROR(SUMIF(A1:A3,">0",B1:B2),0)', nums)).toEqual(err('#VALUE!'));
+    // SUMIFS mismatch is an Excel error, so it stays catchable (control).
+    expect(calc('IFERROR(SUMIFS(B1:B2,A1:A3,">0"),0)', nums)).toBe(0);
+  });
+
+  it('unsorted approximate MATCH/VLOOKUP', () => {
+    const unsorted = { A1: 10, B1: 'a', A2: 30, B2: 'b', A3: 20, B3: 'c' };
+    expect(calc('IFERROR(MATCH(25,A1:A3),0)', unsorted)).toEqual(err('#N/A'));
+    expect(calc('IFERROR(VLOOKUP(25,A1:B3,2),"x")', unsorted)).toEqual(err('#N/A'));
+    // A genuine not-found on sorted data is an Excel #N/A and stays catchable.
+    expect(calc('IFERROR(MATCH(5,A1:A3),0)', { A1: 10, A2: 20, A3: 30 })).toBe(0);
+  });
+
+  it('INDEX asked for a whole row/column of a 2-D range', () => {
+    expect(calc('IFERROR(INDEX(A1:B3,2),0)', nums)).toEqual(err('#VALUE!'));
+    expect(calc('IFERROR(INDEX(A1:B3,0,1),0)', nums)).toEqual(err('#VALUE!'));
+  });
+
+  it('a formula that does not parse (#NAME?)', () => {
+    const result = evaluateWorkbook([sheet('S', { A1: { f: 'INDIRECT("B1")' }, C1: { f: 'IFERROR(A1,0)' } })]);
+    expect(result.get('S!C1')).toEqual(err('#NAME?'));
+  });
+
+  it('a cycle (#CIRC!) — already uncatchable', () => {
+    const result = evaluateWorkbook([sheet('S', { A1: { f: 'A1' }, C1: { f: 'IFERROR(A1,0)' } })]);
+    expect(result.get('S!C1')).toEqual(err('#CIRC!'));
+  });
+
+  it('across cells: B1=IFERROR(dev,0), C1=IFERROR(B1,5) stays an error', () => {
+    const result = evaluateWorkbook([
+      sheet('S', { A1: 1, A2: 2, A3: 3, B1: { f: 'IFERROR(A1:A3*1,0)' }, C1: { f: 'IFERROR(B1,5)' }, D1: { f: 'B1+1' } }),
+    ]);
+    expect(result.get('S!B1')).toEqual(err('#VALUE!'));
+    expect(result.get('S!C1')).toEqual(err('#VALUE!'));
+    expect(calcIn(result, 'S!D1')).toEqual(err('#VALUE!'));
+  });
+});
+
+function calcIn(result: Map<string, EvalValue>, key: string): EvalValue | undefined {
+  return result.get(key);
+}
