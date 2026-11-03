@@ -24,6 +24,10 @@
  * propagation of uncatchable errors below is defence in depth, not the
  * guarantee: a function that drops an error on some path still cannot
  * produce a trusted wrong number, because the refuse() call was counted.
+ * An empty `deviated` set does NOT mean "equal to Excel" for the three
+ * parked value deviations listed at the end of this docblock (text
+ * collation, number-to-text formatting, the intermediate cancellation snap):
+ * those never call refuse(), so a cell affected by them is not in the set.
  *
  * Known, deliberate deviations from Excel that yield an error where Excel
  * yields a value. Every one of them is raised through `refuse()`, so no
