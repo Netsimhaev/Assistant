@@ -101,6 +101,15 @@ import {
 } from '../governance/typed-recipients.js';
 import { listContacts, type Contact } from '../memory/contacts.js';
 import { resolveContacts, type Ambiguity, type Resolution } from '../memory/contact-resolver.js';
+import { listLedgerItems, loadLedgerItem } from '../ledger/store.js';
+import { renderLedgerBlock } from '../ledger/render.js';
+import { ledgerEchoForSteps } from '../ledger/echo.js';
+import {
+  LedgerAddInput,
+  ledgerAddRuleProblem,
+  LedgerUpdateInput,
+  ledgerUpdateRuleProblem,
+} from '../ledger/ledger-input.js';
 import { recallForPlanning } from '../memory/recall-planning.js';
 import { classifyAction } from '../policy/classify.js';
 import { readEmails, readPhones } from '../policy/facts.js';
@@ -216,6 +225,12 @@ export type InstructionOutcome =
        * here is not neutral — it is a claim that nothing went unused.
        */
       identityNote: string | null;
+      /**
+       * What the ledger steps of the plan say they will record, rendered from
+       * the step inputs before they run (`renderLedgerEcho`). Null when the plan
+       * has no ledger step.
+       */
+      ledgerEcho: string | null;
     }
   | {
       status: 'needs_answer';
@@ -369,6 +384,7 @@ export async function runInstruction(
     channel: options.channel,
     textOrigin,
     bundle: active.bundle,
+    timeZone: active.charter.identity.timezone,
   };
 
   // Spec §6: more than one person fits the name, so nothing is sent until the
@@ -480,6 +496,8 @@ interface DoorContext {
   channel: ConfirmationChannel;
   textOrigin: InstructionTextOrigin;
   bundle: PolicyBundle;
+  /** The active charter's `identity.timezone`: the ledger's dates are the owner's wall clock. */
+  timeZone: string;
 }
 
 /**
@@ -523,6 +541,16 @@ async function planAndCheck(
     memoryBlock = '';
   }
 
+  // Same degradation as the recall above: no ledger context is worse than
+  // having it, but not planning because a read failed is worse still.
+  let ledgerBlock = '';
+  try {
+    const items = await listLedgerItems({ businessId: door.businessId, statuses: ['open', 'stuck'] });
+    ledgerBlock = renderLedgerBlock({ now: new Date(), timeZone: door.timeZone, items });
+  } catch {
+    ledgerBlock = '';
+  }
+
   let outcome: PlanOutcome;
   try {
     outcome = await door.planner({
@@ -540,6 +568,7 @@ async function planAndCheck(
       // applies the real ramp (`rampLevelForPlan`) when the plan runs.
       rampLevel: 'auto',
       ...(memoryBlock === '' ? {} : { memoryBlock }),
+      ...(ledgerBlock === '' ? {} : { ledgerBlock }),
     });
   } catch (err) {
     // `makePlan` returns `{status:'unparseable'}` for bad model OUTPUT, but it
@@ -605,9 +634,61 @@ async function planAndCheck(
         audit: `instruction door: step ${step.id} class mismatch (${mismatch})`,
       };
     }
+
+    const ledger = await ledgerStepProblem(door, step);
+    if (ledger !== null) return { kind: 'refused', ...ledger };
   }
 
   return { kind: 'plan', plan };
+}
+
+/**
+ * Spec F-I4a: a ledger step the handler would refuse is refused HERE, before
+ * the owner is told "ארשום" / "אעדכן" about it — by the handlers' own schema
+ * and cross-field rules (`ledger/ledger-input.ts`), plus, for an update, that
+ * the item exists in this business. Null when the step is fine (or not a
+ * ledger step).
+ */
+async function ledgerStepProblem(
+  door: DoorContext,
+  step: Plan['steps'][number],
+): Promise<{ reason: string; audit: string } | null> {
+  const invalid = (why: string) => ({
+    reason: 'התוכנית כוללת רישום בפנקס שאינו תקין, ולכן לא רצה.',
+    audit: `instruction door: step ${step.id} ${step.toolName} invalid (${why})`,
+  });
+  if (step.toolName === 'ledger.add') {
+    const parsed = LedgerAddInput.safeParse(step.input);
+    if (!parsed.success) return invalid(parsed.error.issues[0]?.message ?? 'schema');
+    const problem = ledgerAddRuleProblem(parsed.data);
+    return problem === null ? null : invalid(problem);
+  }
+  if (step.toolName === 'ledger.update') {
+    const parsed = LedgerUpdateInput.safeParse(step.input);
+    if (!parsed.success) return invalid(parsed.error.issues[0]?.message ?? 'schema');
+    const item = await loadLedgerItem(parsed.data.itemId, { businessId: door.businessId });
+    if (item === null) {
+      return {
+        reason: 'התוכנית מעדכנת שורה בפנקס שאינה קיימת, ולכן לא רצה.',
+        audit: `instruction door: step ${step.id} ledger.update names no item (${parsed.data.itemId})`,
+      };
+    }
+    const problem = ledgerUpdateRuleProblem(parsed.data, item);
+    return problem === null ? null : invalid(problem);
+  }
+  return null;
+}
+
+/** What a plan's ledger steps will record, as the owner reads it (future tense, F-I4). */
+function ledgerEchoOf(door: DoorContext, plan: Plan): Promise<string | null> {
+  return ledgerEchoForSteps(plan.steps, {
+    businessId: door.businessId,
+    timeZone: door.timeZone,
+    currency: door.bundle.ceilings.currency,
+    instructionText: door.instruction.text,
+    textOrigin: door.textOrigin,
+    knownCounterparties: door.bundle.knownCounterparties,
+  });
 }
 
 async function failJob(door: DoorContext, reason: string): Promise<void> {
@@ -761,7 +842,9 @@ async function planPerCandidate(
     return askOwner(door, identityQuestion);
   }
 
-  const rendered = renderConfirmationQuestion(options, { currency: door.bundle.ceilings.currency });
+  const ledgerEchoes: (string | null)[] = [];
+  for (const option of options) ledgerEchoes.push(await ledgerEchoOf(door, option.plan));
+  const rendered = renderConfirmationQuestion(options, { currency: door.bundle.ceilings.currency, ledgerEchoes });
   if ('refused' in rendered) {
     await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
     return { status: 'refused', reason: rendered.refused };
@@ -829,7 +912,10 @@ async function finishSingle(
       plan,
       contactSource: single.contactSource,
     };
-    const rendered = renderConfirmationQuestion([option], { currency: door.bundle.ceilings.currency });
+    const rendered = renderConfirmationQuestion([option], {
+      currency: door.bundle.ceilings.currency,
+      ledgerEchoes: [await ledgerEchoOf(door, plan)],
+    });
     if ('refused' in rendered) {
       await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
       return { status: 'refused', reason: rendered.refused };
@@ -889,6 +975,7 @@ async function finishSingle(
     grantNote,
     recordingNote,
     identityNote: single.identityNote,
+    ledgerEcho: await ledgerEchoOf(door, plan),
   };
 }
 

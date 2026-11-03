@@ -428,6 +428,40 @@ describe('reaskFailedCommands', () => {
     expect((await loadJob(jobId, { businessId: BUSINESS }))?.phase).toBe('failed');
   });
 
+  it('T6: the re-ask of a mixed plan carries the ledger echo of what is left', async () => {
+    const mixed = Plan.parse({
+      goal: 'לשלוח ולרשום',
+      steps: [
+        PLAN.steps[0],
+        {
+          id: 's2',
+          agent: 'ops.tasks',
+          intent: 'record',
+          toolName: 'ledger.add',
+          input: { family: 'awaiting_reply', description: 'תשובה מהזר' },
+          dependsOn: ['s1'],
+          expectedActionClass: null,
+        },
+      ],
+    });
+    const { jobId } = await seedCommand({ plan: mixed });
+    await transition(jobId, {
+      to: 'followup',
+      actor: 'orchestrator',
+      reason: 'quiet_hours',
+      wakeAt: new Date(Date.now() + 3_600_000),
+      businessId: BUSINESS,
+    });
+    await getPool().query(
+      `UPDATE instruction_confirmations SET decided_at = now() - interval '25 hours' WHERE job_id = $1`,
+      [jobId],
+    );
+    const result = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    expect(result.reasked).toHaveLength(1);
+    const confirmation = await loadConfirmation(result.reasked[0]?.newJobId ?? '', { businessId: BUSINESS });
+    expect(confirmation?.presentedText).toContain('ארשום: ממתינים לצד שני · תשובה מהזר');
+  });
+
   it('a WhatsApp re-ask that was not sent stays undelivered — no messenger, or a failed send', async () => {
     const first = await seedCommand();
     await timeOut(first.jobId, first.bundle);

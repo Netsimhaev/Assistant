@@ -48,6 +48,12 @@ export interface PlanRequest {
    * LAST for the cache's sake, and never re-ordered above the catalogue.
    */
   memoryBlock?: string;
+  /**
+   * The task ledger (`renderLedgerBlock`): today's date and the open items.
+   * Rendered AFTER `memoryBlock`, in the final uncached section — it changes
+   * with the clock and every item, so anywhere earlier breaks the cache.
+   */
+  ledgerBlock?: string;
 }
 
 export type PlanOutcome =
@@ -151,6 +157,9 @@ export function buildPlannerPrompt(
       : []),
     ...(request.memoryBlock !== undefined && request.memoryBlock !== ''
       ? ['', request.memoryBlock]
+      : []),
+    ...(request.ledgerBlock !== undefined && request.ledgerBlock !== ''
+      ? ['', request.ledgerBlock]
       : []),
   ].join('\n');
 }

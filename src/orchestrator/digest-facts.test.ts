@@ -515,4 +515,72 @@ describe('collectDigestFacts', () => {
     expect(facts.exceptions).toHaveLength(20);
     expect(facts.exceptionsHiddenCount).toBe(3); // 23 total − 20 named
   });
+
+  /**
+   * The ledger section (spec §7.9). `open` and `stuck` are point-in-time,
+   * like `waiting`; `closedByEvidence` is window-scoped by its EVENT time.
+   * `overdue` is decided in the CHARTER zone: a date-only due stores the
+   * daily hour on that local date, and it is overdue only once the local
+   * date has passed. `now` is 00:30 on 07.10 in Jerusalem — still 06.10 in
+   * UTC — so a UTC-dated rule would miss `LI-dateonly-past`.
+   */
+  it('counts the ledger: open, overdue in the charter zone, stuck, and closures by evidence in the window', async () => {
+    const db = getPool();
+    const item = (id: string, status: string, due: Date | null, dateOnly: boolean, extra: Partial<{ importance: string; business: string; description: string; updatedAt: Date }> = {}) =>
+      db.query(
+        `INSERT INTO ledger_items
+           (item_id, business_id, family, description, due_at, due_is_date_only, status, importance,
+            origin_job_id, updated_at)
+         VALUES ($1, $2, 'money_in', $3, $4, $5, $6, $7, 'J-origin', coalesce($8::timestamptz, now()))`,
+        [id, extra.business ?? BUSINESS, extra.description ?? `שורה ${id}`, due, dateOnly, status,
+         extra.importance ?? 'normal', extra.updatedAt ?? null],
+      );
+    // Open: 4 (2 overdue, 2 not).
+    await item('LI-dateonly-past', 'open', new Date('2026-10-06T08:00:00+03:00'), true);
+    await item('LI-dateonly-today', 'open', new Date('2026-10-07T08:00:00+03:00'), true);
+    await item('LI-timed-past', 'open', new Date('2026-10-06T23:00:00+03:00'), false);
+    await item('LI-timed-future', 'open', new Date('2026-10-07T01:00:00+03:00'), false);
+    await item('LI-nodue', 'open', null, false);
+    // Stuck: 6, so the named list caps at 5 with the critical one first.
+    for (let i = 1; i <= 5; i += 1) {
+      await item(`LI-stuck-${i}`, 'stuck', null, false, {
+        description: `תקוע ${i}\nשורה שנייה`,
+        updatedAt: new Date(`2026-10-0${i}T10:00:00+03:00`),
+      });
+    }
+    await item('LI-stuck-critical', 'stuck', null, false, {
+      importance: 'critical',
+      description: 'תקוע קריטי',
+      updatedAt: new Date('2026-09-01T10:00:00+03:00'),
+    });
+    // Closed by evidence: one inside the window, one before it.
+    await item('LI-ev-in', 'closed_by_evidence', null, false);
+    await item('LI-ev-out', 'closed_by_evidence', null, false);
+    await db.query(
+      `INSERT INTO ledger_events (event_id, business_id, item_id, kind, by_whom, at)
+       VALUES ('LE-in', $1, 'LI-ev-in', 'closed_by_evidence', 'system', $2),
+              ('LE-out', $1, 'LI-ev-out', 'closed_by_evidence', 'system', $3)`,
+      [BUSINESS, new Date('2026-10-06T12:00:00+03:00'), new Date('2026-10-05T12:00:00+03:00')],
+    );
+    // Another business's rows count for nothing here.
+    await item('LI-other-open', 'open', new Date('2026-10-01T08:00:00+03:00'), true, { business: 'other-business' });
+    await item('LI-other-stuck', 'stuck', null, false, { business: 'other-business' });
+
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, {
+      businessId: BUSINESS,
+      now: new Date('2026-10-07T00:30:00+03:00'),
+    });
+
+    expect(facts.ledger.open).toBe(5);
+    expect(facts.ledger.overdue).toBe(2);
+    expect(facts.ledger.stuck).toBe(6);
+    expect(facts.ledger.closedByEvidence).toBe(1);
+    expect(facts.ledger.topStuck).toHaveLength(5);
+    expect(facts.ledger.topStuck[0]).toBe('תקוע קריטי');
+  });
+
+  it('reports a ledger with nothing in it as all zeros', async () => {
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    expect(facts.ledger).toEqual({ open: 0, overdue: 0, stuck: 0, closedByEvidence: 0, topStuck: [] });
+  });
 });

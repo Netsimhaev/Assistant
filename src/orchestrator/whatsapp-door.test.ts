@@ -42,6 +42,7 @@ import {
 import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { raiseMailReply } from './mail-reply.js';
 import { presentMailCard } from './whatsapp-mail-card.js';
+import { createLedgerItem, loadLedgerItem } from '../ledger/store.js';
 
 const BUSINESS = 'test-business';
 // `buildCharter`'s default principal (`src/test/fixtures.ts`) carries this
@@ -247,7 +248,7 @@ describe('runWhatsAppDoor', () => {
       planner: plannedWith(recallPlan()),
     });
 
-    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
     expect(messenger.sentTexts).toHaveLength(1);
     expect(messenger.sentTexts[0]).toContain('קיבלתי');
 
@@ -1263,7 +1264,7 @@ describe('runWhatsAppDoor', () => {
       },
     });
 
-    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
     expect(seenInstructions).toEqual(['ראשונה (מוקדמת)', 'שנייה (מאוחרת)']);
   });
 
@@ -2013,5 +2014,168 @@ describe('confirming a held command over WhatsApp', () => {
     expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
     expect(await confirmationState(first)).toBe('pending');
     expect(await confirmationState(second)).toBe('pending');
+  });
+
+  /**
+   * Ledger commands (Task Ledger, task 11; ruling R5): read BEFORE the
+   * confirmation reader, for typed text only, and only when the text is a
+   * ledger command — "2 בוצע" with a boss-command question open reads as
+   * `unclear` there and would otherwise be swallowed for the whole window.
+   */
+  describe('ledger commands beside an open confirmation', () => {
+    async function ledgerItem(description: string): Promise<string> {
+      const created = await createLedgerItem(
+        {
+          family: 'awaiting_reply',
+          description,
+          dueAt: null,
+          dueIsDateOnly: false,
+          importance: 'normal',
+          importanceManual: false,
+          counterpartyName: null,
+          counterpartyEmail: null,
+          counterpartyEmailVerified: false,
+          counterpartyDomain: null,
+          reference: null,
+          amountMinor: null,
+          stages: [],
+          proposedStages: null,
+          originJobId: 'J-ledger',
+        },
+        { businessId: BUSINESS, by: 'test' },
+      );
+      return created.itemId;
+    }
+
+    /** A batch the owner received a minute ago. */
+    async function deliveredBatch(items: string[]): Promise<void> {
+      await getPool().query(
+        `INSERT INTO ledger_whatsapp_batches (batch_id, business_id, items, sent_at)
+         VALUES ($1, $2, $3, now() - interval '1 minute')`,
+        [`LB-door-${items.join('-')}`, BUSINESS, items],
+      );
+    }
+
+    async function ledgerStatus(itemId: string): Promise<string | undefined> {
+      return (await loadLedgerItem(itemId, { businessId: BUSINESS }))?.status;
+    }
+
+    it('"2 בוצע" with a two-option confirmation open closes the ledger item and confirms nothing', async () => {
+      const jobId = await held([OPTION_A, OPTION_B]);
+      const first = await ledgerItem('ראשון');
+      const second = await ledgerItem('שני');
+      await deliveredBatch([first, second]);
+
+      const msg = reply('2 בוצע');
+      gateway.enqueue(msg);
+      const result = await pass();
+
+      expect(result.ledgerReplies).toBe(1);
+      expect(result.confirmationReplies).toBe(0);
+      expect(result.instructed).toBe(0);
+      expect(await ledgerStatus(second)).toBe('done');
+      expect(await ledgerStatus(first)).toBe('open');
+      expect(await confirmationState(jobId)).toBe('pending');
+      expect(await phase(jobId)).toBe('plan');
+      expect(lastSent()).toBe('עודכן: שני — בוצע');
+      expect((await messageRow(msg.providerMessageId))?.state).toBe('handled');
+    });
+
+    it('a boss-command "כן" still confirms while a ledger batch is open', async () => {
+      const jobId = await held([SINGLE]);
+      const only = await ledgerItem('יחיד');
+      await deliveredBatch([only]);
+
+      gateway.enqueue(reply('כן'));
+      const result = await pass();
+
+      expect(result.confirmationReplies).toBe(1);
+      expect(result.ledgerReplies).toBe(0);
+      expect(await confirmationState(jobId)).toBe('confirmed');
+      expect(await ledgerStatus(only)).toBe('open');
+      expect(lastSent()).toBe(CONFIRM_EXECUTING);
+    });
+
+    it('a bare "בטלי" cancels the open question, never the one-item ledger batch', async () => {
+      const jobId = await held([SINGLE]);
+      const only = await ledgerItem('יחיד');
+      await deliveredBatch([only]);
+
+      gateway.enqueue(reply('בטלי'));
+      const result = await pass();
+
+      expect(result.confirmationReplies).toBe(1);
+      expect(result.ledgerReplies).toBe(0);
+      expect(await confirmationState(jobId)).toBe('cancelled');
+      expect(await ledgerStatus(only)).toBe('open');
+      expect(lastSent()).toBe(CONFIRM_CANCELLED);
+    });
+
+    it('a bare word that is also a contact name picks the option, never the ledger item', async () => {
+      // "פתחי" (Fathi) is a real name, and a one-word stored name is picked by that word.
+      const fathi: ConfirmationOption = { ...OPTION_A, label: 'פתחי (dana@example.com)', contactName: 'פתחי' };
+      const jobId = await held([fathi, OPTION_B]);
+      const only = await ledgerItem('יחיד');
+      await deliveredBatch([only]);
+      await getPool().query(`UPDATE ledger_items SET status = 'done' WHERE item_id = $1`, [only]);
+
+      gateway.enqueue(reply('פתחי'));
+      const result = await pass();
+
+      expect(result.confirmationReplies).toBe(1);
+      expect(result.ledgerReplies).toBe(0);
+      expect(await confirmationState(jobId)).toBe('confirmed');
+      expect((await loadConfirmation(jobId, { businessId: BUSINESS }))?.chosenPlanHash).toBe(fathi.planHash);
+      expect(await ledgerStatus(only)).toBe('done');
+    });
+
+    it('a bare ledger word with no question open still reaches the ledger', async () => {
+      const only = await ledgerItem('יחיד');
+      await deliveredBatch([only]);
+
+      gateway.enqueue(reply('בוצע'));
+      const result = await pass();
+
+      expect(result.ledgerReplies).toBe(1);
+      expect(await ledgerStatus(only)).toBe('done');
+      expect(lastSent()).toBe('עודכן: יחיד — בוצע');
+    });
+
+    it('a voice note saying "2 בוצע" does not apply — it goes on to the instruction door', async () => {
+      const first = await ledgerItem('ראשון');
+      const second = await ledgerItem('שני');
+      await deliveredBatch([first, second]);
+
+      gateway.enqueue({ ...audioMsg({ senderNumber: PRINCIPAL_NUMBER }), providerTimestamp: new Date(Date.now() + 1_000).toISOString() });
+      let transcribed = 0;
+      const result = await runWhatsAppDoor({
+        gateway,
+        messenger,
+        businessId: BUSINESS,
+        provider: async () => {
+          transcribed += 1;
+          return { text: '2 בוצע' };
+        },
+        planner: plannedWith(recallPlan()),
+      });
+
+      expect(transcribed).toBe(1);
+      expect(result.ledgerReplies).toBe(0);
+      expect(result.instructed).toBe(1);
+      expect(await ledgerStatus(second)).toBe('open');
+    });
+
+    it('a caption saying "2 בוצע" does not apply either', async () => {
+      const first = await ledgerItem('ראשון');
+      const second = await ledgerItem('שני');
+      await deliveredBatch([first, second]);
+
+      gateway.enqueue({ ...reply('2 בוצע'), mediaKind: 'image' });
+      const result = await pass(plannedWith(recallPlan()));
+
+      expect(result.ledgerReplies).toBe(0);
+      expect(result.instructed).toBe(1);
+      expect(await ledgerStatus(second)).toBe('open');
+    });
   });
 });

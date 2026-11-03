@@ -147,6 +147,7 @@ import { transcribeInbound, type TranscriptionProvider } from '../whatsapp/trans
 import { runInstruction, type InstructionOutcome, type RunInstructionOptions } from './instruct.js';
 import { linkWhatsAppMessage } from './jobs.js';
 import { handleMailCardMessage, isMailCardAction, openMailCards } from './whatsapp-mail-card.js';
+import { handleLedgerWhatsApp } from '../ledger/whatsapp-command.js';
 import {
   applyConfirmation,
   openConfirmations,
@@ -217,6 +218,13 @@ export interface DoorResult {
    * apply counts under `refused`.
    */
   confirmationReplies: number;
+  /**
+   * The owner answered the ledger's numbered batch with a ledger command
+   * (`ledger/whatsapp-command.ts`: "2 בוצע", "1 דחי מחר") and it was
+   * applied. Counted apart for the reason `mailCardReplies` gives. A command
+   * that could not be resolved or applied counts under `refused`.
+   */
+  ledgerReplies: number;
   /**
    * A confirmation answer `applyConfirmation` threw on — decided or not, not
    * applied (a bound-hash mismatch, a transient transition error). The owner
@@ -342,6 +350,7 @@ function composeAck(outcome: InstructionOutcome): string {
   // just spoke.
   if (outcome.recordingNote !== null) parts.push(outcome.recordingNote);
   if (outcome.identityNote !== null) parts.push(outcome.identityNote);
+  if (outcome.ledgerEcho !== null) parts.push(outcome.ledgerEcho);
   return parts.join('\n\n');
 }
 
@@ -451,6 +460,7 @@ type ProcessOutcome =
   | 'closed'
   | 'mailCard'
   | 'confirmation'
+  | 'ledger'
   | 'skipped';
 
 /** Spec §10.11, verbatim: more than one thing is open, and the answer cannot say which. */
@@ -489,9 +499,24 @@ async function tellOwnerAndSettle(
 }
 
 /**
+ * The audit actor for a principal's message. Called only once the sender is
+ * established as the principal, which `isPrincipalSender` grants only when
+ * `authorityNumberKey` parses the number — so a null here is a broken
+ * invariant, thrown (and caught by `processOne`) rather than papered over
+ * with the raw, unnormalised number.
+ */
+function principalActor(senderNumber: string): string {
+  const key = authorityNumberKey(senderNumber);
+  if (key === null) throw new Error('principal sender has no authority number key');
+  return `whatsapp:${key}`;
+}
+
+/**
  * The owner's TYPED message while at least one boss-command confirmation is
- * open on WhatsApp (spec §4.3, §10.11). Runs FIRST for a principal's typed
- * message — before the mail card and before routing.
+ * open on WhatsApp (spec §4.3, §10.11). Runs for a principal's typed message
+ * right after the NUMBERED ledger commands ("2 בוצע") and before the bare
+ * ones, the mail card and routing — so a pick by name ("פתחי" is a name)
+ * wins over a bare ledger word.
  *
  * Returns `'passthrough'`, claiming and settling nothing, when the message is
  * not an answer to the question at all (`readConfirmation` → `none`): a new
@@ -687,15 +712,59 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
 
     const isAudio = msg.mediaKind === 'audio';
 
-    // A boss-command confirmation question is read FIRST of all (spec
-    // §10.11) — before the mail card, transcription and routing — and only
-    // for TYPED text: a voice note or a caption that looks like "כן" never
-    // confirms; it goes on through the door below as a new instruction, and
-    // the question stays pending (§4.3). The typed-only check is the first
-    // line of `handleConfirmationMessage`, the one place it lives. A message
-    // that is not an answer ("שלח" included) falls through untouched.
+    // Ledger commands ("2 בוצע", "1 דחי מחר"; `ledger/whatsapp-command.ts`)
+    // are read in two halves around the confirmation reader (ruling R5, as
+    // amended in review):
+    //
+    //   - NUMBERED commands first of all. With a boss-command question open,
+    //     "2 בוצע" reads `unclear` in the confirmation reader and would be
+    //     swallowed for the whole window; and a number followed by words is
+    //     never a confirmation answer (`readConfirmation` picks by number only
+    //     when the number is the whole message, and never confirms on more
+    //     than one token), so nothing is taken from the question.
+    //   - BARE commands only after it. A bare ledger word can also be a
+    //     contact's name — "פתחי" (Fathi) — and a question's pick by name must
+    //     win; the confirmation reader passes through on `none`, so a bare
+    //     command still reaches the ledger when no question reads it. The three
+    //     phrases whose first token is a cancel/confirm word ("בטלי",
+    //     "לא התקיימה", "אשרי כתובת") are commands only with a number at all.
+    //
+    // Typed text only: a transcript or a caption is not the owner's
+    // keystrokes. A non-command falls through untouched and unclaimed.
+    const typedLedger =
+      msg.mediaKind === null && msg.body !== null
+        ? {
+            text: msg.body,
+            messageId: stored.id,
+            inboundAt: new Date(msg.providerTimestamp),
+            businessId: ctx.businessId,
+            by: principalActor(msg.senderNumber),
+            now: new Date(),
+            timeZone: ctx.charter.identity.timezone,
+            messenger: ctx.messenger,
+          }
+        : null;
+    if (typedLedger !== null) {
+      const ledger = await handleLedgerWhatsApp({ ...typedLedger, accept: 'numbered' });
+      if (ledger === 'applied') return 'ledger';
+      if (ledger !== 'passthrough') return ledger;
+    }
+
+    // A boss-command confirmation question is read next (spec §10.11) —
+    // before the mail card, transcription and routing — and only for TYPED
+    // text: a voice note or a caption that looks like "כן" never confirms;
+    // it goes on through the door below as a new instruction, and the
+    // question stays pending (§4.3). The typed-only check is the first line
+    // of `handleConfirmationMessage`, the one place it lives. A message that
+    // is not an answer ("שלח" included) falls through untouched.
     const confirmAnswer = await handleConfirmationMessage({ msg, storedId: stored.id, ctx });
     if (confirmAnswer !== 'passthrough') return confirmAnswer;
+
+    if (typedLedger !== null) {
+      const ledger = await handleLedgerWhatsApp({ ...typedLedger, accept: 'bare' });
+      if (ledger === 'applied') return 'ledger';
+      if (ledger !== 'passthrough') return ledger;
+    }
 
     // An open mailbox reply card is read next — before transcription, the
     // instruction cap and `pendingQuestions` — but only for TYPED text that
@@ -1165,6 +1234,7 @@ export async function runWhatsAppDoor(options: {
     closed: 0,
     mailCardReplies: 0,
     confirmationReplies: 0,
+    ledgerReplies: 0,
     confirmErrored: [],
     malformedSenderCount: 0,
   };
@@ -1208,6 +1278,7 @@ export async function runWhatsAppDoor(options: {
     else if (outcome === 'closed') result.closed += 1;
     else if (outcome === 'mailCard') result.mailCardReplies += 1;
     else if (outcome === 'confirmation') result.confirmationReplies += 1;
+    else if (outcome === 'ledger') result.ledgerReplies += 1;
     // 'skipped' — a redelivery, a race on the claim, or a failure before the
     // message was ever claimed — adds to none of the four buckets.
   }

@@ -94,6 +94,14 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'tasks.read',
   'tasks.update_state',
   'followup.schedule',
+  // The task ledger's writers. Read-only by GATE STAGE, not by effect: they
+  // write `ledger_items`. Classifying them would route an owner instruction
+  // through the boss-command confirmation question, which spec §7.1 (L1)
+  // forbids. Their boundary is `assertLedgerWriter` inside the handler —
+  // stored provenance 'boss' AND a boss_instructions row — and a ledger row
+  // grants nothing: whatever it later causes to leave goes through the gate.
+  'ledger.add',
+  'ledger.update',
   'crm.read',
   'accounting.read',
   'schema.map',
@@ -175,6 +183,9 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   'chart.render': false,
   'tasks.update_state': false,
   'followup.schedule': false,
+  // The ledger is written only from the owner's own instructions.
+  'ledger.add': false,
+  'ledger.update': false,
   'schema.map': false,
   'norms.query': false,
   'recipe.save': false,

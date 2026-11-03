@@ -175,6 +175,8 @@ describe('the erasure screen', () => {
         digestIds: [],
         draftIds: [],
         mailIds: [],
+        ledgerItemIds: [],
+        ledgerRuleIds: [],
         filePaths: [],
         items: [],
         excluded: [
@@ -201,6 +203,8 @@ describe('the erasure screen', () => {
         digestIds: [],
         draftIds: [],
         mailIds: [],
+        ledgerItemIds: [],
+        ledgerRuleIds: [],
         filePaths: [],
         items: [],
         excluded: [],
@@ -700,6 +704,51 @@ describe('what the owner authorised', () => {
     expect(extractPlanHash(html)).not.toBe(planHash);
   });
 
+  /**
+   * The fingerprint names WHICH ledger rows, not only how many. The owner
+   * read a preview listing one ledger row; that row is swapped for another
+   * that also names Ronit, under the same job — every count is identical, so
+   * only `ledgerItemIds` in the fingerprint can tell the two plans apart.
+   */
+  it('refuses when a different ledger row took the place of the one in the preview', async () => {
+    const baseUrl = await startServer();
+    const { jobId } = await seedRonit();
+    const db = getPool();
+    await db.query(
+      `INSERT INTO ledger_items (item_id, business_id, family, description, origin_job_id)
+       VALUES ('LI-first', $1, 'money_in', $2, $3)`,
+      [BUSINESS, `לגבות מ-${RONIT}`, jobId],
+    );
+    const cookie = await signIn(baseUrl);
+    const previewHtml = await (
+      await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
+    ).text();
+    const csrf = extractCsrf(previewHtml);
+    const planHash = extractPlanHash(previewHtml);
+
+    await db.query(`DELETE FROM ledger_items WHERE item_id = 'LI-first'`);
+    await db.query(
+      `INSERT INTO ledger_items (item_id, business_id, family, description, origin_job_id)
+       VALUES ('LI-second', $1, 'money_in', $2, $3)`,
+      [BUSINESS, `לגבות מ-${RONIT}`, jobId],
+    );
+
+    const res = await fetch(`${baseUrl}/erase/confirm`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf,
+        planHash,
+        anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('השתנה מאז');
+    const left = await db.query(`SELECT 1 FROM ledger_items WHERE item_id = 'LI-second'`);
+    expect(left.rows).toHaveLength(1);
+  });
+
   it('destroys when the rebuilt plan is the one the owner read', async () => {
     const baseUrl = await startServer();
     await seedRonit();
@@ -883,6 +932,8 @@ describe('the smaller things the screen owes the owner', () => {
         digestIds: [],
         draftIds: [],
         mailIds: [],
+        ledgerItemIds: [],
+        ledgerRuleIds: [],
         filePaths: [],
         items: [],
         excluded: [],

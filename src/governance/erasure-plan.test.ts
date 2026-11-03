@@ -13,6 +13,7 @@ import { insertOrGetDocument } from '../documents/store.js';
 import { recordSignature } from './signatures.js';
 import { keepItem } from './kept-items.js';
 import { buildErasurePlan } from './erasure-plan.js';
+import { executeErasure } from './erasure.js';
 
 const BUSINESS = 'test-business';
 const RONIT = 'ronit@beta-log.example';
@@ -792,5 +793,260 @@ describe('buildErasurePlan', () => {
     );
 
     expect(plan.filePaths[0]).toBe(join(root, `${BUSINESS}/${documentId}/original.txt`));
+  });
+});
+
+/**
+ * The task ledger (migration 052). Its rows hold names, addresses and free
+ * descriptions — content about a person — so it is wired in BOTH roles, like
+ * `boss_instructions`: a discovery source by its own content, and a deletion
+ * target by job membership. And an item drags the jobs it produced (origin,
+ * nudge, every event's job): a nudge job's plan carries the counterparty's
+ * address, and erasing the item while leaving that plan would keep the very
+ * thing the owner asked to forget.
+ */
+describe('the task ledger', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  interface ItemSeed {
+    itemId: string;
+    originJobId: string;
+    description?: string;
+    counterpartyName?: string | null;
+    counterpartyEmail?: string | null;
+    counterpartyDomain?: string | null;
+    reference?: string | null;
+    stages?: unknown;
+    proposedStages?: unknown;
+    nudgeJobId?: string | null;
+    createdAt?: string;
+  }
+
+  async function anItem(seed: ItemSeed): Promise<string> {
+    await getPool().query(
+      `INSERT INTO ledger_items
+         (item_id, business_id, family, description, counterparty_name, counterparty_email,
+          counterparty_domain, reference, stages, proposed_stages, nudge_job_id, origin_job_id,
+          created_at)
+       VALUES ($1, $2, 'money_in', $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11,
+               coalesce($12::timestamptz, now()))`,
+      [
+        seed.itemId,
+        BUSINESS,
+        seed.description ?? 'שורה רגילה',
+        seed.counterpartyName ?? null,
+        seed.counterpartyEmail ?? null,
+        seed.counterpartyDomain ?? null,
+        seed.reference ?? null,
+        JSON.stringify(seed.stages ?? []),
+        seed.proposedStages === undefined ? null : JSON.stringify(seed.proposedStages),
+        seed.nudgeJobId ?? null,
+        seed.originJobId,
+        seed.createdAt ?? null,
+      ],
+    );
+    return seed.itemId;
+  }
+
+  async function anEvent(itemId: string, eventId: string, note: string | null, jobId: string | null = null): Promise<void> {
+    await getPool().query(
+      `INSERT INTO ledger_events (event_id, business_id, item_id, kind, job_id, note, by_whom)
+       VALUES ($1, $2, $3, 'updated', $4, $5, 'owner')`,
+      [eventId, BUSINESS, itemId, jobId, note],
+    );
+  }
+
+  async function aReminder(itemId: string, reminderId: string, body: string): Promise<void> {
+    await getPool().query(
+      `INSERT INTO ledger_reminders (reminder_id, business_id, item_id, slot, kind, body)
+       VALUES ($1, $2, $3, $4, 'due', $5)`,
+      [reminderId, BUSINESS, itemId, `slot-${reminderId}`, body],
+    );
+  }
+
+  const count = (
+    plan: Awaited<ReturnType<typeof buildErasurePlan>>,
+    table: string,
+    action = 'delete',
+  ): number | undefined => plan.items.find((i) => i.table === table && i.action === action)?.count;
+
+  it.each([
+    ['description', { description: `חשבונית של ${RONIT}` }],
+    ['counterparty_name', { counterpartyName: RONIT }],
+    ['counterparty_email', { counterpartyEmail: RONIT }],
+    ['counterparty_domain', { counterpartyDomain: `x${RONIT}` }],
+    ['reference', { reference: `הזמנה ${RONIT}` }],
+    ['stages', { stages: [{ name: `שיחה עם ${RONIT}`, done: false }] }],
+    ['proposed_stages', { proposedStages: [{ name: `פגישה עם ${RONIT}`, done: false }] }],
+  ] as Array<[string, Partial<ItemSeed>]>)('finds an item by its own %s', async (_column, fields) => {
+    const origin = await bareJob('ledger-origin');
+    const decoyOrigin = await bareJob('ledger-decoy-origin');
+    await anItem({ itemId: 'LI-match', originJobId: origin, ...fields });
+    await anItem({ itemId: 'LI-decoy', originJobId: decoyOrigin, description: 'משהו אחר לגמרי' });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.ledgerItemIds).toEqual(['LI-match']);
+    expect(plan.jobIds).toContain(origin);
+    expect(plan.jobIds).not.toContain(decoyOrigin);
+    expect(count(plan, 'ledger_items')).toBe(1);
+  });
+
+  it('finds a name with a double quote inside stages (JSON-escaped in the text form)', async () => {
+    const NAME = 'אלפא בע"מ';
+    const origin = await bareJob('ledger-quote');
+    await anItem({ itemId: 'LI-quote', originJobId: origin, stages: [{ name: `חוזה מול ${NAME}`, done: false }] });
+
+    // The premise: the JSONB text form escapes the quote, so a plain text
+    // match alone cannot find it.
+    const premise = await getPool().query(`SELECT 1 FROM ledger_items WHERE stages::text ILIKE $1`, [`%${NAME}%`]);
+    expect(premise.rows).toHaveLength(0);
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: NAME }, { businessId: BUSINESS });
+    expect(plan.ledgerItemIds).toEqual(['LI-quote']);
+  });
+
+  it('finds an item through an event note or a reminder body alone, and takes its events and reminders', async () => {
+    const originA = await bareJob('ledger-note');
+    const originB = await bareJob('ledger-reminder');
+    await anItem({ itemId: 'LI-note', originJobId: originA });
+    await anEvent('LI-note', 'LE-note', `דיברתי עם ${RONIT}`);
+    await anEvent('LI-note', 'LE-plain', 'עדכון כללי');
+    await anItem({ itemId: 'LI-rem', originJobId: originB });
+    await aReminder('LI-rem', 'LR-rem', `תזכורת: לחזור אל ${RONIT}`);
+    await anItem({ itemId: 'LI-other', originJobId: await bareJob('ledger-other') });
+    await anEvent('LI-other', 'LE-other', 'בלי שמות');
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect([...plan.ledgerItemIds].sort()).toEqual(['LI-note', 'LI-rem']);
+    expect(count(plan, 'ledger_items')).toBe(2);
+    expect(count(plan, 'ledger_events')).toBe(2);
+    expect(count(plan, 'ledger_reminders')).toBe(1);
+  });
+
+  it('drags the nudge job and every event job of a found item into jobIds', async () => {
+    const origin = await bareJob('ledger-with-nudge');
+    const nudge = await bareJob('nudge job, no name in title');
+    const eventJob = await bareJob('event job, no name in title');
+    await anItem({ itemId: 'LI-n', originJobId: origin, counterpartyEmail: RONIT, nudgeJobId: nudge });
+    await anEvent('LI-n', 'LE-n', null, eventJob);
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.jobIds).toEqual(expect.arrayContaining([origin, nudge, eventJob]));
+  });
+
+  it('takes an item whose origin job the anchor already reached, even with no name in it', async () => {
+    const origin = await jobAbout(RONIT, 'instruction naming ronit');
+    await anItem({ itemId: 'LI-member', originJobId: origin, description: 'לגבות תשלום' });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.ledgerItemIds).toEqual(['LI-member']);
+  });
+
+  it('a window anchor takes items created inside it, not one just outside', async () => {
+    const inside = await bareJob('w-in');
+    const outside = await bareJob('w-out');
+    await anItem({ itemId: 'LI-in', originJobId: inside, createdAt: '2020-03-10T12:00:00Z' });
+    await anItem({ itemId: 'LI-out', originJobId: outside, createdAt: '2020-03-20T12:00:00Z' });
+
+    const plan = await buildErasurePlan(
+      { kind: 'window', fromIso: '2020-03-01T00:00:00Z', toIso: '2020-03-15T00:00:00Z' },
+      { businessId: BUSINESS },
+    );
+
+    expect(plan.ledgerItemIds).toEqual(['LI-in']);
+  });
+
+  it('finds a counterparty critical rule by its match, and never a family rule', async () => {
+    const db = getPool();
+    await db.query(
+      `INSERT INTO ledger_critical_rules (rule_id, business_id, kind, match, created_by)
+       VALUES ('LC-ronit', $1, 'counterparty', $2, 'owner'),
+              ('LC-dana', $1, 'counterparty', 'dana@gamma.example', 'owner')`,
+      [BUSINESS, RONIT],
+    );
+    await db.query(
+      `INSERT INTO ledger_critical_rules (rule_id, business_id, kind, family, created_by)
+       VALUES ('LC-family', $1, 'family', 'money_in', 'owner')`,
+      [BUSINESS],
+    );
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.ledgerRuleIds).toEqual(['LC-ronit']);
+    expect(count(plan, 'ledger_critical_rules')).toBe(1);
+  });
+
+  it('the preview counts equal the rows the executor really touched, and batches keep every position', async () => {
+    const origin = await bareJob('ledger-exec');
+    const keepOrigin = await bareJob('ledger-keep');
+    await anItem({ itemId: 'LI-x', originJobId: origin, counterpartyEmail: RONIT });
+    await anEvent('LI-x', 'LE-x1', 'נוצר');
+    await anEvent('LI-x', 'LE-x2', 'עודכן');
+    await aReminder('LI-x', 'LR-x', 'תזכורת');
+    await anItem({ itemId: 'LI-keep', originJobId: keepOrigin, description: 'שורה של מישהו אחר' });
+    await anEvent('LI-keep', 'LE-keep', 'נוצר');
+    const db = getPool();
+    await db.query(
+      `INSERT INTO ledger_whatsapp_batches (batch_id, business_id, items)
+       VALUES ('LW-only', $1, ARRAY['LI-x']),
+              ('LW-mixed', $1, ARRAY['LI-keep', 'LI-x', 'LI-z']),
+              ('LW-untouched', $1, ARRAY['LI-keep'])`,
+      [BUSINESS],
+    );
+    await db.query(
+      `INSERT INTO ledger_critical_rules (rule_id, business_id, kind, match, created_by)
+       VALUES ('LC-r', $1, 'counterparty', $2, 'owner')`,
+      [BUSINESS, RONIT],
+    );
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    const outcome = await executeErasure(plan, { businessId: BUSINESS });
+
+    const LEDGER = [
+      'ledger_items:delete',
+      'ledger_events:delete',
+      'ledger_reminders:delete',
+      'ledger_whatsapp_batches:scrub',
+      'ledger_critical_rules:delete',
+    ];
+    const previewed = new Map(plan.items.map((i) => [`${i.table}:${i.action}`, i.count]));
+    const executed = new Map(outcome.deleted.map((i) => [`${i.table}:${i.action}`, i.count]));
+    for (const key of LEDGER) {
+      expect(executed.get(key), key).toBe(previewed.get(key));
+    }
+    // And the numbers are the real ones, so the equality above is not 0 = 0.
+    expect(previewed.get('ledger_items:delete')).toBe(1);
+    expect(previewed.get('ledger_events:delete')).toBe(2);
+    expect(previewed.get('ledger_reminders:delete')).toBe(1);
+    // No batch is ever deleted: a deleted batch would make a reply resolve
+    // against an older one.
+    expect(previewed.has('ledger_whatsapp_batches:delete')).toBe(false);
+    expect(executed.has('ledger_whatsapp_batches:delete')).toBe(false);
+    expect(previewed.get('ledger_whatsapp_batches:scrub')).toBe(2);
+    expect(previewed.get('ledger_critical_rules:delete')).toBe(1);
+
+    const batches = await db.query<{ batch_id: string; items: string[] }>(
+      'SELECT batch_id, items FROM ledger_whatsapp_batches ORDER BY batch_id',
+    );
+    // The erased id becomes '' in place: "3" still means LI-z.
+    expect(batches.rows).toEqual([
+      { batch_id: 'LW-mixed', items: ['LI-keep', '', 'LI-z'] },
+      { batch_id: 'LW-only', items: [''] },
+      { batch_id: 'LW-untouched', items: ['LI-keep'] },
+    ]);
+    const left = await db.query<{ item_id: string }>('SELECT item_id FROM ledger_items');
+    expect(left.rows.map((r) => r.item_id)).toEqual(['LI-keep']);
+    const leftEvents = await db.query<{ event_id: string }>('SELECT event_id FROM ledger_events');
+    expect(leftEvents.rows.map((r) => r.event_id)).toEqual(['LE-keep']);
   });
 });

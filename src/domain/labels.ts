@@ -15,6 +15,7 @@
  * "ומדווחת" would single out one of two levels the code does not tell apart.
  */
 import type { ActionClass } from './action.js';
+import type { LedgerFamily, LedgerStatus } from './ledger.js';
 import type { AutonomyLevel, TrustLevel } from './trust.js';
 
 export const ACTION_CLASS_HE: Readonly<Record<ActionClass, string>> = Object.freeze({
@@ -59,6 +60,23 @@ export const TRUST_LEVEL_HE: Readonly<Record<TrustLevel, string>> = Object.freez
   known_counterparty: 'גורם מוכר',
   unknown_external: 'גורם חיצוני לא מוכר',
   open_web: 'אתר אינטרנט פתוח',
+});
+
+export const ledgerFamilyLabel: Readonly<Record<LedgerFamily, string>> = Object.freeze({
+  money_in: 'כסף נכנס',
+  money_out: 'כסף יוצא',
+  meetings: 'פגישות ושיחות',
+  warm_leads: 'לקוחות חמים',
+  awaiting_reply: 'ממתינים לצד שני',
+  projects: 'עבודות פתוחות',
+});
+
+export const ledgerStatusLabel: Readonly<Record<LedgerStatus, string>> = Object.freeze({
+  open: 'פתוח',
+  stuck: 'תקוע',
+  closed_by_evidence: 'נסגר לפי ראיה',
+  done: 'בוצע',
+  cancelled: 'בוטל',
 });
 
 /**

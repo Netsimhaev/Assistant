@@ -98,6 +98,9 @@ export const config = {
   // with a daily count off `audit_log`, not with a token budget — and a second,
   // unproven cost mechanism beside the one that works is how two readers drift.
   delegationsPerDay: positiveInt('DELEGATIONS_PER_DAY', 50),
+  // Ledger follow-ups (nudges) opened per day, counted in the charter zone. Each
+  // is a drafter call and an outbound job, so it is capped like the others. 0 stops them.
+  ledgerNudgesPerDay: positiveInt('LEDGER_NUDGES_PER_DAY', 20),
   // Two budgets, not one — docs/superpowers/specs/2026-10-01-whatsapp-boss-channel-design.md
   // §6.2. Shared, a customer sending fifty voice notes exhausts the budget and
   // then the OWNER'S OWN recording goes untranscribed: a stranger degrading

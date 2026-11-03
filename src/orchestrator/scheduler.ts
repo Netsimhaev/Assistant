@@ -1,5 +1,11 @@
 import { appendAudit } from '../audit/log.js';
-import { loadActiveCharter } from '../charter/store.js';
+import { activeCharterVersion, loadActiveCharter } from '../charter/store.js';
+import { closeLedgerByEvidence } from '../ledger/evidence.js';
+import type { EvidenceResult } from '../ledger/evidence.js';
+import { runLedgerPass } from '../ledger/pass.js';
+import type { LedgerPassResult } from '../ledger/pass.js';
+import { runNudgeDrafter } from '../sdk/nudge-drafter.js';
+import type { NudgeDrafter } from '../sdk/nudge-drafter.js';
 import { config } from '../config.js';
 import { getPool, withTransaction } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
@@ -759,6 +765,23 @@ export interface SchedulerPassResult {
    * must not hide, by rejecting the pass, the work that already succeeded.
    */
   actionUpdatesError: string | null;
+  /**
+   * `closeLedgerByEvidence`, right after `pollMailbox`: a counterparty reply
+   * that arrived this pass closes its ledger item before any reminder about it
+   * is claimed. `null` means the stage did NOT run (no active charter, or it
+   * threw — then `ledgerEvidenceError` says why); an empty result means it ran
+   * and found nothing.
+   */
+  ledgerEvidence: EvidenceResult | null;
+  ledgerEvidenceError: string | null;
+  /**
+   * `runLedgerPass` (nudge observation, due reminders, act-mode nudges), after
+   * `closeVerifiedJobs` and before the WhatsApp report, so a nudge job closed
+   * this very pass is observed this pass. Nudge jobs it opens here sit in
+   * `execute` and run on the NEXT pass's `runDueJobs`. `null` = did not run.
+   */
+  ledger: LedgerPassResult | null;
+  ledgerError: string | null;
 }
 
 /**
@@ -857,6 +880,8 @@ export async function schedulerPass(
     mailClient?: PollMailboxOptions['client'];
     mailTriage?: PollMailboxOptions['triage'];
     mailDrafter?: PollMailboxOptions['drafter'];
+    /** Test seam; production leaves it unset and act-mode nudges use `runNudgeDrafter`. */
+    ledgerDrafter?: NudgeDrafter;
   } = {},
 ): Promise<SchedulerPassResult> {
   const businessId = options.businessId ?? config.businessId;
@@ -997,6 +1022,34 @@ export async function schedulerPass(
     mailError = err instanceof Error ? err.message : String(err);
   }
 
+  // Right after the poll: a reply that arrived this pass closes its item
+  // before the ledger stage below could remind about it. Null = did not run.
+  let ledgerHasCharter = false;
+  let ledgerEvidence: EvidenceResult | null = null;
+  let ledgerEvidenceError: string | null = null;
+  let ledgerError: string | null = null;
+  try {
+    ledgerHasCharter = (await activeCharterVersion(businessId)) !== null;
+  } catch (err) {
+    // Could not even tell whether a charter is active: neither ledger stage
+    // runs, and both say why. The rest of the pass is unaffected.
+    const message = err instanceof Error ? err.message : String(err);
+    ledgerEvidenceError = message;
+    ledgerError = message;
+  }
+  if (ledgerHasCharter) {
+    try {
+      ledgerEvidence = await closeLedgerByEvidence({
+        businessId,
+        ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
+        ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
+        ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
+      });
+    } catch (err) {
+      ledgerEvidenceError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
   // Both conductor loops run after the tick's transaction has committed, not
   // inside it — see the docblock above.
   //
@@ -1064,6 +1117,28 @@ export async function schedulerPass(
   // instead and every close would trail a pass behind the work that earned
   // it.
   const verified = await closeVerifiedJobs(options);
+
+  // The ledger pass, after the closes (a nudge job closed this pass is
+  // observed this pass) and before the report. Jobs it opens run next pass.
+  // The drafter MUST default to the real one: without it act-mode nudge slots
+  // stay unclaimed forever.
+  let ledger: LedgerPassResult | null = null;
+  if (ledgerHasCharter) {
+    try {
+      ledger = await runLedgerPass({
+        businessId,
+        ...(options.now !== undefined ? { now: options.now } : {}),
+        ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
+        ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
+        ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
+        drafter: options.ledgerDrafter ?? runNudgeDrafter,
+        // Spec I5: this pass's evidence notices go first in the pass's ONE batch.
+        ...(ledgerEvidence !== null ? { evidenceNotices: ledgerEvidence.notices } : {}),
+      });
+    } catch (err) {
+      ledgerError = err instanceof Error ? err.message : String(err);
+    }
+  }
 
   // Mail body retention — see `SchedulerPassResult.mailRetention`.
   let mailRetention: { scrubbed: number } | null = null;
@@ -1186,6 +1261,10 @@ export async function schedulerPass(
     digest,
     actionUpdates,
     actionUpdatesError,
+    ledgerEvidence,
+    ledgerEvidenceError,
+    ledger,
+    ledgerError,
   };
 }
 

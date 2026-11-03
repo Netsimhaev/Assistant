@@ -238,7 +238,7 @@ function phoneNumbersIn(instruction: string): string[] {
  * depend on, but kept to the same shape on purpose so "looks like an
  * address" means the same thing wherever this codebase asks it.
  */
-const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
  * Sentence punctuation a token can trail without it being part of an address.
@@ -361,7 +361,7 @@ export function emailAddressesIn(instruction: string): string[] {
  * `textOrigin === 'typed'`, and the two are asked separately at both call
  * sites below so neither can be mistaken for the other again.
  */
-function appearsVerbatimIn(candidate: string, instruction: string): boolean {
+export function appearsVerbatimIn(candidate: string, instruction: string): boolean {
   const trimmed = candidate.trim();
   if (trimmed.length === 0) return false;
 
@@ -386,7 +386,7 @@ function appearsVerbatimIn(candidate: string, instruction: string): boolean {
   return emailAddressesIn(instruction).includes(target);
 }
 
-function knownToCharter(
+export function knownToCharter(
   candidate: string,
   known: PolicyBundle['knownCounterparties'],
 ): boolean {

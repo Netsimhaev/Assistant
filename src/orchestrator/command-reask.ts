@@ -90,6 +90,7 @@ import {
 } from '../governance/instruction-confirmations.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { renderConfirmationQuestion } from './command-echo.js';
+import { ledgerEchoForSteps } from '../ledger/echo.js';
 import { WHATSAPP_MESSAGE_MAX_CHARS, WHATSAPP_QUESTION_TOO_LONG } from './command-confirm.js';
 import { PhaseMovedError, createJob, linkWhatsAppMessage, transition } from './jobs.js';
 import { bindPlanToJob, completedSteps, loadStoredPlan, planHashOf } from './plan-store.js';
@@ -316,8 +317,19 @@ async function reaskOne(
 
   const active = await loadActiveCharter(businessId);
   if (active === null) throw new Error(`command re-ask: no active charter for business ${businessId}`);
+  // T6: the ledger steps still left are read-only, so `renderStepEcho` hides
+  // them; the owner sees what they will record, as in the first question.
+  const ledgerEcho = await ledgerEchoForSteps(residual.steps, {
+    businessId,
+    timeZone: active.charter.identity.timezone,
+    currency: active.bundle.ceilings.currency,
+    instructionText: instruction.text,
+    textOrigin: instruction.textOrigin,
+    knownCounterparties: active.bundle.knownCounterparties,
+  });
   const rendered = renderConfirmationQuestion([option], {
     currency: active.bundle.ceilings.currency,
+    ledgerEchoes: [ledgerEcho],
     reask: candidate.uncertain,
     alreadyDone: chosen.plan.steps.length - residual.steps.length,
   });

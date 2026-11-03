@@ -175,6 +175,13 @@ export function renderConfirmationQuestion(
     reask?: boolean;
     /** Steps of the original plan that completed and were dropped from this one; shown when > 0. */
     alreadyDone?: number;
+    /**
+     * Per option (same order), what its ledger steps will record
+     * (`ledgerEchoForSteps`), or null. `renderStepEcho` hides read-only steps,
+     * and the ledger tools are read-only, so without this the owner would
+     * confirm a mixed plan without seeing what it writes to his ledger (T6).
+     */
+    ledgerEchoes?: readonly (string | null)[];
   },
 ): { text: string } | { refused: string } {
   const multiple = options.length > 1;
@@ -183,7 +190,8 @@ export function renderConfirmationQuestion(
     const echoes = optionEchoes(option, opts.currency);
     if (!Array.isArray(echoes)) return echoes;
     const head = `${multiple ? `${index + 1}. ` : ''}${labelText(option.label)}${sourceMarker(option)}`;
-    rendered.push([head, ...echoes].join('\n'));
+    const ledger = opts.ledgerEchoes?.[index] ?? null;
+    rendered.push([head, ...echoes, ...(ledger === null ? [] : [ledger])].join('\n'));
   }
 
   const parts: string[] = [];
