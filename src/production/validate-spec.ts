@@ -1,48 +1,68 @@
 /**
  * The gate between what the drafter wrote and what gets built. A
  * `DocumentSpec` that parsed is only well-formed; this asks whether it is
- * TRUE to its sources and buildable:
+ * TRUE to its sources and buildable. Pure: no I/O, no model.
  *
- * - **Cell numbers.** A `{v, src}` cell must be found in the one source it
- *   names — the instruction text, that artifact's text, or that memory's
- *   body — never in some other source. Matching is `ungroundedNumbers`
- *   (`governance/numeric-grounding.ts`), reused: thousands separators and
- *   trailing decimal zeros are normalised, so `1890` ≡ `1,890` ≡ `1890.00`.
- *   A cell in a `percent` column also grounds as its ×100 form (`0.15`
- *   against "15%"). A pointer that does not resolve is `source_not_found`,
- *   not ungrounded — the source is missing, not the number.
- * - **Free text** (titles, headings, paragraphs, list items, clause text,
- *   header strings, text cells, slide text): every number must appear in
- *   SOME source, in a formula result, or be structural. Structural numbers
- *   are a closed set: clause numbers 1..(number of clauses), slide numbers
- *   1..(number of slides), and today's year, month and day. Dates written
- *   with `/`, `-` or `:` are already excluded by `numbersIn`'s adjacency
- *   rule. `legalBasis` is NOT checked: it is a citation of a statute (whose
- *   name often carries a year), not a figure about the business.
- *   A known looseness of the structural set: with three clauses, a bare "3"
- *   anywhere in the text grounds. The alternative — parsing "סעיף 3" — is a
- *   Hebrew-grammar guess; this is the honest, closed rule.
- * - **Formulas** live in workbooks only. A formula in a docx/pdf/pptx table
- *   has no addresses to read and is `formula_problem`. In a workbook: every
- *   parse problem, every reference to a sheet that does not exist, and two
- *   sheets whose names differ only in case are `formula_problem` up front;
- *   then the workbook is evaluated (`evaluateWorkbook`) over the layout the
- *   renderer uses (`xlsx-layout.ts`). Every cell in `deviated` — THE
- *   GUARANTEE of `formula.ts` — is a `formula_problem`, ONE PROBLEM PER
- *   DEVIATED CELL (so the drafter sees each cell to fix); a formula cell that
- *   is not deviated but evaluates to an error is also one. A cell is reported
- *   once, deviated taking precedence.
- * - **Caps** (`CAPS`): sheets, rows per sheet, slides. Pages are checked
- *   after rendering (check 1), not here. Over a cap the spec is refused, not
- *   truncated.
- * - **Images** must name a `documentId` in `sources.documents`.
- * - **Filename**: the same positive rule as a folder segment (spec §9.2):
- *   letters, digits, space, `-`, `_`, and `.` not first or last; no Windows
- *   reserved name; bidi controls stripped first. The renderer appends the
- *   real extension.
- * - **Structure**: `REQUIRED_STRUCTURE[kind]`, Hebrew part names.
+ * **Matching** reuses `ungroundedNumbers` (`governance/numeric-grounding.ts`)
+ * — thousands separators and trailing decimal zeros normalised, so `1890` ≡
+ * `1,890` ≡ `1890.00`, and a sign is part of the value (`-500` grounds on
+ * "-500" or "500-", never on "500"). That module is advisory and drops every
+ * digit run touching `/`, `-` or `:`; here that would let "12,000/חודש" or
+ * "3000-4000" through unchecked, so both draft and source text go through
+ * `prepare` first:
+ *   - full date shapes (`d/m/yy`, `d/m/yyyy`, `d.m.yyyy`, ISO `yyyy-mm-dd`,
+ *     with valid day and month) and times (`h:mm`, `h:mm:ss`, valid hour and
+ *     minute) are blanked in DRAFT text — exempt;
+ *   - a date written in words ("4 בנובמבר 2026") is blanked only when it is
+ *     TODAY — the only place today's day, month and year are structural;
+ *   - then every `/` or `:` touching a digit, and every `-` between a digit
+ *     and a letter or digit, becomes a space — each side of a range is its
+ *     own number. A leading or trailing minus sign is untouched.
  *
- * Pure: no I/O, no model.
+ * **Cells.** A `{v, src}` cell grounds only in the one source it names. Money
+ * values are MAJOR units exactly as the sources write them (1890 = ₪1,890).
+ * In a `percent` column a value is a FRACTION (0.15 displays 15%): its
+ * displayed ×100 form must ground ("15%"/"15"), and the raw fraction is also
+ * accepted when it is not an integer and the source writes it ("0.15") — so
+ * `{v: 15}`, which would display 1500%, does not ground on "15%". A `{d}`
+ * cell must equal `today` or appear in some source as ISO, `d/m/yyyy` or
+ * `d.m.yyyy`. A pointer that does not resolve is `source_not_found`.
+ *
+ * **Free text** — the title, the filename, sheet names, headings,
+ * paragraphs, list items, clause titles and text, table and slide headers,
+ * text cells, slide text, string literals inside formulas, and
+ * `legalBasis[].note` (the `law` itself is a statute citation and exempt) —
+ * must ground in some source or in an untainted formula result. Structural
+ * numbers are exempt only where structural: a clause or slide title that is
+ * just its own number, or starts with "סעיף N" / "N." where N is that
+ * clause's (or slide's) own position. Never in body text, cells or bullets.
+ *
+ * **Formulas** live in workbooks only (a `{f}` in a docx/pdf/pptx table has
+ * no addresses: `formula_problem`). In a workbook:
+ *   - every NUMBER LITERAL must ground in the sources (not in formula
+ *     results — a literal cannot ground itself); exempt is the closed set
+ *     {0, 1, 100, 12}. A negated literal is checked as its magnitude.
+ *   - a cell with an ungrounded literal is TAINTED, and so is every formula
+ *     reading a tainted cell, transitively; a tainted result never grounds
+ *     free text (no laundering `{f:'18900'}` into a title).
+ *   - untainted results ground free text in the form the column displays:
+ *     `int` → integer, `money`/`decimal2` → 2 decimals, `percent` → ×100,
+ *     no format → the exact value.
+ *   - up front, `formula_problem`: a parse problem, a reference to a sheet
+ *     that does not exist (case-insensitive, as Excel), two sheet names that
+ *     differ only in case. If any exists, evaluation is skipped.
+ *   - then the workbook is evaluated (`evaluateWorkbook`) over the shared
+ *     layout (`xlsx-layout.ts`): ONE `formula_problem` PER DEVIATED CELL
+ *     (THE GUARANTEE of `formula.ts`), and one per non-deviated formula whose
+ *     value is an error. A cell is reported once, deviated first.
+ *
+ * **Caps** (`CAPS`, checked first; over a cap nothing else runs): sheets,
+ * rows per sheet, slides — and an xlsx date before 1900-03-01, which Excel's
+ * 1900 date system cannot hold, is also `cap_exceeded` (outside the supported
+ * range). Pages are checked after rendering, not here.
+ *
+ * **Images** must name a `documentId` in `sources.documents`. **Filename**:
+ * the positive rule of spec §9.2. **Structure**: `REQUIRED_STRUCTURE[kind]`.
  */
 import type {
   Block,
@@ -51,11 +71,19 @@ import type {
   DocumentSpec,
   SourceRef,
   XlsxSheet,
+  XlsxTable,
 } from '../domain/document-spec.js';
 import { ungroundedNumbers } from '../governance/numeric-grounding.js';
 import { stripBidiControls } from '../util/bidi.js';
-import { evaluateWorkbook, parseFormula, type EvalError, type EvalValue, type FormulaAst } from './formula.js';
-import { layoutSheet, toEvalSheet, type PlacedCell } from './xlsx-layout.js';
+import {
+  evaluateWorkbook,
+  parseFormula,
+  referencedCells,
+  type EvalError,
+  type EvalValue,
+  type FormulaAst,
+} from './formula.js';
+import { EXCEL_MIN_DATE, layoutSheet, toEvalSheet, type PlacedCell } from './xlsx-layout.js';
 
 export interface GroundingSources {
   instructionText: string;
@@ -85,13 +113,14 @@ export const CONTRACT_DISCLAIMER_HE = 'טיוטה — מומלץ שעורך די
 export const CONTRACT_DISCLAIMER_EN = 'Draft — we recommend a lawyer review it';
 
 export interface ValidateSpecOptions {
-  /**
-   * Today's LOCAL date (charter timezone), `YYYY-MM-DD`, for the structural
-   * date numbers. Defaults to today's UTC date — callers in production pass
-   * the charter-local date.
-   */
-  today?: string;
+  /** Today's LOCAL date in the charter timezone, `YYYY-MM-DD`. Required: no UTC default. */
+  today: string;
 }
+
+/** Number literals a formula may carry without a source. Closed set. */
+const EXEMPT_LITERALS: ReadonlySet<number> = new Set([0, 1, 100, 12]);
+
+type AddProblem = (code: SpecProblemCode, where: string, detail: string) => void;
 
 // ---------------------------------------------------------------- structure
 
@@ -183,12 +212,82 @@ export const REQUIRED_STRUCTURE: Record<DocumentKind, (spec: DocumentSpec) => st
   other: titleOnly,
 };
 
-// ---------------------------------------------------------------- numbers
+// ---------------------------------------------------------------- text preparation
 
 /** A number as plain digits — never exponent notation, never grouping. */
 function plainNumber(v: number): string {
   return v.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 20 });
 }
+
+const at15 = (v: number) => Number(v.toPrecision(15));
+
+function parseIsoDate(value: string): [number, number, number] | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return null;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d ? [y, mo, d] : null;
+}
+
+const validDayMonth = (d: string, m: string) => Number(d) >= 1 && Number(d) <= 31 && Number(m) >= 1 && Number(m) <= 12;
+
+// Not inside a longer number or separator run (a particle dash like "ל-" is fine).
+const BEFORE = String.raw`(?<![\d.,/:]|\d-)`;
+const AFTER = String.raw`(?![\d/:-]|[.,]\d)`;
+const SLASH_DATE = new RegExp(`${BEFORE}(\\d{1,2})/(\\d{1,2})/(?:\\d{4}|\\d{2})${AFTER}`, 'g');
+const DOT_DATE = new RegExp(`${BEFORE}(\\d{1,2})\\.(\\d{1,2})\\.\\d{4}${AFTER}`, 'g');
+const ISO_DATE = new RegExp(`${BEFORE}\\d{4}-\\d{2}-\\d{2}${AFTER}`, 'g');
+const TIME = new RegExp(`${BEFORE}(?:[01]?\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?${AFTER}`, 'g');
+
+const MONTH_NAMES: readonly (readonly string[])[] = [
+  ['ינואר', 'january', 'jan'],
+  ['פברואר', 'february', 'feb'],
+  ['מרץ', 'מרס', 'march', 'mar'],
+  ['אפריל', 'april', 'apr'],
+  ['מאי', 'may'],
+  ['יוני', 'june', 'jun'],
+  ['יולי', 'july', 'jul'],
+  ['אוגוסט', 'august', 'aug'],
+  ['ספטמבר', 'september', 'sep', 'sept'],
+  ['אוקטובר', 'october', 'oct'],
+  ['נובמבר', 'november', 'nov'],
+  ['דצמבר', 'december', 'dec'],
+];
+const WORD_DATE = new RegExp(
+  `(?<!\\d)(\\d{1,2})\\s+(?:[בל]-?)?(${MONTH_NAMES.flat().join('|')})\\s+(\\d{4})(?!\\d)`,
+  'giu',
+);
+
+/** Blank exempt date and time shapes in DRAFT text; today in words too. */
+function blankDates(text: string, today: [number, number, number]): string {
+  return text
+    .replace(SLASH_DATE, (all, d: string, m: string) => (validDayMonth(d, m) ? ' ' : all))
+    .replace(DOT_DATE, (all, d: string, m: string) => (validDayMonth(d, m) ? ' ' : all))
+    .replace(ISO_DATE, (all: string) => (parseIsoDate(all) !== null ? ' ' : all))
+    .replace(TIME, ' ')
+    .replace(WORD_DATE, (all, d: string, month: string, y: string) => {
+      const mi = MONTH_NAMES.findIndex((names) => names.includes(month.toLowerCase()));
+      return Number(d) === today[2] && mi + 1 === today[1] && Number(y) === today[0] ? ' ' : all;
+    });
+}
+
+/** Split separators touching digits so each side is its own number. */
+function splitSeparators(text: string): string {
+  return text.replace(/(?<=\d)[/:]|[/:](?=\d)/g, ' ').replace(/(?<=\d)-(?=[\p{L}\p{N}])/gu, ' ');
+}
+
+const OWN_NUMBER_PREFIX = [/^\s*(\d+)\s*$/, /^\s*סעיף\s+(\d+)(?!\d)/, /^\s*(\d+)\.(?!\d)/];
+
+/** Remove a title's own structural number (clause/slide position `n`), if it carries one. */
+function stripOwnNumber(title: string, n: number): string {
+  for (const pattern of OWN_NUMBER_PREFIX) {
+    const m = pattern.exec(title);
+    if (m && Number(m[1]) === n) return title.slice(m[0].length);
+  }
+  return title;
+}
+
+// ---------------------------------------------------------------- sources
 
 function sourceText(ref: SourceRef, sources: GroundingSources): string | null {
   switch (ref.kind) {
@@ -217,11 +316,31 @@ function describeRef(ref: SourceRef): string {
   }
 }
 
+const allSourceTexts = (s: GroundingSources): string[] => [
+  s.instructionText,
+  ...s.documents.flatMap((d) => d.artifacts.map((a) => a.text)),
+  ...s.memories.map((m) => m.body),
+];
+
+function dateGrounded(date: string, today: string, texts: string[]): boolean {
+  if (date === today) return true;
+  const parts = parseIsoDate(date);
+  if (parts === null) return false;
+  const [y, m, d] = parts;
+  const iso = new RegExp(`(?<!\\d)${date}(?!\\d)`);
+  const dmy = new RegExp(`(?<!\\d)0?${d}[/.]0?${m}[/.]${y}(?!\\d)`);
+  return texts.some((t) => iso.test(t) || dmy.test(t));
+}
+
+// ---------------------------------------------------------------- collector
+
 class Collector {
   readonly problems: SpecProblem[] = [];
   constructor(
     private readonly sources: GroundingSources,
-    /** Every source text, formula result and structural number, pooled. */
+    private readonly today: string,
+    private readonly todayParts: [number, number, number],
+    /** Prepared source texts plus untainted formula results. */
     private readonly pool: string[],
   ) {}
 
@@ -230,23 +349,32 @@ class Collector {
   }
 
   text(where: string, text: string): void {
-    const missing = ungroundedNumbers(text, this.pool);
+    const missing = ungroundedNumbers(splitSeparators(blankDates(text, this.todayParts)), this.pool);
     if (missing.length > 0) {
       this.add('ungrounded_number', where, `מספר שאין לו מקור: ${[...new Set(missing)].join(', ')}`);
     }
   }
 
   valueCell(where: string, cell: { v: number; src: SourceRef }, percent: boolean): void {
-    const text = sourceText(cell.src, this.sources);
-    if (text === null) {
+    const raw = sourceText(cell.src, this.sources);
+    if (raw === null) {
       this.add('source_not_found', where, `המקור לא נמצא: ${describeRef(cell.src)}`);
       return;
     }
-    const candidates = [plainNumber(cell.v)];
-    if (percent) candidates.push(plainNumber(Number((cell.v * 100).toPrecision(15))));
+    const text = splitSeparators(raw);
+    const candidates = percent
+      ? [plainNumber(at15(cell.v * 100)), ...(Number.isInteger(cell.v) ? [] : [plainNumber(cell.v)])]
+      : [plainNumber(cell.v)];
     const grounded = candidates.some((c) => ungroundedNumbers(c, [text]).length === 0);
     if (!grounded) {
-      this.add('ungrounded_number', where, `המספר ${plainNumber(cell.v)} לא נמצא ב${describeRef(cell.src)}`);
+      const shown = percent ? `${candidates[0]}%` : plainNumber(cell.v);
+      this.add('ungrounded_number', where, `המספר ${shown} לא נמצא ב${describeRef(cell.src)}`);
+    }
+  }
+
+  dateCell(where: string, date: string): void {
+    if (!dateGrounded(date, this.today, allSourceTexts(this.sources))) {
+      this.add('ungrounded_number', where, `התאריך ${date} לא נמצא באף מקור`);
     }
   }
 
@@ -254,7 +382,8 @@ class Collector {
   plainCell(where: string, cell: Cell): void {
     if ('v' in cell) this.valueCell(where, cell, false);
     else if ('t' in cell) this.text(where, cell.t);
-    else if ('f' in cell) this.add('formula_problem', where, 'נוסחה מותרת רק בגיליון Excel');
+    else if ('d' in cell) this.dateCell(where, cell.d);
+    else this.add('formula_problem', where, 'נוסחה מותרת רק בגיליון Excel');
   }
 
   plainTable(where: string, header: string[], rows: Cell[][]): void {
@@ -287,6 +416,30 @@ function sheetNamesIn(ast: FormulaAst, out: Set<string>): void {
   }
 }
 
+function literalsIn(ast: FormulaAst, numbers: number[], strings: string[]): void {
+  switch (ast.type) {
+    case 'number':
+      numbers.push(ast.value);
+      return;
+    case 'string':
+      strings.push(ast.value);
+      return;
+    case 'unary':
+    case 'percent':
+      literalsIn(ast.arg, numbers, strings);
+      return;
+    case 'binary':
+      literalsIn(ast.left, numbers, strings);
+      literalsIn(ast.right, numbers, strings);
+      return;
+    case 'call':
+      ast.args.forEach((a) => literalsIn(a, numbers, strings));
+      return;
+    default:
+      return;
+  }
+}
+
 function placedWhere(sheetIndex: number, p: PlacedCell): string {
   const base = `sheet ${sheetIndex + 1} table ${p.table + 1}`;
   switch (p.role) {
@@ -303,27 +456,58 @@ function placedWhere(sheetIndex: number, p: PlacedCell): string {
 
 const isEvalError = (v: EvalValue | undefined): v is EvalError => typeof v === 'object' && v !== null;
 
-/** Formula checks for a workbook; returns the numeric formula results for grounding. */
-type AddProblem = (code: SpecProblemCode, where: string, detail: string) => void;
+/** The text a result shows in its column, for grounding free text. */
+function displayedResult(value: number, table: XlsxTable, column: number): string {
+  switch (table.numberFormat?.[column]) {
+    case 'int':
+      return at15(value).toFixed(0);
+    case 'money':
+    case 'decimal2':
+      return at15(value).toFixed(2);
+    case 'percent':
+      return plainNumber(at15(value * 100));
+    case undefined:
+      return plainNumber(value);
+  }
+}
 
-function checkWorkbook(sheets: XlsxSheet[], add: AddProblem): string[] {
+interface FormulaCellInfo {
+  /** Ungrounded number literals, as plain strings. */
+  ungrounded: string[];
+  /** String literals: free text. */
+  strings: string[];
+}
+
+interface WorkbookCheck {
+  /** Per formula cell, keyed `SHEETUPPER!A1`. */
+  cells: Map<string, FormulaCellInfo>;
+  /** Displayed forms of untainted numeric results. */
+  results: string[];
+}
+
+const cellKey = (sheet: string, address: string) => `${sheet.toUpperCase()}!${address}`;
+
+function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProblem): WorkbookCheck {
   const layouts = sheets.map(layoutSheet);
   const upper = sheets.map((s) => s.name.toUpperCase());
-  let duplicate = false;
+  const cells = new Map<string, FormulaCellInfo>();
+  const reads = new Map<string, string[]>();
+  let blocked = false;
+
   upper.forEach((name, i) => {
     if (upper.indexOf(name) !== i) {
-      duplicate = true;
+      blocked = true;
       add('formula_problem', `sheet ${i + 1}`, `שם הגיליון "${sheets[i]!.name}" כבר קיים (בלי הבדל בין אותיות גדולות לקטנות)`);
     }
   });
 
-  let upFront = false;
   layouts.forEach((placed, si) => {
     for (const p of placed) {
       if (p.cell === null || !('f' in p.cell)) continue;
+      const key = cellKey(sheets[si]!.name, p.address);
       const parsed = parseFormula(p.cell.f);
       if (!parsed.ok) {
-        upFront = true;
+        blocked = true;
         add('formula_problem', placedWhere(si, p), parsed.problem.detail);
         continue;
       }
@@ -331,40 +515,62 @@ function checkWorkbook(sheets: XlsxSheet[], add: AddProblem): string[] {
       sheetNamesIn(parsed.ast, named);
       for (const name of named) {
         if (!upper.includes(name.toUpperCase())) {
-          upFront = true;
+          blocked = true;
           add('formula_problem', placedWhere(si, p), `הנוסחה מפנה לגיליון שאינו קיים: "${name}"`);
         }
       }
+      const numbers: number[] = [];
+      const strings: string[] = [];
+      literalsIn(parsed.ast, numbers, strings);
+      const ungrounded = numbers
+        .filter((n) => !EXEMPT_LITERALS.has(n))
+        .map(plainNumber)
+        .filter((n) => ungroundedNumbers(n, literalPool).length > 0);
+      cells.set(key, { ungrounded: [...new Set(ungrounded)], strings });
+      reads.set(
+        key,
+        referencedCells(parsed.ast).map((ref) => {
+          const bang = ref.lastIndexOf('!');
+          return bang < 0 ? cellKey(sheets[si]!.name, ref) : cellKey(ref.slice(0, bang), ref.slice(bang + 1));
+        }),
+      );
     }
   });
   // Evaluating would throw on a duplicate name, and a formula that did not
-  // parse or names a missing sheet is already refused — the drafter fixes
-  // those first; evaluation over them would only add derived noise.
-  if (duplicate || upFront) return [];
+  // parse or names a missing sheet is already refused — evaluation over them
+  // would only add derived noise.
+  if (blocked) return { cells, results: [] };
+
+  // Taint: an ungrounded literal, or reading a tainted cell, transitively.
+  const tainted = new Set([...cells].filter(([, info]) => info.ungrounded.length > 0).map(([k]) => k));
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const [key, deps] of reads) {
+      if (!tainted.has(key) && deps.some((d) => tainted.has(d))) {
+        tainted.add(key);
+        changed = true;
+      }
+    }
+  }
 
   const evaluation = evaluateWorkbook(sheets.map(toEvalSheet));
   const results: string[] = [];
   layouts.forEach((placed, si) => {
     const name = sheets[si]!.name;
-    const table = (t: number) => sheets[si]!.tables[t]!;
     for (const p of placed) {
       if (p.cell === null || !('f' in p.cell)) continue;
-      const key = `${name}!${p.address}`;
-      const value = evaluation.values.get(key);
-      if (evaluation.deviated.has(key)) {
+      const evalKey = `${name}!${p.address}`;
+      const value = evaluation.values.get(evalKey);
+      if (evaluation.deviated.has(evalKey)) {
         add('formula_problem', placedWhere(si, p), 'לא ניתן לאמת שהנוסחה תחושב כמו ב-Excel');
       } else if (isEvalError(value)) {
         add('formula_problem', placedWhere(si, p), `הנוסחה מחזירה שגיאה: ${value.error}`);
-      } else if (typeof value === 'number') {
-        results.push(plainNumber(value), value.toFixed(2), value.toFixed(0));
-        if (table(p.table).numberFormat?.[p.column] === 'percent') {
-          const pct = value * 100;
-          results.push(plainNumber(Number(pct.toPrecision(15))), pct.toFixed(2), pct.toFixed(0));
-        }
+      } else if (typeof value === 'number' && !tainted.has(cellKey(name, p.address))) {
+        results.push(displayedResult(value, sheets[si]!.tables[p.table]!, p.column));
       }
     }
   });
-  return results;
+  return { cells, results };
 }
 
 // ---------------------------------------------------------------- filename
@@ -372,8 +578,7 @@ function checkWorkbook(sheets: XlsxSheet[], add: AddProblem): string[] {
 const FILENAME_CHARS = /^[\p{L}\p{M}\p{N} _\-.]+$/u;
 const WINDOWS_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 
-function filenameProblem(raw: string): string | null {
-  const name = stripBidiControls(raw);
+function filenameProblem(name: string): string | null {
   if (name.trim().length === 0) return 'שם הקובץ ריק';
   if (!FILENAME_CHARS.test(name)) return 'שם הקובץ מכיל תו אסור (מותרים אותיות, ספרות, רווח, מקף, קו תחתון ונקודה)';
   if (name.startsWith('.') || name.endsWith('.') || name.endsWith(' ')) {
@@ -386,14 +591,6 @@ function filenameProblem(raw: string): string | null {
 }
 
 // ---------------------------------------------------------------- entry
-
-function structuralNumbers(spec: DocumentSpec, today: string): string {
-  const count = Math.max(clauseCount(spec), spec.format === 'pptx' ? spec.slides.length : 0);
-  const [y, m, d] = today.split('-').map(Number) as [number, number, number];
-  const nums = [y, m, d];
-  for (let i = 1; i <= count; i++) nums.push(i);
-  return nums.join(' ');
-}
 
 function imageIds(spec: DocumentSpec): { where: string; documentId: string }[] {
   switch (spec.format) {
@@ -414,6 +611,7 @@ function imageIds(spec: DocumentSpec): { where: string; documentId: string }[] {
 }
 
 function checkBlocks(blocks: Block[], c: Collector): void {
+  let clause = 0;
   blocks.forEach((b, i) => {
     const where = `block ${i + 1}`;
     switch (b.type) {
@@ -428,7 +626,8 @@ function checkBlocks(blocks: Block[], c: Collector): void {
         c.plainTable(where, b.header, b.rows);
         return;
       case 'clause':
-        c.text(`${where} title`, b.title);
+        clause += 1;
+        c.text(`${where} title`, stripOwnNumber(b.title, clause));
         c.text(where, b.text);
         return;
       case 'pageBreak':
@@ -438,18 +637,7 @@ function checkBlocks(blocks: Block[], c: Collector): void {
   });
 }
 
-export function validateSpec(
-  spec: DocumentSpec,
-  sources: GroundingSources,
-  options: ValidateSpecOptions = {},
-): SpecProblem[] {
-  const today = options.today ?? new Date().toISOString().slice(0, 10);
-  const early: SpecProblem[] = [];
-  const add: AddProblem = (code, where, detail) => {
-    early.push({ code, where, detail });
-  };
-
-  // Caps first: over a cap, nothing else is worth computing.
+function checkCaps(spec: DocumentSpec, add: AddProblem): void {
   if (spec.format === 'xlsx') {
     if (spec.sheets.length > CAPS.sheets) {
       add('cap_exceeded', 'document', `יש ${spec.sheets.length} גיליונות; המקסימום הוא ${CAPS.sheets}`);
@@ -459,15 +647,41 @@ export function validateSpec(
       if (rows > CAPS.rowsPerSheet) {
         add('cap_exceeded', `sheet ${i + 1}`, `יש ${rows} שורות בגיליון; המקסימום הוא ${CAPS.rowsPerSheet}`);
       }
+      for (const p of layoutSheet(sheet)) {
+        if (p.cell !== null && 'd' in p.cell && p.cell.d < EXCEL_MIN_DATE) {
+          add('cap_exceeded', placedWhere(i, p), `תאריך לפני ${EXCEL_MIN_DATE} אינו נתמך ב-Excel`);
+        }
+      }
     });
   }
   if (spec.format === 'pptx' && spec.slides.length > CAPS.slides) {
     add('cap_exceeded', 'document', `יש ${spec.slides.length} שקפים; המקסימום הוא ${CAPS.slides}`);
   }
+}
+
+export function validateSpec(
+  spec: DocumentSpec,
+  sources: GroundingSources,
+  options: ValidateSpecOptions,
+): SpecProblem[] {
+  const today = options?.today;
+  const todayParts = typeof today === 'string' ? parseIsoDate(today) : null;
+  if (today === undefined || todayParts === null) {
+    throw new TypeError('validateSpec: options.today must be the charter-local date as YYYY-MM-DD');
+  }
+
+  const early: SpecProblem[] = [];
+  const add: AddProblem = (code, where, detail) => {
+    early.push({ code, where, detail });
+  };
+
+  // Caps first: over a cap, nothing else is worth computing.
+  checkCaps(spec, add);
   if (early.length > 0) return early;
 
-  const filename = filenameProblem(spec.filename);
-  if (filename !== null) add('filename_invalid', 'filename', filename);
+  const filename = stripBidiControls(spec.filename);
+  const filenameIssue = filenameProblem(filename);
+  if (filenameIssue !== null) add('filename_invalid', 'filename', filenameIssue);
 
   const missing = REQUIRED_STRUCTURE[spec.kind](spec);
   if (missing.length > 0) add('missing_structure', 'document', `חסר במסמך: ${missing.join(', ')}`);
@@ -481,16 +695,15 @@ export function validateSpec(
     if (!known.has(image.documentId)) add('unknown_image', image.where, `התמונה מפנה למסמך שאינו בין המקורות: ${image.documentId}`);
   }
 
-  const formulaResults = spec.format === 'xlsx' ? checkWorkbook(spec.sheets, add) : [];
-  const pool = [
-    sources.instructionText,
-    ...sources.documents.flatMap((d) => d.artifacts.map((a) => a.text)),
-    ...sources.memories.map((m) => m.body),
-    ...formulaResults,
-    structuralNumbers(spec, today),
-  ];
-  const c = new Collector(sources, pool);
+  const sourcePool = allSourceTexts(sources).map(splitSeparators);
+  const workbook = spec.format === 'xlsx' ? checkWorkbook(spec.sheets, sourcePool, add) : null;
+  const c = new Collector(sources, today, todayParts, [...sourcePool, ...(workbook?.results ?? [])]);
+
   c.text('title', spec.title);
+  if (filenameIssue === null) c.text('filename', filename);
+  spec.legalBasis?.forEach((basis, i) => {
+    if (basis.note !== undefined) c.text(`legalBasis ${i + 1} note`, basis.note);
+  });
 
   switch (spec.format) {
     case 'docx':
@@ -500,7 +713,7 @@ export function validateSpec(
     case 'pptx':
       spec.slides.forEach((s, i) => {
         const where = `slide ${i + 1}`;
-        if ('title' in s && s.title !== undefined) c.text(`${where} title`, s.title);
+        if ('title' in s && s.title !== undefined) c.text(`${where} title`, stripOwnNumber(s.title, i + 1));
         switch (s.type) {
           case 'title':
             if (s.subtitle !== undefined) c.text(`${where} subtitle`, s.subtitle);
@@ -523,6 +736,7 @@ export function validateSpec(
       break;
     case 'xlsx':
       spec.sheets.forEach((sheet, si) => {
+        c.text(`sheet ${si + 1} name`, sheet.name);
         for (const p of layoutSheet(sheet)) {
           const where = placedWhere(si, p);
           if (p.text !== null) {
@@ -535,6 +749,15 @@ export function validateSpec(
             c.valueCell(where, cell, sheet.tables[p.table]!.numberFormat?.[p.column] === 'percent');
           } else if ('t' in cell) {
             c.text(where, cell.t);
+          } else if ('d' in cell) {
+            c.dateCell(where, cell.d);
+          } else {
+            const info = workbook?.cells.get(cellKey(sheet.name, p.address));
+            if (info === undefined) continue; // did not parse: already a formula_problem
+            if (info.ungrounded.length > 0) {
+              c.add('ungrounded_number', where, `מספר בנוסחה שאין לו מקור: ${info.ungrounded.join(', ')}`);
+            }
+            for (const s of info.strings) c.text(where, s);
           }
         }
       });

@@ -63,8 +63,17 @@ export function layoutSheet(sheet: XlsxSheet): PlacedCell[] {
 const DAY_MS = 86_400_000;
 const EXCEL_EPOCH_MS = Date.UTC(1899, 11, 30);
 
-/** Excel's 1900-system serial for a `YYYY-MM-DD` date (valid from 1900-03-01). */
+/**
+ * The first date Excel's 1900 system holds without its fictitious 1900-02-29
+ * shifting the serial. validateSpec refuses an xlsx date before it
+ * (`cap_exceeded`); `excelDateSerial` throws on one, so a caller that skipped
+ * validation fails loudly instead of writing a wrong date.
+ */
+export const EXCEL_MIN_DATE = '1900-03-01';
+
+/** Excel's 1900-system serial for a `YYYY-MM-DD` date. Throws RangeError before 1900-03-01. */
 export function excelDateSerial(date: string): number {
+  if (date < EXCEL_MIN_DATE) throw new RangeError(`date before ${EXCEL_MIN_DATE}: ${date}`);
   const [y, m, d] = date.split('-').map(Number) as [number, number, number];
   return Math.round((Date.UTC(y, m - 1, d) - EXCEL_EPOCH_MS) / DAY_MS);
 }

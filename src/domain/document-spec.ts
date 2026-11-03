@@ -76,6 +76,12 @@ export const Cell = z.union([
 ]);
 export type Cell = z.infer<typeof Cell>;
 
+/**
+ * Per-column display format. `money`: values are MAJOR units exactly as the
+ * sources write them (1890 = ₪1,890), never minor units; renderers format
+ * them with a currency number format. `percent`: values are fractions (0.15
+ * displays 15%).
+ */
 const NumberFormat = z.enum(['int', 'money', 'percent', 'decimal2']);
 
 export const XlsxTable = z
