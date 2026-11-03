@@ -286,7 +286,7 @@ describe('validateSpec — formulas', () => {
 
   it('a reference to a sheet that does not exist → formula_problem', () => {
     const spec = xlsx({
-      sheets: [{ name: 'a', tables: [{ header: ['x'], rows: [[{ f: "'גיליון חסר'!A1+1" }]] }] }],
+      sheets: [{ name: 'a', tables: [{ header: ['x'], rows: [[{ f: "'גיליון חסר'!A1*100" }]] }] }],
     });
     const problems = validateSpec(spec, sources(), TODAY);
     expect(codes(problems)).toEqual(['formula_problem']);
@@ -538,7 +538,7 @@ describe('fix round 1', () => {
       expect(wheres(bare, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 1 col 1']);
       // Controls: a grounded literal, and the closed exemption set.
       expect(validateSpec(sheetWith([[fromDoc(1890)], [{ f: 'A2+3200' }]]), sources(), TODAY)).toEqual([]);
-      expect(validateSpec(sheetWith([[fromDoc(1890)], [{ f: 'ROUND(A2*12/100,0)+1-0' }]]), sources(), TODAY)).toEqual([]);
+      expect(validateSpec(sheetWith([[fromDoc(1890)], [{ f: 'ROUND(A2*12/100,0)' }]]), sources(), TODAY)).toEqual([]);
       // A negated literal is checked as its magnitude.
       expect(wheres(validateSpec(sheetWith([[{ f: '-77777' }]]), sources(), TODAY), 'ungrounded_number')).toHaveLength(1);
     });
@@ -631,7 +631,9 @@ describe('fix round 1', () => {
     it("today's parts ground only inside a date", () => {
       const t = { today: '2027-01-05' };
       expect(validateSpec(docx([{ type: 'paragraph', text: 'נכון ל-5 בינואר 2027' }]), sources(), t)).toEqual([]);
-      expect(codes(validateSpec(docx([{ type: 'paragraph', text: 'בשנת 2027' }]), sources(), t))).toEqual([
+      // Round 3: today's year is exempt as a bare 4-digit number; its day is not.
+      expect(validateSpec(docx([{ type: 'paragraph', text: 'בשנת 2027' }]), sources(), t)).toEqual([]);
+      expect(codes(validateSpec(docx([{ type: 'paragraph', text: 'בשנת 2028' }]), sources(), t))).toEqual([
         'ungrounded_number',
       ]);
       expect(codes(validateSpec(docx([{ type: 'paragraph', text: '5 יחידות' }]), sources(), t))).toEqual([
@@ -780,5 +782,104 @@ describe('fix round 2', () => {
       const problems = validateSpec(para('עד 20 בדצמבר 2026'), sources(), TODAY);
       expect(codes(problems)).toEqual(['ungrounded_number']);
     });
+  });
+});
+
+describe('fix round 3', () => {
+  const sheetWith = (rows: Cell[][], over: Record<string, unknown> = {}) =>
+    xlsx({ sheets: [{ name: 'a', tables: [{ header: ['x', 'y'], rows, ...over }] }] });
+  const wheres = (problems: SpecProblem[], code: string) =>
+    problems.filter((p) => p.code === code).map((p) => p.where);
+  const para = (text: string) => docx([{ type: 'paragraph', text }]);
+
+  describe('exempt literals are positional', () => {
+    it('exempt values combined by arithmetic are refused, and do not ground free text', () => {
+      const probe = sheetWith([[{ f: '100*100+12*12+1+1' }]], { title: 'סה"כ 10146' });
+      expect(wheres(validateSpec(probe, sources(), TODAY), 'ungrounded_number')).toEqual([
+        'sheet 1 table 1 title',
+        'sheet 1 table 1 row 1 col 1',
+      ]);
+    });
+    it('an exempt value times an exempt value is refused (no cell reference on the other side)', () => {
+      for (const f of ['100*100*12', '12*12', '100/1']) {
+        expect(wheres(validateSpec(sheetWith([[{ f }]]), sources(), TODAY), 'ungrounded_number')).toEqual([
+          'sheet 1 table 1 row 1 col 1',
+        ]);
+      }
+    });
+
+    it('literal arguments of an aggregate are formula_problem', () => {
+      const probe = sheetWith([[{ f: 'COUNTA("a","b","c","d","e","f","g")*100' }]], { title: 'סה"כ 700' });
+      const problems = validateSpec(probe, sources(), TODAY);
+      expect(wheres(problems, 'formula_problem')).toEqual(['sheet 1 table 1 row 1 col 1']);
+      expect(wheres(problems, 'ungrounded_number')).toContain('sheet 1 table 1 title');
+      for (const f of ['SUM(1890,3200)', 'MAX(A2,1890)', 'COUNT(TRUE)']) {
+        expect(wheres(validateSpec(sheetWith([[fromDoc(1890)], [{ f }]]), sources(), TODAY), 'formula_problem')).toEqual([
+          'sheet 1 table 1 row 2 col 1',
+        ]);
+      }
+    });
+    it('criteria positions may carry literals; their digits still ground', () => {
+      const ok = sheetWith([[fromDoc(1890), fromDoc(3200)], [{ f: 'COUNTIF(A2:A2,">1890")' }, { f: 'SUMIF(A2:A2,">1890",B2:B2)' }]]);
+      expect(validateSpec(ok, sources(), TODAY)).toEqual([]);
+      const bad = sheetWith([[fromDoc(1890)], [{ f: 'COUNTIF(A2:A2,">55555")' }]]);
+      expect(codes(validateSpec(bad, sources(), TODAY))).toEqual(['ungrounded_number']);
+    });
+    it('the allowed positions pass', () => {
+      const ok = sheetWith([
+        [fromDoc(1890), fromDoc(3200)],
+        [{ f: 'ROUND(A2,2)' }, { f: 'A2*100' }],
+        [{ f: 'B2/12' }, { f: 'VLOOKUP(A2,A2:B2,2,FALSE)' }],
+        [{ f: 'MATCH(A2,A2:A2,0)' }, { f: 'ROUNDDOWN(B2/12,-1)' }],
+      ]);
+      expect(validateSpec(ok, sources(), TODAY)).toEqual([]);
+    });
+    it('an exempt value outside those positions must ground', () => {
+      for (const f of ['A2+1', 'A2-100', 'IF(A2>12,A2,0)']) {
+        expect(wheres(validateSpec(sheetWith([[fromDoc(1890)], [{ f }]]), sources(), TODAY), 'ungrounded_number')).toEqual([
+          'sheet 1 table 1 row 2 col 1',
+        ]);
+      }
+    });
+  });
+
+  describe('percent raw value', () => {
+    const pct = (v: number, text: string) =>
+      validateSpec(
+        sheetWith([[fromDoc(v)]], { numberFormat: ['percent'] }),
+        sources({ documents: [{ documentId: PRICE_LIST, artifacts: [{ ordinal: 1, text }] }] }),
+        TODAY,
+      );
+    it('{v:1.5} against "1.5%" is refused (it would display 150%)', () => {
+      expect(codes(pct(1.5, 'שיעור 1.5%'))).toEqual(['ungrounded_number']);
+      expect(codes(pct(1.5, 'שיעור 1.5 %'))).toEqual(['ungrounded_number']);
+    });
+    it('{v:0.015} against "1.5%" passes; {v:0.015} against "0.015" passes', () => {
+      expect(pct(0.015, 'שיעור 1.5%')).toEqual([]);
+      expect(pct(0.015, 'שיעור 0.015')).toEqual([]);
+    });
+  });
+
+  it('d-m-yyyy and d-m-yy are date shapes: an invented 15-12-2026 is refused', () => {
+    const problems = validateSpec(para('עד 15-12-2026'), sources(), TODAY);
+    expect(codes(problems)).toEqual(['ungrounded_number']);
+    expect(problems[0]!.detail).toContain('15-12-2026');
+    expect(validateSpec(para('עד 15-12-2026'), sources({ instructionText: 'עד 15/12/2026' }), TODAY)).toEqual([]);
+    expect(validateSpec(para('עד 15/12/2026'), sources({ instructionText: 'עד 15-12-26' }), TODAY)).toEqual([]);
+    expect(validateSpec(para('נכון ל-4-11-2026'), sources(), TODAY)).toEqual([]);
+  });
+
+  it('in the filename a letter-dash-digit is a separator, not a sign', () => {
+    const named = (filename: string) => validateSpec(docx([{ type: 'paragraph', text: 'x' }], { filename }), sources(), TODAY);
+    expect(named('מחירון-1890')).toEqual([]);
+    expect(named('report-2026')).toEqual([]);
+    expect(named('report-5555').map((p) => p.where)).toEqual(['filename']);
+  });
+
+  it('the M of סעיף N.M is 1–2 digits', () => {
+    const seven = Array.from({ length: 7 }, () => ({ type: 'clause', title: 'נושא', text: 'תוכן' }));
+    const ref = (text: string) => validateSpec(docx([...seven, { type: 'paragraph', text }]), sources(), TODAY);
+    expect(ref('כאמור בסעיף 4.12')).toEqual([]);
+    expect(codes(ref('כאמור בסעיף 4.123'))).toEqual(['ungrounded_number']);
   });
 });

@@ -12,9 +12,10 @@
  * the steps of `Collector.text` first:
  *   - a cross-reference to one of THIS spec's clauses — exactly `סעיף N` or
  *     `סעיף N.M` (glued particles allowed: "לסעיף 4"), "Clause N",
- *     "Section N", with 1 ≤ N ≤ the clause count — is blanked. Only N is
- *     verifiable: sub-clauses are not modelled, so M is not checked;
- *   - every full date shape (`d/m/yy(yy)`, `d.m.yy(yy)`, ISO, or a date in
+ *     "Section N", with 1 ≤ N ≤ the clause count and M of 1–2 digits — is
+ *     blanked. Only N is verifiable: sub-clauses are not modelled;
+ *   - every full date shape (`d/m/yy(yy)`, `d.m.yy(yy)`, `d-m-yy(yy)`, ISO,
+ *     or a date in
  *     words such as "4 בנובמבר 2026") whose date exists is grounded exactly
  *     like a `{d}` cell — it must equal `today` or be a date some source
  *     writes in any of these shapes — and reported as a whole when not;
@@ -27,8 +28,9 @@
  * values are MAJOR units exactly as the sources write them (1890 = ₪1,890).
  * In a `percent` column a value is a FRACTION (0.15 displays 15%): its
  * displayed ×100 form must ground ("15%"/"15"), and the raw fraction is also
- * accepted when it is not an integer and the source writes it ("0.15") — so
- * `{v: 15}`, which would display 1500%, does not ground on "15%". A `{d}`
+ * accepted when it is not an integer and the source writes that exact number
+ * NOT followed by `%` ("0.15") — so `{v: 15}` (1500%) does not ground on
+ * "15%", nor `{v: 1.5}` (150%) on "1.5%". A `{d}`
  * cell must equal `today` or be a date some source writes (ISO, `d/m/yyyy`,
  * `d.m.yyyy`, two-digit years as 20yy, or in words). A pointer that does not
  * resolve is `source_not_found`.
@@ -41,13 +43,24 @@
  * numbers are exempt only where structural: a clause or slide title that is
  * just its own number, or starts with "סעיף N" / "N." where N is that
  * clause's (or slide's) own position — and the clause cross-references
- * above. Any other number in body text, cells or bullets is checked.
+ * above. Today's year is exempt as a bare 4-digit number. In the filename
+ * a dash between a letter and a digit is a separator ("report-2026"), not a
+ * sign. Any other number in body text, cells or bullets is checked.
  *
  * **Formulas** live in workbooks only (a `{f}` in a docx/pdf/pptx table has
  * no addresses: `formula_problem`). In a workbook:
  *   - every NUMBER LITERAL must ground in the sources (not in formula
- *     results — a literal cannot ground itself); exempt is the closed set
- *     {0, 1, 100, 12}. A negated literal is checked as its magnitude.
+ *     results — a literal cannot ground itself), except POSITIONALLY: in a
+ *     parameter position (ROUND* `digits`, VLOOKUP `col_index` and
+ *     `range_lookup`, MATCH `match_type`, each within its bounds), or as a
+ *     direct `*`/`/` operand in {0, 1, 100, 12} whose other operand contains
+ *     a cell reference. So exempt values cannot be combined by arithmetic
+ *     (`100*100+12*12+1+1`). A negated literal is checked as its magnitude.
+ *   - a literal (number, string or boolean) argument of SUM, AVERAGE, MIN,
+ *     MAX, COUNT, COUNTA, COUNTIF, SUMIF, SUMIFS or SUMPRODUCT is
+ *     `formula_problem` — those take cells (`COUNTA("a",…)*100` would count
+ *     strings into a number). The criteria argument of COUNTIF/SUMIF/SUMIFS
+ *     may be a literal; its digits ground like any string literal.
  *   - a cell with an ungrounded literal is TAINTED, and so is every formula
  *     reading a tainted cell, transitively; a tainted result never grounds
  *     free text (no laundering `{f:'18900'}` into a title).
@@ -242,6 +255,9 @@ const AFTER = String.raw`(?![\d/:-]|[.,]\d)`;
 const SLASH_DATE = new RegExp(`${BEFORE}(\\d{1,2})/(\\d{1,2})/(\\d{4}|\\d{2})${AFTER}`, 'g');
 const DOT_DATE = new RegExp(`${BEFORE}(\\d{1,2})\\.(\\d{1,2})\\.(\\d{4}|\\d{2})${AFTER}`, 'g');
 const ISO_DATE = new RegExp(`${BEFORE}(\\d{4})-(\\d{2})-(\\d{2})${AFTER}`, 'g');
+const DASH_DATE = new RegExp(`${BEFORE}(\\d{1,2})-(\\d{1,2})-(\\d{4}|\\d{2})${AFTER}`, 'g');
+/** A number written as a percentage ("1.5%", "15 %"). */
+const PERCENT_FOLLOWED = /\d[\d,]*(?:\.\d+)?\s*%/g;
 const TIME = new RegExp(`${BEFORE}(?:[01]?\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?${AFTER}`, 'g');
 
 const MONTH_NAMES: readonly (readonly string[])[] = [
@@ -289,6 +305,7 @@ function replaceDates(text: string, replace: (iso: string, raw: string) => strin
     .replace(SLASH_DATE, (all, d: string, m: string, y: string) => via(all, y, m, d))
     .replace(DOT_DATE, (all, d: string, m: string, y: string) => via(all, y, m, d))
     .replace(ISO_DATE, (all, y: string, m: string, d: string) => via(all, y, m, d))
+    .replace(DASH_DATE, (all, d: string, m: string, y: string) => via(all, y, m, d))
     .replace(WORD_DATE, (all, d: string, month: string, y: string) => via(all, y, String(monthNumber(month)), d));
 }
 
@@ -304,7 +321,7 @@ function datesIn(texts: string[]): Set<string> {
   return out;
 }
 
-const CLAUSE_REF = /(?<!\p{L})(?:[ולבמהכש]{0,3}סעיף|clause|section)\s+(\d+)(?:\.(\d+))?(?!\d|\.\d)/giu;
+const CLAUSE_REF = /(?<!\p{L})(?:[ולבמהכש]{0,3}סעיף|clause|section)\s+(\d+)(?:\.(\d{1,2}))?(?!\d|\.\d)/giu;
 
 /**
  * Blank cross-references to this spec's own clauses: exactly `סעיף N` or
@@ -412,12 +429,16 @@ class Collector {
       return;
     }
     const text = splitSeparators(raw);
-    const candidates = percent
-      ? [plainNumber(at15(cell.v * 100)), ...(Number.isInteger(cell.v) ? [] : [plainNumber(cell.v)])]
-      : [plainNumber(cell.v)];
-    const grounded = candidates.some((c) => ungroundedNumbers(c, [text]).length === 0);
+    const groundsIn = (candidate: string, source: string) => ungroundedNumbers(candidate, [source]).length === 0;
+    const displayed = percent ? plainNumber(at15(cell.v * 100)) : plainNumber(cell.v);
+    // A percent cell's raw fraction counts only where the source writes that
+    // exact number NOT followed by `%` ("0.15", never "1.5%" for {v: 1.5},
+    // which would display 150%), and never for an integer.
+    const rawAccepted =
+      percent && !Number.isInteger(cell.v) && groundsIn(plainNumber(cell.v), text.replace(PERCENT_FOLLOWED, ' '));
+    const grounded = groundsIn(displayed, text) || rawAccepted;
     if (!grounded) {
-      const shown = percent ? `${candidates[0]}%` : plainNumber(cell.v);
+      const shown = percent ? `${displayed}%` : displayed;
       this.add('ungrounded_number', where, `המספר ${shown} לא נמצא ב${describeRef(cell.src)}`);
     }
   }
@@ -466,24 +487,127 @@ function sheetNamesIn(ast: FormulaAst, out: Set<string>): void {
   }
 }
 
-function literalsIn(ast: FormulaAst, numbers: number[], strings: string[]): void {
-  switch (ast.type) {
-    case 'number':
-      numbers.push(ast.value);
-      return;
-    case 'string':
-      strings.push(ast.value);
-      return;
+/** Functions whose arguments are refs/ranges; a literal argument is refused. */
+const AGGREGATES: ReadonlySet<string> = new Set([
+  'SUM',
+  'AVERAGE',
+  'MIN',
+  'MAX',
+  'COUNT',
+  'COUNTA',
+  'COUNTIF',
+  'SUMIF',
+  'SUMIFS',
+  'SUMPRODUCT',
+]);
+
+/** The criteria argument of COUNTIF/SUMIF (index 1) and SUMIFS (2, 4, 6, …). */
+const isCriteriaPosition = (name: string, i: number) =>
+  ((name === 'COUNTIF' || name === 'SUMIF') && i === 1) || (name === 'SUMIFS' && i >= 2 && i % 2 === 0);
+
+/** A literal, possibly signed or with `%`. */
+function isLiteral(n: FormulaAst): boolean {
+  if (n.type === 'number' || n.type === 'string' || n.type === 'boolean') return true;
+  return (n.type === 'unary' || n.type === 'percent') && isLiteral(n.arg);
+}
+
+/** A number literal's magnitude (through a unary sign), else null. */
+function numberOf(n: FormulaAst): number | null {
+  if (n.type === 'number') return n.value;
+  return n.type === 'unary' ? numberOf(n.arg) : null;
+}
+
+function hasCellRef(n: FormulaAst): boolean {
+  switch (n.type) {
+    case 'ref':
+    case 'range':
+      return true;
     case 'unary':
     case 'percent':
-      literalsIn(ast.arg, numbers, strings);
-      return;
+      return hasCellRef(n.arg);
     case 'binary':
-      literalsIn(ast.left, numbers, strings);
-      literalsIn(ast.right, numbers, strings);
-      return;
+      return hasCellRef(n.left) || hasCellRef(n.right);
     case 'call':
-      ast.args.forEach((a) => literalsIn(a, numbers, strings));
+      return n.args.some(hasCellRef);
+    default:
+      return false;
+  }
+}
+
+/**
+ * A parameter position (not a value): ROUND/ROUNDUP/ROUNDDOWN `digits`
+ * (an integer in −15..15), VLOOKUP `col_index` (1..16384) and `range_lookup`
+ * (0/1), MATCH `match_type` (−1/0/1). The sign counts here: `ROUND(x,-1)`.
+ */
+function isParameter(name: string, i: number, arg: FormulaAst): boolean {
+  const magnitude = numberOf(arg);
+  if (magnitude === null || !Number.isInteger(magnitude)) return false;
+  const v = arg.type === 'unary' && arg.op === '-' ? -magnitude : magnitude;
+  switch (name) {
+    case 'ROUND':
+    case 'ROUNDUP':
+    case 'ROUNDDOWN':
+      return i === 1 && v >= -15 && v <= 15;
+    case 'VLOOKUP':
+      return (i === 2 && v >= 1 && v <= 16384) || (i === 3 && (v === 0 || v === 1));
+    case 'MATCH':
+      return i === 2 && v >= -1 && v <= 1;
+    default:
+      return false;
+  }
+}
+
+interface FormulaLiterals {
+  /** Number literals that must ground (magnitudes). */
+  numbers: number[];
+  /** String literals: free text. */
+  strings: string[];
+  /** Literal arguments of an aggregate outside a criteria position. */
+  aggregateLiterals: string[];
+}
+
+/**
+ * Collect a formula's literals under the POSITIONAL exemption (fix round 3):
+ * a literal needs no source only in a parameter position (`isParameter`), or
+ * as a direct operand of `*` or `/` whose value is in EXEMPT_LITERALS and
+ * whose OTHER operand contains a cell reference (`A2*100`, `B2/12`). Every
+ * other number literal must ground — any `+`/`-` operand, a literal inside a
+ * function argument, a literal times a literal — so exempt values cannot be
+ * combined by arithmetic into an arbitrary number.
+ */
+function literalsIn(ast: FormulaAst, out: FormulaLiterals, exempt = false): void {
+  switch (ast.type) {
+    case 'number':
+      if (!exempt) out.numbers.push(ast.value);
+      return;
+    case 'string':
+      out.strings.push(ast.value);
+      return;
+    case 'unary':
+      literalsIn(ast.arg, out, exempt);
+      return;
+    case 'percent':
+      literalsIn(ast.arg, out);
+      return;
+    case 'binary': {
+      const scaling = ast.op === '*' || ast.op === '/';
+      const ok = (self: FormulaAst, other: FormulaAst) => {
+        const v = numberOf(self);
+        return scaling && v !== null && EXEMPT_LITERALS.has(v) && hasCellRef(other);
+      };
+      literalsIn(ast.left, out, ok(ast.left, ast.right));
+      literalsIn(ast.right, out, ok(ast.right, ast.left));
+      return;
+    }
+    case 'call':
+      ast.args.forEach((arg, i) => {
+        if (AGGREGATES.has(ast.name) && isLiteral(arg) && !isCriteriaPosition(ast.name, i)) {
+          out.aggregateLiterals.push(`${ast.name} (ארגומנט ${i + 1})`);
+          return;
+        }
+        if (isParameter(ast.name, i, arg)) return;
+        literalsIn(arg, out);
+      });
       return;
     default:
       return;
@@ -569,14 +693,20 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
           add('formula_problem', placedWhere(si, p), `הנוסחה מפנה לגיליון שאינו קיים: "${name}"`);
         }
       }
-      const numbers: number[] = [];
-      const strings: string[] = [];
-      literalsIn(parsed.ast, numbers, strings);
-      const ungrounded = numbers
-        .filter((n) => !EXEMPT_LITERALS.has(n))
+      const literals: FormulaLiterals = { numbers: [], strings: [], aggregateLiterals: [] };
+      literalsIn(parsed.ast, literals);
+      if (literals.aggregateLiterals.length > 0) {
+        blocked = true;
+        add(
+          'formula_problem',
+          placedWhere(si, p),
+          `פונקציה שמקבלת תאים קיבלה ערך קבוע: ${literals.aggregateLiterals.join(', ')}`,
+        );
+      }
+      const ungrounded = literals.numbers
         .map(plainNumber)
         .filter((n) => ungroundedNumbers(n, literalPool).length > 0);
-      cells.set(key, { ungrounded: [...new Set(ungrounded)], strings });
+      cells.set(key, { ungrounded: [...new Set(ungrounded)], strings: literals.strings });
       reads.set(
         key,
         referencedCells(parsed.ast).map((ref) => {
@@ -750,10 +880,14 @@ export function validateSpec(
   const c = new Collector(sources, today, datesIn(allSourceTexts(sources)), clauseCount(spec), [
     ...sourcePool,
     ...(workbook?.results ?? []),
+    // Today's year is structural as a bare number ("בשנת 2026"); free text only.
+    today.slice(0, 4),
   ]);
 
   c.text('title', spec.title);
-  if (filenameIssue === null) c.text('filename', filename);
+  // In a filename a dash between a letter and a digit is a separator
+  // ("report-2026"), never a minus sign.
+  if (filenameIssue === null) c.text('filename', filename.replace(/(?<=\p{L})-(?=\d)/gu, ' '));
   spec.legalBasis?.forEach((basis, i) => {
     if (basis.note !== undefined) c.text(`legalBasis ${i + 1} note`, basis.note);
   });
