@@ -52,7 +52,11 @@ describe('DocumentSpec', () => {
     const sheet = xlsx() as { sheets: Array<Record<string, unknown>> };
     sheet.sheets[0]!['extra'] = 1;
     expect(DocumentSpec.safeParse(sheet).success).toBe(false);
+    const cleanSheet = xlsx() as { sheets: Array<Record<string, unknown>> };
+    expect(DocumentSpec.safeParse(cleanSheet).success).toBe(true);
+    expect(Cell.safeParse({ t: 'a' }).success).toBe(true);
     expect(Cell.safeParse({ t: 'a', extra: 1 }).success).toBe(false);
+    expect(DocumentSpec.safeParse(docx([{ type: 'paragraph', text: 'x' }])).success).toBe(true);
     expect(
       DocumentSpec.safeParse(docx([{ type: 'paragraph', text: 'x', extra: 1 }])).success,
     ).toBe(false);
@@ -93,8 +97,43 @@ describe('DocumentSpec', () => {
       Cell.safeParse({ v: 1, src: { kind: 'document', documentId: 'DOC-1', ordinal: 0 } }).success,
     ).toBe(true);
     expect(
+      DocumentSpec.safeParse(docx([{ type: 'image', documentId: 'DOC-1' }])).success,
+    ).toBe(true);
+    expect(
       DocumentSpec.safeParse(docx([{ type: 'image', documentId: 'constructor' }])).success,
     ).toBe(false);
+  });
+
+  it('rejects an unknown key in a table, a slide, style and a legalBasis entry', () => {
+    const tbl = { header: ['x'], rows: [[{ t: 'a' }]] };
+    const withTable = (t: object) => xlsx({ sheets: [{ name: 'a', tables: [t] }] });
+    expect(DocumentSpec.safeParse(withTable(tbl)).success).toBe(true);
+    expect(DocumentSpec.safeParse(withTable({ ...tbl, extra: 1 })).success).toBe(false);
+
+    const pptx = (slide: object) => ({ ...base, format: 'pptx', slides: [slide] });
+    const slide = { type: 'titleBullets', title: 't', bullets: ['b'] };
+    expect(DocumentSpec.safeParse(pptx(slide)).success).toBe(true);
+    expect(DocumentSpec.safeParse(pptx({ ...slide, extra: 1 })).success).toBe(false);
+
+    expect(DocumentSpec.safeParse(xlsx({ style: { theme: 'clean', accent: 'navy' } })).success).toBe(true);
+    expect(
+      DocumentSpec.safeParse(xlsx({ style: { theme: 'clean', accent: 'navy', x: 1 } })).success,
+    ).toBe(false);
+
+    const contract = (lb: object) => ({
+      ...docx([{ type: 'clause', title: 't', text: 'x' }]),
+      kind: 'contract',
+      legalBasis: [lb],
+    });
+    expect(DocumentSpec.safeParse(contract({ law: 'חוק' })).success).toBe(true);
+    expect(DocumentSpec.safeParse(contract({ law: 'חוק', extra: 1 })).success).toBe(false);
+  });
+
+  it('a d cell must be a real calendar date', () => {
+    expect(Cell.safeParse({ d: '2026-02-28' }).success).toBe(true);
+    expect(Cell.safeParse({ d: '2028-02-29' }).success).toBe(true);
+    expect(Cell.safeParse({ d: '2026-13-45' }).success).toBe(false);
+    expect(Cell.safeParse({ d: '2026-02-30' }).success).toBe(false);
   });
 });
 

@@ -61,11 +61,17 @@ export const SourceRef = z.discriminatedUnion('kind', [
 ]);
 export type SourceRef = z.infer<typeof SourceRef>;
 
+function isRealDate(value: string): boolean {
+  const [y, m, d] = value.split('-').map(Number) as [number, number, number];
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
 /** A formula string is stored without the leading `=`. */
 export const Cell = z.union([
   z.object({ v: z.number().finite(), src: SourceRef }).strict(),
   z.object({ t: z.string() }).strict(),
-  z.object({ d: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }).strict(),
+  z.object({ d: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(isRealDate, 'תאריך לא קיים') }).strict(),
   z.object({ f: z.string().min(1).regex(/^[^=]/) }).strict(),
 ]);
 export type Cell = z.infer<typeof Cell>;
