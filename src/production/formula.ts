@@ -16,10 +16,22 @@
  * WEBSERVICE, CALL among them — none is whitelisted), an external workbook
  * `[x]`, a defined name, or a syntax error.
  *
+ * THE GUARANTEE is `evaluateWorkbook(...).deviated`: every formula cell whose
+ * evaluation called `refuse()` at any depth, or that reads (directly or via a
+ * range, transitively) such a cell. A workbook with a non-empty `deviated` set
+ * is NOT verifiable — our numbers may differ from Excel's — and later tasks
+ * (validateSpec, check 1) MUST refuse it as `formula_problem`. Per-function
+ * propagation of uncatchable errors below is defence in depth, not the
+ * guarantee: a function that drops an error on some path still cannot
+ * produce a trusted wrong number, because the refuse() call was counted.
+ *
  * Known, deliberate deviations from Excel that yield an error where Excel
  * yields a value. Every one of them is raised through `refuse()`, so no
  * IFERROR — in the same cell or a cell that reads it — turns it into the
- * fallback; errors Excel itself raises stay plain and catchable:
+ * fallback, and functions that skip errors per Excel (COUNT, COUNTA,
+ * COUNTIF/SUMIF/SUMIFS criteria, MATCH/VLOOKUP scans) return it instead of
+ * skipping it; errors Excel itself raises stay plain and keep Excel's
+ * catching and skipping:
  * - Text in arithmetic is #VALUE! even when it looks numeric (Excel: "5"+1=6).
  *   Text containing any digit is refused (Excel may coerce it); text with no
  *   digit is a plain #VALUE!, as in Excel.
@@ -33,7 +45,10 @@
  * - SUMIF's sum_range must have the criteria range's shape (Excel resizes).
  * - Approximate MATCH/VLOOKUP verify the lookup column is sorted (by Excel
  *   type rank) and return #N/A when it is not; Excel's binary search returns
- *   an arbitrary row there.
+ *   an arbitrary row there. Consequence: a text header above numbers (e.g.
+ *   VLOOKUP over A1:B9 with "מחיר" in A1) is "unsorted" by type rank and
+ *   refuses with an uncatchable #N/A where Excel may return a value — the
+ *   acceptable direction; the spec should range below the header.
  * - IFERROR never catches #CIRC!: a cycle is never rescued into a number.
  * - A formula that does not parse evaluates to #NAME? (Excel cannot store it).
  *
@@ -611,10 +626,31 @@ const mkErr = (error: FormulaErrorCode): EvalError => ({ error });
  * Errors Excel itself raises stay plain and catchable.
  */
 const UNCATCHABLE = new WeakSet<EvalError>();
+/**
+ * Counts every refuse() call. The evaluator compares it before and after a
+ * cell, so a cell whose evaluation refused anything — at any depth, used or
+ * not — is reported as deviated. Evaluation is synchronous, so a module
+ * counter is exact.
+ */
+let refuseCount = 0;
 function refuse(code: FormulaErrorCode): EvalError {
   const e = mkErr(code);
   UNCATCHABLE.add(e);
+  refuseCount++;
   return e;
+}
+
+function isUncatchable(v: Cell): v is EvalError {
+  return isErr(v) && (UNCATCHABLE.has(v) || v.error === '#CIRC!');
+}
+
+/**
+ * Functions that skip errors per Excel (COUNT, criteria, lookups) must not
+ * skip a deviation error or a cycle: they return the first one they meet.
+ */
+function firstUncatchable(cells: Iterable<Cell>): EvalError | null {
+  for (const c of cells) if (isUncatchable(c)) return c;
+  return null;
 }
 
 function isErr(v: unknown): v is EvalError {
@@ -865,7 +901,9 @@ function cellsOf(range: RangeOp): Cell[] {
 const UNSORTED = -2;
 
 /** Returns a 0-based index, -1 (not found) or UNSORTED. `type` is MATCH's match_type. */
-function lookupIndex(values: Cell[], lookup: number | string | boolean, type: -1 | 0 | 1): number {
+function lookupIndex(values: Cell[], lookup: number | string | boolean, type: -1 | 0 | 1): number | EvalError {
+  const uncatchable = firstUncatchable(values);
+  if (uncatchable) return uncatchable;
   if (type === 0) {
     if (typeof lookup === 'string') {
       const re = wildcardRegex(lookup);
@@ -916,6 +954,9 @@ class Workbook {
   readonly nodeByKey = new Map<string, number>();
   readonly nodesBySheet: number[][];
   readonly values = new Map<number, EvalValue>();
+  /** Nodes whose own evaluation called refuse(). */
+  readonly ownDeviated = new Set<number>();
+  private adj: number[][] = [];
 
   constructor(input: EvalSheet[]) {
     const seen = new Set<string>();
@@ -1012,6 +1053,7 @@ class Workbook {
     const low = new Array<number>(n).fill(0);
     const onStack = new Array<boolean>(n).fill(false);
     const adj: number[][] = this.nodes.map((_, i) => this.deps(i));
+    this.adj = adj;
     const stack: number[] = [];
     let counter = 0;
 
@@ -1050,7 +1092,13 @@ class Workbook {
           } while (w !== v);
           const cyclic = scc.length > 1 || adj[v]!.includes(v);
           for (const member of scc) {
-            this.values.set(member, cyclic ? mkErr('#CIRC!') : this.evaluateNode(member));
+            if (cyclic) {
+              this.values.set(member, mkErr('#CIRC!'));
+              continue;
+            }
+            const before = refuseCount;
+            this.values.set(member, this.evaluateNode(member));
+            if (refuseCount !== before) this.ownDeviated.add(member);
           }
         }
       }
@@ -1284,6 +1332,8 @@ class Workbook {
           const op = this.arg(args, i, sheet);
           const values = isRange(op) ? cellsOf(op) : [op];
           const direct = !isRange(op);
+          const uncatchable = firstUncatchable(values);
+          if (uncatchable) return uncatchable;
           for (const c of values) {
             if (name === 'COUNTA') {
               if (c !== null) count++;
@@ -1302,7 +1352,10 @@ class Workbook {
         if (isErr(range)) return range;
         const crit = makeCriterion(this.scalarArg(args, 1, sheet));
         if (isErr(crit)) return crit;
-        return cellsOf(range).filter(crit).length;
+        const cells = cellsOf(range);
+        const uncatchable = firstUncatchable(cells);
+        if (uncatchable) return uncatchable;
+        return cells.filter(crit).length;
       }
       case 'SUMIF': {
         const range = this.rangeArg(args, 0, sheet);
@@ -1401,6 +1454,7 @@ class Workbook {
           type = t > 0 ? 1 : t < 0 ? -1 : 0;
         }
         const i = lookupIndex(cellsOf(range), lookup, type);
+        if (isErr(i)) return i;
         if (i === UNSORTED) return refuse('#N/A');
         return i < 0 ? mkErr('#N/A') : i + 1;
       }
@@ -1424,6 +1478,7 @@ class Workbook {
         const firstColumn: Cell[] = [];
         for (let r = 0; r < table.rows; r++) firstColumn.push(table.at(r, 0));
         const i = lookupIndex(firstColumn, lookup, approx ? 1 : 0);
+        if (isErr(i)) return i;
         // A value, not a reference (unlike INDEX).
         if (i === UNSORTED) return refuse('#N/A');
         return i < 0 ? mkErr('#N/A') : table.at(i, col - 1);
@@ -1433,6 +1488,10 @@ class Workbook {
 
   private conditionalSum(sumRange: RangeOp, pairs: Array<[RangeOp, Criterion]>): number | EvalError {
     if (pairs.some(([r]) => r.rows !== sumRange.rows || r.cols !== sumRange.cols)) return mkErr('#VALUE!');
+    for (const range of [sumRange, ...pairs.map(([r]) => r)]) {
+      const uncatchable = firstUncatchable(cellsOf(range));
+      if (uncatchable) return uncatchable;
+    }
     let total = 0;
     for (let r = 0; r < sumRange.rows; r++) {
       for (let c = 0; c < sumRange.cols; c++) {
@@ -1443,6 +1502,31 @@ class Workbook {
       }
     }
     return finish(total);
+  }
+
+  /**
+   * Own deviations plus every node that statically reads one (directly or via
+   * a range, untaken IF branches included), transitively.
+   */
+  deviated(): Set<string> {
+    const readers: number[][] = this.nodes.map(() => []);
+    this.adj.forEach((deps, i) => deps.forEach((d) => readers[d]!.push(i)));
+    const seen = new Set<number>(this.ownDeviated);
+    const queue = [...seen];
+    while (queue.length > 0) {
+      for (const r of readers[queue.pop()!]!) {
+        if (!seen.has(r)) {
+          seen.add(r);
+          queue.push(r);
+        }
+      }
+    }
+    const out = new Set<string>();
+    for (const i of seen) {
+      const node = this.nodes[i]!;
+      out.add(`${this.sheets[node.sheet]!.name}!${formatAddress(node.at)}`);
+    }
+    return out;
   }
 
   results(): Map<string, EvalValue> {
@@ -1459,15 +1543,25 @@ class Workbook {
   }
 }
 
+export interface WorkbookEvaluation {
+  /** Every non-empty cell, literal or formula, keyed `Sheet!A1` (sheet name unquoted). */
+  values: Map<string, EvalValue>;
+  /**
+   * Formula cells whose value we cannot vouch for: their evaluation hit a
+   * deviation from Excel (refuse()) at any depth, or they read — directly or
+   * via a range — a cell that did. See the module docblock: a workbook with a
+   * non-empty set is NOT verifiable.
+   */
+  deviated: ReadonlySet<string>;
+}
+
 /**
- * Evaluates every formula of a workbook with Excel semantics. The result
- * holds every non-empty cell — literal or formula — keyed `Sheet!A1` with the
- * sheet name unquoted. A cycle yields #CIRC! on every member; a formula that
- * does not parse yields #NAME?. Throws only on a caller bug (malformed key,
- * duplicate sheet name).
+ * Evaluates every formula of a workbook with Excel semantics. A cycle yields
+ * #CIRC! on every member; a formula that does not parse yields #NAME? (and is
+ * deviated). Throws only on a caller bug (malformed key, duplicate sheet name).
  */
-export function evaluateWorkbook(sheets: EvalSheet[]): Map<string, EvalValue> {
+export function evaluateWorkbook(sheets: EvalSheet[]): WorkbookEvaluation {
   const wb = new Workbook(sheets);
   wb.evaluateAll();
-  return wb.results();
+  return { values: wb.results(), deviated: wb.deviated() };
 }

@@ -15,9 +15,13 @@ function sheet(name: string, cells: Cells): EvalSheet {
   return { name, cells: new Map(Object.entries(cells)) };
 }
 
+function evalValues(sheets: EvalSheet[]): Map<string, EvalValue> {
+  return evaluateWorkbook(sheets).values;
+}
+
 /** Evaluates `f` in cell ZZ1 of a sheet named S, beside `cells`. */
 function calc(f: string, cells: Cells = {}): EvalValue | undefined {
-  const result = evaluateWorkbook([sheet('S', { ...cells, ZZ1: { f } })]);
+  const result = evalValues([sheet('S', { ...cells, ZZ1: { f } })]);
   return result.get('S!ZZ1');
 }
 
@@ -134,12 +138,12 @@ describe('evaluateWorkbook — required cases', () => {
   });
 
   it('A1 = A1+1 → #CIRC!', () => {
-    const result = evaluateWorkbook([sheet('S', { A1: { f: 'A1+1' } })]);
+    const result = evalValues([sheet('S', { A1: { f: 'A1+1' } })]);
     expect(result.get('S!A1')).toEqual(err('#CIRC!'));
   });
 
   it('a cycle yields #CIRC! on every member, and only on them', () => {
-    const result = evaluateWorkbook([
+    const result = evalValues([
       sheet('S', { A1: { f: 'B1+1' }, B1: { f: 'C1+1' }, C1: { f: 'A1+1' }, D1: 5, E1: { f: 'D1*2' } }),
     ]);
     expect(result.get('S!A1')).toEqual(err('#CIRC!'));
@@ -149,7 +153,7 @@ describe('evaluateWorkbook — required cases', () => {
   });
 
   it('a cycle through a range is a cycle', () => {
-    const result = evaluateWorkbook([sheet('S', { A1: 1, A2: { f: 'SUM(A1:A3)' } })]);
+    const result = evalValues([sheet('S', { A1: 1, A2: { f: 'SUM(A1:A3)' } })]);
     expect(result.get('S!A2')).toEqual(err('#CIRC!'));
   });
 
@@ -183,7 +187,7 @@ describe('evaluateWorkbook — required cases', () => {
   });
 
   it('cross-sheet ref with a Hebrew sheet name in quotes', () => {
-    const result = evaluateWorkbook([
+    const result = evalValues([
       sheet('גיליון 1', { A1: 41 }),
       sheet('סיכום', { A1: { f: "'גיליון 1'!A1+1" } }),
     ]);
@@ -240,7 +244,7 @@ describe('evaluateWorkbook — Excel semantics', () => {
   it('formula chains evaluate in dependency order, across a long chain', () => {
     const cells: Cells = { A1: 1 };
     for (let r = 2; r <= 3000; r++) cells[`A${r}`] = { f: `A${r - 1}+1` };
-    const result = evaluateWorkbook([sheet('S', cells)]);
+    const result = evalValues([sheet('S', cells)]);
     expect(result.get('S!A3000')).toBe(3000);
   });
 
@@ -249,15 +253,15 @@ describe('evaluateWorkbook — Excel semantics', () => {
   });
 
   it('literal cells appear in the result, empty ones do not', () => {
-    const result = evaluateWorkbook([sheet('S', { A1: 3, A2: 'x', A3: null })]);
+    const result = evalValues([sheet('S', { A1: 3, A2: 'x', A3: null })]);
     expect(result.get('S!A1')).toBe(3);
     expect(result.get('S!A2')).toBe('x');
     expect(result.has('S!A3')).toBe(false);
   });
 
   it('rejects a malformed cell key and duplicate sheet names loudly', () => {
-    expect(() => evaluateWorkbook([sheet('S', { a1: 1 })])).toThrow();
-    expect(() => evaluateWorkbook([sheet('S', {}), sheet('s', {})])).toThrow();
+    expect(() => evalValues([sheet('S', { a1: 1 })])).toThrow();
+    expect(() => evalValues([sheet('S', {}), sheet('s', {})])).toThrow();
   });
 });
 
@@ -343,7 +347,7 @@ describe('fix round 1 — no plausible wrong number', () => {
   });
 
   it('IFERROR does not rescue a cycle into a number', () => {
-    const result = evaluateWorkbook([sheet('S', { A1: { f: 'A1+1' }, B1: { f: 'IFERROR(A1,0)' } })]);
+    const result = evalValues([sheet('S', { A1: { f: 'A1+1' }, B1: { f: 'IFERROR(A1,0)' } })]);
     expect(result.get('S!A1')).toEqual(err('#CIRC!'));
     expect(result.get('S!B1')).toEqual(err('#CIRC!'));
   });
@@ -373,7 +377,7 @@ describe('fix round 1 — no plausible wrong number', () => {
 
   it('add/subtract cancellation snaps to 0 like Excel', () => {
     expect(calc('0.3-(0.1+0.2)')).toBe(0);
-    const result = evaluateWorkbook([sheet('S', { C1: { f: '0.3-(0.1+0.2)' }, D1: { f: 'C1=0' } })]);
+    const result = evalValues([sheet('S', { C1: { f: '0.3-(0.1+0.2)' }, D1: { f: 'C1=0' } })]);
     expect(result.get('S!D1')).toBe(true);
     // A genuinely small difference is not snapped.
     expect(calc('1e-20-0')).toBe(1e-20);
@@ -448,17 +452,17 @@ describe('fix round 2 — IFERROR never launders a deviation error', () => {
   });
 
   it('a formula that does not parse (#NAME?)', () => {
-    const result = evaluateWorkbook([sheet('S', { A1: { f: 'INDIRECT("B1")' }, C1: { f: 'IFERROR(A1,0)' } })]);
+    const result = evalValues([sheet('S', { A1: { f: 'INDIRECT("B1")' }, C1: { f: 'IFERROR(A1,0)' } })]);
     expect(result.get('S!C1')).toEqual(err('#NAME?'));
   });
 
   it('a cycle (#CIRC!) — already uncatchable', () => {
-    const result = evaluateWorkbook([sheet('S', { A1: { f: 'A1' }, C1: { f: 'IFERROR(A1,0)' } })]);
+    const result = evalValues([sheet('S', { A1: { f: 'A1' }, C1: { f: 'IFERROR(A1,0)' } })]);
     expect(result.get('S!C1')).toEqual(err('#CIRC!'));
   });
 
   it('across cells: B1=IFERROR(dev,0), C1=IFERROR(B1,5) stays an error', () => {
-    const result = evaluateWorkbook([
+    const result = evalValues([
       sheet('S', { A1: 1, A2: 2, A3: 3, B1: { f: 'IFERROR(A1:A3*1,0)' }, C1: { f: 'IFERROR(B1,5)' }, D1: { f: 'B1+1' } }),
     ]);
     expect(result.get('S!B1')).toEqual(err('#VALUE!'));
@@ -470,3 +474,60 @@ describe('fix round 2 — IFERROR never launders a deviation error', () => {
 function calcIn(result: Map<string, EvalValue>, key: string): EvalValue | undefined {
   return result.get(key);
 }
+
+describe('fix round 3 — deviations are reported structurally and never skipped', () => {
+  /** B1 = A1+1 with A1 = "5": a deviation (Excel would give 6). B2 = 3. */
+  const probe = { A1: '5', B1: { f: 'A1+1' }, B2: 3, C1: 'x', C2: 'y' } as Cells;
+
+  function run(f: string, extra: Cells = {}) {
+    const out = evaluateWorkbook([sheet('S', { ...probe, ...extra, ZZ1: { f } })]);
+    return { value: out.values.get('S!ZZ1'), deviated: out.deviated };
+  }
+
+  it.each([
+    ['COUNT(B1:B2)', '#VALUE!'],
+    ['COUNTA(B1:B2)', '#VALUE!'],
+    ['COUNTIF(B1:B2,">5")', '#VALUE!'],
+    ['SUMIF(B1:B2,">0")', '#VALUE!'],
+    ['SUMIF(C1:C2,"y",B1:B2)', '#VALUE!'],
+    ['SUMIFS(B2:B2,B1:B1,">0")', '#VALUE!'],
+    ['IFERROR(MATCH(6,B1:B2,0),0)', '#VALUE!'],
+    ['IFERROR(MATCH(6,B1:B2),0)', '#VALUE!'],
+    ['IFERROR(VLOOKUP(6,B1:C2,2,FALSE),0)', '#VALUE!'],
+  ])('%s → uncatchable error, and the cell is deviated', (f, code) => {
+    const { value, deviated } = run(f);
+    expect(value).toEqual(err(code));
+    expect(deviated.has('S!ZZ1')).toBe(true);
+    expect(deviated.has('S!B1')).toBe(true);
+  });
+
+  it('plain Excel errors keep being skipped (controls)', () => {
+    const div = { D1: { f: '1/0' }, D2: 4 } as Cells;
+    expect(run('COUNT(D1:D2)', div).value).toBe(1);
+    expect(run('COUNTIF(D1:D2,">3")', div).value).toBe(1);
+    expect(run('IFERROR(MATCH(4,D1:D2,0),0)', div).value).toBe(2);
+    expect(run('SUMIF(D2:D2,">3")', div).value).toBe(4);
+  });
+
+  it('a workbook with only plain Excel errors has nothing deviated', () => {
+    const out = evaluateWorkbook([sheet('S', { A1: { f: '1/0' }, A2: { f: 'IFERROR(A1,7)' }, A3: { f: 'VLOOKUP(9,B1:C1,2,FALSE)' } })]);
+    expect(out.values.get('S!A1')).toEqual(err('#DIV/0!'));
+    expect(out.values.get('S!A2')).toBe(7);
+    expect(out.deviated.size).toBe(0);
+  });
+
+  it('deviation spreads to every cell that references a deviated cell, directly or via a range', () => {
+    const out = evaluateWorkbook([
+      sheet('S', { A1: '5', B1: { f: 'A1+1' }, C1: { f: 'B1' }, D1: { f: 'SUM(A1:C1)' }, E1: { f: '2+2' } }),
+      sheet('T', { A1: { f: 'S!D1' } }),
+    ]);
+    expect([...out.deviated].sort()).toEqual(['S!B1', 'S!C1', 'S!D1', 'T!A1']);
+    expect(out.values.get('S!E1')).toBe(4);
+  });
+
+  it('a refused value that is never used still marks the cell (conservative)', () => {
+    // The digit text is refused inside the SUMPRODUCT array arithmetic.
+    const { deviated } = run('IFERROR(SUMPRODUCT((B2:B3>1)*1),0)');
+    expect(deviated.has('S!ZZ1')).toBe(true);
+  });
+});
