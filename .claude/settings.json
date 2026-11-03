@@ -7,7 +7,7 @@
             "type": "command",
             "command": "node .claude/hooks/post-task-check.mjs",
             "shell": "bash",
-            "timeout": 780,
+            "timeout": 1350,
             "statusMessage": "בודק קוד ואבטחה..."
           }
         ]

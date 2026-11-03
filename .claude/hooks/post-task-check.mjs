@@ -102,13 +102,15 @@ const DEFAULT_BUDGET_MS = 120_000;
  * the outer timeout leaves after the two short commands and a margin.
  *
  * Measured 25/10: typecheck 5s, audit 1s, the suite 336–509s (the high end
- * under load from a second session). With the outer 780s that gives 630s.
+ * under load from a second session). With the outer 780s that gave 630s.
+ * Measured 03/11: the suite alone 707–790s (3,578 tests), so the outer timeout
+ * was raised to 1350s, which gives the suite 1200s.
  * Read from settings at run time so raising the outer timeout raises this
  * with it, instead of the two numbers drifting apart.
  */
 const SHORT_BUDGET_MS = 60_000;
 const MARGIN_MS = 30_000;
-const FALLBACK_OUTER_TIMEOUT_S = 780;
+const FALLBACK_OUTER_TIMEOUT_S = 1350;
 
 function outerTimeoutSeconds() {
   try {
