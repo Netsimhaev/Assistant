@@ -230,4 +230,13 @@ describe('renderPptx', () => {
     expect(await chartXml('bar', 'en')).not.toContain('maxMin');
     expect(await chartXml('pie', 'he')).not.toContain('maxMin');
   });
+
+  it('bar and line charts hide the value axis (data labels carry the values)', async () => {
+    for (const type of ['bar', 'line'] as const) {
+      const xml = await chartXml(type, 'he');
+      const valAx = /<c:valAx>[\s\S]*?<\/c:valAx>/.exec(xml)?.[0] ?? '';
+      expect(valAx, type).toContain('<c:delete val="1"/>');
+      expect(xml, type).toContain('<c:showVal val="1"/>');
+    }
+  });
 });

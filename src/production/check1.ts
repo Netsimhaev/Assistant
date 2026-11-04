@@ -31,19 +31,32 @@
  *       `evaluateWorkbook` over the file's own cells: a deviated cell →
  *       `formula_problem`, an error (computed or cached) or a direct
  *       reference to an empty cell → `formula_error`, a cached result that
- *       differs (or is missing) → `formula_mismatch`.
+ *       differs (or is missing) → `formula_mismatch`. POSITION, not just
+ *       presence: every spec cell is compared to the file cell at its
+ *       `xlsx-layout` address (`{v}` value, `{t}` text, `{d}` date serial,
+ *       `{f}` formula text after `normaliseFormula`), headers and titles
+ *       included, and a non-empty file cell the layout never placed →
+ *       `cell_mismatch`. A wrong range whose result happens to be a pool
+ *       value is caught here and nowhere else.
  *     - docx: in Hebrew every paragraph with text carries `w:bidi` and every
  *       run with Hebrew letters `w:rtl` (in English neither appears); for a
  *       contract the footer carries the D6 disclaimer and the body the legal
- *       basis heading, every cited law, and the signature block. mammoth's
- *       text of the file is order-checked against the spec too.
- *     - pptx: in Hebrew every slide paragraph with text has `rtl="1"`.
+ *       basis heading, every cited law, and the signature block. Fields: a
+ *       positive allowlist (`ALLOWED_DOCX_FIELDS`, PAGE/NUMPAGES) over every
+ *       `w:instrText` and `w:fldSimple` — INCLUDETEXT, HYPERLINK, DDE … →
+ *       `unsafe_part`. mammoth's text of the file is order-checked too.
+ *     - pptx: in Hebrew every slide paragraph with text has `rtl="1"`. The
+ *       chart parts (`<a:t>`, `<c:v>`), the chart data workbooks, and the
+ *       speaker notes are read as the file's own text too.
  *     - pdf: `%PDF-` magic; no action/script/embedded-file/link name
- *       (`PDF_FORBIDDEN_NAMES`, `#xx` escapes decoded). This is a token scan:
- *       a name inside a compressed object stream is not seen. Our Chromium
- *       PDFs carry none; the scan is the backstop, not the boundary. For a
- *       contract the disclaimer, heading, laws and signatures are looked
- *       for in `rendered.text` (Chromium prints the footer).
+ *       (`PDF_FORBIDDEN_NAMES`, `#xx` escapes decoded), scanned with every
+ *       `stream…endstream` body blanked first — stream bytes are data, and a
+ *       font program would otherwise trip it. A name inside a compressed
+ *       object stream is therefore not seen; our Chromium PDFs carry none,
+ *       so the scan is the backstop, not the boundary. For a contract the
+ *       D6 disclaimer must be in the FOOTER of every page (the last
+ *       `FOOTER_LINES` lines of each page of `rendered.text`, pages split on
+ *       a blank line); the heading, laws and signatures anywhere.
  *  4. Bidi controls: the renderers isolate digit runs structurally (separate
  *     runs, `<bdi>`), never with control characters, so
  *     `RENDERER_BIDI_CONTROLS` is empty and any control in the file's own
@@ -54,9 +67,17 @@
  *       its digit sequences reversed → `digits_reversed`; neither →
  *       `text_missing`. A number the spec shows (cells, single-word runs)
  *       absent while its reverse is present → `digits_reversed`.
+ *       Each table row of a docx/pdf/pptx table, its cells as displayed in
+ *       the charter `currency`, must read in column order (a swapped pair →
+ *       `order_reversed`); a Hebrew pptx table is laid out right to left, so
+ *       there the mirrored order is accepted too. Chart labels and values
+ *       join the runs and the numbers.
  *     - grounding: `createTextGrounder` (the same code as `validateSpec`)
- *       over the extracted text, with page numbers, clause labels, ordered
- *       list numbers and the cited laws as structure.
+ *       over the extracted text AND over the zip formats' own text — notes,
+ *       document properties, chart data, cells a viewer may not print. A
+ *       structural number (page, clause, sub-clause, list, slide, sheet)
+ *       grounds only as the first or last token of a line
+ *       (`blankStructure`); cited laws are exempt as in `validateSpec`.
  *
  * Every finding's `he` is the fixed string of its code (`CHECK1_HE`): the
  * fix loop sends these back to the drafter, never text from a source.
@@ -70,7 +91,7 @@ import mammoth from 'mammoth';
 import { inspectArchive } from '../documents/archive-guard.js';
 import type { Block, Cell, DocumentSpec } from '../domain/document-spec.js';
 import { stripBidiControls } from '../util/bidi.js';
-import { formatNumber } from './format-value.js';
+import { formatCell, formatNumber, type CellNumberFormat } from './format-value.js';
 import {
   evaluateWorkbook,
   formatAddress,
@@ -81,6 +102,7 @@ import {
   type SheetCellInput,
 } from './formula.js';
 import { numberClause } from './render-shared.js';
+import { excelDateSerial, layoutSheet, type PlacedCell } from './xlsx-layout.js';
 import {
   CAPS,
   CONTRACT_DISCLAIMER_EN,
@@ -107,7 +129,8 @@ export type Check1Code =
   | 'bidi_control'
   | 'text_truncated'
   | 'file_unreadable'
-  | 'spec_invalid';
+  | 'spec_invalid'
+  | 'cell_mismatch';
 
 /** The one owner-facing string per code. Fixed: no finding carries source text. */
 export const CHECK1_HE: Record<Check1Code, string> = {
@@ -126,6 +149,7 @@ export const CHECK1_HE: Record<Check1Code, string> = {
   text_truncated: 'לא ניתן היה לקרוא את כל הטקסט של המסמך, ולכן הבדיקה לא הושלמה',
   file_unreadable: 'לא ניתן לקרוא את הקובץ שנבנה',
   spec_invalid: 'תיאור המסמך לא עבר את הבדיקה המוקדמת',
+  cell_mismatch: 'תא בגיליון אינו מכיל את מה שתוכנן לו',
 };
 
 export interface Check1Finding {
@@ -153,6 +177,8 @@ export interface Check1Input {
   rendered: Check1Rendered;
   /** Today's LOCAL date in the charter timezone, `YYYY-MM-DD`. Required. */
   today: string;
+  /** The charter currency the renderer formatted money with; table rows are compared as displayed. Required. */
+  currency: string;
 }
 
 /** How a `validateSpec` problem reads as a check-1 finding. Exhaustive. */
@@ -386,6 +412,22 @@ const partsMatching = (zip: JSZip, re: RegExp) =>
     .filter((n) => re.test(n))
     .sort((a, b) => Number(/(\d+)\.xml$/.exec(a)?.[1] ?? 0) - Number(/(\d+)\.xml$/.exec(b)?.[1] ?? 0));
 
+/** A piece of text the file itself carries, named by the part it came from. */
+interface OwnText {
+  part: string;
+  text: string;
+}
+
+/** The content elements of `docProps/core.xml` (dates and revision are tool metadata, not content). */
+const CORE_TEXT_TAGS = ['dc:title', 'dc:subject', 'dc:description', 'dc:creator', 'cp:keywords', 'cp:category', 'cp:lastModifiedBy'];
+
+async function docPropsText(zip: JSZip, own: OwnText[]): Promise<void> {
+  const core = await zip.file('docProps/core.xml')?.async('string');
+  if (core !== undefined) own.push({ part: 'docProps/core.xml', text: CORE_TEXT_TAGS.flatMap((t) => xmlTexts(core, t)).join('\n') });
+  const app = await zip.file('docProps/app.xml')?.async('string');
+  if (app !== undefined) own.push({ part: 'docProps/app.xml', text: xmlTexts(app, 'vt:lpstr').join('\n') });
+}
+
 // ---------------------------------------------------------------- xlsx
 
 interface FileFormula {
@@ -439,11 +481,84 @@ function directRefs(ast: FormulaAst, out: { sheet: string | null; address: strin
   }
 }
 
-async function checkXlsx(input: Check1Input, f: Findings, ownText: string[]): Promise<void> {
+/**
+ * A formula's text compared for equality: no leading `=`, no whitespace and
+ * upper case OUTSIDE string literals ("…", with `""` as a quote) and quoted
+ * sheet names ('…'). Excel's space-as-intersection is not supported by the
+ * evaluator, so removing spaces never changes what a supported formula means.
+ */
+export function normaliseFormula(formula: string): string {
+  const src = formula.replace(/^\s*=/, '');
+  let out = '';
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i]!;
+    if (quote !== null) {
+      out += ch;
+      if (ch === quote) {
+        if (src[i + 1] === quote) {
+          out += quote;
+          i += 1;
+        } else quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ch;
+    } else if (!/\s/.test(ch)) out += ch.toUpperCase();
+  }
+  return out;
+}
+
+/** What a file cell holds, read once, for both evaluation and the position check. */
+type FileCell =
+  | { kind: 'number'; value: number }
+  | { kind: 'string'; value: string }
+  | { kind: 'boolean'; value: boolean }
+  | { kind: 'date'; serial: number }
+  | { kind: 'formula'; formula: string; cached: unknown }
+  | { kind: 'error' };
+
+function readFileCell(cell: ExcelJS.Cell): FileCell | null {
+  const v = cell.value as unknown;
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number') return { kind: 'number', value: v };
+  if (typeof v === 'boolean') return { kind: 'boolean', value: v };
+  if (typeof v === 'string') return { kind: 'string', value: v };
+  if (v instanceof Date) return { kind: 'date', serial: (v.getTime() - EXCEL_EPOCH_MS) / DAY_MS };
+  if (typeof v === 'object') {
+    if ('formula' in v || 'sharedFormula' in v) return { kind: 'formula', formula: cell.formula, cached: (v as { result?: unknown }).result };
+    if ('richText' in v) return { kind: 'string', value: (v as { richText: { text: string }[] }).richText.map((r) => r.text).join('') };
+    if ('error' in v) return { kind: 'error' };
+    if ('text' in v) return { kind: 'string', value: String((v as { text: unknown }).text) };
+  }
+  return { kind: 'error' };
+}
+
+/** Does the file cell hold exactly what the spec placed at this address? */
+function cellMatches(placed: PlacedCell, file: FileCell | undefined): boolean {
+  const empty = file === undefined || (file.kind === 'string' && file.value === '');
+  if (placed.cell === null) {
+    const text = placed.text ?? '';
+    return text === '' ? empty : file?.kind === 'string' && file.value === text;
+  }
+  const c = placed.cell;
+  if ('v' in c) return file?.kind === 'number' && sameValue(file.value, c.v);
+  if ('t' in c) return c.t === '' ? empty : file?.kind === 'string' && file.value === c.t;
+  if ('d' in c) {
+    const serial = excelDateSerial(c.d);
+    return (file?.kind === 'date' && file.serial === serial) || (file?.kind === 'number' && file.value === serial);
+  }
+  return file?.kind === 'formula' && normaliseFormula(file.formula) === normaliseFormula(c.f);
+}
+
+async function checkXlsx(input: Check1Input, f: Findings, own: OwnText[]): Promise<void> {
   const zip = await loadZip(input.bytes, 'xlsx', f);
   if (zip === null) return;
   const workbookXml = (await zip.file('xl/workbook.xml')?.async('string')) ?? '';
   if (/<definedNames?[\s>]/.test(workbookXml)) f.add('unsafe_part', 'workbook defined names');
+  await docPropsText(zip, own);
 
   const wb = new ExcelJS.Workbook();
   try {
@@ -452,45 +567,65 @@ async function checkXlsx(input: Check1Input, f: Findings, ownText: string[]): Pr
     f.add('file_unreadable', 'workbook');
     return;
   }
-  const rtl = input.spec.language === 'he';
+  const spec = input.spec as Extract<DocumentSpec, { format: 'xlsx' }>;
+  const rtl = spec.language === 'he';
   const evalSheets: EvalSheet[] = [];
   const filled = new Map<string, Set<string>>();
   const formulas: FileFormula[] = [];
+  const strings: string[] = [];
 
+  if (wb.worksheets.length !== spec.sheets.length) f.add('cell_mismatch', 'workbook sheets');
   wb.worksheets.forEach((ws, i) => {
-    ownText.push(ws.name);
+    const where = (address: string) => `sheet ${i + 1} ${address}`;
+    strings.push(ws.name);
     if ((ws.views?.[0]?.rightToLeft === true) !== rtl) f.add('direction_wrong', `sheet ${i + 1}`);
     const cells = new Map<string, SheetCellInput>();
     const present = new Set<string>();
+    const fileCells = new Map<string, FileCell>();
     ws.eachRow({ includeEmpty: false }, (row) => {
       row.eachCell({ includeEmpty: false }, (cell) => {
         const address = cell.address.replace(/\$/g, '').toUpperCase();
-        const v = cell.value as unknown;
-        let input: SheetCellInput = null;
-        if (typeof v === 'number' || typeof v === 'boolean') input = v;
-        else if (typeof v === 'string') input = v;
-        else if (v instanceof Date) input = (v.getTime() - EXCEL_EPOCH_MS) / DAY_MS;
-        else if (typeof v === 'object' && v !== null) {
-          if ('formula' in v || 'sharedFormula' in v) {
-            const formula = cell.formula;
-            input = { f: formula };
-            formulas.push({ sheet: i, sheetName: ws.name, address, formula, cached: (v as { result?: unknown }).result });
-          } else if ('richText' in v) {
-            input = (v as { richText: { text: string }[] }).richText.map((r) => r.text).join('');
-          } else if ('error' in v) {
-            f.add('formula_error', `sheet ${i + 1} ${address}`);
-          } else if ('text' in v) {
-            input = String((v as { text: unknown }).text);
-          }
+        const read = readFileCell(cell);
+        if (read === null) return;
+        fileCells.set(address, read);
+        let value: SheetCellInput = null;
+        switch (read.kind) {
+          case 'number':
+          case 'boolean':
+          case 'string':
+            value = read.value;
+            break;
+          case 'date':
+            value = read.serial;
+            break;
+          case 'formula':
+            value = { f: normaliseFormula(read.formula) };
+            formulas.push({ sheet: i, sheetName: ws.name, address, formula: normaliseFormula(read.formula), cached: read.cached });
+            break;
+          case 'error':
+            f.add('formula_error', where(address));
+            break;
         }
-        if (typeof input === 'string') ownText.push(input);
-        if (input !== null && input !== '') present.add(address);
-        cells.set(address, input);
+        if (typeof value === 'string') strings.push(value);
+        if (value !== null && value !== '') present.add(address);
+        cells.set(address, value);
       });
     });
     evalSheets.push({ name: ws.name, cells });
     filled.set(ws.name.toUpperCase(), present);
+
+    // Position, not presence: every spec cell at its layout address, and nothing else.
+    const specSheet = spec.sheets[i];
+    if (specSheet === undefined) return;
+    if (ws.name !== specSheet.name) f.add('cell_mismatch', `sheet ${i + 1} name`);
+    const placed = layoutSheet(specSheet);
+    const expected = new Set(placed.map((p) => p.address));
+    for (const p of placed) if (!cellMatches(p, fileCells.get(p.address))) f.add('cell_mismatch', where(p.address));
+    for (const [address, cell] of fileCells) {
+      if (!expected.has(address) && !(cell.kind === 'string' && cell.value === '')) f.add('cell_mismatch', where(address));
+    }
   });
+  own.push({ part: 'workbook', text: strings.join('\n') });
 
   let evaluation: ReturnType<typeof evaluateWorkbook>;
   try {
@@ -536,6 +671,22 @@ const isOn = (xml: string, tag: string) => {
   return !/w:val\s*=\s*["'](?:0|false|off)["']/.test(m[1] ?? '');
 };
 
+/** The only field codes a document may carry: page numbering. Everything else (INCLUDETEXT, HYPERLINK, DDE …) reaches out. */
+export const ALLOWED_DOCX_FIELDS: ReadonlySet<string> = new Set(['PAGE', 'NUMPAGES']);
+
+/** Every field instruction in a part (`w:instrText` pieces and `w:fldSimple w:instr`), each refused unless allowed. */
+function fieldsAllowed(xml: string): boolean {
+  const instructions = [
+    ...xmlTexts(xml, 'w:instrText'),
+    ...[...xml.matchAll(/<w:fldSimple\b[^>]*\bw:instr\s*=\s*"([^"]*)"/g)].map((m) => decodeXml(m[1] ?? '')),
+    ...[...xml.matchAll(/<w:fldSimple\b[^>]*\bw:instr\s*=\s*'([^']*)'/g)].map((m) => decodeXml(m[1] ?? '')),
+  ];
+  return instructions.every((ins) => {
+    const word = ins.trim().split(/\s+/)[0] ?? '';
+    return word === '' || ALLOWED_DOCX_FIELDS.has(word.toUpperCase());
+  });
+}
+
 interface Contract {
   disclaimer: string;
   heading: string;
@@ -545,12 +696,14 @@ interface Contract {
 const CONTRACT_HE: Contract = { disclaimer: CONTRACT_DISCLAIMER_HE, heading: 'הבסיס החוקי', signature: 'חתימת צד א׳' };
 const CONTRACT_EN: Contract = { disclaimer: CONTRACT_DISCLAIMER_EN, heading: 'Legal basis', signature: 'Party A signature' };
 
-/** D6 structure of a contract, looked for in the text the file carries. */
-function checkContract(spec: DocumentSpec, body: string, footer: string, f: Findings): void {
+const contractTexts = (spec: DocumentSpec): Contract => (spec.language === 'he' ? CONTRACT_HE : CONTRACT_EN);
+
+/** D6 structure of a contract: the disclaimer where the footer is, the legal basis and signatures in the body. */
+function checkContract(spec: DocumentSpec, body: string, footerHasDisclaimer: boolean, f: Findings): void {
   if (spec.kind !== 'contract') return;
-  const c = spec.language === 'he' ? CONTRACT_HE : CONTRACT_EN;
+  const c = contractTexts(spec);
   const b = normalise(body);
-  if (!normalise(footer).includes(normalise(c.disclaimer))) f.add('missing_structure', 'disclaimer');
+  if (!footerHasDisclaimer) f.add('missing_structure', 'disclaimer');
   const laws = (spec.legalBasis ?? []).map((l) => normalise(l.law));
   if (!b.includes(normalise(c.heading)) || laws.length === 0 || laws.some((l) => !b.includes(l))) {
     f.add('missing_structure', 'legal basis');
@@ -558,15 +711,17 @@ function checkContract(spec: DocumentSpec, body: string, footer: string, f: Find
   if (!b.includes(normalise(c.signature))) f.add('missing_structure', 'signatures');
 }
 
-async function checkDocx(input: Check1Input, f: Findings, ownText: string[]): Promise<string | null> {
+async function checkDocx(input: Check1Input, f: Findings, own: OwnText[]): Promise<string | null> {
   const zip = await loadZip(input.bytes, 'docx', f);
   if (zip === null) return null;
+  await docPropsText(zip, own);
   const rtl = input.spec.language === 'he';
-  const parts = partsMatching(zip, /^word\/(?:document|footer\d+|header\d+)\.xml$/);
+  const parts = partsMatching(zip, /^word\/(?:document|footer\d+|header\d+|footnotes|endnotes)\.xml$/);
   let body = '';
   let footer = '';
   for (const name of parts) {
     const xml = await zip.file(name)!.async('string');
+    if (!fieldsAllowed(xml)) f.add('unsafe_part', `field ${name}`);
     const lines: string[] = [];
     let wrong = false;
     for (const p of xml.match(W_PARAGRAPH) ?? []) {
@@ -584,11 +739,11 @@ async function checkDocx(input: Check1Input, f: Findings, ownText: string[]): Pr
     if (wrong) f.add('direction_wrong', name);
     const all = lines.join('\n');
     if (hasForeignBidi(all)) f.add('bidi_control', name);
-    ownText.push(all);
+    own.push({ part: name, text: all });
     if (name === 'word/document.xml') body = all;
-    else footer += `\n${all}`;
+    else if (/^word\/footer\d+\.xml$/.test(name)) footer += `\n${all}`;
   }
-  checkContract(input.spec, body, footer, f);
+  checkContract(input.spec, body, normalise(footer).includes(normalise(contractTexts(input.spec).disclaimer)), f);
   try {
     return (await mammoth.extractRawText({ buffer: input.bytes })).value;
   } catch {
@@ -599,18 +754,41 @@ async function checkDocx(input: Check1Input, f: Findings, ownText: string[]): Pr
 
 // ---------------------------------------------------------------- pptx
 
-async function checkPptx(input: Check1Input, f: Findings, ownText: string[]): Promise<void> {
+async function checkPptx(input: Check1Input, f: Findings, own: OwnText[]): Promise<void> {
   const zip = await loadZip(input.bytes, 'pptx', f);
   if (zip === null) return;
+  await docPropsText(zip, own);
   for (const name of Object.keys(zip.files).filter((n) => EMBEDDED_CHART_WORKBOOK.test(n))) {
     const label = `${name} > `;
     const inner = await zip.file(name)!.async('nodebuffer');
     if (!(await guardArchive(inner, label, f))) continue;
+    let workbook: JSZip;
     try {
-      await checkZipParts(await JSZip.loadAsync(inner), CHART_WORKBOOK_ALLOWLIST, label, f);
+      workbook = await JSZip.loadAsync(inner);
     } catch {
       f.add('file_unreadable', `part ${label}`);
+      continue;
     }
+    await checkZipParts(workbook, CHART_WORKBOOK_ALLOWLIST, label, f);
+    // The chart's data: shared strings and every non-shared-string value of its sheet.
+    const shared = xmlTexts((await workbook.file('xl/sharedStrings.xml')?.async('string')) ?? '', 't').join('\n');
+    const sheet = (await workbook.file('xl/worksheets/sheet1.xml')?.async('string')) ?? '';
+    const values = [...sheet.matchAll(/<c\b(?![^>]*\bt="s")[^>]*>(?:<f>[^<]*<\/f>)?<v>([^<]*)<\/v>/g)].map((m) => decodeXml(m[1] ?? ''));
+    const data = `${shared}\n${values.join('\n')}`;
+    if (hasForeignBidi(data)) f.add('bidi_control', `${label}xl/sharedStrings.xml`);
+    own.push({ part: `${label}xl/sharedStrings.xml`, text: data });
+  }
+  for (const name of partsMatching(zip, /^ppt\/charts\/chart\d+\.xml$/)) {
+    const xml = await zip.file(name)!.async('string');
+    const text = [...xmlTexts(xml, 'a:t'), ...xmlTexts(xml, 'c:v')].join('\n');
+    if (hasForeignBidi(text)) f.add('bidi_control', name);
+    own.push({ part: name, text });
+  }
+  for (const name of partsMatching(zip, /^ppt\/notesSlides\/notesSlide\d+\.xml$/)) {
+    const xml = await zip.file(name)!.async('string');
+    const text = (xml.match(/<a:p>[\s\S]*?<\/a:p>/g) ?? []).map((p) => xmlTexts(p, 'a:t').join('')).join('\n');
+    if (hasForeignBidi(text)) f.add('bidi_control', name);
+    own.push({ part: name, text });
   }
   const rtl = input.spec.language === 'he';
   for (const name of partsMatching(zip, /^ppt\/slides\/slide\d+\.xml$/)) {
@@ -628,11 +806,14 @@ async function checkPptx(input: Check1Input, f: Findings, ownText: string[]): Pr
     if (wrong) f.add('direction_wrong', `slide ${n}`);
     const all = lines.join('\n');
     if (hasForeignBidi(all)) f.add('bidi_control', `slide ${n}`);
-    ownText.push(all);
+    own.push({ part: name, text: all });
   }
 }
 
 // ---------------------------------------------------------------- pdf
+
+/** Lines of the page footer: Chromium prints it last, so the disclaimer sits in a page's final lines. */
+const FOOTER_LINES = 3;
 
 function checkPdf(input: Check1Input, f: Findings): void {
   const raw = input.bytes.toString('latin1');
@@ -640,12 +821,22 @@ function checkPdf(input: Check1Input, f: Findings): void {
     f.add('file_unreadable', 'pdf');
     return;
   }
-  for (const m of raw.matchAll(/\/([^\s/<>[\]()%{}]+)/g)) {
+  // Stream bodies are data (font programs, images, content): a name-shaped byte run there is not a key.
+  const dictionaries = raw.replace(/(?<!end)stream\r?\n[\s\S]*?endstream/g, 'stream endstream');
+  for (const m of dictionaries.matchAll(/\/([^\s/<>[\]()%{}]+)/g)) {
     const name = (m[1] ?? '').replace(/#([0-9a-fA-F]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
     if (PDF_FORBIDDEN_NAMES.has(name)) f.add('unsafe_part', `pdf /${name}`);
   }
   const text = input.rendered.text;
-  checkContract(input.spec, text, text, f);
+  const disclaimer = normalise(contractTexts(input.spec).disclaimer);
+  const pages = text.split(/\n\s*\n/).filter((p) => p.trim() !== '');
+  const everyFooter =
+    pages.length > 0 &&
+    pages.every((page) => {
+      const lines = page.split('\n').filter((l) => l.trim() !== '');
+      return normalise(lines.slice(-FOOTER_LINES).join(' ')).includes(disclaimer);
+    });
+  checkContract(input.spec, text, everyFooter, f);
 }
 
 // ---------------------------------------------------------------- text
@@ -655,22 +846,40 @@ interface TextRun {
   text: string;
 }
 
+/** One table row as the page shows it: each cell's displayed text, in column order. */
+interface RowRun {
+  where: string;
+  cells: string[];
+  /** The file lays the columns out right to left (pptx Hebrew tables): reversed cell order is the correct one too. */
+  mirrored: boolean;
+}
+
+interface SpecText {
+  runs: TextRun[];
+  rows: RowRun[];
+  numbers: string[];
+}
+
 /** Every piece of spec text as the renderers put it on the page. */
-function specTextRuns(spec: DocumentSpec, currency: string): { runs: TextRun[]; numbers: string[] } {
+function specTextRuns(spec: DocumentSpec, currency: string): SpecText {
   // docx/pdf print the title as the first line; xlsx/pptx keep it as file metadata only.
   const runs: TextRun[] = spec.format === 'docx' || spec.format === 'pdf' ? [{ where: 'title', text: spec.title }] : [];
+  const rows: RowRun[] = [];
   const numbers: string[] = [];
-  const cells = (where: string, header: string[], rows: Cell[][], numberFormat?: readonly string[]) => {
+  const shown = (cell: Cell, fmt: string | undefined): string =>
+    'f' in cell ? '' : formatCell(cell, fmt as CellNumberFormat | undefined, currency, 'check1');
+  const cells = (where: string, header: string[], body: Cell[][], numberFormat?: readonly string[], tableRows = true) => {
     header.forEach((h, c) => runs.push({ where: `${where} header col ${c + 1}`, text: h }));
-    rows.forEach((row, r) =>
+    body.forEach((row, r) =>
       row.forEach((cell, c) => {
         if ('t' in cell) runs.push({ where: `${where} row ${r + 1} col ${c + 1}`, text: cell.t });
-        else if ('v' in cell) {
-          const fmt = numberFormat?.[c] as 'int' | 'money' | 'percent' | 'decimal2' | undefined;
-          numbers.push(formatNumber(cell.v, fmt, currency));
-        }
+        else if ('v' in cell) numbers.push(formatNumber(cell.v, numberFormat?.[c] as CellNumberFormat | undefined, currency));
       }),
     );
+    if (!tableRows) return;
+    const mirrored = spec.format === 'pptx' && spec.language === 'he';
+    rows.push({ where: `${where} header`, cells: header, mirrored });
+    body.forEach((row, r) => rows.push({ where: `${where} row ${r + 1}`, cells: row.map((c, i) => shown(c, numberFormat?.[i])), mirrored }));
   };
   const blocks = (list: Block[]) => {
     let clause = 0;
@@ -730,13 +939,16 @@ function specTextRuns(spec: DocumentSpec, currency: string): { runs: TextRun[]; 
           case 'table':
             cells(where, s.header, s.rows, s.numberFormat);
             return;
+          case 'chart':
+            // The chart's own labels and values: category names and data labels are on the page.
+            cells(`${where} chart`, [], s.rows, undefined, false);
+            return;
           case 'imageText':
           case 'paragraph':
             runs.push({ where, text: s.text });
             return;
-          case 'chart':
           case 'collage':
-            return; // chart text lives in the chart part, not on the page text layer
+            return;
         }
       });
       break;
@@ -745,12 +957,13 @@ function specTextRuns(spec: DocumentSpec, currency: string): { runs: TextRun[]; 
         sheet.tables.forEach((t, ti) => {
           const where = `sheet ${si + 1} table ${ti + 1}`;
           if (t.title !== undefined) runs.push({ where: `${where} title`, text: t.title });
-          cells(where, t.header, [...t.rows, ...(t.totals === undefined ? [] : [t.totals])], t.numberFormat);
+          // Rows are checked by position in the file (`cell_mismatch`); a converter's text order across cells is not ours.
+          cells(where, t.header, [...t.rows, ...(t.totals === undefined ? [] : [t.totals])], t.numberFormat, false);
         }),
       );
       break;
   }
-  return { runs, numbers };
+  return { runs, rows, numbers };
 }
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -788,9 +1001,10 @@ function placement(candidate: string, t: string, original: (token: string) => st
   return best;
 }
 
-function checkOrder(runs: TextRun[], numbers: string[], extracted: string, f: Findings): void {
+function checkOrder(spec: SpecText, extracted: string, f: Findings): void {
   const t = normalise(extracted);
-  for (const run of runs) {
+  const numbers = [...spec.numbers];
+  for (const run of spec.runs) {
     const text = normalise(run.text);
     if (text.split(' ').length < 2) {
       if (text.length > 0) numbers.push(text);
@@ -813,6 +1027,17 @@ function checkOrder(runs: TextRun[], numbers: string[], extracted: string, f: Fi
     }
     f.add('text_missing', run.where);
   }
+  // A table row reads in column order: a swapped pair of cells is a different row.
+  for (const row of spec.rows) {
+    const cells = row.cells.map(normalise).filter((c) => c !== '');
+    if (cells.length < 2) continue;
+    const forward = cells.join(' ');
+    const backward = [...cells].reverse().join(' ');
+    if (t.includes(forward) || (row.mirrored && t.includes(backward))) continue;
+    if (placement(forward, t, (tok) => tok) === 'digits_reversed') f.add('digits_reversed', row.where);
+    else if (cells.every((c) => t.includes(c))) f.add('order_reversed', row.where);
+    else f.add('text_missing', row.where);
+  }
   // A number the spec shows, absent from the page while its digits reversed are present.
   const onPage = new Set((t.match(DIGIT_RUN) ?? []).map(digitsOnly));
   for (const shown of numbers) {
@@ -824,8 +1049,16 @@ function checkOrder(runs: TextRun[], numbers: string[], extracted: string, f: Fi
   }
 }
 
-/** Numbers the page carries by structure: page numbers, clause and list numbers, cited laws. */
-function structuralPool(spec: DocumentSpec, pageCount: number): string[] {
+// ---------------------------------------------------------------- structure in text
+
+interface Structure {
+  /** Numbers a page carries by structure: page numbers, clause and sub-clause labels, list and slide numbers. */
+  numbers: ReadonlySet<string>;
+  /** Statute citations: exempt as in `validateSpec`. */
+  laws: string[];
+}
+
+function structureOf(spec: DocumentSpec, pageCount: number): Structure {
   let top = Math.max(1, pageCount);
   const labels: string[] = [];
   if (spec.format === 'docx' || spec.format === 'pdf') {
@@ -841,20 +1074,46 @@ function structuralPool(spec: DocumentSpec, pageCount: number): string[] {
   }
   if (spec.format === 'pptx') top = Math.max(top, spec.slides.length);
   if (spec.format === 'xlsx') top = Math.max(top, spec.sheets.length);
-  const ints = Array.from({ length: top }, (_, i) => String(i + 1)).join(' ');
-  return [ints, labels.join(' '), ...(spec.legalBasis ?? []).map((l) => l.law)];
+  return {
+    numbers: new Set([...Array.from({ length: top }, (_, i) => String(i + 1)), ...labels]),
+    laws: (spec.legalBasis ?? []).map((l) => normalise(l.law)).filter((l) => l !== ''),
+  };
+}
+
+const LEADING_LABEL = /^(\d+(?:\.\d+)?)\.?(?=\s|$)/;
+const TRAILING_NUMBER = /(?:^|\s)(\d+)(?:\s*\/\s*(\d+))?$/;
+
+/**
+ * Structural numbers ground only where structure puts them: as the first or
+ * last token of a line (a clause label, a list number, "עמוד 1", "1 / 3") —
+ * never in the middle of a sentence. Cited laws are blanked wherever they are.
+ */
+function blankStructure(text: string, s: Structure): string {
+  return stripBidiControls(text)
+    .split('\n')
+    .map((raw) => {
+      let line = raw.replace(/\s+/g, ' ').trim();
+      for (const law of s.laws) line = line.split(law).join(' ');
+      line = line.trim();
+      const lead = LEADING_LABEL.exec(line);
+      if (lead && s.numbers.has(lead[1]!)) line = line.slice(lead[0].length).trim();
+      const tail = TRAILING_NUMBER.exec(line);
+      if (tail && s.numbers.has(tail[1]!) && (tail[2] === undefined || s.numbers.has(tail[2]))) {
+        line = line.slice(0, line.length - tail[0].length).trim();
+      }
+      return line;
+    })
+    .join('\n');
 }
 
 // ---------------------------------------------------------------- entry
 
-/** The currency only shapes the symbol around digits; digits are what the order check compares. */
-const DIGITS_CURRENCY = 'ILS';
-
 export async function runCheck1(input: Check1Input): Promise<Check1Result> {
-  const { spec, sources, rendered, today } = input;
+  const { spec, sources, rendered, today, currency } = input;
   if (typeof today !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(today)) {
     throw new TypeError('runCheck1: today must be the charter-local date as YYYY-MM-DD');
   }
+  if (typeof currency !== 'string' || currency === '') throw new TypeError('runCheck1: currency is required');
   const f = new Findings();
 
   for (const p of validateSpec(spec, sources, { today })) f.add(SPEC_CODE[p.code], p.where);
@@ -862,31 +1121,40 @@ export async function runCheck1(input: Check1Input): Promise<Check1Result> {
   if (rendered.pageCount > CAPS.pages) f.add('cap_exceeded', 'document');
   if (rendered.textTruncated) f.add('text_truncated', 'document');
 
-  const ownText: string[] = [];
+  const own: OwnText[] = [];
   let fileText: string | null = null;
   switch (spec.format) {
     case 'xlsx':
-      await checkXlsx(input, f, ownText);
+      await checkXlsx(input, f, own);
       break;
     case 'docx':
-      fileText = await checkDocx(input, f, ownText);
+      fileText = await checkDocx(input, f, own);
       break;
     case 'pptx':
-      await checkPptx(input, f, ownText);
+      await checkPptx(input, f, own);
       break;
     case 'pdf':
       checkPdf(input, f);
       if (hasForeignBidi(rendered.text)) f.add('bidi_control', 'rendered text');
       break;
   }
-  if (spec.format === 'xlsx' && ownText.some(hasForeignBidi)) f.add('bidi_control', 'workbook');
+  if (spec.format === 'xlsx' && own.some((o) => o.part === 'workbook' && hasForeignBidi(o.text))) {
+    f.add('bidi_control', 'workbook');
+  }
+
+  const structure = structureOf(spec, rendered.pageCount);
+  const grounder = createTextGrounder(spec, sources, { today });
+  const ground = (label: string, text: string) => {
+    for (const missing of grounder(blankStructure(text, structure))) f.add('ungrounded_number', `${label}: ${safeWhere(missing)}`);
+  };
+  // The file's own text — including what is never printed (notes, metadata, chart data) — is grounded too.
+  for (const o of own) ground(o.part, o.text);
 
   if (!rendered.textTruncated) {
-    const { runs, numbers } = specTextRuns(spec, DIGITS_CURRENCY);
-    checkOrder(runs, [...numbers], rendered.text, f);
-    if (fileText !== null) checkOrder(runs, [...numbers], fileText, f);
-    const grounder = createTextGrounder(spec, sources, { today, extraPool: structuralPool(spec, rendered.pageCount) });
-    for (const missing of grounder(normalise(rendered.text))) f.add('ungrounded_number', `rendered text: ${safeWhere(missing)}`);
+    const text = specTextRuns(spec, currency);
+    checkOrder(text, rendered.text, f);
+    if (fileText !== null) checkOrder(text, fileText, f);
+    ground('rendered text', rendered.text);
   }
 
   return { passed: f.list.length === 0, findings: f.list };

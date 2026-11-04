@@ -211,6 +211,8 @@ function chartSlide(slide: PptxSlide, s: Extract<Slide, { type: 'chart' }>, n: n
     showLegend: s.chartType === 'pie',
     legendPos: 'b',
     showValue: true,
+    // The data labels carry every value; a value axis would only add numbers no source gave.
+    ...(s.chartType === 'pie' ? {} : { valAxisHidden: true }),
     catAxisLabelFontFace: FONT,
     valAxisLabelFontFace: FONT,
     dataLabelFontFace: FONT,

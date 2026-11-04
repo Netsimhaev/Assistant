@@ -200,7 +200,9 @@ async function buildPdf(spec: PdfSpec) {
   const bytes = await renderPdf(spec, { printer: stubPrinter, assets, currency: 'ILS' });
   const html = renderHtml(spec, assets, { currency: 'ILS' });
   const footer = htmlText(`<body>${renderFooterTemplate(spec, assets)}</body>`).replace(/\s*\/\s*$/, ' 1 / 1');
-  return { bytes, text: `${htmlText(html)}\n${footer}` };
+  // One page: lines separated by single newlines (pages are separated by a blank line), the footer last.
+  const body = htmlText(html).replace(/\n\s*\n/g, '\n').trim();
+  return { bytes, text: `${body}\n${footer.trim()}`, body, footer: footer.trim() };
 }
 
 const rendered = (text: string, over: Partial<{ pageCount: number; textTruncated: boolean }> = {}) => ({
@@ -254,7 +256,7 @@ describe('runCheck1', () => {
       bytes,
       sources,
       rendered: rendered(await docxText(bytes), { pageCount: 61 }),
-      today: TODAY,
+      today: TODAY, currency: 'ILS',
     });
     const f = r.findings.find((x) => x.code === 'cap_exceeded');
     expect(f?.he).toBe(CHECK1_HE.cap_exceeded);
@@ -263,7 +265,7 @@ describe('runCheck1', () => {
 
   it('a passing file has findings = []', async () => {
     const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
-    const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY });
+    const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY, currency: 'ILS' });
     expect(r.findings).toEqual([]);
     expect(r.passed).toBe(true);
   });
@@ -282,7 +284,7 @@ describe('runCheck1', () => {
     };
     delete (en as { legalBasis?: unknown }).legalBasis;
     const bytes = await renderDocx(en, { currency: 'ILS', images: noImages });
-    const r = await runCheck1({ spec: en, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY });
+    const r = await runCheck1({ spec: en, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY, currency: 'ILS' });
     expect(r.findings).toEqual([]);
   });
 
@@ -291,14 +293,14 @@ describe('runCheck1', () => {
       const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
       const text = await docxText(bytes);
       expectFocusInOrder(text);
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY });
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([]);
     });
 
     it('pdf (contract)', async () => {
       const { bytes, text } = await buildPdf(contractPdf);
       expectFocusInOrder(text);
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text), today: TODAY });
+      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([]);
     });
 
@@ -306,7 +308,7 @@ describe('runCheck1', () => {
       const bytes = await renderXlsx(profitXlsx, { currency: 'ILS' });
       const text = await xlsxText(bytes);
       expectFocusInOrder(text);
-      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(text), today: TODAY });
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([]);
     });
 
@@ -314,7 +316,7 @@ describe('runCheck1', () => {
       const { buffer: bytes } = await renderPptx(profitPptx, { currency: 'ILS', images: noImages });
       const text = await pptxText(bytes);
       expectFocusInOrder(text);
-      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(text), today: TODAY });
+      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([]);
     });
   });
@@ -323,28 +325,28 @@ describe('runCheck1', () => {
     it('a workbook whose cached result was tampered → formula_mismatch', async () => {
       const good = await renderXlsx(profitXlsx, { currency: 'ILS' });
       const bytes = await replaceIn(good, 'xl/worksheets/sheet1.xml', /(<f>SUM\(D3:D4\)<\/f><v>)\d+(<\/v>)/, '$19999$2');
-      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY });
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toContainEqual({ code: 'formula_mismatch', where: 'sheet 1 D5', he: CHECK1_HE.formula_mismatch });
     });
 
     it('a formula that divides by zero (an empty divisor) → formula_error', async () => {
       const good = await renderXlsx(profitXlsx, { currency: 'ILS' });
       const bytes = await replaceIn(good, 'xl/worksheets/sheet1.xml', '<f>C3-B3</f>', '<f>C3/F9</f>');
-      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY });
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toContainEqual(expect.objectContaining({ code: 'formula_error', where: 'sheet 1 D3' }));
     });
 
     it('a formula that references itself → formula_error', async () => {
       const good = await renderXlsx(profitXlsx, { currency: 'ILS' });
       const bytes = await replaceIn(good, 'xl/worksheets/sheet1.xml', '<f>C3-B3</f>', '<f>C3-D3</f>');
-      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY });
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toContainEqual(expect.objectContaining({ code: 'formula_error', where: 'sheet 1 D3' }));
     });
 
     it('a formula that references an empty cell → formula_error, even when the value is unchanged', async () => {
       const good = await renderXlsx(profitXlsx, { currency: 'ILS' });
       const bytes = await replaceIn(good, 'xl/worksheets/sheet1.xml', '<f>C3-B3</f>', '<f>C3-B3+F9</f>');
-      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY });
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toContainEqual(expect.objectContaining({ code: 'formula_error', where: 'sheet 1 D3' }));
       expect(codes(r)).not.toContain('formula_mismatch'); // same value: only the empty reference refused it
     });
@@ -357,13 +359,13 @@ describe('runCheck1', () => {
         '</sheets>',
         '</sheets><definedNames><definedName name="x">\'רווח\'!$A$1</definedName></definedNames>',
       );
-      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY });
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY, currency: 'ILS' });
       expect(codes(r)).toEqual(['unsafe_part']);
     });
 
     it('a Hebrew sheet that is not rightToLeft → direction_wrong', async () => {
       const bytes = await renderXlsx({ ...profitXlsx, language: 'en' }, { currency: 'ILS' });
-      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(bytes)), today: TODAY });
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(bytes)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'direction_wrong', where: 'sheet 1', he: CHECK1_HE.direction_wrong }]);
     });
   });
@@ -372,14 +374,14 @@ describe('runCheck1', () => {
     it('a reversed Hebrew line in the extracted text → order_reversed', async () => {
       const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
       const text = (await docxText(bytes)).replace('בין החברה המספקת לבין הלקוח הקונה', 'הקונה הלקוח לבין המספקת החברה בין');
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY });
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'order_reversed', where: 'block 2', he: CHECK1_HE.order_reversed }]);
     });
 
     it('"1,890" extracted as "098,1" → digits_reversed', async () => {
       const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
       const text = (await docxText(bytes)).replace('עולה ₪1,890', 'עולה ₪098,1');
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY });
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toContainEqual({ code: 'digits_reversed', where: 'block 4', he: CHECK1_HE.digits_reversed });
       expect(codes(r)).not.toContain('order_reversed');
     });
@@ -387,14 +389,14 @@ describe('runCheck1', () => {
     it('a run the extracted text simply lacks → text_missing', async () => {
       const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
       const text = (await docxText(bytes)).replace('אחריות מלאה על כל פגם', '');
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY });
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'text_missing', where: 'block 6', he: CHECK1_HE.text_missing }]);
     });
 
     it('a number on the page that nothing grounds → ungrounded_number', async () => {
       const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
       const text = `${await docxText(bytes)}\nתוספת של 7,777 ש"ח`;
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY });
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([
         { code: 'ungrounded_number', where: 'rendered text: 7777', he: CHECK1_HE.ungrounded_number },
       ]);
@@ -402,7 +404,7 @@ describe('runCheck1', () => {
 
     it('contract without disclaimer (render bypassed) → missing_structure', async () => {
       const bytes = await renderDocx({ ...contractDocx, kind: 'letter' }, { currency: 'ILS', images: noImages });
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY });
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toContainEqual({ code: 'missing_structure', where: 'disclaimer', he: CHECK1_HE.missing_structure });
       expect(r.findings).toContainEqual({ code: 'missing_structure', where: 'legal basis', he: CHECK1_HE.missing_structure });
     });
@@ -412,7 +414,7 @@ describe('runCheck1', () => {
       const bytes = await rezip(good, async (zip) => {
         zip.file('word/vbaProject.bin', Buffer.from('not really vba'));
       });
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(good)), today: TODAY });
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(good)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'unsafe_part', where: 'part word/vbaProject.bin', he: CHECK1_HE.unsafe_part }]);
     });
 
@@ -424,13 +426,13 @@ describe('runCheck1', () => {
         '</Relationships>',
         '<Relationship Id="rId99" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/x" TargetMode="External"/></Relationships>',
       );
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(good)), today: TODAY });
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(good)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'unsafe_part', where: 'part word/_rels/document.xml.rels', he: CHECK1_HE.unsafe_part }]);
     });
 
     it('a Hebrew document rendered without bidi paragraphs → direction_wrong', async () => {
       const bytes = await renderDocx({ ...contractDocx, language: 'en' }, { currency: 'ILS', images: noImages });
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY });
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY, currency: 'ILS' });
       expect(codes(r)).toContain('direction_wrong');
     });
 
@@ -440,7 +442,7 @@ describe('runCheck1', () => {
         blocks: contractDocx.blocks.map((b, i) => (i === 1 ? { type: 'paragraph', text: 'בין החברה המספקת‮ לבין הלקוח הקונה' } : b)),
       };
       const bytes = await renderDocx(spec, { currency: 'ILS', images: noImages });
-      const r = await runCheck1({ spec, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY });
+      const r = await runCheck1({ spec, bytes, sources, rendered: rendered(await docxText(bytes)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'bidi_control', where: 'word/document.xml', he: CHECK1_HE.bidi_control }]);
     });
   });
@@ -456,19 +458,19 @@ describe('runCheck1', () => {
       ],
     };
     const xbytes = await renderXlsx(xspec, { currency: 'ILS' });
-    const x = await runCheck1({ spec: xspec, bytes: xbytes, sources, rendered: rendered(await xlsxText(xbytes)), today: TODAY });
+    const x = await runCheck1({ spec: xspec, bytes: xbytes, sources, rendered: rendered(await xlsxText(xbytes)), today: TODAY, currency: 'ILS' });
     expect(x.findings).toEqual([{ code: 'bidi_control', where: 'workbook', he: CHECK1_HE.bidi_control }]);
 
     const pspec: PptxSpec = { ...profitPptx, slides: [{ type: 'title', title: 'טבלת רווח⁦ לריהוט' }] };
     const { buffer: pbytes } = await renderPptx(pspec, { currency: 'ILS', images: noImages });
-    const p = await runCheck1({ spec: pspec, bytes: pbytes, sources, rendered: rendered(await pptxText(pbytes)), today: TODAY });
+    const p = await runCheck1({ spec: pspec, bytes: pbytes, sources, rendered: rendered(await pptxText(pbytes)), today: TODAY, currency: 'ILS' });
     expect(p.findings).toEqual([{ code: 'bidi_control', where: 'slide 1', he: CHECK1_HE.bidi_control }]);
   });
 
   describe('pptx', () => {
     it('a Hebrew deck whose text bodies are not rtl → direction_wrong', async () => {
       const { buffer: bytes } = await renderPptx({ ...profitPptx, language: 'en' }, { currency: 'ILS', images: noImages });
-      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(await pptxText(bytes)), today: TODAY });
+      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(await pptxText(bytes)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toContainEqual({ code: 'direction_wrong', where: 'slide 1', he: CHECK1_HE.direction_wrong });
     });
 
@@ -481,7 +483,7 @@ describe('runCheck1', () => {
         inner.file('xl/vbaProject.bin', Buffer.from('x'));
         zip.file(name, await inner.generateAsync({ type: 'nodebuffer' }));
       });
-      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(await pptxText(good)), today: TODAY });
+      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(await pptxText(good)), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([
         {
           code: 'unsafe_part',
@@ -500,7 +502,7 @@ describe('runCheck1', () => {
         bytes,
         sources,
         rendered: rendered(text.replace(CONTRACT_DISCLAIMER_HE, '')),
-        today: TODAY,
+        today: TODAY, currency: 'ILS',
       });
       expect(r.findings).toEqual([{ code: 'missing_structure', where: 'disclaimer', he: CHECK1_HE.missing_structure }]);
     });
@@ -511,14 +513,14 @@ describe('runCheck1', () => {
         FIXTURE_PDF.toString('latin1').replace('/Type /Catalog', '/Type /Catalog /OpenAction << /S /J#61vaScript /JS (x) >>'),
         'latin1',
       );
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text), today: TODAY });
+      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toContainEqual(expect.objectContaining({ code: 'unsafe_part', where: 'pdf /OpenAction' }));
       expect(r.findings).toContainEqual(expect.objectContaining({ code: 'unsafe_part', where: 'pdf /JavaScript' }));
     });
 
     it('a bidi control in the extracted text → bidi_control', async () => {
       const { bytes, text } = await buildPdf(contractPdf);
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(`${text}⁧`), today: TODAY });
+      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(`${text}⁧`), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'bidi_control', where: 'rendered text', he: CHECK1_HE.bidi_control }]);
     });
   });
@@ -526,15 +528,15 @@ describe('runCheck1', () => {
   describe('all formats', () => {
     it('more than 60 pages → cap_exceeded', async () => {
       const { bytes, text } = await buildPdf(contractPdf);
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text, { pageCount: 61 }), today: TODAY });
+      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text, { pageCount: 61 }), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'cap_exceeded', where: 'document', he: CHECK1_HE.cap_exceeded }]);
-      const ok = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text, { pageCount: 60 }), today: TODAY });
+      const ok = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text, { pageCount: 60 }), today: TODAY, currency: 'ILS' });
       expect(ok.findings).toEqual([]);
     });
 
     it('text that was not fully read → text_truncated, and the document does not pass', async () => {
       const { bytes, text } = await buildPdf(contractPdf);
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text, { textTruncated: true }), today: TODAY });
+      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text, { textTruncated: true }), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'text_truncated', where: 'document', he: CHECK1_HE.text_truncated }]);
       expect(r.passed).toBe(false);
     });
@@ -546,22 +548,191 @@ describe('runCheck1', () => {
         bytes,
         sources: { ...sources, instructionText: 'הוראה בלי מספרים' },
         rendered: rendered(await docxText(bytes)),
-        today: TODAY,
+        today: TODAY, currency: 'ILS',
       });
       expect(codes(r)).toContain('ungrounded_number');
       expect(r.findings.some((f) => f.where.startsWith('block'))).toBe(true); // from validateSpec, not the page
     });
 
     it('bytes that are not the declared format → file_unreadable', async () => {
-      const r = await runCheck1({ spec: profitXlsx, bytes: Buffer.from('nope'), sources, rendered: rendered(''), today: TODAY });
+      const r = await runCheck1({ spec: profitXlsx, bytes: Buffer.from('nope'), sources, rendered: rendered(''), today: TODAY, currency: 'ILS' });
       expect(codes(r)).toContain('file_unreadable');
     });
 
     it('today is required', async () => {
       const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
       await expect(
-        runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(''), today: undefined as unknown as string }),
+        runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(''), today: undefined as unknown as string, currency: 'ILS' }),
       ).rejects.toThrow(TypeError);
+    });
+  });
+  describe('fix round 1', () => {
+    it('an RLO in a chart label → bidi_control (chart part and its data workbook are scanned)', async () => {
+      const spec: PptxSpec = {
+        ...profitPptx,
+        slides: profitPptx.slides.map((s) =>
+          s.type === 'chart' ? { ...s, rows: [[{ t: 'שולחן\u202E' }, { v: 1890, src: SRC }], ...s.rows.slice(1)] } : s,
+        ),
+      };
+      const { buffer: bytes } = await renderPptx(spec, { currency: 'ILS', images: noImages });
+      const r = await runCheck1({ spec, bytes, sources, rendered: rendered(await pptxText(bytes)), today: TODAY, currency: 'ILS' });
+      expect(codes(r).length).toBeGreaterThan(0);
+      expect(r.findings.every((f) => f.code === 'bidi_control')).toBe(true);
+      expect(r.findings.some((f) => /^ppt\/charts\/chart\d+\.xml$/.test(f.where))).toBe(true);
+    });
+
+    it('a chart label whose digits are reversed on the page → digits_reversed', async () => {
+      const spec: PptxSpec = {
+        ...profitPptx,
+        slides: [
+          {
+            type: 'chart',
+            title: 'גרף מחירים',
+            chartType: 'bar',
+            header: ['פריט', 'מחיר'],
+            rows: [[{ t: 'דגם 2025' }, { v: 1890, src: SRC }]],
+            column: 1,
+            labelColumn: 0,
+          },
+        ],
+      };
+      const r = await runCheck1({
+        spec,
+        bytes: (await renderPptx(spec, { currency: 'ILS', images: noImages })).buffer,
+        sources: { ...sources, instructionText: `${sources.instructionText} דגם 2025` },
+        rendered: rendered('גרף מחירים\nדגם 5202\n1,890'),
+        today: TODAY, currency: 'ILS',
+      });
+      expect(r.findings).toContainEqual(expect.objectContaining({ code: 'digits_reversed', where: 'slide 1 chart row 1 col 1' }));
+    });
+
+    it('xlsx: values swapped between two rows → cell_mismatch at both addresses', async () => {
+      const good = await renderXlsx(profitXlsx, { currency: 'ILS' });
+      const a = await replaceIn(good, 'xl/worksheets/sheet1.xml', /(<c r="B3"[^>]*><v>)1150(<\/v>)/, '$1@@$2');
+      const b = await replaceIn(a, 'xl/worksheets/sheet1.xml', /(<c r="B4"[^>]*><v>)450(<\/v>)/, '$11150$2');
+      const bytes = await replaceIn(b, 'xl/worksheets/sheet1.xml', '@@', '450');
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toContainEqual({ code: 'cell_mismatch', where: 'sheet 1 B3', he: CHECK1_HE.cell_mismatch });
+      expect(r.findings).toContainEqual({ code: 'cell_mismatch', where: 'sheet 1 B4', he: CHECK1_HE.cell_mismatch });
+    });
+
+    it('xlsx: a missing {v} cell → cell_mismatch', async () => {
+      const good = await renderXlsx(profitXlsx, { currency: 'ILS' });
+      const bytes = await replaceIn(good, 'xl/worksheets/sheet1.xml', /<c r="C3"[^>]*><v>1890<\/v><\/c>/, '');
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toContainEqual({ code: 'cell_mismatch', where: 'sheet 1 C3', he: CHECK1_HE.cell_mismatch });
+    });
+
+    it('xlsx: a wrong-range formula whose result is a pool value → cell_mismatch only', async () => {
+      const good = await renderXlsx(profitXlsx, { currency: 'ILS' });
+      const bytes = await replaceIn(good, 'xl/worksheets/sheet1.xml', '<f>SUM(D3:D4)</f><v>2180</v>', '<f>SUM(D4:D4)</f><v>1440</v>');
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(bytes)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'cell_mismatch', where: 'sheet 1 D5', he: CHECK1_HE.cell_mismatch }]);
+    });
+
+    it('xlsx: the same formula written with spaces and lower case is not a mismatch', async () => {
+      const good = await renderXlsx(profitXlsx, { currency: 'ILS' });
+      const bytes = await replaceIn(good, 'xl/worksheets/sheet1.xml', '<f>SUM(D3:D4)</f>', '<f>sum( D3 : D4 )</f>');
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(bytes)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([]);
+    });
+
+    it('xlsx: an extra cell the spec never placed → cell_mismatch', async () => {
+      const good = await renderXlsx(profitXlsx, { currency: 'ILS' });
+      const bytes = await replaceIn(good, 'xl/worksheets/sheet1.xml', /(<row r="1"[^>]*>)/, '$1<c r="H1"><v>7777</v></c>');
+      const r = await runCheck1({ spec: profitXlsx, bytes, sources, rendered: rendered(await xlsxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toContainEqual({ code: 'cell_mismatch', where: 'sheet 1 H1', he: CHECK1_HE.cell_mismatch });
+    });
+
+    it('docx: two table cells swapped on the page → the row is not in order', async () => {
+      const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
+      const good = await docxText(bytes);
+      const text = good.replace(/₪1,890(\s+)39%/, '39%$1₪1,890');
+      expect(text).not.toBe(good);
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'order_reversed', where: 'block 8 row 1', he: CHECK1_HE.order_reversed }]);
+    });
+
+    it('a number in unprinted file content (docProps title) is grounded too', async () => {
+      const good = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
+      const bytes = await replaceIn(good, 'docProps/core.xml', /<dc:title>[^<]*<\/dc:title>/, '<dc:title>חוזה 7777</dc:title>');
+      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(await docxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([
+        { code: 'ungrounded_number', where: 'docProps/core.xml: 7777', he: CHECK1_HE.ungrounded_number },
+      ]);
+    });
+
+    it('a number in pptx speaker notes is grounded', async () => {
+      const { buffer: good } = await renderPptx(profitPptx, { currency: 'ILS', images: noImages });
+      const bytes = await rezip(good, async (zip) => {
+        const name = 'ppt/notesSlides/notesSlide1.xml';
+        const xml = await zip.file(name)!.async('string');
+        const next = xml.replace(
+          '</p:spTree>',
+          '<p:sp><p:txBody><a:p><a:r><a:t>הנחה סודית 7777</a:t></a:r></a:p></p:txBody></p:sp></p:spTree>',
+        );
+        expect(next).not.toBe(xml);
+        zip.file(name, next);
+      });
+      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(await pptxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([
+        { code: 'ungrounded_number', where: 'ppt/notesSlides/notesSlide1.xml: 7777', he: CHECK1_HE.ungrounded_number },
+      ]);
+    });
+
+    it('pdf: a forbidden name inside a stream body is data, not a dictionary key', async () => {
+      const { text } = await buildPdf(contractPdf);
+      const inStream = Buffer.from(
+        FIXTURE_PDF.toString('latin1').replace('trailer', '3 0 obj\n<< /Length 8 >>\nstream\n/URI /AA\nendstream\nendobj\ntrailer'),
+        'latin1',
+      );
+      const clean = await runCheck1({ spec: contractPdf, bytes: inStream, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      expect(clean.findings).toEqual([]);
+      const outside = Buffer.from(FIXTURE_PDF.toString('latin1').replace('/Type /Catalog', '/Type /Catalog /U#52I (x)'), 'latin1');
+      const r = await runCheck1({ spec: contractPdf, bytes: outside, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'unsafe_part', where: 'pdf /URI', he: CHECK1_HE.unsafe_part }]);
+    });
+
+    it('docx: a field other than PAGE/NUMPAGES → unsafe_part; PAGE is allowed', async () => {
+      const good = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
+      const page = await replaceIn(good, 'word/footer1.xml', '</w:ftr>', '<w:p><w:fldSimple w:instr=" PAGE \\* MERGEFORMAT "/></w:p></w:ftr>');
+      const ok = await runCheck1({ spec: contractDocx, bytes: page, sources, rendered: rendered(await docxText(good)), today: TODAY, currency: 'ILS' });
+      expect(ok.findings).toEqual([]);
+      const bad = await replaceIn(
+        good,
+        'word/document.xml',
+        '</w:body>',
+        '<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> INCLUDETEXT "c:\\\\x.docx" </w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:body>',
+      );
+      const r = await runCheck1({ spec: contractDocx, bytes: bad, sources, rendered: rendered(await docxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'unsafe_part', where: 'field word/document.xml', he: CHECK1_HE.unsafe_part }]);
+    });
+
+    it('a structural number grounds only at line start or end, not mid-line', async () => {
+      const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
+      const base = await docxText(bytes);
+      const mid = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(`${base}\nהוספנו 3 פריטים`), today: TODAY, currency: 'ILS' });
+      expect(mid.findings).toEqual([{ code: 'ungrounded_number', where: 'rendered text: 3', he: CHECK1_HE.ungrounded_number }]);
+      const edge = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(`${base}\nעמוד 1`), today: TODAY, currency: 'ILS' });
+      expect(edge.findings).toEqual([]);
+    });
+
+    it('pdf: the disclaimer must be in the footer of every page', async () => {
+      const { bytes, body, footer } = await buildPdf(contractPdf);
+      const top = await runCheck1({
+        spec: contractPdf,
+        bytes,
+        sources,
+        rendered: rendered(`${CONTRACT_DISCLAIMER_HE}\n${body}\n1 / 1`),
+        today: TODAY, currency: 'ILS',
+      });
+      expect(top.findings).toEqual([{ code: 'missing_structure', where: 'disclaimer', he: CHECK1_HE.missing_structure }]);
+      const twoPages = `${body}\n${footer.replace('1 / 1', '1 / 2')}\n\nהמשך\n2 / 2`;
+      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(twoPages, { pageCount: 2 }), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'missing_structure', where: 'disclaimer', he: CHECK1_HE.missing_structure }]);
+      const both = `${body}\n${footer.replace('1 / 1', '1 / 2')}\n\nהמשך\n${footer.replace('1 / 1', '2 / 2')}`;
+      const ok = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(both, { pageCount: 2 }), today: TODAY, currency: 'ILS' });
+      expect(ok.findings).toEqual([]);
     });
   });
 });
