@@ -52,7 +52,7 @@ function percentFormat(values: number[]): string {
 /** Display length of a number under a column format (separators, symbol, decimals, percent). */
 function shownLength(n: number, fmt: string | undefined): number {
   if (fmt === undefined) return String(n).length;
-  const dec = (fmt.match(/.(0+)/)?.[1] ?? '').length;
+  const dec = (fmt.match(/\.(0+)/)?.[1] ?? '').length;
   const pct = fmt.includes('%');
   const body = (pct ? n * 100 : n).toLocaleString('en-US', {
     minimumFractionDigits: dec,
