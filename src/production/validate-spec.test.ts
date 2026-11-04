@@ -135,6 +135,15 @@ describe('validateSpec — cell grounding', () => {
     ]);
   });
 
+  it('a docx table percent column grounds 0.15 against "15%" and a money column keeps major units', () => {
+    const tbl = (v: number, fmt: string) =>
+      docx([{ type: 'table', header: ['x'], rows: [[fromDoc(v)]], numberFormat: [fmt] }]);
+    expect(validateSpec(tbl(0.15, 'percent'), sources(), TODAY)).toEqual([]);
+    const noFmt = docx([{ type: 'table', header: ['x'], rows: [[fromDoc(0.15)]] }]);
+    expect(codes(validateSpec(noFmt, sources(), TODAY))).toEqual(['ungrounded_number']);
+    expect(validateSpec(tbl(1890, 'money'), sources(), TODAY)).toEqual([]);
+  });
+
   it('a percent column grounds 0.15 against "15%"', () => {
     const spec = xlsx({
       sheets: [

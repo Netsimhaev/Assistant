@@ -7,9 +7,15 @@
  * own LTR run so the bidi algorithm cannot reorder it. Clause numbers are
  * generated here; a contract gets signature blocks, "הבסיס החוקי" and the
  * disclaimer in the footer of every page.
+ *
+ * Clause numbering: each `clause` block is numbered `N.` by the renderer (a
+ * title that already starts with its own number is stripped, never doubled).
+ * When the clause `text` has more than one non-blank line, every non-blank
+ * line becomes its own sub-clause `N.1`, `N.2`, ...; a single-line text gets
+ * no sub-number.
  */
-import { readFile } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
+import { open, stat } from 'node:fs/promises';
+import { isAbsolute, relative, resolve } from 'node:path';
 import {
   AlignmentType,
   BorderStyle,
@@ -32,7 +38,7 @@ import { getPool, type Queryable } from '../db/pool.js';
 import type { AccentColor, Block, DocxSpec } from '../domain/document-spec.js';
 import { formatCell } from './format-value.js';
 import { SpecRenderError } from './render-error.js';
-import { CONTRACT_DISCLAIMER_EN, CONTRACT_DISCLAIMER_HE } from './validate-spec.js';
+import { CONTRACT_DISCLAIMER_EN, CONTRACT_DISCLAIMER_HE, stripOwnNumber } from './validate-spec.js';
 
 export type ImageLoader = (documentId: string) => Promise<{ bytes: Buffer; mediaType: string } | null>;
 
@@ -62,7 +68,8 @@ const HEADING_LEVEL = {
 } as const;
 
 /** Currency prefix + digits with inner separators + optional percent. */
-const NUMBER_RUN = /[₪$€]?\d+(?:[,.:/]\d+)*%?/g;
+const NUMBER_RUN = /(?:(?<![\p{L}\d])[-−])?[₪$€]?\d+(?:[,.:/]\d+)*%?/gu;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 interface Ctx {
   rtl: boolean;
@@ -162,7 +169,8 @@ async function imageParagraph(documentId: string, ctx: Ctx, options: RenderDocxO
   );
 }
 
-function tableOf(header: string[], rows: Extract<Block, { type: 'table' }>['rows'], ctx: Ctx, where: string): Table {
+function tableOf(block: Extract<Block, { type: 'table' }>, ctx: Ctx, where: string): Table {
+  const { header, rows, numberFormat } = block;
   const cell = (runs: TextRun[], shade?: string) =>
     new TableCell({
       children: [para(runs, ctx, { spacingAfter: 40 })],
@@ -175,7 +183,7 @@ function tableOf(header: string[], rows: Extract<Block, { type: 'table' }>['rows
   const body = rows.map(
     (row, r) =>
       new TableRow({
-        children: row.map((c, i) => cell(textRuns(formatCell(c, undefined, ctx.currency, `${where}.rows[${r}][${i}]`), ctx))),
+        children: row.map((c, i) => cell(textRuns(formatCell(c, numberFormat?.[i], ctx.currency, `${where}.rows[${r}][${i}]`), ctx))),
       }),
   );
   return new Table({
@@ -241,7 +249,7 @@ export async function renderDocx(spec: DocxSpec, options: RenderDocxOptions): Pr
         });
         break;
       case 'table':
-        children.push(tableOf(block.header, block.rows, ctx, where));
+        children.push(tableOf(block, ctx, where));
         children.push(para([], ctx));
         break;
       case 'pageBreak':
@@ -253,7 +261,7 @@ export async function renderDocx(spec: DocxSpec, options: RenderDocxOptions): Pr
       case 'clause': {
         clauseNo += 1;
         children.push(
-          para([numberRun(`${clauseNo}.`, { bold: true }), ...textRuns(` ${block.title}`, ctx, { bold: true })], ctx),
+          para([numberRun(`${clauseNo}.`, { bold: true }), ...textRuns(` ${stripOwnNumber(block.title, clauseNo).trim()}`, ctx, { bold: true })], ctx),
         );
         const lines = block.text.split(/\r?\n/).filter((l) => l.trim() !== '');
         if (lines.length <= 1) {
@@ -322,12 +330,22 @@ export function createDbImageLoader(businessId: string, db: Queryable = getPool(
     const row = rows[0];
     if (!row) return null;
     const root = resolve(config.documentRoot);
-    const full = resolve(join(root, row.stored_path));
-    if (!full.startsWith(root + sep)) return null;
+    const full = resolve(root, row.stored_path);
+    const rel = relative(root, full);
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null;
     try {
-      return { bytes: await readFile(full), mediaType: row.media_type };
-    } catch {
-      return null;
+      const info = await stat(full);
+      if (!info.isFile()) throw Object.assign(new Error('not a file'), { code: 'EISDIR' });
+      if (info.size > MAX_IMAGE_BYTES) throw new SpecRenderError('image_too_large', documentId);
+      const handle = await open(full, 'r');
+      try {
+        return { bytes: await handle.readFile(), mediaType: row.media_type };
+      } finally {
+        await handle.close();
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw err;
     }
   };
 }

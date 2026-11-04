@@ -369,7 +369,7 @@ function splitSeparators(text: string): string {
 const OWN_NUMBER_PREFIX = [/^\s*(\d+)\s*$/, /^\s*סעיף\s+(\d+)(?!\d)/, /^\s*(\d+)\.(?!\d)/];
 
 /** Remove a title's own structural number (clause/slide position `n`), if it carries one. */
-function stripOwnNumber(title: string, n: number): string {
+export function stripOwnNumber(title: string, n: number): string {
   for (const pattern of OWN_NUMBER_PREFIX) {
     const m = pattern.exec(title);
     if (m && Number(m[1]) === n) return title.slice(m[0].length);
@@ -487,16 +487,20 @@ class Collector {
   }
 
   /** A cell outside a workbook (docx/pdf/pptx table). */
-  plainCell(where: string, cell: Cell): void {
-    if ('v' in cell) this.valueCell(where, cell, false);
+  plainCell(where: string, cell: Cell, percent = false): void {
+    if ('v' in cell) this.valueCell(where, cell, percent);
     else if ('t' in cell) this.text(where, cell.t);
     else if ('d' in cell) this.dateCell(where, cell.d);
     else this.add('formula_problem', where, 'נוסחה מותרת רק בגיליון Excel');
   }
 
-  plainTable(where: string, header: string[], rows: Cell[][]): void {
+  plainTable(where: string, header: string[], rows: Cell[][], numberFormat?: readonly string[]): void {
     header.forEach((h, c) => this.text(`${where} header col ${c + 1}`, h));
-    rows.forEach((row, r) => row.forEach((cell, c) => this.plainCell(`${where} row ${r + 1} col ${c + 1}`, cell)));
+    rows.forEach((row, r) =>
+      row.forEach((cell, c) =>
+        this.plainCell(`${where} row ${r + 1} col ${c + 1}`, cell, numberFormat?.[c] === 'percent'),
+      ),
+    );
   }
 }
 
@@ -1167,7 +1171,7 @@ function checkBlocks(blocks: Block[], c: Collector): void {
         b.items.forEach((item, j) => c.text(`${where} item ${j + 1}`, item));
         return;
       case 'table':
-        c.plainTable(where, b.header, b.rows);
+        c.plainTable(where, b.header, b.rows, b.numberFormat);
         return;
       case 'clause':
         clause += 1;
@@ -1276,7 +1280,7 @@ export function validateSpec(
             return;
           case 'table':
           case 'chart':
-            c.plainTable(where, s.header, s.rows);
+            c.plainTable(where, s.header, s.rows, s.type === 'table' ? s.numberFormat : undefined);
             return;
           case 'imageText':
           case 'paragraph':

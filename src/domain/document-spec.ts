@@ -82,7 +82,7 @@ export type Cell = z.infer<typeof Cell>;
  * them with a currency number format. `percent`: values are fractions (0.15
  * displays 15%).
  */
-const NumberFormat = z.enum(['int', 'money', 'percent', 'decimal2']);
+export const NumberFormat = z.enum(['int', 'money', 'percent', 'decimal2']);
 
 export const XlsxTable = z
   .object({
@@ -135,6 +135,7 @@ export const Block = z.discriminatedUnion('type', [
       type: z.literal('table'),
       header: z.array(z.string()).min(1),
       rows: z.array(z.array(Cell)),
+      numberFormat: z.array(NumberFormat).optional(),
     })
     .strict(),
   z.object({ type: z.literal('pageBreak') }).strict(),
@@ -161,6 +162,7 @@ export const Slide = z.discriminatedUnion('type', [
       title: z.string(),
       header: z.array(z.string()).min(1),
       rows: z.array(z.array(Cell)),
+      numberFormat: z.array(NumberFormat).optional(),
     })
     .strict(),
   z
