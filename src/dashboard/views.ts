@@ -35,17 +35,9 @@ import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import { OUTLOOK_SUBJECT_NOTE, WARNING_PREFIXES, mailboxReplyRecipient, splitReplyDetail } from '../mail/reply-card.js';
 import { formatMinor } from '../util/money.js';
 
-/** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
-export function escapeHtml(value: unknown): string {
-  const str =
-    typeof value === 'string' ? value : value === null || value === undefined ? '' : String(value);
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
+// The one escaping helper; defined in `src/util/html.ts`, re-exported unchanged.
+import { escapeHtml } from '../util/html.js';
+export { escapeHtml };
 
 const esc = escapeHtml;
 

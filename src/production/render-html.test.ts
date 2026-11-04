@@ -87,7 +87,7 @@ describe('renderHtml', () => {
     expect(html).toContain('<bdi dir="ltr">2.</bdi>');
     // No digit sits outside an LTR isolate in the body text.
     const body = html.slice(html.indexOf('<body'));
-    const outside = body.replace(/<bdi dir="ltr">[^<]*<\/bdi>/g, '').replace(/<[^>]*>/g, '');
+    const outside = body.replace(/<bdi dir="ltr">[^<]*<\/bdi>/g, '').replace(/<[^>]*>/g, '').replace(/&[^;]+;/g, '');
     expect(outside).not.toMatch(/\d/);
   });
 
@@ -156,5 +156,7 @@ describe('renderFooterTemplate', () => {
     const contract = renderFooterTemplate(spec({ kind: 'contract', legalBasis: [{ law: 'x' }] }), assets);
     expect(contract).toContain(CONTRACT_DISCLAIMER_HE);
     expect(contract).not.toMatch(/<script/i);
+    expect(contract).toContain('Content-Security-Policy');
+    expect(contract).toContain('box-sizing: border-box');
   });
 });

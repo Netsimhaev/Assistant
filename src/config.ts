@@ -83,6 +83,10 @@ export const config = {
   documentRoot: resolve(required('DOCUMENT_ROOT')),
   documentInbox: optional('DOCUMENT_INBOX'),
   documentReadsPerDay: positiveInt('DOCUMENT_READS_PER_DAY', 20),
+  // Whole-process-tree resident-set cap for the headless Chromium that prints
+  // PDFs (`src/production/chromium.ts`). Enforced on Linux only, by sampling
+  // /proc, like `run-extractor.ts`.
+  chromiumRssCapMb: positiveInt('DOCUMENT_CHROMIUM_RSS_MB', 768),
   // The Hebrew Regular face embedded in every produced PDF. Its three
   // companions (Hebrew Bold, Noto Sans Regular/Bold for Latin and digits) are
   // fixed file names in the SAME directory — see `PDF_FONT_FILES` in

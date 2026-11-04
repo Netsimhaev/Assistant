@@ -23,9 +23,13 @@
  * did not print CSS `@page` margin boxes for most of its history, so they go
  * in Playwright's `footerTemplate` (`renderFooterTemplate`), which Chromium
  * draws in the bottom page margin of every page. The template is our own
- * static markup; the only variable text (the disclaimer) is a constant.
+ * static markup; the only variable text (the disclaimer) is a constant. It
+ * carries the same CSP meta as the page — defence in depth: the template is
+ * inserted into Chromium's own header/footer document, where a meta CSP may
+ * not take effect, so the real control remains that the template holds
+ * nothing but our constants and `data:` fonts.
  */
-import { escapeHtml } from '../dashboard/views.js';
+import { escapeHtml } from '../util/html.js';
 import type { Block, PdfSpec, StyleTheme } from '../domain/document-spec.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { formatCell } from './format-value.js';
@@ -244,7 +248,7 @@ export function renderFooterTemplate(spec: PdfSpec, assets: PdfAssets): string {
     spec.kind === 'contract'
       ? `<div>${escapeHtml(stripBidiControls(rtl ? CONTRACT_DISCLAIMER_HE : CONTRACT_DISCLAIMER_EN))}</div>`
       : '';
-  return `<style>${fontFaces(assets.fonts, ['hebrewRegular', 'latinRegular'])}
-.doc-footer { width: 100%; margin: 0 18mm; font-family: ${FONT_STACK}; font-size: 8pt; color: #595959; text-align: center; }
+  return `<meta http-equiv="Content-Security-Policy" content="${escapeHtml(CSP)}"><style>${fontFaces(assets.fonts, ['hebrewRegular', 'latinRegular'])}
+.doc-footer { width: 100%; box-sizing: border-box; padding: 0 18mm; font-family: ${FONT_STACK}; font-size: 8pt; color: #595959; text-align: center; }
 </style><div class="doc-footer" dir="${rtl ? 'rtl' : 'ltr'}" lang="${rtl ? 'he' : 'en'}">${disclaimer}<div><bdi dir="ltr"><span class="pageNumber"></span> / <span class="totalPages"></span></bdi></div></div>`;
 }

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { PdfSpec } from '../domain/document-spec.js';
 import { renderFooterTemplate, renderHtml, type PdfAssets } from './render-html.js';
-import { loadPdfAssets, PDF_FONT_FILES, renderPdf, type PdfPrinter } from './render-pdf.js';
+import { loadPdfAssets, MAX_PDF_HTML_BYTES, PDF_FONT_FILES, renderPdf, type PdfPrinter } from './render-pdf.js';
 import { SpecRenderError } from './render-error.js';
 import type { ImageLoader } from './render-shared.js';
 
@@ -60,6 +60,20 @@ describe('renderPdf', () => {
     };
     await expect(renderPdf(spec(), { printer, assets, currency: 'ILS' })).rejects.toThrow(/not a PDF/);
     expect(ran).toBe(true);
+  });
+
+  it('refuses an HTML over the size cap before printing (pdf_too_large)', async () => {
+    let printed = false;
+    const printer: PdfPrinter = async () => {
+      printed = true;
+      return PDF_BYTES;
+    };
+    const huge = spec({ blocks: [{ type: 'paragraph', text: 'א'.repeat(Math.ceil(MAX_PDF_HTML_BYTES / 2) + 10) }] });
+    const err = await renderPdf(huge, { printer, assets, currency: 'ILS' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SpecRenderError);
+    expect((err as SpecRenderError).code).toBe('pdf_too_large');
+    expect(printed).toBe(false);
+    expect(MAX_PDF_HTML_BYTES).toBe(60 * 1024 * 1024);
   });
 });
 

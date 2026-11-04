@@ -34,6 +34,13 @@ export type PdfPrinter = (html: string, signal: AbortSignal, options: PrintOptio
 /** Upper bound on one print, enforced by `renderPdf` (signal) and by the printer (`withDeadline`). */
 export const PDF_PRINT_TIMEOUT_MS = 60_000;
 
+/**
+ * Largest HTML handed to a printer. Checked before Chromium starts: the
+ * printer's RSS watchdog is the real memory bound, this is the cheap
+ * complement that refuses an absurd page without launching anything.
+ */
+export const MAX_PDF_HTML_BYTES = 60 * 1024 * 1024;
+
 /** File names inside the font directory. `hebrewRegular` is the file `DOCUMENT_FONT_PATH` names. */
 export const PDF_FONT_FILES: Record<keyof PdfFonts, string> = {
   hebrewRegular: 'NotoSansHebrew-Regular.ttf',
@@ -101,6 +108,8 @@ export interface RenderPdfDeps {
 
 export async function renderPdf(spec: PdfSpec, deps: RenderPdfDeps): Promise<Buffer> {
   const html = renderHtml(spec, deps.assets, { currency: deps.currency });
+  const bytes = Buffer.byteLength(html, 'utf8');
+  if (bytes > MAX_PDF_HTML_BYTES) throw new SpecRenderError('pdf_too_large', `html ${bytes} bytes`);
   const footerTemplate = renderFooterTemplate(spec, deps.assets);
   const pdf = await deps.printer(html, AbortSignal.timeout(PDF_PRINT_TIMEOUT_MS), { footerTemplate });
   if (pdf.length < 5 || pdf.subarray(0, 5).toString('latin1') !== '%PDF-') {
