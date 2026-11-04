@@ -40,6 +40,7 @@ import type { DocumentKind, DocumentLanguage } from '../domain/document-spec.js'
 import { documentKindLabel } from '../domain/labels.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { config } from '../config.js';
+import { linkedAbortController } from '../util/abort.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { buildFence, stripFenceMarkers } from '../util/fence.js';
 import {
@@ -250,15 +251,20 @@ function refuseUnderTest(): void {
   );
 }
 
-export async function judgeDocument(request: DocJudgeRequest): Promise<JudgeOutcome> {
-  refuseUnderTest();
+/** The live call with `query` injected (the test seam); `judgeDocument` is the guarded default. */
+export async function judgeWithQuery(
+  request: DocJudgeRequest,
+  signal: AbortSignal | undefined,
+  run: typeof query,
+): Promise<JudgeOutcome> {
   const { message, options } = buildDocJudgeCall(request);
+  const abortController = linkedAbortController(signal);
   async function* input(): AsyncGenerator<SDKUserMessage> {
     yield message;
   }
   let raw = '';
   let failure: string | null = null;
-  for await (const event of query({ prompt: input(), options })) {
+  for await (const event of run({ prompt: input(), options: { ...options, abortController } })) {
     if (event.type !== 'result') continue;
     if (event.subtype === 'success') raw = event.result;
     else failure = `model call ended with ${event.subtype}`;
@@ -266,6 +272,12 @@ export async function judgeDocument(request: DocJudgeRequest): Promise<JudgeOutc
   }
   if (raw === '' && failure !== null) return { status: 'unjudged', reason: failure, raw };
   return interpretDocJudgeResponse(raw);
+}
+
+/** `signal`: the caller's deadline — aborting it aborts the SDK call. */
+export async function judgeDocument(request: DocJudgeRequest, signal?: AbortSignal): Promise<JudgeOutcome> {
+  refuseUnderTest();
+  return judgeWithQuery(request, signal, query);
 }
 
 export type DocJudge = typeof judgeDocument;

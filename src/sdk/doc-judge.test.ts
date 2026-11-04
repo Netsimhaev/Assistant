@@ -10,6 +10,7 @@ import {
   DOC_JUDGE_TEXT_LABEL,
   interpretDocJudgeResponse,
   judgeDocument,
+  judgeWithQuery,
   MAX_JUDGE_INSTRUCTION_CHARS,
   MAX_JUDGE_PAGES,
   type DocJudgeRequest,
@@ -188,5 +189,39 @@ describe('interpretDocJudgeResponse', () => {
 describe('the live judge', () => {
   it('refuses under test when called live', async () => {
     await expect(judgeDocument(request())).rejects.toThrow(/NODE_ENV=test/);
+  });
+});
+
+describe('judgeWithQuery: the caller signal reaches the SDK query', () => {
+  it('aborting the signal aborts options.abortController; a pre-aborted signal arrives aborted', async () => {
+    let captured: AbortController | undefined;
+    const stubQuery = ((args: { options?: { abortController?: AbortController } }) => {
+      captured = args.options?.abortController;
+      return (async function* () {
+        await new Promise<void>((resolve) => captured?.signal.addEventListener('abort', () => resolve()));
+        yield { type: 'result', subtype: 'error_during_execution' };
+      })();
+    }) as never;
+    const controller = new AbortController();
+    const running = judgeWithQuery(request(), controller.signal, stubQuery);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(captured).toBeInstanceOf(AbortController);
+    expect(captured!.signal.aborted).toBe(false);
+    controller.abort();
+    const outcome = await running;
+    expect(captured!.signal.aborted).toBe(true);
+    expect(outcome.status).not.toBe('judged');
+
+    const pre = new AbortController();
+    pre.abort();
+    let early: AbortController | undefined;
+    const once = ((args: { options?: { abortController?: AbortController } }) => {
+      early = args.options?.abortController;
+      return (async function* () {
+        yield { type: 'result', subtype: 'error_during_execution' };
+      })();
+    }) as never;
+    await judgeWithQuery(request(), pre.signal, once);
+    expect(early!.signal.aborted).toBe(true);
   });
 });

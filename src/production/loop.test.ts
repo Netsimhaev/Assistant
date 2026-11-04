@@ -25,6 +25,7 @@ import { buildCharter } from '../test/fixtures.js';
 import { runCheck1, type Check1Input } from './check1.js';
 import {
   CHECK2_UNJUDGED_HE,
+  FILE_CHANGED_REASON,
   productionCapReason,
   runDocumentProductions,
   type ProductionFinished,
@@ -33,6 +34,7 @@ import {
 import type { PageRenderer } from './page-images.js';
 import type { PdfAssets } from './render-html.js';
 import type { PdfPrinter } from './render-pdf.js';
+import { PRODUCTION_TOOLS_MISSING_REASON, RENDER_ERROR_HE } from './render-error.js';
 import { createProduction, EMPTY_WORK, latestVersion, loadProduction } from './store.js';
 
 const B = 'test-business';
@@ -129,6 +131,9 @@ function run(over: Partial<RunProductionsOptions> & { drafter: Drafter }) {
     judge: passingJudge,
     printer: neverPrinter,
     renderer: renderer.fn,
+    // Real time is irrelevant here; the budget tests pass a clock of their own.
+    clock: () => 0,
+    budgetMs: Number.MAX_SAFE_INTEGER,
     onFinished: async (f) => {
       finished.push(f);
     },
@@ -172,6 +177,8 @@ describe('runDocumentProductions', () => {
     expect(version!.storedPath).toBe(join('produced', B, id, `${version!.versionId}.docx`));
     expect(version!.check1).toMatchObject({ passed: true, findings: [] });
     expect(version!.check2).toMatchObject({ passed: true, status: 'judged' });
+    // Rendered once per attempt: check 1's text and check 2's images come from one render.
+    expect(r.renderer.calls).toHaveLength(1);
     expect(await readFile(join(root, (version!.check2 as { previewPath: string }).previewPath))).toEqual(PNG);
 
     expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('closed');
@@ -219,7 +226,7 @@ describe('runDocumentProductions', () => {
     const p = await loadProduction(B, id);
     expect(p?.stage).toBe('failed_checks');
     expect(p?.attempt).toBe(2);
-    expect(p?.work.findings).toContainEqual(
+    expect(p?.findings).toContainEqual(
       expect.objectContaining({ check: 'check1', code: 'cap_exceeded', he: 'המסמך ארוך מהמותר' }),
     );
     const version = await latestVersion(id);
@@ -254,7 +261,7 @@ describe('runDocumentProductions', () => {
     // Resumed: building re-used version 1 (no second version), then check1 and check2 ran.
     const { rows } = await getPool().query('SELECT 1 FROM document_versions WHERE production_id = $1', [id]);
     expect(rows).toHaveLength(1);
-    expect(second.renderer.calls).toHaveLength(2);
+    expect(second.renderer.calls).toHaveLength(1);
   });
 
   it('a resumed pdf check1 gets the same HTML string the PDF was printed from', async () => {
@@ -300,7 +307,7 @@ describe('runDocumentProductions', () => {
     for (let i = 0; i < 20; i += 1) {
       const { id } = await produce();
       await getPool().query(
-        `UPDATE document_productions SET stage = 'ready', findings = $2, created_at = '2026-11-04T05:00:00Z' WHERE production_id = $1`,
+        `UPDATE document_productions SET stage = 'ready', work = $2, created_at = '2026-11-04T05:00:00Z' WHERE production_id = $1`,
         [id, { ...EMPTY_WORK, drafted: true, finished: true }],
       );
     }
@@ -323,7 +330,7 @@ describe('runDocumentProductions', () => {
     for (let i = 0; i < 19; i += 1) {
       const { id } = await produce();
       await getPool().query(
-        `UPDATE document_productions SET stage = 'ready', findings = $2, created_at = '2026-11-04T05:00:00Z' WHERE production_id = $1`,
+        `UPDATE document_productions SET stage = 'ready', work = $2, created_at = '2026-11-04T05:00:00Z' WHERE production_id = $1`,
         [id, { ...EMPTY_WORK, drafted: true, finished: true }],
       );
     }
@@ -395,7 +402,7 @@ describe('runDocumentProductions', () => {
     const result = await run({ drafter: drafter.fn, judge: unjudged }).promise;
     expect(result).toMatchObject({ failedChecks: 1 });
     expect(drafter.calls).toHaveLength(3);
-    expect((await loadProduction(B, id))?.work.findings).toEqual([
+    expect((await loadProduction(B, id))?.findings).toEqual([
       { check: 'check2', code: 'unjudged', where: 'document', he: CHECK2_UNJUDGED_HE },
     ]);
   });
@@ -442,5 +449,183 @@ describe('runDocumentProductions', () => {
     };
     await run({ drafter: drafterOf([letter()]).fn, check1 }).promise;
     expect(seen).toEqual([{ passed: true, findings: [] }]);
+  });
+});
+
+/** A spec validateSpec refuses: 4729 appears in no source. */
+const ungrounded = (): DocxSpec => ({
+  ...letter(),
+  blocks: [{ type: 'paragraph', text: 'המחיר הוא 4729 שקלים' }],
+});
+
+function crashAt(event: 'version_saved' | 'check1_saved' | 'check2_saved') {
+  let armed = true;
+  return (at: string) => {
+    if (at === event && armed) {
+      armed = false;
+      throw new Error('crash');
+    }
+  };
+}
+
+describe('fix round 1', () => {
+  it('missing tools: the pass is null, but queued rows end failed with the tools reason and the origin job fails', async () => {
+    const { id, jobId } = await produce();
+    const finished: ProductionFinished[] = [];
+    const result = await runDocumentProductions({
+      businessId: B,
+      now: NOW,
+      production: { available: false, sofficePath: null, chromiumPath: null },
+      onFinished: async (f) => {
+        finished.push(f);
+      },
+    });
+    expect(result).toBeNull();
+    const p = await loadProduction(B, id);
+    expect(p?.stage).toBe('failed');
+    expect(p?.work.reason).toBe(PRODUCTION_TOOLS_MISSING_REASON);
+    expect(p?.work.finished).toBe(true);
+    expect(finished).toEqual([{ productionId: id, versionId: null, stage: 'failed', reason: PRODUCTION_TOOLS_MISSING_REASON }]);
+    expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('failed');
+  });
+
+  it('spec-stage failed_checks has no version to show: versionId null', async () => {
+    const { id } = await produce();
+    const drafter = drafterOf([ungrounded()]);
+    const r = run({ drafter: drafter.fn });
+    expect(await r.promise).toMatchObject({ failedChecks: 1 });
+    expect(drafter.calls).toHaveLength(3);
+    expect((await loadProduction(B, id))?.findings[0]).toMatchObject({ check: 'spec', code: 'ungrounded_number' });
+    expect(r.finished).toEqual([{ productionId: id, versionId: null, stage: 'failed_checks', reason: null }]);
+  });
+
+  it('failed_checks after two built versions and a spec failure: the stale version is NOT passed', async () => {
+    const { id } = await produce();
+    const r = run({ drafter: drafterOf([letter(BAD_TITLE), letter(BAD_TITLE), ungrounded()]).fn });
+    expect(await r.promise).toMatchObject({ failedChecks: 1 });
+    expect((await latestVersion(id))?.versionNo).toBe(2);
+    expect(r.finished[0]).toMatchObject({ stage: 'failed_checks', versionId: null });
+  });
+
+  it('failed after a version was built: versionId null', async () => {
+    const { id } = await produce();
+    const judge: DocJudge = async () => {
+      throw new Error('sdk down');
+    };
+    const r = run({ drafter: drafterOf([letter()]).fn, judge });
+    expect(await r.promise).toMatchObject({ failed: 1 });
+    expect((await latestVersion(id))?.versionNo).toBe(1);
+    expect(r.finished[0]).toMatchObject({ stage: 'failed', versionId: null, reason: 'הבדיקה השנייה של המסמך נכשלה' });
+  });
+
+  it('a built file missing from disk on resume ends failed with the file-changed reason', async () => {
+    const { id } = await produce();
+    const drafter = drafterOf([letter()]);
+    await run({ drafter: drafter.fn, checkpoint: crashAt('version_saved') }).promise;
+    const v = await latestVersion(id);
+    await rm(join(root, v!.storedPath));
+    const result = await run({ drafter: drafter.fn }).promise;
+    expect(result).toMatchObject({ failed: 1, errored: [] });
+    expect((await loadProduction(B, id))?.work.reason).toBe(FILE_CHANGED_REASON);
+  });
+
+  it('invariant breaks end failed with render_failed, never an endless errored', async () => {
+    const noDraft = await produce();
+    await getPool().query(`UPDATE document_productions SET stage = 'building', work = $2 WHERE production_id = $1`, [
+      noDraft.id,
+      { ...EMPTY_WORK, drafted: true, memoryIds: [] },
+    ]);
+    const noVersion = await produce();
+    await getPool().query(`UPDATE document_productions SET stage = 'check1', work = $2 WHERE production_id = $1`, [
+      noVersion.id,
+      { ...EMPTY_WORK, drafted: true, memoryIds: [] },
+    ]);
+    const result = await run({ drafter: drafterOf([letter()]).fn }).promise;
+    expect(result).toMatchObject({ failed: 2, errored: [] });
+    for (const id of [noDraft.id, noVersion.id]) {
+      const p = await loadProduction(B, id);
+      expect(p?.stage).toBe('failed');
+      expect(p?.work.reason).toBe(RENDER_ERROR_HE.render_failed);
+    }
+  });
+
+  it('a vanished origin job is reported and the production still terminates', async () => {
+    const { id } = await produce({ originJobId: 'J-gone' });
+    const r = run({ drafter: drafterOf([letter()]).fn });
+    expect(await r.promise).toMatchObject({ ready: 1, errored: [], originJobMissing: [id] });
+    expect((await loadProduction(B, id))?.work.finished).toBe(true);
+    expect(r.finished).toHaveLength(1);
+    // Next pass: nothing left to finish.
+    expect(await run({ drafter: drafterOf([letter()]).fn }).promise).toMatchObject({
+      ready: 0,
+      errored: [],
+      originJobMissing: [],
+    });
+  });
+
+  it('the drafter and the judge receive the deadline signal, and it aborts on timeout', async () => {
+    await produce();
+    let seen: AbortSignal | undefined;
+    const hang: Drafter = async (_request, signal) => {
+      seen = signal;
+      return new Promise(() => {});
+    };
+    await run({ drafter: hang, deadlines: { draft: 20 } }).promise;
+    expect(seen).toBeInstanceOf(AbortSignal);
+    expect(seen!.aborted).toBe(true);
+
+    await produce();
+    let judgeSignal: AbortSignal | undefined;
+    const judge: DocJudge = async (request, signal) => {
+      judgeSignal = signal;
+      return passingJudge(request);
+    };
+    await run({ drafter: drafterOf([letter()]).fn, judge }).promise;
+    expect(judgeSignal).toBeInstanceOf(AbortSignal);
+    expect(judgeSignal!.aborted).toBe(false);
+  });
+
+  it('a stage whose deadlines exceed the remaining budget is not started (after the first)', async () => {
+    const { id } = await produce();
+    let t = 0;
+    const drafter = drafterOf([letter()]);
+    const slow: Drafter = async (request) => {
+      t += 50_000; // 70s left: enough for the render (60s), not for the page render (90s)
+      return drafter.fn(request);
+    };
+    const r = run({ drafter: slow, clock: () => t, budgetMs: 120_000 });
+    await r.promise;
+    expect((await loadProduction(B, id))?.stage).toBe('check1');
+    expect(r.renderer.calls).toHaveLength(0);
+  });
+
+  it('a stored check 1 is reused on resume: check 1 does not run again, pages re-rendered once for check 2', async () => {
+    const { id } = await produce();
+    let checks = 0;
+    const check1 = async (input: Check1Input) => {
+      checks += 1;
+      return runCheck1(input);
+    };
+    await run({ drafter: drafterOf([letter()]).fn, check1, checkpoint: crashAt('check1_saved') }).promise;
+    expect((await loadProduction(B, id))?.stage).toBe('check1');
+    const second = run({ drafter: drafterOf([letter()]).fn, check1 });
+    expect(await second.promise).toMatchObject({ ready: 1 });
+    expect(checks).toBe(1);
+    expect(second.renderer.calls).toHaveLength(1);
+  });
+
+  it('a stored check 2 is reused on resume: the judge is not paid twice', async () => {
+    const { id } = await produce();
+    let judged = 0;
+    const judge: DocJudge = async (request) => {
+      judged += 1;
+      return passingJudge(request);
+    };
+    await run({ drafter: drafterOf([letter()]).fn, judge, checkpoint: crashAt('check2_saved') }).promise;
+    expect((await loadProduction(B, id))?.stage).toBe('check2');
+    const second = run({ drafter: drafterOf([letter()]).fn, judge });
+    expect(await second.promise).toMatchObject({ ready: 1 });
+    expect(judged).toBe(1);
+    expect(second.renderer.calls).toHaveLength(0);
   });
 });

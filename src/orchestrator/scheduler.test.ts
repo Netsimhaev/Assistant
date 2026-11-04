@@ -549,7 +549,7 @@ describe('the document production loop runs in the pass, right after the plans',
     });
   }
 
-  it('does not run (null, not zeros) when the runtime has no production tools; the request stays queued', async () => {
+  it('does not run (null, not zeros) without production tools, and the request ends failed instead of waiting', async () => {
     const bundle = await install();
     const id = await queuedProduction(bundle);
     const unavailable = await schedulerPass({
@@ -562,10 +562,12 @@ describe('the document production loop runs in the pass, right after the plans',
     const absent = await schedulerPass({ businessId: BUSINESS, now: NOON, runtime: inert() });
     expect(absent.documentProductions).toBeNull();
     const { loadProduction } = await import('../production/store.js');
-    expect((await loadProduction(BUSINESS, id))?.stage).toBe('queued');
+    const p = await loadProduction(BUSINESS, id);
+    expect(p?.stage).toBe('failed');
+    expect(p?.work.reason).toBe('כלי ההפקה אינו מותקן בשרת');
   });
 
-  it('drives a queued production to ready in the same pass when the seams are present', async () => {
+  it('drives a queued production through the pass right after the plans, and to ready on the next pass', async () => {
     const { mkdtemp, rm } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -574,11 +576,7 @@ describe('the document production loop runs in the pass, right after the plans',
     const id = await queuedProduction(bundle);
     const root = await mkdtemp(join(tmpdir(), 'sched-produced-'));
     try {
-      const result = await schedulerPass({
-        businessId: BUSINESS,
-        now: NOON,
-        runtime: inert(),
-        production: {
+      const production: NonNullable<Parameters<typeof schedulerPass>[0]>['production'] = {
           documentRoot: root,
           drafter: async () => ({
             status: 'drafted',
@@ -607,11 +605,16 @@ describe('the document production loop runs in the pass, right after the plans',
               (cid) => ({ id: cid, statement: cid, severity: 'must' as const, passed: true, detail: '' }),
             ),
           }),
-        },
-      });
-      expect(result.documentProductionsError).toBeNull();
-      expect(result.documentProductions).toMatchObject({ ready: 1, errored: [] });
+      };
+      // Pass 1: draft, build and check 1. Check 2 (the judge, 120s) does not fit
+      // the rest of a 120s budget, so it waits for the next pass (loop.ts, Budget).
+      const first = await schedulerPass({ businessId: BUSINESS, now: NOON, runtime: inert(), production });
+      expect(first.documentProductionsError).toBeNull();
+      expect(first.documentProductions).toMatchObject({ ready: 0, errored: [] });
       const { loadProduction } = await import('../production/store.js');
+      expect((await loadProduction(BUSINESS, id))?.stage).toBe('check2');
+      const result = await schedulerPass({ businessId: BUSINESS, now: NOON, runtime: inert(), production });
+      expect(result.documentProductions).toMatchObject({ ready: 1, errored: [] });
       expect((await loadProduction(BUSINESS, id))?.stage).toBe('ready');
     } finally {
       await rm(root, { recursive: true, force: true });

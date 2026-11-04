@@ -48,6 +48,7 @@ import type { PolicyBundle } from '../domain/policy.js';
 import type { TrustLevel } from '../domain/trust.js';
 import { FORMULA_FUNCTIONS } from '../production/formula.js';
 import { CAPS, CONTRACT_DISCLAIMER_HE, EXEMPT_LITERALS } from '../production/validate-spec.js';
+import { linkedAbortController } from '../util/abort.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { buildFence, stripFenceMarkers, type Fence } from '../util/fence.js';
 import { extractJsonObjects } from '../util/json-extract.js';
@@ -359,18 +360,33 @@ function refuseUnderTest(): void {
   );
 }
 
-export async function draftDocumentSpec(request: DraftRequest): Promise<DraftOutcome> {
-  refuseUnderTest();
+/**
+ * The live call with the SDK's `query` injected — the seam a test stubs to
+ * see that `signal` reaches `options.abortController`. No test guard here:
+ * `draftDocumentSpec` is the guarded default.
+ */
+export async function draftWithQuery(
+  request: DraftRequest,
+  signal: AbortSignal | undefined,
+  run: typeof query,
+): Promise<DraftOutcome> {
   const { prompt, options } = buildDraftCall(request);
+  const abortController = linkedAbortController(signal);
   let raw = '';
   let failure: string | null = null;
-  for await (const message of query({ prompt, options })) {
+  for await (const message of run({ prompt, options: { ...options, abortController } })) {
     if (message.type !== 'result') continue;
     if (message.subtype === 'success') raw = message.result;
     else failure = `model call ended with ${message.subtype}`;
   }
   if (raw === '' && failure !== null) return { status: 'undrafted', reason: failure };
   return interpretDraftResponse(raw, request);
+}
+
+/** `signal`: the caller's deadline — aborting it aborts the SDK call, so nothing runs (or bills) past it. */
+export async function draftDocumentSpec(request: DraftRequest, signal?: AbortSignal): Promise<DraftOutcome> {
+  refuseUnderTest();
+  return draftWithQuery(request, signal, query);
 }
 
 export type Drafter = typeof draftDocumentSpec;

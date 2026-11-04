@@ -1,0 +1,16 @@
+-- 054_production_work.sql
+--
+-- A production's working record, apart from its findings. `findings` (053)
+-- holds the most recent failing findings only — what the card shows. `work`
+-- holds what one stage hands the next across a crash: whether the first
+-- draft was started (the daily cap counts it), the memory ids the drafter
+-- saw, the spec waiting to be built, the previous attempt for a fix round,
+-- the failure reason and whether the terminal side effects ran
+-- (`src/production/store.ts`, `ProductionWork`).
+--
+-- `work` carries the drafted spec — content that can name a person — so the
+-- erasure must reach it (Task 16).
+--
+-- A new migration and not an edit of 053: the runner is keyed by file name,
+-- and a database that already ran 053 would never see the edit.
+ALTER TABLE document_productions ADD COLUMN work JSONB NOT NULL DEFAULT '{}'::jsonb;

@@ -9,6 +9,7 @@ import {
   DRAFTER_MODEL_DEEP,
   DRAFTER_MODEL_DEFAULT,
   draftDocumentSpec,
+  draftWithQuery,
   interpretDraftResponse,
   pickDrafterModel,
   renderFormatCatalogue,
@@ -267,5 +268,39 @@ describe('interpreting the reply', () => {
 describe('the live call', () => {
   it('refuses under test when called live', async () => {
     await expect(draftDocumentSpec(request())).rejects.toThrow(/NODE_ENV=test/);
+  });
+});
+
+describe('draftWithQuery: the caller signal reaches the SDK query', () => {
+  it('aborting the signal aborts options.abortController; a pre-aborted signal arrives aborted', async () => {
+    let captured: AbortController | undefined;
+    const stubQuery = ((args: { options?: { abortController?: AbortController } }) => {
+      captured = args.options?.abortController;
+      return (async function* () {
+        await new Promise<void>((resolve) => captured?.signal.addEventListener('abort', () => resolve()));
+        yield { type: 'result', subtype: 'error_during_execution' };
+      })();
+    }) as never;
+    const controller = new AbortController();
+    const running = draftWithQuery(request(), controller.signal, stubQuery);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(captured).toBeInstanceOf(AbortController);
+    expect(captured!.signal.aborted).toBe(false);
+    controller.abort();
+    const outcome = await running;
+    expect(captured!.signal.aborted).toBe(true);
+    expect(outcome.status).not.toBe('drafted');
+
+    const pre = new AbortController();
+    pre.abort();
+    let early: AbortController | undefined;
+    const once = ((args: { options?: { abortController?: AbortController } }) => {
+      early = args.options?.abortController;
+      return (async function* () {
+        yield { type: 'result', subtype: 'error_during_execution' };
+      })();
+    }) as never;
+    await draftWithQuery(request(), pre.signal, once);
+    expect(early!.signal.aborted).toBe(true);
   });
 });

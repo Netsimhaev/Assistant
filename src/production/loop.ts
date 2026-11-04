@@ -18,8 +18,27 @@
  * `validateSpec` accepted (`work.draft`); `building` writes the file and its
  * `document_versions` row, whose id is deterministic per version number, so
  * a crash between the write and the stage move re-uses the row (no second
- * render); `check1`/`check2` store their results on the version. A crash
- * DURING a model call re-runs it — the one call that was not finished.
+ * render); `check1`/`check2` store their results on the version, and a
+ * resumed stage that finds its result already stored uses it instead of
+ * paying again. A crash DURING a model call re-runs it — the one call that
+ * was not finished. The working record lives in the `work` column (054);
+ * `findings` holds the last failing findings only.
+ *
+ * **One page render per attempt.** Check 1 renders the pages once (with the
+ * pages earlier attempts flagged) and check 2 judges those same images in the
+ * same drive; only a resume into `check2` renders again.
+ *
+ * **Deterministic failures terminate.** A built file missing or changed on
+ * disk ends `failed` with `FILE_CHANGED_REASON`; a broken invariant (building
+ * with no stored draft, a check with no version for this attempt) ends
+ * `failed` with `render_failed` — never an `errored` that repeats each pass.
+ * An origin job that no longer exists is reported (`originJobMissing`) and
+ * the production still finishes.
+ *
+ * **Missing tools.** Without a printer and page renderer the pass returns
+ * `null` ("did not run"), but every claimable non-terminal production ends
+ * `failed` with `PRODUCTION_TOOLS_MISSING_REASON` and is finished (origin job
+ * failed, `onFinished` called), so no request waits forever.
  *
  * **Grounding is against what the drafter saw.** The sources are the
  * production's own `source_document_ids` (this business only), the
@@ -56,12 +75,22 @@
  *
  * **Every external call is raced against a deadline** (`withDeadline`):
  * draft 180s, render 60s, page render 90s, judge 120s. A deadline that fires
- * aborts the signal handed to the call and ends the production `failed`.
+ * aborts the signal handed to the call — the drafter and the judge pass it to
+ * the SDK as `abortController`, so the billed call stops too — and ends the
+ * production `failed`.
  *
- * **Budget.** A pass stops starting stages once `budgetMs` has elapsed; the
- * production in hand keeps its stage and the rest stay where they are.
+ * **Budget.** A stage starts only if the remaining budget covers that
+ * stage's deadlines (`stageCostMs`: draft 180s, build 60s, check 1 90s,
+ * check 2 210s, or 120s when check 1's pages are in hand); stages with no
+ * external call cost 0. The FIRST costed stage of a pass is exempt — the
+ * draft alone (180s) exceeds the default budget (120s), and without the
+ * exemption nothing would ever be drafted. True upper bound on one pass:
+ * `max(budgetMs, largest stage cost)` plus database time — 210s with the
+ * defaults. The cost: a production usually needs two passes (draft, build
+ * and check 1 in one; check 2 in the next).
  */
 import { createHash } from 'node:crypto';
+import { z } from 'zod';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { loadActiveCharter, type ActiveCharter } from '../charter/store.js';
@@ -75,7 +104,7 @@ import { productionStageLabel } from '../domain/labels.js';
 import type { TrustLevel } from '../domain/trust.js';
 import { withDeadline } from '../governance/notify.js';
 import { recallMemories } from '../memory/store.js';
-import { PhaseMovedError, transition } from '../orchestrator/jobs.js';
+import { loadJob, PhaseMovedError, transition } from '../orchestrator/jobs.js';
 import type { Runtime } from '../orchestrator/runtime.js';
 import { MAX_MEMORIES, type DraftMemory, type Drafter, type FencedSource } from '../sdk/doc-drafter.js';
 import { DOC_JUDGE_REQUIRED_CRITERIA, type DocJudge } from '../sdk/doc-judge.js';
@@ -84,7 +113,7 @@ import { localParts } from '../util/local-time.js';
 import { runCheck1, type Check1Finding, type Check1Result } from './check1.js';
 import type { PageImages, PageRenderer } from './page-images.js';
 import { createDbImageLoader, renderDocx } from './render-docx.js';
-import { renderErrorReason, RENDER_ERROR_HE } from './render-error.js';
+import { PRODUCTION_TOOLS_MISSING_REASON, renderErrorReason, RENDER_ERROR_HE } from './render-error.js';
 import { renderHtml, type PdfAssets } from './render-html.js';
 import { loadPdfAssets, renderPdfWithHtml, type PdfPrinter } from './render-pdf.js';
 import { renderPptx } from './render-pptx.js';
@@ -104,7 +133,7 @@ import {
   versionIdFor,
   type DocumentVersion,
   type Production,
-  type ProductionFinding,
+  ProductionFinding,
   type ProductionWork,
 } from './store.js';
 import type { GroundingSources, SpecProblem, SpecProblemCode } from './validate-spec.js';
@@ -196,9 +225,11 @@ export interface RunProductionsOptions {
   leaseMs?: number;
   deadlines?: Partial<StageDeadlines>;
   /** Test seam: a throw here simulates a crash at that point. */
-  checkpoint?: (event: 'version_saved', productionId: string) => Promise<void> | void;
+  checkpoint?: (event: CheckpointEvent, productionId: string) => Promise<void> | void;
   db?: Queryable;
 }
+
+export type CheckpointEvent = 'version_saved' | 'check1_saved' | 'check2_saved';
 
 export interface RunProductionsResult {
   /** Stage moves made this pass. */
@@ -209,6 +240,8 @@ export interface RunProductionsResult {
   /** Lost races: a stage someone else moved, an origin job someone else moved. */
   skipped: number;
   errored: { productionId: string; error: string }[];
+  /** Productions that finished although their origin job no longer exists. */
+  originJobMissing: string[];
 }
 
 class StageTimeout extends Error {
@@ -361,25 +394,37 @@ interface Ctx {
   today: () => string;
   now: () => Date;
   result: RunProductionsResult;
+  /** Pages check 1 rendered this pass, by version id — check 2 judges the same images. */
+  pages: Map<string, PageImages>;
 }
 
 type StepOutcome = 'moved' | 'lost';
 
-async function move(
-  ctx: Ctx,
-  p: Production,
-  to: ProductionStage,
-  work: ProductionWork,
-  attempt?: number,
-): Promise<StepOutcome> {
-  const ok = await advanceStage(p.productionId, p.stage, to, { work, ...(attempt === undefined ? {} : { attempt }) }, ctx.db);
+interface MoveOptions {
+  work?: ProductionWork;
+  findings?: ProductionFinding[];
+  attempt?: number;
+}
+
+async function move(ctx: Ctx, p: Production, to: ProductionStage, o: MoveOptions = {}): Promise<StepOutcome> {
+  const ok = await advanceStage(
+    p.productionId,
+    p.stage,
+    to,
+    {
+      work: o.work ?? p.work,
+      ...(o.findings === undefined ? {} : { findings: o.findings }),
+      ...(o.attempt === undefined ? {} : { attempt: o.attempt }),
+    },
+    ctx.db,
+  );
   if (!ok) return 'lost';
   ctx.result.advanced += 1;
   return 'moved';
 }
 
-async function fail(ctx: Ctx, p: Production, reason: string, work: ProductionWork = p.work): Promise<StepOutcome> {
-  return move(ctx, p, 'failed', { ...work, reason });
+async function fail(ctx: Ctx, p: Production, reason: string, o: MoveOptions = {}): Promise<StepOutcome> {
+  return move(ctx, p, 'failed', { ...o, work: { ...(o.work ?? p.work), reason } });
 }
 
 async function capReached(ctx: Ctx): Promise<boolean> {
@@ -394,16 +439,23 @@ async function failAttempt(
   spec: DocumentSpec,
   findings: ProductionFinding[],
 ): Promise<StepOutcome> {
-  const base: ProductionWork = { ...p.work, draft: null, findings };
-  if (p.attempt >= MAX_FIX_ATTEMPTS) return move(ctx, p, 'failed_checks', base);
-  if (await capReached(ctx)) return fail(ctx, p, productionCapReason(ctx.perDay), base);
-  return move(ctx, p, 'fixing', { ...base, previous: { spec, findings: forDrafter(findings) } }, p.attempt + 1);
+  const work: ProductionWork = { ...p.work, draft: null };
+  if (p.attempt >= MAX_FIX_ATTEMPTS) return move(ctx, p, 'failed_checks', { work, findings });
+  if (await capReached(ctx)) return fail(ctx, p, productionCapReason(ctx.perDay), { work, findings });
+  return move(ctx, p, 'fixing', {
+    work: { ...work, previous: { spec, findings: forDrafter(findings) } },
+    findings,
+    attempt: p.attempt + 1,
+  });
 }
+
+/** A broken invariant: deterministic, so it terminates the production instead of repeating as `errored`. */
+class InvariantBroken extends Error {}
 
 async function stepQueued(ctx: Ctx, p: Production): Promise<StepOutcome> {
   if (await capReached(ctx)) return fail(ctx, p, productionCapReason(ctx.perDay));
   const memoryIds = p.work.memoryIds ?? (await recallFor(p, ctx.db));
-  return move(ctx, p, 'drafting', { ...p.work, drafted: true, memoryIds });
+  return move(ctx, p, 'drafting', { work: { ...p.work, drafted: true, memoryIds } });
 }
 
 async function stepDrafting(ctx: Ctx, p: Production): Promise<StepOutcome> {
@@ -412,20 +464,23 @@ async function stepDrafting(ctx: Ctx, p: Production): Promise<StepOutcome> {
   const previousSpec = p.work.previous === null ? null : DocumentSpec.safeParse(p.work.previous.spec);
   let outcome: Awaited<ReturnType<Drafter>>;
   try {
-    outcome = await timed('draft', ctx.deadlines.draft, () =>
-      ctx.drafter({
-        bundle: ctx.active.bundle,
-        instruction: p.instructionText,
-        format: p.format,
-        language: p.language,
-        kind: p.kind,
-        sources: sources.fenced,
-        memories: sources.memories,
-        today,
-        ...(previousSpec?.success === true && p.work.previous !== null
-          ? { previous: { spec: previousSpec.data, findings: p.work.previous.findings } }
-          : {}),
-      }),
+    outcome = await timed('draft', ctx.deadlines.draft, (signal) =>
+      ctx.drafter(
+        {
+          bundle: ctx.active.bundle,
+          instruction: p.instructionText,
+          format: p.format,
+          language: p.language,
+          kind: p.kind,
+          sources: sources.fenced,
+          memories: sources.memories,
+          today,
+          ...(previousSpec?.success === true && p.work.previous !== null
+            ? { previous: { spec: previousSpec.data, findings: p.work.previous.findings } }
+            : {}),
+        },
+        signal,
+      ),
     );
   } catch (err) {
     return fail(ctx, p, err instanceof StageTimeout ? TIMEOUT_REASON.draft : DRAFT_FAILED_REASON);
@@ -437,7 +492,7 @@ async function stepDrafting(ctx: Ctx, p: Production): Promise<StepOutcome> {
   }
   const problems = validateSpec(spec, sources.grounding, { today });
   if (problems.length > 0) return failAttempt(ctx, p, spec, specFindings(problems));
-  return move(ctx, p, 'building', { ...p.work, draft: spec, findings: [] });
+  return move(ctx, p, 'building', { work: { ...p.work, draft: spec }, findings: [] });
 }
 
 function relativeFilePath(p: Production, versionId: string, ext: string): string {
@@ -447,10 +502,10 @@ function relativeFilePath(p: Production, versionId: string, ext: string): string
 async function stepBuilding(ctx: Ctx, p: Production): Promise<StepOutcome> {
   const versionNo = p.attempt + 1;
   const existing = await latestVersion(p.productionId, ctx.db);
-  if (existing?.versionNo === versionNo) return move(ctx, p, 'check1', { ...p.work, draft: null });
+  if (existing?.versionNo === versionNo) return move(ctx, p, 'check1', { work: { ...p.work, draft: null } });
 
   const parsed = DocumentSpec.safeParse(p.work.draft);
-  if (!parsed.success) throw new Error(`production ${p.productionId} is in building with no stored draft`);
+  if (!parsed.success) throw new InvariantBroken(`production ${p.productionId} is in building with no stored draft`);
   const spec = parsed.data;
   let bytes: Buffer;
   try {
@@ -489,17 +544,28 @@ async function stepBuilding(ctx: Ctx, p: Production): Promise<StepOutcome> {
     ctx.db,
   );
   await ctx.checkpoint('version_saved', p.productionId);
-  return move(ctx, p, 'check1', { ...p.work, draft: null });
+  return move(ctx, p, 'check1', { work: { ...p.work, draft: null } });
 }
 
-async function currentVersion(ctx: Ctx, p: Production): Promise<{ version: DocumentVersion; bytes: Buffer } | null> {
+/** The version this attempt built — or an invariant break. */
+async function attemptVersion(ctx: Ctx, p: Production): Promise<DocumentVersion> {
   const version = await latestVersion(p.productionId, ctx.db);
   if (version === null || version.versionNo !== p.attempt + 1) {
-    throw new Error(`production ${p.productionId} is in ${p.stage} with no version ${p.attempt + 1}`);
+    throw new InvariantBroken(`production ${p.productionId} is in ${p.stage} with no version ${p.attempt + 1}`);
   }
-  const bytes = await readFile(join(ctx.documentRoot, version.storedPath));
-  if (createHash('sha256').update(bytes).digest('hex') !== version.sha256) return null;
-  return { version, bytes };
+  return version;
+}
+
+/** The file's bytes, or `null` when it is missing or no longer matches the version's sha256. */
+async function versionBytes(ctx: Ctx, version: DocumentVersion): Promise<Buffer | null> {
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(join(ctx.documentRoot, version.storedPath));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  return createHash('sha256').update(bytes).digest('hex') === version.sha256 ? bytes : null;
 }
 
 async function renderPages(
@@ -516,15 +582,40 @@ async function renderPages(
   }
 }
 
+async function flaggedSoFar(ctx: Ctx, productionId: string): Promise<number[]> {
+  const { rows } = await ctx.db.query<{ check1: { flaggedPages?: number[] } | null }>(
+    'SELECT check1 FROM document_versions WHERE production_id = $1',
+    [productionId],
+  );
+  const pages = new Set<number>();
+  for (const r of rows) for (const n of r.check1?.flaggedPages ?? []) if (Number.isInteger(n)) pages.add(n);
+  return [...pages].sort((a, b) => a - b);
+}
+
+const StoredCheck1 = z.object({
+  passed: z.boolean(),
+  findings: z.array(z.object({ code: z.string(), where: z.string(), he: z.string() })),
+});
+const StoredCheck2 = z.object({ passed: z.boolean(), findings: z.array(ProductionFinding) });
+
 async function stepCheck1(ctx: Ctx, p: Production): Promise<StepOutcome> {
-  const current = await currentVersion(ctx, p);
-  if (current === null) return fail(ctx, p, FILE_CHANGED_REASON);
-  const { version, bytes } = current;
+  const version = await attemptVersion(ctx, p);
   const spec = version.spec;
+
+  // Resumed after the result was stored: use it, do not pay again.
+  const stored = StoredCheck1.safeParse(version.check1);
+  if (stored.success) {
+    if (!stored.data.passed) return failAttempt(ctx, p, spec, check1Findings(stored.data.findings as Check1Finding[]));
+    return move(ctx, p, 'check2', { findings: [] });
+  }
+
+  const bytes = await versionBytes(ctx, version);
+  if (bytes === null) return fail(ctx, p, FILE_CHANGED_REASON);
   const sources = await loadSources(p, p.work.memoryIds ?? [], ctx.db);
   const today = ctx.today();
 
-  const pages = await renderPages(ctx, { format: spec.format, bytes }, []);
+  // Rendered once for this attempt: check 1 reads the text, check 2 the images.
+  const pages = await renderPages(ctx, { format: spec.format, bytes }, await flaggedSoFar(ctx, p.productionId));
   if ('failed' in pages) return fail(ctx, p, pages.failed);
   const rendered = { text: pages.text, pageCount: pages.pageCount, textTruncated: pages.textTruncated };
 
@@ -536,47 +627,54 @@ async function stepCheck1(ctx: Ctx, p: Production): Promise<StepOutcome> {
   } else {
     result = await ctx.check1({ spec, bytes, sources: sources.grounding, rendered, today, currency: ctx.currency });
   }
-  const findings = check1Findings(result.findings);
   await saveVersionCheck(
     version.versionId,
     'check1',
     { passed: result.passed, findings: result.findings, pageCount: pages.pageCount, flaggedPages: flaggedPagesOf(result.findings) },
     ctx.db,
   );
-  if (!result.passed) return failAttempt(ctx, p, spec, findings);
-  return move(ctx, p, 'check2', { ...p.work, findings: [] });
-}
-
-async function flaggedSoFar(ctx: Ctx, productionId: string): Promise<number[]> {
-  const { rows } = await ctx.db.query<{ check1: { flaggedPages?: number[] } | null }>(
-    'SELECT check1 FROM document_versions WHERE production_id = $1',
-    [productionId],
-  );
-  const pages = new Set<number>();
-  for (const r of rows) for (const n of r.check1?.flaggedPages ?? []) if (Number.isInteger(n)) pages.add(n);
-  return [...pages].sort((a, b) => a - b);
+  await ctx.checkpoint('check1_saved', p.productionId);
+  if (!result.passed) return failAttempt(ctx, p, spec, check1Findings(result.findings));
+  ctx.pages.set(version.versionId, pages);
+  return move(ctx, p, 'check2', { findings: [] });
 }
 
 async function stepCheck2(ctx: Ctx, p: Production): Promise<StepOutcome> {
-  const current = await currentVersion(ctx, p);
-  if (current === null) return fail(ctx, p, FILE_CHANGED_REASON);
-  const { version, bytes } = current;
+  const version = await attemptVersion(ctx, p);
   const spec = version.spec;
 
-  const pages = await renderPages(ctx, { format: spec.format, bytes }, await flaggedSoFar(ctx, p.productionId));
-  if ('failed' in pages) return fail(ctx, p, pages.failed);
+  const stored = StoredCheck2.safeParse(version.check2);
+  if (stored.success) {
+    if (!stored.data.passed) return failAttempt(ctx, p, spec, stored.data.findings);
+    return move(ctx, p, 'ready', { findings: [] });
+  }
+
+  let pages = ctx.pages.get(version.versionId) ?? null;
+  if (pages === null) {
+    // A resume into check 2: the pages check 1 rendered are gone with the process.
+    const bytes = await versionBytes(ctx, version);
+    if (bytes === null) return fail(ctx, p, FILE_CHANGED_REASON);
+    const rendered = await renderPages(ctx, { format: spec.format, bytes }, await flaggedSoFar(ctx, p.productionId));
+    if ('failed' in rendered) return fail(ctx, p, rendered.failed);
+    pages = rendered;
+  }
+  ctx.pages.delete(version.versionId);
+  const seen = pages;
 
   let outcome: Awaited<ReturnType<DocJudge>>;
   try {
-    outcome = await timed('judge', ctx.deadlines.judge, () =>
-      ctx.judge({
-        bundle: ctx.active.bundle,
-        instruction: p.instructionText,
-        kind: p.kind,
-        language: p.language,
-        text: pages.text,
-        pages: pages.pages,
-      }),
+    outcome = await timed('judge', ctx.deadlines.judge, (signal) =>
+      ctx.judge(
+        {
+          bundle: ctx.active.bundle,
+          instruction: p.instructionText,
+          kind: p.kind,
+          language: p.language,
+          text: seen.text,
+          pages: seen.pages,
+        },
+        signal,
+      ),
     );
   } catch (err) {
     return fail(ctx, p, err instanceof StageTimeout ? TIMEOUT_REASON.judge : JUDGE_FAILED_REASON);
@@ -584,9 +682,10 @@ async function stepCheck2(ctx: Ctx, p: Production): Promise<StepOutcome> {
 
   // The card's preview: check 2's first page, stored beside the version.
   let previewPath: string | null = null;
-  const first = pages.pages[0];
+  const first = seen.pages[0];
   if (first !== undefined) {
     previewPath = relativeFilePath(p, version.versionId, 'preview.png');
+    await mkdir(dirname(join(ctx.documentRoot, previewPath)), { recursive: true });
     await writeFile(join(ctx.documentRoot, previewPath), first);
   }
 
@@ -611,14 +710,16 @@ async function stepCheck2(ctx: Ctx, p: Production): Promise<StepOutcome> {
     {
       passed,
       status: outcome.status,
+      findings,
       criteria: outcome.status === 'judged' ? outcome.criteria : [],
-      pageCount: pages.pageCount,
+      pageCount: seen.pageCount,
       previewPath,
     },
     ctx.db,
   );
+  await ctx.checkpoint('check2_saved', p.productionId);
   if (!passed) return failAttempt(ctx, p, spec, findings);
-  return move(ctx, p, 'ready', { ...p.work, findings: [] });
+  return move(ctx, p, 'ready', { findings: [] });
 }
 
 async function step(ctx: Ctx, p: Production): Promise<StepOutcome> {
@@ -634,11 +735,31 @@ async function step(ctx: Ctx, p: Production): Promise<StepOutcome> {
     case 'check2':
       return stepCheck2(ctx, p);
     case 'fixing':
-      return move(ctx, p, 'drafting', p.work);
+      return move(ctx, p, 'drafting');
     case 'ready':
     case 'failed_checks':
     case 'failed':
-      throw new Error(`step called on terminal stage ${p.stage}`);
+      throw new InvariantBroken(`step called on terminal stage ${p.stage}`);
+  }
+}
+
+/** What a stage may spend on external calls — the deadlines it can run into. */
+export function stageCostMs(stage: ProductionStage, deadlines: StageDeadlines, pagesInHand: boolean): number {
+  switch (stage) {
+    case 'drafting':
+      return deadlines.draft;
+    case 'building':
+      return deadlines.render;
+    case 'check1':
+      return deadlines.pageRender;
+    case 'check2':
+      return (pagesInHand ? 0 : deadlines.pageRender) + deadlines.judge;
+    case 'queued':
+    case 'fixing':
+    case 'ready':
+    case 'failed_checks':
+    case 'failed':
+      return 0;
   }
 }
 
@@ -651,24 +772,41 @@ async function reload(ctx: Ctx, productionId: string): Promise<Production> {
 const isTerminal = (stage: ProductionStage): stage is ProductionFinished['stage'] =>
   stage === 'ready' || stage === 'failed_checks' || stage === 'failed';
 
+/**
+ * The version a finished production hands on: only for `ready` /
+ * `failed_checks`, and only when it belongs to the final attempt — a version
+ * from an earlier attempt (the final draft failed `validateSpec`) is not what
+ * the findings are about.
+ */
+async function finishedVersionId(ctx: Ctx, p: Production): Promise<string | null> {
+  if (p.stage !== 'ready' && p.stage !== 'failed_checks') return null;
+  const version = await latestVersion(p.productionId, ctx.db);
+  return version !== null && version.versionNo === p.attempt + 1 ? version.versionId : null;
+}
+
 /** Origin job, audit row, callback — then `finished`. At least once. */
 async function finish(ctx: Ctx, p: Production): Promise<void> {
   if (!isTerminal(p.stage) || p.work.finished) return;
   const stage = p.stage;
-  const version = await latestVersion(p.productionId, ctx.db);
+  const versionId = await finishedVersionId(ctx, p);
   const reason = stage === 'failed' ? (p.work.reason ?? RENDER_ERROR_HE.render_failed) : null;
 
-  try {
-    await transition(p.originJobId, {
-      to: stage === 'failed' ? 'failed' : 'closed',
-      expectFrom: 'followup',
-      actor: 'orchestrator',
-      reason: stage === 'failed' ? `הפקת המסמך נכשלה: ${reason}` : `הפקת המסמך הסתיימה: ${productionStageLabel[stage]}`,
-      businessId: p.businessId,
-    });
-  } catch (err) {
-    if (!(err instanceof PhaseMovedError)) throw err;
-    ctx.result.skipped += 1;
+  if ((await loadJob(p.originJobId, { businessId: p.businessId, db: ctx.db })) === null) {
+    // Deterministic: reported once, never retried into an endless `errored`.
+    ctx.result.originJobMissing.push(p.productionId);
+  } else {
+    try {
+      await transition(p.originJobId, {
+        to: stage === 'failed' ? 'failed' : 'closed',
+        expectFrom: 'followup',
+        actor: 'orchestrator',
+        reason: stage === 'failed' ? `הפקת המסמך נכשלה: ${reason}` : `הפקת המסמך הסתיימה: ${productionStageLabel[stage]}`,
+        businessId: p.businessId,
+      });
+    } catch (err) {
+      if (!(err instanceof PhaseMovedError)) throw err;
+      ctx.result.skipped += 1;
+    }
   }
 
   await appendAudit(
@@ -688,7 +826,7 @@ async function finish(ctx: Ctx, p: Production): Promise<void> {
     { businessId: p.businessId },
   );
 
-  await ctx.onFinished({ productionId: p.productionId, versionId: version?.versionId ?? null, stage, reason });
+  await ctx.onFinished({ productionId: p.productionId, versionId, stage, reason });
   await saveWork(p.productionId, stage, { ...p.work, finished: true }, ctx.db);
 
   if (stage === 'ready') ctx.result.ready += 1;
@@ -696,15 +834,30 @@ async function finish(ctx: Ctx, p: Production): Promise<void> {
   else ctx.result.failed += 1;
 }
 
+interface Budget {
+  /** May a stage costing `costMs` start now? */
+  allows(costMs: number): boolean;
+}
+
 /**
  * Advance one production until it is terminal, a race is lost, or the budget
- * runs out. Returns false when the budget ran out (the pass should stop).
+ * cannot cover the next stage. Returns false when the budget stopped it (the
+ * pass should stop).
  */
-async function drive(ctx: Ctx, first: Production, hasBudget: () => boolean): Promise<boolean> {
+async function drive(ctx: Ctx, first: Production, budget: Budget): Promise<boolean> {
   let p = first;
   while (!isTerminal(p.stage)) {
-    if (!hasBudget()) return false;
-    if ((await step(ctx, p)) === 'lost') {
+    const version = p.stage === 'check2' ? await latestVersion(p.productionId, ctx.db) : null;
+    const pagesInHand = version !== null && ctx.pages.has(version.versionId);
+    if (!budget.allows(stageCostMs(p.stage, ctx.deadlines, pagesInHand))) return false;
+    let outcome: StepOutcome;
+    try {
+      outcome = await step(ctx, p);
+    } catch (err) {
+      if (!(err instanceof InvariantBroken)) throw err;
+      outcome = await fail(ctx, p, RENDER_ERROR_HE.render_failed);
+    }
+    if (outcome === 'lost') {
       ctx.result.skipped += 1;
       return true;
     }
@@ -718,10 +871,16 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function newResult(): RunProductionsResult {
+  return { advanced: 0, ready: 0, failedChecks: 0, failed: 0, skipped: 0, errored: [], originJobMissing: [] };
+}
+
 /**
  * Run the loop for one business. `null` when production cannot run on this
  * server (`runtime.production` absent or unavailable, and no seams injected)
- * — "did not run", never zeros, which would read as "nothing to do".
+ * — "did not run", never zeros, which would read as "nothing to do". Even
+ * then, every claimable non-terminal production is ended `failed` with
+ * `PRODUCTION_TOOLS_MISSING_REASON` and finished, so none waits forever.
  */
 export async function runDocumentProductions(options: RunProductionsOptions = {}): Promise<RunProductionsResult | null> {
   const businessId = options.businessId ?? config.businessId;
@@ -741,28 +900,29 @@ export async function runDocumentProductions(options: RunProductionsOptions = {}
     printer ??= createChromiumPrinter({ executablePath: tools.chromiumPath! });
     renderer ??= createLocalPageRenderer({ sofficePath: tools.sofficePath!, chromiumPath: tools.chromiumPath! });
   }
-  if (printer === null || renderer === null) return null;
+  const unavailable = printer === null || renderer === null;
 
   const active = await loadActiveCharter(businessId, db);
-  if (active === null) throw new Error(`runDocumentProductions: no active charter for ${businessId}`);
-
-  let drafter = options.drafter;
-  let judge = options.judge;
-  if (drafter === undefined) drafter = (await import('../sdk/doc-drafter.js')).draftDocumentSpec;
-  if (judge === undefined) judge = (await import('../sdk/doc-judge.js')).judgeDocument;
+  if (active === null) {
+    if (unavailable) return null;
+    throw new Error(`runDocumentProductions: no active charter for ${businessId}`);
+  }
 
   const images = options.images ?? createDbImageLoader(businessId, db);
   const now = (): Date => options.now ?? new Date();
-  const result: RunProductionsResult = { advanced: 0, ready: 0, failedChecks: 0, failed: 0, skipped: 0, errored: [] };
+  const result = newResult();
+  const unusable = async (): Promise<never> => {
+    throw new Error('production tools are not available');
+  };
   const ctx: Ctx = {
     businessId,
     db,
     active,
     currency: active.bundle.ceilings.currency,
-    drafter,
-    judge,
-    printer,
-    renderer,
+    drafter: options.drafter ?? (async (request, signal) => (await import('../sdk/doc-drafter.js')).draftDocumentSpec(request, signal)),
+    judge: options.judge ?? (async (request, signal) => (await import('../sdk/doc-judge.js')).judgeDocument(request, signal)),
+    printer: printer ?? unusable,
+    renderer: renderer ?? unusable,
     check1: options.check1 ?? runCheck1,
     pdfAssets: options.pdfAssets ?? ((spec) => loadPdfAssets(spec, { images })),
     images,
@@ -774,12 +934,25 @@ export async function runDocumentProductions(options: RunProductionsOptions = {}
     today: () => localParts(now(), active.charter.identity.timezone).date,
     now,
     result,
+    pages: new Map(),
   };
 
   const clock = options.clock ?? Date.now;
   const started = clock();
   const budgetMs = options.budgetMs ?? DEFAULT_BUDGET_MS;
+  let spentOnce = false;
   const hasBudget = (): boolean => clock() - started < budgetMs;
+  const budget: Budget = {
+    allows(costMs) {
+      if (costMs === 0) return hasBudget();
+      // The first costed stage of the pass always starts — see the docblock.
+      if (!spentOnce) {
+        spentOnce = true;
+        return true;
+      }
+      return budgetMs - (clock() - started) >= costMs;
+    },
+  };
   const holder = options.holder ?? `scheduler-${process.pid}`;
   const leaseMs = options.leaseMs ?? PRODUCTION_LEASE_MS;
   const attempted: string[] = [];
@@ -804,7 +977,13 @@ export async function runDocumentProductions(options: RunProductionsOptions = {}
     attempted.push(p.productionId);
     let keepGoing = true;
     try {
-      keepGoing = await drive(ctx, p, hasBudget);
+      if (unavailable) {
+        // Nothing can be built here: end it now rather than leave it queued forever.
+        if ((await fail(ctx, p, PRODUCTION_TOOLS_MISSING_REASON)) === 'lost') result.skipped += 1;
+        else await finish(ctx, await reload(ctx, p.productionId));
+      } else {
+        keepGoing = await drive(ctx, p, budget);
+      }
     } catch (err) {
       result.errored.push({ productionId: p.productionId, error: errorText(err) });
     } finally {
@@ -812,5 +991,5 @@ export async function runDocumentProductions(options: RunProductionsOptions = {}
     }
     if (!keepGoing) break;
   }
-  return result;
+  return unavailable ? null : result;
 }

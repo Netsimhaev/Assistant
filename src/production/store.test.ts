@@ -132,13 +132,33 @@ describe('production store', () => {
     const b = await createProduction(input());
     const yesterday = await createProduction(input());
     await createProduction(input()); // queued, never drafted: not counted
-    await getPool().query(`UPDATE document_productions SET findings = $2, attempt = 2 WHERE production_id = $1`, [a, drafted]);
-    await getPool().query(`UPDATE document_productions SET findings = $2 WHERE production_id = $1`, [b, drafted]);
+    await getPool().query(`UPDATE document_productions SET work = $2, attempt = 2 WHERE production_id = $1`, [a, drafted]);
+    await getPool().query(`UPDATE document_productions SET work = $2 WHERE production_id = $1`, [b, drafted]);
     await getPool().query(
-      `UPDATE document_productions SET findings = $2, attempt = 1, created_at = '2026-11-03T21:59:00Z' WHERE production_id = $1`,
+      `UPDATE document_productions SET work = $2, attempt = 1, created_at = '2026-11-03T21:59:00Z' WHERE production_id = $1`,
       [yesterday, drafted],
     );
     await getPool().query(`UPDATE document_productions SET created_at = '2026-11-03T22:30:00Z' WHERE production_id <> $1`, [yesterday]);
     expect(await productionsToday(B, TZ, getPool(), now)).toBe(4); // a: 1+2, b: 1
+  });
+
+  it('an unreadable working record fails closed (throws), never reads as empty', async () => {
+    const id = await createProduction(input());
+    expect((await loadProduction(B, id))?.work).toEqual(EMPTY_WORK);
+    await getPool().query(`UPDATE document_productions SET work = '{"drafted":"yes"}' WHERE production_id = $1`, [id]);
+    await expect(loadProduction(B, id)).rejects.toThrow(/unreadable work record/);
+  });
+
+  it('findings live in their own column; advanceStage writes them apart from work', async () => {
+    const id = await createProduction(input());
+    const f = [{ check: 'spec' as const, code: 'cap_exceeded', where: 'document', he: 'x' }];
+    expect(await advanceStage(id, 'queued', 'fixing', { findings: f })).toBe(true);
+    const { rows } = await getPool().query<{ findings: unknown; work: unknown }>(
+      'SELECT findings, work FROM document_productions WHERE production_id = $1',
+      [id],
+    );
+    expect(rows[0]!.findings).toEqual(f);
+    expect(rows[0]!.work).toEqual(EMPTY_WORK);
+    expect((await loadProduction(B, id))?.findings).toEqual(f);
   });
 });

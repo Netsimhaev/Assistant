@@ -9,7 +9,7 @@
  * start a scheduler loop.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { logErrored } from './scheduler-log.js';
+import { logErrored, resetProductionNoticeForTests } from './scheduler-log.js';
 import type { SchedulerPassResult } from './scheduler.js';
 
 /** A clean pass: every bucket empty, every error null. */
@@ -52,7 +52,7 @@ function cleanResult(): SchedulerPassResult {
     ledgerEvidenceError: null,
     ledger: null,
     ledgerError: null,
-    documentProductions: { advanced: 0, ready: 0, failedChecks: 0, failed: 0, skipped: 0, errored: [] },
+    documentProductions: { advanced: 0, ready: 0, failedChecks: 0, failed: 0, skipped: 0, errored: [], originJobMissing: [] },
     documentProductionsError: null,
   };
 }
@@ -254,13 +254,16 @@ describe('logErrored: document production', () => {
     error: vi.spyOn(console, 'error').mockImplementation(() => {}),
   });
 
-  it('"did not run" (null) reads differently from "ran, nothing to do" (zeros, silent)', () => {
+  it('"did not run" (null) reads differently from "ran, nothing to do" (zeros, silent), and prints once per process', () => {
+    resetProductionNoticeForTests();
     const s = spy();
     try {
       logErrored(cleanResult());
       expect(s.log).not.toHaveBeenCalled();
       logErrored({ ...cleanResult(), documentProductions: null });
-      expect(s.log).toHaveBeenCalledWith(expect.stringMatching(/^document production did not run this pass/));
+      logErrored({ ...cleanResult(), documentProductions: null });
+      expect(s.log).toHaveBeenCalledTimes(1);
+      expect(s.log).toHaveBeenCalledWith(expect.stringMatching(/^document production did not run: /));
       expect(s.error).not.toHaveBeenCalled();
     } finally {
       s.log.mockRestore();
@@ -292,12 +295,14 @@ describe('logErrored: document production', () => {
           failed: 1,
           skipped: 0,
           errored: [{ productionId: 'DP-1', error: 'bang' }],
+          originJobMissing: ['DP-2'],
         },
       });
       expect(s.log).toHaveBeenCalledWith(
         'document production: 5 stage move(s), 1 ready, 0 stopped at checks, 1 failed, 0 skipped',
       );
       expect(s.error).toHaveBeenCalledWith('document production DP-1 errored: bang');
+      expect(s.error).toHaveBeenCalledWith('document production DP-2 finished, but its origin job no longer exists');
     } finally {
       s.log.mockRestore();
       s.error.mockRestore();

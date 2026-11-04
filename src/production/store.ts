@@ -2,16 +2,18 @@
  * The production store: one `document_productions` row per request and one
  * `document_versions` row per built file (migration 053).
  *
- * **The `findings` column is the production's working record**, typed here
- * as `ProductionWork` and exposed as `Production.work`. It carries what a
- * stage must hand the next one across a crash — the spec the drafter wrote
- * and `validateSpec` accepted (awaiting a build), the memory ids the drafter
- * saw (so every later stage grounds against the same set), the previous
- * attempt for a fix round — and the most recent findings and failure reason
- * the card shows. One JSON column rather than new columns because migration
- * 053 is the branch's only migration and has already run; the shape is
- * parsed on every read, so a malformed row reads as an empty record rather
- * than as a value nobody checked.
+ * **Two JSON columns, two jobs.** `findings` (053) holds the most recent
+ * failing findings only — what the card shows. `work` (054) is the working
+ * record, `ProductionWork`: what a stage must hand the next one across a
+ * crash — whether the first draft was started, the memory ids the drafter saw
+ * (so every later stage grounds against the same set), the spec
+ * `validateSpec` accepted (awaiting a build), the previous attempt for a fix
+ * round, the failure reason, and whether the terminal side effects ran. Both
+ * are parsed on every read and a malformed row THROWS (fail closed): a
+ * working record nobody can read must not be treated as an empty one, which
+ * would re-draft and pay again, or forget that a production already finished.
+ * `work` holds the drafted spec — content that can name a person — and must
+ * be wired into the erasure (Task 16).
  *
  * **Leases.** `claimProduction` is ONE conditional `UPDATE … RETURNING`: a
  * row is taken only when it is not terminal and its lease is absent or past.
@@ -77,8 +79,6 @@ export const ProductionWork = z
       .strict()
       .nullable()
       .default(null),
-    /** The most recent failing findings (spec, check 1 or check 2). */
-    findings: z.array(ProductionFinding).default([]),
     /** The owner-facing reason a production ended `failed`. */
     reason: z.string().nullable().default(null),
     /** True once the terminal side effects (origin job, audit, `onFinished`) ran. */
@@ -102,8 +102,10 @@ export interface Production {
   sourceDocumentIds: string[];
   stage: ProductionStage;
   attempt: number;
-  /** The `findings` column — see the module docblock. */
+  /** The `work` column — see the module docblock. */
   work: ProductionWork;
+  /** The most recent failing findings (spec, check 1 or check 2); `[]` when none. */
+  findings: ProductionFinding[];
   leaseUntil: Date | null;
   leasedBy: string | null;
   createdAt: Date;
@@ -124,15 +126,25 @@ interface ProductionRow {
   stage: string;
   attempt: number;
   findings: unknown;
+  work: unknown;
   lease_until: Date | null;
   leased_by: string | null;
   created_at: Date;
   updated_at: Date;
 }
 
-function toWork(raw: unknown): ProductionWork {
+/** Fail closed: an unreadable working record is an error, never an empty one. */
+function toWork(productionId: string, raw: unknown): ProductionWork {
   const parsed = ProductionWork.safeParse(raw ?? {});
-  return parsed.success ? parsed.data : { ...EMPTY_WORK };
+  if (!parsed.success) throw new Error(`production ${productionId}: unreadable work record (${parsed.error.issues[0]?.message ?? 'schema'})`);
+  return parsed.data;
+}
+
+function toFindings(productionId: string, raw: unknown): ProductionFinding[] {
+  if (raw === null || raw === undefined) return [];
+  const parsed = z.array(ProductionFinding).safeParse(raw);
+  if (!parsed.success) throw new Error(`production ${productionId}: unreadable findings`);
+  return parsed.data;
 }
 
 function toProduction(row: ProductionRow): Production {
@@ -149,7 +161,8 @@ function toProduction(row: ProductionRow): Production {
     sourceDocumentIds: row.source_document_ids,
     stage: ProductionStage.parse(row.stage),
     attempt: row.attempt,
-    work: toWork(row.findings),
+    work: toWork(row.production_id, row.work),
+    findings: toFindings(row.production_id, row.findings),
     leaseUntil: row.lease_until,
     leasedBy: row.leased_by,
     createdAt: row.created_at,
@@ -175,7 +188,7 @@ export async function createProduction(input: CreateProductionInput, db: Queryab
   await db.query(
     `INSERT INTO document_productions
        (production_id, business_id, origin_job_id, instruction_text, text_origin, format, language, kind,
-        destination, source_document_ids, findings)
+        destination, source_document_ids, work)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
     [
       productionId,
@@ -262,7 +275,7 @@ export async function claimUnfinished(
               SELECT production_id FROM document_productions
                WHERE business_id = $1
                  AND stage IN ('ready', 'failed_checks', 'failed')
-                 AND COALESCE((findings->>'finished')::boolean, false) = false
+                 AND COALESCE((work->>'finished')::boolean, false) = false
                  AND (lease_until IS NULL OR lease_until < now())
                  AND NOT (production_id = ANY($4::text[]))
                ORDER BY updated_at, production_id
@@ -287,6 +300,7 @@ export async function releaseLease(productionId: string, holder: string, db: Que
 export interface StagePatch {
   attempt?: number;
   work?: ProductionWork;
+  findings?: ProductionFinding[];
 }
 
 /**
@@ -304,7 +318,8 @@ export async function advanceStage(
     `UPDATE document_productions
         SET stage = $3,
             attempt = COALESCE($4::int, attempt),
-            findings = COALESCE($5::jsonb, findings),
+            work = COALESCE($5::jsonb, work),
+            findings = COALESCE($6::jsonb, findings),
             updated_at = now()
       WHERE production_id = $1 AND stage = $2`,
     [
@@ -313,6 +328,7 @@ export async function advanceStage(
       ProductionStage.parse(to),
       patch.attempt ?? null,
       patch.work === undefined ? null : JSON.stringify(ProductionWork.parse(patch.work)),
+      patch.findings === undefined ? null : JSON.stringify(z.array(ProductionFinding).parse(patch.findings)),
     ],
   );
   return (rowCount ?? 0) > 0;
@@ -453,7 +469,7 @@ export async function productionsToday(
 ): Promise<number> {
   const start = localToInstant(localParts(now, timeZone).date, '00:00', timeZone);
   const { rows } = await db.query<{ n: string }>(
-    `SELECT (COUNT(*) FILTER (WHERE COALESCE((findings->>'drafted')::boolean, false))
+    `SELECT (COUNT(*) FILTER (WHERE COALESCE((work->>'drafted')::boolean, false))
              + COALESCE(SUM(attempt), 0))::text AS n
        FROM document_productions
       WHERE business_id = $1 AND created_at >= $2`,
