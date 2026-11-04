@@ -72,8 +72,16 @@
  *     is not a number under the perturbation) is CONSTANT-DERIVED
  *     (`A2/A2*100*100*12`, reference-free formulas): its displayed value must
  *     ground in the sources like a literal, and it never grounds free text.
+ *     The same test applies to every OPERAND (fix round 5): each operand of
+ *     `+ - * /`, each SUM/AVERAGE/MIN/MAX argument and ROUND*'s first
+ *     argument, at any depth (an IF branch included), is evaluated as a
+ *     synthetic cell in both workbooks; one that does not move must ground
+ *     its own value, and taints the cell (`A2/A2*100*100*12+A2`).
  *     Exempt by name: a COUNT/COUNTA/COUNTIF/MATCH call alone, or scaled by
- *     ONE exempt literal — counts and positions are layout-derived.
+ *     ONE exempt literal — counts and positions are layout-derived. Their
+ *     results never ground free text. COUNT/COUNTA take distinct,
+ *     non-overlapping refs/ranges and COUNTIF one ref/range
+ *     (`COUNTA(A2,A2,A2)` is `formula_problem`).
  *   - a STRING result is free text grounded in the sources (and today's
  *     year) only, never in formula results (`"5"&"0"&"0"&"0"`, `A2&"0"`).
  *   - untainted, non-constant results ground free text in the form the column displays:
@@ -108,9 +116,11 @@ import { ungroundedNumbers } from '../governance/numeric-grounding.js';
 import { stripBidiControls } from '../util/bidi.js';
 import {
   evaluateWorkbook,
+  formatAddress,
   parseFormula,
   referencedCells,
   type EvalError,
+  type EvalSheet,
   type EvalValue,
   type FormulaAst,
 } from './formula.js';
@@ -608,6 +618,136 @@ function isCountResult(ast: FormulaAst): boolean {
   return (isCount(ast.left) && isExempt(ast.right)) || (ast.op === '*' && isExempt(ast.left) && isCount(ast.right));
 }
 
+type Rect = { sheet: string; c1: number; c2: number; r1: number; r2: number };
+
+function rectOf(n: FormulaAst, sheet: string): Rect | null {
+  if (n.type === 'ref') {
+    return { sheet: (n.sheet ?? sheet).toUpperCase(), c1: n.at.col, c2: n.at.col, r1: n.at.row, r2: n.at.row };
+  }
+  if (n.type === 'range') {
+    return {
+      sheet: (n.sheet ?? sheet).toUpperCase(),
+      c1: Math.min(n.from.col, n.to.col),
+      c2: Math.max(n.from.col, n.to.col),
+      r1: Math.min(n.from.row, n.to.row),
+      r2: Math.max(n.from.row, n.to.row),
+    };
+  }
+  return null;
+}
+
+const overlaps = (a: Rect, b: Rect) =>
+  a.sheet === b.sheet && a.c1 <= b.c2 && b.c1 <= a.c2 && a.r1 <= b.r2 && b.r1 <= a.r2;
+
+/**
+ * The shape of a count's arguments (fix round 5): COUNT/COUNTA take distinct,
+ * non-overlapping refs or ranges — `COUNTA(A2,A2,A2,A2,A2)` manufactures a
+ * 5 — and COUNTIF exactly one ref or range. Literal arguments are left to
+ * the aggregate-literal rule, so a cell is not refused twice for one thing.
+ */
+function countArgProblems(ast: FormulaAst, sheet: string, out: string[]): void {
+  switch (ast.type) {
+    case 'unary':
+    case 'percent':
+      countArgProblems(ast.arg, sheet, out);
+      return;
+    case 'binary':
+      countArgProblems(ast.left, sheet, out);
+      countArgProblems(ast.right, sheet, out);
+      return;
+    case 'call': {
+      if (ast.name === 'COUNT' || ast.name === 'COUNTA') {
+        const rects: Rect[] = [];
+        ast.args.forEach((arg, i) => {
+          if (isLiteral(arg)) return;
+          const r = rectOf(arg, sheet);
+          if (r === null) {
+            out.push(`${ast.name} (ארגומנט ${i + 1}) חייב להיות תא או טווח`);
+          } else if (rects.some((q) => overlaps(q, r))) {
+            out.push(`${ast.name} (ארגומנט ${i + 1}) חופף לארגומנט קודם`);
+          } else {
+            rects.push(r);
+          }
+        });
+      }
+      if (ast.name === 'COUNTIF' && ast.args[0] !== undefined && rectOf(ast.args[0], sheet) === null) {
+        out.push('COUNTIF (ארגומנט 1) חייב להיות תא או טווח');
+      }
+      ast.args.forEach((a) => countArgProblems(a, sheet, out));
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+const OPERAND_FUNCTIONS: ReadonlySet<string> = new Set(['SUM', 'AVERAGE', 'MIN', 'MAX']);
+const ROUNDS: ReadonlySet<string> = new Set(['ROUND', 'ROUNDUP', 'ROUNDDOWN']);
+
+/**
+ * Every subexpression the per-operand perturbation test applies to (fix
+ * round 5): each operand of `+ - * /`, each argument of SUM/AVERAGE/MIN/MAX,
+ * and the first argument of ROUND/ROUNDUP/ROUNDDOWN — at any depth, inside
+ * any function (an IF branch included). A bare ref or range is an input, not
+ * a computation, and a literal is grounded by the literal rule: both skipped.
+ */
+function operandsOf(ast: FormulaAst, out: FormulaAst[]): void {
+  const test = (n: FormulaAst) => {
+    if (n.type !== 'ref' && n.type !== 'range' && !isLiteral(n)) out.push(n);
+  };
+  switch (ast.type) {
+    case 'unary':
+    case 'percent':
+      operandsOf(ast.arg, out);
+      return;
+    case 'binary':
+      if (ast.op === '+' || ast.op === '-' || ast.op === '*' || ast.op === '/') {
+        test(ast.left);
+        test(ast.right);
+      }
+      operandsOf(ast.left, out);
+      operandsOf(ast.right, out);
+      return;
+    case 'call':
+      ast.args.forEach((arg, i) => {
+        if (OPERAND_FUNCTIONS.has(ast.name) || (ROUNDS.has(ast.name) && i === 0)) test(arg);
+        operandsOf(arg, out);
+      });
+      return;
+    default:
+      return;
+  }
+}
+
+const quoteSheet = (name: string) => `'${name.replace(/'/g, "''")}'!`;
+
+/** A formula text for a subexpression, fully parenthesised, that parses back to the same AST. */
+function printFormula(ast: FormulaAst): string {
+  switch (ast.type) {
+    case 'number':
+      return plainNumber(ast.value);
+    case 'string':
+      return `"${ast.value.replace(/"/g, '""')}"`;
+    case 'boolean':
+      return ast.value ? 'TRUE' : 'FALSE';
+    case 'ref':
+      return `${ast.sheet === null ? '' : quoteSheet(ast.sheet)}${formatAddress(ast.at)}`;
+    case 'range':
+      return `${ast.sheet === null ? '' : quoteSheet(ast.sheet)}${formatAddress(ast.from)}:${formatAddress(ast.to)}`;
+    case 'unary':
+      return `(${ast.op}${printFormula(ast.arg)})`;
+    case 'percent':
+      return `(${printFormula(ast.arg)}%)`;
+    case 'binary':
+      return `(${printFormula(ast.left)}${ast.op}${printFormula(ast.right)})`;
+    case 'call':
+      return `${ast.name}(${ast.args.map(printFormula).join(',')})`;
+  }
+}
+
+/** Synthetic cells live in the last column, where no spec table reaches. */
+const SYNTHETIC_COLUMN = 16384;
+
 interface FormulaLiterals {
   /** Number literals that must ground (signed when negated outside an exempt position). */
   numbers: number[];
@@ -716,8 +856,11 @@ interface FormulaCellInfo {
   strings: string[];
   /** A string-valued result: free text grounded in the sources only. */
   stringResult: string | null;
-  /** A constant-derived numeric result whose displayed value no source gives. */
-  constantUngrounded: string | null;
+  /**
+   * Constant-derived values no source gives: the cell's own displayed result,
+   * or an operand's value (fix round 5). One problem per cell.
+   */
+  constantUngrounded: string[];
 }
 
 interface WorkbookCheck {
@@ -751,6 +894,7 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
   const cells = new Map<string, FormulaCellInfo>();
   const reads = new Map<string, string[]>();
   const countResults = new Set<string>();
+  const asts = new Map<string, { sheet: number; ast: FormulaAst }>();
   let blocked = false;
 
   upper.forEach((name, i) => {
@@ -791,6 +935,13 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
           placedWhere(si, p),
           `פונקציה שמקבלת תאים קיבלה ערך קבוע: ${literals.aggregateLiterals.join(', ')}`,
         );
+      } else {
+        const shape: string[] = [];
+        countArgProblems(parsed.ast, sheets[si]!.name, shape);
+        if (shape.length > 0) {
+          blocked = true;
+          add('formula_problem', placedWhere(si, p), shape.join('; '));
+        }
       }
       const ungrounded = literals.numbers
         .map(plainNumber)
@@ -799,8 +950,9 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
         ungrounded: [...new Set(ungrounded)],
         strings: literals.strings,
         stringResult: null,
-        constantUngrounded: null,
+        constantUngrounded: [],
       });
+      asts.set(key, { sheet: si, ast: parsed.ast });
       if (isCountResult(parsed.ast)) countResults.add(key);
       reads.set(
         key,
@@ -817,16 +969,19 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
   if (blocked) return { cells, results: [] };
 
   // Taint: an ungrounded literal, or reading a tainted cell, transitively.
-  const tainted = new Set([...cells].filter(([, info]) => info.ungrounded.length > 0).map(([k]) => k));
-  for (let changed = true; changed; ) {
-    changed = false;
-    for (const [key, deps] of reads) {
-      if (!tainted.has(key) && deps.some((d) => tainted.has(d))) {
-        tainted.add(key);
-        changed = true;
+  const propagate = (tainted: Set<string>) => {
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const [key, deps] of reads) {
+        if (!tainted.has(key) && deps.some((d) => tainted.has(d))) {
+          tainted.add(key);
+          changed = true;
+        }
       }
     }
-  }
+    return tainted;
+  };
+  const literalTainted = propagate(new Set([...cells].filter(([, info]) => info.ungrounded.length > 0).map(([k]) => k)));
 
   const evaluation = evaluateWorkbook(sheets.map(toEvalSheet));
   // The perturbation check: the same workbook and layout with every `{v}`
@@ -834,7 +989,46 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
   // constants, not from the inputs (`A2/A2*100*100*12`), so its displayed
   // value must ground like a literal, and it never grounds free text.
   const perturbed = evaluateWorkbook(sheets.map(perturbSheet).map(toEvalSheet));
-  const results: string[] = [];
+  // Per-operand perturbation (fix round 5): every operand subexpression
+  // (`operandsOf`) becomes a synthetic cell on its own sheet, in a copy of
+  // both workbooks — same layout, so its refs mean what they mean in the
+  // cell. An operand that does not move is constant-derived exactly like a
+  // whole cell: `A2/A2*100*100*12+A2` moves, but its left operand does not.
+  const synthetic: { key: string; evalKey: string; ast: FormulaAst }[] = [];
+  const syntheticRows = sheets.map(() => 0);
+  for (const [key, { sheet, ast }] of asts) {
+    if (literalTainted.has(key)) continue;
+    const ops: FormulaAst[] = [];
+    operandsOf(ast, ops);
+    for (const op of ops) {
+      syntheticRows[sheet]! += 1;
+      const address = formatAddress({ col: SYNTHETIC_COLUMN, row: syntheticRows[sheet]! });
+      synthetic.push({ key, evalKey: `${sheets[sheet]!.name}!${address}`, ast: op });
+    }
+  }
+  const withSynthetic = (evalSheets: EvalSheet[]) => {
+    for (const cell of synthetic) {
+      const bang = cell.evalKey.lastIndexOf('!');
+      const target = evalSheets.find((e) => e.name === cell.evalKey.slice(0, bang))!;
+      target.cells.set(cell.evalKey.slice(bang + 1), { f: printFormula(cell.ast) });
+    }
+    return evaluateWorkbook(evalSheets);
+  };
+  if (synthetic.length > 0) {
+    const base = withSynthetic(sheets.map(toEvalSheet));
+    const moved = withSynthetic(sheets.map(perturbSheet).map(toEvalSheet));
+    for (const cell of synthetic) {
+      const v = base.values.get(cell.evalKey);
+      if (typeof v !== 'number' || isCountResult(cell.ast)) continue;
+      const m = moved.values.get(cell.evalKey);
+      if (typeof m === 'number' && m !== v) continue;
+      const shown = plainNumber(at15(v));
+      if (ungroundedNumbers(shown, literalPool).length > 0) cells.get(cell.key)!.constantUngrounded.push(shown);
+    }
+  }
+
+  const constants = new Set<string>();
+  const numeric: { key: string; shown: string }[] = [];
   layouts.forEach((placed, si) => {
     const name = sheets[si]!.name;
     for (const p of placed) {
@@ -849,17 +1043,26 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
         add('formula_problem', placedWhere(si, p), `הנוסחה מחזירה שגיאה: ${value.error}`);
       } else if (typeof value === 'string') {
         info.stringResult = value;
-      } else if (typeof value === 'number' && !tainted.has(key)) {
+      } else if (typeof value === 'number' && !literalTainted.has(key)) {
         const shown = displayedResult(value, sheets[si]!.tables[p.table]!, p.column);
         const moved = perturbed.values.get(evalKey);
         // A perturbed result that is not a number counts as NOT moved: the
-        // stricter reading (a branch that errors on other inputs).
-        const constant = !countResults.has(key) && (typeof moved !== 'number' || moved === value);
-        if (!constant) results.push(shown);
-        else if (ungroundedNumbers(shown, literalPool).length > 0) info.constantUngrounded = shown;
+        // stricter reading (a branch that errors on other inputs). A count or
+        // MATCH result is exempt from grounding but never grounds free text.
+        const counted = countResults.has(key);
+        const constant = !counted && (typeof moved !== 'number' || moved === value);
+        if (constant && ungroundedNumbers(shown, literalPool).length > 0) info.constantUngrounded.unshift(shown);
+        if (constant || counted) constants.add(key);
+        else numeric.push({ key, shown });
       }
     }
   });
+  // A constant-derived value no source gives taints like an ungrounded literal.
+  const tainted = propagate(
+    new Set([...literalTainted, ...[...cells].filter(([, i]) => i.constantUngrounded.length > 0).map(([k]) => k)]),
+  );
+  const results = numeric.filter((n) => !tainted.has(n.key) && !constants.has(n.key)).map((n) => n.shown);
+  for (const info of cells.values()) info.constantUngrounded = [...new Set(info.constantUngrounded)];
   return { cells, results };
 }
 
@@ -1056,8 +1259,12 @@ export function validateSpec(
             if (info.ungrounded.length > 0) {
               c.add('ungrounded_number', where, `מספר בנוסחה שאין לו מקור: ${info.ungrounded.join(', ')}`);
             }
-            if (info.constantUngrounded !== null) {
-              c.add('ungrounded_number', where, `תוצאת הנוסחה ${info.constantUngrounded} אינה תלויה בנתונים ואין לה מקור`);
+            if (info.constantUngrounded.length > 0) {
+              c.add(
+                'ungrounded_number',
+                where,
+                `ערך בנוסחה שאינו תלוי בנתונים ואין לו מקור: ${info.constantUngrounded.join(', ')}`,
+              );
             }
             const reported = new Set<string>();
             for (const s of info.strings) {

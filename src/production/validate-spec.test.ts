@@ -1000,3 +1000,96 @@ describe('fix round 4', () => {
     expect(neg('זיכוי -1890')).toEqual([]);
   });
 });
+
+describe('fix round 5', () => {
+  const PROBE_SOURCE = 'מחיר 1,890 הנחה 15% עמלה 1.5% דמי ניהול 2.5 אחוזים ב-1/3/2026 פריט 5 קוד 0';
+  const withText = (text: string) =>
+    sources({ documents: [{ documentId: PRICE_LIST, artifacts: [{ ordinal: 1, text }] }] });
+  const probeSources = withText(PROBE_SOURCE);
+  const sheetWith = (rows: Cell[][], over: Record<string, unknown> = {}) =>
+    xlsx({ sheets: [{ name: 'a', tables: [{ header: ['x', 'y'], rows, ...over }] }] });
+  const wheres = (problems: SpecProblem[], code: string) =>
+    problems.filter((p) => p.code === code).map((p) => p.where);
+
+  describe('every arithmetic operand is perturbation-tested', () => {
+    it('a constant operand added to an input is refused and does not ground "סך 121890"', () => {
+      const probe = sheetWith([[fromDoc(1890)], [{ f: 'A3/A3*100*100*12+A3' }]], { title: 'סך 121890' });
+      const problems = validateSpec(probe, probeSources, TODAY);
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 title', 'sheet 1 table 1 row 2 col 1']);
+      expect(problems.find((p) => p.where === 'sheet 1 table 1 row 2 col 1')!.detail).toContain('120000');
+    });
+    it('(A2/A2+A2/A2)*A2 is refused', () => {
+      const problems = validateSpec(sheetWith([[fromDoc(1890)], [{ f: '(A2/A2+A2/A2)*A2' }]]), probeSources, TODAY);
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 2 col 1']);
+      expect(problems[0]!.detail).toContain('2');
+    });
+    it('a constant hidden in an IF branch is refused', () => {
+      const problems = validateSpec(
+        sheetWith([[fromDoc(1890)], [{ f: 'IF(A2=1890,A2/A2*100*100*12,A2)' }]]),
+        probeSources,
+        TODAY,
+      );
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 2 col 1']);
+    });
+    it('a constant argument of SUM / ROUND is refused', () => {
+      for (const f of ['SUM(A2,A2/A2*100*100)', 'ROUND(A2/A2*100*100,0)+A2']) {
+        expect(wheres(validateSpec(sheetWith([[fromDoc(1890)], [{ f }]]), probeSources, TODAY), 'ungrounded_number')).toEqual([
+          'sheet 1 table 1 row 2 col 1',
+        ]);
+      }
+    });
+    it('a constant SUM argument, ROUND argument, or an operand that errors when perturbed is refused', () => {
+      // Every inner operand here grounds (1, 1890; 5 is a grounded literal):
+      // only the named position catches the 9450.
+      for (const f of [
+        'SUM(A2,A2/A2*1890*5)',
+        'IF(A2=1890,ROUND(A2/A2*1890*5,0),A2)',
+        'IFERROR(IF(A2=1890,A2/A2*1890*5,1/0)+A2,A2)',
+      ]) {
+        const problems = validateSpec(sheetWith([[fromDoc(1890)], [{ f }]]), probeSources, TODAY);
+        expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 2 col 1']);
+        expect(problems[0]!.detail).toContain('9450');
+      }
+    });
+    it('legitimate operands still pass', () => {
+      const ok = sheetWith([
+        [fromDoc(1890), fromDoc(1.17)],
+        [fromDoc(5), { f: 'A2*B2' }],
+        [{ f: 'SUM(A2:A3)-B2' }, { f: 'ROUND(A2*B2,2)' }],
+        [{ f: 'A2*100' }, { f: 'B2/12' }],
+        [{ f: 'SUM(A2:A3)/COUNT(A2:A3)' }, { f: '(A2+A3)*B2' }],
+      ]);
+      expect(validateSpec(ok, withText('מחיר 1,890 מקדם 1.17 פריט 5'), TODAY)).toEqual([]);
+    });
+  });
+
+  describe('count arguments', () => {
+    it('repeated or overlapping COUNT/COUNTA arguments are formula_problem', () => {
+      for (const f of ['COUNTA(A2,A2,A2,A2,A2)*100', 'COUNT(A2:A3,A3)', 'COUNT(A2:A3,A2:A3)']) {
+        const problems = validateSpec(sheetWith([[fromDoc(1890)], [fromDoc(5)], [{ f }]]), probeSources, TODAY);
+        expect(wheres(problems, 'formula_problem')).toEqual(['sheet 1 table 1 row 3 col 1']);
+      }
+      const seven = sheetWith([[fromDoc(1890)], [{ f: 'COUNT(A3,A3,A3,A3,A3,A3,A3)' }]], { title: 'סך 7' });
+      const problems = validateSpec(seven, probeSources, TODAY);
+      expect(wheres(problems, 'formula_problem')).toEqual(['sheet 1 table 1 row 2 col 1']);
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 title']);
+    });
+    it('COUNT over an expression, and COUNTIF over a non-range, are formula_problem', () => {
+      for (const f of ['COUNT(A2*1)', 'COUNTIF(A2*1,">5")']) {
+        const problems = validateSpec(sheetWith([[fromDoc(1890)], [{ f }]]), probeSources, TODAY);
+        expect(wheres(problems, 'formula_problem')).toEqual(['sheet 1 table 1 row 2 col 1']);
+        expect(problems.find((q) => q.code === 'formula_problem')!.detail).toContain('תא או טווח');
+      }
+    });
+    it('controls: distinct ranges pass', () => {
+      const ok = sheetWith([[fromDoc(1890), fromDoc(5)], [{ f: 'COUNT(A2,B2)' }, { f: 'COUNTA(A2:A2,B2:B2)' }]]);
+      expect(validateSpec(ok, probeSources, TODAY)).toEqual([]);
+    });
+    it('a count or MATCH result does not ground free text', () => {
+      for (const f of ['COUNT(A3:A4)', 'MATCH(5,A3:A4,0)']) {
+        const probe = sheetWith([[fromDoc(1890)], [fromDoc(5)], [{ f }]], { title: 'סך 2' });
+        expect(wheres(validateSpec(probe, probeSources, TODAY), 'ungrounded_number')).toEqual(['sheet 1 table 1 title']);
+      }
+    });
+  });
+});
