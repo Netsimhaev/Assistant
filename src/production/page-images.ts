@@ -45,14 +45,18 @@
  *     nothing reads.
  *
  * **Text.** pdf.js text items come back from the page as plain JSON and go
- * through the extractor's own `linesOf` (`documents/extractors/pdf.ts`), so
- * check 2 reads lines exactly the way an incoming PDF is read — the same
- * baseline grouping and right-to-left ordering heuristic, with the same
- * known limits (two-column layouts, a split LTR run inside an RTL line).
+ * through the extractor's `linesOf` (`documents/extractors/pdf.ts`) for the
+ * baseline grouping, but with the production joiner `joinChromiumLine`
+ * (`chromium-lines.ts`), NOT the incoming-document `joinLine`: Chromium
+ * writes each glyph run as its own item in visual order, and only this
+ * joiner reassembles those runs. Incoming documents keep `joinLine`
+ * untouched (review ruling (a)). Text covers the first `MAX_PDF_PAGES`
+ * pages; `textTruncated` says when the document is longer.
  *
  * **Which pages** (`selectPages`, spec §7.2): every page when there are ten
  * or fewer; otherwise ten — the first, the last, then the pages check 1
- * flagged, in page order, until the cap. Images are returned in page order.
+ * flagged, in page order, until the cap; with nothing flagged, ten pages
+ * spread evenly from first to last. Images are returned in page order.
  *
  * Tests never need LibreOffice or Chromium: `spawn` and `rasterise` are
  * seams. The real binaries run in `npm run doc:render-check`
@@ -67,6 +71,7 @@ import { pathToFileURL } from 'node:url';
 import { config } from '../config.js';
 import type { DocumentFormat } from '../domain/document-spec.js';
 import { linesOf, MAX_PDF_PAGES, PDF_LOAD_OPTIONS } from '../documents/extractors/pdf.js';
+import { joinChromiumLine } from './chromium-lines.js';
 import {
   blockNetwork,
   CLOSE_TIMEOUT_MS,
@@ -99,9 +104,11 @@ const KILL_SETTLE_MS = 5_000;
 export interface PageImages {
   /** PNG bytes, in page order. */
   pages: Buffer[];
-  /** Extracted text, pages separated by a blank line. */
+  /** Extracted text, pages separated by a blank line — of the first `MAX_PDF_PAGES` pages only. */
   text: string;
   pageCount: number;
+  /** True when the PDF has more than `MAX_PDF_PAGES` pages, so `text` stops before the end. */
+  textTruncated: boolean;
 }
 
 export interface PageRenderOptions {
@@ -121,14 +128,20 @@ export type Rasteriser = (pdf: Buffer, select: (pageCount: number) => number[], 
 /**
  * The page sample, in page order: every page when `pageCount <= 10`;
  * otherwise first, last, then flagged pages (whole numbers within range,
- * ascending, de-duplicated) until `MAX_PAGE_IMAGES`.
+ * ascending, de-duplicated) until `MAX_PAGE_IMAGES`. When nothing valid is
+ * flagged, the ten are spread evenly from first to last, so the judge sees a
+ * representative sample rather than two pages.
  */
 export function selectPages(pageCount: number, flagged: readonly number[]): number[] {
   if (pageCount <= MAX_PAGE_IMAGES) return Array.from({ length: Math.max(pageCount, 0) }, (_, i) => i + 1);
-  const chosen = new Set<number>([1, pageCount]);
   const candidates = [...new Set(flagged)]
     .filter((n) => Number.isInteger(n) && n >= 1 && n <= pageCount)
     .sort((a, b) => a - b);
+  if (candidates.length === 0) {
+    const step = (pageCount - 1) / (MAX_PAGE_IMAGES - 1);
+    return Array.from({ length: MAX_PAGE_IMAGES }, (_, k) => 1 + Math.round(k * step));
+  }
+  const chosen = new Set<number>([1, pageCount]);
   for (const n of candidates) {
     if (chosen.size >= MAX_PAGE_IMAGES) break;
     chosen.add(n);
@@ -187,6 +200,23 @@ export function killProcessTree(child: SofficeChild): void {
   }
 }
 
+/**
+ * After a conversion that ended on its own (exit 0 or not), SIGKILL whatever
+ * is left in the child's process group — `soffice` can leave `soffice.bin`
+ * behind. POSIX only: the group id is the dead leader's pid, which no other
+ * process takes as a group while members remain. Not on Windows, where
+ * `taskkill /T` on an exited pid could hit an unrelated process that reused
+ * it. Must not throw.
+ */
+export function reapProcessGroup(child: SofficeChild): void {
+  if (process.platform === 'win32' || child.pid === undefined) return;
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    // group already empty
+  }
+}
+
 /** The exact command line (spec/brief). `profileDir` is private to this run. */
 export function sofficeArgs(dir: string, inputPath: string): string[] {
   return [
@@ -205,6 +235,7 @@ interface SofficeRun {
   sofficePath: string;
   spawn: SpawnSoffice;
   killTree: (child: SofficeChild) => void;
+  reapGroup: (child: SofficeChild) => void;
   deadlineMs: number;
 }
 
@@ -212,7 +243,8 @@ function runSoffice(run: SofficeRun, dir: string, inputPath: string, signal: Abo
   return new Promise<void>((resolve, reject) => {
     let settled = false;
     let killedFor: 'timeout' | 'abort' | null = null;
-    let stderr = '';
+    // Only counted: stderr may echo document content, and the reason reaches logs.
+    let stderrBytes = 0;
     let settleTimer: ReturnType<typeof setTimeout> | undefined;
 
     const child = run.spawn(run.sofficePath, sofficeArgs(dir, inputPath), {
@@ -249,12 +281,18 @@ function runSoffice(run: SofficeRun, dir: string, inputPath: string, signal: Abo
     signal.addEventListener('abort', onAbort, { once: true });
 
     child.stderr?.on('data', (chunk) => {
-      if (stderr.length < 2_000) stderr += String(chunk);
+      stderrBytes += chunk.length;
     });
-    child.once('error', (err) => finish(new SpecRenderError('render_failed', `soffice: ${err.message}`)));
+    child.once('error', (err) =>
+      finish(new SpecRenderError('render_failed', `soffice could not start (${(err as NodeJS.ErrnoException).code ?? 'error'})`)),
+    );
     child.once('close', (code, sig) => {
-      if (killedFor !== null) finish(killedError());
-      else if (code !== 0) finish(new SpecRenderError('render_failed', `soffice exit ${code ?? sig}: ${stderr.trim().slice(0, 300)}`));
+      if (killedFor !== null) {
+        finish(killedError());
+        return;
+      }
+      run.reapGroup(child);
+      if (code !== 0) finish(new SpecRenderError('render_failed', `soffice exit ${code ?? sig} (stderr ${stderrBytes} bytes)`));
       else finish(null);
     });
   });
@@ -409,13 +447,23 @@ function launchRasterSession(executablePath: string): () => Promise<RasterSessio
           call(RENDER_IN_PAGE, { pageNumbers, targetWidth: RASTER_TARGET_WIDTH_PX, maxEdge: RASTER_MAX_EDGE_PX }),
         )) as string[];
         await context.close().catch(() => undefined);
-        return {
-          pages: pngs.map((b64) => Buffer.from(b64, 'base64')),
-          text: loaded.pages.map((items) => linesOf(items).join('\n')).join('\n\n'),
-          pageCount: loaded.pageCount,
-        };
+        return pageImagesFrom(loaded, pngs);
       },
     };
+  };
+}
+
+/**
+ * The renderer's result from what the page returned: PNGs decoded, text
+ * joined with the production joiner, and `textTruncated` when the document
+ * is longer than the `MAX_PDF_PAGES` pages the page read text from.
+ */
+export function pageImagesFrom(loaded: { pageCount: number; pages: unknown[][] }, pngsBase64: string[]): PageImages {
+  return {
+    pages: pngsBase64.map((b64) => Buffer.from(b64, 'base64')),
+    text: loaded.pages.map((items) => linesOf(items, joinChromiumLine).join('\n')).join('\n\n'),
+    pageCount: loaded.pageCount,
+    textTruncated: loaded.pageCount > MAX_PDF_PAGES,
   };
 }
 
@@ -455,6 +503,7 @@ export interface LocalPageRendererOptions {
   /** Test seams. Production uses the defaults. */
   spawn?: SpawnSoffice;
   killTree?: (child: SofficeChild) => void;
+  reapGroup?: (child: SofficeChild) => void;
   rasterise?: Rasteriser;
   /** Where the per-run temp dir is created. Default: the OS temp dir. */
   tmpRoot?: string;
@@ -466,6 +515,7 @@ export function createLocalPageRenderer(options: LocalPageRendererOptions): Page
     sofficePath: options.sofficePath,
     spawn: options.spawn ?? defaultSpawn,
     killTree: options.killTree ?? killProcessTree,
+    reapGroup: options.reapGroup ?? reapProcessGroup,
     deadlineMs: options.sofficeDeadlineMs ?? SOFFICE_TIMEOUT_MS,
   };
   const rasterise = options.rasterise ?? createChromiumRasteriser({ executablePath: options.chromiumPath });

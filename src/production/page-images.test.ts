@@ -8,6 +8,7 @@ import {
   createChromiumRasteriser,
   createLocalPageRenderer,
   MAX_PAGE_IMAGES,
+  pageImagesFrom,
   selectPages,
   type PageImages,
   type Rasteriser,
@@ -30,7 +31,7 @@ interface SpawnCall {
 /** A fake soffice child. `behaviour` decides what it does once spawned. */
 class FakeChild extends EventEmitter implements SofficeChild {
   pid: number | undefined = undefined;
-  stderr = null;
+  readonly stderr = new EventEmitter();
   readonly signals: NodeJS.Signals[] = [];
   kill(signal: NodeJS.Signals): boolean {
     this.signals.push(signal);
@@ -50,6 +51,7 @@ function fakeSpawn(behaviour: Behaviour, calls: SpawnCall[], children: FakeChild
     setImmediate(() => {
       if (behaviour === 'hang') return;
       if (behaviour === 'fail') {
+        child.stderr.emit('data', Buffer.from('SECRET body text'));
         child.emit('close', 1, null);
         return;
       }
@@ -74,7 +76,7 @@ function fakeRasteriser(probe: RasterProbe, pageCount = 3, fail = false): Raster
     if (fail) throw new SpecRenderError('render_failed', 'rasterise');
     const pages = select(pageCount);
     probe.selected.push(pages);
-    return { pages: pages.map(() => PNG), text: 'שורה', pageCount };
+    return { pages: pages.map(() => PNG), text: 'שורה', pageCount, textTruncated: false };
   };
 }
 
@@ -243,8 +245,9 @@ describe('selectPages', () => {
     expect(selectPages(10, [])).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 
-  it('more than 10 pages and nothing flagged → first and last only', () => {
-    expect(selectPages(11, [])).toEqual([1, 11]);
+  it('more than 10 pages and nothing flagged → 10 pages spread evenly, first and last included', () => {
+    expect(selectPages(11, [])).toEqual([1, 2, 3, 4, 5, 7, 8, 9, 10, 11]);
+    expect(selectPages(100, [])).toEqual([1, 12, 23, 34, 45, 56, 67, 78, 89, 100]);
   });
 
   it('ignores flags that are not whole page numbers', () => {
@@ -259,7 +262,7 @@ describe('createChromiumRasteriser', () => {
       pid: 777,
       rasterise: async (_pdf, select) => {
         const pages = select(2);
-        return { pages: pages.map(() => PNG), text: 'א', pageCount: 2 };
+        return { pages: pages.map(() => PNG), text: 'א', pageCount: 2, textTruncated: false };
       },
       close: async () => {
         probe.closed += 1;
@@ -313,5 +316,73 @@ describe('createChromiumRasteriser', () => {
     expect((err as SpecRenderError).code).toBe('render_memory');
     expect(sampled).toBe(777);
     expect(probe.killed).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('createLocalPageRenderer — review fixes', () => {
+  it('a non-zero exit names the exit code and the stderr size, never stderr itself', async () => {
+    const probe: RasterProbe = { received: [], selected: [] };
+    const err = await renderer('fail', [], [], probe)({ format: 'docx', bytes: Buffer.from('PK') }, signal()).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(SpecRenderError);
+    expect((err as SpecRenderError).code).toBe('render_failed');
+    expect((err as SpecRenderError).where).toBe('soffice exit 1 (stderr 16 bytes)');
+    expect((err as SpecRenderError).message).not.toContain('SECRET');
+  });
+
+  it('the leftover process group is reaped after the child exits on its own, and not after a timeout kill', async () => {
+    const probe: RasterProbe = { received: [], selected: [] };
+    const reaped: string[] = [];
+    const reapGroup = () => {
+      reaped.push('reap');
+    };
+    await renderer('convert', [], [], probe, { reapGroup })({ format: 'docx', bytes: Buffer.from('PK') }, signal());
+    expect(reaped).toEqual(['reap']);
+
+    await renderer('fail', [], [], probe, { reapGroup })({ format: 'docx', bytes: Buffer.from('PK') }, signal()).catch(
+      () => undefined,
+    );
+    expect(reaped).toEqual(['reap', 'reap']);
+
+    const children: FakeChild[] = [];
+    const timedOut = await renderer('hang', [], children, probe, { reapGroup, sofficeDeadlineMs: 20 })(
+      { format: 'docx', bytes: Buffer.from('PK') },
+      signal(),
+    ).catch((e: unknown) => e);
+    expect((timedOut as SpecRenderError).code).toBe('render_timeout');
+    expect((children[0] as FakeChild).signals).toContain('SIGKILL');
+    expect(reaped).toEqual(['reap', 'reap']);
+  });
+});
+
+describe('pageImagesFrom', () => {
+  const item = (str: string, x: number, width: number) => ({ str, dir: 'ltr', transform: [10, 0, 0, 10, x, 700], width, height: 10 });
+
+  it('flags textTruncated only when the PDF has more pages than the text was read from', () => {
+    const fifty = pageImagesFrom({ pageCount: 50, pages: [[item('a', 36, 5)]] }, []);
+    expect(fifty.textTruncated).toBe(false);
+    const fiftyOne = pageImagesFrom({ pageCount: 51, pages: [[item('a', 36, 5)]] }, []);
+    expect(fiftyOne.textTruncated).toBe(true);
+    expect(fiftyOne.pageCount).toBe(51);
+  });
+
+  it('joins text with the production joiner and decodes the PNGs', () => {
+    const out = pageImagesFrom(
+      {
+        pageCount: 1,
+        pages: [
+          [
+            { str: 'שולחן מעוצב חדש', dir: 'rtl', transform: [10, 0, 0, 10, 300, 700], width: 80, height: 10 },
+            item('₪', 266, 9),
+            item('1,890', 274, 22),
+          ],
+        ],
+      },
+      [PNG.toString('base64')],
+    );
+    // The incoming joiner would read `1,890₪` here; the production joiner keeps the run.
+    expect(out.text).toBe('שולחן מעוצב חדש ₪1,890');
+    expect(out.pages).toEqual([PNG]);
   });
 });

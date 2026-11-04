@@ -71,10 +71,8 @@
  * written before the Hebrew word it follows, comes back in the order the
  * producer happened to write them. `linesOf` therefore groups items into
  * lines by baseline, orders each line by position — right to left when most
- * of its letters are right-to-left, left to right otherwise — puts a space
- * between neighbours that a visible gap separates, and reassembles a run in
- * the other direction that the producer split into several items (see
- * `joinLine`).
+ * of its characters are in right-to-left items, left to right otherwise —
+ * and puts a space between neighbours that a visible gap separates.
  *
  * **Flags.** Two document-level facts go on the first artefact
  * (`ordinal: 0`), the same rule `docx.ts` and `xlsx.ts` follow:
@@ -116,9 +114,10 @@ export const PDF_LOAD_OPTIONS = {
 /** Items on one line sit within this fraction of the font size of each other's baseline. */
 const SAME_LINE_TOLERANCE = 0.5;
 /** A horizontal gap wider than this fraction of the font size is a word break. */
-const WORD_GAP = 0.15;
+export const WORD_GAP = 0.15;
 
-interface PlacedText {
+/** A text item placed on the page. `rtl` is pdf.js's own `dir` for the item. */
+export interface PlacedText {
   str: string;
   rtl: boolean;
   x: number;
@@ -159,130 +158,51 @@ function placedOf(item: unknown): PlacedText | null {
   };
 }
 
-/** Characters of a right-to-left script (Hebrew, Arabic, Syriac, Thaana, NKo). */
-const RTL_LETTER = /[\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Syriac}\p{Script=Thaana}\p{Script=Nko}]/u;
-const LETTER = /\p{L}/u;
-const DIGIT = /\p{Nd}/u;
-/** Terminators that belong to an adjacent number (₪1,890, 39%), as the bidi algorithm's ET class. */
-const NUMBER_TERMINATOR = /^[\p{Sc}%‰°#+\-−]+$/u;
-/** A neutral drawn in a right-to-left context is the mirrored glyph; its logical character is the other one. */
-const MIRROR: Readonly<Record<string, string>> = {
-  '(': ')', ')': '(', '[': ']', ']': '[', '{': '}', '}': '{', '<': '>', '>': '<', '«': '»', '»': '«',
-};
-
-/** R: right-to-left letters; L: other letters; EN: a number; N: neither (punctuation). */
-type BidiClass = 'R' | 'L' | 'EN' | 'N';
-
-function classOf(text: string): BidiClass {
-  if (RTL_LETTER.test(text)) return 'R';
-  if (LETTER.test(text)) return 'L';
-  if (DIGIT.test(text)) return 'EN';
-  return 'N';
+function nonSpaceLength(text: string): number {
+  return text.replace(/\s/g, '').length;
 }
 
-function mirrored(text: string): string {
-  return [...text].map((ch) => MIRROR[ch] ?? ch).join('');
-}
-
-/**
- * One line's items, in reading order, joined with a space wherever a visible
- * gap separates two.
- *
- * The base direction is right-to-left when the line has more right-to-left
- * LETTERS than other letters — digits and punctuation do not vote, so a
- * Hebrew table row of numbers is still a Hebrew row. Items are first taken in
- * visual order along the base direction. Some producers (headless Chromium
- * among them) write every glyph run as its own item, so a run in the OTHER
- * direction — a Latin word split at a ligature, a number with its currency
- * sign, a Hebrew phrase in an English line — arrives as several items whose
- * visual order is the reverse of their reading order. Consecutive items of
- * the other direction are therefore grouped into one run and the run is
- * reversed: items that touch always group; across a word gap only two
- * letters of that direction do (two numbers a gap apart are separate cells or
- * words). A terminator (₪, %) touching a number joins it; a neutral touching
- * two items of the other direction joins their run. Every other neutral
- * takes the base direction, and in a right-to-left context its bracket is the
- * mirrored glyph, so `(`/`)` are swapped back to the logical character.
- * Known limit: a producer that maps a mirrored glyph to its logical character
- * already would have its brackets swapped here.
- */
+/** One line's items, in reading order, joined with a space wherever a visible gap separates two. */
 function joinLine(items: PlacedText[]): string {
-  let rtlLetters = 0;
-  let otherLetters = 0;
+  let rtlChars = 0;
+  let ltrChars = 0;
   for (const item of items) {
-    for (const ch of item.str) {
-      if (RTL_LETTER.test(ch)) rtlLetters += 1;
-      else if (LETTER.test(ch)) otherLetters += 1;
-    }
+    if (item.rtl) rtlChars += nonSpaceLength(item.str);
+    else ltrChars += nonSpaceLength(item.str);
   }
-  const rtl = rtlLetters > otherLetters;
+  const rtl = rtlChars > ltrChars;
   const ordered = [...items].sort((a, b) => (rtl ? b.x + b.width - (a.x + a.width) : a.x - b.x));
 
-  // gapBefore[i]: a visible word gap between ordered[i - 1] and ordered[i].
-  const gapBefore = ordered.map((item, i) => {
-    const previous = ordered[i - 1];
-    if (previous === undefined) return false;
-    const gap = rtl ? previous.x - (item.x + item.width) : item.x - (previous.x + previous.width);
-    return gap > WORD_GAP * Math.max(previous.size, item.size);
-  });
-
-  const classes = ordered.map((item) => classOf(item.str));
-  // Terminators touching a number are part of it.
-  classes.forEach((c, i) => {
-    if (c !== 'N' || !NUMBER_TERMINATOR.test(ordered[i]?.str ?? '')) return;
-    const touchesNumber =
-      (classes[i - 1] === 'EN' && !gapBefore[i]) || (classes[i + 1] === 'EN' && gapBefore[i + 1] === false);
-    if (touchesNumber) classes[i] = 'EN';
-  });
-  const isOther = (c: BidiClass | undefined) => (rtl ? c === 'L' || c === 'EN' : c === 'R');
-  const otherLetter: BidiClass = rtl ? 'L' : 'R';
-  // A neutral touching two items of the other direction joins their run.
-  const foreign = classes.map(
-    (c, i) =>
-      isOther(c) ||
-      (c === 'N' && isOther(classes[i - 1]) && isOther(classes[i + 1]) && !gapBefore[i] && gapBefore[i + 1] === false),
-  );
-
-  // Segments of consecutive ordered indices; other-direction runs are reversed.
-  const segments: number[][] = [];
-  for (let i = 0; i < ordered.length; i++) {
-    const current = segments[segments.length - 1];
-    const previous = i - 1;
-    const joins =
-      current !== undefined &&
-      foreign[i] === true &&
-      foreign[previous] === true &&
-      (!gapBefore[i] || (classes[previous] === otherLetter && classes[i] === otherLetter));
-    if (joins) current.push(i);
-    else segments.push([i]);
-  }
-
   let line = '';
-  let first = true;
-  for (const segment of segments) {
-    const start = segment[0] as number;
-    const reversed = foreign[start] === true && segment.length > 1;
-    const sequence = reversed ? [...segment].reverse() : segment;
-    sequence.forEach((index, k) => {
-      const item = ordered[index] as PlacedText;
-      // Space before this item: the boundary gap for a segment's first item,
-      // otherwise the gap that separated it from its visual neighbour.
-      const spaceBefore = first ? false : k === 0 ? gapBefore[start] : reversed ? gapBefore[index + 1] : gapBefore[index];
-      if (spaceBefore === true && !/\s$/.test(line) && !/^\s/.test(item.str)) line += ' ';
-      const neutralInRtl = classes[index] === 'N' && (rtl ? !foreign[index] : foreign[index] === true);
-      line += neutralInRtl ? mirrored(item.str) : item.str;
-      first = false;
-    });
+  let previous: PlacedText | null = null;
+  for (const item of ordered) {
+    if (previous !== null) {
+      const gap = rtl ? previous.x - (item.x + item.width) : item.x - (previous.x + previous.width);
+      const spaced = /\s$/.test(line) || /^\s/.test(item.str);
+      if (!spaced && gap > WORD_GAP * Math.max(previous.size, item.size)) line += ' ';
+    }
+    line += item.str;
+    previous = item;
   }
   return line;
 }
+
+/** Joins one line's items (already grouped by baseline) into its text. */
+export type LineJoiner = (items: PlacedText[]) => string;
 
 /**
  * A page's text items, as trimmed non-empty lines from the top of the page
  * down. One sort and one sweep, so a page of many tiny items costs
  * n log n — not one comparison per item per line.
+ *
+ * `joiner` defaults to this module's `joinLine`, which is what every
+ * INCOMING document is read with. The only other joiner is
+ * `joinChromiumLine` (`src/production/chromium-lines.ts`), used solely for
+ * the text of our own produced PDFs in check 2: it regroups glyph runs that
+ * headless Chromium splits into separate items, which would reorder table
+ * cells of an arbitrary incoming PDF.
  */
-export function linesOf(items: readonly unknown[]): string[] {
+export function linesOf(items: readonly unknown[], joiner: LineJoiner = joinLine): string[] {
   const placed = items.map(placedOf).filter((p): p is PlacedText => p !== null);
   placed.sort((a, b) => b.y - a.y);
 
@@ -300,7 +220,7 @@ export function linesOf(items: readonly unknown[]): string[] {
   }
   if (current.length > 0) lines.push(current);
 
-  return lines.map((line) => joinLine(line).trim()).filter((line) => line !== '');
+  return lines.map((line) => joiner(line).trim()).filter((line) => line !== '');
 }
 
 export async function extractPdf(sourcePath: string): Promise<DocumentArtifact[]> {
