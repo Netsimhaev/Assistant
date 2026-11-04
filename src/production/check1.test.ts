@@ -566,6 +566,51 @@ describe('runCheck1', () => {
       ).rejects.toThrow(TypeError);
     });
   });
+  describe('fix round 2: pptx table cell order from the slide XML', () => {
+    /** Swap the two `<a:tc>` cells of the n-th `<a:tr>` (0 = header) of slide 4. */
+    async function swapRow(bytes: Buffer, n: number): Promise<Buffer> {
+      return rezip(bytes, async (zip) => {
+        const name = 'ppt/slides/slide4.xml';
+        const xml = await zip.file(name)!.async('string');
+        const rows = xml.match(/<a:tr\b[\s\S]*?<\/a:tr>/g)!;
+        const row = rows[n]!;
+        const tcs = row.match(/<a:tc>[\s\S]*?<\/a:tc>/g)!;
+        expect(tcs).toHaveLength(2);
+        const swapped = row.replace(tcs[0]! + tcs[1]!, tcs[1]! + tcs[0]!);
+        expect(swapped).not.toBe(row);
+        zip.file(name, xml.replace(row, swapped));
+      });
+    }
+
+    it('a swapped pair in a 2-column Hebrew table → order_reversed', async () => {
+      const { buffer: good } = await renderPptx(profitPptx, { currency: 'ILS', images: noImages });
+      const bytes = await swapRow(good, 1);
+      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(await pptxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'order_reversed', where: 'slide 4 row 1', he: CHECK1_HE.order_reversed }]);
+      const header = await swapRow(good, 0);
+      const h = await runCheck1({ spec: profitPptx, bytes: header, sources, rendered: rendered(await pptxText(good)), today: TODAY, currency: 'ILS' });
+      expect(h.findings).toEqual([{ code: 'order_reversed', where: 'slide 4 header', he: CHECK1_HE.order_reversed }]);
+    });
+
+    it('an English table keeps column order as written, and passes', async () => {
+      const en: PptxSpec = {
+        ...profitPptx,
+        language: 'en',
+        slides: [
+          { type: 'title', title: 'Profit table' },
+          { type: 'paragraph', text: 'Prices as agreed' },
+          { type: 'titleBullets', title: 'Summary', bullets: ['Desk price 1,890'] },
+          { type: 'table', title: 'Prices', header: ['Item', 'Price'], rows: [[{ t: 'Office Pro' }, { v: 1890, src: SRC }]], numberFormat: ['int', 'money'] },
+        ],
+      };
+      const { buffer: bytes } = await renderPptx(en, { currency: 'ILS', images: noImages });
+      const r = await runCheck1({ spec: en, bytes, sources, rendered: rendered(await pptxText(bytes)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([]);
+      const swapped = await runCheck1({ spec: en, bytes: await swapRow(bytes, 1), sources, rendered: rendered(await pptxText(bytes)), today: TODAY, currency: 'ILS' });
+      expect(swapped.findings).toEqual([{ code: 'order_reversed', where: 'slide 4 row 1', he: CHECK1_HE.order_reversed }]);
+    });
+  });
+
   describe('fix round 1', () => {
     it('an RLO in a chart label → bidi_control (chart part and its data workbook are scanned)', async () => {
       const spec: PptxSpec = {

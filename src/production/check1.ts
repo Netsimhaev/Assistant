@@ -69,8 +69,10 @@
  *       absent while its reverse is present → `digits_reversed`.
  *       Each table row of a docx/pdf/pptx table, its cells as displayed in
  *       the charter `currency`, must read in column order (a swapped pair →
- *       `order_reversed`); a Hebrew pptx table is laid out right to left, so
- *       there the mirrored order is accepted too. Chart labels and values
+ *       `order_reversed`). pptx tables are checked in the slide XML instead
+ *       (`checkPptxTables`): the `<a:tc>` sequence must be the row in the
+ *       renderer's deterministic column order — reversed for Hebrew, as
+ *       written for English, never "either order". Chart labels and values
  *       join the runs and the numbers.
  *     - grounding: `createTextGrounder` (the same code as `validateSpec`)
  *       over the extracted text AND over the zip formats' own text — notes,
@@ -808,6 +810,45 @@ async function checkPptx(input: Check1Input, f: Findings, own: OwnText[]): Promi
     if (hasForeignBidi(all)) f.add('bidi_control', `slide ${n}`);
     own.push({ part: name, text: all });
   }
+  await checkPptxTables(input, zip, f);
+}
+
+/**
+ * pptx tables: each row's cells, read from the slide XML `<a:tc>` sequence,
+ * must be the spec row's displayed cells in the renderer's column order —
+ * reversed for Hebrew (the first column drawn at the right edge), as written
+ * for English. Never "either order": a swapped pair in a two-column Hebrew
+ * table is a mirror image, and only the deterministic rule tells them apart.
+ */
+async function checkPptxTables(input: Check1Input, zip: JSZip, f: Findings): Promise<void> {
+  if (input.spec.format !== 'pptx') return;
+  const rtl = input.spec.language === 'he';
+  for (const [i, slide] of input.spec.slides.entries()) {
+    if (slide.type !== 'table') continue;
+    const where = `slide ${i + 1}`;
+    const xml = (await zip.file(`ppt/slides/slide${i + 1}.xml`)?.async('string')) ?? '';
+    const fileRows = (xml.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) ?? []).map((tr) =>
+      (tr.match(/<a:tc(?:\s[^>]*)?>[\s\S]*?<\/a:tc>/g) ?? []).map((tc) => normalise(xmlTexts(tc, 'a:t').join(''))),
+    );
+    const expected: { where: string; cells: string[] }[] = [
+      { where: `${where} header`, cells: slide.header },
+      ...slide.rows.map((row, r) => ({
+        where: `${where} row ${r + 1}`,
+        cells: row.map((c, j) =>
+          'f' in c ? '' : formatCell(c, slide.numberFormat?.[j] as CellNumberFormat | undefined, input.currency, 'check1'),
+        ),
+      })),
+    ];
+    expected.forEach((row, r) => {
+      const want = row.cells.map(normalise);
+      if (rtl) want.reverse();
+      const got = fileRows[r];
+      if (got !== undefined && got.length === want.length && got.every((c, j) => c === want[j])) return;
+      const sorted = (a: string[]) => [...a].sort().join('\u0000');
+      f.add(got !== undefined && sorted(got) === sorted(want) ? 'order_reversed' : 'text_missing', row.where);
+    });
+    if (fileRows.length > expected.length) f.add('text_missing', `${where} rows`);
+  }
 }
 
 // ---------------------------------------------------------------- pdf
@@ -850,8 +891,6 @@ interface TextRun {
 interface RowRun {
   where: string;
   cells: string[];
-  /** The file lays the columns out right to left (pptx Hebrew tables): reversed cell order is the correct one too. */
-  mirrored: boolean;
 }
 
 interface SpecText {
@@ -877,9 +916,8 @@ function specTextRuns(spec: DocumentSpec, currency: string): SpecText {
       }),
     );
     if (!tableRows) return;
-    const mirrored = spec.format === 'pptx' && spec.language === 'he';
-    rows.push({ where: `${where} header`, cells: header, mirrored });
-    body.forEach((row, r) => rows.push({ where: `${where} row ${r + 1}`, cells: row.map((c, i) => shown(c, numberFormat?.[i])), mirrored }));
+    rows.push({ where: `${where} header`, cells: header });
+    body.forEach((row, r) => rows.push({ where: `${where} row ${r + 1}`, cells: row.map((c, i) => shown(c, numberFormat?.[i])) }));
   };
   const blocks = (list: Block[]) => {
     let clause = 0;
@@ -937,7 +975,8 @@ function specTextRuns(spec: DocumentSpec, currency: string): SpecText {
             s.bullets.forEach((b, j) => runs.push({ where: `${where} bullet ${j + 1}`, text: b }));
             return;
           case 'table':
-            cells(where, s.header, s.rows, s.numberFormat);
+            // Row order is checked in the slide XML (`checkPptxTables`), where the column order is deterministic.
+            cells(where, s.header, s.rows, s.numberFormat, false);
             return;
           case 'chart':
             // The chart's own labels and values: category names and data labels are on the page.
@@ -1032,8 +1071,7 @@ function checkOrder(spec: SpecText, extracted: string, f: Findings): void {
     const cells = row.cells.map(normalise).filter((c) => c !== '');
     if (cells.length < 2) continue;
     const forward = cells.join(' ');
-    const backward = [...cells].reverse().join(' ');
-    if (t.includes(forward) || (row.mirrored && t.includes(backward))) continue;
+    if (t.includes(forward)) continue;
     if (placement(forward, t, (tok) => tok) === 'digits_reversed') f.add('digits_reversed', row.where);
     else if (cells.every((c) => t.includes(c))) f.add('order_reversed', row.where);
     else f.add('text_missing', row.where);
