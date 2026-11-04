@@ -139,7 +139,8 @@ export type Check1Code =
   | 'text_truncated'
   | 'file_unreadable'
   | 'spec_invalid'
-  | 'cell_mismatch';
+  | 'cell_mismatch'
+  | 'structure_mismatch';
 
 /** The one owner-facing string per code. Fixed: no finding carries source text. */
 export const CHECK1_HE: Record<Check1Code, string> = {
@@ -159,6 +160,7 @@ export const CHECK1_HE: Record<Check1Code, string> = {
   file_unreadable: 'לא ניתן לקרוא את הקובץ שנבנה',
   spec_invalid: 'תיאור המסמך לא עבר את הבדיקה המוקדמת',
   cell_mismatch: 'תא בגיליון אינו מכיל את מה שתוכנן לו',
+  structure_mismatch: 'מבנה הקובץ אינו תואם למה שתוכנן (טבלה עודפת או חסרה)',
 };
 
 export interface Check1Finding {
@@ -179,8 +181,7 @@ export interface Check1Rendered {
   textTruncated: boolean;
 }
 
-export interface Check1Input {
-  spec: DocumentSpec;
+interface Check1Common {
   bytes: Buffer;
   sources: GroundingSources;
   rendered: Check1Rendered;
@@ -188,17 +189,21 @@ export interface Check1Input {
   today: string;
   /** The charter currency the renderer formatted money with; table rows are compared as displayed. Required. */
   currency: string;
-  /**
-   * pdf only, and REQUIRED for pdf: the exact HTML that was printed
-   * (`renderPdfWithHtml`). Table rows are compared against its `<table>`
-   * structure in logical order — text read back from PDF pages is in visual
-   * order, and the Chromium joiner's letter vote can reverse a mostly-Latin
-   * or digit-only Hebrew row. Chosen over re-rendering inside check 1: the
-   * HTML handed in is the one Chromium actually printed, not a second
-   * rendering that could only ever agree with itself.
-   */
-  html?: string;
 }
+
+/**
+ * Discriminated on `spec.format`: a pdf REQUIRES `html` — the exact HTML that
+ * was printed (`renderPdfWithHtml`). Table rows are compared against its
+ * `<table>` structure in logical order — text read back from PDF pages is in
+ * visual order, and the Chromium joiner's letter vote can reverse a
+ * mostly-Latin or digit-only Hebrew row. Chosen over re-rendering inside
+ * check 1: the HTML handed in is the one Chromium actually printed, not a
+ * second rendering that could only ever agree with itself. `runCheck1` also
+ * guards it at runtime, for a caller that casts.
+ */
+export type Check1Input =
+  | (Check1Common & { spec: Exclude<DocumentSpec, { format: 'pdf' }>; html?: never })
+  | (Check1Common & { spec: Extract<DocumentSpec, { format: 'pdf' }>; html: string });
 
 /** How a `validateSpec` problem reads as a check-1 finding. Exhaustive. */
 const SPEC_CODE: Record<SpecProblemCode, Check1Code> = {
@@ -774,7 +779,10 @@ async function checkDocx(input: Check1Input, f: Findings, own: OwnText[]): Promi
       ),
     ),
   );
-  specTables(input.spec, input.currency).forEach((table, k) =>
+  const docxTables = specTables(input.spec, input.currency);
+  // Exactly the spec's tables, plus the signature table for a contract: an extra table is content nobody planned.
+  if (fileTables.length !== docxTables.length + (input.spec.kind === 'contract' ? 1 : 0)) f.add('structure_mismatch', 'tables');
+  docxTables.forEach((table, k) =>
     compareRows(table.rows, fileTables[k] ?? [], false, f, `${table.where} rows`),
   );
   try {
@@ -882,6 +890,7 @@ async function checkPptxCharts(input: Check1Input, zip: JSZip, f: Findings): Pro
     slide.rows.forEach((row, r) => {
       const labelCell = row[slide.labelColumn];
       const valueCell = row[slide.column];
+      // Labels compare with default formatting (no column format): the renderer formats chart labels the same way.
       const label = labelCell === undefined || 'f' in labelCell ? '' : formatCell(labelCell, undefined, input.currency, 'check1');
       const value = Number(values.get(r));
       const ok =
@@ -993,7 +1002,18 @@ function checkPdf(input: Check1Input, f: Findings): void {
       [...tr.matchAll(/<(th|td)>([\s\S]*?)<\/\1>/g)].map((m) => cellText(m[2] ?? '')),
     ),
   );
-  specTables(input.spec, input.currency).forEach((table, k) =>
+  const pdfTables = specTables(input.spec, input.currency);
+  // Exactly the spec's bare tables, and exactly one signature table for a contract (none otherwise).
+  const signatures = (html.match(/<table class="signatures">/g) ?? []).length;
+  const allTables = (html.match(/<table\b/g) ?? []).length;
+  if (
+    fileTables.length !== pdfTables.length ||
+    signatures !== (input.spec.kind === 'contract' ? 1 : 0) ||
+    allTables !== fileTables.length + signatures
+  ) {
+    f.add('structure_mismatch', 'tables');
+  }
+  pdfTables.forEach((table, k) =>
     compareRows(table.rows, fileTables[k] ?? [], false, f, `${table.where} rows`),
   );
 }

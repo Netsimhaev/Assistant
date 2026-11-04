@@ -621,9 +621,36 @@ describe('runCheck1', () => {
 
     it('pdf without the printed HTML is refused loudly', async () => {
       const { bytes, text } = await buildPdf(tablePdf);
-      await expect(
-        runCheck1({ spec: tablePdf, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' }),
-      ).rejects.toThrow(TypeError);
+      // The type forbids this (html is required for pdf); the runtime guard holds for a caller that casts.
+      const input = { spec: tablePdf, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' } as unknown as Parameters<typeof runCheck1>[0];
+      await expect(runCheck1(input)).rejects.toThrow(TypeError);
+    });
+
+    it('docx: a table the spec never asked for → structure_mismatch', async () => {
+      const good = await renderDocx(tableDocx, { currency: 'ILS', images: noImages });
+      const bytes = await rezip(good, async (zip) => {
+        const xml = await zip.file('word/document.xml')!.async('string');
+        const tbl = xml.match(/<w:tbl(?:\s[^>]*)?>[\s\S]*?<\/w:tbl>/)![0];
+        zip.file('word/document.xml', xml.replace('</w:body>', `${tbl}</w:body>`));
+      });
+      const r = await runCheck1({ spec: tableDocx, bytes, sources, rendered: rendered(await docxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'structure_mismatch', where: 'tables', he: CHECK1_HE.structure_mismatch }]);
+      // A contract carries exactly one table more: the signatures.
+      const contract = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
+      const ok = await runCheck1({ spec: contractDocx, bytes: contract, sources, rendered: rendered(await docxText(contract)), today: TODAY, currency: 'ILS' });
+      expect(ok.findings).toEqual([]);
+    });
+
+    it('pdf: an extra table in the printed HTML, or a missing signature table → structure_mismatch', async () => {
+      const { bytes, text, html } = await buildPdf(tablePdf);
+      const extra = html.replace('</body>', '<table><tr><td>x</td></tr></table></body>');
+      const r = await runCheck1({ spec: tablePdf, html: extra, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'structure_mismatch', where: 'tables', he: CHECK1_HE.structure_mismatch }]);
+      const c = await buildPdf(contractPdf);
+      const noSignatures = c.html.replace(/<table class="signatures">[\s\S]*?<\/table>/, '');
+      expect(noSignatures).not.toBe(c.html);
+      const s = await runCheck1({ spec: contractPdf, html: noSignatures, bytes: c.bytes, sources, rendered: rendered(c.text), today: TODAY, currency: 'ILS' });
+      expect(s.findings).toEqual([{ code: 'structure_mismatch', where: 'tables', he: CHECK1_HE.structure_mismatch }]);
     });
 
     it('pptx: a chart value moved to another category → cell_mismatch at both points', async () => {
