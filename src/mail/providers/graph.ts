@@ -22,6 +22,7 @@ import {
   type MailboxClient,
   type MailboxFailure,
   type MailboxHttp,
+  type OutgoingAttachment,
 } from './types.js';
 
 const BASE = 'https://graph.microsoft.com/v1.0';
@@ -30,6 +31,29 @@ const SELECT =
 const MAX_PAGES = 200;
 const DELTA_HEADERS = { Prefer: 'odata.maxpagesize=50' };
 const ALLOWED_LABELS: readonly string[] = Object.values(MAIL_LABELS);
+
+/**
+ * The largest single file this client attaches inline (spec §8.2, a Claude
+ * ruling): Graph takes a `fileAttachment` in one request only up to 3MB, and
+ * there is no upload session in this project. Larger is refused — the mailbox
+ * adapter refuses it first, in Hebrew; this is the provider's own floor.
+ */
+export const GRAPH_MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;
+
+function attachmentTooLarge(attachments: readonly OutgoingAttachment[]): MailboxFailure | null {
+  return attachments.some((file) => file.bytes.length > GRAPH_MAX_ATTACHMENT_BYTES)
+    ? { failure: 'rejected', status: 0, message: 'graph attachment is larger than 3MB' }
+    : null;
+}
+
+function fileAttachment(file: OutgoingAttachment): Record<string, string> {
+  return {
+    '@odata.type': '#microsoft.graph.fileAttachment',
+    name: file.filename,
+    contentType: file.mediaType,
+    contentBytes: file.bytes.toString('base64'),
+  };
+}
 
 /**
  * The initial delta only needs to reach a deltaLink: filter to mail received from now on
@@ -279,6 +303,44 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
         if (reply.to.length === 0 || !reply.to.every((a) => ADDRESS_SHAPE.test(a))) {
           return { failure: 'rejected', status: 0, message: 'reply recipient is not a plain address' } as MailboxFailure;
         }
+        const attachments = reply.attachments ?? [];
+        const tooLarge = attachmentTooLarge(attachments);
+        if (tooLarge !== null) return tooLarge;
+        const message = { toRecipients: reply.to.map((address) => ({ emailAddress: { address } })), ccRecipients: [] };
+        if (attachments.length > 0) {
+          // A reply with a file is three calls: createReply (a draft that
+          // quotes the original, with the same explicit recipients and empty
+          // cc), one POST per fileAttachment, then send. The one-call /reply
+          // below takes no attachments. A failure before the send leaves an
+          // unsent draft in the mailbox — never a sent mail without its file;
+          // nothing here removes it (this client never removes anything).
+          const created = await http.request({
+            method: 'POST',
+            url: `${BASE}/me/messages/${encodeURIComponent(reply.providerMessageId)}/createReply`,
+            accessToken: token,
+            body: { message, comment: reply.body },
+            signal,
+          });
+          if (!ok2xx(created.status)) return failureFromStatus(created.status, created.body);
+          const draftId = asRecord(created.body)['id'];
+          if (typeof draftId !== 'string' || draftId === '') {
+            return { failure: 'rejected', status: created.status, message: 'graph createReply returned no draft id' } as MailboxFailure;
+          }
+          const draftUrl = `${BASE}/me/messages/${encodeURIComponent(draftId)}`;
+          for (const file of attachments) {
+            const added = await http.request({
+              method: 'POST',
+              url: `${draftUrl}/attachments`,
+              accessToken: token,
+              body: fileAttachment(file),
+              signal,
+            });
+            if (!ok2xx(added.status)) return failureFromStatus(added.status, added.body);
+          }
+          const sent = await http.request({ method: 'POST', url: `${draftUrl}/send`, accessToken: token, signal });
+          if (!ok2xx(sent.status)) return failureFromStatus(sent.status, sent.body);
+          return { externalId: null };
+        }
         // One call, no draft left behind on failure. The recipients are set explicitly so a
         // different Reply-To on the original can never redirect the answer, and cc stays empty.
         // Graph answers 202 with an empty body, so there is no sent-message id to report.
@@ -286,10 +348,7 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
           method: 'POST',
           url: `${BASE}/me/messages/${encodeURIComponent(reply.providerMessageId)}/reply`,
           accessToken: token,
-          body: {
-            message: { toRecipients: reply.to.map((address) => ({ emailAddress: { address } })), ccRecipients: [] },
-            comment: reply.body,
-          },
+          body: { message, comment: reply.body },
           signal,
         });
         if (!ok2xx(res.status)) return failureFromStatus(res.status, res.body);
@@ -307,9 +366,13 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
         if (/[\r\n]/.test(message.subject)) {
           return { failure: 'rejected', status: 0, message: 'mail subject contains a line break' } as MailboxFailure;
         }
+        const attachments = message.attachments ?? [];
+        const tooLarge = attachmentTooLarge(attachments);
+        if (tooLarge !== null) return tooLarge;
         // One call: sendMail sends and files in Sent; no draft is created, so
         // nothing is left behind on failure. cc stays empty, as on a reply.
         // Graph answers 202 with an empty body: no sent-message id to report.
+        // Attachments ride inline on the same message as fileAttachments.
         const res = await http.request({
           method: 'POST',
           url: `${BASE}/me/sendMail`,
@@ -320,6 +383,7 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
               body: { contentType: 'Text', content: message.body },
               toRecipients: message.to.map((address) => ({ emailAddress: { address } })),
               ccRecipients: [],
+              ...(attachments.length > 0 ? { attachments: attachments.map(fileAttachment) } : {}),
             },
             saveToSentItems: true,
           },

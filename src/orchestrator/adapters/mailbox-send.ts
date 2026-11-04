@@ -1,5 +1,5 @@
 import { createGmailClient } from '../../mail/providers/gmail.js';
-import { createGraphClient } from '../../mail/providers/graph.js';
+import { createGraphClient, GRAPH_MAX_ATTACHMENT_BYTES } from '../../mail/providers/graph.js';
 import { isFailure } from '../../mail/providers/types.js';
 import type { MailboxClient, MailboxFailure } from '../../mail/providers/types.js';
 import type { ReplyTargetLookup } from '../../mail/inbox-store.js';
@@ -113,6 +113,16 @@ export function createMailboxSendAdapter(options: MailboxSendOptions): ExternalA
       const subject = readString(input, 'subject');
       const body = readString(input, 'body');
 
+      // Microsoft takes a file inline only up to 3MB, and this project has no
+      // upload session (spec §8.2). Refused before anything is sent, final:
+      // the same file will be too large on every retry.
+      if (
+        options.provider === 'microsoft' &&
+        call.attachments.some((file) => file.bytes.length > GRAPH_MAX_ATTACHMENT_BYTES)
+      ) {
+        return ATTACHMENT_TOO_LARGE_MICROSOFT;
+      }
+
       const threading = THREADING_FIELDS.map((key) => threadingPresence(input, key));
       if (threading.every((present) => !present)) {
         return sendNew(input, subject, body, call);
@@ -172,7 +182,16 @@ export function createMailboxSendAdapter(options: MailboxSendOptions): ExternalA
       return toAdapterResult(() =>
         client.sendReply(
           token,
-          { to, subject, body, inReplyTo, references, threadId, providerMessageId },
+          {
+            to,
+            subject,
+            body,
+            inReplyTo,
+            references,
+            threadId,
+            providerMessageId,
+            ...withAttachments(call),
+          },
           call.signal,
         ),
       );
@@ -192,11 +211,27 @@ export function createMailboxSendAdapter(options: MailboxSendOptions): ExternalA
     if (subject === null || body === null) return MESSAGE_INCOMPLETE;
     if (call.credential === null) return CREDENTIAL_UNAVAILABLE;
     const token = call.credential.value;
-    return toAdapterResult(() => client.sendNew(token, { to, subject, body }, call.signal));
+    return toAdapterResult(() => client.sendNew(token, { to, subject, body, ...withAttachments(call) }, call.signal));
   }
 }
 
-const THREADING_FIELDS = ['inReplyTo', 'threadId', 'providerMessageId'] as const;
+/**
+ * The resolved files, only when there are any — so a send without attachments
+ * hands the client the exact object it always did. Taken from
+ * `call.attachments` and never from the redacted `input` (ruling C16).
+ */
+function withAttachments(call: AdapterCall): { attachments?: AdapterCall['attachments'] } {
+  return call.attachments.length > 0 ? { attachments: call.attachments } : {};
+}
+
+const ATTACHMENT_TOO_LARGE_MICROSOFT: AdapterResult = {
+  ok: false,
+  retryable: false,
+  code: 'attachment_too_large_microsoft',
+  message: 'הקובץ גדול מדי לשליחה מ-Outlook בפרויקט הזה',
+};
+
+const THREADING_FIELDS =['inReplyTo', 'threadId', 'providerMessageId'] as const;
 
 /**
  * Whether a threading field is there at all. Own keys only, like every read

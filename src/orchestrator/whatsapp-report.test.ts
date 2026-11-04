@@ -1184,6 +1184,23 @@ describe('failedText', () => {
     expect(failedText('reply_target_lookup_failed — x')).not.toBe(FAILED_GENERIC_TEXT);
   });
 
+  it('maps every attachment refusal (document production §8.2) to its own Hebrew sentence', () => {
+    const codes = [
+      'attachment_not_found',
+      'attachment_hash_mismatch',
+      'attachment_too_large',
+      'attachment_too_large_microsoft',
+      'attachment_invalid',
+      'attachments_not_supported',
+    ];
+    const texts = codes.map((code) => failedText(`${code} — x`));
+    for (const text of texts) {
+      expect(text).not.toBe(FAILED_GENERIC_TEXT);
+      expect(text).toMatch(/[א-ת]/);
+    }
+    expect(new Set(texts).size).toBe(codes.length);
+  });
+
   it('falls through to the generic text for anything unmapped, in every shape', () => {
     expect(failedText(null)).toBe(FAILED_GENERIC_TEXT);
     expect(failedText('some_future_code — details')).toBe(FAILED_GENERIC_TEXT);

@@ -310,6 +310,16 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   reply_recipient_mismatch: 'תשובה בתוך שיחה נשלחת רק לשולח המקורי',
   reply_target_lookup_failed: 'לא ניתן היה לבדוק את המייל שאליו עונים', // retryable
 
+  // Attachments on mail.send (document production §8.2): performStep's own
+  // refusals (run-plan.ts, production/attachments.ts) and the mailbox
+  // adapter's Microsoft cap. All final.
+  attachment_not_found: 'הקובץ המצורף לא נמצא',
+  attachment_hash_mismatch: 'הקובץ המצורף השתנה מאז שאושר',
+  attachment_too_large: 'הקבצים המצורפים גדולים מ-20MB',
+  attachment_too_large_microsoft: 'הקובץ גדול מדי לשליחה מ-Outlook בפרויקט הזה',
+  attachment_invalid: 'פרטי הקובץ המצורף אינם תקינים',
+  attachments_not_supported: 'אפשר לצרף קבצים רק למייל',
+
   // run-due.ts's own plan-level rejections, under the `run_due:` namespace
   // `leadingCode` manufactures.
   'run_due:no_plan_bound': 'לא נמצאה תוכנית פעולה למשימה',

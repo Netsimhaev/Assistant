@@ -22,6 +22,7 @@ function call(over: Partial<AdapterCall> = {}): AdapterCall {
     endpoint: null,
     businessId: 'test-business',
     idempotencyKey: 'test-idempotency-key',
+    attachments: [],
     signal: new AbortController().signal,
     ...over,
   };
@@ -490,6 +491,7 @@ function mailCall(over: Partial<AdapterCall> = {}): AdapterCall {
     endpoint: null,
     businessId: 'test-business',
     idempotencyKey: 'test-idempotency-key',
+    attachments: [],
     signal: new AbortController().signal,
     ...over,
   };

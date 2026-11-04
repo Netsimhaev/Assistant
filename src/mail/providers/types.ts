@@ -1,4 +1,7 @@
 import type { IncomingMail } from '../inbox-store.js';
+import type { OutgoingAttachment } from '../../orchestrator/adapters/types.js';
+
+export type { OutgoingAttachment };
 
 export interface MailboxHttp {
   request(input: {
@@ -23,6 +26,12 @@ export interface OutgoingReply {
   threadId: string;
   /** Provider's own id of the mail being answered. Graph needs it (its reply is addressed by id, not by Message-ID); Gmail ignores it. */
   providerMessageId: string;
+  /**
+   * Resolved produced documents (document production §8.2) — the exact
+   * approved bytes. Absent or empty means a plain single-part message, the
+   * shape every send had before attachments existed.
+   */
+  attachments?: readonly OutgoingAttachment[];
 }
 
 /**
@@ -33,6 +42,12 @@ export interface OutgoingMessage {
   to: string[];
   subject: string;
   body: string;
+  /**
+   * Resolved produced documents (document production §8.2) — the exact
+   * approved bytes. Absent or empty means a plain single-part message, the
+   * shape every send had before attachments existed.
+   */
+  attachments?: readonly OutgoingAttachment[];
 }
 
 export interface MailboxClient {
