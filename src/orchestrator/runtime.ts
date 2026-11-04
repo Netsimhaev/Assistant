@@ -27,6 +27,7 @@ import type { TokenHttp } from './oauth-token.js';
 import type { CredentialHandle } from './adapters/types.js';
 import type { WhatsAppGateway } from '../whatsapp/gateway.js';
 import { canonicalHash } from '../util/canonical.js';
+import { PRODUCTION_TOOLS_MISSING_REASON } from '../production/render-error.js';
 
 /** Which vendor's code serves a binding's system. Matches `ConnectionBinding.provider`. */
 const GOOGLE_PROVIDER = 'google';
@@ -87,6 +88,17 @@ export interface Runtime {
    * `overrides.whatsappGateway` below.
    */
   whatsapp?: { gateway: WhatsAppGateway };
+  /**
+   * Whether document production can run on this server: both binaries it
+   * needs (`DOCUMENT_SOFFICE_PATH` for the LibreOffice page conversion of
+   * check 2, `DOCUMENT_CHROMIUM_PATH` for PDF printing and page images) are
+   * configured. When `available` is false a production fails with stage
+   * `failed` and `PRODUCTION_TOOLS_MISSING_REASON`
+   * (`src/production/page-images.ts`), and `warnings` says which path is
+   * missing. Optional so hand-built test runtimes keep typechecking; every
+   * real build sets it, and a reader treats an absent field as unavailable.
+   */
+  production?: { available: boolean; sofficePath: string | null; chromiumPath: string | null };
   /**
    * What could not be assembled, and why.
    *
@@ -513,6 +525,30 @@ export async function buildRuntime(
     );
   }
 
+  // Same switch discipline as the SMTP set: a server without LibreOffice or
+  // Chromium still starts (the scheduler has other work), but the operator is
+  // told, so "no document was produced" does not look like "none was asked".
+  // Presence only; whether the binary actually runs is what
+  // `npm run doc:render-check` checks (docs/11-pre-launch-checks.md).
+  const productionPath = (key: string): string | null => {
+    const value = env[key];
+    return value === undefined || value.length === 0 ? null : value;
+  };
+  const production = {
+    sofficePath: productionPath('DOCUMENT_SOFFICE_PATH'),
+    chromiumPath: productionPath('DOCUMENT_CHROMIUM_PATH'),
+  };
+  const missingProduction = [
+    ...(production.sofficePath === null ? ['DOCUMENT_SOFFICE_PATH'] : []),
+    ...(production.chromiumPath === null ? ['DOCUMENT_CHROMIUM_PATH'] : []),
+  ];
+  if (missingProduction.length > 0) {
+    warnings.push(
+      `no document production: ${missingProduction.join(', ')} not set — every document ` +
+        `production will fail ("${PRODUCTION_TOOLS_MISSING_REASON}")`,
+    );
+  }
+
   // Additive, on top of the mail adapter above: every system whose binding
   // carries `provider: 'google'`, and whose charter-declared connection for
   // that same system BOTH uses the `api` channel AND serves `calendar.read`,
@@ -642,6 +678,7 @@ export async function buildRuntime(
     credentials,
     ...(notify !== undefined ? { notify } : {}),
     ...(whatsapp !== undefined ? { whatsapp } : {}),
+    production: { available: missingProduction.length === 0, ...production },
     warnings,
   };
 }

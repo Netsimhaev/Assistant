@@ -96,6 +96,13 @@ export const config = {
     optional('DOCUMENT_FONT_PATH') ??
       resolve(dirname(fileURLToPath(import.meta.url)), '..', 'assets', 'fonts', 'NotoSansHebrew-Regular.ttf'),
   ),
+  // The two binaries document production needs on the server
+  // (`src/production/page-images.ts`, `chromium.ts`): LibreOffice converts
+  // docx/xlsx/pptx to a TEMPORARY PDF for the page images of check 2 only,
+  // and headless Chromium prints PDFs and rasterises pages. Either absent =>
+  // `buildRuntime` warns and productions fail, never a throw at startup.
+  sofficePath: optional('DOCUMENT_SOFFICE_PATH'),
+  chromiumPath: optional('DOCUMENT_CHROMIUM_PATH'),
   // Model reads (triage calls) of incoming mail per day. A mail pulled after
   // the ceiling is recorded and shown as "not read — daily ceiling reached",
   // and is read on a later pass once the count resets (spec §5.4).
