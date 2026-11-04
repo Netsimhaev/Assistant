@@ -1093,3 +1093,114 @@ describe('fix round 5', () => {
     });
   });
 });
+
+describe('fix round 6 (breaker)', () => {
+  const withText = (text: string) =>
+    sources({ documents: [{ documentId: PRICE_LIST, artifacts: [{ ordinal: 1, text }] }] });
+  const wheres = (problems: SpecProblem[], code: string) =>
+    problems.filter((p) => p.code === code).map((p) => p.where);
+  const profitTable = (pairs: [number, number][]) => {
+    const n = pairs.length;
+    return xlsx({
+      sheets: [
+        {
+          name: 'רווחיות',
+          tables: [
+            {
+              header: ['עלות', 'מחיר', 'רווח', 'שולי רווח'],
+              numberFormat: ['money', 'money', 'money', 'percent'],
+              rows: pairs.map(([cost, price], i) => [
+                fromDoc(cost),
+                fromDoc(price),
+                { f: `B${i + 2}-A${i + 2}` },
+                { f: `C${i + 2}/B${i + 2}` },
+              ]),
+              totals: [
+                { f: `SUM(A2:A${n + 1})` },
+                { f: `SUM(B2:B${n + 1})` },
+                { f: `SUM(C2:C${n + 1})` },
+                { f: `C${n + 2}/B${n + 2}` },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  };
+  const PAIRS: [number, number][] = [
+    [1200, 1890],
+    [0.7, 3.3],
+    [1890, 300],
+    [500, 0.7],
+    [300, 500],
+  ];
+  const pairSource = 'עלויות ומחירים: 1,200 1,890 0.7 3.3 1890 300 500 0.7 300 500';
+
+  it('the profit table (profit, margin, totals, totals margin) is accepted for every pair and all together', () => {
+    for (const pair of PAIRS) {
+      expect(validateSpec(profitTable([pair]), withText(pairSource), TODAY)).toEqual([]);
+    }
+    expect(validateSpec(profitTable(PAIRS), withText(pairSource), TODAY)).toEqual([]);
+  });
+
+  it('ratios of late cells in a large workbook still move (factors do not crowd)', () => {
+    // ~25,000 inputs: a factor sequence that converges (1+0.37(k+1)/(k+2))
+    // puts adjacent late factors within the tolerance, and D/E would look constant.
+    const rows: Cell[][] = Array.from({ length: 4999 }, () => Array.from({ length: 5 }, () => fromDoc(1890)));
+    rows.push([{ t: 'יחס' }, { t: '-' }, { t: '-' }, { t: '-' }, { f: 'D5000/E5000' }]);
+    const spec = xlsx({ sheets: [{ name: 'a', tables: [{ header: ['a', 'b', 'c', 'd', 'e'], rows }] }] });
+    expect(validateSpec(spec, withText('מחיר 1,890'), TODAY)).toEqual([]);
+  });
+
+  it('a share of total is accepted', () => {
+    const spec = xlsx({
+      sheets: [
+        {
+          name: 'a',
+          tables: [
+            {
+              header: ['x', 'y'],
+              rows: [
+                [fromDoc(1200), { f: 'A2/SUM(A2:A5)' }],
+                [fromDoc(1890), { f: 'A3/SUM(A2:A5)' }],
+                [fromDoc(300), { f: 'A4/SUM(A2:A5)' }],
+                [fromDoc(500), { f: 'A5/SUM(A2:A5)' }],
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    expect(validateSpec(spec, withText(pairSource), TODAY)).toEqual([]);
+  });
+
+  it('a self-ratio stays constant: A2/A2*100+A2 and (A2/B2)*(B2/A2)*100+A2 are refused', () => {
+    for (const f of ['A2/A2*100+A2', '(A2/B2)*(B2/A2)*100+A2']) {
+      const spec = xlsx({
+        sheets: [{ name: 'a', tables: [{ header: ['x', 'y', 'z'], rows: [[fromDoc(1200), fromDoc(1890), { f }]] }] }],
+      });
+      const problems = validateSpec(spec, withText(pairSource), TODAY);
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 1 col 3']);
+      expect(problems[0]!.detail).toContain('100');
+    }
+  });
+
+  it('an inline percent literal grounds against "17%" as f×100% or (f−1)×100%', () => {
+    const vat = (f: string) =>
+      validateSpec(
+        xlsx({ sheets: [{ name: 'a', tables: [{ header: ['x', 'y'], rows: [[fromDoc(1890), { f }]] }] }] }),
+        withText('מחיר 1,890 מע"מ 17%'),
+        TODAY,
+      );
+    expect(vat('A2*1.17')).toEqual([]);
+    expect(vat('A2*0.17')).toEqual([]);
+    expect(wheres(vat('A2*1.18'), 'ungrounded_number')).toEqual(['sheet 1 table 1 row 1 col 2']);
+    // The percent forms need the % sign in the source: a bare "17" is not "17%".
+    const bare = validateSpec(
+      xlsx({ sheets: [{ name: 'a', tables: [{ header: ['x', 'y'], rows: [[fromDoc(1890), { f: 'A2*1.17' }]] }] }] }),
+      withText('מחיר 1,890 פריט 17'),
+      TODAY,
+    );
+    expect(wheres(bare, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 1 col 2']);
+  });
+});

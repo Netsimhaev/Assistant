@@ -56,7 +56,9 @@
  *     direct `*`/`/` operand in {0, 1, 100, 12} whose other operand contains
  *     a cell reference. So exempt values cannot be combined by arithmetic
  *     (`100*100+12*12+1+1`). A negated literal outside those positions is
- *     grounded WITH its sign (`-1890` needs "-1890", not "1890").
+ *     grounded WITH its sign (`-1890` needs "-1890", not "1890"). A literal
+ *     f also grounds as an inline percent: f×100 or (f−1)×100 written with a
+ *     percent mark in a source (`A2*1.17` / `A2*0.17` on "17%").
  *   - TRUE/FALSE as an operand of `+ - * / ^`, a unary sign or `%` is
  *     `formula_problem` (`(TRUE+TRUE)*A2` manufactures a 2).
  *   - a literal (number, string or boolean) argument of SUM, AVERAGE, MIN,
@@ -68,8 +70,10 @@
  *     reading a tainted cell, transitively; a tainted result never grounds
  *     free text (no laundering `{f:'18900'}` into a title).
  *   - PERTURBATION: the workbook is evaluated a second time, same layout,
- *     with every `{v}` input ×1.37. A numeric result that does not move (or
- *     is not a number under the perturbation) is CONSTANT-DERIVED
+ *     with every `{v}` input × its OWN factor (`perturbationFactor`, fix
+ *     round 6 — a uniform factor left every ratio of inputs unmoved). A
+ *     numeric result that does not move beyond a relative 1e-9 (or is not a
+ *     number under the perturbation) is CONSTANT-DERIVED
  *     (`A2/A2*100*100*12`, reference-free formulas): its displayed value must
  *     ground in the sources like a literal, and it never grounds free text.
  *     The same test applies to every OPERAND (fix round 5): each operand of
@@ -408,6 +412,9 @@ const allSourceTexts = (s: GroundingSources): string[] => [
   ...s.memories.map((m) => m.body),
 ];
 
+
+/** Every percent-marked number the sources write ("17%", "2.5 אחוזים"), as its own text. */
+const percentMarked = (texts: string[]): string[] => texts.flatMap((t) => t.match(PERCENT_FOLLOWED) ?? []);
 
 // ---------------------------------------------------------------- collector
 
@@ -872,23 +879,68 @@ interface WorkbookCheck {
 
 const cellKey = (sheet: string, address: string) => `${sheet.toUpperCase()}!${address}`;
 
-/** The input factor of the perturbation check: not a round number, so it does not cancel. */
-const PERTURBATION = 1.37;
+/**
+ * The factor of the k-th `{v}` input (fix round 6). Each input gets its OWN
+ * factor — a uniform factor leaves every ratio of inputs unmoved, so a margin
+ * `C2/B2` or a share `A2/SUM(A2:A5)` looked constant. The k-th factor is
+ * 1.1 + 0.8·frac((k+1)·φ⁻¹): a low-discrepancy sequence, so any two factors
+ * stay well apart (~1/N for N inputs, far above MOVE_TOLERANCE) however many
+ * inputs a workbook holds; a hyperbolic 1+0.37(k+1)/(k+2) would crowd toward
+ * 1.37 and let ratios of late cells look constant. The same cell always gets
+ * the same factor, so `A2/A2` and `A2/B2*B2/A2` stay invariant.
+ */
+export function perturbationFactor(k: number): number {
+  const golden = 0.6180339887498949;
+  const frac = ((k + 1) * golden) % 1;
+  return 1.1 + 0.8 * frac;
+}
 
-/** The same sheet, same layout, with every `{v}` input multiplied by PERTURBATION. */
-function perturbSheet(sheet: XlsxSheet): XlsxSheet {
-  const move = (cell: Cell): Cell => ('v' in cell ? { ...cell, v: cell.v * PERTURBATION } : cell);
-  return {
+/** Relative tolerance under which a perturbed value has NOT moved. */
+const MOVE_TOLERANCE = 1e-9;
+
+/** Did a value move under the perturbation? A non-number never counts as moved. */
+function moved(v: number, m: EvalValue | undefined): boolean {
+  return typeof m === 'number' && Math.abs(m - v) > MOVE_TOLERANCE * Math.max(Math.abs(v), 1);
+}
+
+/**
+ * The same workbook, same layout, with every `{v}` input multiplied by its
+ * own factor; k counts `{v}` cells in a fixed order (sheet, table, row, then
+ * totals, column), so the perturbation is deterministic per spec.
+ */
+function perturbWorkbook(sheets: XlsxSheet[]): XlsxSheet[] {
+  let k = 0;
+  const move = (cell: Cell): Cell => ('v' in cell ? { ...cell, v: cell.v * perturbationFactor(k++) } : cell);
+  return sheets.map((sheet) => ({
     ...sheet,
     tables: sheet.tables.map((t) => ({
       ...t,
       rows: t.rows.map((row) => row.map(move)),
       ...(t.totals === undefined ? {} : { totals: t.totals.map(move) }),
     })),
-  };
+  }));
 }
 
-function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProblem): WorkbookCheck {
+/**
+ * A formula literal grounds in the sources as written, or as an inline
+ * percent (fix round 6): f×100 or (f−1)×100 written WITH a percent mark
+ * ("17%", "17 אחוז") — so `A2*1.17` and `A2*0.17` ground on "17%", and
+ * `A2*1.18` does not. `percentPool` holds only the percent-marked numbers.
+ */
+function literalGrounded(f: number, literalPool: string[], percentPool: string[]): boolean {
+  if (ungroundedNumbers(plainNumber(f), literalPool).length === 0) return true;
+  // `ungroundedNumbers` treats an EMPTY pool as "nothing to check": no
+  // percent-marked number in any source must mean no percent grounding.
+  if (percentPool.length === 0) return false;
+  return [f * 100, (f - 1) * 100].some((x) => ungroundedNumbers(plainNumber(at15(x)), percentPool).length === 0);
+}
+
+function checkWorkbook(
+  sheets: XlsxSheet[],
+  literalPool: string[],
+  percentPool: string[],
+  add: AddProblem,
+): WorkbookCheck {
   const layouts = sheets.map(layoutSheet);
   const upper = sheets.map((s) => s.name.toUpperCase());
   const cells = new Map<string, FormulaCellInfo>();
@@ -944,8 +996,8 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
         }
       }
       const ungrounded = literals.numbers
-        .map(plainNumber)
-        .filter((n) => ungroundedNumbers(n, literalPool).length > 0);
+        .filter((n) => !literalGrounded(n, literalPool, percentPool))
+        .map(plainNumber);
       cells.set(key, {
         ungrounded: [...new Set(ungrounded)],
         strings: literals.strings,
@@ -988,7 +1040,7 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
   // input ×PERTURBATION. A numeric result that does not move is built from
   // constants, not from the inputs (`A2/A2*100*100*12`), so its displayed
   // value must ground like a literal, and it never grounds free text.
-  const perturbed = evaluateWorkbook(sheets.map(perturbSheet).map(toEvalSheet));
+  const perturbed = evaluateWorkbook(perturbWorkbook(sheets).map(toEvalSheet));
   // Per-operand perturbation (fix round 5): every operand subexpression
   // (`operandsOf`) becomes a synthetic cell on its own sheet, in a copy of
   // both workbooks — same layout, so its refs mean what they mean in the
@@ -1016,12 +1068,11 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
   };
   if (synthetic.length > 0) {
     const base = withSynthetic(sheets.map(toEvalSheet));
-    const moved = withSynthetic(sheets.map(perturbSheet).map(toEvalSheet));
+    const shifted = withSynthetic(perturbWorkbook(sheets).map(toEvalSheet));
     for (const cell of synthetic) {
       const v = base.values.get(cell.evalKey);
       if (typeof v !== 'number' || isCountResult(cell.ast)) continue;
-      const m = moved.values.get(cell.evalKey);
-      if (typeof m === 'number' && m !== v) continue;
+      if (moved(v, shifted.values.get(cell.evalKey))) continue;
       const shown = plainNumber(at15(v));
       if (ungroundedNumbers(shown, literalPool).length > 0) cells.get(cell.key)!.constantUngrounded.push(shown);
     }
@@ -1045,12 +1096,12 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
         info.stringResult = value;
       } else if (typeof value === 'number' && !literalTainted.has(key)) {
         const shown = displayedResult(value, sheets[si]!.tables[p.table]!, p.column);
-        const moved = perturbed.values.get(evalKey);
+
         // A perturbed result that is not a number counts as NOT moved: the
         // stricter reading (a branch that errors on other inputs). A count or
         // MATCH result is exempt from grounding but never grounds free text.
         const counted = countResults.has(key);
-        const constant = !counted && (typeof moved !== 'number' || moved === value);
+        const constant = !counted && !moved(value, perturbed.values.get(evalKey));
         if (constant && ungroundedNumbers(shown, literalPool).length > 0) info.constantUngrounded.unshift(shown);
         if (constant || counted) constants.add(key);
         else numeric.push({ key, shown });
@@ -1191,7 +1242,7 @@ export function validateSpec(
   const sourcePool = allSourceTexts(sources).map(splitSeparators);
   // What a string formula result may ground in: sources and today's year, never formula results.
   const freeTextSources = [...sourcePool, today.slice(0, 4)];
-  const workbook = spec.format === 'xlsx' ? checkWorkbook(spec.sheets, sourcePool, add) : null;
+  const workbook = spec.format === 'xlsx' ? checkWorkbook(spec.sheets, sourcePool, percentMarked(allSourceTexts(sources)), add) : null;
   const c = new Collector(sources, today, datesIn(allSourceTexts(sources)), clauseCount(spec), [
     ...sourcePool,
     ...(workbook?.results ?? []),
