@@ -165,4 +165,69 @@ describe('renderPptx', () => {
     expect(x).toContain('ברוכים הבאים');
     expect(x).toContain('תת כותרת');
   });
+
+  const ref = { kind: 'instruction' } as const;
+  const twoCol: Slide = {
+    type: 'table',
+    title: 'טבלה',
+    header: ['שם', 'הנחה', 'מחיר'],
+    rows: [
+      [{ t: 'אלפא' }, { v: 0.15, src: ref }, { v: 1890, src: ref }],
+      [{ t: 'בטא' }, { v: 0.5, src: ref }, { v: 20, src: ref }],
+    ],
+    numberFormat: ['int', 'percent', 'money'],
+  };
+  const texts = (x: string) => [...x.matchAll(/<a:t>([^<]*)<\/a:t>/g)].map((m) => m[1]);
+
+  it('he table columns are reversed (first header rightmost) and formats follow their column', async () => {
+    const { buffer } = await renderPptx(spec([twoCol]), { currency: 'ILS', images: none });
+    const t = texts(await slideXml(buffer, 1));
+    const at = (s: string) => t.indexOf(s);
+    // XML order is left-to-right on screen: last column first, first column last.
+    expect(at('מחיר')).toBeLessThan(at('הנחה'));
+    expect(at('הנחה')).toBeLessThan(at('שם'));
+    expect(t.slice(at('אלפא') - 2, at('אלפא') + 1)).toEqual(['₪1,890', '15%', 'אלפא']);
+    expect(t.slice(at('בטא') - 2, at('בטא') + 1)).toEqual(['₪20', '50%', 'בטא']);
+  });
+
+  it('en table keeps column order', async () => {
+    const { buffer } = await renderPptx(
+      spec([{ ...twoCol, header: ['Name', 'Disc', 'Price'] } as Slide], { language: 'en' }),
+      { currency: 'ILS', images: none },
+    );
+    const t = texts(await slideXml(buffer, 1));
+    expect(t.indexOf('Name')).toBeLessThan(t.indexOf('Disc'));
+    expect(t.indexOf('Disc')).toBeLessThan(t.indexOf('Price'));
+  });
+
+  it('header digit runs are their own run', async () => {
+    const { buffer } = await renderPptx(
+      spec([{ type: 'table', title: 'ט', header: ['שנת 2025'], rows: [[{ t: 'x' }]] }]),
+      { currency: 'ILS', images: none },
+    );
+    expect(texts(await slideXml(buffer, 1))).toContain('2025');
+  });
+
+  const chart = (chartType: 'bar' | 'line' | 'pie'): Slide => ({
+    type: 'chart',
+    title: 'c',
+    chartType,
+    header: ['a', 'b'],
+    rows: [[{ t: 'x' }, { v: 1, src: ref }]],
+    column: 1,
+    labelColumn: 0,
+  });
+  async function chartXml(chartType: 'bar' | 'line' | 'pie', language: 'he' | 'en'): Promise<string> {
+    const { buffer } = await renderPptx(spec([chart(chartType)], { language }), { currency: 'ILS', images: none });
+    const zip = await JSZip.loadAsync(buffer);
+    const f = Object.keys(zip.files).find((n) => /^ppt\/charts\/chart\d+\.xml$/.test(n))!;
+    return zip.file(f)!.async('string');
+  }
+
+  it('he bar and line charts reverse the category axis; en and pie do not', async () => {
+    expect(await chartXml('bar', 'he')).toContain('<c:orientation val="maxMin"/>');
+    expect(await chartXml('line', 'he')).toContain('<c:orientation val="maxMin"/>');
+    expect(await chartXml('bar', 'en')).not.toContain('maxMin');
+    expect(await chartXml('pie', 'he')).not.toContain('maxMin');
+  });
 });

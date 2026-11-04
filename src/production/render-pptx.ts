@@ -184,7 +184,8 @@ function tableSlide(slide: PptxSlide, s: Extract<Slide, { type: 'table' }>, n: n
     ...extra,
   });
   const head = order.map((i) => ({
-    text: s.header[i] as string,
+    // runs() splits digit runs into their own LTR runs, like every other Hebrew text
+    text: runs(s.header[i] as string, ctx, { bold: true, fontSize: 16, color: 'FFFFFF' }),
     options: cellOpts({ bold: true, color: 'FFFFFF', fill: { color: ctx.accent } }),
   }));
   const body = s.rows.map((row, r) =>
@@ -208,6 +209,7 @@ function chartSlide(slide: PptxSlide, s: Extract<Slide, { type: 'chart' }>, n: n
   );
   const values = s.rows.map((row, r) => numericValue(row[s.column], `${where}.rows[${r}][${s.column}]`));
   const type = s.chartType;
+  const rtlAxis = ctx.rtl && s.chartType !== 'pie' ? { catAxisOrientation: 'maxMin' as 'minMax' } : {}; // typings only list 'minMax'; the writer emits any value
   slide.addChart(type, [{ name: s.header[s.column] ?? '', labels, values }], {
     x: MARGIN,
     y: BODY_Y,
@@ -220,6 +222,7 @@ function chartSlide(slide: PptxSlide, s: Extract<Slide, { type: 'chart' }>, n: n
     catAxisLabelFontFace: FONT,
     valAxisLabelFontFace: FONT,
     dataLabelFontFace: FONT,
+    ...rtlAxis,
   });
 }
 
