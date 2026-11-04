@@ -1,9 +1,46 @@
 /**
- * Helpers shared by the docx and pptx renderers: the bidi digit-run splitter
+ * Helpers shared by the docx, pptx and pdf renderers: the bidi digit-run splitter
  * and the png/jpeg-only image check. One copy, so the two renderers cannot
  * drift on what counts as a number or an acceptable image.
  */
+import type { AccentColor } from '../domain/document-spec.js';
 import { SpecRenderError } from './render-error.js';
+import { stripOwnNumber } from './validate-spec.js';
+
+/** The closed accent palette, one copy for every renderer (hex, no `#`). */
+export const ACCENT_HEX: Record<AccentColor, string> = {
+  navy: '1F3864',
+  teal: '1B7F8C',
+  green: '2E7D32',
+  burgundy: '7B1E3A',
+  gray: '595959',
+  orange: 'D9730D',
+};
+
+/**
+ * Clause numbering, shared so docx and pdf number identically: clause `n` is
+ * `n.`; a title that already starts with its own number is stripped, never
+ * doubled; a text with more than one non-blank line becomes sub-clauses
+ * `n.1`, `n.2`, ... and a single-line text gets no sub-number.
+ */
+export interface NumberedClause {
+  label: string;
+  title: string;
+  /** One entry per body line; `label` is null for a single-line body. */
+  lines: { label: string | null; text: string }[];
+}
+
+export function numberClause(n: number, title: string, text: string): NumberedClause {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim() !== '');
+  return {
+    label: `${n}.`,
+    title: stripOwnNumber(title, n).trim(),
+    lines:
+      lines.length <= 1
+        ? [{ label: null, text: lines[0] ?? '' }]
+        : lines.map((line, i) => ({ label: `${n}.${i + 1}`, text: line })),
+  };
+}
 
 export type ImageLoader = (documentId: string) => Promise<{ bytes: Buffer; mediaType: string } | null>;
 

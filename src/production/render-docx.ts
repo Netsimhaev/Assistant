@@ -35,11 +35,11 @@ import {
 } from 'docx';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
-import type { AccentColor, Block, DocxSpec } from '../domain/document-spec.js';
+import type { Block, DocxSpec } from '../domain/document-spec.js';
 import { formatCell } from './format-value.js';
 import { SpecRenderError } from './render-error.js';
-import { checkImage, splitNumberRuns, type ImageLoader } from './render-shared.js';
-import { CONTRACT_DISCLAIMER_EN, CONTRACT_DISCLAIMER_HE, stripOwnNumber } from './validate-spec.js';
+import { ACCENT_HEX, checkImage, numberClause, splitNumberRuns, type ImageLoader } from './render-shared.js';
+import { CONTRACT_DISCLAIMER_EN, CONTRACT_DISCLAIMER_HE } from './validate-spec.js';
 
 export type { ImageLoader };
 
@@ -52,14 +52,6 @@ const FONT = 'Arial';
 /** A4 with 2cm margins leaves ~17cm; docx transformations are in pixels (96dpi). */
 const MAX_IMAGE_WIDTH_PX = 600;
 
-const ACCENT_HEX: Record<AccentColor, string> = {
-  navy: '1F3864',
-  teal: '1B7F8C',
-  green: '2E7D32',
-  burgundy: '7B1E3A',
-  gray: '595959',
-  orange: 'D9730D',
-};
 
 const HEADING_SIZE: Record<1 | 2 | 3, number> = { 1: 36, 2: 30, 3: 26 };
 const HEADING_LEVEL = {
@@ -221,15 +213,13 @@ export async function renderDocx(spec: DocxSpec, options: RenderDocxOptions): Pr
         break;
       case 'clause': {
         clauseNo += 1;
-        children.push(
-          para([numberRun(`${clauseNo}.`, { bold: true }), ...textRuns(` ${stripOwnNumber(block.title, clauseNo).trim()}`, ctx, { bold: true })], ctx),
-        );
-        const lines = block.text.split(/\r?\n/).filter((l) => l.trim() !== '');
-        if (lines.length <= 1) {
-          children.push(para(textRuns(lines[0] ?? '', ctx), ctx));
-        } else {
-          lines.forEach((line, n) =>
-            children.push(para([numberRun(`${clauseNo}.${n + 1}`), ...textRuns(` ${line}`, ctx)], ctx)),
+        const clause = numberClause(clauseNo, block.title, block.text);
+        children.push(para([numberRun(clause.label, { bold: true }), ...textRuns(` ${clause.title}`, ctx, { bold: true })], ctx));
+        for (const line of clause.lines) {
+          children.push(
+            line.label === null
+              ? para(textRuns(line.text, ctx), ctx)
+              : para([numberRun(line.label), ...textRuns(` ${line.text}`, ctx)], ctx),
           );
         }
         break;

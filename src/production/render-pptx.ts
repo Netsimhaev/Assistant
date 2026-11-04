@@ -12,10 +12,10 @@
  * before the photos exist); a present image of the wrong type still throws.
  */
 import PptxModule from 'pptxgenjs';
-import type { AccentColor, Cell, PptxSpec, Slide } from '../domain/document-spec.js';
+import type { Cell, PptxSpec, Slide } from '../domain/document-spec.js';
 import { formatCell } from './format-value.js';
 import { SpecRenderError } from './render-error.js';
-import { checkImage, splitNumberRuns, type CheckedImage, type ImageLoader } from './render-shared.js';
+import { ACCENT_HEX, checkImage, splitNumberRuns, type CheckedImage, type ImageLoader } from './render-shared.js';
 import { stripOwnNumber } from './validate-spec.js';
 
 export interface RenderPptxOptions {
@@ -31,14 +31,6 @@ const BODY_Y = 1.7;
 const BODY_H = H - BODY_Y - 0.6;
 const CONTENT_W = W - 2 * MARGIN;
 
-const ACCENT_HEX: Record<AccentColor, string> = {
-  navy: '1F3864',
-  teal: '1B7F8C',
-  green: '2E7D32',
-  burgundy: '7B1E3A',
-  gray: '595959',
-  orange: 'D9730D',
-};
 
 interface Ctx {
   rtl: boolean;
