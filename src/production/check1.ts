@@ -67,13 +67,20 @@
  *       its digit sequences reversed → `digits_reversed`; neither →
  *       `text_missing`. A number the spec shows (cells, single-word runs)
  *       absent while its reverse is present → `digits_reversed`.
- *       Each table row of a docx/pdf/pptx table, its cells as displayed in
- *       the charter `currency`, must read in column order (a swapped pair →
- *       `order_reversed`). pptx tables are checked in the slide XML instead
- *       (`checkPptxTables`): the `<a:tc>` sequence must be the row in the
- *       renderer's deterministic column order — reversed for Hebrew, as
- *       written for English, never "either order". Chart labels and values
- *       join the runs and the numbers.
+ *       Tables are NOT order-checked on the page text: the Chromium joiner's
+ *       letter vote can return a mostly-Latin or digit-only Hebrew row
+ *       reversed, so a correct table would be refused. Their cells feed only
+ *       the digit-reversal numbers there. Row order is checked against the
+ *       FILE's own structure (`compareRows`), positionally, with each cell
+ *       as displayed in the charter `currency`: docx `<w:tr>`/`<w:tc>` in
+ *       `word/document.xml` (logical order; `visuallyRightToLeft` does not
+ *       reorder the XML); pdf the `<table>` rows of the printed HTML
+ *       (`Check1Input.html`, from `renderPdfWithHtml`); pptx the slide's
+ *       `<a:tc>` sequence in the renderer's deterministic column order —
+ *       reversed for Hebrew, as written for English, never "either order".
+ *       A cell's paragraphs join with a space. Chart points by position
+ *       (`checkPptxCharts`): point i of the category and value caches must
+ *       be spec row i's label and value, else `cell_mismatch`.
  *     - grounding: `createTextGrounder` (the same code as `validateSpec`)
  *       over the extracted text AND over the zip formats' own text — notes,
  *       document properties, chart data, cells a viewer may not print. A
@@ -181,6 +188,16 @@ export interface Check1Input {
   today: string;
   /** The charter currency the renderer formatted money with; table rows are compared as displayed. Required. */
   currency: string;
+  /**
+   * pdf only, and REQUIRED for pdf: the exact HTML that was printed
+   * (`renderPdfWithHtml`). Table rows are compared against its `<table>`
+   * structure in logical order — text read back from PDF pages is in visual
+   * order, and the Chromium joiner's letter vote can reverse a mostly-Latin
+   * or digit-only Hebrew row. Chosen over re-rendering inside check 1: the
+   * HTML handed in is the one Chromium actually printed, not a second
+   * rendering that could only ever agree with itself.
+   */
+  html?: string;
 }
 
 /** How a `validateSpec` problem reads as a check-1 finding. Exhaustive. */
@@ -746,6 +763,20 @@ async function checkDocx(input: Check1Input, f: Findings, own: OwnText[]): Promi
     else if (/^word\/footer\d+\.xml$/.test(name)) footer += `\n${all}`;
   }
   checkContract(input.spec, body, normalise(footer).includes(normalise(contractTexts(input.spec).disclaimer)), f);
+  // Table rows from the file's own structure: `<w:tr>`/`<w:tc>` are in logical order
+  // (`visuallyRightToLeft` does not reorder the XML). Spec tables are the first ones; the
+  // contract signature table comes after them and is checked by `checkContract`.
+  const documentXml = (await zip.file('word/document.xml')?.async('string')) ?? '';
+  const fileTables = (documentXml.match(/<w:tbl(?:\s[^>]*)?>[\s\S]*?<\/w:tbl>/g) ?? []).map((tbl) =>
+    (tbl.match(/<w:tr(?:\s[^>]*)?>[\s\S]*?<\/w:tr>/g) ?? []).map((tr) =>
+      (tr.match(/<w:tc(?:\s[^>]*)?>[\s\S]*?<\/w:tc>/g) ?? []).map((tc) =>
+        normalise((tc.match(W_PARAGRAPH) ?? []).map((wp) => xmlTexts(wp, 'w:t').join('')).join(' ')),
+      ),
+    ),
+  );
+  specTables(input.spec, input.currency).forEach((table, k) =>
+    compareRows(table.rows, fileTables[k] ?? [], false, f, `${table.where} rows`),
+  );
   try {
     return (await mammoth.extractRawText({ buffer: input.bytes })).value;
   } catch {
@@ -811,6 +842,95 @@ async function checkPptx(input: Check1Input, f: Findings, own: OwnText[]): Promi
     own.push({ part: name, text: all });
   }
   await checkPptxTables(input, zip, f);
+  await checkPptxCharts(input, zip, f);
+}
+
+/** Every `<c:pt idx><c:v>` of a cache block, by point index. */
+function cachePoints(block: string): Map<number, string> {
+  const out = new Map<number, string>();
+  for (const m of block.matchAll(/<c:pt\s+idx="(\d+)"[^>]*>\s*(?:<c:formatCode>[^<]*<\/c:formatCode>\s*)?<c:v>([^<]*)<\/c:v>/g)) {
+    out.set(Number(m[1]), decodeXml(m[2] ?? ''));
+  }
+  return out;
+}
+
+/**
+ * Chart data by position (the chart a slide draws, found through the
+ * slide's relationships): point i of the series' category cache must be the
+ * spec row i's label and point i of its value cache the row's value. A value
+ * moved to another category is `cell_mismatch` — the page would still show
+ * every number the sources give.
+ */
+async function checkPptxCharts(input: Check1Input, zip: JSZip, f: Findings): Promise<void> {
+  if (input.spec.format !== 'pptx') return;
+  for (const [i, slide] of input.spec.slides.entries()) {
+    if (slide.type !== 'chart') continue;
+    const where = `slide ${i + 1} chart`;
+    const rels = (await zip.file(`ppt/slides/_rels/slide${i + 1}.xml.rels`)?.async('string')) ?? '';
+    const target = /Type="[^"]*\/chart"[^>]*Target="([^"]+)"|Target="([^"]+)"[^>]*Type="[^"]*\/chart"/.exec(rels);
+    const raw = target?.[1] ?? target?.[2];
+    const path = raw === undefined ? undefined : raw.startsWith('/') ? raw.slice(1) : `ppt/${raw.replace(/^\.\.\//, '')}`;
+    const xml = path === undefined ? undefined : await zip.file(path)?.async('string');
+    const series = xml === undefined ? [] : (xml.match(/<c:ser>[\s\S]*?<\/c:ser>/g) ?? []);
+    if (series.length !== 1) {
+      f.add('cell_mismatch', where);
+      continue;
+    }
+    const ser = series[0]!;
+    const labels = cachePoints(/<c:cat>[\s\S]*?<\/c:cat>/.exec(ser)?.[0] ?? '');
+    const values = cachePoints(/<c:val>[\s\S]*?<\/c:val>/.exec(ser)?.[0] ?? '');
+    slide.rows.forEach((row, r) => {
+      const labelCell = row[slide.labelColumn];
+      const valueCell = row[slide.column];
+      const label = labelCell === undefined || 'f' in labelCell ? '' : formatCell(labelCell, undefined, input.currency, 'check1');
+      const value = Number(values.get(r));
+      const ok =
+        normalise(labels.get(r) ?? '') === normalise(label) &&
+        valueCell !== undefined &&
+        'v' in valueCell &&
+        values.has(r) &&
+        sameValue(value, valueCell.v);
+      if (!ok) f.add('cell_mismatch', `${where} point ${r + 1}`);
+    });
+    if (labels.size > slide.rows.length || values.size > slide.rows.length) f.add('cell_mismatch', `${where} points`);
+  }
+}
+
+/** One expected row: the spec's displayed cells, in column order. */
+interface ExpectedRow {
+  where: string;
+  cells: string[];
+}
+
+/**
+ * Rows read from a file's own table structure against the spec rows,
+ * positionally. `mirror`: the file lays columns out right to left (pptx
+ * Hebrew), a deterministic rule — never "either order". Same cells in another
+ * order → `order_reversed`; anything else → `text_missing`.
+ */
+function compareRows(expected: ExpectedRow[], fileRows: string[][], mirror: boolean, f: Findings, extraWhere: string): void {
+  expected.forEach((row, r) => {
+    const want = row.cells.map(normalise);
+    if (mirror) want.reverse();
+    const got = fileRows[r];
+    if (got !== undefined && got.length === want.length && got.every((c, j) => c === want[j])) return;
+    const sorted = (a: string[]) => [...a].sort().join('\u0000');
+    f.add(got !== undefined && sorted(got) === sorted(want) ? 'order_reversed' : 'text_missing', row.where);
+  });
+  if (fileRows.length > expected.length) f.add('text_missing', extraWhere);
+}
+
+/** The displayed rows (header first) of a docx/pdf/pptx table block or slide. */
+function expectedRows(where: string, header: string[], rows: Cell[][], numberFormat: readonly string[] | undefined, currency: string): ExpectedRow[] {
+  return [
+    { where: `${where} header`, cells: header },
+    ...rows.map((row, r) => ({
+      where: `${where} row ${r + 1}`,
+      cells: row.map((c, j) =>
+        'f' in c ? '' : formatCell(c, numberFormat?.[j] as CellNumberFormat | undefined, currency, 'check1'),
+      ),
+    })),
+  ];
 }
 
 /**
@@ -827,27 +947,13 @@ async function checkPptxTables(input: Check1Input, zip: JSZip, f: Findings): Pro
     if (slide.type !== 'table') continue;
     const where = `slide ${i + 1}`;
     const xml = (await zip.file(`ppt/slides/slide${i + 1}.xml`)?.async('string')) ?? '';
+    // A cell's paragraphs join with a space, as the spec's line breaks normalise to one.
     const fileRows = (xml.match(/<a:tr(?:\s[^>]*)?>[\s\S]*?<\/a:tr>/g) ?? []).map((tr) =>
-      (tr.match(/<a:tc(?:\s[^>]*)?>[\s\S]*?<\/a:tc>/g) ?? []).map((tc) => normalise(xmlTexts(tc, 'a:t').join(''))),
+      (tr.match(/<a:tc(?:\s[^>]*)?>[\s\S]*?<\/a:tc>/g) ?? []).map((tc) =>
+        normalise((tc.match(/<a:p>[\s\S]*?<\/a:p>/g) ?? []).map((ap) => xmlTexts(ap, 'a:t').join('')).join(' ')),
+      ),
     );
-    const expected: { where: string; cells: string[] }[] = [
-      { where: `${where} header`, cells: slide.header },
-      ...slide.rows.map((row, r) => ({
-        where: `${where} row ${r + 1}`,
-        cells: row.map((c, j) =>
-          'f' in c ? '' : formatCell(c, slide.numberFormat?.[j] as CellNumberFormat | undefined, input.currency, 'check1'),
-        ),
-      })),
-    ];
-    expected.forEach((row, r) => {
-      const want = row.cells.map(normalise);
-      if (rtl) want.reverse();
-      const got = fileRows[r];
-      if (got !== undefined && got.length === want.length && got.every((c, j) => c === want[j])) return;
-      const sorted = (a: string[]) => [...a].sort().join('\u0000');
-      f.add(got !== undefined && sorted(got) === sorted(want) ? 'order_reversed' : 'text_missing', row.where);
-    });
-    if (fileRows.length > expected.length) f.add('text_missing', `${where} rows`);
+    compareRows(expectedRows(where, slide.header, slide.rows, slide.numberFormat, input.currency), fileRows, rtl, f, `${where} rows`);
   }
 }
 
@@ -878,6 +984,26 @@ function checkPdf(input: Check1Input, f: Findings): void {
       return normalise(lines.slice(-FOOTER_LINES).join(' ')).includes(disclaimer);
     });
   checkContract(input.spec, text, everyFooter, f);
+
+  // Table rows from the printed HTML (logical order). The signature table carries a class; spec tables do not.
+  const html = input.html ?? '';
+  const cellText = (s: string) => normalise(decodeXml(s.replace(/<[^>]*>/g, '')));
+  const fileTables = (html.match(/<table>[\s\S]*?<\/table>/g) ?? []).map((table) =>
+    (table.match(/<tr>[\s\S]*?<\/tr>/g) ?? []).map((tr) =>
+      [...tr.matchAll(/<(th|td)>([\s\S]*?)<\/\1>/g)].map((m) => cellText(m[2] ?? '')),
+    ),
+  );
+  specTables(input.spec, input.currency).forEach((table, k) =>
+    compareRows(table.rows, fileTables[k] ?? [], false, f, `${table.where} rows`),
+  );
+}
+
+/** docx/pdf table blocks, in document order, as expected rows. */
+function specTables(spec: DocumentSpec, currency: string): { where: string; rows: ExpectedRow[] }[] {
+  if (spec.format !== 'docx' && spec.format !== 'pdf') return [];
+  return spec.blocks.flatMap((b, i) =>
+    b.type === 'table' ? [{ where: `block ${i + 1}`, rows: expectedRows(`block ${i + 1}`, b.header, b.rows, b.numberFormat, currency) }] : [],
+  );
 }
 
 // ---------------------------------------------------------------- text
@@ -887,15 +1013,8 @@ interface TextRun {
   text: string;
 }
 
-/** One table row as the page shows it: each cell's displayed text, in column order. */
-interface RowRun {
-  where: string;
-  cells: string[];
-}
-
 interface SpecText {
   runs: TextRun[];
-  rows: RowRun[];
   numbers: string[];
 }
 
@@ -903,21 +1022,17 @@ interface SpecText {
 function specTextRuns(spec: DocumentSpec, currency: string): SpecText {
   // docx/pdf print the title as the first line; xlsx/pptx keep it as file metadata only.
   const runs: TextRun[] = spec.format === 'docx' || spec.format === 'pdf' ? [{ where: 'title', text: spec.title }] : [];
-  const rows: RowRun[] = [];
   const numbers: string[] = [];
-  const shown = (cell: Cell, fmt: string | undefined): string =>
-    'f' in cell ? '' : formatCell(cell, fmt as CellNumberFormat | undefined, currency, 'check1');
-  const cells = (where: string, header: string[], body: Cell[][], numberFormat?: readonly string[], tableRows = true) => {
-    header.forEach((h, c) => runs.push({ where: `${where} header col ${c + 1}`, text: h }));
-    body.forEach((row, r) =>
+  // Table and chart cells are checked in the file's own structure (rows, positions);
+  // on the page text only their digits are, for reversal.
+  const cells = (header: string[], body: Cell[][], numberFormat?: readonly string[]) => {
+    numbers.push(...header);
+    body.forEach((row) =>
       row.forEach((cell, c) => {
-        if ('t' in cell) runs.push({ where: `${where} row ${r + 1} col ${c + 1}`, text: cell.t });
+        if ('t' in cell) numbers.push(cell.t);
         else if ('v' in cell) numbers.push(formatNumber(cell.v, numberFormat?.[c] as CellNumberFormat | undefined, currency));
       }),
     );
-    if (!tableRows) return;
-    rows.push({ where: `${where} header`, cells: header });
-    body.forEach((row, r) => rows.push({ where: `${where} row ${r + 1}`, cells: row.map((c, i) => shown(c, numberFormat?.[i])) }));
   };
   const blocks = (list: Block[]) => {
     let clause = 0;
@@ -932,7 +1047,7 @@ function specTextRuns(spec: DocumentSpec, currency: string): SpecText {
           b.items.forEach((item, j) => runs.push({ where: `${where} item ${j + 1}`, text: item }));
           return;
         case 'table':
-          cells(where, b.header, b.rows, b.numberFormat);
+          cells(b.header, b.rows, b.numberFormat);
           return;
         case 'clause': {
           clause += 1;
@@ -976,11 +1091,11 @@ function specTextRuns(spec: DocumentSpec, currency: string): SpecText {
             return;
           case 'table':
             // Row order is checked in the slide XML (`checkPptxTables`), where the column order is deterministic.
-            cells(where, s.header, s.rows, s.numberFormat, false);
+            cells(s.header, s.rows, s.numberFormat);
             return;
           case 'chart':
             // The chart's own labels and values: category names and data labels are on the page.
-            cells(`${where} chart`, [], s.rows, undefined, false);
+            cells([], s.rows);
             return;
           case 'imageText':
           case 'paragraph':
@@ -997,12 +1112,12 @@ function specTextRuns(spec: DocumentSpec, currency: string): SpecText {
           const where = `sheet ${si + 1} table ${ti + 1}`;
           if (t.title !== undefined) runs.push({ where: `${where} title`, text: t.title });
           // Rows are checked by position in the file (`cell_mismatch`); a converter's text order across cells is not ours.
-          cells(where, t.header, [...t.rows, ...(t.totals === undefined ? [] : [t.totals])], t.numberFormat, false);
+          cells(t.header, [...t.rows, ...(t.totals === undefined ? [] : [t.totals])], t.numberFormat);
         }),
       );
       break;
   }
-  return { runs, rows, numbers };
+  return { runs, numbers };
 }
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -1065,16 +1180,6 @@ function checkOrder(spec: SpecText, extracted: string, f: Findings): void {
       continue;
     }
     f.add('text_missing', run.where);
-  }
-  // A table row reads in column order: a swapped pair of cells is a different row.
-  for (const row of spec.rows) {
-    const cells = row.cells.map(normalise).filter((c) => c !== '');
-    if (cells.length < 2) continue;
-    const forward = cells.join(' ');
-    if (t.includes(forward)) continue;
-    if (placement(forward, t, (tok) => tok) === 'digits_reversed') f.add('digits_reversed', row.where);
-    else if (cells.every((c) => t.includes(c))) f.add('order_reversed', row.where);
-    else f.add('text_missing', row.where);
   }
   // A number the spec shows, absent from the page while its digits reversed are present.
   const onPage = new Set((t.match(DIGIT_RUN) ?? []).map(digitsOnly));
@@ -1152,6 +1257,9 @@ export async function runCheck1(input: Check1Input): Promise<Check1Result> {
     throw new TypeError('runCheck1: today must be the charter-local date as YYYY-MM-DD');
   }
   if (typeof currency !== 'string' || currency === '') throw new TypeError('runCheck1: currency is required');
+  if (spec.format === 'pdf' && typeof input.html !== 'string') {
+    throw new TypeError('runCheck1: a pdf needs the printed HTML (renderPdfWithHtml)');
+  }
   const f = new Findings();
 
   for (const p of validateSpec(spec, sources, { today })) f.add(SPEC_CODE[p.code], p.where);

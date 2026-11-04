@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { PdfSpec } from '../domain/document-spec.js';
 import { renderFooterTemplate, renderHtml, type PdfAssets } from './render-html.js';
-import { loadPdfAssets, MAX_PDF_HTML_BYTES, PDF_FONT_FILES, renderPdf, type PdfPrinter } from './render-pdf.js';
+import { loadPdfAssets, MAX_PDF_HTML_BYTES, PDF_FONT_FILES, renderPdf, renderPdfWithHtml, type PdfPrinter } from './render-pdf.js';
 import { SpecRenderError } from './render-error.js';
 import type { ImageLoader } from './render-shared.js';
 
@@ -36,6 +36,19 @@ function spec(over: Partial<PdfSpec> = {}): PdfSpec {
 const PDF_BYTES = Buffer.from('%PDF-1.7\n%stub\n');
 
 describe('renderPdf', () => {
+  it('renderPdfWithHtml returns the exact HTML that was printed, beside the PDF', async () => {
+    let printed = '';
+    const printer: PdfPrinter = async (html) => {
+      printed = html;
+      return PDF_BYTES;
+    };
+    const s = spec();
+    const out = await renderPdfWithHtml(s, { printer, assets, currency: 'ILS' });
+    expect(out.pdf).toBe(PDF_BYTES);
+    expect(out.html).toBe(printed);
+    expect(out.html).toBe(renderHtml(s, assets, { currency: 'ILS' }));
+  });
+
   it("the printer receives exactly renderHtml's output", async () => {
     const calls: { html: string; signal: AbortSignal; footer: string }[] = [];
     const printer: PdfPrinter = async (html, signal, options) => {

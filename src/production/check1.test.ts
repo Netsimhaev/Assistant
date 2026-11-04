@@ -186,6 +186,8 @@ const assets: PdfAssets = {
   images: new Map(),
 };
 const stubPrinter: PdfPrinter = async () => FIXTURE_PDF;
+/** What renderPdfWithHtml hands check 1 beside the bytes: the HTML that was printed. */
+const CONTRACT_PDF_HTML = (): string => renderHtml(contractPdf, assets, { currency: 'ILS' });
 
 /** What a correct text extraction of the printed page says: body text in reading order, then the footer. */
 function htmlText(html: string): string {
@@ -202,7 +204,7 @@ async function buildPdf(spec: PdfSpec) {
   const footer = htmlText(`<body>${renderFooterTemplate(spec, assets)}</body>`).replace(/\s*\/\s*$/, ' 1 / 1');
   // One page: lines separated by single newlines (pages are separated by a blank line), the footer last.
   const body = htmlText(html).replace(/\n\s*\n/g, '\n').trim();
-  return { bytes, text: `${body}\n${footer.trim()}`, body, footer: footer.trim() };
+  return { bytes, html, text: `${body}\n${footer.trim()}`, body, footer: footer.trim() };
 }
 
 const rendered = (text: string, over: Partial<{ pageCount: number; textTruncated: boolean }> = {}) => ({
@@ -300,7 +302,7 @@ describe('runCheck1', () => {
     it('pdf (contract)', async () => {
       const { bytes, text } = await buildPdf(contractPdf);
       expectFocusInOrder(text);
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      const r = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([]);
     });
 
@@ -498,7 +500,7 @@ describe('runCheck1', () => {
     it('contract without the disclaimer on the page → missing_structure', async () => {
       const { bytes, text } = await buildPdf(contractPdf);
       const r = await runCheck1({
-        spec: contractPdf,
+        spec: contractPdf, html: CONTRACT_PDF_HTML(),
         bytes,
         sources,
         rendered: rendered(text.replace(CONTRACT_DISCLAIMER_HE, '')),
@@ -513,14 +515,14 @@ describe('runCheck1', () => {
         FIXTURE_PDF.toString('latin1').replace('/Type /Catalog', '/Type /Catalog /OpenAction << /S /J#61vaScript /JS (x) >>'),
         'latin1',
       );
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      const r = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toContainEqual(expect.objectContaining({ code: 'unsafe_part', where: 'pdf /OpenAction' }));
       expect(r.findings).toContainEqual(expect.objectContaining({ code: 'unsafe_part', where: 'pdf /JavaScript' }));
     });
 
     it('a bidi control in the extracted text → bidi_control', async () => {
       const { bytes, text } = await buildPdf(contractPdf);
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(`${text}⁧`), today: TODAY, currency: 'ILS' });
+      const r = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes, sources, rendered: rendered(`${text}⁧`), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'bidi_control', where: 'rendered text', he: CHECK1_HE.bidi_control }]);
     });
   });
@@ -528,15 +530,15 @@ describe('runCheck1', () => {
   describe('all formats', () => {
     it('more than 60 pages → cap_exceeded', async () => {
       const { bytes, text } = await buildPdf(contractPdf);
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text, { pageCount: 61 }), today: TODAY, currency: 'ILS' });
+      const r = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes, sources, rendered: rendered(text, { pageCount: 61 }), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'cap_exceeded', where: 'document', he: CHECK1_HE.cap_exceeded }]);
-      const ok = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text, { pageCount: 60 }), today: TODAY, currency: 'ILS' });
+      const ok = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes, sources, rendered: rendered(text, { pageCount: 60 }), today: TODAY, currency: 'ILS' });
       expect(ok.findings).toEqual([]);
     });
 
     it('text that was not fully read → text_truncated, and the document does not pass', async () => {
       const { bytes, text } = await buildPdf(contractPdf);
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(text, { textTruncated: true }), today: TODAY, currency: 'ILS' });
+      const r = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes, sources, rendered: rendered(text, { textTruncated: true }), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'text_truncated', where: 'document', he: CHECK1_HE.text_truncated }]);
       expect(r.passed).toBe(false);
     });
@@ -566,6 +568,115 @@ describe('runCheck1', () => {
       ).rejects.toThrow(TypeError);
     });
   });
+  describe('fix round 3: table rows and chart points from the file structure', () => {
+    const tableBlocks = [
+      {
+        type: 'table' as const,
+        header: ['דגם', 'מחיר', 'הנחה'],
+        rows: [[{ t: 'Office Pro' }, { v: 1890, src: SRC }, { v: 0.39, src: SRC }]],
+        numberFormat: ['int' as const, 'money' as const, 'percent' as const],
+      },
+    ];
+    const tableDocx: DocxSpec = { format: 'docx', ...common, kind: 'price_list', blocks: tableBlocks };
+    const tablePdf: PdfSpec = { ...tableDocx, format: 'pdf' };
+    /** The Chromium joiner's letter vote can hand back a mostly-Latin Hebrew row in reverse. */
+    const reversedRow = (text: string) => text.replace(/Office Pro\s+₪1,890\s+39%/, '39% ₪1,890 Office Pro');
+
+    it('a Hebrew row "Office Pro | 1,890 | 39%" passes in docx even when the page text reads it reversed', async () => {
+      const bytes = await renderDocx(tableDocx, { currency: 'ILS', images: noImages });
+      const good = await docxText(bytes);
+      const text = reversedRow(good);
+      expect(text).not.toBe(good);
+      const r = await runCheck1({ spec: tableDocx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([]);
+    });
+
+    it('a Hebrew row "Office Pro | 1,890 | 39%" passes in pdf even when the page text reads it reversed', async () => {
+      const { bytes, text: good, html } = await buildPdf(tablePdf);
+      const text = reversedRow(good);
+      expect(text).not.toBe(good);
+      const r = await runCheck1({ spec: tablePdf, html, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([]);
+    });
+
+    it('docx: a swapped pair of cells in the file → order_reversed', async () => {
+      const good = await renderDocx(tableDocx, { currency: 'ILS', images: noImages });
+      const bytes = await rezip(good, async (zip) => {
+        const xml = await zip.file('word/document.xml')!.async('string');
+        const row = xml.match(/<w:tr(?:\s[^>]*)?>[\s\S]*?<\/w:tr>/g)![1]!;
+        const tcs = row.match(/<w:tc(?:\s[^>]*)?>[\s\S]*?<\/w:tc>/g)!;
+        zip.file('word/document.xml', xml.replace(row, row.replace(tcs[1]! + tcs[2]!, tcs[2]! + tcs[1]!)));
+      });
+      const r = await runCheck1({ spec: tableDocx, bytes, sources, rendered: rendered(await docxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'order_reversed', where: 'block 1 row 1', he: CHECK1_HE.order_reversed }]);
+    });
+
+    it('pdf: a swapped pair of cells in the printed HTML → order_reversed', async () => {
+      const { bytes, text, html } = await buildPdf(tablePdf);
+      const swapped = html.replace(/(<td>[^]*?<\/td>)(<td>[^]*?<\/td>)(<td>[^]*?<\/td>)/, '$1$3$2');
+      expect(swapped).not.toBe(html);
+      const r = await runCheck1({ spec: tablePdf, html: swapped, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([{ code: 'order_reversed', where: 'block 1 row 1', he: CHECK1_HE.order_reversed }]);
+    });
+
+    it('pdf without the printed HTML is refused loudly', async () => {
+      const { bytes, text } = await buildPdf(tablePdf);
+      await expect(
+        runCheck1({ spec: tablePdf, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' }),
+      ).rejects.toThrow(TypeError);
+    });
+
+    it('pptx: a chart value moved to another category → cell_mismatch at both points', async () => {
+      const { buffer: good } = await renderPptx(profitPptx, { currency: 'ILS', images: noImages });
+      const bytes = await rezip(good, async (zip) => {
+        const name = Object.keys(zip.files).find((n) => /^ppt\/charts\/chart\d+\.xml$/.test(n))!;
+        const xml = await zip.file(name)!.async('string');
+        const next = xml.replace(/(<c:numCache>[\s\S]*?<c:v>)1890(<\/c:v>[\s\S]*?<c:v>)450(<\/c:v>)/, '$1450$21890$3');
+        expect(next).not.toBe(xml);
+        zip.file(name, next);
+      });
+      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(await pptxText(good)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([
+        { code: 'cell_mismatch', where: 'slide 5 chart point 1', he: CHECK1_HE.cell_mismatch },
+        { code: 'cell_mismatch', where: 'slide 5 chart point 2', he: CHECK1_HE.cell_mismatch },
+      ]);
+    });
+
+    it('pptx: a chart label moved to another point → cell_mismatch', async () => {
+      const { buffer: good } = await renderPptx(profitPptx, { currency: 'ILS', images: noImages });
+      const bytes = await rezip(good, async (zip) => {
+        const name = Object.keys(zip.files).find((n) => /^ppt\/charts\/chart\d+\.xml$/.test(n))!;
+        const xml = await zip.file(name)!.async('string');
+        const next = xml.replace(/(<c:cat>[\s\S]*?<c:v>)שולחן(<\/c:v>[\s\S]*?<c:v>)כיסא(<\/c:v>)/, '$1כיסא$2שולחן$3');
+        expect(next).not.toBe(xml);
+        zip.file(name, next);
+      });
+      const r = await runCheck1({ spec: profitPptx, bytes, sources, rendered: rendered(await pptxText(good)), today: TODAY, currency: 'ILS' });
+      expect(codes(r)).toEqual(['cell_mismatch', 'cell_mismatch']);
+    });
+
+    it('pptx: a multi-line table cell matches the spec (paragraphs joined with a space)', async () => {
+      const spec: PptxSpec = {
+        ...profitPptx,
+        slides: [
+          {
+            type: 'table',
+            title: 'מחירים',
+            header: ['פריט', 'מחיר'],
+            rows: [[{ t: 'שולחן משרדי\nOffice Pro' }, { v: 1890, src: SRC }]],
+            numberFormat: ['int', 'money'],
+          },
+        ],
+      };
+      const { buffer: bytes } = await renderPptx(spec, { currency: 'ILS', images: noImages });
+      const xml = await (await JSZip.loadAsync(bytes)).file('ppt/slides/slide1.xml')!.async('string');
+      const cell = xml.match(/<a:tc(?:\s[^>]*)?>[\s\S]*?<\/a:tc>/g)!.find((tc) => tc.includes('Office Pro'))!;
+      expect(cell.match(/<a:p>/g)!.length).toBeGreaterThan(1); // the cell really is two paragraphs
+      const r = await runCheck1({ spec, bytes, sources, rendered: rendered(await pptxText(bytes)), today: TODAY, currency: 'ILS' });
+      expect(r.findings).toEqual([]);
+    });
+  });
+
   describe('fix round 2: pptx table cell order from the slide XML', () => {
     /** Swap the two `<a:tc>` cells of the n-th `<a:tr>` (0 = header) of slide 4. */
     async function swapRow(bytes: Buffer, n: number): Promise<Buffer> {
@@ -648,7 +759,7 @@ describe('runCheck1', () => {
         rendered: rendered('גרף מחירים\nדגם 5202\n1,890'),
         today: TODAY, currency: 'ILS',
       });
-      expect(r.findings).toContainEqual(expect.objectContaining({ code: 'digits_reversed', where: 'slide 1 chart row 1 col 1' }));
+      expect(r.findings).toContainEqual(expect.objectContaining({ code: 'digits_reversed', where: 'number 2025' }));
     });
 
     it('xlsx: values swapped between two rows → cell_mismatch at both addresses', async () => {
@@ -689,15 +800,6 @@ describe('runCheck1', () => {
       expect(r.findings).toContainEqual({ code: 'cell_mismatch', where: 'sheet 1 H1', he: CHECK1_HE.cell_mismatch });
     });
 
-    it('docx: two table cells swapped on the page → the row is not in order', async () => {
-      const bytes = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
-      const good = await docxText(bytes);
-      const text = good.replace(/₪1,890(\s+)39%/, '39%$1₪1,890');
-      expect(text).not.toBe(good);
-      const r = await runCheck1({ spec: contractDocx, bytes, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
-      expect(r.findings).toEqual([{ code: 'order_reversed', where: 'block 8 row 1', he: CHECK1_HE.order_reversed }]);
-    });
-
     it('a number in unprinted file content (docProps title) is grounded too', async () => {
       const good = await renderDocx(contractDocx, { currency: 'ILS', images: noImages });
       const bytes = await replaceIn(good, 'docProps/core.xml', /<dc:title>[^<]*<\/dc:title>/, '<dc:title>חוזה 7777</dc:title>');
@@ -731,10 +833,10 @@ describe('runCheck1', () => {
         FIXTURE_PDF.toString('latin1').replace('trailer', '3 0 obj\n<< /Length 8 >>\nstream\n/URI /AA\nendstream\nendobj\ntrailer'),
         'latin1',
       );
-      const clean = await runCheck1({ spec: contractPdf, bytes: inStream, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      const clean = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes: inStream, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(clean.findings).toEqual([]);
       const outside = Buffer.from(FIXTURE_PDF.toString('latin1').replace('/Type /Catalog', '/Type /Catalog /U#52I (x)'), 'latin1');
-      const r = await runCheck1({ spec: contractPdf, bytes: outside, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
+      const r = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes: outside, sources, rendered: rendered(text), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'unsafe_part', where: 'pdf /URI', he: CHECK1_HE.unsafe_part }]);
     });
 
@@ -765,7 +867,7 @@ describe('runCheck1', () => {
     it('pdf: the disclaimer must be in the footer of every page', async () => {
       const { bytes, body, footer } = await buildPdf(contractPdf);
       const top = await runCheck1({
-        spec: contractPdf,
+        spec: contractPdf, html: CONTRACT_PDF_HTML(),
         bytes,
         sources,
         rendered: rendered(`${CONTRACT_DISCLAIMER_HE}\n${body}\n1 / 1`),
@@ -773,10 +875,10 @@ describe('runCheck1', () => {
       });
       expect(top.findings).toEqual([{ code: 'missing_structure', where: 'disclaimer', he: CHECK1_HE.missing_structure }]);
       const twoPages = `${body}\n${footer.replace('1 / 1', '1 / 2')}\n\nהמשך\n2 / 2`;
-      const r = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(twoPages, { pageCount: 2 }), today: TODAY, currency: 'ILS' });
+      const r = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes, sources, rendered: rendered(twoPages, { pageCount: 2 }), today: TODAY, currency: 'ILS' });
       expect(r.findings).toEqual([{ code: 'missing_structure', where: 'disclaimer', he: CHECK1_HE.missing_structure }]);
       const both = `${body}\n${footer.replace('1 / 1', '1 / 2')}\n\nהמשך\n${footer.replace('1 / 1', '2 / 2')}`;
-      const ok = await runCheck1({ spec: contractPdf, bytes, sources, rendered: rendered(both, { pageCount: 2 }), today: TODAY, currency: 'ILS' });
+      const ok = await runCheck1({ spec: contractPdf, html: CONTRACT_PDF_HTML(), bytes, sources, rendered: rendered(both, { pageCount: 2 }), today: TODAY, currency: 'ILS' });
       expect(ok.findings).toEqual([]);
     });
   });

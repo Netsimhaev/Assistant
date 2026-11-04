@@ -107,6 +107,15 @@ export interface RenderPdfDeps {
 }
 
 export async function renderPdf(spec: PdfSpec, deps: RenderPdfDeps): Promise<Buffer> {
+  return (await renderPdfWithHtml(spec, deps)).pdf;
+}
+
+/**
+ * The PDF and the exact HTML that was printed. Check 1 compares table rows
+ * against this HTML (`Check1Input.html`): it is the PDF's structure in logical
+ * order, where text read back from the pages is in visual order.
+ */
+export async function renderPdfWithHtml(spec: PdfSpec, deps: RenderPdfDeps): Promise<{ pdf: Buffer; html: string }> {
   const html = renderHtml(spec, deps.assets, { currency: deps.currency });
   const bytes = Buffer.byteLength(html, 'utf8');
   if (bytes > MAX_PDF_HTML_BYTES) throw new SpecRenderError('pdf_too_large', `html ${bytes} bytes`);
@@ -115,5 +124,5 @@ export async function renderPdf(spec: PdfSpec, deps: RenderPdfDeps): Promise<Buf
   if (pdf.length < 5 || pdf.subarray(0, 5).toString('latin1') !== '%PDF-') {
     throw new Error('renderPdf: printer output is not a PDF');
   }
-  return pdf;
+  return { pdf, html };
 }
