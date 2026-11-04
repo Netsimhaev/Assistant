@@ -58,7 +58,7 @@ function shownLength(n: number, fmt: string | undefined): number {
     minimumFractionDigits: dec,
     maximumFractionDigits: dec,
   });
-  const symbol = fmt.includes('"') ? (fmt.match(/"([^"]*)"/)?.[1] ?? '').length + 1 : 0;
+  const symbol = fmt.includes('"') ? (fmt.match(/"([^"]*)"/)?.[1] ?? '').length + (fmt.startsWith('"') ? 0 : 1) : 0;
   return body.length + symbol + (pct ? 1 : 0);
 }
 
