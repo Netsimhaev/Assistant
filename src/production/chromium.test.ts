@@ -83,6 +83,35 @@ describe('createChromiumPrinter', () => {
     expect(probe.killed).toBe(0);
   });
 
+  it('skips a watchdog tick while the previous /proc sample is still running', async () => {
+    const probe: Probe = { killed: 0, closed: 0, printed: 0 };
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let calls = 0;
+    const printer = createChromiumPrinter({
+      executablePath: 'x',
+      sampleIntervalMs: 2,
+      launch: async () =>
+        session(probe, {
+          print: async () => {
+            await new Promise((r) => setTimeout(r, 80));
+            return PDF;
+          },
+        }),
+      sampleTreeRss: async () => {
+        calls += 1;
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 25));
+        inFlight -= 1;
+        return 0;
+      },
+    });
+    expect(await printer('<html></html>', signal(), { footerTemplate: '' })).toBe(PDF);
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(maxInFlight).toBe(1);
+  });
+
   it('a launch that hangs is rejected within the one deadline, and a late browser is killed', async () => {
     const probe: Probe = { killed: 0, closed: 0, printed: 0 };
     let resolveLaunch: (s: BrowserSession) => void = () => undefined;

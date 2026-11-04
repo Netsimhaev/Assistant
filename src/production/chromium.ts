@@ -144,18 +144,26 @@ export async function treeRssBytes(pid: number, proc: ProcReader = LINUX_PROC): 
   return rootRead ? total : null;
 }
 
-function killTreeLinux(pid: number): void {
-  void treePids(pid, LINUX_PROC)
-    .then((pids) => {
-      for (const p of pids.reverse()) {
-        try {
-          process.kill(p, 'SIGKILL');
-        } catch {
-          // already gone
-        }
+/**
+ * Kill order: walk the tree FIRST (while every ppid link still exists), then
+ * SIGKILL the descendants leaves-first, then the browser itself through
+ * `server.kill()`. Killing the root first would orphan its children to init
+ * and the walk would no longer find them. The primary guarantee is
+ * Playwright's own kill, which signals the browser's whole process group;
+ * this walk is the backstop for a descendant that left the group.
+ */
+async function killTree(pid: number | undefined, killServer: () => Promise<void>): Promise<void> {
+  if (process.platform === 'linux' && pid !== undefined) {
+    const pids = await treePids(pid, LINUX_PROC).catch(() => [pid]);
+    for (const p of pids.filter((x) => x !== pid).reverse()) {
+      try {
+        process.kill(p, 'SIGKILL');
+      } catch {
+        // already gone
       }
-    })
-    .catch(() => undefined);
+    }
+  }
+  await killServer();
 }
 
 function launchPlaywright(executablePath: string): BrowserLauncher {
@@ -168,8 +176,7 @@ function launchPlaywright(executablePath: string): BrowserLauncher {
     });
     const pid = server.process().pid;
     const kill = () => {
-      if (process.platform === 'linux' && pid !== undefined) killTreeLinux(pid);
-      server.kill().catch(() => undefined);
+      void killTree(pid, () => server.kill()).catch(() => undefined);
     };
     let browser;
     try {
@@ -278,8 +285,15 @@ export function createChromiumPrinter(options: ChromiumPrinterOptions): PdfPrint
         signal.throwIfAborted();
         if (sample !== null && s.pid !== undefined) {
           const pid = s.pid;
+          // A tick is skipped while the previous sample is still walking
+          // /proc, so slow reads never pile up into overlapping walks.
+          let sampling = false;
           watchdog = setInterval(() => {
-            sample(pid).then(
+            if (sampling) return;
+            sampling = true;
+            sample(pid).finally(() => {
+              sampling = false;
+            }).then(
               (rss) => {
                 if (rss !== null && rss > capBytes && !finished) {
                   killNow(s);
