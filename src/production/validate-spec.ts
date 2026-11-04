@@ -879,6 +879,12 @@ interface WorkbookCheck {
   cells: Map<string, FormulaCellInfo>;
   /** Displayed forms of untainted numeric results. */
   results: string[];
+  /**
+   * Every untainted numeric formula value, counts and grounded constants
+   * included — what the built workbook SHOWS in those cells. Only
+   * `createTextGrounder` reads it: a count may be shown, never cited.
+   */
+  shown: { value: number; percent: boolean }[];
 }
 
 const cellKey = (sheet: string, address: string) => `${sheet.toUpperCase()}!${address}`;
@@ -1022,7 +1028,7 @@ function checkWorkbook(
   // Evaluating would throw on a duplicate name, and a formula that did not
   // parse or names a missing sheet is already refused — evaluation over them
   // would only add derived noise.
-  if (blocked) return { cells, results: [] };
+  if (blocked) return { cells, results: [], shown: [] };
 
   // Taint: an ungrounded literal, or reading a tainted cell, transitively.
   const propagate = (tainted: Set<string>) => {
@@ -1084,6 +1090,7 @@ function checkWorkbook(
 
   const constants = new Set<string>();
   const numeric: { key: string; shown: string }[] = [];
+  const values: { key: string; value: number; percent: boolean }[] = [];
   layouts.forEach((placed, si) => {
     const name = sheets[si]!.name;
     for (const p of placed) {
@@ -1100,6 +1107,7 @@ function checkWorkbook(
         info.stringResult = value;
       } else if (typeof value === 'number' && !literalTainted.has(key)) {
         const shown = displayedResult(value, sheets[si]!.tables[p.table]!, p.column);
+        values.push({ key, value, percent: sheets[si]!.tables[p.table]!.numberFormat?.[p.column] === 'percent' });
 
         // A perturbed result that is not a number counts as NOT moved: the
         // stricter reading (a branch that errors on other inputs). A count or
@@ -1118,7 +1126,7 @@ function checkWorkbook(
   );
   const results = numeric.filter((n) => !tainted.has(n.key) && !constants.has(n.key)).map((n) => n.shown);
   for (const info of cells.values()) info.constantUngrounded = [...new Set(info.constantUngrounded)];
-  return { cells, results };
+  return { cells, results, shown: values.filter((v) => !tainted.has(v.key)).map(({ value, percent }) => ({ value, percent })) };
 }
 
 // ---------------------------------------------------------------- filename
@@ -1340,4 +1348,94 @@ export function validateSpec(
   }
 
   return [...early, ...c.problems];
+}
+
+// ---------------------------------------------------------------- text read back from a built file
+
+/** Every `{v}` cell of the spec, with whether its column shows it as a percent. */
+function valueCells(spec: DocumentSpec): { value: number; percent: boolean }[] {
+  const out: { value: number; percent: boolean }[] = [];
+  const take = (rows: Cell[][], numberFormat: readonly string[] | undefined) =>
+    rows.forEach((row) =>
+      row.forEach((cell, c) => {
+        if ('v' in cell) out.push({ value: cell.v, percent: numberFormat?.[c] === 'percent' });
+      }),
+    );
+  switch (spec.format) {
+    case 'docx':
+    case 'pdf':
+      for (const b of spec.blocks) if (b.type === 'table') take(b.rows, b.numberFormat);
+      break;
+    case 'pptx':
+      for (const s of spec.slides) {
+        if (s.type === 'table') take(s.rows, s.numberFormat);
+        else if (s.type === 'chart') take(s.rows, undefined);
+      }
+      break;
+    case 'xlsx':
+      for (const sheet of spec.sheets) {
+        for (const t of sheet.tables) take([...t.rows, ...(t.totals === undefined ? [] : [t.totals])], t.numberFormat);
+      }
+      break;
+  }
+  return out;
+}
+
+/**
+ * The forms a value takes on a page: as written, and rounded to 0–6
+ * decimals (a column format or a viewer rounds); a percent cell shows ×100.
+ */
+function displayVariants(value: number, percent: boolean): string[] {
+  const x = at15(percent ? value * 100 : value);
+  const out = new Set([plainNumber(x)]);
+  for (let d = 0; d <= 6; d += 1) out.add(plainNumber(Number(x.toFixed(d))));
+  return [...out];
+}
+
+export interface TextGrounderOptions {
+  /** Today's LOCAL date in the charter timezone, `YYYY-MM-DD`. */
+  today: string;
+  /** Structural numbers the caller knows the page carries (page numbers, clause labels). */
+  extraPool?: readonly string[];
+}
+
+/**
+ * Grounding for text READ BACK from a built file (check 1, `check1.ts`):
+ * the same preparation as `Collector.text` — clause cross-references, dates
+ * against `today` and the sources, times, separators — over a pool of the
+ * sources, today's year, untainted formula results, `extraPool`, and the
+ * DISPLAYED forms of the spec's own values (`{v}` cells and every untainted
+ * formula value, counts included, rounded as a column or viewer shows them,
+ * percent ×100). A built page shows "₪1,890" or "39%" where the spec holds
+ * 1890 or 0.39; without those forms every correct table would fail.
+ *
+ * The spec's values are in the pool because `validateSpec` grounded them:
+ * a caller MUST also run `validateSpec` on the same spec and refuse its
+ * problems (check 1 does), or an ungrounded `{v}` would ground its own text.
+ * What this catches is the file disagreeing with the spec — a number the
+ * renderer, a tamper or a converter put on the page that no source, spec
+ * value or structure explains.
+ */
+export function createTextGrounder(
+  spec: DocumentSpec,
+  sources: GroundingSources,
+  options: TextGrounderOptions,
+): (text: string) => string[] {
+  const today = options?.today;
+  if (typeof today !== 'string' || parseIsoDate(today) === null) {
+    throw new TypeError('createTextGrounder: options.today must be the charter-local date as YYYY-MM-DD');
+  }
+  const texts = allSourceTexts(sources);
+  const sourcePool = texts.map(splitSeparators);
+  const workbook =
+    spec.format === 'xlsx' ? checkWorkbook(spec.sheets, sourcePool, percentMarked(texts), () => undefined) : null;
+  const displayed = [...valueCells(spec), ...(workbook?.shown ?? [])].flatMap((v) => displayVariants(v.value, v.percent));
+  const c = new Collector(sources, today, datesIn(texts), clauseCount(spec), [
+    ...sourcePool,
+    ...(workbook?.results ?? []),
+    today.slice(0, 4),
+    displayed.join(' '),
+    ...(options.extraPool ?? []).map(splitSeparators),
+  ]);
+  return (text) => c.missing(text);
 }
