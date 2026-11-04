@@ -883,3 +883,120 @@ describe('fix round 3', () => {
     expect(codes(ref('כאמור בסעיף 4.123'))).toEqual(['ungrounded_number']);
   });
 });
+
+describe('fix round 4', () => {
+  const PROBE_SOURCE = 'מחיר 1,890 הנחה 15% עמלה 1.5% דמי ניהול 2.5 אחוזים ב-1/3/2026 פריט 5 קוד 0';
+  const probeSources = sources({
+    documents: [{ documentId: PRICE_LIST, artifacts: [{ ordinal: 1, text: PROBE_SOURCE }] }],
+  });
+  const sheetWith = (rows: Cell[][], over: Record<string, unknown> = {}) =>
+    xlsx({ sheets: [{ name: 'a', tables: [{ header: ['x', 'y'], rows, ...over }] }] });
+  const wheres = (problems: SpecProblem[], code: string) =>
+    problems.filter((p) => p.code === code).map((p) => p.where);
+
+  describe('a string-valued formula result is free text, grounded in sources only', () => {
+    it('concatenated digits are refused', () => {
+      const problems = validateSpec(sheetWith([[{ f: '"5"&"0"&"0"&"0"' }]]), probeSources, TODAY);
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 1 col 1']);
+      expect(problems[0]!.detail).toContain('5000');
+    });
+    it('a grounded cell with a digit appended is refused', () => {
+      const problems = validateSpec(sheetWith([[fromDoc(1890)], [{ f: 'A2&"0"' }]]), probeSources, TODAY);
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 2 col 1']);
+      expect(problems[0]!.detail).toContain('18900');
+    });
+    it('a string result never grounds in a formula result', () => {
+      const problems = validateSpec(sheetWith([[fromDoc(1890)], [{ f: 'A2*100' }], [{ f: 'A3&""' }]]), probeSources, TODAY);
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 3 col 1']);
+    });
+    it('controls: a label joined to a grounded cell passes; a bad literal is reported once', () => {
+      expect(validateSpec(sheetWith([[fromDoc(1890)], [{ f: '"מחיר: "&A2' }]]), probeSources, TODAY)).toEqual([]);
+      const once = validateSpec(sheetWith([[{ f: '"מחיר 99999"' }]]), probeSources, TODAY);
+      expect(once).toHaveLength(1);
+    });
+  });
+
+  describe('a constant-derived numeric result must ground like a literal', () => {
+    it('A2/A2*100*100*12 is refused and does not ground "סך 120000"', () => {
+      const probe = sheetWith([[fromDoc(1890)], [{ f: 'A3/A3*100*100*12' }]], { title: 'סך 120000' });
+      expect(wheres(validateSpec(probe, probeSources, TODAY), 'ungrounded_number')).toEqual([
+        'sheet 1 table 1 title',
+        'sheet 1 table 1 row 2 col 1',
+      ]);
+    });
+    it('(A2/A2+A2/A2+A2/A2)*100 is refused and does not ground "סך 300"', () => {
+      const probe = sheetWith([[fromDoc(1890)], [{ f: '(A3/A3+A3/A3+A3/A3)*100' }]], { title: 'סך 300' });
+      expect(wheres(validateSpec(probe, probeSources, TODAY), 'ungrounded_number')).toEqual([
+        'sheet 1 table 1 title',
+        'sheet 1 table 1 row 2 col 1',
+      ]);
+    });
+    it('a reference-free formula is treated the same', () => {
+      const problems = validateSpec(sheetWith([[{ f: '1890*15' }]]), probeSources, TODAY);
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 1 col 1']);
+      expect(validateSpec(sheetWith([[{ f: '1890' }]]), probeSources, TODAY)).toEqual([]);
+    });
+    it('formulas that follow their inputs still pass', () => {
+      const ok = sheetWith([
+        [fromDoc(1890), fromDoc(1.5)],
+        [fromDoc(5), fromDoc(15)],
+        [{ f: 'SUM(A2:A3)' }, { f: 'ROUND(A2*B2,2)' }],
+        [{ f: 'A2*B2' }, { f: 'COUNTIF(A2:A3,">5")' }],
+        [{ f: 'COUNT(A2:A3)' }, { f: 'COUNTA(A2:A3)' }],
+      ]);
+      expect(validateSpec(ok, probeSources, TODAY)).toEqual([]);
+    });
+    it('the count exemption is the count alone, or the count scaled once', () => {
+      const rows = (f: string) => sheetWith([[fromDoc(1890)], [fromDoc(5)], [{ f }]]);
+      expect(validateSpec(rows('COUNTIF(A2:A3,">5")*100'), probeSources, TODAY)).toEqual([]);
+      expect(validateSpec(rows('MATCH(5,A2:A3,0)'), probeSources, TODAY)).toEqual([]);
+      for (const f of ['(COUNT(A2:A3)+COUNT(A2:A3))*100*100*12', 'COUNT(A2:A3)*100*100*12']) {
+        expect(wheres(validateSpec(rows(f), probeSources, TODAY), 'ungrounded_number')).toEqual(['sheet 1 table 1 row 3 col 1']);
+      }
+    });
+    it('a result that errors under the perturbation counts as constant', () => {
+      const problems = validateSpec(
+        sheetWith([[fromDoc(1890)], [{ f: 'IF(A2<2026,A2/A2*100*100*12,1/0)' }]]),
+        sources({ documents: [{ documentId: PRICE_LIST, artifacts: [{ ordinal: 1, text: PROBE_SOURCE + ' שנת 2026' }] }] }),
+        TODAY,
+      );
+      expect(wheres(problems, 'ungrounded_number')).toEqual(['sheet 1 table 1 row 2 col 1']);
+      expect(problems[0]!.detail).toContain('120000');
+    });
+    it('booleans in arithmetic are formula_problem', () => {
+      for (const f of ['(TRUE+TRUE)*A2', '-FALSE+A2', 'A2^TRUE']) {
+        const problems = validateSpec(sheetWith([[fromDoc(1890)], [{ f }]]), probeSources, TODAY);
+        expect(wheres(problems, 'formula_problem')).toEqual(['sheet 1 table 1 row 2 col 1']);
+      }
+      // Control: a boolean argument of IF / VLOOKUP is not arithmetic.
+      expect(
+        validateSpec(sheetWith([[fromDoc(1890)], [{ f: 'IF(TRUE,A2,0)' }]]), probeSources, TODAY),
+      ).toEqual([]);
+    });
+  });
+
+  it('"2.5 אחוזים" is a percent: {v:2.5} is refused, {v:0.025} passes', () => {
+    const pct = (v: number) => validateSpec(sheetWith([[fromDoc(v)]], { numberFormat: ['percent'] }), probeSources, TODAY);
+    expect(codes(pct(2.5))).toEqual(['ungrounded_number']);
+    expect(pct(0.025)).toEqual([]);
+    const pctText = (v: number, text: string) =>
+      validateSpec(
+        sheetWith([[fromDoc(v)]], { numberFormat: ['percent'] }),
+        sources({ documents: [{ documentId: PRICE_LIST, artifacts: [{ ordinal: 1, text }] }] }),
+        TODAY,
+      );
+    expect(codes(pctText(2.5, 'דמי ניהול 2.5 אחוז'))).toEqual(['ungrounded_number']);
+    expect(codes(pctText(2.5, 'fee 2.5 percent'))).toEqual(['ungrounded_number']);
+  });
+
+  it('a negated literal is grounded with its sign', () => {
+    const neg = (text: string) =>
+      validateSpec(
+        sheetWith([[{ f: '-1890' }]]),
+        sources({ documents: [{ documentId: PRICE_LIST, artifacts: [{ ordinal: 1, text }] }] }),
+        TODAY,
+      );
+    expect(wheres(neg('מחיר 1890'), 'ungrounded_number')).toEqual(['sheet 1 table 1 row 1 col 1']);
+    expect(neg('זיכוי -1890')).toEqual([]);
+  });
+});

@@ -29,7 +29,7 @@
  * In a `percent` column a value is a FRACTION (0.15 displays 15%): its
  * displayed ×100 form must ground ("15%"/"15"), and the raw fraction is also
  * accepted when it is not an integer and the source writes that exact number
- * NOT followed by `%` ("0.15") — so `{v: 15}` (1500%) does not ground on
+ * NOT followed by `%`, "אחוז(ים)" or "percent" ("0.15") — so `{v: 15}` (1500%) does not ground on
  * "15%", nor `{v: 1.5}` (150%) on "1.5%". A `{d}`
  * cell must equal `today` or be a date some source writes (ISO, `d/m/yyyy`,
  * `d.m.yyyy`, two-digit years as 20yy, or in words). A pointer that does not
@@ -55,7 +55,10 @@
  *     `range_lookup`, MATCH `match_type`, each within its bounds), or as a
  *     direct `*`/`/` operand in {0, 1, 100, 12} whose other operand contains
  *     a cell reference. So exempt values cannot be combined by arithmetic
- *     (`100*100+12*12+1+1`). A negated literal is checked as its magnitude.
+ *     (`100*100+12*12+1+1`). A negated literal outside those positions is
+ *     grounded WITH its sign (`-1890` needs "-1890", not "1890").
+ *   - TRUE/FALSE as an operand of `+ - * / ^`, a unary sign or `%` is
+ *     `formula_problem` (`(TRUE+TRUE)*A2` manufactures a 2).
  *   - a literal (number, string or boolean) argument of SUM, AVERAGE, MIN,
  *     MAX, COUNT, COUNTA, COUNTIF, SUMIF, SUMIFS or SUMPRODUCT is
  *     `formula_problem` — those take cells (`COUNTA("a",…)*100` would count
@@ -64,7 +67,16 @@
  *   - a cell with an ungrounded literal is TAINTED, and so is every formula
  *     reading a tainted cell, transitively; a tainted result never grounds
  *     free text (no laundering `{f:'18900'}` into a title).
- *   - untainted results ground free text in the form the column displays:
+ *   - PERTURBATION: the workbook is evaluated a second time, same layout,
+ *     with every `{v}` input ×1.37. A numeric result that does not move (or
+ *     is not a number under the perturbation) is CONSTANT-DERIVED
+ *     (`A2/A2*100*100*12`, reference-free formulas): its displayed value must
+ *     ground in the sources like a literal, and it never grounds free text.
+ *     Exempt by name: a COUNT/COUNTA/COUNTIF/MATCH call alone, or scaled by
+ *     ONE exempt literal — counts and positions are layout-derived.
+ *   - a STRING result is free text grounded in the sources (and today's
+ *     year) only, never in formula results (`"5"&"0"&"0"&"0"`, `A2&"0"`).
+ *   - untainted, non-constant results ground free text in the form the column displays:
  *     `int` → integer, `money`/`decimal2` → 2 decimals, `percent` → ×100,
  *     no format → the exact value.
  *   - up front, `formula_problem`: a parse problem, a reference to a sheet
@@ -256,8 +268,8 @@ const SLASH_DATE = new RegExp(`${BEFORE}(\\d{1,2})/(\\d{1,2})/(\\d{4}|\\d{2})${A
 const DOT_DATE = new RegExp(`${BEFORE}(\\d{1,2})\\.(\\d{1,2})\\.(\\d{4}|\\d{2})${AFTER}`, 'g');
 const ISO_DATE = new RegExp(`${BEFORE}(\\d{4})-(\\d{2})-(\\d{2})${AFTER}`, 'g');
 const DASH_DATE = new RegExp(`${BEFORE}(\\d{1,2})-(\\d{1,2})-(\\d{4}|\\d{2})${AFTER}`, 'g');
-/** A number written as a percentage ("1.5%", "15 %"). */
-const PERCENT_FOLLOWED = /\d[\d,]*(?:\.\d+)?\s*%/g;
+/** A number written as a percentage ("1.5%", "15 %", "2.5 אחוזים", "2.5 percent"). */
+const PERCENT_FOLLOWED = /\d[\d,]*(?:\.\d+)?\s*(?:%|אחוז(?:ים)?|percent)/giu;
 const TIME = new RegExp(`${BEFORE}(?:[01]?\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?${AFTER}`, 'g');
 
 const MONTH_NAMES: readonly (readonly string[])[] = [
@@ -410,13 +422,21 @@ class Collector {
     this.problems.push({ code, where, detail });
   }
 
-  text(where: string, text: string): void {
+  /** Ungrounded numbers and dates of free text, against `pool` (default: sources + untainted results). */
+  missing(text: string, pool: string[] = this.pool): string[] {
     const dates: string[] = [];
     const rest = replaceDates(blankClauseRefs(text, this.clauses), (iso, raw) => {
       if (!this.dateGrounded(iso)) dates.push(raw.trim());
       return ' ';
     }).replace(TIME, ' ');
-    const missing = [...new Set([...dates, ...ungroundedNumbers(splitSeparators(rest), this.pool)])];
+    return [...new Set([...dates, ...ungroundedNumbers(splitSeparators(rest), pool)])];
+  }
+
+  text(where: string, text: string): void {
+    this.report(where, this.missing(text));
+  }
+
+  report(where: string, missing: string[]): void {
     if (missing.length > 0) {
       this.add('ungrounded_number', where, `מספר או תאריך שאין לו מקור: ${missing.join(', ')}`);
     }
@@ -557,9 +577,42 @@ function isParameter(name: string, i: number, arg: FormulaAst): boolean {
   }
 }
 
+const ARITHMETIC: ReadonlySet<string> = new Set(['+', '-', '*', '/', '^']);
+
+/** TRUE/FALSE, possibly signed or with `%`. */
+function isBooleanLiteral(n: FormulaAst): boolean {
+  if (n.type === 'boolean') return true;
+  return (n.type === 'unary' || n.type === 'percent') && isBooleanLiteral(n.arg);
+}
+
+/**
+ * Functions whose result is a count — or, for MATCH, a position: layout-
+ * derived, so it need not move with the inputs. MATCH is this round's own
+ * addition to the ruled COUNT/COUNTA/COUNTIF: `MATCH(A2,A2:A9,0)` is the
+ * row a value sits on, not a value.
+ */
+const COUNTS: ReadonlySet<string> = new Set(['COUNT', 'COUNTA', 'COUNTIF', 'MATCH']);
+
+/**
+ * A formula exempt BY NAME from the constant-derived check: exactly a
+ * COUNTS call, or such a call times/divided by ONE exempt
+ * literal (`COUNTIF(...)*100`, a recorded residual). Nothing wider: counts
+ * combined by arithmetic (`(COUNT(A2)+COUNT(A2))*100*12`) manufacture
+ * numbers exactly like `A2/A2`.
+ */
+function isCountResult(ast: FormulaAst): boolean {
+  if (ast.type === 'call') return COUNTS.has(ast.name);
+  if (ast.type !== 'binary' || (ast.op !== '*' && ast.op !== '/')) return false;
+  const isCount = (n: FormulaAst) => n.type === 'call' && COUNTS.has(n.name);
+  const isExempt = (n: FormulaAst) => n.type === 'number' && EXEMPT_LITERALS.has(n.value);
+  return (isCount(ast.left) && isExempt(ast.right)) || (ast.op === '*' && isExempt(ast.left) && isCount(ast.right));
+}
+
 interface FormulaLiterals {
-  /** Number literals that must ground (magnitudes). */
+  /** Number literals that must ground (signed when negated outside an exempt position). */
   numbers: number[];
+  /** A TRUE/FALSE literal is an operand of `+ - * / ^`, a unary sign or `%`. */
+  booleanArithmetic: boolean;
   /** String literals: free text. */
   strings: string[];
   /** Literal arguments of an aggregate outside a criteria position. */
@@ -584,12 +637,23 @@ function literalsIn(ast: FormulaAst, out: FormulaLiterals, exempt = false): void
       out.strings.push(ast.value);
       return;
     case 'unary':
+      if (isBooleanLiteral(ast.arg)) out.booleanArithmetic = true;
+      // A negated literal outside an exempt position is grounded WITH its
+      // sign: `-1890` needs "-1890" (or "1890-") in a source, not "1890".
+      if (ast.op === '-' && ast.arg.type === 'number') {
+        if (!exempt) out.numbers.push(-ast.arg.value);
+        return;
+      }
       literalsIn(ast.arg, out, exempt);
       return;
     case 'percent':
+      if (isBooleanLiteral(ast.arg)) out.booleanArithmetic = true;
       literalsIn(ast.arg, out);
       return;
     case 'binary': {
+      if (ARITHMETIC.has(ast.op) && (isBooleanLiteral(ast.left) || isBooleanLiteral(ast.right))) {
+        out.booleanArithmetic = true;
+      }
       const scaling = ast.op === '*' || ast.op === '/';
       const ok = (self: FormulaAst, other: FormulaAst) => {
         const v = numberOf(self);
@@ -650,6 +714,10 @@ interface FormulaCellInfo {
   ungrounded: string[];
   /** String literals: free text. */
   strings: string[];
+  /** A string-valued result: free text grounded in the sources only. */
+  stringResult: string | null;
+  /** A constant-derived numeric result whose displayed value no source gives. */
+  constantUngrounded: string | null;
 }
 
 interface WorkbookCheck {
@@ -661,11 +729,28 @@ interface WorkbookCheck {
 
 const cellKey = (sheet: string, address: string) => `${sheet.toUpperCase()}!${address}`;
 
+/** The input factor of the perturbation check: not a round number, so it does not cancel. */
+const PERTURBATION = 1.37;
+
+/** The same sheet, same layout, with every `{v}` input multiplied by PERTURBATION. */
+function perturbSheet(sheet: XlsxSheet): XlsxSheet {
+  const move = (cell: Cell): Cell => ('v' in cell ? { ...cell, v: cell.v * PERTURBATION } : cell);
+  return {
+    ...sheet,
+    tables: sheet.tables.map((t) => ({
+      ...t,
+      rows: t.rows.map((row) => row.map(move)),
+      ...(t.totals === undefined ? {} : { totals: t.totals.map(move) }),
+    })),
+  };
+}
+
 function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProblem): WorkbookCheck {
   const layouts = sheets.map(layoutSheet);
   const upper = sheets.map((s) => s.name.toUpperCase());
   const cells = new Map<string, FormulaCellInfo>();
   const reads = new Map<string, string[]>();
+  const countResults = new Set<string>();
   let blocked = false;
 
   upper.forEach((name, i) => {
@@ -693,8 +778,12 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
           add('formula_problem', placedWhere(si, p), `הנוסחה מפנה לגיליון שאינו קיים: "${name}"`);
         }
       }
-      const literals: FormulaLiterals = { numbers: [], strings: [], aggregateLiterals: [] };
+      const literals: FormulaLiterals = { numbers: [], booleanArithmetic: false, strings: [], aggregateLiterals: [] };
       literalsIn(parsed.ast, literals);
+      if (literals.booleanArithmetic) {
+        blocked = true;
+        add('formula_problem', placedWhere(si, p), 'TRUE/FALSE אינם מספרים: אסור להשתמש בהם בחישוב');
+      }
       if (literals.aggregateLiterals.length > 0) {
         blocked = true;
         add(
@@ -706,7 +795,13 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
       const ungrounded = literals.numbers
         .map(plainNumber)
         .filter((n) => ungroundedNumbers(n, literalPool).length > 0);
-      cells.set(key, { ungrounded: [...new Set(ungrounded)], strings: literals.strings });
+      cells.set(key, {
+        ungrounded: [...new Set(ungrounded)],
+        strings: literals.strings,
+        stringResult: null,
+        constantUngrounded: null,
+      });
+      if (isCountResult(parsed.ast)) countResults.add(key);
       reads.set(
         key,
         referencedCells(parsed.ast).map((ref) => {
@@ -734,19 +829,34 @@ function checkWorkbook(sheets: XlsxSheet[], literalPool: string[], add: AddProbl
   }
 
   const evaluation = evaluateWorkbook(sheets.map(toEvalSheet));
+  // The perturbation check: the same workbook and layout with every `{v}`
+  // input ×PERTURBATION. A numeric result that does not move is built from
+  // constants, not from the inputs (`A2/A2*100*100*12`), so its displayed
+  // value must ground like a literal, and it never grounds free text.
+  const perturbed = evaluateWorkbook(sheets.map(perturbSheet).map(toEvalSheet));
   const results: string[] = [];
   layouts.forEach((placed, si) => {
     const name = sheets[si]!.name;
     for (const p of placed) {
       if (p.cell === null || !('f' in p.cell)) continue;
       const evalKey = `${name}!${p.address}`;
+      const key = cellKey(name, p.address);
+      const info = cells.get(key)!;
       const value = evaluation.values.get(evalKey);
       if (evaluation.deviated.has(evalKey)) {
         add('formula_problem', placedWhere(si, p), 'לא ניתן לאמת שהנוסחה תחושב כמו ב-Excel');
       } else if (isEvalError(value)) {
         add('formula_problem', placedWhere(si, p), `הנוסחה מחזירה שגיאה: ${value.error}`);
-      } else if (typeof value === 'number' && !tainted.has(cellKey(name, p.address))) {
-        results.push(displayedResult(value, sheets[si]!.tables[p.table]!, p.column));
+      } else if (typeof value === 'string') {
+        info.stringResult = value;
+      } else if (typeof value === 'number' && !tainted.has(key)) {
+        const shown = displayedResult(value, sheets[si]!.tables[p.table]!, p.column);
+        const moved = perturbed.values.get(evalKey);
+        // A perturbed result that is not a number counts as NOT moved: the
+        // stricter reading (a branch that errors on other inputs).
+        const constant = !countResults.has(key) && (typeof moved !== 'number' || moved === value);
+        if (!constant) results.push(shown);
+        else if (ungroundedNumbers(shown, literalPool).length > 0) info.constantUngrounded = shown;
       }
     }
   });
@@ -876,6 +986,8 @@ export function validateSpec(
   }
 
   const sourcePool = allSourceTexts(sources).map(splitSeparators);
+  // What a string formula result may ground in: sources and today's year, never formula results.
+  const freeTextSources = [...sourcePool, today.slice(0, 4)];
   const workbook = spec.format === 'xlsx' ? checkWorkbook(spec.sheets, sourcePool, add) : null;
   const c = new Collector(sources, today, datesIn(allSourceTexts(sources)), clauseCount(spec), [
     ...sourcePool,
@@ -944,7 +1056,21 @@ export function validateSpec(
             if (info.ungrounded.length > 0) {
               c.add('ungrounded_number', where, `מספר בנוסחה שאין לו מקור: ${info.ungrounded.join(', ')}`);
             }
-            for (const s of info.strings) c.text(where, s);
+            if (info.constantUngrounded !== null) {
+              c.add('ungrounded_number', where, `תוצאת הנוסחה ${info.constantUngrounded} אינה תלויה בנתונים ואין לה מקור`);
+            }
+            const reported = new Set<string>();
+            for (const s of info.strings) {
+              const missing = c.missing(s);
+              missing.forEach((m) => reported.add(m));
+              c.report(where, missing);
+            }
+            // A string result is checked against the sources only, never
+            // against formula results ("5"&"0"&"0"&"0" shows 5000). A number a
+            // string literal already reported is not reported twice.
+            if (info.stringResult !== null) {
+              c.report(where, c.missing(info.stringResult, freeTextSources).filter((m) => !reported.has(m)));
+            }
           }
         }
       });
