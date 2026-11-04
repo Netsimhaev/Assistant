@@ -83,6 +83,10 @@ export const config = {
   documentRoot: resolve(required('DOCUMENT_ROOT')),
   documentInbox: optional('DOCUMENT_INBOX'),
   documentReadsPerDay: positiveInt('DOCUMENT_READS_PER_DAY', 20),
+  // Document productions per local day (charter zone), counting each draft
+  // call: a new production and every fix attempt (src/production/loop.ts).
+  // Over it a production fails before any model call. 0 refuses every one.
+  documentsPerDay: positiveInt('DOCUMENTS_PER_DAY', 20),
   // Whole-process-tree resident-set cap for the headless Chromium that prints
   // PDFs (`src/production/chromium.ts`). Enforced on Linux only, by sampling
   // /proc, like `run-extractor.ts`.

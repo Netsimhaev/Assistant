@@ -136,6 +136,13 @@ export const AuditKind = z.enum([
    * this one is no exception.
    */
   'whatsapp_instruction',
+  /**
+   * A document production reached a terminal stage (ready, failed_checks,
+   * failed). `inputHash` is a hash of the production id, format, kind and
+   * stage only — never the instruction, the spec or the file: the request can
+   * name a person, and this table is the one an erasure cannot reach.
+   */
+  'document_production',
 ]);
 export type AuditKind = z.infer<typeof AuditKind>;
 

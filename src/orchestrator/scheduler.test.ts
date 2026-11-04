@@ -521,3 +521,100 @@ describe('the mail field on SchedulerPassResult', () => {
     expect(pending).toHaveLength(1);
   });
 });
+
+describe('the document production loop runs in the pass, right after the plans', () => {
+  const inert = (production?: Runtime['production']): Runtime => ({
+    registry: new AdapterRegistry([]),
+    credentials: envCredentials({}, 'TEST_CRED_'),
+    warnings: [],
+    ...(production !== undefined ? { production } : {}),
+  });
+
+  async function queuedProduction(bundle: PolicyBundle): Promise<string> {
+    const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
+    for (const to of ['understand', 'plan', 'execute', 'followup'] as const) {
+      await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId: BUSINESS });
+    }
+    const { createProduction } = await import('../production/store.js');
+    return createProduction({
+      businessId: BUSINESS,
+      originJobId: job.jobId,
+      instructionText: 'תכיני מכתב תודה ללקוח',
+      textOrigin: 'typed',
+      format: 'docx',
+      language: 'he',
+      kind: 'letter',
+      destination: { mode: 'save', folder: null },
+      sourceDocumentIds: [],
+    });
+  }
+
+  it('does not run (null, not zeros) when the runtime has no production tools; the request stays queued', async () => {
+    const bundle = await install();
+    const id = await queuedProduction(bundle);
+    const unavailable = await schedulerPass({
+      businessId: BUSINESS,
+      now: NOON,
+      runtime: inert({ available: false, sofficePath: null, chromiumPath: null }),
+    });
+    expect(unavailable.documentProductions).toBeNull();
+    expect(unavailable.documentProductionsError).toBeNull();
+    const absent = await schedulerPass({ businessId: BUSINESS, now: NOON, runtime: inert() });
+    expect(absent.documentProductions).toBeNull();
+    const { loadProduction } = await import('../production/store.js');
+    expect((await loadProduction(BUSINESS, id))?.stage).toBe('queued');
+  });
+
+  it('drives a queued production to ready in the same pass when the seams are present', async () => {
+    const { mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const mammoth = (await import('mammoth')).default;
+    const bundle = await install();
+    const id = await queuedProduction(bundle);
+    const root = await mkdtemp(join(tmpdir(), 'sched-produced-'));
+    try {
+      const result = await schedulerPass({
+        businessId: BUSINESS,
+        now: NOON,
+        runtime: inert(),
+        production: {
+          documentRoot: root,
+          drafter: async () => ({
+            status: 'drafted',
+            spec: {
+              format: 'docx',
+              language: 'he',
+              kind: 'letter',
+              title: 'מכתב ללקוח',
+              filename: 'letter',
+              style: { theme: 'clean', accent: 'navy' },
+              sources: [{ kind: 'instruction' }],
+              blocks: [{ type: 'paragraph', text: 'תודה על הפנייה, נשמח לעזור' }],
+            },
+          }),
+          printer: async () => Buffer.from('%PDF-'),
+          renderer: async (file) => ({
+            pages: [],
+            text: (await mammoth.extractRawText({ buffer: file.bytes })).value,
+            pageCount: 1,
+            textTruncated: false,
+          }),
+          judge: async () => ({
+            status: 'judged',
+            raw: '{}',
+            criteria: ['answers_request', 'language_correct', 'order_as_seen', 'structure_fits_kind', 'legible_professional'].map(
+              (cid) => ({ id: cid, statement: cid, severity: 'must' as const, passed: true, detail: '' }),
+            ),
+          }),
+        },
+      });
+      expect(result.documentProductionsError).toBeNull();
+      expect(result.documentProductions).toMatchObject({ ready: 1, errored: [] });
+      const { loadProduction } = await import('../production/store.js');
+      expect((await loadProduction(BUSINESS, id))?.stage).toBe('ready');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

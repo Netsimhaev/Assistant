@@ -52,6 +52,8 @@ function cleanResult(): SchedulerPassResult {
     ledgerEvidenceError: null,
     ledger: null,
     ledgerError: null,
+    documentProductions: { advanced: 0, ready: 0, failedChecks: 0, failed: 0, skipped: 0, errored: [] },
+    documentProductionsError: null,
   };
 }
 
@@ -242,6 +244,63 @@ describe('logErrored', () => {
     } finally {
       logSpy.mockRestore();
       errorSpy.mockRestore();
+    }
+  });
+});
+
+describe('logErrored: document production', () => {
+  const spy = () => ({
+    log: vi.spyOn(console, 'log').mockImplementation(() => {}),
+    error: vi.spyOn(console, 'error').mockImplementation(() => {}),
+  });
+
+  it('"did not run" (null) reads differently from "ran, nothing to do" (zeros, silent)', () => {
+    const s = spy();
+    try {
+      logErrored(cleanResult());
+      expect(s.log).not.toHaveBeenCalled();
+      logErrored({ ...cleanResult(), documentProductions: null });
+      expect(s.log).toHaveBeenCalledWith(expect.stringMatching(/^document production did not run this pass/));
+      expect(s.error).not.toHaveBeenCalled();
+    } finally {
+      s.log.mockRestore();
+      s.error.mockRestore();
+    }
+  });
+
+  it('a thrown loop prints its error, not "did not run"', () => {
+    const s = spy();
+    try {
+      logErrored({ ...cleanResult(), documentProductions: null, documentProductionsError: 'boom' });
+      expect(s.error).toHaveBeenCalledWith('document production failed: boom');
+      expect(s.log).not.toHaveBeenCalled();
+    } finally {
+      s.log.mockRestore();
+      s.error.mockRestore();
+    }
+  });
+
+  it('a pass that did work prints its counts and every errored production', () => {
+    const s = spy();
+    try {
+      logErrored({
+        ...cleanResult(),
+        documentProductions: {
+          advanced: 5,
+          ready: 1,
+          failedChecks: 0,
+          failed: 1,
+          skipped: 0,
+          errored: [{ productionId: 'DP-1', error: 'bang' }],
+        },
+      });
+      expect(s.log).toHaveBeenCalledWith(
+        'document production: 5 stage move(s), 1 ready, 0 stopped at checks, 1 failed, 0 skipped',
+      );
+      expect(s.error).toHaveBeenCalledWith('document production DP-1 errored: bang');
+    } finally {
+      s.log.mockRestore();
+      s.error.mockRestore();
     }
   });
 });

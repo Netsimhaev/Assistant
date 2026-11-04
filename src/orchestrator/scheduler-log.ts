@@ -262,4 +262,25 @@ export function logErrored(result: SchedulerPassResult): void {
         result.ledger.errored.map((e) => `${e.itemId}: ${e.error}`).join('; '),
     );
   }
+  // Document production (`src/production/loop.ts`). Three different facts,
+  // and they must not read alike: it threw; it did not run at all (no
+  // production tools on this server — every queued request waits); it ran.
+  // A run with nothing to do is silent, like every other clean bucket here.
+  if (result.documentProductionsError !== null) {
+    console.error(`document production failed: ${result.documentProductionsError}`);
+  } else if (result.documentProductions === null) {
+    console.log(
+      'document production did not run this pass: production tools are not installed ' +
+        '(DOCUMENT_SOFFICE_PATH / DOCUMENT_CHROMIUM_PATH) — queued requests wait',
+    );
+  } else {
+    const d = result.documentProductions;
+    if (d.advanced > 0 || d.ready > 0 || d.failedChecks > 0 || d.failed > 0 || d.skipped > 0) {
+      console.log(
+        `document production: ${d.advanced} stage move(s), ${d.ready} ready, ` +
+          `${d.failedChecks} stopped at checks, ${d.failed} failed, ${d.skipped} skipped`,
+      );
+    }
+    for (const e of d.errored) console.error(`document production ${e.productionId} errored: ${e.error}`);
+  }
 }
