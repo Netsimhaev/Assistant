@@ -38,9 +38,10 @@ import { getPool, type Queryable } from '../db/pool.js';
 import type { AccentColor, Block, DocxSpec } from '../domain/document-spec.js';
 import { formatCell } from './format-value.js';
 import { SpecRenderError } from './render-error.js';
+import { checkImage, splitNumberRuns, type ImageLoader } from './render-shared.js';
 import { CONTRACT_DISCLAIMER_EN, CONTRACT_DISCLAIMER_HE, stripOwnNumber } from './validate-spec.js';
 
-export type ImageLoader = (documentId: string) => Promise<{ bytes: Buffer; mediaType: string } | null>;
+export type { ImageLoader };
 
 export interface RenderDocxOptions {
   currency: string;
@@ -67,8 +68,6 @@ const HEADING_LEVEL = {
   3: HeadingLevel.HEADING_3,
 } as const;
 
-/** Currency prefix + digits with inner separators + optional percent. */
-const NUMBER_RUN = /(?:(?<![\p{L}\d])[-−])?[₪$€]?\d+(?:[,.:/]\d+)*%?/gu;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 interface Ctx {
@@ -86,17 +85,9 @@ interface RunStyle {
 function textRuns(text: string, ctx: Ctx, style: RunStyle = {}): TextRun[] {
   const base = { font: FONT, ...style };
   if (!ctx.rtl) return [new TextRun({ text, ...base })];
-  const runs: TextRun[] = [];
-  let last = 0;
-  for (const m of text.matchAll(NUMBER_RUN)) {
-    const at = m.index ?? 0;
-    if (at > last) runs.push(new TextRun({ text: text.slice(last, at), rightToLeft: true, ...base }));
-    runs.push(new TextRun({ text: m[0], ...base }));
-    last = at + m[0].length;
-  }
-  if (last < text.length) runs.push(new TextRun({ text: text.slice(last), rightToLeft: true, ...base }));
-  if (runs.length === 0) runs.push(new TextRun({ text: '', rightToLeft: true, ...base }));
-  return runs;
+  return splitNumberRuns(text).map((p) =>
+    p.ltr ? new TextRun({ text: p.text, ...base }) : new TextRun({ text: p.text, rightToLeft: true, ...base }),
+  );
 }
 
 /** A label such as `2.1` that must stay left-to-right even inside a Hebrew line. */
@@ -118,40 +109,10 @@ function para(
   });
 }
 
-function imageSize(bytes: Buffer, mediaType: string): { width: number; height: number } | null {
-  if (mediaType === 'image/png') {
-    if (bytes.length >= 24 && bytes.readUInt32BE(0) === 0x89504e47) {
-      return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
-    }
-    return null;
-  }
-  // JPEG: walk markers to the first SOF.
-  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
-  let i = 2;
-  while (i + 9 < bytes.length) {
-    if (bytes[i] !== 0xff) {
-      i += 1;
-      continue;
-    }
-    const marker = bytes[i + 1] as number;
-    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
-      return { height: bytes.readUInt16BE(i + 5), width: bytes.readUInt16BE(i + 7) };
-    }
-    i += 2 + bytes.readUInt16BE(i + 2);
-  }
-  return null;
-}
-
 async function imageParagraph(documentId: string, ctx: Ctx, options: RenderDocxOptions, where: string) {
   const img = await options.images(documentId);
   if (img === null) throw new SpecRenderError('unknown_image', where);
-  if (img.mediaType !== 'image/png' && img.mediaType !== 'image/jpeg') {
-    throw new SpecRenderError('unsupported_image', where);
-  }
-  const size = imageSize(img.bytes, img.mediaType);
-  if (size === null || size.width <= 0 || size.height <= 0) {
-    throw new SpecRenderError('unsupported_image', where);
-  }
+  const size = checkImage(img, where);
   const scale = Math.min(1, MAX_IMAGE_WIDTH_PX / size.width);
   return para(
     [
