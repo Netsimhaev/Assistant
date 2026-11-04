@@ -112,4 +112,34 @@ describe('renderXlsx', () => {
     expect((err as SpecRenderError).code).toBe('formula_error');
     expect((err as SpecRenderError).where).toBe('S!A3');
   });
+
+  it('throws formula_error for a deviating formula (text with digits in arithmetic)', async () => {
+    const bad = spec({
+      sheets: [{ name: 'S', tables: [{ header: ['a'], rows: [[{ t: 'ab12' }], [{ f: 'A2+1' }]] }] }],
+    });
+    const ev = evaluateWorkbook(bad.sheets.map(toEvalSheet));
+    expect(ev.deviated.has('S!A3') || typeof ev.values.get('S!A3') === 'object').toBe(true);
+    const err = await renderXlsx(bad, { currency: 'ILS' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SpecRenderError);
+    expect((err as SpecRenderError).code).toBe('formula_error');
+  });
+
+  it('a formula over a date cell caches the same value as evaluateWorkbook', async () => {
+    const s = spec({
+      sheets: [{ name: 'S', tables: [{ header: ['d'], rows: [[{ d: '2026-11-03' }], [{ f: 'A2+30' }]] }] }],
+    });
+    const ev = evaluateWorkbook(s.sheets.map(toEvalSheet));
+    const ws = (await read(await renderXlsx(s, { currency: 'ILS' }))).worksheets[0]!;
+    const cached = (ws.getCell('A3').value as { result: number }).result;
+    expect(cached).toBe(ev.values.get('S!A3'));
+    expect(cached).toBe(46329 + 30);
+  });
+
+  it('column width counts the formatted text (symbol and separators)', async () => {
+    const s = spec({
+      sheets: [{ name: 'S', tables: [{ header: ['x'], rows: [[{ v: 1234567, src }]], numberFormat: ['money'] }] }],
+    });
+    const ws = (await read(await renderXlsx(s, { currency: 'ILS' }))).worksheets[0]!;
+    expect(ws.getColumn(1).width).toBe('₪1,234,567'.length + 2);
+  });
 });

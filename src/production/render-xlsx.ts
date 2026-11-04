@@ -49,6 +49,19 @@ function percentFormat(values: number[]): string {
   return '0.00%';
 }
 
+/** Display length of a number under a column format (separators, symbol, decimals, percent). */
+function shownLength(n: number, fmt: string | undefined): number {
+  if (fmt === undefined) return String(n).length;
+  const dec = (fmt.match(/.(0+)/)?.[1] ?? '').length;
+  const pct = fmt.includes('%');
+  const body = (pct ? n * 100 : n).toLocaleString('en-US', {
+    minimumFractionDigits: dec,
+    maximumFractionDigits: dec,
+  });
+  const symbol = fmt.includes('"') ? (fmt.match(/"([^"]*)"/)?.[1] ?? '').length + 1 : 0;
+  return body.length + symbol + (pct ? 1 : 0);
+}
+
 const isErr = (v: EvalValue): v is { error: never } => typeof v === 'object';
 
 export async function renderXlsx(
@@ -126,7 +139,7 @@ export async function renderXlsx(
         if ('v' in c) {
           cell.value = c.v;
           if (fmt) cell.numFmt = fmt;
-          bump(col, String(c.v).length + 2);
+          bump(col, shownLength(c.v, fmt));
         } else if ('t' in c) {
           cell.value = c.t;
           bump(col, c.t.length);
@@ -139,7 +152,7 @@ export async function renderXlsx(
           const result = valueOf.get(p.address) as number | string | boolean;
           cell.value = { formula: c.f, result };
           if (fmt && typeof result === 'number') cell.numFmt = fmt;
-          bump(col, String(result).length + 2);
+          bump(col, typeof result === 'number' ? shownLength(result, fmt) : String(result).length);
         }
         if (p.role === 'totals') cell.font = { name: FONT, size: 11, bold: true };
       }
