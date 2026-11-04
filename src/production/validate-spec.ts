@@ -163,7 +163,7 @@ export interface ValidateSpecOptions {
 }
 
 /** Number literals a formula may carry without a source. Closed set. */
-const EXEMPT_LITERALS: ReadonlySet<number> = new Set([0, 1, 100, 12]);
+export const EXEMPT_LITERALS: ReadonlySet<number> = new Set([0, 1, 100, 12]);
 
 type AddProblem = (code: SpecProblemCode, where: string, detail: string) => void;
 

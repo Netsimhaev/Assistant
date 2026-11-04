@@ -508,6 +508,7 @@ describe('the from literal in the delegation call', () => {
 
 const SRC = join(process.cwd(), 'src');
 const GOV_VERIFY_PATH = join(SRC, 'sdk', 'gov-verify.ts');
+const DOC_JUDGE_PATH = join(SRC, 'sdk', 'doc-judge.ts');
 
 /**
  * Every import specifier in `source`, in any of the three forms a module can
@@ -618,6 +619,27 @@ describe('gov.verify never opens the document itself', () => {
     );
 
     const offenders = reached.filter((file) => /[\\/]documents[\\/]/.test(file));
+    expect(offenders).toEqual([]);
+  });
+
+  /**
+   * The image judge of document production (`doc-judge.ts`, spec §5.7) is
+   * the same quarantine: it judges the BUILT file from page images and the
+   * text extracted from it, and must never reach a module that reads
+   * document content — rendering and file reading (`production/`) sit
+   * outside it. Same walk, a second entry, the same depth pins (reached
+   * through its import of `gov-verify.ts`), and the file must exist: a walk
+   * from a path that is not there reaches nothing and passes.
+   */
+  it('doc-judge transitive imports reach no document reader', () => {
+    expect(existsSync(DOC_JUDGE_PATH)).toBe(true);
+    const reached = transitiveLocalImports(DOC_JUDGE_PATH);
+    expect(reached, 'doc-judge.ts does not import gov-verify.ts').toContain(GOV_VERIFY_PATH);
+    expect(reached).toContain(join(SRC, 'charter', 'capabilities.ts'));
+    expect(reached).toContain(join(SRC, 'orchestrator', 'adapters', 'types.ts'));
+    const offenders = reached.filter(
+      (file) => /[\\/]documents[\\/]/.test(file) || /[\\/]production[\\/]/.test(file),
+    );
     expect(offenders).toEqual([]);
   });
 });
