@@ -93,6 +93,7 @@ import {
 } from '../ledger/ledger-input.js';
 import { listCriticalRules, loadLedgerSettings, matchesCriticalRule } from '../ledger/settings.js';
 import { extractDomain, normaliseDomainString } from '../util/address.js';
+import { DocSaveInput, runDocSave } from '../production/save.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 
 export interface LocalToolContext {
@@ -692,6 +693,16 @@ const HANDLERS: Record<string, LocalHandler> = {
    * its caller: a handler that could accept a trust level as a parameter is a
    * handler a hostile payload could use to launder one.
    */
+  /**
+   * Copies an approved produced document into the owner's base folder
+   * (document production §9.2). Every path rule, the delivery-job gate and
+   * the write-once-and-re-hash live in `production/save.ts`.
+   */
+  'doc.save': async (input, ctx) => {
+    const parsed = parseOrFail(DocSaveInput, input, 'doc.save');
+    return runDocSave(parsed, { jobId: ctx.jobId, businessId: ctx.businessId, ...(ctx.db ? { db: ctx.db } : {}) });
+  },
+
   'doc.fetch': async (input, ctx) => {
     const parsed = parseOrFail(DocFetchInput, input, 'doc.fetch');
     if (ctx.bundle === undefined) {
@@ -1220,6 +1231,13 @@ export const LOCAL_TOOL_CONTRACTS: readonly { toolName: string; payload: string 
   {
     toolName: 'memory.recall_shallow',
     payload: 'כמו `memory.recall`, ומחזיר לכל היותר שלוש תוצאות.',
+  },
+  {
+    toolName: 'doc.save',
+    payload:
+      '`{"producedVersionId": מזהה הגרסה שאושרה, "sha256": הגיבוב שלה, ' +
+      '"folder": תיקייה יחסית בתוך תיקיית הבסיס או null, "filename": השם הקנוני של הגרסה}` — ' +
+      'לא נקרא ישירות על ידי תוכנית; רץ רק במשימת המסירה של כרטיס מסמך שאושר, ולעולם אינו דורס קובץ.',
   },
   {
     toolName: 'doc.fetch',

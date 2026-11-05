@@ -29,7 +29,7 @@ import {
   sanitizeAttachmentFilename,
   type AttachmentRef,
 } from '../domain/attachment-ref.js';
-import { DocumentFormat } from '../domain/document-spec.js';
+import { DocumentFormat, DocumentKind } from '../domain/document-spec.js';
 
 export {
   AttachmentRef,
@@ -69,28 +69,105 @@ interface VersionFileRow {
   sha256: string;
   size_bytes: string | number;
   format: string;
+  kind: string;
   spec_filename: string | null;
 }
 
-interface VersionFile {
+/**
+ * One produced version as the two consumers of its exact bytes see it — the
+ * mail attachment resolver here and `doc.save` (`save.ts`). Shared so the
+ * business scoping, the containment check and the single read + hash are
+ * written once.
+ */
+export interface VersionFile {
+  versionId: string;
   storedPath: string;
   sha256: string;
   sizeBytes: number;
   format: DocumentFormat;
+  kind: DocumentKind;
   /** The name the recipient sees — see `canonicalAttachmentName`. */
   filename: string;
 }
 
-function toVersionFile(row: VersionFileRow): VersionFile | null {
+function toVersionFile(versionId: string, row: VersionFileRow): VersionFile | null {
   const format = DocumentFormat.safeParse(row.format);
   if (!format.success) return null;
+  const kind = DocumentKind.safeParse(row.kind);
+  if (!kind.success) return null;
   return {
+    versionId,
     storedPath: row.stored_path,
     sha256: row.sha256,
     sizeBytes: Number(row.size_bytes),
     format: format.data,
+    kind: kind.data,
     filename: canonicalAttachmentName({ spec: { filename: row.spec_filename ?? '' }, format: format.data }),
   };
+}
+
+/**
+ * The version row, found only when its production belongs to THIS business.
+ * `null` for anything else — another business's id reads exactly like an id
+ * that never existed.
+ */
+export async function loadVersionFile(
+  versionId: string,
+  businessId: string,
+  db: Queryable = getPool(),
+): Promise<VersionFile | null> {
+  const { rows } = await db.query<VersionFileRow>(
+    `SELECT v.stored_path, v.sha256, v.size_bytes, p.format, p.kind, v.spec->>'filename' AS spec_filename
+       FROM document_versions v
+       JOIN document_productions p ON p.production_id = v.production_id
+      WHERE v.version_id = $1 AND p.business_id = $2`,
+    [versionId, businessId],
+  );
+  const row = rows[0];
+  return row === undefined ? null : toVersionFile(versionId, row);
+}
+
+export type ReadVersionBytesResult =
+  | { ok: true; bytes: Buffer }
+  | { ok: false; code: 'attachment_not_found' | 'attachment_hash_mismatch' };
+
+/**
+ * The version's file, read ONCE from disk and hashed, against the size and
+ * hash the caller expects. The path is the row's relative `stored_path` under
+ * `config.documentRoot`, contained by `path.relative`; the size is checked
+ * against the open handle before reading, so a file swapped for a far larger
+ * one is a mismatch without being pulled into memory. The returned buffer is
+ * the one that was hashed — callers must use it and never re-read.
+ */
+export async function readVersionBytes(
+  version: VersionFile,
+  expected: { sha256: string; sizeBytes: number },
+): Promise<ReadVersionBytesResult> {
+  const root = resolve(config.documentRoot);
+  const full = resolve(root, version.storedPath);
+  const rel = relative(root, full);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return { ok: false, code: 'attachment_not_found' };
+
+  let bytes: Buffer;
+  try {
+    const handle = await open(full, 'r');
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) return { ok: false, code: 'attachment_not_found' };
+      if (info.size !== expected.sizeBytes) return { ok: false, code: 'attachment_hash_mismatch' };
+      bytes = await handle.readFile();
+    } finally {
+      await handle.close();
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EISDIR' || code === 'ENOTDIR') return { ok: false, code: 'attachment_not_found' };
+    throw err;
+  }
+  if (bytes.length !== expected.sizeBytes) return { ok: false, code: 'attachment_hash_mismatch' };
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  if (digest !== expected.sha256) return { ok: false, code: 'attachment_hash_mismatch' };
+  return { ok: true, bytes };
 }
 
 /**
@@ -127,16 +204,7 @@ export async function resolveAttachments(
 ): Promise<ResolveAttachmentsResult> {
   const versions: VersionFile[] = [];
   for (const ref of refs) {
-    const { rows } = await db.query<VersionFileRow>(
-      `SELECT v.stored_path, v.sha256, v.size_bytes, p.format, v.spec->>'filename' AS spec_filename
-         FROM document_versions v
-         JOIN document_productions p ON p.production_id = v.production_id
-        WHERE v.version_id = $1 AND p.business_id = $2`,
-      [ref.producedVersionId, businessId],
-    );
-    const row = rows[0];
-    if (row === undefined) return fail('attachment_not_found');
-    const version = toVersionFile(row);
+    const version = await loadVersionFile(ref.producedVersionId, businessId, db);
     if (version === null) return fail('attachment_not_found');
     if (version.sha256 !== ref.sha256 || version.sizeBytes !== ref.sizeBytes) {
       return fail('attachment_hash_mismatch');
@@ -150,41 +218,17 @@ export async function resolveAttachments(
   const total = versions.reduce((sum, v) => sum + v.sizeBytes, 0);
   if (total > MAX_ATTACHMENTS_TOTAL_BYTES) return fail('attachment_too_large');
 
-  const root = resolve(config.documentRoot);
   const files: ResolvedAttachment[] = [];
   for (const [index, ref] of refs.entries()) {
     const version = versions[index];
     if (version === undefined) return fail('attachment_not_found');
-    const full = resolve(root, version.storedPath);
-    const rel = relative(root, full);
-    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return fail('attachment_not_found');
-
-    let bytes: Buffer;
-    try {
-      const handle = await open(full, 'r');
-      try {
-        const info = await handle.stat();
-        if (!info.isFile()) return fail('attachment_not_found');
-        // Checked before reading: a file swapped for a far larger one is a
-        // mismatch, and must not be pulled into memory to find that out.
-        if (info.size !== ref.sizeBytes) return fail('attachment_hash_mismatch');
-        bytes = await handle.readFile();
-      } finally {
-        await handle.close();
-      }
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT' || code === 'EISDIR' || code === 'ENOTDIR') return fail('attachment_not_found');
-      throw err;
-    }
-    if (bytes.length !== ref.sizeBytes) return fail('attachment_hash_mismatch');
-    const digest = createHash('sha256').update(bytes).digest('hex');
-    if (digest !== ref.sha256) return fail('attachment_hash_mismatch');
+    const read = await readVersionBytes(version, { sha256: ref.sha256, sizeBytes: ref.sizeBytes });
+    if (!read.ok) return fail(read.code);
 
     files.push({
       filename: version.filename,
       mediaType: FORMAT_MEDIA_TYPE[version.format],
-      bytes,
+      bytes: read.bytes,
     });
   }
   return { ok: true, files };

@@ -133,6 +133,8 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
   // needs.
   'prod.docs': [
     'file.write',
+    // Document production §9.2 — only ever run on a delivery job (save.ts).
+    'doc.save',
     'memory.recall',
     'template.load',
     'agent.request_help',

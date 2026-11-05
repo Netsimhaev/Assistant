@@ -54,6 +54,10 @@ const TOOL_ACTION_CLASS: Record<string, ActionClass> = {
   // new `ActionClass` and a schema-version bump, deliberately.
   'code_execution': 'artifact.write',
   'doc.deliver': 'doc.deliver',
+  // Document production §9.2: copies an approved file into the owner's base
+  // folder. A filesystem write, so classified (never read-only — that would
+  // skip stages 5–10 and leave no audit row) and internal, so not outbound.
+  'doc.save': 'artifact.write',
   'memory.write_entity': 'memory.write_longterm',
   'memory.write_chunk': 'memory.write_longterm',
   'memory.upsert_preference': 'memory.write_longterm',
@@ -209,6 +213,7 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   'media.publish': false,
   'file.write': false,
   'doc.deliver': false,
+  'doc.save': false,
   'memory.write_entity': false,
   'memory.write_chunk': false,
   'memory.upsert_preference': false,

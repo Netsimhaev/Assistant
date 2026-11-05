@@ -321,6 +321,16 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   attachment_name_mismatch: 'שם הקובץ המצורף אינו השם שאושר',
   attachments_not_supported: 'אפשר לצרף קבצים רק למייל שמוסר מסמך שאושר',
 
+  // doc.save (document production §9.2, production/save.ts). All final.
+  save_not_supported: 'אפשר לשמור קובץ רק ממסמך שאושר',
+  save_no_base_folder: 'לא הוגדרה תיקיית בסיס לשמירה',
+  save_not_found: 'המסמך לשמירה לא נמצא',
+  save_hash_mismatch: 'המסמך השתנה מאז שאושר ולא נשמר',
+  save_name_mismatch: 'שם הקובץ אינו השם שאושר',
+  save_folder_refused: 'התיקייה שבבקשה אינה תקינה',
+  save_names_exhausted: 'כבר יש בתיקייה 99 קבצים בשם הזה',
+  save_verify_failed: 'הקובץ שנשמר לא היה זהה למסמך שאושר ונמחק',
+
   // run-due.ts's own plan-level rejections, under the `run_due:` namespace
   // `leadingCode` manufactures.
   'run_due:no_plan_bound': 'לא נמצאה תוכנית פעולה למשימה',

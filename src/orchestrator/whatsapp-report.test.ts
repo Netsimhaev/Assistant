@@ -1202,6 +1202,25 @@ describe('failedText', () => {
     expect(new Set(texts).size).toBe(codes.length);
   });
 
+  it('maps every doc.save refusal (document production §9.2) to its own Hebrew sentence', () => {
+    const codes = [
+      'save_not_supported',
+      'save_no_base_folder',
+      'save_not_found',
+      'save_hash_mismatch',
+      'save_name_mismatch',
+      'save_folder_refused',
+      'save_names_exhausted',
+      'save_verify_failed',
+    ];
+    const texts = codes.map((code) => failedText(`${code} — x`));
+    for (const text of texts) {
+      expect(text).not.toBe(FAILED_GENERIC_TEXT);
+      expect(text).toMatch(/[א-ת]/);
+    }
+    expect(new Set(texts).size).toBe(codes.length);
+  });
+
   it('falls through to the generic text for anything unmapped, in every shape', () => {
     expect(failedText(null)).toBe(FAILED_GENERIC_TEXT);
     expect(failedText('some_future_code — details')).toBe(FAILED_GENERIC_TEXT);

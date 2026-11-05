@@ -12,6 +12,7 @@ import {
   CEILING_EXEMPT_TOOLS,
   classifyAction,
   classifiedToolNames,
+  ingestsExternalContent,
   isOutbound,
   refineActionClass,
   READ_ONLY_TOOLS,
@@ -288,6 +289,17 @@ describe('constants that must fail closed as the system grows', () => {
       expect(classified.includes(tool), tool).toBe(false);
       expect(KNOWN_TOOL_NAMES.has(tool), tool).toBe(true);
     }
+
+    // `doc.save` (document production §9.2) is the opposite case: it writes a
+    // file into the owner's folder, so it is classified as `artifact.write`
+    // and NEVER read-only — read-only would skip stages 5–10 and leave no
+    // audit row. It reaches no person, so it is not outbound either, and it
+    // reads nothing from outside.
+    expect(classifyAction('doc.save')).toBe('artifact.write');
+    expect(READ_ONLY_TOOLS.has('doc.save')).toBe(false);
+    expect(isOutbound('doc.save')).toBe(false);
+    expect(ingestsExternalContent('doc.save')).toBe(false);
+    expect(KNOWN_TOOL_NAMES.has('doc.save')).toBe(true);
 
     // The one line a future change would add. `mail.send` is classified; were
     // it also read-only, `rampLevelForPlan` would skip it and the step would
