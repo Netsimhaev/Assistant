@@ -4,29 +4,46 @@
  *
  * Path safety is the whole point, and every rule is positive:
  *
- * - **A folder is a sequence of relative segments, each checked against an
- *   allowlist** (`/^[\p{L}\p{N} _.-]+$/u`, no leading dot), never a path that
- *   is "cleaned". Bidi controls are stripped first, so an override cannot make
- *   the owner read one name while the disk gets another. Refused: `..`,
- *   anything absolute, a drive letter, a UNC share, an empty segment, Windows
- *   reserved device names (case-insensitive, with or without an extension —
- *   `con.txt` opens the console on Windows), a trailing dot or space (Windows
- *   silently strips them, so `a.` IS `a` and `CON ` IS `CON`), more than five
- *   segments, more than 200 characters. A `null` folder is the kind label.
+ * - **A folder is a sequence of relative segments, each checked by
+ *   `nameProblem`** (`name-rules.ts` — the same rule `validateSpec` applies to
+ *   the spec filename), never a path that is "cleaned". Bidi controls are
+ *   stripped first, so an override cannot make the owner read one name while
+ *   the disk gets another. Refused here on top: anything absolute, a drive
+ *   letter, a UNC share, an empty segment, more than five segments, more than
+ *   200 characters. A `null` folder is the kind label. The filename passes the
+ *   same rule. A path the filesystem still finds too long (`ENAMETOOLONG`) is
+ *   the same Hebrew folder refusal, never a crash.
  * - **Directories are walked one segment at a time, and a link is refused
  *   even when it points back inside.** First a read-only walk over the
  *   segments that already exist — any link or non-directory refuses before
  *   anything is created — then the missing segments are made one `mkdir` at
- *   a time (never `recursive`, which follows links), each re-`lstat`ed. Then
- *   the created directory's `realpath` must start with the base's `realpath`
- *   plus a separator: the backstop for a link swapped in between the checks.
- * - **A file is never overwritten.** Opened with `wx` (O_CREAT|O_EXCL, which
- *   also refuses a dangling link at that name); on `EEXIST` the next name is
- *   ` (2)` … ` (99)` before the extension, and past that a Hebrew refusal.
- * - **The bytes written are the bytes approved.** The source is read once and
- *   hashed (`readVersionBytes`, shared with the mail attachment resolver), the
- *   same buffer is written, and the written file is read back and re-hashed —
- *   a mismatch deletes what was written and fails.
+ *   a time (never `recursive`), each re-`lstat`ed. Then the created
+ *   directory's `realpath` must start with the base's `realpath` plus a
+ *   separator. **What that backstop does and does not cover, honestly:** if a
+ *   link is swapped into an existing segment between the walk and a later
+ *   `mkdir`, that `mkdir` goes through the link and an EMPTY directory may be
+ *   created OUTSIDE the base before the `realpath` check refuses. No file is
+ *   ever written there — the file is opened only after the check passes.
+ *   Swapping a link into the owner's folder needs local write access to it,
+ *   which is already more than this tool could grant.
+ * - **A file is never overwritten.** A name with any entry at it (a link, a
+ *   dangling link included) is taken; the open is `wx+` (O_CREAT|O_EXCL). On
+ *   `EEXIST` the next name is ` (2)` … ` (99)` before the extension, and past
+ *   that a Hebrew refusal. **Windows residual:** O_EXCL there does NOT refuse a
+ *   dangling junction (measured on the dev machine: the open succeeds and the
+ *   write fails `EISDIR`). The `lstat` before the open catches the static case;
+ *   a junction swapped in between the two is caught by the post-open identity
+ *   check (the opened handle must be a regular file with the same dev/ino as
+ *   the path's `lstat`), which closes it untouched and moves on. A junction
+ *   can only point at a directory, so a file can never be written through one;
+ *   a file symlink needs admin or developer mode on Windows.
+ * - **The bytes written are the bytes approved, checked through the handle.**
+ *   The source is read once and hashed (`readVersionBytes`, shared with the
+ *   mail attachment resolver), the same buffer is written and `sync`ed, then
+ *   read back through the SAME handle from position 0 and re-hashed. On a
+ *   mismatch, or a write error, the handle's file is truncated to zero and the
+ *   path is unlinked ONLY if its `lstat` dev/ino still equals the handle's —
+ *   a name re-pointed in between is never deleted, because it is not ours.
  *
  * Only a document DELIVERY job may run it (a job a
  * `document_cards.delivery_job_id` in this business names — `isDeliveryJob`,
@@ -35,7 +52,8 @@
  * deletes them (§9.3), which is why the result carries the absolute `path`.
  */
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, open, readFile, realpath, unlink } from 'node:fs/promises';
+import type { BigIntStats } from 'node:fs';
+import { lstat, mkdir, open, realpath, unlink, type FileHandle } from 'node:fs/promises';
 import { extname, isAbsolute, join, sep } from 'node:path';
 import { z } from 'zod';
 import { getPool, type Queryable } from '../db/pool.js';
@@ -46,6 +64,7 @@ import { loadDocumentSettings } from '../governance/document-settings.js';
 import { StepChannelError } from '../orchestrator/step-error.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { isDeliveryJob, loadVersionFile, readVersionBytes } from './attachments.js';
+import { MAX_SEGMENT_BYTES, nameProblem } from './name-rules.js';
 
 export const DocSaveInput = z
   .object({
@@ -82,40 +101,16 @@ export const MAX_FOLDER_SEGMENTS = 5;
 export const MAX_FOLDER_CHARS = 200;
 const MAX_NAME_SUFFIX = 99;
 
-/** The allowlist, verbatim from the brief. A leading dot is refused separately. */
-const SEGMENT_CHARS = /^[\p{L}\p{N} _.-]+$/u;
-/**
- * Windows device names. `¹²³` because `\p{N}` admits them and Windows treats
- * `COM¹` … `LPT³` as devices too.
- */
-const WINDOWS_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$/i;
-
 const HE = {
   tooLong: `נתיב התיקייה ארוך מ-${MAX_FOLDER_CHARS} תווים`,
   absolute: 'התיקייה חייבת להיות יחסית לתיקיית הבסיס — בלי כונן ובלי נתיב מלא',
   tooDeep: `אפשר עד ${MAX_FOLDER_SEGMENTS} רמות תיקיות`,
-  empty: 'יש בנתיב תיקייה בלי שם',
-  dots: 'אסור ".." בשם תיקייה או קובץ',
-  chars: 'שם תיקייה או קובץ מכיל תו אסור (מותרים אותיות, ספרות, רווח, מקף, קו תחתון ונקודה)',
-  leadingDot: 'שם תיקייה או קובץ לא יכול להתחיל בנקודה',
-  trailing: 'שם תיקייה או קובץ לא יכול להסתיים בנקודה או ברווח',
-  reserved: (stem: string) => `"${stem}" הוא שם שמור ב-Windows`,
   link: 'בדרך לתיקייה יש קיצור דרך (קישור) — לא שומרים דרכו',
   notDirectory: 'בדרך לתיקייה יש קובץ באותו שם',
   escaped: 'התיקייה שנוצרה אינה בתוך תיקיית הבסיס',
   baseMissing: 'תיקיית הבסיס לא נמצאה',
+  pathTooLong: 'הנתיב ארוך מדי למערכת הקבצים — לא נשמר',
 } as const;
-
-function segmentProblem(segment: string): string | null {
-  if (segment === '') return HE.empty;
-  if (segment.includes('..')) return HE.dots;
-  if (!SEGMENT_CHARS.test(segment)) return HE.chars;
-  if (segment.startsWith('.')) return HE.leadingDot;
-  if (segment.endsWith('.') || segment.endsWith(' ')) return HE.trailing;
-  const stem = (segment.split('.')[0] ?? '').trim();
-  if (WINDOWS_RESERVED.test(stem)) return HE.reserved(stem);
-  return null;
-}
 
 type Segments = { ok: true; segments: string[] } | { ok: false; he: string };
 
@@ -131,15 +126,17 @@ function folderSegments(folder: string | null, kind: DocumentKind): Segments {
   const segments = cleaned.replace(/[\\/]$/, '').split(/[\\/]/);
   if (segments.length > MAX_FOLDER_SEGMENTS) return { ok: false, he: HE.tooDeep };
   for (const segment of segments) {
-    const problem = segmentProblem(segment);
+    const problem = nameProblem(segment);
     if (problem !== null) return { ok: false, he: problem };
   }
   return { ok: true, segments };
 }
 
-async function lstatOrNull(path: string) {
+const isNameTooLong = (err: unknown): boolean => (err as NodeJS.ErrnoException).code === 'ENAMETOOLONG';
+
+async function lstatOrNull(path: string): Promise<BigIntStats | null> {
   try {
-    return await lstat(path);
+    return await lstat(path, { bigint: true });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;
@@ -147,7 +144,7 @@ async function lstatOrNull(path: string) {
 }
 
 /** Is this an entry the walk may enter? A link — wherever it points — is not. */
-function walkProblem(info: Awaited<ReturnType<typeof lstat>>): string | null {
+function walkProblem(info: BigIntStats): string | null {
   if (info.isSymbolicLink()) return HE.link;
   if (!info.isDirectory()) return HE.notDirectory;
   return null;
@@ -167,9 +164,17 @@ export async function resolveSaveTarget(
 ): Promise<SaveTarget> {
   const parsed = folderSegments(folder, kind);
   if (!parsed.ok) return parsed;
-  const nameProblem = segmentProblem(filename);
-  if (nameProblem !== null) return { ok: false, he: nameProblem };
+  const filenameIssue = nameProblem(filename);
+  if (filenameIssue !== null) return { ok: false, he: filenameIssue };
+  try {
+    return await createInsideBase(baseFolder, parsed.segments, filename);
+  } catch (err) {
+    if (isNameTooLong(err)) return { ok: false, he: HE.pathTooLong };
+    throw err;
+  }
+}
 
+async function createInsideBase(baseFolder: string, segments: string[], filename: string): Promise<SaveTarget> {
   let realBase: string;
   try {
     realBase = await realpath(baseFolder);
@@ -182,8 +187,8 @@ export async function resolveSaveTarget(
   // Read-only walk first: a link or a file anywhere on the existing part of
   // the path refuses before a single directory is created.
   let current = realBase;
-  let firstMissing = parsed.segments.length;
-  for (const [index, segment] of parsed.segments.entries()) {
+  let firstMissing = segments.length;
+  for (const [index, segment] of segments.entries()) {
     const candidate = join(current, segment);
     const info = await lstatOrNull(candidate);
     if (info === null) {
@@ -196,7 +201,7 @@ export async function resolveSaveTarget(
   }
 
   // Create what is missing, one segment at a time; never `recursive`.
-  for (const segment of parsed.segments.slice(firstMissing)) {
+  for (const segment of segments.slice(firstMissing)) {
     const candidate = join(current, segment);
     try {
       await mkdir(candidate);
@@ -223,14 +228,39 @@ function nameWithSuffix(name: string, n: number): string {
   return `${stem} (${n})${ext}`;
 }
 
-const sha256Of = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
+const sameEntry = (a: BigIntStats, b: BigIntStats): boolean => a.dev === b.dev && a.ino === b.ino;
+
+/**
+ * Empty the handle's file, then unlink the path only if it still names that
+ * very file. A path re-pointed since the open is not ours to delete.
+ */
+async function discard(handle: FileHandle, path: string): Promise<void> {
+  await handle.truncate(0).catch(() => undefined);
+  const mine = await handle.stat({ bigint: true }).catch(() => null);
+  const there = await lstatOrNull(path).catch(() => null);
+  if (mine !== null && there !== null && there.isFile() && sameEntry(mine, there)) {
+    await unlink(path).catch(() => undefined);
+  }
+}
+
+/** The whole file, read through the handle from position 0. */
+async function readBack(handle: FileHandle, size: number): Promise<Buffer> {
+  const buffer = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  return buffer.subarray(0, offset);
+}
 
 export type SaveFileResult = { ok: true; path: string } | { ok: false; code: SaveFailureCode; he: string };
 
 /**
  * Write `bytes` into `dir` under `name` — or `name (2)` … `name (99)` — never
- * overwriting, then read the file back and compare its hash with
- * `expectedSha256`. A mismatch deletes what this call wrote.
+ * overwriting, then read the file back through the same handle and compare
+ * its hash with `expectedSha256`. A mismatch discards what this call wrote.
  */
 export async function saveVersionToFolder(
   dir: string,
@@ -239,44 +269,49 @@ export async function saveVersionToFolder(
   expectedSha256: string,
 ): Promise<SaveFileResult> {
   for (let n = 1; n <= MAX_NAME_SUFFIX; n++) {
-    const path = join(dir, nameWithSuffix(name, n));
-    // Any entry at the name — a file, a folder, a link, a DANGLING link — is
-    // taken. Checked before `wx` because Windows opens a dangling junction
-    // under O_EXCL instead of answering EEXIST (measured on the dev machine);
-    // `wx` stays as the race-proof layer for a file created in between.
+    const candidateName = nameWithSuffix(name, n);
+    // The suffix can push a name the rule accepted past the component limit
+    // (`MAX_SEGMENT_BYTES`). Refused here, the same on every OS — Windows
+    // answers such a name with ENOENT/EINVAL rather than ENAMETOOLONG.
+    if (Buffer.byteLength(candidateName, 'utf8') > MAX_SEGMENT_BYTES) {
+      return { ok: false, code: 'save_folder_refused', he: HE.pathTooLong };
+    }
+    const path = join(dir, candidateName);
+    // Any entry at the name — a dangling link included — is taken. Before the
+    // open because Windows opens a dangling junction under O_EXCL.
     if ((await lstatOrNull(path)) !== null) continue;
-    let handle;
+    let handle: FileHandle;
     try {
-      handle = await open(path, 'wx');
+      handle = await open(path, 'wx+');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'EEXIST') continue;
+      if (isNameTooLong(err)) return { ok: false, code: 'save_folder_refused', he: HE.pathTooLong };
       throw err;
-    }
-    // What was opened must be the regular file this call just created. A
-    // link swapped in between the check and the open is left alone (not
-    // unlinked — it is not ours) and the next name is tried.
-    const opened = await handle.stat();
-    const entry = await lstatOrNull(path);
-    if (!opened.isFile() || entry === null || !entry.isFile()) {
-      await handle.close();
-      continue;
     }
     try {
-      await handle.writeFile(bytes);
-      await handle.sync();
-    } catch (err) {
-      await handle.close().catch(() => undefined);
-      await unlink(path).catch(() => undefined);
-      throw err;
-    }
-    await handle.close();
+      // What was opened must be the regular file at this path, by identity.
+      // Anything else (a junction swapped in) is closed untouched — not ours.
+      const opened = await handle.stat({ bigint: true });
+      const entry = await lstatOrNull(path);
+      if (!opened.isFile() || entry === null || !entry.isFile() || !sameEntry(opened, entry)) continue;
 
-    const written = await readFile(path);
-    if (sha256Of(written) !== expectedSha256) {
-      await unlink(path).catch(() => undefined);
-      return { ok: false, code: 'save_verify_failed', he: SAVE_FAILURE_HE.save_verify_failed };
+      try {
+        await handle.write(bytes, 0, bytes.length, 0);
+        await handle.sync();
+      } catch (err) {
+        await discard(handle, path);
+        throw err;
+      }
+
+      const written = await readBack(handle, bytes.length + 1);
+      if (createHash('sha256').update(written).digest('hex') !== expectedSha256) {
+        await discard(handle, path);
+        return { ok: false, code: 'save_verify_failed', he: SAVE_FAILURE_HE.save_verify_failed };
+      }
+      return { ok: true, path };
+    } finally {
+      await handle.close().catch(() => undefined);
     }
-    return { ok: true, path };
   }
   return { ok: false, code: 'save_names_exhausted', he: SAVE_FAILURE_HE.save_names_exhausted };
 }

@@ -128,6 +128,7 @@ import {
   type EvalValue,
   type FormulaAst,
 } from './formula.js';
+import { nameProblem } from './name-rules.js';
 import { EXCEL_MIN_DATE, layoutSheet, toEvalSheet, type PlacedCell } from './xlsx-layout.js';
 
 export interface GroundingSources {
@@ -1131,20 +1132,10 @@ function checkWorkbook(
 
 // ---------------------------------------------------------------- filename
 
-const FILENAME_CHARS = /^[\p{L}\p{M}\p{N} _\-.]+$/u;
-const WINDOWS_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
-
-function filenameProblem(name: string): string | null {
-  if (name.trim().length === 0) return 'שם הקובץ ריק';
-  if (!FILENAME_CHARS.test(name)) return 'שם הקובץ מכיל תו אסור (מותרים אותיות, ספרות, רווח, מקף, קו תחתון ונקודה)';
-  if (name.startsWith('.') || name.endsWith('.') || name.endsWith(' ')) {
-    return 'שם הקובץ לא יכול להתחיל בנקודה או להסתיים בנקודה או ברווח';
-  }
-  if (name.includes('..')) return 'שם הקובץ לא יכול להכיל ".."';
-  const stem = name.split('.')[0]!.trim();
-  if (WINDOWS_RESERVED.test(stem)) return `"${stem}" הוא שם שמור ב-Windows`;
-  return null;
-}
+// The same rule `doc.save` applies to every folder segment and to the saved
+// name (`name-rules.ts`, spec §9.2) — one copy, so a filename production
+// accepts is never refused at save after the owner approved it.
+const filenameProblem = nameProblem;
 
 // ---------------------------------------------------------------- entry
 

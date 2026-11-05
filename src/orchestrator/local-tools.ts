@@ -682,6 +682,16 @@ const HANDLERS: Record<string, LocalHandler> = {
   },
 
   /**
+   * Copies an approved produced document into the owner's base folder
+   * (document production §9.2). Every path rule, the delivery-job gate and
+   * the write-once-and-re-hash live in `production/save.ts`.
+   */
+  'doc.save': async (input, ctx) => {
+    const parsed = parseOrFail(DocSaveInput, input, 'doc.save');
+    return runDocSave(parsed, { jobId: ctx.jobId, businessId: ctx.businessId, ...(ctx.db ? { db: ctx.db } : {}) });
+  },
+
+  /**
    * `know.reader`'s half of a delegation. Resolves the document context ref
    * `requestHelp` merged into the step's input, reads it, and hands back a
    * result shape that says which of the three real outcomes happened —
@@ -693,16 +703,6 @@ const HANDLERS: Record<string, LocalHandler> = {
    * its caller: a handler that could accept a trust level as a parameter is a
    * handler a hostile payload could use to launder one.
    */
-  /**
-   * Copies an approved produced document into the owner's base folder
-   * (document production §9.2). Every path rule, the delivery-job gate and
-   * the write-once-and-re-hash live in `production/save.ts`.
-   */
-  'doc.save': async (input, ctx) => {
-    const parsed = parseOrFail(DocSaveInput, input, 'doc.save');
-    return runDocSave(parsed, { jobId: ctx.jobId, businessId: ctx.businessId, ...(ctx.db ? { db: ctx.db } : {}) });
-  },
-
   'doc.fetch': async (input, ctx) => {
     const parsed = parseOrFail(DocFetchInput, input, 'doc.fetch');
     if (ctx.bundle === undefined) {

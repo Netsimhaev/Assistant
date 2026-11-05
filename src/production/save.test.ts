@@ -68,6 +68,9 @@ describe('resolveSaveTarget — Review Focus 3, refused in Hebrew and nothing wr
     { folder: 'חוזים<x>', why: 'character outside the allowlist' },
     { folder: 'a.', why: 'trailing dot (Windows aliases it)' },
     { folder: 'x'.repeat(201), why: 'over 200 chars' },
+    { folder: 'א'.repeat(128), why: 'a segment over 255 UTF-8 bytes' },
+    { folder: 'COM¹', why: 'superscript device digit' },
+    { folder: 'שָׁלוֹם', why: 'niqqud (combining marks are outside the allowlist)' },
   ];
   for (const { folder, why } of refusals) {
     it(`refuses ${JSON.stringify(folder.slice(0, 30))} (${why})`, async () => {
@@ -179,6 +182,15 @@ describe('saveVersionToFolder', () => {
     const result = await saveVersionToFolder(base, 'a.xlsx', bytes, sha(bytes));
     expect(result).toEqual({ ok: false, code: 'save_names_exhausted', he: SAVE_FAILURE_HE.save_names_exhausted });
     expect(await tree(base)).toEqual(before);
+  });
+
+  it('refuses in Hebrew when the " (2)" suffix would push the name past 255 UTF-8 bytes', async () => {
+    const name = `${'א'.repeat(125)}.xlsx`; // exactly 255 bytes — allowed
+    await writeFile(join(base, name), 'owner file');
+    const result = await saveVersionToFolder(base, name, bytes, sha(bytes));
+    expect(result).toMatchObject({ ok: false, code: 'save_folder_refused' });
+    if (!result.ok) expect(result.he).toMatch(/[א-ת]/);
+    expect(await tree(base)).toEqual([name]);
   });
 
   it('a hash that does not match after writing deletes what it wrote and fails', async () => {

@@ -84,6 +84,7 @@
 - ☐ PDF עם סיסמה או פגום — נשאר להורדה ולא נעלם
 - ☐ מייל עם יותר מ-10 צרופות — לדעת שהאחת-עשרה נזרקת
 - ☐ `npm run doc:render-check` passes on the server with LibreOffice, Chromium and the Hebrew font installed (`DOCUMENT_SOFFICE_PATH`, `DOCUMENT_CHROMIUM_PATH`, `DOCUMENT_FONT_PATH`). נבדק חלקית ב-04/11 על מכונת הפיתוח: מסלול ה-PDF עבר (Chrome מותקן — גופני Noto בלבד, סדר העברית תקין בטקסט שחולץ, צילום עמוד); Word/Excel/מצגת לא נבדקו — LibreOffice אינו מותקן.
+- ☐ `doc.save` לתיקיית הבסיס האמיתית של הבעלים במערכת ההפעלה של השרת, כולל נתיב עברי ארוך ותווים שאינם ASCII (`src/production/save.ts`). נבדק עד היום רק במבחנים על מכונת הפיתוח (Windows, כולל junction שמצביע החוצה) — לא על Linux של השרת ולא על התיקייה שהבעלים בוחר.
 
 ---
 

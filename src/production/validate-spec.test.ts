@@ -427,7 +427,7 @@ describe('validateSpec — images and filename', () => {
   });
 
   it('a filename with a path, a reserved name or a control character → filename_invalid', () => {
-    for (const filename of ['../etc', 'a/b', 'a\\b', 'CON', 'nul.docx', '.hidden', 'a:b', 'name.', 'a*b']) {
+    for (const filename of ['../etc', 'a/b', 'a\\b', 'CON', 'nul.docx', '.hidden', 'a:b', 'name.', 'a*b', 'שָׁלוֹם', 'COM¹', 'lpt³.docx', '中'.repeat(90)]) {
       expect(codes(validateSpec(docx([{ type: 'paragraph', text: 'x' }], { filename }), sources(), TODAY))).toEqual([
         'filename_invalid',
       ]);

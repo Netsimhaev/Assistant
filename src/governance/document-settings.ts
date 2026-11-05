@@ -85,7 +85,11 @@ export async function loadDocumentSettings(options: { businessId: string; db?: Q
 function isFullyQualified(path: string): boolean {
   if (!isAbsolute(path)) return false;
   if (process.platform !== 'win32') return true;
-  return /^[A-Za-z]:[\\/]/.test(path) || /^\\\\[^\\]/.test(path);
+  // A drive, or a UNC share `\\server\share`. The device namespaces `\\.\`
+  // and `\\?\` (either separator) are refused: they bypass Win32 path
+  // normalisation — the very layer that makes "inside the base" mean anything.
+  if (/^[A-Za-z]:[\\/]/.test(path)) return true;
+  return /^[\\/]{2}(?![.?][\\/])[^\\/]+[\\/][^\\/]+/.test(path);
 }
 
 /** The checked, resolved base folder, or a Hebrew refusal thrown as an `Error`. */

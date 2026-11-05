@@ -70,7 +70,7 @@ describe('document settings', () => {
   });
 
   it('settings refuse a relative base folder', async () => {
-    for (const relative of ['מסמכים', './docs', 'docs\\a', '\\no-drive']) {
+    for (const relative of ['מסמכים', './docs', 'docs\\a', '\\no-drive', '\\\\.\\C:\\x', '\\\\?\\C:\\x', '\\\\?\\UNC\\srv\\share']) {
       await expect(saveDocumentSettings({ ...channels, baseFolder: relative }, { businessId: B })).rejects.toThrow(
         DOCUMENT_SETTINGS_HE.notAbsolute,
       );
