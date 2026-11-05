@@ -63,12 +63,26 @@
 import type { WhatsAppGateway } from './gateway.js';
 import { recordOutbound, settleMessage } from './store.js';
 import type { Queryable } from '../db/pool.js';
+import { createHash } from 'node:crypto';
 import { canonicalHash } from '../util/canonical.js';
 
 export interface BossMessenger {
   readonly channel: 'whatsapp';
   /** Never throws. Never takes a recipient. */
   send(input: { text: string; jobId: string | null }): Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Send a file to the owner — never takes a recipient, exactly like `send`
+   * (document production ֲ§8.3). Present only when the gateway can send files;
+   * absent, a caller records the channel `skipped_not_connected`. Never
+   * throws.
+   */
+  sendFile?(input: {
+    filename: string;
+    mediaType: string;
+    bytes: Buffer;
+    caption: string;
+    jobId: string | null;
+  }): Promise<{ ok: boolean; error?: string }>;
 }
 
 /**
@@ -193,9 +207,50 @@ async function recordAttempt(
 export function createBossMessenger(options: CreateBossMessengerOptions): BossMessenger {
   const { gateway, contactId, businessId, db } = options;
   const nowFn = options.now ?? (() => new Date());
+  const gatewaySendFile = gateway.sendFile?.bind(gateway);
 
   return {
     channel: 'whatsapp',
+
+    // The file half, offered only when the gateway can carry a file. The
+    // recipient is `contactId` from construction — the same control as `send`.
+    ...(gatewaySendFile !== undefined
+      ? {
+          async sendFile(input: { filename: string; mediaType: string; bytes: Buffer; caption: string; jobId: string | null }) {
+            try {
+              const idempotencyKey = canonicalHash({
+                file: createHash('sha256').update(input.bytes).digest('hex'),
+                key: idempotencyKeyFor({ jobId: input.jobId, text: input.caption }, nowFn()),
+              });
+              let result: { messageId: string; state: 'sent' | 'queued' | 'rejected' };
+              try {
+                result = await withDeadline(
+                  gatewaySendFile({
+                    contactId,
+                    filename: input.filename,
+                    mediaType: input.mediaType,
+                    bytes: input.bytes,
+                    caption: input.caption,
+                    idempotencyKey,
+                  }),
+                  SEND_TIMEOUT_MS,
+                );
+              } catch (error) {
+                await recordAttempt({ text: input.caption, jobId: input.jobId }, businessId, 'failed', db);
+                return { ok: false, error: error instanceof Error ? error.message : String(error) };
+              }
+              if (result.state === 'rejected') {
+                await recordAttempt({ text: input.caption, jobId: input.jobId }, businessId, 'failed', db);
+                return { ok: false, error: 'gateway rejected the file' };
+              }
+              await recordAttempt({ text: input.caption, jobId: input.jobId }, businessId, 'sent', db);
+              return { ok: true };
+            } catch (error) {
+              return { ok: false, error: error instanceof Error ? error.message : String(error) };
+            }
+          },
+        }
+      : {}),
 
     async send(input) {
       // `send` never throws, full stop. Everything that can reject —

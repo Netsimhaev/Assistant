@@ -991,7 +991,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         // deliberate coarseness of the flag (`instruct.ts`) is what bounds
         // the loop — it does not remember WHICH name was ambiguous, only that
         // a second pass is underway.
-        ...(answered !== null ? { identityAsked: true } : {}),
+        ...(answered !== null ? { identityAsked: true, sourceAsked: true } : {}),
         ...(ctx.planner !== undefined ? { planner: ctx.planner } : {}),
       },
     );

@@ -183,7 +183,7 @@ export const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set([
   'charter.evaluate', 'charter.propose_amendment', 'charter.read',
   'charter.voice', 'code_execution', 'commitment.make', 'contract.sign',
   'credential.request_session', 'crm.read', 'crm.write', 'data.export',
-  'discount.grant', 'doc.deliver', 'doc.fetch', 'doc.save', 'escalate_to_human',
+  'discount.grant', 'doc.deliver', 'doc.fetch', 'doc.produce', 'doc.save', 'escalate_to_human',
   'file.write', 'followup.schedule', 'ledger.add', 'ledger.update',
   'mail.draft', 'mail.send',
   'media.generate_image', 'media.generate_video', 'media.inspect',

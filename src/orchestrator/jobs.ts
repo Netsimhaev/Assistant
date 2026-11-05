@@ -1,3 +1,4 @@
+import type pg from 'pg';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
 import { JobPhase, canTransition, type JobActor } from '../domain/job.js';
@@ -69,13 +70,19 @@ export interface CreateJobInput {
   provenance: TrustLevel;
   title?: string;
   businessId?: string;
+  /**
+   * Run inside the caller's transaction. For a caller that must create the
+   * job and everything that makes it runnable atomically — the document
+   * card's delivery job (`production/card.ts`). Omitted, the pool.
+   */
+  db?: Queryable;
 }
 
 export async function createJob(input: CreateJobInput): Promise<Job> {
   const businessId = input.businessId ?? config.businessId;
   const jobId = `J-${ulid()}`;
 
-  const { rows } = await getPool().query<JobRow>(
+  const { rows } = await (input.db ?? getPool()).query<JobRow>(
     `INSERT INTO jobs (job_id, business_id, phase, charter_version, provenance, title)
      VALUES ($1, $2, 'intake', $3, $4, $5)
      RETURNING *`,
@@ -139,6 +146,15 @@ export interface TransitionInput {
    * behaves exactly as it always has.
    */
   expectFrom?: JobPhase;
+  /**
+   * Run inside the caller's transaction instead of opening one. Every
+   * statement is the same; only the commit is the caller's. For a move that
+   * must land with the caller's own writes or not at all — the document
+   * card's approval (`production/card.ts`) commits the delivery job's move to
+   * `execute` together with the card that names it, and `doc.produce` parks
+   * its job in the same transaction that writes the production row.
+   */
+  tx?: pg.PoolClient;
 }
 
 /**
@@ -180,7 +196,7 @@ export async function transition(
 ): Promise<Job> {
   const businessId = input.businessId ?? config.businessId;
 
-  return withTransaction(async (tx) => {
+  const body = async (tx: pg.PoolClient): Promise<Job> => {
     const { rows } = await tx.query<JobRow>(
       'SELECT * FROM jobs WHERE job_id = $1 AND business_id = $2 FOR UPDATE',
       [jobId, businessId],
@@ -237,7 +253,8 @@ export async function transition(
     const row = updated.rows[0];
     if (!row) throw new Error(`job ${jobId} vanished mid-transition`);
     return toJob(row);
-  });
+  };
+  return input.tx !== undefined ? body(input.tx) : withTransaction(body);
 }
 
 export interface JobStep {

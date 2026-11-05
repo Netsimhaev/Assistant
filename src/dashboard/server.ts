@@ -1519,6 +1519,9 @@ async function answerUnderClaim(
       // Spec §7.2: asked once per chain — this is the second pass, so the
       // identity question is suppressed even if a name is still ambiguous.
       identityAsked: true,
+      // Document production §5.6: the source-document question is bounded by
+      // the same second-pass flag.
+      sourceAsked: true,
     },
   );
 

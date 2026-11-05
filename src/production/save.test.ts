@@ -324,6 +324,19 @@ describe('doc.save handler', () => {
     expect(err.code).toBe('save_not_supported');
   });
 
+  it("refuses a version other than the one this job's card approved, before touching the disk", async () => {
+    const approved = await produced();
+    const other = await produced();
+    await deliveryCard(approved);
+    await withBase();
+    const err = await refusal({ producedVersionId: other, sha256: sha(bytes), folder: 'x', filename: CANONICAL });
+    expect(err.code).toBe('save_not_supported');
+    expect(await tree(base)).toEqual([]);
+    // Control: the approved version saves on the same job.
+    const ok = await save({ producedVersionId: approved, sha256: sha(bytes), folder: 'x', filename: CANONICAL });
+    expect(ok['performed']).toBe(true);
+  });
+
   it('refuses when no base folder is configured', async () => {
     const versionId = await produced();
     await deliveryCard(versionId);

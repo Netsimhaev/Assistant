@@ -42,6 +42,12 @@ import type { MailPollResult, PollMailboxOptions } from './mail-poll.js';
 import type { ResumeResult } from './resume-delegated.js';
 import { runDueJobs } from './run-due.js';
 import { runDocumentProductions, type RunProductionsOptions, type RunProductionsResult } from '../production/loop.js';
+import {
+  onProductionFinished,
+  reraiseFailedDeliveries,
+  type CardSeams,
+  type ReraiseResult,
+} from '../production/card.js';
 import type { RunDueResult } from './run-due.js';
 import { buildRuntime } from './runtime.js';
 import { closeVerifiedJobs } from './verify.js';
@@ -792,6 +798,13 @@ export interface SchedulerPassResult {
    */
   documentProductions: RunProductionsResult | null;
   documentProductionsError: string | null;
+  /**
+   * Document cards whose delivery job failed, returned to the owner this
+   * pass (`reraiseFailedDeliveries`, C17) — run right after the re-ask,
+   * which skips delivery jobs. Null only when it threw.
+   */
+  deliveriesReraised: ReraiseResult | null;
+  deliveriesReraisedError: string | null;
 }
 
 /**
@@ -1112,6 +1125,16 @@ export async function schedulerPass(
   // Right after the plans (spec §5.5): a production `doc.produce` queued
   // this very pass is drafted now. Its own time budget bounds how long the
   // rest of the pass waits. Isolated like every other stage.
+  // The document card's seams: the email alert (with the file), this pass's
+  // WhatsApp messenger (built from this pass's charter), the dashboard link.
+  const cardSeams: CardSeams = {
+    ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
+    ...(runtime.notify?.sendAlertWithAttachment !== undefined
+      ? { sendAlertWithAttachment: runtime.notify.sendAlertWithAttachment }
+      : {}),
+    ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
+    ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
+  };
   let documentProductions: RunProductionsResult | null = null;
   let documentProductionsError: string | null = null;
   try {
@@ -1120,6 +1143,10 @@ export async function schedulerPass(
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(runtime.production !== undefined ? { production: runtime.production } : {}),
       ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
+      // Ruling R4: a finished production becomes a card (or one failure
+      // notice) on the owner's chosen channels. A test seam below may
+      // replace it.
+      onFinished: (finished) => onProductionFinished(finished, { businessId, ...cardSeams }),
       ...options.production,
     });
   } catch (err) {
@@ -1145,6 +1172,15 @@ export async function schedulerPass(
   // the same pass instead of waiting a full interval. Run before the plans
   // instead and every close would trail a pass behind the work that earned
   // it.
+  // C17: a document delivery job that failed is skipped by the re-ask above;
+  // its card comes back to the owner instead, once per failure.
+  let deliveriesReraised: ReraiseResult | null = null;
+  let deliveriesReraisedError: string | null = null;
+  try {
+    deliveriesReraised = await reraiseFailedDeliveries({ businessId, ...cardSeams });
+  } catch (err) {
+    deliveriesReraisedError = err instanceof Error ? err.message : String(err);
+  }
   const verified = await closeVerifiedJobs(options);
 
   // The ledger pass, after the closes (a nudge job closed this pass is
@@ -1296,6 +1332,8 @@ export async function schedulerPass(
     ledgerError,
     documentProductions,
     documentProductionsError,
+    deliveriesReraised,
+    deliveriesReraisedError,
   };
 }
 

@@ -83,6 +83,18 @@ export const ProductionWork = z
     reason: z.string().nullable().default(null),
     /** True once the terminal side effects (origin job, audit, `onFinished`) ran. */
     finished: z.boolean().default(false),
+    /**
+     * Owner-facing Hebrew notes the card shows beside the document, fixed when
+     * the production is queued (`doc.produce`, `requestFix`): an address that
+     * was not authorised, a source that was not found. Never read by any check.
+     */
+    notes: z.array(z.string()).default([]),
+    /**
+     * True once the owner was told a production ended with no card (no
+     * version to show) — the one-time claim `production/card.ts` takes before
+     * it sends, so an at-least-once `onFinished` notifies at most once.
+     */
+    notified: z.boolean().default(false),
   })
   .strict();
 export type ProductionWork = z.infer<typeof ProductionWork>;
@@ -180,6 +192,8 @@ export interface CreateProductionInput {
   kind: DocumentKind;
   destination: ProductionDestination;
   sourceDocumentIds: string[];
+  /** See `ProductionWork.notes`. */
+  notes?: string[];
 }
 
 export async function createProduction(input: CreateProductionInput, db: Queryable = getPool()): Promise<string> {
@@ -201,7 +215,7 @@ export async function createProduction(input: CreateProductionInput, db: Queryab
       DocumentKind.parse(input.kind),
       JSON.stringify(destination),
       input.sourceDocumentIds,
-      JSON.stringify(EMPTY_WORK),
+      JSON.stringify({ ...EMPTY_WORK, notes: input.notes ?? [] }),
     ],
   );
   return productionId;
@@ -476,4 +490,20 @@ export async function productionsToday(
     [businessId, start],
   );
   return Number(rows[0]?.n ?? 0);
+}
+
+/** One version, found only when its production belongs to THIS business. */
+export async function loadVersion(
+  businessId: string,
+  versionId: string,
+  db: Queryable = getPool(),
+): Promise<DocumentVersion | null> {
+  const { rows } = await db.query<VersionRow>(
+    `SELECT v.* FROM document_versions v
+       JOIN document_productions p ON p.production_id = v.production_id
+      WHERE v.version_id = $1 AND p.business_id = $2`,
+    [versionId, businessId],
+  );
+  const row = rows[0];
+  return row === undefined ? null : toVersion(row);
 }

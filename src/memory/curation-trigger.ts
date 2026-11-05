@@ -14,7 +14,16 @@
 import type { Plan } from '../domain/plan.js';
 import { ingestsExternalContent, isOutbound } from '../policy/classify.js';
 
+/**
+ * A plan that produces a document is never curated (document production
+ * §5.7, C18) — a positive marker, the `doc.produce` step itself. Without it
+ * every document would cost one more billed curator call outside the daily
+ * production cap (`doc.produce` reads sources, so the table below says yes).
+ */
+export const NOT_CURATED_TOOLS: readonly string[] = ['doc.produce'];
+
 export function jobQualifiesForCuration(plan: Plan): boolean {
+  if (plan.steps.some((step) => NOT_CURATED_TOOLS.includes(step.toolName))) return false;
   return plan.steps.some(
     (step) => ingestsExternalContent(step.toolName) || isOutbound(step.toolName),
   );

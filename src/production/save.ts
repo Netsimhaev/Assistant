@@ -46,8 +46,9 @@
  *   a name re-pointed in between is never deleted, because it is not ours.
  *
  * Only a document DELIVERY job may run it (a job a
- * `document_cards.delivery_job_id` in this business names — `isDeliveryJob`,
- * the Task 12 marker), checked before anything touches the disk. The base
+ * `document_cards.delivery_job_id` in this business names), and only for the
+ * version that card shows (`deliveryVersionOf`), checked before anything
+ * touches the disk. The base
  * folder's own copies are the owner's files: erasure lists them but never
  * deletes them (§9.3), which is why the result carries the absolute `path`.
  */
@@ -63,7 +64,7 @@ import { documentKindLabel } from '../domain/labels.js';
 import { loadDocumentSettings } from '../governance/document-settings.js';
 import { StepChannelError } from '../orchestrator/step-error.js';
 import { stripBidiControls } from '../util/bidi.js';
-import { isDeliveryJob, loadVersionFile, readVersionBytes } from './attachments.js';
+import { deliveryVersionOf, loadVersionFile, readVersionBytes } from './attachments.js';
 import { MAX_SEGMENT_BYTES, nameProblem } from './name-rules.js';
 
 export const DocSaveInput = z
@@ -344,7 +345,10 @@ export async function runDocSave(
   ctx: { jobId: string; businessId: string; db?: Queryable },
 ): Promise<{ performed: true; path: string }> {
   const db = ctx.db ?? getPool();
-  if (!(await isDeliveryJob(ctx.businessId, ctx.jobId, db))) throw refuse('save_not_supported');
+  // The version must be the one the owner approved on the card that created
+  // this delivery job (Task 14, carry (b)) — checked before any disk read.
+  const approved = await deliveryVersionOf(ctx.businessId, ctx.jobId, db);
+  if (approved === null || approved !== input.producedVersionId) throw refuse('save_not_supported');
 
   const settings = await loadDocumentSettings({ businessId: ctx.businessId, db });
   if (settings.baseFolder === null) throw refuse('save_no_base_folder');

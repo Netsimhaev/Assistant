@@ -250,3 +250,29 @@ export async function isDeliveryJob(businessId: string, jobId: string, db: Query
   );
   return (rowCount ?? 0) > 0;
 }
+
+/**
+ * The one produced version this job may deliver: the `version_id` of the
+ * card (in THIS business) whose `delivery_job_id` is this job, or `null`.
+ *
+ * The hardened form of `isDeliveryJob` (Task 14, carry (b)): being a
+ * delivery job is not enough — a `mail.send` attachment and a `doc.save`
+ * step must name exactly the version the owner approved on that card. A plan
+ * that somehow names another version (another card's, another production's)
+ * is refused before any file is read. `approveDocumentCard` is the only
+ * writer of `delivery_job_id`, and only on the job it creates, so the card a
+ * delivery job resolves to is the card the owner pressed.
+ */
+export async function deliveryVersionOf(
+  businessId: string,
+  jobId: string,
+  db: Queryable = getPool(),
+): Promise<string | null> {
+  const { rows } = await db.query<{ version_id: string }>(
+    'SELECT version_id FROM document_cards WHERE business_id = $1 AND delivery_job_id = $2',
+    [businessId, jobId],
+  );
+  // Two cards naming one job cannot happen (one writer, one job per
+  // approval); if it ever did, which version is approved is not knowable.
+  return rows.length === 1 ? rows[0]!.version_id : null;
+}

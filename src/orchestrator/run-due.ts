@@ -275,6 +275,7 @@ export async function runDueJobs(
           ...(options.now !== undefined ? { now: options.now } : {}),
           ...(options.reader !== undefined ? { reader: options.reader } : {}),
           ...(options.judge !== undefined ? { judge: options.judge } : {}),
+          ...(runtime.production !== undefined ? { production: runtime.production } : {}),
           ...(governingEnvelope !== null
             ? { autonomyCeiling: governingEnvelope.constraints.autonomyCeiling }
             : {}),

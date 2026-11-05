@@ -34,7 +34,7 @@ import { planStepIsFeasible } from './catalogue.js';
 import { StepChannelError } from './step-error.js';
 import { runLocalTool, type LocalToolContext } from './local-tools.js';
 import { ATTACHMENT_TOOL, ATTACHMENTS_KEY, AttachmentRefs } from '../domain/attachment-ref.js';
-import { isDeliveryJob, resolveAttachments, type ResolvedAttachment } from '../production/attachments.js';
+import { deliveryVersionOf, resolveAttachments, type ResolvedAttachment } from '../production/attachments.js';
 import type { Job } from './jobs.js';
 
 /**
@@ -123,6 +123,11 @@ export interface RunPlanRequest {
    * Production callers leave this unset and the real judge runs.
    */
   judge?: LocalToolContext['judge'];
+  /**
+   * Whether this server can produce documents (`runtime.production`), for
+   * `doc.produce` alone — threaded to `LocalToolContext.production`.
+   */
+  production?: LocalToolContext['production'];
   /**
    * The hard cap carried by the envelope that opened THIS JOB as a
    * delegation's child, forwarded to every step's `GateContext.autonomyCeiling`.
@@ -598,6 +603,7 @@ async function performStep(
       agent: step.agent,
       ...(request.reader !== undefined ? { reader: request.reader } : {}),
       ...(request.judge !== undefined ? { judge: request.judge } : {}),
+      ...(request.production !== undefined ? { production: request.production } : {}),
     });
     // No `externalId`: nothing outside the instance issued a handle, and
     // inventing one would tell `verify` it had a far end to ask.
@@ -801,8 +807,10 @@ const ATTACHMENT_INVALID_HE = 'פרטי הקובץ המצורף אינם תקי�
  * attachments — the key on any other tool, local ones included, is refused
  * rather than ignored, so a payload that names a file is never quietly acted
  * on without it. And only on a document DELIVERY job (a job a
- * `document_cards.delivery_job_id` in this business names): a model-written
- * plan that emits the field on any other job is refused before a file is read.
+ * `document_cards.delivery_job_id` in this business names), and only for the
+ * version that card shows (`deliveryVersionOf`): a model-written plan that
+ * emits the field on any other job, or names any other version, is refused
+ * before a file is read.
  */
 async function stepAttachments(
   toolName: string,
@@ -816,7 +824,10 @@ async function stepAttachments(
   const refs = AttachmentRefs.safeParse(effectiveInput[ATTACHMENTS_KEY]);
   if (!refs.success) throw new StepChannelError('attachment_invalid', ATTACHMENT_INVALID_HE, false);
   if (refs.data.length === 0) return [];
-  if (!(await isDeliveryJob(job.businessId, job.jobId))) {
+  // Not merely "a delivery job": every ref must name the very version the
+  // owner approved on the card that created this job (Task 14, carry (b)).
+  const approved = await deliveryVersionOf(job.businessId, job.jobId);
+  if (approved === null || refs.data.some((ref) => ref.producedVersionId !== approved)) {
     throw new StepChannelError('attachments_not_supported', ATTACHMENTS_NOT_SUPPORTED_HE, false);
   }
   const resolved = await resolveAttachments(refs.data, job.businessId);

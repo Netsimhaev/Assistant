@@ -1770,3 +1770,100 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     });
   });
 });
+
+describe('an instruction that asks for a document (document production §5.6)', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    await withCharter();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  function producePlan(input: Record<string, unknown>): Plan {
+    return {
+      goal: 'להפיק טבלת רווח',
+      assumptions: [],
+      clarifyingQuestion: null,
+      estimatedCostMinor: 0,
+      steps: [
+        {
+          id: 's1',
+          agent: 'prod.docs',
+          intent: 'להפיק',
+          toolName: 'doc.produce',
+          input,
+          dependsOn: [],
+          expectedActionClass: null,
+        },
+      ],
+    };
+  }
+
+  const VALID = {
+    format: 'xlsx',
+    kind: 'profit_table',
+    request: 'טבלת רווח לנובמבר',
+    destination: { mode: 'save', folder: null },
+    sourceHints: ['המחירון'],
+  };
+
+  async function doc(name: string, at: string): Promise<void> {
+    await getPool().query(
+      `INSERT INTO documents (document_id, business_id, source, original_name, media_type, sha256, byte_size,
+                              stored_path, status, created_at)
+       VALUES ($1, $2, 'manual', $3, 'application/pdf', $4, 1, 'x', 'extracted', $5)`,
+      [`DOC-${name}-${at}`, BUSINESS, name, `${at.replace(/\D/g, '')}`.padStart(64, '0'), at],
+    );
+  }
+
+  it('a source that fits several documents asks once, before anything is bound; the second pass goes ahead', async () => {
+    await doc('מחירון 2025.pdf', '2026-09-01T10:00:00Z');
+    await doc('מחירון 2026.pdf', '2026-10-01T10:00:00Z');
+    const planner = async () => ({ status: 'planned' as const, plan: producePlan(VALID) });
+
+    const first = await runInstruction(
+      { text: 'תכיני טבלת רווח לפי המחירון' },
+      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner },
+    );
+    if (first.status !== 'needs_answer') throw new Error(first.status);
+    expect(first.question).toContain('מחירון 2026.pdf');
+    expect(first.question).toContain('מחירון 2025.pdf');
+    expect(first.question).toContain('השיבי בשם הקובץ');
+    expect(await loadPlanBody(first.jobId, { businessId: BUSINESS })).toBeNull();
+
+    const second = await runInstruction(
+      { text: 'תכיני טבלת רווח לפי המחירון\n\nמחירון 2026' },
+      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner, sourceAsked: true },
+    );
+    expect(second.status).toBe('planned');
+  });
+
+  it('one matching document asks nothing — the plan runs as a read-only plan', async () => {
+    await doc('מחירון 2026.pdf', '2026-10-01T10:00:00Z');
+    const result = await runInstruction(
+      { text: 'תכיני טבלת רווח לפי המחירון' },
+      {
+        textOrigin: 'typed',
+        channel: 'dashboard',
+        businessId: BUSINESS,
+        planner: async () => ({ status: 'planned', plan: producePlan(VALID) }),
+      },
+    );
+    expect(result.status).toBe('planned');
+  });
+
+  it('a doc.produce step the handler would refuse is refused at the door', async () => {
+    const result = await runInstruction(
+      { text: 'תכיני מסמך' },
+      {
+        textOrigin: 'typed',
+        channel: 'dashboard',
+        businessId: BUSINESS,
+        planner: async () => ({ status: 'planned', plan: producePlan({ ...VALID, format: 'exe' }) }),
+      },
+    );
+    expect(result.status).toBe('refused');
+  });
+});

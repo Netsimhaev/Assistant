@@ -262,6 +262,14 @@ export function logErrored(result: SchedulerPassResult): void {
         result.ledger.errored.map((e) => `${e.itemId}: ${e.error}`).join('; '),
     );
   }
+  // Document cards returned after a failed delivery (`production/card.ts`).
+  if (result.deliveriesReraisedError !== null) {
+    console.error(`document card re-raise failed: ${result.deliveriesReraisedError}`);
+  } else if (result.deliveriesReraised !== null) {
+    for (const e of result.deliveriesReraised.errored) {
+      console.error(`document card ${e.cardId} re-raise errored: ${e.error}`);
+    }
+  }
   // Document production (`src/production/loop.ts`). Three different facts,
   // and they must not read alike: it threw; it did not run at all (no
   // production tools on this server — every queued request waits); it ran.

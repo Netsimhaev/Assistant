@@ -331,6 +331,10 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   save_names_exhausted: 'כבר יש בתיקייה 99 קבצים בשם הזה',
   save_verify_failed: 'הקובץ שנשמר לא היה זהה למסמך שאושר ונמחק',
 
+  // doc.produce's own refusals (document production §5.2, local-tools.ts).
+  production_not_boss_instruction: 'אפשר להפיק מסמך רק לפי הוראה שלך',
+  production_tools_missing: 'הפקת מסמכים לא מוגדרת בשרת הזה',
+
   // run-due.ts's own plan-level rejections, under the `run_due:` namespace
   // `leadingCode` manufactures.
   'run_due:no_plan_bound': 'לא נמצאה תוכנית פעולה למשימה',
@@ -467,6 +471,21 @@ async function reportCandidates(
         AND NOT EXISTS (
           SELECT 1 FROM instruction_confirmations r
            WHERE r.business_id = j.business_id AND r.reask_of = j.job_id
+        )
+        -- Document production §4: a job whose plan's only step is
+        -- doc.produce and that queued a production is reported by its
+        -- document card, not by a sentence here.
+        AND NOT (
+          EXISTS (
+            SELECT 1 FROM job_plans p
+             WHERE p.business_id = j.business_id AND p.job_id = j.job_id
+               AND jsonb_array_length(p.plan -> 'steps') = 1
+               AND p.plan -> 'steps' -> 0 ->> 'toolName' = 'doc.produce'
+          )
+          AND EXISTS (
+            SELECT 1 FROM document_productions dp
+             WHERE dp.business_id = j.business_id AND dp.origin_job_id = j.job_id
+          )
         )
         AND NOT (
           j.phase = 'failed'

@@ -229,6 +229,23 @@ describe('performStep and attachments', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("a ref naming any version but the card's own is refused before a file is read", async () => {
+    // Version A is a real, intact file of this business — only it is not the
+    // version the card (built for the LAST version produced) approved.
+    const other = await produced(Buffer.from('another approved docx'));
+    await produced(Buffer.from('the card version'), 2);
+    const { calls, registry } = spy();
+    const result = await run(mailPlan([other]), registry);
+    expect(result).toMatchObject({ status: 'halted', reason: 'attachments_not_supported' });
+    expect(calls).toHaveLength(0);
+    // Control: the card's own version goes out on an identical setup.
+    await resetDatabase();
+    const own = await produced(Buffer.from('the card version'));
+    const control = spy();
+    expect((await run(mailPlan([own]), control.registry)).status).toBe('done');
+    expect(control.calls).toHaveLength(1);
+  });
+
   it('an empty attachments list needs no delivery job', async () => {
     const { calls, registry } = spy();
     expect((await run(mailPlan([]), registry, { cardBusiness: null })).status).toBe('done');

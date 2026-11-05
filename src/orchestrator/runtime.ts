@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { storedCredentials } from '../governance/credential-store.js';
@@ -66,6 +67,19 @@ export interface Runtime {
      * Every real build of `notify` below sets it.
      */
     sendAlert?(subject: string, body: string): Promise<{ ok: boolean; error?: string }>;
+    /**
+     * `sendAlert` with one file attached — the document card's email to the
+     * owner (document production §10, D10). Same transport, credential and
+     * recipient as `sendAlert`; never throws. The idempotency key hashes the
+     * subject, the body and the file's sha256, so the caller puts something
+     * unique in the body (the card id) — two identical cards would otherwise
+     * collapse into one at the mail server while this reports `ok`.
+     */
+    sendAlertWithAttachment?(
+      subject: string,
+      body: string,
+      attachment: { filename: string; mediaType: string; bytes: Buffer },
+    ): Promise<{ ok: boolean; error?: string }>;
   };
   /**
    * The WhatsApp bridge, GREEN-API side only — never the messenger.
@@ -432,6 +446,37 @@ export async function buildRuntime(
                     // (same `since`, same `state`), while two different
                     // outages — even under the same state word — must not.
                     idempotencyKey: `whatsapp-health-alert:${canonicalHash({ subject, body })}`,
+                    signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
+                  },
+                ),
+                ALERT_TIMEOUT_MS,
+              );
+              return { ok: true };
+            } catch (error) {
+              return { ok: false, error: error instanceof Error ? error.message : String(error) };
+            }
+          },
+          // The document card's email (document production §10): the same
+          // seam as `sendAlert` above, with the file attached.
+          async sendAlertWithAttachment(subject, body, attachment) {
+            try {
+              const credential = await withAlertDeadline(
+                credentials.resolve(notifyRef, config.businessId),
+                ALERT_TIMEOUT_MS,
+              );
+              if (credential === null) {
+                return { ok: false, error: `לא נמצא credential עבור ${notifyRef}` };
+              }
+              const fileSha = createHash('sha256').update(attachment.bytes).digest('hex');
+              await withAlertDeadline(
+                transport.send(
+                  { to: [to], subject, body, attachments: [attachment] },
+                  {
+                    endpoint: null,
+                    credential,
+                    // Content-derived like `sendAlert`'s; the body carries
+                    // the card id, so two cards never share a key.
+                    idempotencyKey: `document-card-alert:${canonicalHash({ subject, body, fileSha })}`,
                     signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
                   },
                 ),

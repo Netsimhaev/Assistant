@@ -290,6 +290,18 @@ describe('constants that must fail closed as the system grows', () => {
       expect(KNOWN_TOOL_NAMES.has(tool), tool).toBe(true);
     }
 
+    // `doc.produce` (document production §5.2, C2) sits with them, on the
+    // `assert.evaluate` precedent: read-only by gate stage, its boundary the
+    // writer check inside the handler (`assertProductionWriter`). Never also
+    // classified, always known, and it ingests outside content (it reads the
+    // source documents) — which keeps it out of the first-contact exemption.
+    expect(READ_ONLY_TOOLS.has('doc.produce')).toBe(true);
+    expect(classified.includes('doc.produce')).toBe(false);
+    expect(classifyAction('doc.produce')).toBeNull();
+    expect(KNOWN_TOOL_NAMES.has('doc.produce')).toBe(true);
+    expect(ingestsExternalContent('doc.produce')).toBe(true);
+    expect(isOutbound('doc.produce')).toBe(false);
+
     // `doc.save` (document production §9.2) is the opposite case: it writes a
     // file into the owner's folder, so it is classified as `artifact.write`
     // and NEVER read-only — read-only would skip stages 5–10 and leave no
