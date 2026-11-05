@@ -1,4 +1,4 @@
-import { documentSourceLabel } from '../domain/labels.js';
+import { documentSourceLabel } from '../documents/source-label.js';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';

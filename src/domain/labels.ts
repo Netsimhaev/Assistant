@@ -16,7 +16,6 @@
  */
 import type { ActionClass } from './action.js';
 import type { DocumentCardState, DocumentFormat, DocumentKind, ProductionStage } from './document-spec.js';
-import type { DocumentSource } from '../documents/types.js';
 import type { LedgerFamily, LedgerStatus } from './ledger.js';
 import type { AutonomyLevel, TrustLevel } from './trust.js';
 
@@ -132,14 +131,6 @@ export const productionStageLabel: Readonly<Record<ProductionStage, string>> = O
   ready: 'מוכן לאישור',
   failed_checks: 'נעצר בבדיקות',
   failed: 'נכשל',
-});
-
-/** Who brought a document in, as the owner reads it. */
-export const documentSourceLabel: Readonly<Record<DocumentSource, string>> = Object.freeze({
-  manual: 'תיקיית הקליטה',
-  mail: 'מייל נכנס',
-  api: 'חיבור חיצוני',
-  instruction: 'צורף להוראה',
 });
 
 /**

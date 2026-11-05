@@ -18,7 +18,7 @@ import { closePool } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { loadArtifacts } from '../documents/store.js';
 import type { DocumentSource } from '../documents/types.js';
-import { documentSourceLabel } from '../domain/labels.js';
+import { documentSourceLabel } from '../documents/source-label.js';
 
 const SOURCES: readonly DocumentSource[] = ['manual', 'mail', 'api'];
 
