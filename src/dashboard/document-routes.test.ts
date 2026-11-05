@@ -127,8 +127,10 @@ async function card(
   });
   const bytes = Buffer.from(`docx bytes ${productionId} ${seq}`);
   const storedPath = `${DIR}/${productionId}.docx`;
-  await mkdir(join(config.documentRoot, DIR), { recursive: true });
-  await writeFile(join(config.documentRoot, storedPath), bytes);
+  // Under the dashboard's own document root (M7): the download reads from
+  // the root the server was given, never a second one.
+  await mkdir(join(uploadRoot, DIR), { recursive: true });
+  await writeFile(join(uploadRoot, storedPath), bytes);
   const versionId = await saveVersion({ productionId, versionNo: 1, spec, storedPath, sha256: sha(bytes), sizeBytes: bytes.length });
   await saveVersionCheck(versionId, 'check1', { passed: true, findings: [] });
   let previewPath: string | null = null;
@@ -146,7 +148,7 @@ async function card(
       : {}),
   })).toBe(true);
   const created = await createDocumentCard(versionId, { businessId: B });
-  return { cardId: created.cardId, versionId, productionId, bytes, path: join(config.documentRoot, storedPath) };
+  return { cardId: created.cardId, versionId, productionId, bytes, path: join(uploadRoot, storedPath) };
 }
 
 const recallPlan: Plan = {

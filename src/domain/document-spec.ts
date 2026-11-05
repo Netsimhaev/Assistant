@@ -36,7 +36,7 @@ export const AccentColor = z.enum(['navy', 'teal', 'green', 'burgundy', 'gray', 
 export type AccentColor = z.infer<typeof AccentColor>;
 
 /** A document card's state (migration 053's CHECK). Lives here so `labels.ts` can name it without reaching `production/`. */
-export const DocumentCardState = z.enum(['open', 'approved', 'saved', 'fix_requested', 'superseded', 'failed_send']);
+export const DocumentCardState = z.enum(['open', 'approved', 'saved', 'superseded', 'failed_send']);
 export type DocumentCardState = z.infer<typeof DocumentCardState>;
 
 export const ProductionStage = z.enum([

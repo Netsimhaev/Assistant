@@ -368,12 +368,21 @@ export async function handleDocumentPreview(
   res.end(bytes);
 }
 
-export async function handleDocumentDownload(res: ServerResponse, businessId: string, cardId: string): Promise<void> {
+export async function handleDocumentDownload(
+  res: ServerResponse,
+  businessId: string,
+  cardId: string,
+  documentRoot: string | undefined,
+): Promise<void> {
   const loaded = await loadCard(businessId, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
   const file = await loadVersionFile(loaded.version.versionId, businessId);
   if (file === null) return html(res, 404, renderNotFound());
-  const read = await readVersionBytes(file, { sha256: loaded.version.sha256, sizeBytes: loaded.version.sizeBytes });
+  const read = await readVersionBytes(
+    file,
+    { sha256: loaded.version.sha256, sizeBytes: loaded.version.sizeBytes },
+    documentRoot ?? config.documentRoot,
+  );
   if (!read.ok) {
     if (read.code === 'attachment_hash_mismatch') {
       return html(res, 409, renderDownloadRefused());
@@ -413,7 +422,8 @@ export async function handleDocumentApprove(
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());
   const loaded = await loadCard(businessId, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
-  return renderCard(res, 409, businessId, session, loaded, options.documentRoot, CARD_STALE_HE);
+  const error = outcome.status === 'no_base_folder' ? outcome.reason : CARD_STALE_HE;
+  return renderCard(res, 409, businessId, session, loaded, options.documentRoot, error);
 }
 
 export async function handleDocumentFix(

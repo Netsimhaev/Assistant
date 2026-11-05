@@ -5,6 +5,7 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
@@ -12,6 +13,7 @@ import { config } from '../config.js';
 import { closePool, getPool } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
 import { CLOSURE_VERB_WORDS } from '../governance/closure-command.js';
+import { DOCUMENT_SETTINGS_DEFAULTS, saveDocumentSettings } from '../governance/document-settings.js';
 import { FORGET_VERBS } from '../governance/forget-command.js';
 import { LEDGER_COMMAND_WORDS } from '../ledger/whatsapp-command.js';
 import { addTypedRecipient, approveDocumentCard, createDocumentCard, loadDocumentCard } from '../production/card.js';
@@ -128,6 +130,8 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
   beforeEach(async () => {
     await resetDatabase();
     await installCharter(buildCharter({ version: 'v-gate' }), { businessId: B });
+    // A save option needs somewhere to save to (M4); the gate under test is time.
+    await saveDocumentSettings({ ...DOCUMENT_SETTINGS_DEFAULTS, baseFolder: tmpdir() }, { businessId: B });
   });
   afterAll(async () => {
     await rm(join(config.documentRoot, DIR), { recursive: true, force: true });
@@ -185,7 +189,8 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
       },
     } as unknown as BossMessenger;
     await getPool().query(
-      `INSERT INTO document_settings (business_id, to_whatsapp, to_email, to_screen) VALUES ($1, true, false, true)`,
+      `INSERT INTO document_settings (business_id, to_whatsapp, to_email, to_screen) VALUES ($1, true, false, true)
+        ON CONFLICT (business_id) DO UPDATE SET to_whatsapp = true, to_email = false, to_screen = true`,
       [B],
     );
     const before = (await loadDocumentCard(B, cardId))!.whatsappDeliveredAt!;

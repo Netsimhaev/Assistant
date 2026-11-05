@@ -8,7 +8,7 @@ import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { CharterConnection } from '../domain/connection.js';
-import type { DocxSpec } from '../domain/document-spec.js';
+import { DocumentCardState, type DocxSpec } from '../domain/document-spec.js';
 import { Plan } from '../domain/plan.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { saveDocumentSettings } from '../governance/document-settings.js';
@@ -46,7 +46,11 @@ import {
   reraiseFailedDeliveries,
   requestFix,
   RETRY_PREFIX,
+  SAVE_NO_BASE_FOLDER_HE,
+  SAVE_RETRY_PREFIX,
 } from './card.js';
+import { documentCardAlertKey } from '../orchestrator/runtime.js';
+import { tmpdir } from 'node:os';
 import { UNAUTHORISED_ADDRESS_NOTE } from './produce-input.js';
 import { PRODUCTION_TOOLS_MISSING_REASON } from './render-error.js';
 import {
@@ -410,7 +414,8 @@ describe('approveDocumentCard', () => {
     expect((await approveDocumentCard(card.cardId, 'smuggled', 'dashboard', { businessId: B })).status).toBe('card_stale');
     expect(await deliveryJobs()).toBe(0);
     expect((await loadDocumentCard(B, card.cardId))?.state).toBe('open');
-    // Control: the shown plan's hash does approve.
+    // Control: the shown plan's hash does approve (a save: it needs a base folder).
+    await saveDocumentSettings({ toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: B });
     const ok = await approveDocumentCard(card.cardId, card.deliveryPlans[1]!.planHash, 'dashboard', { businessId: B });
     expect(ok.status).toBe('approved');
     expect((await loadDocumentCard(B, card.cardId))?.state).toBe('saved');
@@ -458,7 +463,8 @@ describe('approveDocumentCard', () => {
     expect((await approveDocumentCard(card.cardId, send.planHash, 'dashboard', { businessId: B })).status).toBe('card_stale');
     expect(await deliveryJobs()).toBe(0);
 
-    // Save is allowed.
+    // Save is allowed (once there is a base folder to save into).
+    await saveDocumentSettings({ toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: B });
     const saved = await approveDocumentCard(card.cardId, card.deliveryPlans[0]!.planHash, 'dashboard', { businessId: B });
     expect(saved).toMatchObject({ status: 'approved', option: 'save' });
     expect((await loadDocumentCard(B, card.cardId))?.state).toBe('saved');
@@ -749,5 +755,136 @@ describe('exclusions', () => {
     if (again.status !== 'approved') throw new Error(again.status);
     expect(again.jobId).not.toBe(jobId);
     expect((await loadDocumentCard(B, cardId))?.deliveryJobId).toBe(again.jobId);
+  });
+});
+
+// ---------------------------------------------------------------- final fix wave (I2, M4, M5)
+
+describe('card notices are each unique, and save needs a base folder', () => {
+  /** Approve the card's option of `kind`, fail the delivery job, return the job id. */
+  async function approveAndFail(cardId: string, kind: 'send' | 'save'): Promise<string> {
+    const card = await loadDocumentCard(B, cardId);
+    const option = card!.deliveryPlans.find((o) => o.option === kind)!;
+    const outcome = await approveDocumentCard(cardId, option.planHash, 'dashboard', { businessId: B });
+    if (outcome.status !== 'approved') throw new Error(outcome.status);
+    await transition(outcome.jobId, { to: 'failed', actor: 'orchestrator', reason: 'adapter_timeout', businessId: B });
+    return outcome.jobId;
+  }
+
+  it('I2: two re-raises of the same card carry different notice ids, so their email idempotency keys differ', async () => {
+    const { versionId } = await readyProduction();
+    const card = await cardFor(versionId);
+    await saveDocumentSettings({ toWhatsApp: false, toEmail: true, toScreen: true, baseFolder: null }, { businessId: B });
+    const emails: { subject: string; body: string; bytes: Buffer }[] = [];
+    const seams = {
+      businessId: B,
+      sendAlertWithAttachment: async (subject: string, body: string, file: { bytes: Buffer }) => {
+        emails.push({ subject, body, bytes: file.bytes });
+        return { ok: true };
+      },
+    };
+
+    await approveAndFail(card.cardId, 'send');
+    expect((await reraiseFailedDeliveries(seams)).reraised).toHaveLength(1);
+    await approveAndFail(card.cardId, 'send');
+    expect((await reraiseFailedDeliveries(seams)).reraised).toHaveLength(1);
+
+    expect(emails).toHaveLength(2);
+    const [a, b] = emails as [(typeof emails)[0], (typeof emails)[0]];
+    for (const e of [a, b]) expect(e.body).toMatch(/^מזהה הודעה: \S+$/m);
+    expect(documentCardAlertKey(a.subject, a.body, a.bytes)).not.toBe(documentCardAlertKey(b.subject, b.body, b.bytes));
+    // Control: without the notice-id line the two notices are byte-identical,
+    // so the line is what keeps the second from being dropped as a duplicate.
+    const strip = (body: string) => body.replace(/^מזהה הודעה: \S+$/m, '');
+    expect(strip(a.body)).toBe(strip(b.body));
+    expect(documentCardAlertKey(a.subject, strip(a.body), a.bytes)).toBe(documentCardAlertKey(b.subject, strip(b.body), b.bytes));
+  });
+
+  it('M4: a save option is refused up front while no base folder is set — no job, card stays open', async () => {
+    const { versionId } = await readyProduction({ destination: { mode: 'save', folder: null } });
+    const card = await cardFor(versionId);
+    const save = card.deliveryPlans.find((o) => o.option === 'save')!;
+    const refused = await approveDocumentCard(card.cardId, save.planHash, 'dashboard', { businessId: B });
+    expect(refused).toEqual({ status: 'no_base_folder', reason: SAVE_NO_BASE_FOLDER_HE });
+    expect(await deliveryJobs()).toBe(0);
+    expect((await loadDocumentCard(B, card.cardId))?.state).toBe('open');
+
+    // Control: the same option with a base folder set is approved.
+    await saveDocumentSettings({ toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: B });
+    const approved = await approveDocumentCard(card.cardId, save.planHash, 'dashboard', { businessId: B });
+    expect(approved).toMatchObject({ status: 'approved', option: 'save' });
+  });
+
+  it('M4: a returned save card says the SAVE did not complete, not the send', async () => {
+    const { versionId } = await readyProduction({ destination: { mode: 'save', folder: null } });
+    const card = await cardFor(versionId);
+    await saveDocumentSettings({ toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: B });
+    await approveAndFail(card.cardId, 'save');
+    const messenger = createFakeMessenger();
+    expect((await reraiseFailedDeliveries({ businessId: B, messenger })).reraised).toHaveLength(1);
+    const caption = messenger.sentFiles[0]?.caption ?? '';
+    expect(caption.startsWith(SAVE_RETRY_PREFIX)).toBe(true);
+    expect(caption).not.toContain(RETRY_PREFIX);
+    expect(caption).not.toContain(MAY_HAVE_SENT_LINE);
+  });
+
+  async function breakCharter(): Promise<void> {
+    await getPool().query(
+      `UPDATE charter_versions SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
+        WHERE business_id = $1`,
+      [B],
+    );
+  }
+
+  it('M5: a new card with an unreadable charter is created, sends nothing in a guessed currency, and records the notice as failed', async () => {
+    const { versionId } = await readyProduction();
+    await saveDocumentSettings({ toWhatsApp: true, toEmail: true, toScreen: true, baseFolder: null }, { businessId: B });
+    await breakCharter();
+    let emailed = 0;
+    const messenger = createFakeMessenger();
+    const result = await createDocumentCard(versionId, {
+      businessId: B,
+      messenger,
+      sendAlertWithAttachment: async () => ((emailed += 1), { ok: true }),
+    });
+    expect(result).toMatchObject({ status: 'created', notice: { email: 'failed', whatsapp: 'failed' } });
+    expect(emailed).toBe(0);
+    expect(messenger.sentFiles).toHaveLength(0);
+    const card = await loadCardForVersion(B, versionId);
+    expect(card).toMatchObject({ state: 'open', emailState: 'failed', whatsappState: 'failed', whatsappDeliveredAt: null });
+  });
+
+  it('M5: a re-raise with an unreadable charter records the notice as failed and an error, without throwing', async () => {
+    const { versionId } = await readyProduction();
+    const card = await cardFor(versionId);
+    await saveDocumentSettings({ toWhatsApp: false, toEmail: true, toScreen: true, baseFolder: null }, { businessId: B });
+    await approveAndFail(card.cardId, 'send');
+    await breakCharter();
+    let emailed = 0;
+    const result = await reraiseFailedDeliveries({
+      businessId: B,
+      sendAlertWithAttachment: async () => ((emailed += 1), { ok: true }),
+    });
+    expect(emailed).toBe(0);
+    expect(result.reraised).toEqual([]);
+    expect(result.errored).toEqual([{ cardId: card.cardId, error: 'charter_unreadable' }]);
+    expect(await loadDocumentCard(B, card.cardId)).toMatchObject({ state: 'failed_send', emailState: 'failed' });
+  });
+});
+
+describe('card states (M6)', () => {
+  it('fix_requested is not a card state — a fix supersedes the card — in the code or in the database', async () => {
+    expect([...DocumentCardState.options]).toEqual(['open', 'approved', 'saved', 'superseded', 'failed_send']);
+    const { versionId } = await readyProduction();
+    const card = await cardFor(versionId);
+    // The CHECK refuses the dropped state...
+    await expect(
+      getPool().query(`UPDATE document_cards SET state = 'fix_requested' WHERE card_id = $1`, [card.cardId]),
+    ).rejects.toThrow(/document_cards_state_known/);
+    // ...and still admits every kept one (the update ran against a real row).
+    const { rowCount } = await getPool().query(`UPDATE document_cards SET state = 'superseded' WHERE card_id = $1`, [
+      card.cardId,
+    ]);
+    expect(rowCount).toBe(1);
   });
 });

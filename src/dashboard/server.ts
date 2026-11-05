@@ -3075,7 +3075,7 @@ async function route(
     const cardId = decodePathSegment(documentGetMatch[1]);
     if (cardId === null) return notFound(res);
     return documentGetMatch[2] === 'download'
-      ? handleDocumentDownload(res, businessId, cardId)
+      ? handleDocumentDownload(res, businessId, cardId, documentRoot)
       : handleDocumentPreview(res, businessId, cardId, documentRoot);
   }
   const documentPostMatch = DOCUMENT_CARD_POST_PATH.exec(pathname);

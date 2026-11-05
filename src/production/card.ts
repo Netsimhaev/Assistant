@@ -75,6 +75,7 @@
  * recipients re-checked on the joined text. It counts toward
  * `DOCUMENTS_PER_DAY` and is refused up front past it.
  */
+import { ulid } from 'ulid';
 import { z } from 'zod';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
@@ -302,6 +303,18 @@ export function buildDeliveryOptions(
 // ---------------------------------------------------------------- the card text
 
 export const RETRY_PREFIX = 'השליחה הקודמת לא הושלמה';
+/** The returned card's first line when the failed delivery was a SAVE, not a send. */
+export const SAVE_RETRY_PREFIX = 'השמירה הקודמת לא הושלמה';
+/** A save option pressed while no base folder is set (document settings) — refused before any job. */
+export const SAVE_NO_BASE_FOLDER_HE = 'לא הוגדרה תיקיית בסיס לשמירה — אפשר להגדיר אותה בהגדרות המסמכים ואז לאשר שוב.';
+/**
+ * The line every card notice ends with: a fresh id per notice, never stored.
+ * The email seam's idempotency key is derived from the content
+ * (`documentCardAlertKey`), and two notices of the same card — a re-raise
+ * after a second failed delivery — are otherwise byte-identical: the mail
+ * server would drop the second as a duplicate while the send reports ok.
+ */
+export const NOTICE_ID_LABEL = 'מזהה הודעה';
 export const MAY_HAVE_SENT_LINE = 'ייתכן שהמייל כבר יצא';
 /**
  * The WhatsApp caption when the card is longer than one WhatsApp message
@@ -369,6 +382,13 @@ export interface CardSeams {
   ) => Promise<{ ok: boolean; error?: string }>;
   messenger?: BossMessenger;
   dashboardBaseUrl?: string;
+  /**
+   * Where produced files live — the card's file is read from under it.
+   * Threaded from the scheduler like the production loop's; the public entry
+   * points (`createDocumentCard`, `reraiseFailedDeliveries`,
+   * `addTypedRecipient`) alone fall back to `config.documentRoot`.
+   */
+  documentRoot?: string;
 }
 
 export interface CardNotice {
@@ -392,9 +412,12 @@ async function notifyCard(
   text: string,
   seams: CardSeams,
   db: Queryable,
+  documentRoot: string,
 ): Promise<CardNotice> {
   const settings = await loadDocumentSettings({ businessId: card.businessId, db });
   const notice: CardNotice = { email: null, whatsapp: null };
+  // A fresh id per notice (I2) — see `NOTICE_ID_LABEL`.
+  text = `${text}\n${NOTICE_ID_LABEL}: ${ulid()}`;
   const subject = `מסמך לבדיקתך: ${toOneLine(version.spec.title)}`.slice(0, 200);
 
   let bytes: Buffer | null = null;
@@ -402,7 +425,7 @@ async function notifyCard(
     if (bytes !== null) return bytes;
     const file = await loadVersionFile(version.versionId, card.businessId, db);
     if (file === null) return null;
-    const read = await readVersionBytes(file, { sha256: version.sha256, sizeBytes: version.sizeBytes });
+    const read = await readVersionBytes(file, { sha256: version.sha256, sizeBytes: version.sizeBytes }, documentRoot);
     bytes = read.ok ? read.bytes : null;
     return bytes;
   };
@@ -449,6 +472,42 @@ async function notifyCard(
   return notice;
 }
 
+/**
+ * The card cannot be rendered — the charter is unreadable or missing, so
+ * its amounts would be shown in a guessed currency. Nothing is sent; each
+ * channel the owner chose records `failed`, and the card itself stays on
+ * the dashboard. Never throws for a send: it runs after the card row
+ * committed.
+ */
+async function recordNoticeFailure(
+  card: { cardId: string; businessId: string },
+  db: Queryable,
+): Promise<CardNotice> {
+  const settings = await loadDocumentSettings({ businessId: card.businessId, db });
+  const notice: CardNotice = {
+    email: settings.toEmail ? 'failed' : null,
+    whatsapp: settings.toWhatsApp ? 'failed' : null,
+  };
+  await db.query(
+    `UPDATE document_cards
+        SET email_state = COALESCE($3, email_state),
+            whatsapp_state = COALESCE($4, whatsapp_state)
+      WHERE business_id = $1 AND card_id = $2`,
+    [card.businessId, card.cardId, notice.email, notice.whatsapp],
+  );
+  return notice;
+}
+
+/** The active charter's currency, or `null` when the charter is missing or unreadable. */
+async function charterCurrency(businessId: string, db: Queryable): Promise<string | null> {
+  try {
+    const active = await loadActiveCharter(businessId, db);
+    return active === null ? null : active.bundle.ceilings.currency;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------- creation
 
 export interface CreateCardOptions extends CardSeams {
@@ -491,17 +550,28 @@ export async function createDocumentCard(versionId: string, options: CreateCardO
     return { status: 'exists', cardId: existing?.cardId ?? cardId };
   }
 
-  const active = await loadActiveCharter(businessId, db);
+  const currency = await charterCurrency(businessId, db);
+  if (currency === null) {
+    return { status: 'created', cardId, notice: await recordNoticeFailure({ cardId, businessId }, db) };
+  }
   const text = renderCardText({
     cardId,
     production,
     version,
     options: optionsBuilt,
     stage,
-    currency: active?.bundle.ceilings.currency ?? 'ILS',
+    currency,
     ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
   });
-  const notice = await notifyCard({ cardId, businessId }, production, version, text, options, db);
+  const notice = await notifyCard(
+    { cardId, businessId },
+    production,
+    version,
+    text,
+    options,
+    db,
+    options.documentRoot ?? config.documentRoot,
+  );
   return { status: 'created', cardId, notice };
 }
 
@@ -557,6 +627,8 @@ export type ApproveOutcome =
   | { status: 'not_open'; state: CardState }
   /** A WhatsApp answer the card was not open for: not delivered there, answered before delivery, or past the window. */
   | { status: 'not_answerable' }
+  /** A save option while no base folder is set (`SAVE_NO_BASE_FOLDER_HE`) — not stale: the card is fine, the settings are not. */
+  | { status: 'no_base_folder'; reason: string }
   | { status: 'not_found' };
 
 /**
@@ -649,6 +721,12 @@ export async function approveDocumentCard(
     }
     // Defence in depth (C6): a send only ever on a version that passed.
     if (rebuilt.option === 'send' && stage !== 'ready') return { status: 'card_stale' };
+    // A save with nowhere to save to would only fail in `doc.save`
+    // (`save_no_base_folder`) and come back as a returned card; refuse it here.
+    if (rebuilt.option === 'save') {
+      const settings = await loadDocumentSettings({ businessId, db: tx });
+      if (settings.baseFolder === null) return { status: 'no_base_folder', reason: SAVE_NO_BASE_FOLDER_HE };
+    }
 
     const active = await loadActiveCharter(businessId, tx);
     if (active === null) throw new Error(`approveDocumentCard: no active charter for ${businessId}`);
@@ -855,7 +933,7 @@ async function resendAfterTypedAddress(
       currency: active.bundle.ceilings.currency,
       ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
     });
-    await notifyCard(card, production, version, text, options, db);
+    await notifyCard(card, production, version, text, options, db, options.documentRoot ?? config.documentRoot);
     return 'sent';
   } catch (err) {
     console.error(
@@ -1004,8 +1082,8 @@ export async function reraiseFailedDeliveries(options: CardSeams & { businessId:
   const db = options.db ?? getPool();
   const { businessId } = options;
   const result: ReraiseResult = { reraised: [], errored: [] };
-  const { rows } = await db.query<{ card_id: string; delivery_job_id: string; may_have_sent: boolean }>(
-    `SELECT c.card_id, c.delivery_job_id,
+  const { rows } = await db.query<{ card_id: string; delivery_job_id: string; state: string; may_have_sent: boolean }>(
+    `SELECT c.card_id, c.delivery_job_id, c.state,
             EXISTS (SELECT 1 FROM job_step_results r
                      WHERE r.business_id = c.business_id AND r.job_id = c.delivery_job_id
                        AND r.status = 'unknown') AS may_have_sent
@@ -1029,18 +1107,33 @@ export async function reraiseFailedDeliveries(options: CardSeams & { businessId:
       const version = await loadVersion(businessId, card.versionId, db);
       const production = version === null ? null : await loadProduction(businessId, version.productionId, db);
       if (version === null || production === null) continue;
-      const active = await loadActiveCharter(businessId, db);
+      const currency = await charterCurrency(businessId, db);
+      if (currency === null) {
+        // The claim already moved the card to `failed_send`: it stays on the
+        // dashboard, and the owner's channels record the notice as failed.
+        await recordNoticeFailure(card, db);
+        result.errored.push({ cardId: card.cardId, error: 'charter_unreadable' });
+        continue;
+      }
+      // A failed SAVE is told as a save (`saved` was the state the claim
+      // moved from); a send keeps the may-have-sent line after a timeout.
+      const prefix =
+        row.state === 'saved'
+          ? [SAVE_RETRY_PREFIX]
+          : row.may_have_sent
+            ? [RETRY_PREFIX, MAY_HAVE_SENT_LINE]
+            : [RETRY_PREFIX];
       const text = renderCardText({
         cardId: card.cardId,
         production,
         version,
         options: card.deliveryPlans,
         stage: production.stage === 'failed_checks' ? 'failed_checks' : 'ready',
-        currency: active?.bundle.ceilings.currency ?? 'ILS',
-        prefix: row.may_have_sent ? [RETRY_PREFIX, MAY_HAVE_SENT_LINE] : [RETRY_PREFIX],
+        currency,
+        prefix,
         ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
       });
-      await notifyCard(card, production, version, text, options, db);
+      await notifyCard(card, production, version, text, options, db, options.documentRoot ?? config.documentRoot);
       result.reraised.push({ cardId: card.cardId, jobId: row.delivery_job_id, mayHaveSent: row.may_have_sent });
     } catch (err) {
       result.errored.push({ cardId: row.card_id, error: err instanceof Error ? err.message : String(err) });

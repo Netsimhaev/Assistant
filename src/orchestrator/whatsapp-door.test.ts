@@ -44,7 +44,9 @@ import { raiseMailReply } from './mail-reply.js';
 import { presentMailCard } from './whatsapp-mail-card.js';
 import { createLedgerItem, loadLedgerItem } from '../ledger/store.js';
 import type { DocxSpec } from '../domain/document-spec.js';
-import { addTypedRecipient, createDocumentCard, loadDocumentCard } from '../production/card.js';
+import { addTypedRecipient, createDocumentCard, loadDocumentCard, SAVE_NO_BASE_FOLDER_HE } from '../production/card.js';
+import { saveDocumentSettings } from '../governance/document-settings.js';
+import { tmpdir } from 'node:os';
 import { advanceStage, createProduction, saveVersion, type ProductionDestination } from '../production/store.js';
 import {
   DOCUMENT_CARD_FIX_OPENED,
@@ -2256,6 +2258,7 @@ describe('confirming a held command over WhatsApp', () => {
 
     it('"שמרי" approves the single save option', async () => {
       const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
+      await saveDocumentSettings({ toWhatsApp: false, toEmail: false, toScreen: true, baseFolder: tmpdir() }, { businessId: BUSINESS });
       gateway.enqueue(reply('שמרי'));
       const result = await pass();
 
@@ -2314,6 +2317,19 @@ describe('confirming a held command over WhatsApp', () => {
       expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
     });
 
+    it('"שמרי" with no base folder set is refused with the reason, and nothing is approved', async () => {
+      const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
+      const msg = reply('שמרי');
+      gateway.enqueue(msg);
+      const result = await pass();
+
+      expect(result.refused).toBe(1);
+      expect(lastSent()).toBe(SAVE_NO_BASE_FOLDER_HE);
+      expect(result.documentCardReplies).toBe(0);
+      expect(await cardState(cardId)).toBe('open');
+      expect((await messageRow(msg.providerMessageId))?.state).toBe('failed');
+    });
+
     it('"שלחי" with two document cards open → SEVERAL_OPEN_REFUSAL', async () => {
       const a = await documentCard();
       const b = await documentCard();
@@ -2323,6 +2339,46 @@ describe('confirming a held command over WhatsApp', () => {
       expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
       expect(await cardState(a)).toBe('open');
       expect(await cardState(b)).toBe('open');
+    });
+
+    it('"שמרי" with a document card AND a clarifying question open → SEVERAL_OPEN_REFUSAL, nothing approved', async () => {
+      // A clarifying question raised on WhatsApp ("לאיזו רונית?"): "שמרי"
+      // could be its answer as much as the card's, and it does not say which.
+      gateway.enqueue(reply('תשלחי לרונית', 500));
+      await pass(plannedWith(mailPlan({ clarifyingQuestion: 'לאיזו רונית?' })));
+      const questionJobs = await openJobs(BUSINESS);
+      expect(questionJobs).toHaveLength(1);
+      const questionJob = questionJobs[0]?.jobId ?? '';
+      expect(await phase(questionJob)).toBe('understand');
+      const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
+
+      const msg = reply('שמרי', 2_000);
+      gateway.enqueue(msg);
+      const result = await pass();
+
+      // The document-card reader ran and refused: the message was claimed
+      // and settled failed, with the collision sentence.
+      expect(result.refused).toBe(1);
+      expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+      expect(result.documentCardReplies).toBe(0);
+      expect(await cardState(cardId)).toBe('open');
+      expect((await messageRow(msg.providerMessageId))?.state).toBe('failed');
+      expect(await phase(questionJob)).toBe('understand');
+    });
+
+    it('"שמרי" with a document card AND a confirmation delivered on WhatsApp → SEVERAL_OPEN_REFUSAL, nothing approved', async () => {
+      const jobId = await held([SINGLE]);
+      const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
+      const msg = reply('שמרי');
+      gateway.enqueue(msg);
+      const result = await pass();
+
+      expect(result.refused).toBe(1);
+      expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+      expect(result.documentCardReplies).toBe(0);
+      expect(await cardState(cardId)).toBe('open');
+      expect((await messageRow(msg.providerMessageId))?.state).toBe('failed');
+      expect(await confirmationState(jobId)).toBe('pending');
     });
 
     it('voice "שלחי" passes through', async () => {

@@ -179,6 +179,18 @@ const GREEN_API_INSTANCE_REF_KEY = 'GREEN_API_INSTANCE_REF';
 const GREEN_API_TOKEN_REF_KEY = 'GREEN_API_TOKEN_REF';
 
 /**
+ * The document card email's idempotency key — content-derived, like
+ * `sendAlert`'s. Unique per notice only because every card notice carries
+ * its own `מזהה הודעה` line (`NOTICE_ID_LABEL`, `production/card.ts`): two
+ * notices of the same card are otherwise byte-identical, and the mail server
+ * would drop the second as a duplicate while the send reports ok.
+ */
+export function documentCardAlertKey(subject: string, body: string, bytes: Buffer): string {
+  const fileSha = createHash('sha256').update(bytes).digest('hex');
+  return `document-card-alert:${canonicalHash({ subject, body, fileSha })}`;
+}
+
+/**
  * Assemble a production runtime.
  *
  * **Async because the master key is a file, and it is read here** — once, at
@@ -467,16 +479,13 @@ export async function buildRuntime(
               if (credential === null) {
                 return { ok: false, error: `לא נמצא credential עבור ${notifyRef}` };
               }
-              const fileSha = createHash('sha256').update(attachment.bytes).digest('hex');
               await withAlertDeadline(
                 transport.send(
                   { to: [to], subject, body, attachments: [attachment] },
                   {
                     endpoint: null,
                     credential,
-                    // Content-derived like `sendAlert`'s; the body carries
-                    // the card id, so two cards never share a key.
-                    idempotencyKey: `document-card-alert:${canonicalHash({ subject, body, fileSha })}`,
+                    idempotencyKey: documentCardAlertKey(subject, body, attachment.bytes),
                     signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
                   },
                 ),

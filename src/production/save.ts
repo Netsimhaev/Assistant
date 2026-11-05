@@ -343,7 +343,7 @@ function refuse(code: SaveFailureCode, he: string = SAVE_FAILURE_HE[code]): Step
  */
 export async function runDocSave(
   input: DocSaveInput,
-  ctx: { jobId: string; businessId: string; db?: Queryable },
+  ctx: { jobId: string; businessId: string; documentRoot: string; db?: Queryable },
 ): Promise<{ performed: true; path: string }> {
   const db = ctx.db ?? getPool();
   // The version must be the one the owner approved on the card that created
@@ -362,7 +362,7 @@ export async function runDocSave(
 
   // The source is read (once) BEFORE the folder is created: a file that
   // changed on disk refuses without leaving an empty folder behind.
-  const read = await readVersionBytes(version, { sha256: version.sha256, sizeBytes: version.sizeBytes });
+  const read = await readVersionBytes(version, { sha256: version.sha256, sizeBytes: version.sizeBytes }, ctx.documentRoot);
   if (!read.ok) throw refuse(read.code === 'attachment_not_found' ? 'save_not_found' : 'save_hash_mismatch');
 
   const target = await resolveSaveTarget(settings.baseFolder, input.folder, version.kind, input.filename);

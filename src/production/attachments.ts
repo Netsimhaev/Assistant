@@ -22,7 +22,6 @@
 import { createHash } from 'node:crypto';
 import { open } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
-import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import {
   FORMAT_MEDIA_TYPE,
@@ -134,7 +133,8 @@ export type ReadVersionBytesResult =
 /**
  * The version's file, read ONCE from disk and hashed, against the size and
  * hash the caller expects. The path is the row's relative `stored_path` under
- * `config.documentRoot`, contained by `path.relative`; the size is checked
+ * the caller's `documentRoot` (threaded from the entry point, which alone
+ * falls back to `config.documentRoot`), contained by `path.relative`; the size is checked
  * against the open handle before reading, so a file swapped for a far larger
  * one is a mismatch without being pulled into memory. The returned buffer is
  * the one that was hashed — callers must use it and never re-read.
@@ -142,8 +142,9 @@ export type ReadVersionBytesResult =
 export async function readVersionBytes(
   version: VersionFile,
   expected: { sha256: string; sizeBytes: number },
+  documentRoot: string,
 ): Promise<ReadVersionBytesResult> {
-  const root = resolve(config.documentRoot);
+  const root = resolve(documentRoot);
   const full = resolve(root, version.storedPath);
   const rel = relative(root, full);
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return { ok: false, code: 'attachment_not_found' };
@@ -200,6 +201,7 @@ function fail(code: AttachmentFailureCode): ResolveAttachmentsResult {
 export async function resolveAttachments(
   refs: readonly AttachmentRef[],
   businessId: string,
+  documentRoot: string,
   db: Queryable = getPool(),
 ): Promise<ResolveAttachmentsResult> {
   const versions: VersionFile[] = [];
@@ -222,7 +224,7 @@ export async function resolveAttachments(
   for (const [index, ref] of refs.entries()) {
     const version = versions[index];
     if (version === undefined) return fail('attachment_not_found');
-    const read = await readVersionBytes(version, { sha256: ref.sha256, sizeBytes: ref.sizeBytes });
+    const read = await readVersionBytes(version, { sha256: ref.sha256, sizeBytes: ref.sizeBytes }, documentRoot);
     if (!read.ok) return fail(read.code);
 
     files.push({

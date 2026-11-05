@@ -115,6 +115,12 @@ export interface LocalToolContext {
   businessId: string;
   db?: Queryable;
   /**
+   * Where produced files live (`doc.save` reads the approved version from
+   * under it). Threaded from the scheduler like the production loop's; this
+   * entry point alone falls back to `config.documentRoot`.
+   */
+  documentRoot?: string;
+  /**
    * The active charter — required by `doc.fetch` (`readDocument` needs it to
    * build the reading prompt) and by nothing else today. Optional here so the
    * memory-family tests that predate this field do not have to supply one;
@@ -741,7 +747,12 @@ const HANDLERS: Record<string, LocalHandler> = {
    */
   'doc.save': async (input, ctx) => {
     const parsed = parseOrFail(DocSaveInput, input, 'doc.save');
-    return runDocSave(parsed, { jobId: ctx.jobId, businessId: ctx.businessId, ...(ctx.db ? { db: ctx.db } : {}) });
+    return runDocSave(parsed, {
+      jobId: ctx.jobId,
+      businessId: ctx.businessId,
+      documentRoot: ctx.documentRoot ?? config.documentRoot,
+      ...(ctx.db ? { db: ctx.db } : {}),
+    });
   },
 
   /**

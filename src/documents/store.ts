@@ -377,6 +377,14 @@ export async function documentsAwaitingRead(
         AND d.status = 'extracted'
         AND d.read_attempts < $2
         AND d.source <> 'mail'
+        -- A file the owner attached to an instruction is HIS input to that
+        -- instruction, not a stranger's document: reading it here would
+        -- raise a card on his own upload under \`unknown_external\`.
+        AND NOT EXISTS (
+              SELECT 1 FROM boss_instructions bi
+               WHERE bi.business_id = d.business_id
+                 AND d.document_id = ANY (bi.attached_document_ids)
+            )
         AND NOT EXISTS (
               SELECT 1 FROM document_artifacts a
                WHERE a.document_id = d.document_id

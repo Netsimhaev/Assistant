@@ -146,18 +146,17 @@ import {
 import { transcribeInbound, type TranscriptionProvider } from '../whatsapp/transcribe.js';
 import { runInstruction, type InstructionOutcome, type RunInstructionOptions } from './instruct.js';
 import { linkWhatsAppMessage } from './jobs.js';
-import { handleMailCardMessage, isMailCardAction, openMailCards } from './whatsapp-mail-card.js';
+import { handleMailCardMessage, isMailCardAction } from './whatsapp-mail-card.js';
+import { openOnWhatsApp } from './whatsapp-open.js';
 import {
   SEVERAL_OPEN_REFUSAL,
   handleDocumentCardMessage,
   isDocumentCardAction,
-  openDocumentCards,
 } from './whatsapp-document-card.js';
 import type { Runtime } from './runtime.js';
 import { handleLedgerWhatsApp } from '../ledger/whatsapp-command.js';
 import {
   applyConfirmation,
-  openConfirmations,
   readConfirmation,
   WHATSAPP_MESSAGE_MAX_CHARS,
   WHATSAPP_QUESTION_TOO_LONG,
@@ -167,7 +166,6 @@ import {
 import { markConfirmationDelivered } from '../governance/instruction-confirmations.js';
 import {
   ambiguousQuestion,
-  answerableWhatsAppQuestions,
   claimAsAnswer,
   closureConfirmation,
   decideWhatsAppRoute,
@@ -570,12 +568,15 @@ async function handleConfirmationMessage(input: {
   const windowOverride =
     ctx.questionWindowMinutes !== undefined ? { windowMinutes: ctx.questionWindowMinutes } : {};
 
-  const confirmations = await openConfirmations({
+  // Everything open, by the one shared definition (`openOnWhatsApp`) the
+  // document-card and mail-card readers also count from.
+  const open = await openOnWhatsApp({
     businessId: ctx.businessId,
-    channel: 'whatsapp',
-    inboundAt: new Date(msg.providerTimestamp),
+    excludeMessageId: storedId,
+    inboundAt: msg.providerTimestamp,
     ...windowOverride,
   });
+  const confirmations = open.confirmations;
   if (confirmations.length === 0) return 'passthrough';
 
   const readings: ConfirmReading[] = confirmations.map((c) => readConfirmation(text, c.options));
@@ -597,23 +598,7 @@ async function handleConfirmationMessage(input: {
     });
   };
 
-  const cards = await openMailCards({
-    businessId: ctx.businessId,
-    excludeMessageId: storedId,
-    inboundAt: msg.providerTimestamp,
-    ...windowOverride,
-  });
-  const questions = await answerableWhatsAppQuestions({
-    businessId: ctx.businessId,
-    ...windowOverride,
-  });
-  // Open document cards count too (document production C9) — the same
-  // definition the document-card reader uses.
-  const documentCards = await openDocumentCards({
-    businessId: ctx.businessId,
-    inboundAt: msg.providerTimestamp,
-    ...windowOverride,
-  });
+  const { mailCards: cards, questions, documentCards } = open;
   const only = confirmations.length === 1 ? confirmations[0] : undefined;
   const reading = readings[0];
   if (
@@ -809,23 +794,21 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     if (msg.mediaKind === null && msg.body !== null && isDocumentCardAction(msg.body)) {
       const windowOverride =
         ctx.questionWindowMinutes !== undefined ? { windowMinutes: ctx.questionWindowMinutes } : {};
-      const documentCards = await openDocumentCards({
+      const open = await openOnWhatsApp({
         businessId: ctx.businessId,
+        excludeMessageId: stored.id,
         inboundAt: msg.providerTimestamp,
         ...windowOverride,
       });
-      if (documentCards.length > 0) {
-        const mailCards = await openMailCards({
-          businessId: ctx.businessId,
-          excludeMessageId: stored.id,
-          inboundAt: msg.providerTimestamp,
-          ...windowOverride,
-        });
+      if (open.documentCards.length > 0) {
+        // Every other open thing counts against the card (C9, and the
+        // confirmation reader's own collision rule): "שמרי" could as well be
+        // the answer to an open clarifying question.
         const handled = await handleDocumentCardMessage({
           msg,
           storedId: stored.id,
-          cards: documentCards,
-          mailCardsOpen: mailCards.length,
+          cards: open.documentCards,
+          othersOpen: open.mailCards.length + open.questions.length + open.confirmations.length,
           messenger: ctx.messenger,
           businessId: ctx.businessId,
           production: ctx.production,
@@ -844,14 +827,16 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // note, a caption, a new instruction — falls through to the ordinary door
     // below, and the card stays open.
     if (msg.mediaKind === null && msg.body !== null && isMailCardAction(msg.body)) {
-      const cards = await openMailCards({
-        businessId: ctx.businessId,
-        excludeMessageId: stored.id,
-        inboundAt: msg.providerTimestamp,
-        ...(ctx.questionWindowMinutes !== undefined
-          ? { windowMinutes: ctx.questionWindowMinutes }
-          : {}),
-      });
+      const cards = (
+        await openOnWhatsApp({
+          businessId: ctx.businessId,
+          excludeMessageId: stored.id,
+          inboundAt: msg.providerTimestamp,
+          ...(ctx.questionWindowMinutes !== undefined
+            ? { windowMinutes: ctx.questionWindowMinutes }
+            : {}),
+        })
+      ).mailCards;
       if (cards.length > 0) {
         const handled = await handleMailCardMessage({
           msg,

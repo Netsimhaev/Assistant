@@ -1137,6 +1137,7 @@ export async function schedulerPass(
       : {}),
     ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
     ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
+    ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
   };
   let documentProductions: RunProductionsResult | null = null;
   let documentProductionsError: string | null = null;

@@ -19,10 +19,12 @@
  *     not approve this one. An unreadable timestamp is never "after";
  *   - the delivery is inside `WHATSAPP_QUESTION_WINDOW_MINUTES`.
  *
- * **Document cards and mail-reply cards are counted together (C9).** "שלחי"
- * is the word both kinds answer to, and it does not say which: with more
- * than one card of either kind open, the answer is `SEVERAL_OPEN_REFUSAL`
- * and nothing is approved. The same count gates "תיקון:".
+ * **Everything open on WhatsApp is counted together (C9).** "שלחי" is the
+ * word both kinds of card answer to, and "שמרי" could as well answer an open
+ * clarifying question: with more than one thing open — document cards, mail
+ * reply cards, clarifying questions, confirmations delivered there
+ * (`openOnWhatsApp`) — the answer is `SEVERAL_OPEN_REFUSAL` and nothing is
+ * approved. The same count gates "תיקון:".
  *
  * **"שלחי"/"שלח" approves the card's single SEND option; "שמרי"/"שמור" its
  * single SAVE option.** None or several of the chosen kind — "יש כמה
@@ -143,14 +145,16 @@ export type DocumentCardOutcome = 'decided' | 'fix' | 'refused' | 'skipped' | 'p
 
 /**
  * The owner's typed "שלחי"/"שלח" or "תיקון: …" while at least one document
- * card is open. `mailCardsOpen` is how many mailbox reply cards are open for
- * the same message (`openMailCards`) — counted together with `cards` (C9).
+ * card is open. `othersOpen` is how many OTHER things are open for the same
+ * message — mail reply cards, clarifying questions and confirmations
+ * delivered on WhatsApp (`openOnWhatsApp`, the definition every reader
+ * shares) — counted together with `cards` (C9).
  */
 export async function handleDocumentCardMessage(input: {
   msg: NormalizedInboundMessage;
   storedId: string;
   cards: readonly DocumentCard[];
-  mailCardsOpen: number;
+  othersOpen: number;
   messenger: BossMessenger;
   businessId: string;
   production: Runtime['production'] | undefined;
@@ -174,7 +178,7 @@ export async function handleDocumentCardMessage(input: {
     return 'refused';
   };
 
-  const only = cards.length === 1 && input.mailCardsOpen === 0 ? cards[0] : undefined;
+  const only = cards.length === 1 && input.othersOpen === 0 ? cards[0] : undefined;
   if (only === undefined) return refuse(SEVERAL_OPEN_REFUSAL);
 
   const fix = fixRequestText(text);
@@ -206,6 +210,7 @@ export async function handleDocumentCardMessage(input: {
     whatsappInboundAt: new Date(msg.providerTimestamp),
     ...(input.windowMinutes !== undefined ? { windowMinutes: input.windowMinutes } : {}),
   });
+  if (outcome.status === 'no_base_folder') return refuse(outcome.reason);
   if (outcome.status !== 'approved') return refuse(DOCUMENT_CARD_GONE);
   await reply(
     kind === 'send' && production.destination.mode === 'send'

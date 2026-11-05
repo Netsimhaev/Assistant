@@ -141,7 +141,6 @@ export const documentCardStateLabel: Readonly<Record<DocumentCardState, string>>
   open: 'מחכה לבדיקתך',
   approved: 'אושר לשליחה',
   saved: 'אושר לשמירה',
-  fix_requested: 'נשלח לתיקון',
   superseded: 'הוחלף בגרסה חדשה',
   failed_send: 'המסירה לא הושלמה',
 });

@@ -7,6 +7,9 @@ import {
   recordReadFailure,
 } from './store.js';
 import { ingestDocument } from './ingest.js';
+import { createJob } from '../orchestrator/jobs.js';
+import { buildCharter } from '../test/fixtures.js';
+import { installCharter } from '../charter/store.js';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -125,6 +128,35 @@ describe('the conductor queries', () => {
     await recordReadFailure(documentId, 'twice', { businessId: BUSINESS });
     const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
     expect(waiting.map((d) => d.documentId)).toEqual([documentId]);
+  });
+
+  it('never offers a file the owner attached to an instruction, only the inbox file beside it', async () => {
+    // An owner upload is ingested as an ordinary `manual` document. Without
+    // the exclusion the conductor read it as a stranger's document
+    // (`unknown_external`) and raised a card on the owner's own file.
+    const ownerUpload = await anExtractedDocument('הצעת מחיר שהבעלים העלה');
+    const inboxFile = await anExtractedDocument('מסמך מתיקיית הקליטה');
+    const foreignNamed = await anExtractedDocument('מסמך שעסק אחר נוקב בו');
+    const db = getPool();
+    const own = await installCharter(buildCharter({ version: 'cond-own' }), { businessId: BUSINESS });
+    const foreign = await installCharter(buildCharter({ version: 'cond-foreign' }), { businessId: 'someone-else' });
+    const ownJob = await createJob({ businessId: BUSINESS, charterVersion: own.charterVersion, provenance: 'boss' });
+    const foreignJob = await createJob({ businessId: 'someone-else', charterVersion: foreign.charterVersion, provenance: 'boss' });
+    await db.query(
+      `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin, attached_document_ids)
+       VALUES ('INS-upload', $1, $2, 'תכיני הצעה', 'typed', $3)`,
+      [BUSINESS, ownJob.jobId, [ownerUpload]],
+    );
+    // Same id under ANOTHER business: must not hide this business's file.
+    await db.query(
+      `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin, attached_document_ids)
+       VALUES ('INS-foreign', 'someone-else', $1, 'תכיני הצעה', 'typed', $2)`,
+      [foreignJob.jobId, [foreignNamed]],
+    );
+
+    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    expect(waiting.map((d) => d.documentId).sort()).toEqual([inboxFile, foreignNamed].sort());
+    expect(waiting.map((d) => d.documentId)).not.toContain(ownerUpload);
   });
 
   it('never offers another business\'s document', async () => {

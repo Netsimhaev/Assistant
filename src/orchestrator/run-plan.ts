@@ -1,4 +1,5 @@
 import type { ActionClass } from '../domain/action.js';
+import { config } from '../config.js';
 import type { ConnectionBinding } from '../domain/connection.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel } from '../domain/trust.js';
@@ -90,6 +91,12 @@ export interface RunPlanRequest {
    * minute for it. Production callers leave it unset and get the constant.
    */
   adapterTimeoutMs?: number;
+  /**
+   * Where produced files live — read by a `mail.send` attachment and by
+   * `doc.save`. Threaded from the scheduler; `runPlan` alone falls back to
+   * `config.documentRoot`.
+   */
+  documentRoot?: string;
   /** Passed through to the gate so a queued approval reaches the owner. */
   notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
   /**
@@ -567,7 +574,8 @@ async function performStep(
   // First, before a local handler or any channel is touched: a step whose
   // attachments do not resolve to the exact approved bytes fails here, final,
   // and no adapter is ever called (spec §8.2, ruling C16).
-  const attachments = await stepAttachments(step.toolName, effectiveInput, request.job);
+  const documentRoot = request.documentRoot ?? config.documentRoot;
+  const attachments = await stepAttachments(step.toolName, effectiveInput, request.job, documentRoot);
 
   if (!needsChannel(step.toolName)) {
     // A local step never carries attachments: `stepAttachments` above already
@@ -604,6 +612,7 @@ async function performStep(
       ...(request.reader !== undefined ? { reader: request.reader } : {}),
       ...(request.judge !== undefined ? { judge: request.judge } : {}),
       ...(request.production !== undefined ? { production: request.production } : {}),
+      documentRoot,
     });
     // No `externalId`: nothing outside the instance issued a handle, and
     // inventing one would tell `verify` it had a far end to ask.
@@ -816,6 +825,7 @@ async function stepAttachments(
   toolName: string,
   effectiveInput: Record<string, unknown>,
   job: Job,
+  documentRoot: string,
 ): Promise<ResolvedAttachment[]> {
   if (!Object.hasOwn(effectiveInput, ATTACHMENTS_KEY)) return [];
   if (toolName !== ATTACHMENT_TOOL) {
@@ -830,7 +840,7 @@ async function stepAttachments(
   if (approved === null || refs.data.some((ref) => ref.producedVersionId !== approved)) {
     throw new StepChannelError('attachments_not_supported', ATTACHMENTS_NOT_SUPPORTED_HE, false);
   }
-  const resolved = await resolveAttachments(refs.data, job.businessId);
+  const resolved = await resolveAttachments(refs.data, job.businessId, documentRoot);
   if (!resolved.ok) throw new StepChannelError(resolved.code, resolved.he, false);
   return resolved.files;
 }
