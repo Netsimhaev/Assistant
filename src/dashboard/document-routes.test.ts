@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import type { Server } from 'node:http';
+import { request, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -133,8 +133,11 @@ async function card(
   await saveVersionCheck(versionId, 'check1', { passed: true, findings: [] });
   let previewPath: string | null = null;
   if (options.preview !== undefined) {
+    // Under the dashboard's own document root — the root the production
+    // loop and the upload write under — never a second one.
     previewPath = `${DIR}/${versionId}.preview.png`;
-    await writeFile(join(config.documentRoot, previewPath), options.preview);
+    await mkdir(join(uploadRoot, DIR), { recursive: true });
+    await writeFile(join(uploadRoot, previewPath), options.preview);
   }
   await saveVersionCheck(versionId, 'check2', { passed: options.stage !== 'failed_checks', status: 'judged', findings: [], previewPath });
   expect(await advanceStage(productionId, 'queued', options.stage ?? 'ready', {
@@ -486,5 +489,63 @@ describe('typedAddressProblem (C12)', () => {
     const zwsp = String.fromCharCode(0x200b);
     expect(typedAddressProblem(`yossi@client${rlo}.example`)).not.toBe(null);
     expect(typedAddressProblem(`yo${zwsp}ssi@client.example`)).not.toBe(null);
+  });
+});
+
+describe('fix round 1 minors', () => {
+  it('an over-cap upload is refused, the request is cut off, and nothing is ingested', async () => {
+    const baseUrl = await start({ uploadMaxBytes: 1024 });
+    const cookie = await login(baseUrl);
+    const csrf = await csrfOf(baseUrl, cookie, '/instruct');
+    const { body, type } = multipart({ csrf, text: 'x' }, { name: 'big.txt', bytes: Buffer.alloc(400 * 1024, 0x61) });
+    const url = new URL(`${baseUrl}/instruct`);
+    // Declared length (refused before a byte is read) and chunked (refused mid-stream).
+    for (const declared of [true, false]) {
+      const { status, text } = await new Promise<{ status: number; text: string }>((resolveIt, reject) => {
+        const req = request(
+          {
+            host: url.hostname,
+            port: url.port,
+            path: url.pathname,
+            method: 'POST',
+            headers: { cookie, 'content-type': type, ...(declared ? { 'content-length': String(body.length) } : {}) },
+          },
+          (res) => {
+            const chunks: Buffer[] = [];
+            res.on('data', (c: Buffer) => chunks.push(c));
+            res.on('end', () => resolveIt({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') }));
+            res.on('error', reject);
+          },
+        );
+        req.on('error', () => undefined); // the server may close the upload mid-body, on purpose
+        if (declared) {
+          req.end(body);
+        } else {
+          for (let at = 0; at < body.length; at += 16 * 1024) req.write(body.subarray(at, at + 16 * 1024));
+          req.end();
+        }
+      });
+      expect(status, `declared=${declared}`).toBe(413);
+      expect(text).toContain('הקובץ גדול');
+    }
+    const { rows } = await getPool().query('SELECT 1 FROM documents');
+    expect(rows).toHaveLength(0);
+  });
+
+  it('an unreadable charter refuses the document screens instead of guessing a zone and currency', async () => {
+    const a = await card();
+    await getPool().query(
+      `UPDATE charter_versions SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
+        WHERE business_id = $1`,
+      [B],
+    );
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    const list = await get(baseUrl, cookie, '/documents');
+    expect(list.status).toBe(503);
+    expect(await list.text()).toContain('לא הצלחתי לקרוא את התקנון');
+    const one = await get(baseUrl, cookie, `/documents/${a.cardId}`);
+    expect(one.status).toBe(503);
+    expect((await loadDocumentCard(B, a.cardId))?.seenAt).toBe(null);
   });
 });

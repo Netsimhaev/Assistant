@@ -555,7 +555,31 @@ export type ApproveOutcome =
   | { status: 'approved'; jobId: string; option: 'send' | 'save' }
   | { status: 'card_stale' }
   | { status: 'not_open'; state: CardState }
+  /** A WhatsApp answer the card was not open for: not delivered there, answered before delivery, or past the window. */
+  | { status: 'not_answerable' }
   | { status: 'not_found' };
+
+/**
+ * Whether a WhatsApp message sent at `inboundAt` can answer a card delivered
+ * at `deliveredAt`: delivered, strictly after the delivery, and the delivery
+ * inside the question window. The same rule the door applies before it
+ * claims the message — re-checked under the card's row lock, because the
+ * delivery stamp can move in between (a typed address withdraws it, C12).
+ */
+export function whatsappAnswerable(
+  deliveredAt: Date | null,
+  inboundAt: Date | undefined,
+  options: { now?: number; windowMinutes?: number } = {},
+): boolean {
+  if (deliveredAt === null || inboundAt === undefined) return false;
+  const windowMinutes = options.windowMinutes ?? config.whatsappQuestionWindowMinutes;
+  if (windowMinutes <= 0) return false;
+  const delivered = deliveredAt.getTime();
+  const inbound = inboundAt.getTime();
+  if (Number.isNaN(delivered) || Number.isNaN(inbound)) return false;
+  if (!(inbound > delivered)) return false;
+  return (options.now ?? Date.now()) - delivered <= windowMinutes * 60_000;
+}
 
 interface LockedCard {
   card: DocumentCard;
@@ -587,7 +611,16 @@ export async function approveDocumentCard(
   cardId: string,
   planHash: string,
   actor: 'dashboard' | 'whatsapp',
-  options: { businessId: string },
+  options: {
+    businessId: string;
+    /**
+     * When the WhatsApp answer was sent (provider timestamp). Required for
+     * `actor: 'whatsapp'` — absent, the answer is refused: the time gate is
+     * re-checked here, under the card's lock (`whatsappAnswerable`).
+     */
+    whatsappInboundAt?: Date;
+    windowMinutes?: number;
+  },
 ): Promise<ApproveOutcome> {
   const { businessId } = options;
   return withTransaction(async (tx) => {
@@ -595,6 +628,14 @@ export async function approveDocumentCard(
     if (locked === null) return { status: 'not_found' };
     const { card, production, version } = locked;
     if (!ACTIONABLE.includes(card.state)) return { status: 'not_open', state: card.state };
+    if (
+      actor === 'whatsapp' &&
+      !whatsappAnswerable(card.whatsappDeliveredAt, options.whatsappInboundAt, {
+        ...(options.windowMinutes !== undefined ? { windowMinutes: options.windowMinutes } : {}),
+      })
+    ) {
+      return { status: 'not_answerable' };
+    }
     if (version.supersededAt !== null) return { status: 'card_stale' };
     if (production.stage !== 'ready' && production.stage !== 'failed_checks') return { status: 'card_stale' };
     const stage = production.stage;
@@ -723,14 +764,14 @@ export type TypedAddressOutcome =
 export async function addTypedRecipient(
   cardId: string,
   typed: string,
-  options: { businessId: string },
+  options: CardSeams & { businessId: string },
 ): Promise<TypedAddressOutcome> {
   const { businessId } = options;
   const problem = typedAddressProblem(typed);
   if (problem !== null) return { status: 'refused', reason: problem };
   const address = typed.trim();
 
-  return withTransaction(async (tx) => {
+  const outcome = await withTransaction<TypedAddressOutcome>(async (tx) => {
     const locked = await lockCard(tx, businessId, cardId);
     if (locked === null) return { status: 'not_found' };
     const { card, production, version } = locked;
@@ -750,14 +791,41 @@ export async function addTypedRecipient(
       [businessId, production.productionId, JSON.stringify(destination)],
     );
     const rebuilt = buildDeliveryOptions({ ...production, destination }, version, 'ready');
+    // The WhatsApp delivery is withdrawn with the old options: the message
+    // the owner has there does not show this address, so no answer to it may
+    // approve the option that sends to it.
     await tx.query(
-      `UPDATE document_cards SET delivery_plans = $3::jsonb WHERE business_id = $1 AND card_id = $2`,
+      `UPDATE document_cards SET delivery_plans = $3::jsonb, whatsapp_delivered_at = NULL
+        WHERE business_id = $1 AND card_id = $2`,
       [businessId, cardId, JSON.stringify(rebuilt)],
     );
     const send = rebuilt.find((option) => option.option === 'send');
     if (send === undefined) throw new Error(`addTypedRecipient: no send option rebuilt for ${cardId}`);
     return { status: 'added', planHash: send.planHash };
   });
+  if (outcome.status !== 'added') return outcome;
+
+  // The card as it now stands goes out again on the owner's channels; only
+  // that delivery, which shows the address, can be answered on WhatsApp.
+  // Never thrown for a send — `notifyCard` records each channel's state.
+  const db = getPool();
+  const card = await loadDocumentCard(businessId, cardId, db);
+  const version = card === null ? null : await loadVersion(businessId, card.versionId, db);
+  const production = version === null ? null : await loadProduction(businessId, version.productionId, db);
+  if (card !== null && version !== null && production !== null) {
+    const active = await loadActiveCharter(businessId, db);
+    const text = renderCardText({
+      cardId,
+      production,
+      version,
+      options: card.deliveryPlans,
+      stage: 'ready',
+      currency: active?.bundle.ceilings.currency ?? 'ILS',
+      ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
+    });
+    await notifyCard(card, production, version, text, options, db);
+  }
+  return outcome;
 }
 
 // ---------------------------------------------------------------- request a fix

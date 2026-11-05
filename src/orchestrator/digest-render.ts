@@ -175,7 +175,9 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
     ledger.overdue > 0 ||
     ledger.stuck > 0 ||
     ledger.closedByEvidence > 0 ||
-    documentsTotal > 0;
+    // Like open ledger rows: cards merely waiting are listed, not news.
+    documents.produced > 0 ||
+    documents.sent > 0;
 
   // Spec §2 decision 3: an empty day is SAID. The screen still gets it so the
   // record stays continuous; `hadContent` is what keeps it out of his inbox.

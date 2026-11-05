@@ -257,11 +257,14 @@ export interface DashboardOptions {
    * reads (`productionToolsFromEnv`).
    */
   production?: DocumentRouteOptions['production'];
+  /** Test seam for the upload cap; production leaves it unset (`MAX_ORIGINAL_BYTES`, the ingest's own). */
+  uploadMaxBytes?: number;
 }
 
 /** What the document screens and the upload need from `createServer`'s options. */
 interface InstructionDoorOptions extends DocumentRouteOptions {
   planner?: (request: PlanRequest) => Promise<PlanOutcome>;
+  uploadMaxBytes?: number;
 }
 
 /**
@@ -1120,9 +1123,18 @@ async function handleInstructPost(
   let form: URLSearchParams;
   let upload: MultipartFile | null = null;
   if (multipart) {
-    const read = await readUploadBody(req, req.headers['content-type']);
+    const read = await readUploadBody(req, req.headers['content-type'], doorOptions.uploadMaxBytes ?? MAX_ORIGINAL_BYTES);
     if (!read.ok) {
       // CSRF cannot be checked on a body that could not be read; nothing was written.
+      if (read.overCap) {
+        // The rest of the body is never buffered: answer with
+        // `Connection: close` (Node closes the socket once the answer is
+        // flushed), and discard whatever is still arriving meanwhile.
+        req.resume();
+        return sendHtml(res, 413, renderInstruct({ csrf: issueCsrfToken(session.sessionId), error: read.reason }), {
+          Connection: 'close',
+        });
+      }
       return sendHtml(res, 400, renderInstruct({ csrf: issueCsrfToken(session.sessionId), error: read.reason }));
     }
     form = read.form;
@@ -1211,26 +1223,50 @@ const UPLOAD_FRAMING_BYTES = MAX_BODY_BYTES;
 
 type UploadBody =
   | { ok: true; form: URLSearchParams; file: MultipartFile | null }
-  | { ok: false; reason: string };
+  /** `overCap`: the body was abandoned mid-stream — the caller must not read the request again. */
+  | { ok: false; reason: string; overCap: boolean };
 
 /**
  * The multipart body of `POST /instruct`, bounded before it is parsed: the
  * ingest's own size cap plus the form's framing. One file at most, refused
  * past the cap — never truncated.
  */
-async function readUploadBody(req: IncomingMessage, contentType: string | undefined): Promise<UploadBody> {
-  const tooLarge = `הקובץ גדול מ-${Math.round(MAX_ORIGINAL_BYTES / (1024 * 1024))}MB.`;
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req as AsyncIterable<Buffer>) {
-    total += chunk.length;
-    if (total > MAX_ORIGINAL_BYTES + UPLOAD_FRAMING_BYTES) {
-      // Drain nothing more into memory; the answer is already known.
-      return { ok: false, reason: tooLarge };
-    }
-    chunks.push(chunk);
+async function readUploadBody(
+  req: IncomingMessage,
+  contentType: string | undefined,
+  maxFileBytes: number,
+): Promise<UploadBody> {
+  const tooLarge = `הקובץ גדול מ-${Math.max(1, Math.round(maxFileBytes / (1024 * 1024)))}MB.`;
+  // A declared length past the cap is refused before a byte is buffered.
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > maxFileBytes + UPLOAD_FRAMING_BYTES) {
+    return { ok: false, reason: tooLarge, overCap: true };
   }
-  const parsed = parseMultipart(Buffer.concat(chunks), contentType, { maxFileBytes: MAX_ORIGINAL_BYTES });
+  // Read with events rather than `for await`: leaving a `for await` early
+  // destroys the request — and its socket — before the refusal can be sent.
+  // Past the cap nothing more is buffered; the caller answers with
+  // `Connection: close` and the rest is discarded.
+  const chunks: Buffer[] = [];
+  const within = await new Promise<boolean>((resolveRead, rejectRead) => {
+    let total = 0;
+    const onData = (chunk: Buffer): void => {
+      total += chunk.length;
+      if (total > maxFileBytes + UPLOAD_FRAMING_BYTES) {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.resume();
+        resolveRead(false);
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = (): void => resolveRead(true);
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.once('error', rejectRead);
+  });
+  if (!within) return { ok: false, reason: tooLarge, overCap: true };
+  const parsed = parseMultipart(Buffer.concat(chunks), contentType, { maxFileBytes });
   if (!parsed.ok) {
     const reason =
       parsed.code === 'too_many_files'
@@ -1238,7 +1274,7 @@ async function readUploadBody(req: IncomingMessage, contentType: string | undefi
         : parsed.code === 'file_too_large'
           ? tooLarge
           : 'לא הצלחתי לקרוא את הטופס.';
-    return { ok: false, reason };
+    return { ok: false, reason, overCap: false };
   }
   const form = new URLSearchParams();
   for (const [key, value] of parsed.fields) form.set(key, value);
@@ -3026,7 +3062,7 @@ async function route(
   const documentCardMatch = DOCUMENT_CARD_PATH.exec(pathname);
   if (method === 'GET' && documentCardMatch?.[1] !== undefined) {
     const cardId = decodePathSegment(documentCardMatch[1]);
-    return cardId === null ? notFound(res) : handleDocumentCard(res, businessId, session, cardId);
+    return cardId === null ? notFound(res) : handleDocumentCard(res, businessId, session, cardId, documentRoot);
   }
   const documentGetMatch = DOCUMENT_CARD_GET_PATH.exec(pathname);
   if (method === 'GET' && documentGetMatch?.[1] !== undefined) {
@@ -3034,16 +3070,17 @@ async function route(
     if (cardId === null) return notFound(res);
     return documentGetMatch[2] === 'download'
       ? handleDocumentDownload(res, businessId, cardId)
-      : handleDocumentPreview(res, businessId, cardId);
+      : handleDocumentPreview(res, businessId, cardId, documentRoot);
   }
   const documentPostMatch = DOCUMENT_CARD_POST_PATH.exec(pathname);
   if (method === 'POST' && documentPostMatch?.[1] !== undefined) {
     const cardId = decodePathSegment(documentPostMatch[1]);
     if (cardId === null) return notFound(res);
     const form = await readFormBody(req);
-    if (documentPostMatch[2] === 'approve') return handleDocumentApprove(res, businessId, session, cardId, form);
-    if (documentPostMatch[2] === 'fix') return handleDocumentFix(res, businessId, session, cardId, form, doorOptions);
-    return handleDocumentAddress(res, businessId, session, cardId, form);
+    const routeOptions = { ...doorOptions, ...(documentRoot !== undefined ? { documentRoot } : {}) };
+    if (documentPostMatch[2] === 'approve') return handleDocumentApprove(res, businessId, session, cardId, form, routeOptions);
+    if (documentPostMatch[2] === 'fix') return handleDocumentFix(res, businessId, session, cardId, form, routeOptions);
+    return handleDocumentAddress(res, businessId, session, cardId, form, routeOptions);
   }
 
   // The OAuth consent ceremony (oauth-routes.ts): the dashboard is the only
@@ -3190,6 +3227,7 @@ export function createServer(options: DashboardOptions = {}): Server {
     const doorOptions: InstructionDoorOptions = {
       production: options.production ?? productionToolsFromEnv(),
       ...(options.planner !== undefined ? { planner: options.planner } : {}),
+      ...(options.uploadMaxBytes !== undefined ? { uploadMaxBytes: options.uploadMaxBytes } : {}),
     };
     route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions, doorOptions).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);

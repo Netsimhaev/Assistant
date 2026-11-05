@@ -607,9 +607,20 @@ async function handleConfirmationMessage(input: {
     businessId: ctx.businessId,
     ...windowOverride,
   });
+  // Open document cards count too (document production C9) — the same
+  // definition the document-card reader uses.
+  const documentCards = await openDocumentCards({
+    businessId: ctx.businessId,
+    inboundAt: msg.providerTimestamp,
+    ...windowOverride,
+  });
   const only = confirmations.length === 1 ? confirmations[0] : undefined;
   const reading = readings[0];
-  if (only === undefined || reading === undefined || cards.length + questions.length > 0) {
+  if (
+    only === undefined ||
+    reading === undefined ||
+    cards.length + questions.length + documentCards.length > 0
+  ) {
     await reply(SEVERAL_OPEN_REFUSAL, 'failed', null);
     return 'refused';
   }
@@ -818,6 +829,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
           messenger: ctx.messenger,
           businessId: ctx.businessId,
           production: ctx.production,
+          ...windowOverride,
         });
         if (handled === 'decided' || handled === 'fix') return 'documentCard';
         if (handled !== 'passthrough') return handled;

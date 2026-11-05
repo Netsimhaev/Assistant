@@ -338,4 +338,10 @@ describe('renderDigest', () => {
     expect(out.hadContent).toBe(true);
     expect(renderDigest(facts()).body).not.toContain('הופקו');
   });
+
+  it('cards merely waiting are not news on their own — the line shows, the window is still empty', () => {
+    const out = renderDigest(facts({ documents: { produced: 0, sent: 0, waiting: 2 } }));
+    expect(out.body).toContain('הופקו 0 מסמכים, 0 נשלחו, 2 מחכים לבדיקתך');
+    expect(out.hadContent).toBe(false);
+  });
 });

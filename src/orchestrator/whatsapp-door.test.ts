@@ -44,12 +44,13 @@ import { raiseMailReply } from './mail-reply.js';
 import { presentMailCard } from './whatsapp-mail-card.js';
 import { createLedgerItem, loadLedgerItem } from '../ledger/store.js';
 import type { DocxSpec } from '../domain/document-spec.js';
-import { createDocumentCard, loadDocumentCard } from '../production/card.js';
+import { addTypedRecipient, createDocumentCard, loadDocumentCard } from '../production/card.js';
 import { advanceStage, createProduction, saveVersion, type ProductionDestination } from '../production/store.js';
 import {
   DOCUMENT_CARD_FIX_OPENED,
   DOCUMENT_CARD_SAVED,
   DOCUMENT_CARD_SEVERAL_OPTIONS,
+  documentCardSent,
 } from './whatsapp-document-card.js';
 
 const BUSINESS = 'test-business';
@@ -2239,17 +2240,64 @@ describe('confirming a held command over WhatsApp', () => {
       return (await loadDocumentCard(BUSINESS, cardId))?.state;
     }
 
-    it('"שלחי" with one document card approves it', async () => {
-      const cardId = await documentCard();
+    it('"שלחי" with one document card approves its single send option', async () => {
+      const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
+      expect((await loadDocumentCard(BUSINESS, cardId))?.deliveryPlans).toHaveLength(2);
       gateway.enqueue(reply('שלחי'));
       const result = await pass();
 
       expect(result.documentCardReplies).toBe(1);
       expect(result.instructed).toBe(0);
       const card = await loadDocumentCard(BUSINESS, cardId);
-      expect(card?.state).toBe('saved');
+      expect(card?.state).toBe('approved');
       expect(card?.deliveryJobId).not.toBe(null);
+      expect(lastSent()).toBe(documentCardSent(['dana@example.com']));
+    });
+
+    it('"שמרי" approves the single save option', async () => {
+      const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
+      gateway.enqueue(reply('שמרי'));
+      const result = await pass();
+
+      expect(result.documentCardReplies).toBe(1);
+      expect(result.ledgerReplies).toBe(0);
+      const card = await loadDocumentCard(BUSINESS, cardId);
+      expect(card?.state).toBe('saved');
       expect(lastSent()).toBe(DOCUMENT_CARD_SAVED);
+    });
+
+    it('a held confirmation and a document card open: "כן" → SEVERAL_OPEN_REFUSAL, nothing applied', async () => {
+      const jobId = await held([SINGLE]);
+      const cardId = await documentCard();
+      gateway.enqueue(reply('כן'));
+      const result = await pass();
+
+      expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+      expect(result.refused).toBe(1);
+      expect(result.confirmationReplies).toBe(0);
+      expect(await confirmationState(jobId)).toBe('pending');
+      expect(await phase(jobId)).toBe('plan');
+      expect(await cardState(cardId)).toBe('open');
+    });
+
+    it('audio "שלחי" passes through', async () => {
+      const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
+      gateway.enqueue(audioMsg({ senderNumber: PRINCIPAL_NUMBER, providerTimestamp: new Date(Date.now() + 1_000).toISOString() }));
+      let transcribed = 0;
+      const result = await runWhatsAppDoor({
+        gateway,
+        messenger,
+        businessId: BUSINESS,
+        provider: async () => {
+          transcribed += 1;
+          return { text: 'שלחי' };
+        },
+        planner: plannedWith(recallPlan()),
+      });
+      expect(transcribed).toBe(1);
+      expect(result.documentCardReplies).toBe(0);
+      expect(result.instructed).toBe(1);
+      expect(await cardState(cardId)).toBe('open');
     });
 
     it('"שלחי" with a document card and a mail card open → SEVERAL_OPEN_REFUSAL, neither approved', async () => {
@@ -2317,13 +2365,24 @@ describe('confirming a held command over WhatsApp', () => {
       expect(await cardState(cardId)).toBe('open');
     });
 
-    it('"שלחי" on a card with a send and a save option asks for the dashboard and approves nothing', async () => {
-      const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
-      expect((await loadDocumentCard(BUSINESS, cardId))?.deliveryPlans).toHaveLength(2);
+    it('"שלחי" on a card with no send option asks for the dashboard and approves nothing', async () => {
+      const cardId = await documentCard({ mode: 'save', folder: null });
+      expect((await loadDocumentCard(BUSINESS, cardId))?.deliveryPlans.map((o) => o.option)).toEqual(['save']);
       gateway.enqueue(reply('שלחי'));
       const result = await pass();
       expect(lastSent()).toBe(DOCUMENT_CARD_SEVERAL_OPTIONS);
       expect(result.refused).toBe(1);
+      expect(await cardState(cardId)).toBe('open');
+    });
+
+    it('a typed address on the dashboard withdraws the card from WhatsApp until it is shown again', async () => {
+      const cardId = await documentCard({ mode: 'send', to: [] });
+      expect((await addTypedRecipient(cardId, 'yossi@client.example', { businessId: BUSINESS })).status).toBe('added');
+      expect((await loadDocumentCard(BUSINESS, cardId))?.whatsappDeliveredAt).toBe(null);
+      gateway.enqueue(reply('שלחי'));
+      const result = await pass(plannedWith(recallPlan()));
+      expect(result.documentCardReplies).toBe(0);
+      expect(result.instructed).toBe(1);
       expect(await cardState(cardId)).toBe('open');
     });
 

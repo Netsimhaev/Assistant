@@ -74,6 +74,8 @@ export interface DocumentRouteOptions {
    * to the same two env vars `buildRuntime` reads.
    */
   production?: Runtime['production'];
+  /** The dashboard's document root (`DashboardOptions.documentRoot`); `config.documentRoot` when unset. */
+  documentRoot?: string;
 }
 
 const SECURITY_HEADERS = { 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY' } as const;
@@ -103,14 +105,31 @@ export function productionToolsFromEnv(env: NodeJS.ProcessEnv = process.env): No
   return { available: sofficePath !== null && chromiumPath !== null, sofficePath, chromiumPath };
 }
 
-async function charterContext(businessId: string): Promise<{ timeZone: string; currency: string }> {
+export const CHARTER_UNREADABLE_HE =
+  'לא הצלחתי לקרוא את התקנון הפעיל, ולכן אינני מציגה מסמכים — בלי התקנון אינני יודעת באיזה מטבע ובאיזה אזור זמן להציג אותם. אפשר לתקן אותו בעריכת הכללים.';
+
+/**
+ * The charter's zone and currency, or `null` when the active charter cannot
+ * be read. Refused, never defaulted: a card whose amounts are shown in a
+ * guessed currency is a card whose echo is not what will run.
+ */
+async function charterContext(businessId: string): Promise<{ timeZone: string; currency: string } | null> {
   try {
     const active = await loadActiveCharter(businessId);
-    if (active !== null) return { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency };
+    return active === null
+      ? null
+      : { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency };
   } catch {
-    // an unreadable charter costs the zone, not the page
+    return null;
   }
-  return { timeZone: 'UTC', currency: 'ILS' };
+}
+
+function charterUnreadable(res: ServerResponse): void {
+  html(
+    res,
+    503,
+    `<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8"><title>מסמכים</title></head><body><p>${CHARTER_UNREADABLE_HE}</p><p><a href="/setup/edit">עריכת הכללים</a></p></body></html>`,
+  );
 }
 
 const ACTIONABLE: readonly CardState[] = ['open', 'failed_send'];
@@ -128,6 +147,9 @@ interface ListRow {
 }
 
 export async function handleDocumentList(res: ServerResponse, businessId: string, session: DocumentSession): Promise<void> {
+  // Before anything is read or marked seen.
+  const context = await charterContext(businessId);
+  if (context === null) return charterUnreadable(res);
   const { rows } = await getPool().query<ListRow>(
     `SELECT c.card_id, c.state, p.kind, v.spec->>'title' AS title, c.created_at, c.seen_at, p.stage
        FROM document_cards c
@@ -163,8 +185,7 @@ export async function handleDocumentList(res: ServerResponse, businessId: string
       [businessId, shown.map((r) => r.card_id)],
     );
   }
-  const { timeZone } = await charterContext(businessId);
-  html(res, 200, renderDocumentList({ rows: listRows, timeZone, csrf: issueCsrfToken(session.sessionId), truncated }));
+  html(res, 200, renderDocumentList({ rows: listRows, timeZone: context.timeZone, csrf: issueCsrfToken(session.sessionId), truncated }));
 }
 
 // ---------------------------------------------------------------- one card
@@ -205,9 +226,13 @@ function previewPathOf(raw: unknown): string | null {
   return parsed.success ? (parsed.data.previewPath ?? null) : null;
 }
 
-/** The stored file under `config.documentRoot`, resolved and contained — `null` when absent or escaping. */
-async function containedFile(stored: string): Promise<string | null> {
-  const root = resolve(config.documentRoot);
+/**
+ * The stored file under `documentRoot` — the dashboard's own root, the one
+ * the upload and the production loop write under — resolved and contained;
+ * `null` when absent or escaping.
+ */
+async function containedFile(stored: string, documentRoot: string | undefined): Promise<string | null> {
+  const root = resolve(documentRoot ?? config.documentRoot);
   try {
     const [realRoot, realFile] = await Promise.all([realpath(root), realpath(resolve(root, stored))]);
     const rel = relative(realRoot, realFile);
@@ -250,13 +275,16 @@ async function renderCard(
   businessId: string,
   session: DocumentSession,
   loaded: Loaded,
+  documentRoot: string | undefined,
   error?: string,
 ): Promise<void> {
   const { card, production, version } = loaded;
-  const { currency } = await charterContext(businessId);
+  const context = await charterContext(businessId);
+  if (context === null) return charterUnreadable(res);
+  const { currency } = context;
   const settings = await loadDocumentSettings({ businessId });
   const previewPath = previewPathOf(version.check2);
-  const hasPreview = previewPath !== null && (await containedFile(previewPath)) !== null;
+  const hasPreview = previewPath !== null && (await containedFile(previewPath, documentRoot)) !== null;
   const failedChecks = production.stage === 'failed_checks';
   html(
     res,
@@ -299,16 +327,22 @@ export async function handleDocumentCard(
   businessId: string,
   session: DocumentSession,
   cardId: string,
+  documentRoot: string | undefined,
 ): Promise<void> {
   const loaded = await loadCard(businessId, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
-  return renderCard(res, 200, businessId, session, loaded);
+  return renderCard(res, 200, businessId, session, loaded, documentRoot);
 }
 
-export async function handleDocumentPreview(res: ServerResponse, businessId: string, cardId: string): Promise<void> {
+export async function handleDocumentPreview(
+  res: ServerResponse,
+  businessId: string,
+  cardId: string,
+  documentRoot: string | undefined,
+): Promise<void> {
   const loaded = await loadCard(businessId, cardId);
   const stored = loaded === null ? null : previewPathOf(loaded.version.check2);
-  const file = stored === null ? null : await containedFile(stored);
+  const file = stored === null ? null : await containedFile(stored, documentRoot);
   if (file === null) return html(res, 404, renderNotFound());
   let bytes: Buffer;
   try {
@@ -369,6 +403,7 @@ export async function handleDocumentApprove(
   session: DocumentSession,
   cardId: string,
   form: URLSearchParams,
+  options: DocumentRouteOptions = {},
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
   // The plan hash and nothing else — see the module docblock.
@@ -378,7 +413,7 @@ export async function handleDocumentApprove(
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());
   const loaded = await loadCard(businessId, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
-  return renderCard(res, 409, businessId, session, loaded, CARD_STALE_HE);
+  return renderCard(res, 409, businessId, session, loaded, options.documentRoot, CARD_STALE_HE);
 }
 
 export async function handleDocumentFix(
@@ -405,6 +440,7 @@ export async function handleDocumentFix(
     businessId,
     session,
     loaded,
+    options.documentRoot,
     outcome.status === 'refused' ? outcome.reason : CARD_STALE_HE,
   );
 }
@@ -416,8 +452,12 @@ export async function handleDocumentAddress(
   session: DocumentSession,
   cardId: string,
   form: URLSearchParams,
+  options: DocumentRouteOptions = {},
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
+  // The dashboard has no notification seams of its own: the re-sent card's
+  // channels are recorded `skipped_not_connected`, and the WhatsApp delivery
+  // stays withdrawn until a card is delivered there again.
   const outcome = await addTypedRecipient(cardId, form.get('to') ?? '', { businessId });
   if (outcome.status === 'added') return seeOther(res, `/documents/${encodeURIComponent(cardId)}`);
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());
@@ -429,6 +469,7 @@ export async function handleDocumentAddress(
     businessId,
     session,
     loaded,
+    options.documentRoot,
     outcome.status === 'refused' ? outcome.reason : CARD_STALE_HE,
   );
 }

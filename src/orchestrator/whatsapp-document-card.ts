@@ -24,14 +24,14 @@
  * than one card of either kind open, the answer is `SEVERAL_OPEN_REFUSAL`
  * and nothing is approved. The same count gates "תיקון:".
  *
- * **"שלחי" approves one option, and only an unambiguous one.** A card that
- * offers several options (send AND save) cannot be answered by one word —
- * "יש כמה אפשרויות — אשרי בדשבורד". A lone option is approved only when it
- * is what the card was made for: a `ready` card whose one option is the send
- * it was asked to make, or the save it was asked to make. A version that did
- * not pass the checks, or a send request left with only a save option (no
- * authorised recipient), is the dashboard's. The approval itself is
- * `approveDocumentCard` — the dashboard's own call, with `actor: 'whatsapp'`.
+ * **"שלחי"/"שלח" approves the card's single SEND option; "שמרי"/"שמור" its
+ * single SAVE option.** None or several of the chosen kind — "יש כמה
+ * אפשרויות — אשרי בדשבורד". A send option exists only on a version that
+ * passed both checks (`buildDeliveryOptions`). The approval is
+ * `approveDocumentCard` with `actor: 'whatsapp'` and the message's provider
+ * timestamp, which re-checks the time gate under the card's row lock
+ * (`whatsappAnswerable`) — the delivery stamp can move between this reader
+ * and the approval (a typed address withdraws it, C12).
  *
  * **"תיקון: <text>"** is `requestFix` with `textOrigin: 'typed'`.
  *
@@ -47,7 +47,7 @@ import { claimMessage, settleMessage } from '../whatsapp/store.js';
 import { approveDocumentCard, loadDocumentCard, requestFix, type DocumentCard } from '../production/card.js';
 import { loadProduction, loadVersion } from '../production/store.js';
 import type { Runtime } from './runtime.js';
-import { isApproveWord } from './whatsapp-mail-card.js';
+import { MAIL_CARD_APPROVE_WORDS, isApproveWord } from './whatsapp-mail-card.js';
 
 /**
  * Spec §10.11 of the boss command, verbatim: more than one thing is open, and
@@ -56,7 +56,6 @@ import { isApproveWord } from './whatsapp-mail-card.js';
  */
 export const SEVERAL_OPEN_REFUSAL = 'יש כמה שאלות פתוחות — עני בדשבורד';
 export const DOCUMENT_CARD_SEVERAL_OPTIONS = 'יש כמה אפשרויות — אשרי בדשבורד';
-export const DOCUMENT_CARD_DASHBOARD_ONLY = 'את הכרטיס הזה אפשר לאשר רק בדשבורד.';
 export const DOCUMENT_CARD_GONE = 'הכרטיס הזה כבר הוכרע או שהשתנה — לא שיניתי דבר.';
 export const DOCUMENT_CARD_FIX_OPENED = 'קיבלתי. אני מכינה גרסה מתוקנת, וכרטיס חדש יגיע אלייך.';
 export const DOCUMENT_CARD_SAVED = 'אישרתי. המסמך יישמר בתיקייה.';
@@ -75,9 +74,26 @@ export function fixRequestText(text: string): string | null {
   return match === null ? null : clean.slice(match[0].length).trim();
 }
 
+/**
+ * "שלחי"/"שלח" — the mail card's own approve words (`MAIL_CARD_APPROVE_WORDS`):
+ * one word answers both kinds of card, which is why C9 counts them together.
+ */
+export const DOCUMENT_CARD_SEND_WORDS: readonly string[] = MAIL_CARD_APPROVE_WORDS;
+/**
+ * "שמרי"/"שמור" approve the card's save option. A whole message only, so the
+ * ledger's "שמרי שלבים" never reads as one; kept disjoint from every other
+ * reader's list (`whatsapp-document-card.test.ts`).
+ */
+export const DOCUMENT_CARD_SAVE_WORDS: readonly string[] = ['שמרי', 'שמור'];
+const SAVE_WORDS: ReadonlySet<string> = new Set(DOCUMENT_CARD_SAVE_WORDS);
+
+function isSaveWord(text: string): boolean {
+  return SAVE_WORDS.has(stripBidiControls(text).trim());
+}
+
 /** Whether a typed message is a document-card action at all — read before anything is claimed. */
 export function isDocumentCardAction(text: string): boolean {
-  return isApproveWord(text) || fixRequestText(text) !== null;
+  return isApproveWord(text) || isSaveWord(text) || fixRequestText(text) !== null;
 }
 
 /**
@@ -138,6 +154,8 @@ export async function handleDocumentCardMessage(input: {
   messenger: BossMessenger;
   businessId: string;
   production: Runtime['production'] | undefined;
+  /** Test seam, the door's `questionWindowMinutes`. */
+  windowMinutes?: number;
 }): Promise<DocumentCardOutcome> {
   const { msg, storedId, cards, messenger, businessId } = input;
   if (msg.mediaKind !== null || msg.body === null) return 'passthrough';
@@ -172,20 +190,27 @@ export async function handleDocumentCardMessage(input: {
     return refuse(outcome.status === 'refused' ? outcome.reason : DOCUMENT_CARD_GONE);
   }
 
-  // "שלחי": one option, and the one the card was made for.
-  if (only.deliveryPlans.length !== 1) return refuse(DOCUMENT_CARD_SEVERAL_OPTIONS);
-  const option = only.deliveryPlans[0]!;
+  // "שלחי" approves the card's single SEND option, "שמרי" its single SAVE
+  // option; none or several of the chosen kind is the dashboard's.
+  const kind: 'send' | 'save' = isSaveWord(text) ? 'save' : 'send';
+  const ofKind = only.deliveryPlans.filter((o) => o.option === kind);
+  if (ofKind.length !== 1) return refuse(DOCUMENT_CARD_SEVERAL_OPTIONS);
+  const option = ofKind[0]!;
   const version = await loadVersion(businessId, only.versionId);
   const production = version === null ? null : await loadProduction(businessId, version.productionId);
   if (production === null) return refuse(DOCUMENT_CARD_GONE);
-  if (production.stage !== 'ready' || option.option !== production.destination.mode) {
-    return refuse(DOCUMENT_CARD_DASHBOARD_ONLY);
-  }
 
-  const outcome = await approveDocumentCard(only.cardId, option.planHash, 'whatsapp', { businessId });
+  // The time gate again, inside the approval, under the card's lock.
+  const outcome = await approveDocumentCard(only.cardId, option.planHash, 'whatsapp', {
+    businessId,
+    whatsappInboundAt: new Date(msg.providerTimestamp),
+    ...(input.windowMinutes !== undefined ? { windowMinutes: input.windowMinutes } : {}),
+  });
   if (outcome.status !== 'approved') return refuse(DOCUMENT_CARD_GONE);
   await reply(
-    production.destination.mode === 'send' ? documentCardSent(production.destination.to) : DOCUMENT_CARD_SAVED,
+    kind === 'send' && production.destination.mode === 'send'
+      ? documentCardSent(production.destination.to)
+      : DOCUMENT_CARD_SAVED,
     'handled',
     outcome.jobId,
   );
