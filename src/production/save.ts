@@ -51,7 +51,7 @@
  * touches the disk. The base
  * folder's own copies are the owner's files: erasure lists them but never
  * deletes them (§9.3), which is why the result carries the absolute `path`
- * and why it is recorded on the delivery row (`recordSavedPath`, migration 057).
+ * and why it is recorded on the delivery row (`recordSavedPath`, migrations 057/058).
  */
 import { createHash } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
@@ -375,16 +375,19 @@ export async function runDocSave(
 }
 
 /**
- * Where the copy landed, on this delivery job's own `document_deliveries`
- * row (migration 057) — the only record of it: a local step's output is not
- * persisted, and the written name may carry a " (2)" suffix the plan never
- * knew. An erasure of the person the document was for lists the path under
- * "נשארים בתיקייה שלך" and never deletes the file (spec C7).
+ * Where the copy landed, APPENDED to this delivery job's own
+ * `document_deliveries.saved_paths` (migrations 057/058) — the only record of
+ * it: a local step's output is not persisted, and the written name may carry
+ * a " (2)" suffix the plan never knew. Appended, never overwritten: a second
+ * copy by the same job must not erase the record of the first. An erasure of
+ * the person the document was for lists every path under "נשארים בתיקייה
+ * שלך" and never deletes the files (spec C7).
  *
  * **A failure here does not fail the save.** The file is written and
  * verified; failing the step would tell the owner the save failed while his
  * copy sits on disk. The cost, recorded in CLAUDE.md's known issues: such a
- * copy is missing from a later erasure preview. Logged, so it is not silent.
+ * copy is missing from a later erasure preview. Logged — both a statement
+ * that threw and one that matched no delivery row — so it is not silent.
  */
 async function recordSavedPath(
   ctx: { jobId: string; businessId: string },
@@ -392,11 +395,14 @@ async function recordSavedPath(
   db: Queryable,
 ): Promise<void> {
   try {
-    await db.query(
-      `UPDATE document_deliveries SET saved_path = $3, saved_at = now()
+    const { rowCount } = await db.query(
+      `UPDATE document_deliveries SET saved_paths = array_append(saved_paths, $3)
         WHERE business_id = $1 AND job_id = $2`,
       [ctx.businessId, ctx.jobId, path],
     );
+    if ((rowCount ?? 0) === 0) {
+      console.error(`doc.save: the copy for job ${ctx.jobId} was written but no delivery row recorded its path`);
+    }
   } catch (err) {
     console.error(`doc.save: the copy for job ${ctx.jobId} was written but its path was not recorded`, err);
   }

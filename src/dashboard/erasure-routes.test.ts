@@ -179,6 +179,7 @@ describe('the erasure screen', () => {
         ledgerRuleIds: [],
         productionIds: [],
         savedCopies: [],
+        filesNotDeleted: [],
         filePaths: [],
         items: [],
         excluded: [
@@ -209,6 +210,7 @@ describe('the erasure screen', () => {
         ledgerRuleIds: [],
         productionIds: [],
         savedCopies: [],
+        filesNotDeleted: [],
         filePaths: [],
         items: [],
         excluded: [],
@@ -940,6 +942,7 @@ describe('the smaller things the screen owes the owner', () => {
         ledgerRuleIds: [],
         productionIds: [],
         savedCopies: [],
+        filesNotDeleted: [],
         filePaths: [],
         items: [],
         excluded: [],

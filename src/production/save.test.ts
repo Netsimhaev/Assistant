@@ -315,13 +315,39 @@ describe('doc.save handler', () => {
     await writeFile(join(dir, CANONICAL), 'taken');
     const result = await save({ producedVersionId: versionId, sha256: sha(bytes), folder: 'לקוחות', filename: CANONICAL });
     expect(result['path']).toBe(join(dir, 'רווחיות מרץ (2).xlsx'));
-    const { rows } = await getPool().query<{ saved_path: string | null; saved_at: Date | null }>(
-      'SELECT saved_path, saved_at FROM document_deliveries WHERE job_id = $1',
+    const { rows } = await getPool().query<{ saved_paths: string[] }>(
+      'SELECT saved_paths FROM document_deliveries WHERE job_id = $1',
       [JOB],
     );
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.saved_path).toBe(result['path']);
-    expect(rows[0]?.saved_at).not.toBeNull();
+    expect(rows).toEqual([{ saved_paths: [result['path']] }]);
+
+    // A second copy by the same delivery job is APPENDED, never overwrites
+    // the first: the owner must be told about every copy on his disk.
+    const again = await save({ producedVersionId: versionId, sha256: sha(bytes), folder: 'לקוחות', filename: CANONICAL });
+    expect(again['path']).toBe(join(dir, 'רווחיות מרץ (3).xlsx'));
+    const after = await getPool().query<{ saved_paths: string[] }>(
+      'SELECT saved_paths FROM document_deliveries WHERE job_id = $1',
+      [JOB],
+    );
+    expect(after.rows).toEqual([{ saved_paths: [result['path'], again['path']] }]);
+  });
+
+  it('logs, and still succeeds, when no delivery row records the copy', async () => {
+    const versionId = await produced();
+    await deliveryCard(versionId);
+    await withBase();
+    const logged: unknown[][] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logged.push(args);
+    };
+    try {
+      const result = await save({ producedVersionId: versionId, sha256: sha(bytes), folder: null, filename: CANONICAL });
+      expect(result['performed']).toBe(true);
+    } finally {
+      console.error = original;
+    }
+    expect(logged.map((args) => String(args[0]))).toEqual([expect.stringContaining('no delivery row')]);
   });
 
   it('a null folder lands under the kind label', async () => {

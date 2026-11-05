@@ -248,6 +248,31 @@ export async function executeErasure(
             .join(' · '),
         );
       }
+
+      // And the cards, locked too: a card approved between the preview and
+      // the confirm has a delivery job the plan never listed — its plan and
+      // confirmation would survive this erasure, and the job would run
+      // against a version this transaction deletes. Any delivery job outside
+      // the plan's jobs (or the jobs the owner kept, which the plan also
+      // knows) refuses. `approveDocumentCard` takes the same row lock, so
+      // an approval after this read waits for the commit and then finds no
+      // card.
+      const known = new Set([
+        ...jobIds,
+        ...plan.excluded.filter((k) => k.itemKind === 'job').map((k) => k.itemId),
+      ]);
+      const { rows: lockedCards } = await client.query<{ card_id: string; delivery_job_id: string | null }>(
+        `SELECT card_id, delivery_job_id FROM document_cards WHERE ${DOCUMENT_CARDS_ERASED_PREDICATE} FOR UPDATE`,
+        [businessId, productionIds],
+      );
+      const raced = lockedCards.filter((row) => row.delivery_job_id !== null && !known.has(row.delivery_job_id));
+      if (raced.length > 0) {
+        throw new ErasureRefusedError(
+          raced
+            .map((row) => `כרטיס המסמך ${row.card_id} אושר מאז שהתצוגה המקדימה הוכנה; המחיקה בוטלה.`)
+            .join(' · '),
+        );
+      }
     }
 
     const del = async (table: string, sql: string, params: unknown[]): Promise<void> => {
@@ -393,7 +418,7 @@ export async function executeErasure(
       `DELETE FROM ledger_critical_rules WHERE ${LEDGER_CRITICAL_RULES_ERASED_PREDICATE}`,
       [businessId, ledgerRuleIds],
     );
-    // Document production (migrations 053–057). Leaf first — cards, then
+    // Document production (migrations 053–058). Leaf first — cards, then
     // versions, then productions: each cascades from the next, and a cascade
     // that beat the explicit statement to the row would leave it reporting
     // zero for a table that really lost rows. No foreign key to `documents`

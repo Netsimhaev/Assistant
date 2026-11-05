@@ -14,7 +14,7 @@ import { insertOrGetDocument } from '../documents/store.js';
 import { recordSignature } from './signatures.js';
 import { keepItem } from './kept-items.js';
 import { buildErasurePlan } from './erasure-plan.js';
-import { executeErasure } from './erasure.js';
+import { ErasureRefusedError, executeErasure } from './erasure.js';
 import { renderErasure } from '../dashboard/views.js';
 
 const BUSINESS = 'test-business';
@@ -1054,7 +1054,7 @@ describe('the task ledger', () => {
 });
 
 /**
- * Document production (migrations 053–057). A production's request text,
+ * Document production (migrations 053–058). A production's request text,
  * destination, working record and findings, every version's spec and check
  * results, and every card's delivery plans are content about a person — and
  * the produced files themselves are the person's document. Discovered by
@@ -1112,17 +1112,24 @@ describe('document production', () => {
   async function aVersion(
     productionId: string,
     versionId: string,
-    opts: { spec?: unknown; deliveryPlans?: unknown } = {},
+    opts: { spec?: unknown; deliveryPlans?: unknown; check1?: unknown; check2?: unknown; storedPath?: string } = {},
   ): Promise<{ file: string; preview: string; cardId: string }> {
-    const storedPath = join('produced', BUSINESS, productionId, `${versionId}.docx`);
+    const storedPath = opts.storedPath ?? join('produced', BUSINESS, productionId, `${versionId}.docx`);
     const previewPath = join('produced', BUSINESS, productionId, `${versionId}.preview.png`);
     await mkdir(join(root, 'produced', BUSINESS, productionId), { recursive: true });
-    await writeFile(join(root, storedPath), 'docx-bytes');
+    if (opts.storedPath === undefined) await writeFile(join(root, storedPath), 'docx-bytes');
     await writeFile(join(root, previewPath), 'png-bytes');
     await getPool().query(
-      `INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes, check2)
-       VALUES ($1, $2, 1, $3::jsonb, $4, repeat('a', 64), 10, $5::jsonb)`,
-      [versionId, productionId, JSON.stringify(opts.spec ?? { title: 'הצעת מחיר' }), storedPath, JSON.stringify({ previewPath })],
+      `INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes, check1, check2)
+       VALUES ($1, $2, 1, $3::jsonb, $4, repeat('a', 64), 10, $5::jsonb, $6::jsonb)`,
+      [
+        versionId,
+        productionId,
+        JSON.stringify(opts.spec ?? { title: 'הצעת מחיר' }),
+        storedPath,
+        opts.check1 === undefined ? null : JSON.stringify(opts.check1),
+        JSON.stringify({ previewPath, ...(opts.check2 === undefined ? {} : { extra: opts.check2 }) }),
+      ],
     );
     const cardId = `CARD-${versionId}`;
     await getPool().query(
@@ -1133,11 +1140,11 @@ describe('document production', () => {
     return { file: join(root, storedPath), preview: join(root, previewPath), cardId };
   }
 
-  async function aDelivery(cardId: string, versionId: string, jobId: string, savedPath: string | null = null): Promise<void> {
+  async function aDelivery(cardId: string, versionId: string, jobId: string, savedPaths: string[] = []): Promise<void> {
     await getPool().query(
-      `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id, saved_path, saved_at)
-       VALUES ($1, $2, $3, $4, $5::text, CASE WHEN $5::text IS NULL THEN NULL ELSE now() END)`,
-      [jobId, BUSINESS, cardId, versionId, savedPath],
+      `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id, saved_paths)
+       VALUES ($1, $2, $3, $4, $5::text[])`,
+      [jobId, BUSINESS, cardId, versionId, savedPaths],
     );
   }
 
@@ -1205,7 +1212,9 @@ describe('document production', () => {
     ['findings', { findings: [{ check: 'check2', code: 'x', where: 'document', he: 'בעיה', detail: RONIT }] }, {}],
     ['a version spec', {}, { spec: { title: `הצעת מחיר ל"אלפא" ${RONIT}` } }],
     ['a card delivery plan', {}, { deliveryPlans: [{ option: 'send', plan: { steps: [{ input: { to: [RONIT] } }] } }] }],
-  ] as Array<[string, Partial<ProductionSeed>, { spec?: unknown; deliveryPlans?: unknown }]>)(
+    ['a version check1', {}, { check1: { findings: [{ detail: `לא נמצא "${RONIT}"` }] } }],
+    ['a version check2', {}, { check2: [{ detail: RONIT }] }],
+  ] as Array<[string, Partial<ProductionSeed>, { spec?: unknown; deliveryPlans?: unknown; check1?: unknown; check2?: unknown }]>)(
     'finds a production by %s alone',
     async (_where, seed, versionOpts) => {
       const origin = await bareJob('production-by-column');
@@ -1270,14 +1279,17 @@ describe('document production', () => {
     const saved = join(base, 'הצעות מחיר', 'הצעה לרונית (2).docx');
     await mkdir(join(base, 'הצעות מחיר'), { recursive: true });
     await writeFile(saved, 'docx-bytes');
-    await aDelivery(v.cardId, 'VER-saved', delivery, saved);
+    // Two copies of one delivery: both are listed, neither is deleted.
+    const second = join(base, 'הצעות מחיר', 'הצעה לרונית (3).docx');
+    await writeFile(second, 'docx-bytes');
+    await aDelivery(v.cardId, 'VER-saved', delivery, [saved, second]);
 
     const plan = await buildErasurePlan(
       { kind: 'contact', identifier: RONIT },
       { businessId: BUSINESS, documentRoot: root },
     );
 
-    expect(plan.savedCopies).toEqual([saved]);
+    expect(plan.savedCopies).toEqual([saved, second].sort());
     // Listed, never queued for deletion.
     expect(plan.filePaths).not.toContain(saved);
     const html = renderErasure({ csrf: 't', anchorLabel: RONIT, plan, planHash: 'h' });
@@ -1286,7 +1298,104 @@ describe('document production', () => {
 
     await executeErasure(plan, { businessId: BUSINESS });
     expect((await stat(saved)).isFile()).toBe(true);
+    expect((await stat(second)).isFile()).toBe(true);
     // The row that recorded the path went with its job.
     expect((await getPool().query('SELECT 1 FROM document_deliveries')).rows).toHaveLength(0);
+  });
+
+  it('finds a production by a saved copy path alone', async () => {
+    const origin = await bareJob('saved-alone');
+    const delivery = await bareJob('saved-alone-delivery');
+    await aProduction({ productionId: 'PR-path', originJobId: origin });
+    const v = await aVersion('PR-path', 'VER-path');
+    await aDelivery(v.cardId, 'VER-path', delivery, [`/home/owner/${RONIT}.docx`]);
+    await aProduction({ productionId: 'PR-other', originJobId: await bareJob('other') });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+
+    expect(plan.productionIds).toEqual(['PR-path']);
+    expect(plan.jobIds).toEqual(expect.arrayContaining([origin, delivery]));
+  });
+
+  it('refuses at execution when a production went back to work after the preview, and keeps everything', async () => {
+    const origin = await bareJob('flip-origin');
+    await aProduction({ productionId: 'PR-flip', originJobId: origin, instructionText: `מסמך ל-${RONIT}` });
+    const v = await aVersion('PR-flip', 'VER-flip');
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+    // Finished when the preview was built: no refusal in the plan.
+    expect(plan.refusals).toEqual([]);
+    expect(plan.productionIds).toEqual(['PR-flip']);
+
+    await getPool().query(
+      `UPDATE document_productions SET stage = 'fixing', work = jsonb_set(work, '{finished}', 'false') WHERE production_id = 'PR-flip'`,
+    );
+
+    await expect(executeErasure(plan, { businessId: BUSINESS })).rejects.toBeInstanceOf(ErasureRefusedError);
+    const db = getPool();
+    expect((await db.query('SELECT 1 FROM document_productions')).rows).toHaveLength(1);
+    expect((await db.query('SELECT 1 FROM document_versions')).rows).toHaveLength(1);
+    expect((await db.query('SELECT 1 FROM document_cards')).rows).toHaveLength(1);
+    expect((await stat(v.file)).isFile()).toBe(true);
+    expect((await stat(v.preview)).isFile()).toBe(true);
+  });
+
+  it('refuses at execution when a card was approved after the preview, a delivery job the plan never listed', async () => {
+    const origin = await bareJob('race-origin');
+    await aProduction({ productionId: 'PR-race', originJobId: origin, instructionText: `מסמך ל-${RONIT}` });
+    const v = await aVersion('PR-race', 'VER-race');
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+    expect(plan.refusals).toEqual([]);
+
+    // The owner approves the card between the preview and the confirm.
+    const delivery = await bareJob('race-delivery');
+    await getPool().query(`UPDATE document_cards SET state = 'approved', delivery_job_id = $1 WHERE card_id = $2`, [
+      delivery,
+      v.cardId,
+    ]);
+
+    await expect(executeErasure(plan, { businessId: BUSINESS })).rejects.toBeInstanceOf(ErasureRefusedError);
+    expect((await getPool().query('SELECT 1 FROM document_cards')).rows).toHaveLength(1);
+    expect((await stat(v.file)).isFile()).toBe(true);
+  });
+
+  it('a card whose delivery job the plan already holds does not refuse', async () => {
+    const origin = await bareJob('held-origin');
+    const delivery = await bareJob('held-delivery');
+    await aProduction({ productionId: 'PR-held', originJobId: origin, instructionText: `מסמך ל-${RONIT}` });
+    const v = await aVersion('PR-held', 'VER-held');
+    await getPool().query(`UPDATE document_cards SET state = 'approved', delivery_job_id = $1 WHERE card_id = $2`, [
+      delivery,
+      v.cardId,
+    ]);
+    await aDelivery(v.cardId, 'VER-held', delivery);
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+    expect(plan.jobIds).toContain(delivery);
+    await executeErasure(plan, { businessId: BUSINESS });
+    expect((await getPool().query('SELECT 1 FROM document_cards')).rows).toHaveLength(0);
+  });
+
+  it('never queues a produced path outside produced/<business>/<production>/ for unlinking', async () => {
+    const origin = await bareJob('escape-origin');
+    await aProduction({ productionId: 'PR-esc', originJobId: origin, instructionText: `מסמך ל-${RONIT}` });
+    const outside = join('..', 'outside.docx');
+    const other = join('produced', BUSINESS, 'PR-someone-else', 'x.docx');
+    await aVersion('PR-esc', 'VER-esc1', { storedPath: outside });
+    const badPreview = join('produced', BUSINESS, 'PR-esc', '..', '..', 'p.png');
+    await getPool().query(
+      `INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes, check2)
+       VALUES ('VER-esc2', 'PR-esc', 2, '{}'::jsonb, $1, repeat('a', 64), 10, $2::jsonb)`,
+      [other, JSON.stringify({ previewPath: badPreview })],
+    );
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS, documentRoot: root });
+
+    expect(plan.filePaths).not.toContain(join(root, outside));
+    expect(plan.filePaths).not.toContain(join(root, other));
+    expect(plan.filePaths).not.toContain(join(root, badPreview));
+    expect(plan.filesNotDeleted).toEqual(
+      expect.arrayContaining([join(root, outside), join(root, other), join(root, badPreview)]),
+    );
+    // The well-formed preview of the first version is still queued.
+    expect(plan.filePaths).toContain(join(root, 'produced', BUSINESS, 'PR-esc', 'VER-esc1.preview.png'));
   });
 });

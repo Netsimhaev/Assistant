@@ -114,10 +114,10 @@ describe('what an erasure leaves behind', () => {
    * only and is asserted directly (kept, the erased id replaced by '' in place); `ledger_settings` holds no person content.
    *
    * **A twenty-first, also outside spec §5.1: document production
-   * (migrations 053–057)** — `document_productions` (request text,
+   * (migrations 053–058)** — `document_productions` (request text,
    * destination, working record, findings), `document_versions` (spec and
    * both checks), `document_cards.delivery_plans` and
-   * `document_deliveries.saved_path`, counted as one store. Seeded on a
+   * `document_deliveries.saved_paths`, counted as one store. Seeded on a
    * production whose origin and delivery jobs name nothing, so only the
    * production's own discovery can reach it. `document_settings` holds no
    * person content.
@@ -595,8 +595,8 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS, JSON.stringify([{ option: 'send', plan: { steps: [{ input: { to: [PROBE] } }] } }]), productionDelivery.jobId],
     );
     await db.query(
-      `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id, saved_path, saved_at)
-       VALUES ($1, $2, 'CARD-probe', 'VER-probe', $3, now())`,
+      `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id, saved_paths)
+       VALUES ($1, $2, 'CARD-probe', 'VER-probe', ARRAY[$3])`,
       [productionDelivery.jobId, BUSINESS, `/home/owner/docs/הצעה ל-${PROBE}.docx`],
     );
 

@@ -1533,7 +1533,7 @@ export const TABLE_LABELS: Record<string, string> = {
   ledger_reminders: 'תזכורות מהפנקס',
   ledger_whatsapp_batches: 'רשימות פנקס ממוספרות בוואטסאפ',
   ledger_critical_rules: 'כללי "קריטי" שנוקבים באדם',
-  // Migrations 053–057: document production — the request, every built
+  // Migrations 053–058: document production — the request, every built
   // version (its content and checks), the approval card, and the record of
   // each delivery.
   document_productions: 'בקשות להפקת מסמך',
@@ -1852,6 +1852,9 @@ export function renderErasure(model: ErasureViewModel): string {
      ${nothing}
      ${plan.filePaths.length > 0 ? `<p>${plan.filePaths.length} קבצים יימחקו מהדיסק.</p>` : ''}
      ${savedCopiesSection(plan.savedCopies)}
+     ${plan.filesNotDeleted.length > 0
+       ? `<p class="error">${plan.filesNotDeleted.length} קבצים שנרשמו להפקה נמצאים מחוץ לתיקיית ההפקה שלה, ולכן לא יימחקו:</p><ul>${plan.filesNotDeleted.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`
+       : ''}
      ${kept === '' ? '' : `<h2>יישמרו לפי הוראתך</h2><ul>${kept}</ul>`}
      ${excludable}
      <p class="muted">מסלול הביקורת יישמר — הוא אינו מחזיק שמות, כתובות או תוכן.</p>

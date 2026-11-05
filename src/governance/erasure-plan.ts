@@ -235,7 +235,7 @@
  * and modes: nothing in it can name anyone, so it is left out for the same
  * reason `autonomy_mode` is.
  *
- * **Migrations 053–057 added document production: four tables are wired in
+ * **Migrations 053–058 added document production: four tables are wired in
  * below, `document_settings` is not.** A production is the owner's request
  * for a file, and every content column of it can name the person the file is
  * for: `document_productions.instruction_text` (the request as typed),
@@ -244,7 +244,7 @@
  * and `.findings`; `document_versions.spec` and its `check1`/`check2`
  * results (a finding's `detail` quotes the spec); `document_cards
  * .delivery_plans` (the plan per option, recipients included); and
- * `document_deliveries.saved_path` (where `doc.save` wrote the copy — its
+ * `document_deliveries.saved_paths` (where `doc.save` wrote each copy — the
  * filename comes from the spec). All of them are discovery sources for the
  * contact anchor, gathered onto one id list, `productionIds`. The window
  * anchor matches a production's own `created_at`; the document anchor takes
@@ -260,7 +260,7 @@
  * card's preview image (`check2.previewPath`), joined to the document root
  * here, like `documents`. The copies the owner SAVED into his base folder do
  * not (spec C7): they are his files on his computer. The preview names each
- * one (`savedCopies`, from `document_deliveries.saved_path`, migration 057)
+ * one (`savedCopies`, from `document_deliveries.saved_paths`, migrations 057/058)
  * under "נשארים בתיקייה שלך", and nothing deletes them.
  *
  * A production that is still being worked on — a stage that is not terminal,
@@ -274,7 +274,7 @@
  * (056) is ids only and goes with its row. `document_settings` is one row per
  * business — channels and a base folder — and names no one.
  */
-import { dirname, join } from 'node:path';
+import { isAbsolute, join, normalize, sep } from 'node:path';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import { keptIds, type KeptItemKind } from './kept-items.js';
@@ -361,7 +361,7 @@ export interface ErasurePlan {
   ledgerItemIds: string[];
   /** `ledger_critical_rules` of kind `counterparty` whose `match` names the contact. */
   ledgerRuleIds: string[];
-  /** `document_productions` rows to erase — see this module's header (migrations 053–057). */
+  /** `document_productions` rows to erase — see this module's header (migrations 053–058). */
   productionIds: string[];
   filePaths: string[];
   /**
@@ -370,6 +370,14 @@ export interface ErasurePlan {
    * (spec C7) — they are his files. Never in `filePaths`.
    */
   savedCopies: string[];
+  /**
+   * Produced-file paths a version row names that fall OUTSIDE
+   * `produced/<businessId>/<productionId>/` — the only shape the loop writes.
+   * Never unlinked: the executor deletes exactly `filePaths`, and a row that
+   * points elsewhere is corrupt or tampered, not a file this erasure may
+   * touch. Shown to the owner so the refusal is not silent.
+   */
+  filesNotDeleted: string[];
   items: ErasureItem[];
   excluded: KeptExclusion[];
   refusals: ErasureRefusal[];
@@ -859,7 +867,7 @@ export const LEDGER_WHATSAPP_BATCHES_SCRUB_SET = `items = ARRAY(
      ORDER BY u.n)`;
 
 /**
- * Document production's predicates (migrations 053–057). Each one is
+ * Document production's predicates (migrations 053–058). Each one is
  * interpolated verbatim by `countItems` and by the executor, with the same
  * parameters.
  *
@@ -882,7 +890,7 @@ export const DOCUMENT_CARDS_ERASED_PREDICATE = `business_id = $1 AND version_id 
 
 /**
  * `document_deliveries` (migration 055): one row per delivery job a card's
- * approval created — ids, plus the path `doc.save` wrote (057). Deleted by
+ * approval created — ids, plus every path `doc.save` wrote (`saved_paths`, 057/058). Deleted by
  * `job_id`, like `confirmed_step_claims`: every delivery job of an erased
  * production is dragged into `jobIds` by `buildErasurePlan`, so this reaches
  * all of them, and a delivery job the owner KEPT keeps its row with it.
@@ -1052,6 +1060,17 @@ export const JOBS_SCRUB_SET = `title = NULL, awaiting_envelope_id = NULL`;
  */
 export const STRANDED_PARENT_PREDICATE = `business_id = $1 AND job_id = ANY ($2)
   AND phase = 'followup' AND awaiting_envelope_id IS NOT NULL`;
+
+/**
+ * True only for a relative path that, normalised, starts with `prefix`
+ * (`produced/<businessId>/<productionId>/`) — so `..` segments, an absolute
+ * path or another production's folder never reach the unlink list.
+ */
+function isProducedPath(relative: string, prefix: string): boolean {
+  if (isAbsolute(relative)) return false;
+  const normalised = normalize(relative);
+  return normalised.startsWith(prefix) && !normalised.split(sep).includes('..');
+}
 
 async function idsFrom(
   db: Queryable,
@@ -1331,7 +1350,7 @@ export async function buildErasurePlan(
 
     // Document production, by its own content — every column of all four
     // tables that can name a person, onto the production that owns it. See
-    // this module's header (migrations 053–057).
+    // this module's header (migrations 053–058).
     for (const productionId of await idsFrom(
       db,
       `SELECT production_id FROM document_productions p
@@ -1345,7 +1364,7 @@ export async function buildErasurePlan(
                                           AND ${jsonbContentMatches('c.delivery_plans', '$2')})
                             OR EXISTS (SELECT 1 FROM document_deliveries d
                                         WHERE d.business_id = $1 AND d.version_id = v.version_id
-                                          AND coalesce(d.saved_path, '') ILIKE $2 ${LIKE_ESCAPE}))))`,
+                                          AND array_to_string(d.saved_paths, chr(10)) ILIKE $2 ${LIKE_ESCAPE}))))`,
       [businessId, pattern],
       'production_id',
     )) productionIds.add(productionId);
@@ -1737,34 +1756,36 @@ export async function buildErasurePlan(
   }
 
   // The produced files go with their rows: the version's file and the card's
-  // preview image, absolute, like `documents` above. The preview path is
-  // taken only when it sits beside the version's own file — the one shape
-  // the loop writes — so a malformed `check2` can never point the unlink
-  // anywhere else.
+  // preview image, absolute, like `documents` above. Each is queued only when
+  // its relative form, normalised, sits under `produced/<businessId>/
+  // <productionId>/` — the one shape the loop writes — so a malformed
+  // `stored_path` or `check2.previewPath` can never point the unlink anywhere
+  // else; such a path goes to `filesNotDeleted`, shown, never unlinked.
   //
   // The copies `doc.save` wrote into the owner's base folder are listed,
   // never deleted (spec C7): every delivery of an erased production, plus any
   // delivery job already in `jobIds`.
   const savedCopies: string[] = [];
+  const filesNotDeleted: string[] = [];
   if (productionList.length > 0) {
-    const { rows } = await db.query<{ stored_path: string; preview_path: string | null }>(
-      `SELECT v.stored_path, v.check2 ->> 'previewPath' AS preview_path
+    const { rows } = await db.query<{ production_id: string; stored_path: string; preview_path: string | null }>(
+      `SELECT p.production_id, v.stored_path, v.check2 ->> 'previewPath' AS preview_path
          FROM document_versions v
          JOIN document_productions p ON p.production_id = v.production_id
         WHERE p.business_id = $1 AND p.production_id = ANY ($2)`,
       [businessId, productionList],
     );
     for (const row of rows) {
-      filePaths.push(join(documentRoot, row.stored_path));
-      if (row.preview_path !== null && dirname(row.preview_path) === dirname(row.stored_path)) {
-        filePaths.push(join(documentRoot, row.preview_path));
+      const prefix = join('produced', businessId, row.production_id) + sep;
+      for (const relative of row.preview_path === null ? [row.stored_path] : [row.stored_path, row.preview_path]) {
+        (isProducedPath(relative, prefix) ? filePaths : filesNotDeleted).push(join(documentRoot, relative));
       }
     }
   }
   if (productionList.length > 0 || jobIds.size > 0) {
     const { rows } = await db.query<{ saved_path: string }>(
-      `SELECT DISTINCT d.saved_path FROM document_deliveries d
-        WHERE d.business_id = $1 AND d.saved_path IS NOT NULL
+      `SELECT DISTINCT u.saved_path FROM document_deliveries d, unnest(d.saved_paths) AS u(saved_path)
+        WHERE d.business_id = $1
           AND (d.job_id = ANY ($2)
             OR d.version_id IN (SELECT v.version_id FROM document_versions v
                                   JOIN document_productions p ON p.production_id = v.production_id
@@ -1798,6 +1819,7 @@ export async function buildErasurePlan(
     productionIds: productionList,
     filePaths,
     savedCopies,
+    filesNotDeleted,
     items,
     excluded,
     refusals,
@@ -1997,7 +2019,7 @@ async function countItems(
       `SELECT count(*)::text AS n FROM ledger_critical_rules WHERE ${LEDGER_CRITICAL_RULES_ERASED_PREDICATE}`,
       [businessId, ledgerRuleIds],
     ),
-    // Document production (migrations 053–057): cards, then versions, then
+    // Document production (migrations 053–058): cards, then versions, then
     // productions, matching the executor's order — see
     // `DOCUMENT_PRODUCTIONS_ERASED_PREDICATE`. Deliveries by job.
     await one(
