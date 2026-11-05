@@ -190,7 +190,7 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
     );
     const before = (await loadDocumentCard(B, cardId))!.whatsappDeliveredAt!;
     const outcome = await addTypedRecipient(cardId, 'yossi@client.example', { businessId: B, messenger });
-    expect(outcome.status).toBe('added');
+    expect(outcome).toMatchObject({ status: 'added', resend: 'sent' });
     // The card as it now stands — with the typed address in its echo — was
     // sent again, and only that new delivery is answerable.
     expect(files).toHaveLength(1);
@@ -200,9 +200,39 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
     expect(after.whatsappDeliveredAt!.getTime()).toBeGreaterThan(before.getTime());
   });
 
-  it('a typed address with no WhatsApp seam leaves the card withdrawn from WhatsApp', async () => {
+  it('a typed address with no notification seams leaves the card withdrawn and its channel states untouched', async () => {
     const cardId = await card({ mode: 'send', to: [] }, 60_000);
-    expect((await addTypedRecipient(cardId, 'yossi@client.example', { businessId: B })).status).toBe('added');
-    expect((await loadDocumentCard(B, cardId))?.whatsappDeliveredAt).toBe(null);
+    await getPool().query(`UPDATE document_cards SET email_state = 'sent', whatsapp_state = 'sent' WHERE card_id = $1`, [cardId]);
+    const outcome = await addTypedRecipient(cardId, 'yossi@client.example', { businessId: B });
+    expect(outcome).toMatchObject({ status: 'added', resend: 'skipped_no_seams' });
+    const after = (await loadDocumentCard(B, cardId))!;
+    expect(after.whatsappDeliveredAt).toBe(null);
+    expect(after.emailState).toBe('sent');
+    expect(after.whatsappState).toBe('sent');
+  });
+
+  it('a typed address is saved even when the charter cannot be read — the re-send is skipped, not guessed', async () => {
+    const cardId = await card({ mode: 'send', to: [] }, 60_000);
+    await getPool().query(`UPDATE document_cards SET whatsapp_state = 'sent' WHERE card_id = $1`, [cardId]);
+    await getPool().query(
+      `UPDATE charter_versions SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
+        WHERE business_id = $1`,
+      [B],
+    );
+    const sent: string[] = [];
+    const messenger = {
+      send: async () => ({ ok: true }),
+      sendFile: async (input: { caption: string }) => {
+        sent.push(input.caption);
+        return { ok: true };
+      },
+    } as unknown as BossMessenger;
+    const outcome = await addTypedRecipient(cardId, 'yossi@client.example', { businessId: B, messenger });
+    expect(outcome).toMatchObject({ status: 'added', resend: 'skipped_charter_unreadable' });
+    expect(sent).toEqual([]);
+    const after = (await loadDocumentCard(B, cardId))!;
+    expect(after.deliveryPlans.some((o) => o.option === 'send')).toBe(true);
+    expect(after.whatsappDeliveredAt).toBe(null);
+    expect(after.whatsappState).toBe('sent');
   });
 });

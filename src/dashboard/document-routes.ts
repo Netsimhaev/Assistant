@@ -455,9 +455,9 @@ export async function handleDocumentAddress(
   options: DocumentRouteOptions = {},
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
-  // The dashboard has no notification seams of its own: the re-sent card's
-  // channels are recorded `skipped_not_connected`, and the WhatsApp delivery
-  // stays withdrawn until a card is delivered there again.
+  // The dashboard has no notification seams of its own: no re-send happens
+  // here, the card's channel states are left as they were, and the WhatsApp
+  // delivery stays withdrawn until a card is delivered there again.
   const outcome = await addTypedRecipient(cardId, form.get('to') ?? '', { businessId });
   if (outcome.status === 'added') return seeOther(res, `/documents/${encodeURIComponent(cardId)}`);
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());

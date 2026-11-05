@@ -740,8 +740,17 @@ export function typedAddressProblem(raw: string): string | null {
   return null;
 }
 
+/**
+ * What became of the re-send after a typed address — recorded, never thrown:
+ * the address is saved either way. `skipped_no_seams`: no notification seam
+ * here (the dashboard process), channel states left as they were;
+ * `skipped_charter_unreadable`: no currency to show amounts in, so no card is
+ * rendered at all; `failed`: the render or the sends threw.
+ */
+export type TypedAddressResend = 'sent' | 'skipped_no_seams' | 'skipped_charter_unreadable' | 'failed';
+
 export type TypedAddressOutcome =
-  | { status: 'added'; planHash: string }
+  | { status: 'added'; planHash: string; resend: TypedAddressResend }
   | { status: 'refused'; reason: string }
   | { status: 'not_open'; state: CardState }
   | { status: 'not_found' };
@@ -771,7 +780,7 @@ export async function addTypedRecipient(
   if (problem !== null) return { status: 'refused', reason: problem };
   const address = typed.trim();
 
-  const outcome = await withTransaction<TypedAddressOutcome>(async (tx) => {
+  const outcome = await withTransaction<TypedAddressOutcome | { status: 'saved'; planHash: string }>(async (tx) => {
     const locked = await lockCard(tx, businessId, cardId);
     if (locked === null) return { status: 'not_found' };
     const { card, production, version } = locked;
@@ -801,31 +810,60 @@ export async function addTypedRecipient(
     );
     const send = rebuilt.find((option) => option.option === 'send');
     if (send === undefined) throw new Error(`addTypedRecipient: no send option rebuilt for ${cardId}`);
-    return { status: 'added', planHash: send.planHash };
+    return { status: 'saved', planHash: send.planHash };
   });
-  if (outcome.status !== 'added') return outcome;
+  if (outcome.status !== 'saved') return outcome;
+  return { status: 'added', planHash: outcome.planHash, resend: await resendAfterTypedAddress(cardId, options) };
+}
 
-  // The card as it now stands goes out again on the owner's channels; only
-  // that delivery, which shows the address, can be answered on WhatsApp.
-  // Never thrown for a send — `notifyCard` records each channel's state.
-  const db = getPool();
-  const card = await loadDocumentCard(businessId, cardId, db);
-  const version = card === null ? null : await loadVersion(businessId, card.versionId, db);
-  const production = version === null ? null : await loadProduction(businessId, version.productionId, db);
-  if (card !== null && version !== null && production !== null) {
-    const active = await loadActiveCharter(businessId, db);
+/**
+ * The card as it now stands goes out again on the owner's channels; only
+ * that delivery, which shows the address, can be answered on WhatsApp. Runs
+ * after the address is committed, so nothing here can undo it: every
+ * failure is a recorded outcome, never a throw. With no seam at all nothing
+ * is written — a process that cannot notify must not overwrite the states a
+ * process that could recorded. With no readable charter no card is rendered
+ * — amounts are never shown in a guessed currency.
+ */
+async function resendAfterTypedAddress(
+  cardId: string,
+  options: CardSeams & { businessId: string },
+): Promise<TypedAddressResend> {
+  const { businessId } = options;
+  if (options.sendAlertWithAttachment === undefined && options.messenger?.sendFile === undefined) {
+    return 'skipped_no_seams';
+  }
+  try {
+    const db = getPool();
+    let active: Awaited<ReturnType<typeof loadActiveCharter>>;
+    try {
+      active = await loadActiveCharter(businessId, db);
+    } catch {
+      return 'skipped_charter_unreadable';
+    }
+    if (active === null) return 'skipped_charter_unreadable';
+    const card = await loadDocumentCard(businessId, cardId, db);
+    const version = card === null ? null : await loadVersion(businessId, card.versionId, db);
+    const production = version === null ? null : await loadProduction(businessId, version.productionId, db);
+    if (card === null || version === null || production === null) return 'failed';
     const text = renderCardText({
       cardId,
       production,
       version,
       options: card.deliveryPlans,
       stage: 'ready',
-      currency: active?.bundle.ceilings.currency ?? 'ILS',
+      currency: active.bundle.ceilings.currency,
       ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
     });
     await notifyCard(card, production, version, text, options, db);
+    return 'sent';
+  } catch (err) {
+    console.error(
+      `addTypedRecipient: card ${cardId} saved, re-send failed:`,
+      err instanceof Error ? err.message : err,
+    );
+    return 'failed';
   }
-  return outcome;
 }
 
 // ---------------------------------------------------------------- request a fix
