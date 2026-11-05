@@ -193,6 +193,19 @@ describe('saveVersionToFolder', () => {
     expect(await tree(base)).toEqual([name]);
   });
 
+  it('a read-back that throws discards what was written before rethrowing', async () => {
+    let called = 0;
+    const failing = async (): Promise<Buffer> => {
+      called++;
+      throw new Error('read-back exploded');
+    };
+    await expect(saveVersionToFolder(base, 'a.xlsx', bytes, sha(bytes), { readBack: failing })).rejects.toThrow(
+      'read-back exploded',
+    );
+    expect(called).toBe(1);
+    expect(await tree(base)).toEqual([]);
+  });
+
   it('a hash that does not match after writing deletes what it wrote and fails', async () => {
     const result = await saveVersionToFolder(base, 'a.xlsx', bytes, sha(Buffer.from('other')));
     expect(result).toMatchObject({ ok: false, code: 'save_verify_failed' });

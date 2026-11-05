@@ -42,3 +42,21 @@ export function nameProblem(name: string): string | null {
   if (WINDOWS_RESERVED.test(stem)) return NAME_RULE_HE.reserved(stem);
   return null;
 }
+
+/**
+ * Room a spec filename must leave for what `doc.save` adds to it: the longest
+ * extension (`.xlsx`/`.docx`/`.pptx`, 5 bytes) and the largest collision
+ * suffix (` (99)`, 5 bytes). Without it a name the spec accepted could be
+ * refused at save — after the owner approved it — once the suffix pushes it
+ * past `MAX_SEGMENT_BYTES`.
+ */
+export const SAVED_NAME_RESERVE_BYTES = Buffer.byteLength('.xlsx', 'utf8') + Buffer.byteLength(' (99)', 'utf8');
+export const MAX_SPEC_FILENAME_BYTES = MAX_SEGMENT_BYTES - SAVED_NAME_RESERVE_BYTES;
+
+/** The spec filename: `nameProblem`, plus room for the extension and ` (99)`. */
+export function specFilenameProblem(name: string): string | null {
+  const problem = nameProblem(name);
+  if (problem !== null) return problem;
+  if (Buffer.byteLength(name, 'utf8') > MAX_SPEC_FILENAME_BYTES) return NAME_RULE_HE.tooLong;
+  return null;
+}

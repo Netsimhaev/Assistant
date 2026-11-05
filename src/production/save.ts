@@ -267,6 +267,10 @@ export async function saveVersionToFolder(
   name: string,
   bytes: Buffer,
   expectedSha256: string,
+  options: {
+    /** The read-back through the handle — injectable so a test can make it throw. */
+    readBack?: (handle: FileHandle, size: number) => Promise<Buffer>;
+  } = {},
 ): Promise<SaveFileResult> {
   for (let n = 1; n <= MAX_NAME_SUFFIX; n++) {
     const candidateName = nameWithSuffix(name, n);
@@ -303,8 +307,17 @@ export async function saveVersionToFolder(
         throw err;
       }
 
-      const written = await readBack(handle, bytes.length + 1);
-      if (createHash('sha256').update(written).digest('hex') !== expectedSha256) {
+      // A read-back or hash that throws must not leave an unverified file
+      // behind: discard it, then rethrow.
+      let digest: string;
+      try {
+        const written = await (options.readBack ?? readBack)(handle, bytes.length + 1);
+        digest = createHash('sha256').update(written).digest('hex');
+      } catch (err) {
+        await discard(handle, path);
+        throw err;
+      }
+      if (digest !== expectedSha256) {
         await discard(handle, path);
         return { ok: false, code: 'save_verify_failed', he: SAVE_FAILURE_HE.save_verify_failed };
       }

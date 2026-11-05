@@ -128,7 +128,7 @@ import {
   type EvalValue,
   type FormulaAst,
 } from './formula.js';
-import { nameProblem } from './name-rules.js';
+import { specFilenameProblem } from './name-rules.js';
 import { EXCEL_MIN_DATE, layoutSheet, toEvalSheet, type PlacedCell } from './xlsx-layout.js';
 
 export interface GroundingSources {
@@ -1135,7 +1135,7 @@ function checkWorkbook(
 // The same rule `doc.save` applies to every folder segment and to the saved
 // name (`name-rules.ts`, spec §9.2) — one copy, so a filename production
 // accepts is never refused at save after the owner approved it.
-const filenameProblem = nameProblem;
+const filenameProblem = specFilenameProblem;
 
 // ---------------------------------------------------------------- entry
 
