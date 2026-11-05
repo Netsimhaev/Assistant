@@ -1187,11 +1187,25 @@ async function handleInstructPost(
   // that every door has to say this out loud — the WhatsApp door is the one
   // that cannot (`whatsapp-door.ts`), because a voice note's text is a
   // transcription provider's output and nobody typed it.
-  // The attached file goes through the ordinary ingest, as a `manual`
-  // document, under a temp path built from nothing the browser sent — the
+  // The attached file goes through the ordinary ingest, as an `instruction`
+  // document (never read by the conductor), under a temp path built from nothing the browser sent — the
   // filename is stored verbatim as `original_name` and never used as a
   // path. A refusal is the ingest's own Hebrew reason, and the instruction
   // is not run: the owner asked for work ON this file.
+  // The two refusals `runInstruction` makes before it writes anything are
+  // made here first when a file came with the text, so a refused instruction
+  // never leaves an ingested upload behind (same messages).
+  if (upload !== null) {
+    const early =
+      text.trim().length === 0
+        ? 'ההוראה ריקה.'
+        : text.length > MAX_INSTRUCTION_CHARS
+          ? `ההוראה ארוכה מ-${MAX_INSTRUCTION_CHARS} תווים. להעברת מסמך יש תיקיית קליטה.`
+          : null;
+    if (early !== null) {
+      return sendHtml(res, 400, renderInstruct({ csrf: issueCsrfToken(session.sessionId), error: early }));
+    }
+  }
   const attachedDocumentIds: string[] = [];
   if (upload !== null) {
     const ingested = await ingestUpload(upload, businessId, documentRoot);
@@ -1282,7 +1296,7 @@ async function readUploadBody(
 }
 
 /**
- * Ingest one uploaded file as a `manual` document. The bytes are written to
+ * Ingest one uploaded file as an `instruction` document (migration 060). The bytes are written to
  * a fresh temp directory under a fixed name (`upload`) — the browser's
  * filename is passed only as `originalName` — and the directory is removed
  * whatever happens. A `rejected` document, or a `stored` one that carries a
@@ -1298,7 +1312,7 @@ async function ingestUpload(
     const path = join(dir, 'upload');
     await writeFile(path, file.bytes, { flag: 'wx' });
     const record = await ingestDocument(
-      { path, source: 'manual', originalName: file.filename },
+      { path, source: 'instruction', originalName: file.filename },
       { businessId, ...(documentRoot !== undefined ? { documentRoot } : {}) },
     );
     if (record.status === 'rejected' || (record.status === 'stored' && record.reason !== null)) {

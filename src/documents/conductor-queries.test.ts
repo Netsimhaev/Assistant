@@ -164,6 +164,20 @@ describe('the conductor queries', () => {
     expect(await documentsAwaitingRead(10, { businessId: 'someone-else' })).toEqual([]);
   });
 
+  it('never offers a file uploaded with an instruction, even when no instruction row ever named it', async () => {
+    // The structural layer: an upload whose instruction was refused (or
+    // crashed) before `boss_instructions` was written carries no attached
+    // id anywhere — only its source says it was the owner's.
+    const dir = await mkdtemp(join(tmpdir(), 'cond-'));
+    const path = join(dir, 'upload');
+    await writeFile(path, 'מחירון שהבעלים העלה', 'utf8');
+    const upload = await ingestDocument({ path, source: 'instruction' }, { businessId: BUSINESS, documentRoot: dir });
+    expect(upload.status).toBe('extracted');
+    const inboxFile = await anExtractedDocument('מסמך מתיקיית הקליטה');
+    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    expect(waiting.map((d) => d.documentId)).toEqual([inboxFile]);
+  });
+
   it('counts only readings created today, for this business', async () => {
     const documentId = await anExtractedDocument('שלום');
     await getPool().query(

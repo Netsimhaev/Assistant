@@ -1,3 +1,4 @@
+import { documentSourceLabel } from '../domain/labels.js';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -102,7 +103,7 @@ describe('runIngestCli', () => {
     // Asserting only 'extracted' would still pass if --source were parsed
     // and silently discarded (ingestDocument defaults to 'manual') — this
     // is the assertion that actually proves the flag reached the pipeline.
-    expect(out).toContain('מקור: mail');
+    expect(out).toContain(`מקור: ${documentSourceLabel.mail}`);
   });
 
   it('prints the Hebrew rejection reason for an unsupported type instead of throwing', async () => {

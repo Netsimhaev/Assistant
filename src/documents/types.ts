@@ -10,8 +10,12 @@
  * they cannot quietly drift apart from one another.
  */
 
-/** Who brought a document in. */
-export type DocumentSource = 'manual' | 'mail' | 'api';
+/**
+ * Who brought a document in. `instruction` is a file the owner attached to
+ * an instruction on the dashboard (migration 060) — his own input, never a
+ * stranger's document for the conductor.
+ */
+export type DocumentSource = 'manual' | 'mail' | 'api' | 'instruction';
 
 /**
  * `pending` — stored, not yet parsed. `extracted` — parsed; its artefacts are

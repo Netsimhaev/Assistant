@@ -224,7 +224,8 @@ describe('upload on /instruct', () => {
     // The name is data: stored verbatim, never part of the path.
     expect(doc.original_name).toBe(name);
     expect(doc.stored_path).not.toContain('..');
-    expect(doc.source).toBe('manual');
+    // The owner's own input, never a stranger's document for the conductor.
+    expect(doc.source).toBe('instruction');
     expect(seen[0]?.attachedDocuments).toEqual([{ documentId: doc.document_id, name }]);
 
     const job = await getPool().query<{ job_id: string }>('SELECT job_id FROM boss_instructions WHERE business_id = $1', [B]);
@@ -258,6 +259,30 @@ describe('upload on /instruct', () => {
     const { rows: jobs } = await getPool().query('SELECT 1 FROM boss_instructions WHERE business_id = $1', [B]);
     expect(jobs).toHaveLength(0);
   });
+
+  for (const [label, text, reason] of [
+    ['empty', '   ', 'ההוראה ריקה.'],
+    ['over-length', 'א'.repeat(4_001), 'ההוראה ארוכה מ-4000 תווים'],
+  ] as const) {
+    it(`an ${label} instruction with a file is refused before the file is ingested`, async () => {
+      let called = 0;
+      const baseUrl = await start({
+        planner: async (): Promise<PlanOutcome> => {
+          called += 1;
+          return { status: 'planned', plan: recallPlan };
+        },
+      });
+      const cookie = await login(baseUrl);
+      const csrf = await csrfOf(baseUrl, cookie, '/instruct');
+      const { body, type } = multipart({ csrf, text }, { name: 'a.txt', bytes: Buffer.from('מוצר,מחיר\nא,100\n', 'utf8') });
+      const res = await fetch(`${baseUrl}/instruct`, { method: 'POST', headers: { cookie, 'content-type': type }, body, redirect: 'manual' });
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain(reason);
+      const { rows } = await getPool().query('SELECT 1 FROM documents WHERE business_id = $1', [B]);
+      expect(rows).toHaveLength(0);
+      expect(called).toBe(0);
+    });
+  }
 
   it('an upload without a valid CSRF token is refused before anything is ingested', async () => {
     const baseUrl = await start();
