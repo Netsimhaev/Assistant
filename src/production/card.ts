@@ -24,11 +24,27 @@
  * plan or a tool. That column is what lets a step carry attachments or save a
  * file at all, and only for that card's version (`deliveryVersionOf`).
  *
- * **The send's words are never model-written.** Recipients are the
- * production's destination, already filtered by `authorisedRecipients` when
- * it was queued; the subject and body are the destination's own when given,
- * else a fixed Hebrew default (`מצורף <סוג>: <כותרת>`). The attachment ref is
- * built from the version row: `canonicalAttachmentName`, its sha256 and size.
+ * **What the send carries.** Recipients are the production's destination,
+ * already filtered by `authorisedRecipients` when it was queued. The subject
+ * and body are planner-written from the owner's instruction (the
+ * destination's own fields) — or, when the planner gave none, a fixed Hebrew
+ * default (`מצורף <סוג>: <כותרת>`). Either way they are shown verbatim on the
+ * card through the step echo and bound by the approval hash: the owner
+ * approves exactly those bytes, and a change is a different plan. The
+ * attachment ref is built from the version row: `canonicalAttachmentName`,
+ * its sha256 and size.
+ *
+ * **A version that did not pass the checks (`failed_checks`, §7.3, C6)** is
+ * offered for saving only, with the warning in the option itself; never for
+ * sending. `approveDocumentCard` re-checks it: a send plan is accepted only
+ * on a `ready` production.
+ *
+ * **Every delivery job is recorded for good** in `document_deliveries`
+ * (migration 055), in the approval's transaction. `delivery_job_id` is the
+ * card's CURRENT delivery — what the attachment and save gates read — and is
+ * overwritten when a returned card is approved again; the record is what
+ * keeps every delivery job, current or not, out of the command re-ask and
+ * out of curation.
  *
  * **Notifications** go to the channels the owner chose
  * (`document_settings`): the screen sends nothing; email is the alert seam
@@ -48,7 +64,10 @@
  * a card whose delivery job failed from `approved`/`saved` to `failed_send`
  * — the one-time claim — and sends it again with "השליחה הקודמת לא הושלמה"
  * (and "ייתכן שהמייל כבר יצא" when a step row is `unknown`). A `failed_send`
- * card can be approved again: a new delivery job, a new confirmation.
+ * card can be approved again: a new delivery job, a new confirmation. The
+ * crash gap, stated: the claim commits before the sends, so a crash between
+ * them leaves a `failed_send` card the owner sees on the screen only — never
+ * a second notice.
  *
  * **"בקשי תיקון" (§8.4)** supersedes the card and its version and opens a new
  * production on a new `boss` job whose instruction is the original plus
@@ -71,6 +90,9 @@ import {
   type InstructionTextOrigin,
 } from '../governance/typed-recipients.js';
 import { renderStepEcho } from '../orchestrator/command-echo.js';
+import { WHATSAPP_MESSAGE_MAX_CHARS } from '../orchestrator/command-confirm.js';
+import type { Runtime } from '../orchestrator/runtime.js';
+import { PRODUCTION_TOOLS_MISSING_REASON } from './render-error.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { bindPlanToJob, planHashOf } from '../orchestrator/plan-store.js';
 import { toOneLine } from '../util/bidi.js';
@@ -190,6 +212,8 @@ const SEND_AGENT = 'comms.email';
 const SAVE_AGENT = 'prod.docs';
 
 export const SAVE_OPTION_LABEL = 'שמרי במחשב בלבד';
+/** The save option of a version that did not pass the checks — the warning rides in the option itself. */
+export const SAVE_UNCHECKED_OPTION_LABEL = 'שמרי במחשב בלבד (המסמך לא עבר את הבדיקות — לבדוק לפני שימוש)';
 
 export function sendOptionLabel(to: readonly string[]): string {
   return `שלחי ל-${to.map(toOneLine).join(', ')}`;
@@ -212,21 +236,21 @@ function attachmentRefOf(production: Production, version: DocumentVersion): Atta
 /**
  * One delivery plan per option the card shows — deterministic in the
  * production and the version alone, so the server can rebuild it on approval
- * and compare hashes. `send` only when the destination is a send with at
- * least one authorised recipient; `save` always (the folder the owner named,
- * or none). A version that did not pass the checks gets no plan at all (C6).
+ * and compare hashes. `send` only on a `ready` production whose destination
+ * is a send with at least one authorised recipient; `save` always (the folder
+ * the owner named, or none) — labelled with the warning when the version did
+ * not pass the checks (C6).
  */
 export function buildDeliveryOptions(
   production: Production,
   version: DocumentVersion,
   stage: 'ready' | 'failed_checks',
 ): DeliveryOption[] {
-  if (stage !== 'ready') return [];
   const ref = attachmentRefOf(production, version);
   const options: DeliveryOption[] = [];
   const destination: ProductionDestination = production.destination;
 
-  if (destination.mode === 'send' && destination.to.length > 0) {
+  if (stage === 'ready' && destination.mode === 'send' && destination.to.length > 0) {
     const subject = destination.subject !== undefined ? toOneLine(destination.subject) : defaultDeliverySubject(version);
     const body = destination.body ?? `${defaultDeliverySubject(version)}.`;
     const plan = Plan.parse({
@@ -263,7 +287,12 @@ export function buildDeliveryOptions(
       },
     ],
   });
-  options.push({ option: 'save', label: SAVE_OPTION_LABEL, planHash: planHashOf(savePlan), plan: savePlan });
+  options.push({
+    option: 'save',
+    label: stage === 'ready' ? SAVE_OPTION_LABEL : SAVE_UNCHECKED_OPTION_LABEL,
+    planHash: planHashOf(savePlan),
+    plan: savePlan,
+  });
   return options;
 }
 
@@ -271,6 +300,14 @@ export function buildDeliveryOptions(
 
 export const RETRY_PREFIX = 'השליחה הקודמת לא הושלמה';
 export const MAY_HAVE_SENT_LINE = 'ייתכן שהמייל כבר יצא';
+/**
+ * The WhatsApp caption when the card is longer than one WhatsApp message
+ * (`WHATSAPP_MESSAGE_MAX_CHARS`) — never a truncated card, the
+ * command-confirm pattern. Such a card is answered on the dashboard only:
+ * `whatsapp_delivered_at` is not stamped for it.
+ */
+export const CARD_TOO_LONG_FOR_WHATSAPP =
+  'כרטיס המסמך ארוך מדי להודעת וואטסאפ אחת — אפשר לקרוא אותו ולאשר אותו רק בדשבורד.';
 
 export interface CardTextInput {
   cardId: string;
@@ -382,8 +419,10 @@ async function notifyCard(
             return b === null ? { ok: false } : send(subject, text, attachment(b));
           });
   }
+  let whatsappAnswerable = false;
   if (settings.toWhatsApp) {
     const sendFile = seams.messenger?.sendFile?.bind(seams.messenger);
+    const tooLong = text.length > WHATSAPP_MESSAGE_MAX_CHARS;
     notice.whatsapp =
       sendFile === undefined
         ? 'skipped_not_connected'
@@ -391,17 +430,18 @@ async function notifyCard(
             const b = await fileOnce();
             if (b === null) return { ok: false };
             const a = attachment(b);
-            return sendFile({ ...a, caption: text, jobId: null });
+            return sendFile({ ...a, caption: tooLong ? CARD_TOO_LONG_FOR_WHATSAPP : text, jobId: null });
           });
+    whatsappAnswerable = notice.whatsapp === 'sent' && !tooLong;
   }
 
   await db.query(
     `UPDATE document_cards
         SET email_state = COALESCE($3, email_state),
             whatsapp_state = COALESCE($4, whatsapp_state),
-            whatsapp_delivered_at = CASE WHEN $4 = 'sent' THEN now() ELSE whatsapp_delivered_at END
+            whatsapp_delivered_at = CASE WHEN $5::boolean THEN now() ELSE whatsapp_delivered_at END
       WHERE business_id = $1 AND card_id = $2`,
-    [card.businessId, card.cardId, notice.email, notice.whatsapp],
+    [card.businessId, card.cardId, notice.email, notice.whatsapp, whatsappAnswerable],
   );
   return notice;
 }
@@ -553,15 +593,18 @@ export async function approveDocumentCard(
     const { card, production, version } = locked;
     if (!ACTIONABLE.includes(card.state)) return { status: 'not_open', state: card.state };
     if (version.supersededAt !== null) return { status: 'card_stale' };
-    if (production.stage !== 'ready') return { status: 'card_stale' };
+    if (production.stage !== 'ready' && production.stage !== 'failed_checks') return { status: 'card_stale' };
+    const stage = production.stage;
 
     // The plan the owner pressed must be the plan stored on the card AND the
     // plan the server builds now from the same production and version.
     const stored = card.deliveryPlans.find((option) => option.planHash === planHash);
-    const rebuilt = buildDeliveryOptions(production, version, 'ready').find((option) => option.planHash === planHash);
+    const rebuilt = buildDeliveryOptions(production, version, stage).find((option) => option.planHash === planHash);
     if (stored === undefined || rebuilt === undefined || planHashOf(stored.plan) !== planHash) {
       return { status: 'card_stale' };
     }
+    // Defence in depth (C6): a send only ever on a version that passed.
+    if (rebuilt.option === 'send' && stage !== 'ready') return { status: 'card_stale' };
 
     const active = await loadActiveCharter(businessId, tx);
     if (active === null) throw new Error(`approveDocumentCard: no active charter for ${businessId}`);
@@ -590,7 +633,7 @@ export async function approveDocumentCard(
       production,
       version,
       options: card.deliveryPlans,
-      stage: 'ready',
+      stage,
       currency: active.bundle.ceilings.currency,
     });
     await createConfirmation(
@@ -620,6 +663,11 @@ export async function approveDocumentCard(
         WHERE business_id = $1 AND card_id = $2`,
       [businessId, cardId, rebuilt.option === 'send' ? 'approved' : 'saved', job.jobId],
     );
+    // The durable record of every delivery job (migration 055).
+    await tx.query(
+      `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id) VALUES ($1, $2, $3, $4)`,
+      [job.jobId, businessId, cardId, version.versionId],
+    );
     return { status: 'approved', jobId: job.jobId, option: rebuilt.option };
   });
 }
@@ -641,11 +689,25 @@ export async function requestFix(
   text: string,
   actor: 'dashboard' | 'whatsapp',
   textOrigin: InstructionTextOrigin,
-  options: { businessId: string; perDay?: number; now?: Date },
+  options: {
+    businessId: string;
+    /**
+     * `runtime.production` — required, though it may be `undefined`: a fix is
+     * a new production, and a server that cannot produce refuses it up front
+     * instead of superseding the card for a production that can only fail.
+     */
+    production: Runtime['production'] | undefined;
+    perDay?: number;
+    now?: Date;
+  },
 ): Promise<FixOutcome> {
   const { businessId } = options;
   const fix = text.trim();
   if (fix === '') return { status: 'refused', reason: FIX_EMPTY_HE };
+  const tools = options.production;
+  if (!(tools?.available === true && tools.sofficePath !== null && tools.chromiumPath !== null)) {
+    return { status: 'refused', reason: PRODUCTION_TOOLS_MISSING_REASON };
+  }
 
   return withTransaction(async (tx) => {
     const locked = await lockCard(tx, businessId, cardId);
@@ -777,7 +839,7 @@ export async function reraiseFailedDeliveries(options: CardSeams & { businessId:
         production,
         version,
         options: card.deliveryPlans,
-        stage: 'ready',
+        stage: production.stage === 'failed_checks' ? 'failed_checks' : 'ready',
         currency: active?.bundle.ceilings.currency ?? 'ILS',
         prefix: row.may_have_sent ? [RETRY_PREFIX, MAY_HAVE_SENT_LINE] : [RETRY_PREFIX],
         ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),

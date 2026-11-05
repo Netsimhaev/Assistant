@@ -827,7 +827,16 @@ async function finish(ctx: Ctx, p: Production): Promise<void> {
   );
 
   await ctx.onFinished({ productionId: p.productionId, versionId, stage, reason });
-  await saveWork(p.productionId, stage, { ...p.work, finished: true }, ctx.db);
+  // Merge, never overwrite, what the callback recorded on the row: the card
+  // module claims `work.notified` inside `onFinished` (production/card.ts),
+  // and `p.work` was read before it ran.
+  const current = await loadProduction(p.businessId, p.productionId, ctx.db);
+  await saveWork(
+    p.productionId,
+    stage,
+    { ...p.work, notified: p.work.notified || current?.work.notified === true, finished: true },
+    ctx.db,
+  );
 
   if (stage === 'ready') ctx.result.ready += 1;
   else if (stage === 'failed_checks') ctx.result.failedChecks += 1;

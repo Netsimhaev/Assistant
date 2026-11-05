@@ -80,7 +80,7 @@ export interface WhatsAppGateway {
    * files omits it, and `createBossMessenger` then offers no `sendFile`, so
    * the caller records the channel as not connected rather than failing.
    * Reached only through `BossMessenger.sendFile`, whose `contactId` is the
-   * principal's, fixed at construction (document production ֲ§8.3).
+   * principal's, fixed at construction (document production §8.3).
    */
   sendFile?(input: {
     contactId: string;

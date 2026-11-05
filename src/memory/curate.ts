@@ -106,6 +106,15 @@ export async function curateJob(
       const stored = await loadPlanBody(jobId, { businessId });
       if (stored === null) return { ...idle, skipped: 'no_plan' };
       if (!jobQualifiesForCuration(stored.plan)) return { ...idle, skipped: 'not_qualified' };
+      // A document delivery job (document production §5.7, C18) is never
+      // curated — positive marker, its `document_deliveries` row (055). Its
+      // mail.send step would otherwise qualify, and the delivery teaches
+      // nothing the owner did not already approve byte for byte.
+      const delivery = await getPool().query(
+        'SELECT 1 FROM document_deliveries WHERE business_id = $1 AND job_id = $2',
+        [businessId, jobId],
+      );
+      if ((delivery.rowCount ?? 0) > 0) return { ...idle, skipped: 'not_qualified' };
     }
 
     // Same switch discipline as DOCUMENT_INBOX: no key means the feature is

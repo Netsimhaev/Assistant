@@ -30,8 +30,14 @@ import type { Runtime } from '../orchestrator/runtime.js';
 import { tick } from '../orchestrator/scheduler.js';
 import { StepChannelError } from '../orchestrator/step-error.js';
 import { createFakeMessenger } from '../whatsapp/fake-messenger.js';
+import { curateJob } from '../memory/curate.js';
+import { bindPlanToJob, planHashOf } from '../orchestrator/plan-store.js';
+import { confirmChoice, createConfirmation } from '../governance/instruction-confirmations.js';
 import {
   approveDocumentCard,
+  buildDeliveryOptions,
+  CARD_TOO_LONG_FOR_WHATSAPP,
+  renderCardText,
   createDocumentCard,
   loadCardForVersion,
   loadDocumentCard,
@@ -43,7 +49,14 @@ import {
 } from './card.js';
 import { UNAUTHORISED_ADDRESS_NOTE } from './produce-input.js';
 import { PRODUCTION_TOOLS_MISSING_REASON } from './render-error.js';
-import { advanceStage, createProduction, loadProduction, saveVersion, type ProductionDestination } from './store.js';
+import {
+  advanceStage,
+  createProduction,
+  loadProduction,
+  loadVersion,
+  saveVersion,
+  type ProductionDestination,
+} from './store.js';
 import { withTransaction } from '../db/pool.js';
 
 const B = 'test-business';
@@ -349,14 +362,34 @@ describe('approveDocumentCard', () => {
     expect(rows.some((r) => r.reason.endsWith(CONFIRMED_COMMAND_EXEMPTION_MARKER))).toBe(true);
   });
 
-  it('the subject and body are never model-written: fixed default, or the destination the owner gave', async () => {
-    const { versionId } = await readyProduction();
-    const send = (await cardFor(versionId)).deliveryPlans[0]!;
-    expect(send.plan.steps[0]?.input).toMatchObject({
-      to: ['stranger@nowhere.example'],
+  it('subject and body are planner-written, shown verbatim on the card via the step echo and bound by the approval hash', async () => {
+    const planned = await readyProduction({
+      destination: { mode: 'send', to: ['stranger@nowhere.example'], subject: 'הצעה לנובמבר', body: 'שלום, מצורפת ההצעה.' },
+    });
+    const card = await cardFor(planned.versionId);
+    const send = card.deliveryPlans[0]!;
+    expect(send.plan.steps[0]?.input).toMatchObject({ subject: 'הצעה לנובמבר', body: 'שלום, מצורפת ההצעה.' });
+    const production = await loadProduction(B, planned.productionId);
+    const version = await loadVersion(B, planned.versionId);
+    const text = renderCardText({
+      cardId: card.cardId,
+      production: production!,
+      version: version!,
+      options: card.deliveryPlans,
+      stage: 'ready',
+      currency: 'ILS',
+    });
+    expect(text).toContain('הצעה לנובמבר');
+    expect(text).toContain('שלום, מצורפת ההצעה.');
+    // Absent from the destination: a fixed default, and a different hash —
+    // the words are part of what the owner approves.
+    const plain = await readyProduction();
+    const plainSend = (await cardFor(plain.versionId)).deliveryPlans[0]!;
+    expect(plainSend.plan.steps[0]?.input).toMatchObject({
       subject: 'מצורף מכתב: הצעת מחיר לאלפא',
       body: 'מצורף מכתב: הצעת מחיר לאלפא.',
     });
+    expect(plainSend.planHash).not.toBe(send.planHash);
   });
 
   it('approve with a stale planHash → card_stale, no job', async () => {
@@ -386,7 +419,7 @@ describe('approveDocumentCard', () => {
   it('approve after requestFix superseded the card → refused', async () => {
     const { versionId } = await readyProduction();
     const card = await cardFor(versionId);
-    const fix = await requestFix(card.cardId, 'תקני את הכותרת', 'dashboard', 'typed', { businessId: B });
+    const fix = await requestFix(card.cardId, 'תקני את הכותרת', 'dashboard', 'typed', { businessId: B, production: AVAILABLE });
     expect(fix.status).toBe('opened');
     const outcome = await approveDocumentCard(card.cardId, card.deliveryPlans[0]!.planHash, 'dashboard', { businessId: B });
     expect(outcome).toEqual({ status: 'not_open', state: 'superseded' });
@@ -406,10 +439,29 @@ describe('approveDocumentCard', () => {
     expect(await deliveryJobs()).toBe(1);
   });
 
-  it('a card that did not pass the checks has nothing to approve', async () => {
-    const { versionId } = await readyProduction({ stage: 'failed_checks' });
+  it('a card that did not pass the checks offers save with a warning, never send', async () => {
+    const { productionId, versionId } = await readyProduction({ stage: 'failed_checks' });
     const card = await cardFor(versionId);
-    expect(card.deliveryPlans).toEqual([]);
+    expect(card.deliveryPlans.map((o) => o.option)).toEqual(['save']);
+    expect(card.deliveryPlans[0]?.label).toContain('לא עבר את הבדיקות');
+
+    // A send plan for this very version (what a ready card would offer),
+    // smuggled into the stored plans, is still refused: send needs `ready`.
+    const production = await loadProduction(B, productionId);
+    const version = await loadVersion(B, versionId);
+    const send = buildDeliveryOptions({ ...production!, stage: 'ready' }, version!, 'ready')[0]!;
+    expect(send.option).toBe('send');
+    await getPool().query(
+      `UPDATE document_cards SET delivery_plans = delivery_plans || $2::jsonb WHERE card_id = $1`,
+      [card.cardId, JSON.stringify([send])],
+    );
+    expect((await approveDocumentCard(card.cardId, send.planHash, 'dashboard', { businessId: B })).status).toBe('card_stale');
+    expect(await deliveryJobs()).toBe(0);
+
+    // Save is allowed.
+    const saved = await approveDocumentCard(card.cardId, card.deliveryPlans[0]!.planHash, 'dashboard', { businessId: B });
+    expect(saved).toMatchObject({ status: 'approved', option: 'save' });
+    expect((await loadDocumentCard(B, card.cardId))?.state).toBe('saved');
   });
 });
 
@@ -419,7 +471,7 @@ describe('requestFix', () => {
   it('requestFix with a voice-origin original → text_origin transcribed', async () => {
     const { versionId } = await readyProduction({ textOrigin: 'transcribed' });
     const card = await cardFor(versionId);
-    const fix = await requestFix(card.cardId, 'הוסיפי את המחיר', 'dashboard', 'typed', { businessId: B });
+    const fix = await requestFix(card.cardId, 'הוסיפי את המחיר', 'dashboard', 'typed', { businessId: B, production: AVAILABLE });
     if (fix.status !== 'opened') throw new Error(fix.status);
     const production = await loadProduction(B, fix.productionId);
     expect(production?.textOrigin).toBe('transcribed');
@@ -432,17 +484,34 @@ describe('requestFix', () => {
     expect(job).toMatchObject({ provenance: 'boss', phase: 'followup', wakeAt: null });
     // Control: typed + typed stays typed and keeps the typed address.
     const typed = await readyProduction();
-    const fix2 = await requestFix((await cardFor(typed.versionId)).cardId, 'תקני', 'dashboard', 'typed', { businessId: B });
+    const fix2 = await requestFix((await cardFor(typed.versionId)).cardId, 'תקני', 'dashboard', 'typed', { businessId: B, production: AVAILABLE });
     if (fix2.status !== 'opened') throw new Error(fix2.status);
     const p2 = await loadProduction(B, fix2.productionId);
     expect(p2?.textOrigin).toBe('typed');
     expect(p2?.destination).toEqual({ mode: 'send', to: ['stranger@nowhere.example'] });
   });
 
+  it('refuses up front when this server cannot produce documents', async () => {
+    const { versionId } = await readyProduction();
+    const card = await cardFor(versionId);
+    for (const production of [undefined, { ...AVAILABLE, available: false }]) {
+      expect(await requestFix(card.cardId, 'תקני', 'dashboard', 'typed', { businessId: B, production })).toEqual({
+        status: 'refused',
+        reason: PRODUCTION_TOOLS_MISSING_REASON,
+      });
+    }
+    expect((await loadDocumentCard(B, card.cardId))?.state).toBe('open');
+    expect(await productionCount()).toBe(1);
+  });
+
   it('counts toward the daily cap and is refused past it', async () => {
     const { versionId } = await readyProduction();
     const card = await cardFor(versionId);
-    const refused = await requestFix(card.cardId, 'תקני', 'dashboard', 'typed', { businessId: B, perDay: 0 });
+    const refused = await requestFix(card.cardId, 'תקני', 'dashboard', 'typed', {
+      businessId: B,
+      perDay: 0,
+      production: AVAILABLE,
+    });
     expect(refused.status).toBe('refused');
     expect((await loadDocumentCard(B, card.cardId))?.state).toBe('open');
   });
@@ -478,6 +547,22 @@ describe('createDocumentCard and its notices', () => {
     expect(again.status).toBe('exists');
     expect(emails).toHaveLength(1);
     expect(messenger.sentFiles).toHaveLength(1);
+  });
+
+  it('a card too long for one WhatsApp message sends the file with a dashboard-only caption, and is not WhatsApp-approvable', async () => {
+    const { productionId, versionId } = await readyProduction();
+    await getPool().query(
+      `UPDATE document_productions SET work = jsonb_set(work, '{notes}', $2::jsonb) WHERE production_id = $1`,
+      [productionId, JSON.stringify(['א'.repeat(4_500)])],
+    );
+    await saveDocumentSettings({ toWhatsApp: true, toEmail: false, toScreen: true, baseFolder: null }, { businessId: B });
+    const messenger = createFakeMessenger();
+    await createDocumentCard(versionId, { businessId: B, messenger });
+    expect(messenger.sentFiles).toHaveLength(1);
+    expect(messenger.sentFiles[0]?.caption).toBe(CARD_TOO_LONG_FOR_WHATSAPP);
+    const card = await loadCardForVersion(B, versionId);
+    expect(card?.whatsappState).toBe('sent');
+    expect(card?.whatsappDeliveredAt).toBeNull();
   });
 
   it('a chosen channel with no seam is skipped_not_connected; an unchosen one stays NULL', async () => {
@@ -567,11 +652,84 @@ describe('exclusions', () => {
     expect((await reraiseFailedDeliveries({ businessId: B, messenger })).reraised).toEqual([]);
     expect(messenger.sentFiles).toHaveLength(1);
 
-    // Control: the very same job, no longer named by a card, IS a re-ask
-    // candidate — the card marker is what kept it out.
-    await getPool().query('UPDATE document_cards SET delivery_job_id = NULL WHERE card_id = $1', [cardId]);
+    // Control: the very same job, with its delivery record gone, IS a re-ask
+    // candidate — the delivery marker is what kept it out.
+    await getPool().query('DELETE FROM document_deliveries WHERE job_id = $1', [jobId]);
     const control = await reaskFailedCommands({ businessId: B });
     expect(control.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
+  });
+
+  it('a returned card approved again: neither the old nor the new delivery job is ever re-asked', async () => {
+    const { cardId, jobId } = await failedDelivery(false);
+    await reraiseFailedDeliveries({ businessId: B });
+    const card = await loadDocumentCard(B, cardId);
+    const again = await approveDocumentCard(cardId, card!.deliveryPlans[0]!.planHash, 'dashboard', { businessId: B });
+    if (again.status !== 'approved') throw new Error(again.status);
+    // The card now names only the NEW job; the old one keeps its own record.
+    expect((await loadDocumentCard(B, cardId))?.deliveryJobId).toBe(again.jobId);
+    const { rows } = await getPool().query<{ job_id: string }>(
+      'SELECT job_id FROM document_deliveries WHERE card_id = $1',
+      [cardId],
+    );
+    expect(rows.map((r) => r.job_id).sort()).toEqual([jobId, again.jobId].sort());
+    expect((await reaskFailedCommands({ businessId: B })).reasked).toEqual([]);
+  });
+
+  it("a production's origin job is never re-asked as a command", async () => {
+    const job = await ownerJob('תכיני מכתב');
+    const plan = Plan.parse({
+      goal: 'g',
+      steps: [{ id: 's1', agent: 'prod.docs', intent: 'i', toolName: 'doc.produce', input: PRODUCE_INPUT }],
+    });
+    await bindPlanToJob(job.jobId, plan, { businessId: B });
+    const hash = planHashOf(plan);
+    await createConfirmation(
+      {
+        jobId: job.jobId,
+        options: [{ label: 'x', planHash: hash, plan, contactSource: null }],
+        presentedText: 'x',
+        channel: 'dashboard',
+      },
+      { businessId: B },
+    );
+    expect(await confirmChoice(job.jobId, hash, 'p', { businessId: B })).toBe(true);
+    await getPool().query(
+      `INSERT INTO confirmed_step_claims (business_id, job_id, step_id, plan_hash) VALUES ($1, $2, 's1', $3)`,
+      [B, job.jobId, hash],
+    );
+    await transition(job.jobId, { to: 'failed', actor: 'orchestrator', reason: 'x', businessId: B });
+    await createProduction({
+      businessId: B,
+      originJobId: job.jobId,
+      instructionText: 'תכיני מכתב',
+      textOrigin: 'typed',
+      format: 'docx',
+      language: 'he',
+      kind: 'letter',
+      destination: { mode: 'save', folder: null },
+      sourceDocumentIds: [],
+    });
+    expect((await reaskFailedCommands({ businessId: B })).reasked).toEqual([]);
+    // Control: without the production row it would be re-asked.
+    await getPool().query('DELETE FROM document_productions WHERE origin_job_id = $1', [job.jobId]);
+    expect((await reaskFailedCommands({ businessId: B })).reasked.map((r) => r.oldJobId)).toEqual([job.jobId]);
+  });
+
+  it('a delivery job is never curated', async () => {
+    const { versionId } = await readyProduction();
+    const card = await cardFor(versionId);
+    const outcome = await approveDocumentCard(card.cardId, card.deliveryPlans[0]!.planHash, 'dashboard', { businessId: B });
+    if (outcome.status !== 'approved') throw new Error(outcome.status);
+    const curator = async (): Promise<never> => {
+      throw new Error('curator must not be called');
+    };
+    const skipped = await curateJob(outcome.jobId, { businessId: B, curator: curator as never });
+    expect(skipped.skipped).toBe('not_qualified');
+    // Control: the same plan on a job with no delivery record passes the
+    // qualification (its mail.send step is outbound).
+    await getPool().query('DELETE FROM document_deliveries WHERE job_id = $1', [outcome.jobId]);
+    const control = await curateJob(outcome.jobId, { businessId: B, curator: curator as never });
+    expect(control.skipped).not.toBe('not_qualified');
   });
 
   it('after an unknown step row the returned card also says the mail may already have gone', async () => {

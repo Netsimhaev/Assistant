@@ -1854,6 +1854,27 @@ describe('an instruction that asks for a document (document production §5.6)', 
     expect(result.status).toBe('planned');
   });
 
+  it('a plan that produces a document and does anything else is refused at the door (§4.2)', async () => {
+    const mixed = producePlan({ ...VALID, sourceHints: [] });
+    mixed.steps.push({ ...mailPlan('dana@example.com').steps[0]!, id: 's2' });
+    const result = await runInstruction(
+      { text: 'תכיני מסמך ותשלחי לדנה' },
+      { textOrigin: 'typed', channel: 'dashboard', businessId: BUSINESS, planner: async () => ({ status: 'planned', plan: mixed }) },
+    );
+    expect(result).toEqual({ status: 'refused', reason: expect.stringContaining('מסמך') });
+    // Control: the production step alone is planned.
+    const alone = await runInstruction(
+      { text: 'תכיני מסמך' },
+      {
+        textOrigin: 'typed',
+        channel: 'dashboard',
+        businessId: BUSINESS,
+        planner: async () => ({ status: 'planned', plan: producePlan({ ...VALID, sourceHints: [] }) }),
+      },
+    );
+    expect(alone.status).toBe('planned');
+  });
+
   it('a doc.produce step the handler would refuse is refused at the door', async () => {
     const result = await runInstruction(
       { text: 'תכיני מסמך' },

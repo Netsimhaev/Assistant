@@ -671,6 +671,18 @@ async function planAndCheck(
     const ledger = await ledgerStepProblem(door, step);
     if (ledger !== null) return { kind: 'refused', ...ledger };
 
+    // Spec §4.2: a plan that produces a document does ONLY that. The
+    // production job is parked and closed by the production loop, the card is
+    // its report, and delivery is a separate approved job — a second step
+    // beside it would run nowhere the owner can see or approve.
+    if (step.toolName === 'doc.produce' && plan.steps.length !== 1) {
+      return {
+        kind: 'refused',
+        reason: 'בקשת מסמך צריכה להיות לבדה בהוראה — השליחה או השמירה נעשות מכרטיס המסמך. אפשר לבקש את שאר הפעולות בהוראה נפרדת.',
+        audit: `instruction door: step ${step.id} doc.produce beside ${plan.steps.length - 1} other step(s)`,
+      };
+    }
+
     // The same schema the `doc.produce` handler parses with: a step it would
     // refuse is refused here, before the job is parked on it.
     if (step.toolName === 'doc.produce') {

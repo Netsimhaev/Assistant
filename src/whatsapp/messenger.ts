@@ -72,7 +72,7 @@ export interface BossMessenger {
   send(input: { text: string; jobId: string | null }): Promise<{ ok: boolean; error?: string }>;
   /**
    * Send a file to the owner — never takes a recipient, exactly like `send`
-   * (document production ֲ§8.3). Present only when the gateway can send files;
+   * (document production §8.3). Present only when the gateway can send files;
    * absent, a caller records the channel `skipped_not_connected`. Never
    * throws.
    */

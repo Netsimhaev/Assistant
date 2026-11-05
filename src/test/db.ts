@@ -23,6 +23,7 @@ export async function resetDatabase(): Promise<void> {
     TRUNCATE TABLE
       audit_log,
       document_settings,
+      document_deliveries,
       document_cards,
       document_versions,
       document_productions,
