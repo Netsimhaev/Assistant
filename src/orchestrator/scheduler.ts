@@ -1009,6 +1009,9 @@ export async function schedulerPass(
         charter: active.charter,
         ...(options.whatsappProvider !== undefined ? { provider: options.whatsappProvider } : {}),
         ...(options.whatsappPlanner !== undefined ? { planner: options.whatsappPlanner } : {}),
+        // A document-card fix ("תיקון: …") is a new production; the door
+        // refuses it up front when this server cannot produce.
+        ...(runtime.production !== undefined ? { production: runtime.production } : {}),
       });
     } catch (err) {
       whatsappError = err instanceof Error ? err.message : String(err);

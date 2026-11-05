@@ -86,7 +86,16 @@ const COLUMNS =
   'instruction_id, business_id, job_id, text, text_origin, question, answer, created_at::text AS created_at';
 
 export async function saveInstruction(
-  input: { jobId: string; text: string; textOrigin: InstructionTextOrigin },
+  input: {
+    jobId: string;
+    text: string;
+    textOrigin: InstructionTextOrigin;
+    /**
+     * Files the owner attached on the dashboard (migration 056). Ids only;
+     * the caller has already checked they are this business's documents.
+     */
+    attachedDocumentIds?: readonly string[];
+  },
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<InstructionRecord> {
   const businessId = options.businessId ?? config.businessId;
@@ -106,10 +115,10 @@ export async function saveInstruction(
   }
 
   const { rows } = await db.query<InstructionRow>(
-    `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin, attached_document_ids)
+     VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING ${COLUMNS}`,
-    [`INS-${ulid()}`, businessId, input.jobId, input.text, input.textOrigin],
+    [`INS-${ulid()}`, businessId, input.jobId, input.text, input.textOrigin, [...(input.attachedDocumentIds ?? [])]],
   );
 
   const row = rows[0];
@@ -235,6 +244,24 @@ export async function claimAnswer(
     [instructionId, businessId, answer],
   );
   return rowCount === 1;
+}
+
+/**
+ * The files the owner attached to this job's instruction (migration 056), in
+ * the order he attached them; `[]` when none or no instruction. What
+ * `doc.produce` reads to tell the owner's own sources from everything else.
+ */
+export async function attachedDocumentsForJob(
+  jobId: string,
+  options: { businessId?: string; db?: Queryable } = {},
+): Promise<string[]> {
+  const businessId = options.businessId ?? config.businessId;
+  const db = options.db ?? getPool();
+  const { rows } = await db.query<{ attached_document_ids: string[] }>(
+    'SELECT attached_document_ids FROM boss_instructions WHERE job_id = $1 AND business_id = $2',
+    [jobId, businessId],
+  );
+  return rows[0]?.attached_document_ids ?? [];
 }
 
 export async function loadInstructionForJob(

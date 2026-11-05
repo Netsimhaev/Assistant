@@ -583,4 +583,60 @@ describe('collectDigestFacts', () => {
     const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
     expect(facts.ledger).toEqual({ open: 0, overdue: 0, stuck: 0, closedByEvidence: 0, topStuck: [] });
   });
+  it('counts produced documents in the window, the ones sent, and the cards still waiting', async () => {
+    const db = getPool();
+    const inWindow = new Date('2026-10-06T12:00:00+03:00');
+    const before = new Date('2026-10-01T12:00:00+03:00');
+    const sha = 'a'.repeat(64);
+    await db.query(
+      `INSERT INTO document_productions (production_id, business_id, origin_job_id, instruction_text, text_origin,
+                                         format, language, kind, destination, stage)
+       VALUES ('DP-1', $1, 'J-o', 'x', 'typed', 'docx', 'he', 'letter', '{"mode":"save","folder":null}', 'ready')`,
+      [BUSINESS],
+    );
+    const versions: Array<[string, number, Date | null]> = [
+      ['DV-1', 1, new Date('2026-10-06T13:00:00+03:00')],
+      ['DV-2', 2, null],
+      ['DV-3', 3, null],
+      ['DV-4', 4, null],
+    ];
+    for (const [id, no, superseded] of versions) {
+      await db.query(
+        `INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes, superseded_at)
+         VALUES ($1, 'DP-1', $2, '{}', 'p', $3, 1, $4)`,
+        [id, no, sha, superseded],
+      );
+    }
+    // DC-1 superseded (fixed) — produced, not waiting. DC-2 approved and its
+    // delivery closed in the window — produced and sent. DC-3 open — produced
+    // and waiting. DC-4 open but created before the window — waiting only.
+    await db.query(
+      `INSERT INTO document_cards (card_id, business_id, version_id, state, created_at, delivery_job_id)
+       VALUES ('DC-1', $1, 'DV-1', 'superseded', $2, NULL),
+              ('DC-2', $1, 'DV-2', 'approved', $2, 'J-del'),
+              ('DC-3', $1, 'DV-3', 'open', $2, NULL),
+              ('DC-4', $1, 'DV-4', 'open', $3, NULL)`,
+      [BUSINESS, inWindow, before],
+    );
+    await db.query(
+      `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
+       VALUES ('J-del', $1, 'מסירת מסמך', 'closed', $3, 'boss', false, $2),
+              ('J-save', $1, 'מסירת מסמך', 'closed', $3, 'boss', false, $2)`,
+      [BUSINESS, new Date('2026-10-06T14:00:00+03:00'), charterVersion],
+    );
+    await db.query(
+      `INSERT INTO job_plans (business_id, job_id, plan_hash, plan)
+       VALUES ($1, 'J-del', 'h1', '{"steps":[{"toolName":"mail.send"}]}'),
+              ($1, 'J-save', 'h2', '{"steps":[{"toolName":"doc.save"}]}')`,
+      [BUSINESS],
+    );
+    await db.query(
+      `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id)
+       VALUES ('J-del', $1, 'DC-2', 'DV-2'), ('J-save', $1, 'DC-1', 'DV-1')`,
+      [BUSINESS],
+    );
+
+    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    expect(facts.documents).toEqual({ produced: 3, sent: 1, waiting: 2 });
+  });
 });

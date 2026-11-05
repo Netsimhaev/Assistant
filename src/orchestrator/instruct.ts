@@ -183,6 +183,15 @@ export interface RunInstructionOptions {
    * never a second question — the same coarse bound.
    */
   sourceAsked?: boolean;
+  /**
+   * Files the owner attached to this instruction on the dashboard (document
+   * production D14) — ids of documents the dashboard just ingested. Only ids
+   * that resolve to THIS business's documents are kept; they are stored on
+   * the instruction (`attached_document_ids`, migration 056), where
+   * `doc.produce` reads them as the owner's own sources, and the planner
+   * sees their ids and names (`PlanRequest.attachedDocuments`), never text.
+   */
+  attachedDocumentIds?: readonly string[];
 }
 
 export interface GrantedAuthorization {
@@ -333,10 +342,17 @@ export async function runInstruction(
     title: input.text.slice(0, 80),
   });
 
+  const attachedDocuments = await attachedDocumentsOf(businessId, options.attachedDocumentIds ?? []);
+
   let instruction: InstructionRecord;
   try {
     instruction = await saveInstruction(
-      { jobId: job.jobId, text: input.text, textOrigin },
+      {
+        jobId: job.jobId,
+        text: input.text,
+        textOrigin,
+        attachedDocumentIds: attachedDocuments.map((d) => d.documentId),
+      },
       { businessId },
     );
   } catch (err) {
@@ -396,6 +412,7 @@ export async function runInstruction(
     textOrigin,
     bundle: active.bundle,
     timeZone: active.charter.identity.timezone,
+    attachedDocuments,
   };
 
   // Spec §6: more than one person fits the name, so nothing is sent until the
@@ -531,6 +548,28 @@ interface DoorContext {
   bundle: PolicyBundle;
   /** The active charter's `identity.timezone`: the ledger's dates are the owner's wall clock. */
   timeZone: string;
+  /** Files the owner attached (ids + names), shown to every planner call of this instruction. */
+  attachedDocuments: readonly { documentId: string; name: string }[];
+}
+
+/**
+ * The attached ids that are this business's documents, with their names, in
+ * the order given. An id of another business, or none at all, is dropped:
+ * the dashboard only ever hands in ids it just ingested, and this is the
+ * second layer that keeps it so.
+ */
+async function attachedDocumentsOf(
+  businessId: string,
+  ids: readonly string[],
+): Promise<{ documentId: string; name: string }[]> {
+  if (ids.length === 0) return [];
+  const { rows } = await getPool().query<{ document_id: string; original_name: string }>(
+    `SELECT document_id, original_name FROM documents
+      WHERE business_id = $1 AND document_id = ANY($2::text[])
+      ORDER BY array_position($2::text[], document_id)`,
+    [businessId, [...new Set(ids)]],
+  );
+  return rows.map((r) => ({ documentId: r.document_id, name: r.original_name }));
 }
 
 /**
@@ -594,6 +633,7 @@ async function planAndCheck(
       // owner's own words (spec §10.6, `instruction-invariants.test.ts`).
       instruction: door.instruction.text,
       ...(resolvedContact === undefined ? {} : { resolvedContact }),
+      ...(door.attachedDocuments.length === 0 ? {} : { attachedDocuments: door.attachedDocuments }),
       provenance: 'boss',
       // Spec §10.10: on the instruction path the confirmation question is
       // the control, so the planner is shown the catalogue at `auto` — at

@@ -43,6 +43,14 @@ import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { raiseMailReply } from './mail-reply.js';
 import { presentMailCard } from './whatsapp-mail-card.js';
 import { createLedgerItem, loadLedgerItem } from '../ledger/store.js';
+import type { DocxSpec } from '../domain/document-spec.js';
+import { createDocumentCard, loadDocumentCard } from '../production/card.js';
+import { advanceStage, createProduction, saveVersion, type ProductionDestination } from '../production/store.js';
+import {
+  DOCUMENT_CARD_FIX_OPENED,
+  DOCUMENT_CARD_SAVED,
+  DOCUMENT_CARD_SEVERAL_OPTIONS,
+} from './whatsapp-document-card.js';
 
 const BUSINESS = 'test-business';
 // `buildCharter`'s default principal (`src/test/fixtures.ts`) carries this
@@ -248,7 +256,7 @@ describe('runWhatsAppDoor', () => {
       planner: plannedWith(recallPlan()),
     });
 
-    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 1, instructed: 1, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
     expect(messenger.sentTexts).toHaveLength(1);
     expect(messenger.sentTexts[0]).toContain('קיבלתי');
 
@@ -1264,7 +1272,7 @@ describe('runWhatsAppDoor', () => {
       },
     });
 
-    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
+    expect(result).toEqual({ polled: 2, instructed: 2, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 });
     expect(seenInstructions).toEqual(['ראשונה (מוקדמת)', 'שנייה (מאוחרת)']);
   });
 
@@ -2176,6 +2184,171 @@ describe('confirming a held command over WhatsApp', () => {
       expect(result.ledgerReplies).toBe(0);
       expect(result.instructed).toBe(1);
       expect(await ledgerStatus(second)).toBe('open');
+    });
+  });
+  describe('a document card over WhatsApp (document production §8.3, C9)', () => {
+    const AVAILABLE = { available: true, sofficePath: '/opt/soffice', chromiumPath: '/opt/chromium' };
+    const DOC_SPEC: DocxSpec = {
+      format: 'docx',
+      language: 'he',
+      kind: 'letter',
+      title: 'הצעת מחיר',
+      filename: 'הצעה',
+      style: { theme: 'clean', accent: 'navy' },
+      sources: [],
+      blocks: [{ type: 'paragraph', text: 'שלום' }],
+    };
+    let docSeq = 0;
+
+    /** A ready production's card, delivered on WhatsApp `deliveredAgoMs` ago. */
+    async function documentCard(
+      destination: ProductionDestination = { mode: 'save', folder: null },
+      deliveredAgoMs = 60_000,
+    ): Promise<string> {
+      docSeq += 1;
+      const productionId = await createProduction({
+        businessId: BUSINESS,
+        originJobId: 'J-origin',
+        instructionText: 'תכיני הצעת מחיר ל-dana@example.com',
+        textOrigin: 'typed',
+        format: 'docx',
+        language: 'he',
+        kind: 'letter',
+        destination,
+        sourceDocumentIds: [],
+      });
+      const versionId = await saveVersion({
+        productionId,
+        versionNo: 1,
+        spec: DOC_SPEC,
+        storedPath: `produced/x/${productionId}.docx`,
+        sha256: `${docSeq}`.padStart(64, 'a'),
+        sizeBytes: 10,
+      });
+      expect(await advanceStage(productionId, 'queued', 'ready', {})).toBe(true);
+      const created = await createDocumentCard(versionId, { businessId: BUSINESS });
+      await getPool().query(
+        `UPDATE document_cards SET whatsapp_delivered_at = now() - make_interval(secs => $2::double precision / 1000)
+          WHERE card_id = $1`,
+        [created.cardId, deliveredAgoMs],
+      );
+      return created.cardId;
+    }
+
+    async function cardState(cardId: string): Promise<string | undefined> {
+      return (await loadDocumentCard(BUSINESS, cardId))?.state;
+    }
+
+    it('"שלחי" with one document card approves it', async () => {
+      const cardId = await documentCard();
+      gateway.enqueue(reply('שלחי'));
+      const result = await pass();
+
+      expect(result.documentCardReplies).toBe(1);
+      expect(result.instructed).toBe(0);
+      const card = await loadDocumentCard(BUSINESS, cardId);
+      expect(card?.state).toBe('saved');
+      expect(card?.deliveryJobId).not.toBe(null);
+      expect(lastSent()).toBe(DOCUMENT_CARD_SAVED);
+    });
+
+    it('"שלחי" with a document card and a mail card open → SEVERAL_OPEN_REFUSAL, neither approved', async () => {
+      const cardId = await documentCard();
+      const approvalId = await raiseMailCard();
+      gateway.enqueue(reply('שלחי'));
+      const result = await pass();
+
+      expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+      expect(result.refused).toBe(1);
+      expect(result.documentCardReplies).toBe(0);
+      expect(result.mailCardReplies).toBe(0);
+      expect(await cardState(cardId)).toBe('open');
+      expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+    });
+
+    it('"שלחי" with two document cards open → SEVERAL_OPEN_REFUSAL', async () => {
+      const a = await documentCard();
+      const b = await documentCard();
+      gateway.enqueue(reply('שלחי'));
+      const result = await pass();
+      expect(result.refused).toBe(1);
+      expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
+      expect(await cardState(a)).toBe('open');
+      expect(await cardState(b)).toBe('open');
+    });
+
+    it('voice "שלחי" passes through', async () => {
+      const cardId = await documentCard();
+      // A caption: like a transcript, not the owner's keystrokes. It reaches
+      // the ordinary door and is planned as an instruction instead.
+      gateway.enqueue({ ...reply('שלחי'), mediaKind: 'image' });
+      const result = await pass(plannedWith(recallPlan()));
+      expect(result.documentCardReplies).toBe(0);
+      expect(result.instructed).toBe(1);
+      expect(await cardState(cardId)).toBe('open');
+    });
+
+    it('"שלחי" before delivered_at does not approve', async () => {
+      const cardId = await documentCard();
+      // Sent (provider time) two minutes before the card reached WhatsApp.
+      gateway.enqueue(reply('שלחי', -120_000));
+      const result = await pass(plannedWith(recallPlan()));
+      expect(result.documentCardReplies).toBe(0);
+      expect(result.instructed).toBe(1);
+      expect(await cardState(cardId)).toBe('open');
+    });
+
+    it('a card never delivered on WhatsApp is not answered there', async () => {
+      const cardId = await documentCard();
+      await getPool().query('UPDATE document_cards SET whatsapp_delivered_at = NULL WHERE card_id = $1', [cardId]);
+      gateway.enqueue(reply('שלחי'));
+      const result = await pass(plannedWith(recallPlan()));
+      expect(result.documentCardReplies).toBe(0);
+      expect(result.instructed).toBe(1);
+      expect(await cardState(cardId)).toBe('open');
+    });
+
+    it('a card delivered outside the window is not answered there', async () => {
+      const cardId = await documentCard({ mode: 'save', folder: null }, (config.whatsappQuestionWindowMinutes + 5) * 60_000);
+      gateway.enqueue(reply('שלחי'));
+      const result = await pass(plannedWith(recallPlan()));
+      expect(result.documentCardReplies).toBe(0);
+      expect(result.instructed).toBe(1);
+      expect(await cardState(cardId)).toBe('open');
+    });
+
+    it('"שלחי" on a card with a send and a save option asks for the dashboard and approves nothing', async () => {
+      const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
+      expect((await loadDocumentCard(BUSINESS, cardId))?.deliveryPlans).toHaveLength(2);
+      gateway.enqueue(reply('שלחי'));
+      const result = await pass();
+      expect(lastSent()).toBe(DOCUMENT_CARD_SEVERAL_OPTIONS);
+      expect(result.refused).toBe(1);
+      expect(await cardState(cardId)).toBe('open');
+    });
+
+    it('"תיקון: …" requests a fix', async () => {
+      const cardId = await documentCard();
+      gateway.enqueue(reply('תיקון: להוסיף את המע"מ'));
+      const result = await runWhatsAppDoor({ gateway, messenger, businessId: BUSINESS, planner: neverCalled, production: AVAILABLE });
+
+      expect(result.documentCardReplies).toBe(1);
+      expect(lastSent()).toBe(DOCUMENT_CARD_FIX_OPENED);
+      expect(await cardState(cardId)).toBe('superseded');
+      const { rows } = await getPool().query<{ instruction_text: string; text_origin: string }>(
+        `SELECT instruction_text, text_origin FROM document_productions WHERE business_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [BUSINESS],
+      );
+      expect(rows[0]?.instruction_text).toContain('תיקון: להוסיף את המע"מ');
+      expect(rows[0]?.text_origin).toBe('typed');
+    });
+
+    it('"שלח" with no document card open still answers the mail card', async () => {
+      const approvalId = await raiseMailCard();
+      gateway.enqueue(reply('שלח'));
+      const result = await pass();
+      expect(result.mailCardReplies).toBe(1);
+      expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).not.toBe('pending');
     });
   });
 });

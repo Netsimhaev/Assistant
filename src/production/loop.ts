@@ -130,6 +130,7 @@ import {
   saveVersion,
   saveVersionCheck,
   saveWork,
+  sourceProvenance,
   versionIdFor,
   type DocumentVersion,
   type Production,
@@ -275,14 +276,8 @@ async function timed<T>(
 
 // ---------------------------------------------------------------- sources
 
-/**
- * Documents have no trust column; every attached document is fenced as
- * `unknown_external` until an upload path records the owner as its author
- * (spec §5.6, Task 15). Over-fencing the owner's own file costs nothing.
- */
-function documentProvenance(_source: string): TrustLevel {
-  return 'unknown_external';
-}
+// Defined beside the work record it reads (store.ts); re-exported for the loop's readers.
+export { sourceProvenance };
 
 /** A memory body as text — the SAME string the drafter sees and grounding checks. */
 export function memoryText(body: Record<string, unknown>): string {
@@ -300,8 +295,8 @@ interface LoadedSources {
 async function loadSources(p: Production, memoryIds: readonly string[], db: Queryable): Promise<LoadedSources> {
   const fenced: FencedSource[] = [];
   if (p.sourceDocumentIds.length > 0) {
-    const { rows } = await db.query<{ document_id: string; source: string }>(
-      `SELECT document_id, source FROM documents WHERE business_id = $1 AND document_id = ANY($2::text[])
+    const { rows } = await db.query<{ document_id: string }>(
+      `SELECT document_id FROM documents WHERE business_id = $1 AND document_id = ANY($2::text[])
         ORDER BY array_position($2::text[], document_id)`,
       [p.businessId, p.sourceDocumentIds],
     );
@@ -309,7 +304,7 @@ async function loadSources(p: Production, memoryIds: readonly string[], db: Quer
       const artifacts = await loadArtifacts(row.document_id, { businessId: p.businessId, db });
       fenced.push({
         documentId: row.document_id,
-        provenance: documentProvenance(row.source),
+        provenance: sourceProvenance(p, row.document_id),
         artifacts: artifacts.map((a) => ({ ordinal: a.ordinal, text: renderArtifactFull(a) })),
       });
     }

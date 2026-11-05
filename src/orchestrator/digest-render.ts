@@ -69,7 +69,7 @@ function namedExceptionsList(items: readonly DigestException[], hiddenCount: num
 }
 
 export function renderDigest(facts: DigestFacts): RenderedDigest {
-  const { window: w, waiting, done, exceptions, permissionChanges, cost, timeZone, ledger } = facts;
+  const { window: w, waiting, done, exceptions, permissionChanges, cost, timeZone, ledger, documents } = facts;
   const lines: string[] = [];
 
   lines.push(`${KIND_LABEL[w.kind]} · ${day(w.start, timeZone)}–${day(w.end, timeZone)}`);
@@ -132,6 +132,15 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
     }
   }
 
+  // Produced documents (document production §10), one line, verbatim.
+  const documentsTotal = documents.produced + documents.sent + documents.waiting;
+  if (documentsTotal > 0) {
+    lines.push(
+      '',
+      `הופקו ${documents.produced} מסמכים, ${documents.sent} נשלחו, ${documents.waiting} מחכים לבדיקתך`,
+    );
+  }
+
   // §3.5 — both measures: what it cost, and how much is left.
   //
   // **"ב-30 הימים האחרונים", never "החודש".** The ceiling beside it is
@@ -165,7 +174,8 @@ export function renderDigest(facts: DigestFacts): RenderedDigest {
     // and the empty-day rule (spec §2 decision 3) would never fire.
     ledger.overdue > 0 ||
     ledger.stuck > 0 ||
-    ledger.closedByEvidence > 0;
+    ledger.closedByEvidence > 0 ||
+    documentsTotal > 0;
 
   // Spec §2 decision 3: an empty day is SAID. The screen still gets it so the
   // record stays continuous; `hadContent` is what keeps it out of his inbox.

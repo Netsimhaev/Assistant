@@ -15,7 +15,7 @@
  * "ומדווחת" would single out one of two levels the code does not tell apart.
  */
 import type { ActionClass } from './action.js';
-import type { DocumentFormat, DocumentKind, ProductionStage } from './document-spec.js';
+import type { DocumentCardState, DocumentFormat, DocumentKind, ProductionStage } from './document-spec.js';
 import type { LedgerFamily, LedgerStatus } from './ledger.js';
 import type { AutonomyLevel, TrustLevel } from './trust.js';
 
@@ -131,4 +131,17 @@ export const productionStageLabel: Readonly<Record<ProductionStage, string>> = O
   ready: 'מוכן לאישור',
   failed_checks: 'נעצר בבדיקות',
   failed: 'נכשל',
+});
+
+/**
+ * A document card's state, as the owner reads it on `/documents`. A new state
+ * is a compile error here until it has Hebrew.
+ */
+export const documentCardStateLabel: Readonly<Record<DocumentCardState, string>> = Object.freeze({
+  open: 'מחכה לבדיקתך',
+  approved: 'אושר לשליחה',
+  saved: 'אושר לשמירה',
+  fix_requested: 'נשלח לתיקון',
+  superseded: 'הוחלף בגרסה חדשה',
+  failed_send: 'המסירה לא הושלמה',
 });

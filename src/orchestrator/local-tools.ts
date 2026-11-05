@@ -70,7 +70,7 @@ import { StepChannelError } from './step-error.js';
 import { getPool } from '../db/pool.js';
 import type { Importance, LedgerStage } from '../domain/ledger.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { loadInstructionForJob } from '../governance/instructions.js';
+import { attachedDocumentsForJob, loadInstructionForJob } from '../governance/instructions.js';
 import {
   LEADING_HEBREW_PARTICLE,
   TRAILING_PUNCTUATION,
@@ -764,9 +764,12 @@ const HANDLERS: Record<string, LocalHandler> = {
    * them would otherwise leave a job in `execute` that queues a second
    * production on its next run.
    *
-   * Uploaded or explicit sources are labelled `unknown_external` by the
-   * loop's fencing whatever their origin (`documentProvenance`, loop.ts);
-   * recording an owner upload as `boss` is Task 15's.
+   * Files the owner attached to the instruction on the dashboard
+   * (`attachedDocumentsForJob`, migration 056) are added to the explicit
+   * sources whatever the plan said, and recorded as `ownerSourceIds` — the
+   * loop fences those as `boss` and every other source as
+   * `unknown_external` (`sourceProvenance`, loop.ts). The attached ids come
+   * from the instruction row, never from the plan.
    */
   'doc.produce': async (input, ctx) => {
     const db = ctx.db ?? getPool();
@@ -804,10 +807,11 @@ const HANDLERS: Record<string, LocalHandler> = {
       destination = parsed.destination;
     }
 
+    const attached = await attachedDocumentsForJob(ctx.jobId, { businessId: ctx.businessId, db });
     const sources = await resolveSourceDocuments(
       ctx.businessId,
       parsed.sourceHints ?? [],
-      (parsed.sources ?? []).map((source) => source.documentId),
+      [...new Set([...attached, ...(parsed.sources ?? []).map((source) => source.documentId)])],
       db,
       { timeZone: active.charter.identity.timezone },
     );
@@ -827,6 +831,7 @@ const HANDLERS: Record<string, LocalHandler> = {
           destination,
           sourceDocumentIds: sources.resolved,
           notes,
+          ownerSourceIds: sources.resolved.filter((id) => attached.includes(id)),
         },
         tx,
       );

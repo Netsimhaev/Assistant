@@ -36,6 +36,7 @@ import {
   ProductionStage,
 } from '../domain/document-spec.js';
 import type { InstructionTextOrigin } from '../governance/typed-recipients.js';
+import type { TrustLevel } from '../domain/trust.js';
 import { ulid } from 'ulid';
 
 export const TERMINAL_STAGES: readonly ProductionStage[] = ['ready', 'failed_checks', 'failed'];
@@ -95,6 +96,14 @@ export const ProductionWork = z
      * it sends, so an at-least-once `onFinished` notifies at most once.
      */
     notified: z.boolean().default(false),
+    /**
+     * The sources the OWNER attached to his instruction on the dashboard
+     * (`boss_instructions.attached_document_ids`, migration 056) — fixed
+     * when the production is queued, carried to a fix. The loop fences
+     * these as `boss` (`sourceProvenance`, below) and every other source
+     * as `unknown_external`. Never taken from a plan.
+     */
+    ownerSourceIds: z.array(z.string()).default([]),
   })
   .strict();
 export type ProductionWork = z.infer<typeof ProductionWork>;
@@ -182,6 +191,20 @@ function toProduction(row: ProductionRow): Production {
   };
 }
 
+/**
+ * Documents have no trust column, and one `documents` row can be the same
+ * bytes from the owner and from a stranger (ingest dedupes by sha256). So
+ * trust is decided per PRODUCTION, positively: a source is `boss` only when
+ * the owner attached it to the instruction on the dashboard
+ * (`work.ownerSourceIds`, recorded by `doc.produce` from
+ * `boss_instructions.attached_document_ids`); every other source — the
+ * inbox, a mail attachment, a hint the resolver matched — is
+ * `unknown_external`.
+ */
+export function sourceProvenance(p: Pick<Production, 'work'>, documentId: string): TrustLevel {
+  return p.work.ownerSourceIds.includes(documentId) ? 'boss' : 'unknown_external';
+}
+
 export interface CreateProductionInput {
   businessId: string;
   originJobId: string;
@@ -194,6 +217,8 @@ export interface CreateProductionInput {
   sourceDocumentIds: string[];
   /** See `ProductionWork.notes`. */
   notes?: string[];
+  /** See `ProductionWork.ownerSourceIds`. */
+  ownerSourceIds?: string[];
 }
 
 export async function createProduction(input: CreateProductionInput, db: Queryable = getPool()): Promise<string> {
@@ -215,7 +240,7 @@ export async function createProduction(input: CreateProductionInput, db: Queryab
       DocumentKind.parse(input.kind),
       JSON.stringify(destination),
       input.sourceDocumentIds,
-      JSON.stringify({ ...EMPTY_WORK, notes: input.notes ?? [] }),
+      JSON.stringify({ ...EMPTY_WORK, notes: input.notes ?? [], ownerSourceIds: input.ownerSourceIds ?? [] }),
     ],
   );
   return productionId;

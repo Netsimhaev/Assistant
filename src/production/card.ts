@@ -80,6 +80,7 @@ import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { getPool, withTransaction, type Queryable } from '../db/pool.js';
 import { FORMAT_MEDIA_TYPE, formatAttachmentSize, type AttachmentRef } from '../domain/attachment-ref.js';
+import { DocumentCardState } from '../domain/document-spec.js';
 import { documentKindLabel } from '../domain/labels.js';
 import { Plan } from '../domain/plan.js';
 import { loadDocumentSettings } from '../governance/document-settings.js';
@@ -87,8 +88,10 @@ import { confirmChoice, createConfirmation } from '../governance/instruction-con
 import { MAX_INSTRUCTION_CHARS, saveInstruction } from '../governance/instructions.js';
 import {
   authorisedRecipients,
+  EMAIL_SHAPE,
   type InstructionTextOrigin,
 } from '../governance/typed-recipients.js';
+import { emailDomainProblem } from '../domain/charter.js';
 import { renderStepEcho } from '../orchestrator/command-echo.js';
 import { WHATSAPP_MESSAGE_MAX_CHARS } from '../orchestrator/command-confirm.js';
 import type { Runtime } from '../orchestrator/runtime.js';
@@ -112,8 +115,8 @@ import {
 
 // ---------------------------------------------------------------- shapes
 
-export const CardState = z.enum(['open', 'approved', 'saved', 'fix_requested', 'superseded', 'failed_send']);
-export type CardState = z.infer<typeof CardState>;
+export const CardState = DocumentCardState;
+export type CardState = DocumentCardState;
 
 /** A card the owner may still act on: fresh, or returned after a failed delivery. */
 const ACTIONABLE: readonly CardState[] = ['open', 'failed_send'];
@@ -672,6 +675,91 @@ export async function approveDocumentCard(
   });
 }
 
+// ---------------------------------------------------------------- a typed address (C12)
+
+export const TYPED_ADDRESS_INVALID_HE = 'הכתובת אינה כתובת מייל תקינה.';
+export const TYPED_ADDRESS_NOT_APPLICABLE_HE =
+  'אפשר להוסיף כתובת רק לכרטיס פתוח של מסמך שעבר את הבדיקות ונועד לשליחה, ושאין בו עדיין נמען.';
+
+/** Anything that renders invisibly or reorders text: an address carrying one is not the address shown. */
+const INVISIBLE_IN_ADDRESS = /[\u{0}-\u{1f}\u{7f}-\u{9f}\u{61c}\u{200b}-\u{200f}\u{202a}-\u{202e}\u{2060}-\u{2069}\u{feff}]/u;
+
+/**
+ * The address the owner typed on the card is a valid single address, or a
+ * Hebrew refusal. Shape: `EMAIL_SHAPE`, a domain `emailDomainProblem`
+ * accepts, nothing invisible, at most 320 characters.
+ */
+export function typedAddressProblem(raw: string): string | null {
+  const address = raw.trim();
+  if (address.length === 0 || address.length > 320) return TYPED_ADDRESS_INVALID_HE;
+  if (INVISIBLE_IN_ADDRESS.test(address)) return TYPED_ADDRESS_INVALID_HE;
+  if (!EMAIL_SHAPE.test(address)) return TYPED_ADDRESS_INVALID_HE;
+  const domain = address.slice(address.lastIndexOf('@') + 1);
+  if (emailDomainProblem(domain) !== null) return TYPED_ADDRESS_INVALID_HE;
+  return null;
+}
+
+export type TypedAddressOutcome =
+  | { status: 'added'; planHash: string }
+  | { status: 'refused'; reason: string }
+  | { status: 'not_open'; state: CardState }
+  | { status: 'not_found' };
+
+/**
+ * C12: a card whose production was meant to be SENT but has no authorised
+ * recipient shows an address field instead of "שלחי". What the owner types
+ * there is his own keystrokes on the dashboard — the authority C12 rules it
+ * is — and it becomes the production's recipient; the card's options are
+ * then rebuilt by `buildDeliveryOptions`, the SAME builder approval rebuilds
+ * from, so the new send option is approved exactly like any other (the
+ * plan hash pressed must equal the hash stored AND the hash rebuilt).
+ *
+ * Nothing is approved here, and nothing is sent: the owner still presses the
+ * new "שלחי ל…" button, which shows the full echo first. One address only;
+ * only on an open card of a `ready` production whose destination is a send
+ * with no recipient left after `authorisedRecipients`; under the card's row
+ * lock, so it cannot race an approval or a fix.
+ */
+export async function addTypedRecipient(
+  cardId: string,
+  typed: string,
+  options: { businessId: string },
+): Promise<TypedAddressOutcome> {
+  const { businessId } = options;
+  const problem = typedAddressProblem(typed);
+  if (problem !== null) return { status: 'refused', reason: problem };
+  const address = typed.trim();
+
+  return withTransaction(async (tx) => {
+    const locked = await lockCard(tx, businessId, cardId);
+    if (locked === null) return { status: 'not_found' };
+    const { card, production, version } = locked;
+    if (!ACTIONABLE.includes(card.state)) return { status: 'not_open', state: card.state };
+    if (
+      version.supersededAt !== null ||
+      production.stage !== 'ready' ||
+      production.destination.mode !== 'send' ||
+      production.destination.to.length > 0
+    ) {
+      return { status: 'refused', reason: TYPED_ADDRESS_NOT_APPLICABLE_HE };
+    }
+    const destination: ProductionDestination = { ...production.destination, to: [address] };
+    await tx.query(
+      `UPDATE document_productions SET destination = $3::jsonb, updated_at = now()
+        WHERE business_id = $1 AND production_id = $2`,
+      [businessId, production.productionId, JSON.stringify(destination)],
+    );
+    const rebuilt = buildDeliveryOptions({ ...production, destination }, version, 'ready');
+    await tx.query(
+      `UPDATE document_cards SET delivery_plans = $3::jsonb WHERE business_id = $1 AND card_id = $2`,
+      [businessId, cardId, JSON.stringify(rebuilt)],
+    );
+    const send = rebuilt.find((option) => option.option === 'send');
+    if (send === undefined) throw new Error(`addTypedRecipient: no send option rebuilt for ${cardId}`);
+    return { status: 'added', planHash: send.planHash };
+  });
+}
+
 // ---------------------------------------------------------------- request a fix
 
 export const FIX_SEPARATOR = '\n\nתיקון: ';
@@ -768,6 +856,8 @@ export async function requestFix(
         destination,
         sourceDocumentIds: production.sourceDocumentIds,
         notes,
+        // The fix is the same request: the owner's own sources stay his.
+        ownerSourceIds: production.work.ownerSourceIds,
       },
       tx,
     );

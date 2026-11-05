@@ -147,6 +147,13 @@ import { transcribeInbound, type TranscriptionProvider } from '../whatsapp/trans
 import { runInstruction, type InstructionOutcome, type RunInstructionOptions } from './instruct.js';
 import { linkWhatsAppMessage } from './jobs.js';
 import { handleMailCardMessage, isMailCardAction, openMailCards } from './whatsapp-mail-card.js';
+import {
+  SEVERAL_OPEN_REFUSAL,
+  handleDocumentCardMessage,
+  isDocumentCardAction,
+  openDocumentCards,
+} from './whatsapp-document-card.js';
+import type { Runtime } from './runtime.js';
 import { handleLedgerWhatsApp } from '../ledger/whatsapp-command.js';
 import {
   applyConfirmation,
@@ -225,6 +232,13 @@ export interface DoorResult {
    * that could not be resolved or applied counts under `refused`.
    */
   ledgerReplies: number;
+  /**
+   * The owner answered an open document card (`whatsapp-document-card.ts`):
+   * approved it with "שלחי", or asked for a fix with "תיקון: …". Counted
+   * apart for the reason `mailCardReplies` gives. A refusal (several cards
+   * open, several options, a card gone) counts under `refused`.
+   */
+  documentCardReplies: number;
   /**
    * A confirmation answer `applyConfirmation` threw on — decided or not, not
    * applied (a bound-hash mismatch, a transient transition error). The owner
@@ -451,6 +465,11 @@ interface ProcessContext {
    * without waiting one out.
    */
   questionWindowMinutes?: number;
+  /**
+   * `runtime.production` — what a document-card fix request ("תיקון: …")
+   * needs to decide up front whether this server can produce at all.
+   */
+  production?: Runtime['production'];
 }
 
 type ProcessOutcome =
@@ -461,10 +480,11 @@ type ProcessOutcome =
   | 'mailCard'
   | 'confirmation'
   | 'ledger'
+  | 'documentCard'
   | 'skipped';
 
 /** Spec §10.11, verbatim: more than one thing is open, and the answer cannot say which. */
-export const SEVERAL_OPEN_REFUSAL = 'יש כמה שאלות פתוחות — עני בדשבורד';
+export { SEVERAL_OPEN_REFUSAL };
 /** The answer to a confirmation, applied: the job runs; its result is the report pass's to tell. */
 export const CONFIRM_EXECUTING = 'מבצעת.';
 export const CONFIRM_CANCELLED = 'בוטל.';
@@ -764,6 +784,44 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       const ledger = await handleLedgerWhatsApp({ ...typedLedger, accept: 'bare' });
       if (ledger === 'applied') return 'ledger';
       if (ledger !== 'passthrough') return ledger;
+    }
+
+    // An open DOCUMENT card is read next (document production §8.3, C9), and
+    // only for typed "שלחי"/"שלח" or "תיקון: …" with at least one document
+    // card delivered on WhatsApp before this message and inside the window.
+    // Document and mail-reply cards are counted together: with more than one
+    // of either open, "שלחי" cannot say which, and nothing is approved. With
+    // no document card open the message falls through to the mail card below
+    // exactly as before. After the confirmation reader and the ledger: "שלחי"
+    // is in neither of their word lists (`command-confirm.test.ts` keeps them
+    // disjoint), so neither takes it.
+    if (msg.mediaKind === null && msg.body !== null && isDocumentCardAction(msg.body)) {
+      const windowOverride =
+        ctx.questionWindowMinutes !== undefined ? { windowMinutes: ctx.questionWindowMinutes } : {};
+      const documentCards = await openDocumentCards({
+        businessId: ctx.businessId,
+        inboundAt: msg.providerTimestamp,
+        ...windowOverride,
+      });
+      if (documentCards.length > 0) {
+        const mailCards = await openMailCards({
+          businessId: ctx.businessId,
+          excludeMessageId: stored.id,
+          inboundAt: msg.providerTimestamp,
+          ...windowOverride,
+        });
+        const handled = await handleDocumentCardMessage({
+          msg,
+          storedId: stored.id,
+          cards: documentCards,
+          mailCardsOpen: mailCards.length,
+          messenger: ctx.messenger,
+          businessId: ctx.businessId,
+          production: ctx.production,
+        });
+        if (handled === 'decided' || handled === 'fix') return 'documentCard';
+        if (handled !== 'passthrough') return handled;
+      }
     }
 
     // An open mailbox reply card is read next — before transcription, the
@@ -1191,6 +1249,8 @@ export async function runWhatsAppDoor(options: {
    * leaves it unset.
    */
   questionWindowMinutes?: number;
+  /** `runtime.production`, for a document-card fix request — see `ProcessContext.production`. */
+  production?: Runtime['production'];
 }): Promise<DoorResult> {
   const businessId = options.businessId ?? config.businessId;
   const { gateway, messenger } = options;
@@ -1235,6 +1295,7 @@ export async function runWhatsAppDoor(options: {
     mailCardReplies: 0,
     confirmationReplies: 0,
     ledgerReplies: 0,
+    documentCardReplies: 0,
     confirmErrored: [],
     malformedSenderCount: 0,
   };
@@ -1257,6 +1318,7 @@ export async function runWhatsAppDoor(options: {
     ...(options.questionWindowMinutes !== undefined
       ? { questionWindowMinutes: options.questionWindowMinutes }
       : {}),
+    ...(options.production !== undefined ? { production: options.production } : {}),
   };
 
   for (const msg of ordered) {
@@ -1279,6 +1341,7 @@ export async function runWhatsAppDoor(options: {
     else if (outcome === 'mailCard') result.mailCardReplies += 1;
     else if (outcome === 'confirmation') result.confirmationReplies += 1;
     else if (outcome === 'ledger') result.ledgerReplies += 1;
+    else if (outcome === 'documentCard') result.documentCardReplies += 1;
     // 'skipped' — a redelivery, a race on the claim, or a failure before the
     // message was ever claimed — adds to none of the four buckets.
   }
