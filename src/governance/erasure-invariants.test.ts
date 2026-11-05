@@ -113,14 +113,23 @@ describe('what an erasure leaves behind', () => {
    * ledger's own discovery can reach it. `ledger_whatsapp_batches` holds ids
    * only and is asserted directly (kept, the erased id replaced by '' in place); `ledger_settings` holds no person content.
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty" count is spec §5.1's own
+   * **A twenty-first, also outside spec §5.1: document production
+   * (migrations 053–057)** — `document_productions` (request text,
+   * destination, working record, findings), `document_versions` (spec and
+   * both checks), `document_cards.delivery_plans` and
+   * `document_deliveries.saved_path`, counted as one store. Seeded on a
+   * production whose origin and delivery jobs name nothing, so only the
+   * production's own discovery can reach it. `document_settings` holds no
+   * person content.
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (28 since migration 052; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (32 since migrations 053–057; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 28 also includes tables scrubbed as a consequence of
+   * stores, while the 32 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
@@ -530,7 +539,73 @@ describe('what an erasure leaves behind', () => {
       [BUSINESS],
     );
 
+    // --- Migrations 053–057: document production. -----------------------
+    //
+    // A production whose origin job names nothing, so only the production's
+    // own discovery can reach it — with the probe in every content column:
+    // the request text, the destination, the working record (the drafted
+    // spec and the card notes), the findings; the version's spec and both
+    // check results; the card's delivery plans; and the path the delivery
+    // job's `doc.save` recorded. The `"` beside it in the spec makes the JSON
+    // path of `jsonbContentMatches` the arm that has to find it there.
+    const productionOrigin = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'הפקת מסמך',
+    });
+    const productionDelivery = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'מסירת מסמך',
+    });
+    await db.query(
+      `INSERT INTO document_productions
+         (production_id, business_id, origin_job_id, instruction_text, text_origin, format, language,
+          kind, destination, stage, findings, work)
+       VALUES ('PR-probe', $1, $2, $3, 'typed', 'docx', 'he', 'quote', $4::jsonb, 'ready', $5::jsonb, $6::jsonb)`,
+      [
+        BUSINESS,
+        productionOrigin.jobId,
+        `תכיני הצעת מחיר ל-${PROBE}`,
+        JSON.stringify({ mode: 'send', to: [PROBE], subject: `הצעה ל-${PROBE}`, body: `שלום ${PROBE}` }),
+        JSON.stringify([{ check: 'check2', code: 'x', where: 'document', he: 'בעיה', detail: PROBE }]),
+        JSON.stringify({
+          finished: true,
+          draft: { title: `הצעה "מסגרת" ל-${PROBE}` },
+          previous: { spec: { title: PROBE }, findings: [{ he: PROBE }] },
+          notes: [`הכתובת ${PROBE} לא אושרה`],
+        }),
+      ],
+    );
+    await db.query(
+      `INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes, check1, check2)
+       VALUES ('VER-probe', 'PR-probe', 1, $1::jsonb, $2, repeat('a', 64), 10, $3::jsonb, $4::jsonb)`,
+      [
+        JSON.stringify({ title: `הצעה "מסגרת" ל-${PROBE}` }),
+        `produced/${BUSINESS}/PR-probe/VER-probe.docx`,
+        JSON.stringify({ findings: [{ detail: PROBE }] }),
+        JSON.stringify({ previewPath: `produced/${BUSINESS}/PR-probe/VER-probe.preview.png`, criteria: [{ detail: PROBE }] }),
+      ],
+    );
+    await db.query(
+      `INSERT INTO document_cards (card_id, business_id, version_id, delivery_plans, delivery_job_id)
+       VALUES ('CARD-probe', $1, 'VER-probe', $2::jsonb, $3)`,
+      [BUSINESS, JSON.stringify([{ option: 'send', plan: { steps: [{ input: { to: [PROBE] } }] } }]), productionDelivery.jobId],
+    );
+    await db.query(
+      `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id, saved_path, saved_at)
+       VALUES ($1, $2, 'CARD-probe', 'VER-probe', $3, now())`,
+      [productionDelivery.jobId, BUSINESS, `/home/owner/docs/הצעה ל-${PROBE}.docx`],
+    );
+
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
+    for (const table of ['document_productions', 'document_versions', 'document_cards', 'document_deliveries']) {
+      expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
+    }
+    // The saved copy is listed for the owner, never deleted (C7).
+    expect(plan.savedCopies).toEqual([`/home/owner/docs/הצעה ל-${PROBE}.docx`]);
     expect(
       plan.items.find((item) => item.table === 'ledger_items' && item.action === 'delete')?.count,
     ).toBe(1);

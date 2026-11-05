@@ -1864,7 +1864,12 @@ function planFingerprint(plan: ErasurePlan): string {
     mailIds: [...plan.mailIds].sort(),
     ledgerItemIds: [...plan.ledgerItemIds].sort(),
     ledgerRuleIds: [...plan.ledgerRuleIds].sort(),
+    productionIds: [...plan.productionIds].sort(),
     filePaths: [...plan.filePaths].sort(),
+    // Display-only to the executor (never deleted), but what the owner was
+    // told stays on his disk: a copy saved between the preview and the
+    // confirm re-shows the preview rather than going unmentioned.
+    savedCopies: [...plan.savedCopies].sort(),
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
     refusals: plan.refusals.map((r) => `${r.kind}:${r.detail}`).sort(),

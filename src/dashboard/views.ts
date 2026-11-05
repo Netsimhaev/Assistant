@@ -1533,6 +1533,13 @@ export const TABLE_LABELS: Record<string, string> = {
   ledger_reminders: 'תזכורות מהפנקס',
   ledger_whatsapp_batches: 'רשימות פנקס ממוספרות בוואטסאפ',
   ledger_critical_rules: 'כללי "קריטי" שנוקבים באדם',
+  // Migrations 053–057: document production — the request, every built
+  // version (its content and checks), the approval card, and the record of
+  // each delivery.
+  document_productions: 'בקשות להפקת מסמך',
+  document_versions: 'גרסאות של מסמכים שהופקו',
+  document_cards: 'כרטיסי מסמך',
+  document_deliveries: 'רישומי מסירה של מסמכים',
 };
 
 /**
@@ -1752,6 +1759,19 @@ function keptList(
     .join('');
 }
 
+/**
+ * The copies of an erased document the owner saved into his base folder
+ * (spec C7): named by path, and NOT deleted — they are his files. Shown so he
+ * knows the person's name still sits on his own disk, and can remove them
+ * himself if he wants.
+ */
+function savedCopiesSection(paths: readonly string[]): string {
+  if (paths.length === 0) return '';
+  return `<h2>נשארים בתיקייה שלך</h2>
+     <p class="muted">עותקים שנשמרו בתיקייה שהגדרת. המחיקה לא נוגעת בהם — אם תרצה, מחק אותם בעצמך.</p>
+     <ul>${paths.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`;
+}
+
 export function renderErasure(model: ErasureViewModel): string {
   const { plan } = model;
   const error = model.error === undefined ? '' : `<p class="error">${esc(model.error)}</p>`;
@@ -1831,6 +1851,7 @@ export function renderErasure(model: ErasureViewModel): string {
      <table><tr><th>מה</th><th>כמה</th><th>מה יקרה</th></tr>${rows}</table>
      ${nothing}
      ${plan.filePaths.length > 0 ? `<p>${plan.filePaths.length} קבצים יימחקו מהדיסק.</p>` : ''}
+     ${savedCopiesSection(plan.savedCopies)}
      ${kept === '' ? '' : `<h2>יישמרו לפי הוראתך</h2><ul>${kept}</ul>`}
      ${excludable}
      <p class="muted">מסלול הביקורת יישמר — הוא אינו מחזיק שמות, כתובות או תוכן.</p>

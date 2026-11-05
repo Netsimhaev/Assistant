@@ -300,6 +300,30 @@ describe('doc.save handler', () => {
     expect(sha(await readFile(expected))).toBe(sha(bytes));
   });
 
+  it('records where the copy landed on the delivery row, for the erasure preview (C7)', async () => {
+    const versionId = await produced();
+    await deliveryCard(versionId);
+    await getPool().query(
+      `INSERT INTO document_deliveries (job_id, business_id, card_id, version_id) VALUES ($1, $2, $3, $4)`,
+      [JOB, B, `DC-${versionId}`, versionId],
+    );
+    await withBase();
+    // An existing file at the name, so the copy lands as " (2)" — a name the
+    // plan never knew, which is why the written path is what gets recorded.
+    const dir = join(await realpath(base), 'לקוחות');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, CANONICAL), 'taken');
+    const result = await save({ producedVersionId: versionId, sha256: sha(bytes), folder: 'לקוחות', filename: CANONICAL });
+    expect(result['path']).toBe(join(dir, 'רווחיות מרץ (2).xlsx'));
+    const { rows } = await getPool().query<{ saved_path: string | null; saved_at: Date | null }>(
+      'SELECT saved_path, saved_at FROM document_deliveries WHERE job_id = $1',
+      [JOB],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.saved_path).toBe(result['path']);
+    expect(rows[0]?.saved_at).not.toBeNull();
+  });
+
   it('a null folder lands under the kind label', async () => {
     const versionId = await produced();
     await deliveryCard(versionId);

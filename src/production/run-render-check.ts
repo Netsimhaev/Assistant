@@ -13,7 +13,12 @@
  *    reversed, numbers not reversed, the parenthesis and the Latin model name
  *    where they belong;
  *  - the PDF: every embedded font (`/BaseFont`) is one of the vendored Noto
- *    faces, with no system font.
+ *    faces, with no system font;
+ *  - every format: check 1 (`runCheck1`) passes on the REAL output and the
+ *    text the real page renderer read back from it — the renderer-text
+ *    fidelity no unit test can see, because every test feeds check 1 a stub
+ *    page renderer. The fixed specs ground against `SENTENCE` as the
+ *    instruction; a finding is a failure, printed with its code and place.
  *
  * Exits non-zero on any failure, and when LibreOffice or Chromium is not
  * configured: on a server, this script passing is a pre-launch check
@@ -28,7 +33,9 @@ import type { Block, DocxSpec, PdfSpec, PptxSpec, XlsxSpec } from '../domain/doc
 import { createChromiumPrinter } from './chromium.js';
 import { createLocalPageRenderer, selectPages, type PageImages, type ProducedFormat } from './page-images.js';
 import { renderDocx } from './render-docx.js';
-import { loadPdfAssets, renderPdf } from './render-pdf.js';
+import { loadPdfAssets, renderPdfWithHtml } from './render-pdf.js';
+import { runCheck1 } from './check1.js';
+import type { GroundingSources } from './validate-spec.js';
 import { renderPptx } from './render-pptx.js';
 import type { ImageLoader } from './render-shared.js';
 import { renderXlsx } from './render-xlsx.js';
@@ -90,6 +97,10 @@ const XLSX: XlsxSpec = {
   ],
 };
 
+/** What the fixed specs ground against: the sentence, as the owner's instruction. */
+const GROUNDING: GroundingSources = { instructionText: SENTENCE, documents: [], memories: [] };
+const SPECS = { docx: DOCX, xlsx: XLSX, pptx: PPTX } as const;
+
 const NOTO = /^NotoSans(Hebrew)?-(Regular|Bold)$/;
 
 /** Every `/BaseFont` name in the file, subset prefix (`ABCDEF+`) removed. */
@@ -136,9 +147,18 @@ async function main(): Promise<number> {
   const printer = createChromiumPrinter({ executablePath: chromiumPath });
   const pages = createLocalPageRenderer({ sofficePath: sofficePath ?? '', chromiumPath });
 
+  // The printed HTML of the PDF, kept for check 1's table-row comparison.
+  let pdfHtml = '';
   const build: Record<ProducedFormat, () => Promise<Buffer>> = {
-    pdf: async () =>
-      renderPdf(PDF, { printer, assets: await loadPdfAssets(PDF, { images: noImages }), currency: CURRENCY }),
+    pdf: async () => {
+      const printed = await renderPdfWithHtml(PDF, {
+        printer,
+        assets: await loadPdfAssets(PDF, { images: noImages }),
+        currency: CURRENCY,
+      });
+      pdfHtml = printed.html;
+      return printed.pdf;
+    },
     docx: () => renderDocx(DOCX, { currency: CURRENCY, images: noImages }),
     xlsx: () => renderXlsx(XLSX, { currency: CURRENCY }),
     pptx: async () => (await renderPptx(PPTX, { currency: CURRENCY, images: noImages })).buffer,
@@ -180,6 +200,15 @@ async function main(): Promise<number> {
       console.log(result.text);
       console.log('--- end ---');
       for (const p of checkOrder(result.text)) failures.push(`${format}: ${p}`);
+
+      const rendered = { text: result.text, pageCount: result.pageCount, textTruncated: result.textTruncated };
+      const base = { bytes, sources: GROUNDING, rendered, today: new Date().toISOString().slice(0, 10), currency: CURRENCY };
+      const check =
+        format === 'pdf'
+          ? await runCheck1({ ...base, spec: PDF, html: pdfHtml })
+          : await runCheck1({ ...base, spec: SPECS[format] });
+      console.log(`check 1: ${check.passed ? 'passed' : `${check.findings.length} finding(s)`}`);
+      for (const finding of check.findings) failures.push(`${format}: check 1 ${finding.code} at ${finding.where}`);
     } catch (err) {
       const msg = `${format}: ${(err as Error).message}`;
       console.error(msg);

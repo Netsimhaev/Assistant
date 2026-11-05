@@ -50,7 +50,8 @@
  * version that card shows (`deliveryVersionOf`), checked before anything
  * touches the disk. The base
  * folder's own copies are the owner's files: erasure lists them but never
- * deletes them (§9.3), which is why the result carries the absolute `path`.
+ * deletes them (§9.3), which is why the result carries the absolute `path`
+ * and why it is recorded on the delivery row (`recordSavedPath`, migration 057).
  */
 import { createHash } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
@@ -369,5 +370,34 @@ export async function runDocSave(
 
   const saved = await saveVersionToFolder(target.dir, target.name, read.bytes, version.sha256);
   if (!saved.ok) throw refuse(saved.code, saved.he);
+  await recordSavedPath(ctx, saved.path, db);
   return { performed: true, path: saved.path };
+}
+
+/**
+ * Where the copy landed, on this delivery job's own `document_deliveries`
+ * row (migration 057) — the only record of it: a local step's output is not
+ * persisted, and the written name may carry a " (2)" suffix the plan never
+ * knew. An erasure of the person the document was for lists the path under
+ * "נשארים בתיקייה שלך" and never deletes the file (spec C7).
+ *
+ * **A failure here does not fail the save.** The file is written and
+ * verified; failing the step would tell the owner the save failed while his
+ * copy sits on disk. The cost, recorded in CLAUDE.md's known issues: such a
+ * copy is missing from a later erasure preview. Logged, so it is not silent.
+ */
+async function recordSavedPath(
+  ctx: { jobId: string; businessId: string },
+  path: string,
+  db: Queryable,
+): Promise<void> {
+  try {
+    await db.query(
+      `UPDATE document_deliveries SET saved_path = $3, saved_at = now()
+        WHERE business_id = $1 AND job_id = $2`,
+      [ctx.businessId, ctx.jobId, path],
+    );
+  } catch (err) {
+    console.error(`doc.save: the copy for job ${ctx.jobId} was written but its path was not recorded`, err);
+  }
 }
