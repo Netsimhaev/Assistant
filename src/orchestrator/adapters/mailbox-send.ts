@@ -231,7 +231,7 @@ const ATTACHMENT_TOO_LARGE_MICROSOFT: AdapterResult = {
   message: 'הקובץ גדול מדי לשליחה מ-Outlook בפרויקט הזה',
 };
 
-const THREADING_FIELDS =['inReplyTo', 'threadId', 'providerMessageId'] as const;
+const THREADING_FIELDS = ['inReplyTo', 'threadId', 'providerMessageId'] as const;
 
 /**
  * Whether a threading field is there at all. Own keys only, like every read

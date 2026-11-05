@@ -1188,6 +1188,7 @@ describe('failedText', () => {
     const codes = [
       'attachment_not_found',
       'attachment_hash_mismatch',
+      'attachment_name_mismatch',
       'attachment_too_large',
       'attachment_too_large_microsoft',
       'attachment_invalid',

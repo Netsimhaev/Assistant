@@ -318,7 +318,8 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   attachment_too_large: 'הקבצים המצורפים גדולים מ-20MB',
   attachment_too_large_microsoft: 'הקובץ גדול מדי לשליחה מ-Outlook בפרויקט הזה',
   attachment_invalid: 'פרטי הקובץ המצורף אינם תקינים',
-  attachments_not_supported: 'אפשר לצרף קבצים רק למייל',
+  attachment_name_mismatch: 'שם הקובץ המצורף אינו השם שאושר',
+  attachments_not_supported: 'אפשר לצרף קבצים רק למייל שמוסר מסמך שאושר',
 
   // run-due.ts's own plan-level rejections, under the `run_due:` namespace
   // `leadingCode` manufactures.

@@ -6,7 +6,12 @@ import { config } from '../config.js';
 import { closePool, getPool } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
 import { resetDatabase } from '../test/db.js';
-import { resolveAttachments, sanitizeAttachmentFilename, type AttachmentRef } from './attachments.js';
+import {
+  canonicalAttachmentName,
+  resolveAttachments,
+  sanitizeAttachmentFilename,
+  type AttachmentRef,
+} from './attachments.js';
 import { createProduction, saveVersion } from './store.js';
 
 const B = 'test-business';
@@ -18,7 +23,7 @@ const spec: DocxSpec = {
   language: 'he',
   kind: 'letter',
   title: 'מכתב',
-  filename: 'letter',
+  filename: 'הצעת מחיר',
   style: { theme: 'clean', accent: 'navy' },
   sources: [],
   blocks: [{ type: 'paragraph', text: 'שלום' }],
@@ -55,7 +60,7 @@ async function produced(
     sha256: sha(bytes),
     sizeBytes: size,
   });
-  return { producedVersionId: versionId, sha256: sha(bytes), filename: opts.name ?? 'מכתב', sizeBytes: size };
+  return { producedVersionId: versionId, sha256: sha(bytes), filename: opts.name ?? 'הצעת מחיר.docx', sizeBytes: size };
 }
 
 beforeEach(async () => {
@@ -69,21 +74,36 @@ afterAll(async () => {
 });
 
 describe('resolveAttachments', () => {
-  it('returns the exact bytes, the format MIME type and the sanitised name', async () => {
+  it('canonical name passes: exact bytes, the format MIME type, the name from the version spec', async () => {
     const bytes = Buffer.from('PK\x03\x04 docx bytes');
-    const ref = await produced(bytes, { name: 'הצעה.pdf' });
+    const ref = await produced(bytes);
     const result = await resolveAttachments([ref], B);
     expect(result).toEqual({
       ok: true,
       files: [
         {
-          // The real extension is forced: the name said .pdf, the file is docx.
-          filename: 'הצעה.pdf.docx',
+          filename: 'הצעת מחיר.docx',
           mediaType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
           bytes,
         },
       ],
     });
+  });
+
+  it('a ref whose filename is not the canonical name → attachment_name_mismatch', async () => {
+    const bytes = Buffer.from('PK\x03\x04 docx bytes');
+    for (const name of ['הצעה.pdf', 'הצעת מחיר', 'הצעת מחיר.DOCX', 'הצעת‮ מחיר.docx']) {
+      const ref = await produced(bytes, { name });
+      const result = await resolveAttachments([ref], B);
+      expect(result, name).toMatchObject({ ok: false, code: 'attachment_name_mismatch' });
+      if (result.ok) throw new Error('unreachable');
+      expect(result.he).toMatch(/שם/);
+    }
+  });
+
+  it('canonicalAttachmentName is the spec filename sanitised with the real extension', () => {
+    expect(canonicalAttachmentName({ spec: { filename: 'דוח/רבעון‮' }, format: 'xlsx' })).toBe('דוחרבעון.xlsx');
+    expect(canonicalAttachmentName({ spec: { filename: 'מכתב.docx' }, format: 'docx' })).toBe('מכתב.docx');
   });
 
   it('re-hashes from disk: a file modified after hashing → attachment_hash_mismatch', async () => {

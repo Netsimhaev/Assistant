@@ -46,6 +46,18 @@ function attachmentTooLarge(attachments: readonly OutgoingAttachment[]): Mailbox
     : null;
 }
 
+/**
+ * A failure once `createReply` has made a draft. Never retryable: a retry
+ * starts over with a new draft, so a transient 4xx/5xx/401 becomes `rejected`.
+ * Status 0 is kept as it is — the dropped connection may have been the send
+ * itself, and the adapter already maps status 0 to its final, ambiguous
+ * `delivery_unknown`.
+ */
+function afterDraftFailure(status: number, body: unknown): MailboxFailure {
+  const failure = failureFromStatus(status, body);
+  return status === 0 ? failure : { failure: 'rejected', status, message: failure.message };
+}
+
 function fileAttachment(file: OutgoingAttachment): Record<string, string> {
   return {
     '@odata.type': '#microsoft.graph.fileAttachment',
@@ -312,8 +324,11 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
           // quotes the original, with the same explicit recipients and empty
           // cc), one POST per fileAttachment, then send. The one-call /reply
           // below takes no attachments. A failure before the send leaves an
-          // unsent draft in the mailbox — never a sent mail without its file;
-          // nothing here removes it (this client never removes anything).
+          // unsent draft in the mailbox — never a sent mail without its file.
+          // Nothing here removes that draft: this client carries no removal
+          // call at all, and forbidden-ops.test.ts scans it to keep it so.
+          // Every failure once the draft exists is therefore FINAL (see
+          // `afterDraftFailure`): a retry would open a second draft.
           const created = await http.request({
             method: 'POST',
             url: `${BASE}/me/messages/${encodeURIComponent(reply.providerMessageId)}/createReply`,
@@ -335,10 +350,10 @@ export function createGraphClient(http: MailboxHttp = defaultMailboxHttp()): Mai
               body: fileAttachment(file),
               signal,
             });
-            if (!ok2xx(added.status)) return failureFromStatus(added.status, added.body);
+            if (!ok2xx(added.status)) return afterDraftFailure(added.status, added.body);
           }
           const sent = await http.request({ method: 'POST', url: `${draftUrl}/send`, accessToken: token, signal });
-          if (!ok2xx(sent.status)) return failureFromStatus(sent.status, sent.body);
+          if (!ok2xx(sent.status)) return afterDraftFailure(sent.status, sent.body);
           return { externalId: null };
         }
         // One call, no draft left behind on failure. The recipients are set explicitly so a

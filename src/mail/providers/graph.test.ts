@@ -346,6 +346,54 @@ describe('graph attachments (document production §8.2)', () => {
     expect(calls.some((c) => c.url.endsWith('/send'))).toBe(false);
   });
 
+  it('any failure after createReply succeeded is final, never a retry that opens a second draft', async () => {
+    const reply = {
+      to: ['dana@example.com'],
+      subject: 'Re',
+      body: 'b',
+      inReplyTo: '<x>',
+      references: null,
+      threadId: 'c',
+      providerMessageId: 'g1',
+      attachments: [file],
+    };
+    const cases: Array<[string, (url: string) => number | null, string]> = [
+      ['a 503 on the attachment upload', (u) => (u.endsWith('/attachments') ? 503 : null), 'rejected'],
+      ['a 401 on the attachment upload', (u) => (u.endsWith('/attachments') ? 401 : null), 'rejected'],
+      ['a 503 on the send', (u) => (u.endsWith('/send') ? 503 : null), 'rejected'],
+    ];
+    for (const [label, statusFor, failure] of cases) {
+      const { http, calls } = fake((r) => {
+        const forced = statusFor(r.url);
+        if (forced !== null) return { status: forced, body: { error: { message: 'x' } } };
+        if (r.url.endsWith('/createReply')) return { status: 201, body: { id: 'draft-9' } };
+        if (r.url.endsWith('/attachments')) return { status: 201, body: {} };
+        return { status: 202, body: null };
+      });
+      const r = await createGraphClient(http).sendReply('tok', reply, signal);
+      expect(r, label).toMatchObject({ failure });
+      expect(calls[0]?.url, label).toMatch(/\/createReply$/);
+    }
+    // Control: a transient failure on createReply itself (no draft yet) stays retryable.
+    const { http } = fake(() => ({ status: 503, body: {} }));
+    expect(await createGraphClient(http).sendReply('tok', reply, signal)).toMatchObject({ failure: 'transient' });
+  });
+
+  it('a dropped connection on the final send stays the ambiguous status-0 answer', async () => {
+    const { http } = fake((r) => {
+      if (r.url.endsWith('/createReply')) return { status: 201, body: { id: 'draft-9' } };
+      if (r.url.endsWith('/attachments')) return { status: 201, body: {} };
+      return { status: 0, body: { error: { message: 'socket hang up' } } };
+    });
+    const r = await createGraphClient(http).sendReply(
+      'tok',
+      { to: ['dana@example.com'], subject: 'Re', body: 'b', inReplyTo: '<x>', references: null, threadId: 'c', providerMessageId: 'g1', attachments: [file] },
+      signal,
+    );
+    // status 0 → the adapter's terminal delivery_unknown, never a retry.
+    expect(r).toMatchObject({ failure: 'transient', status: 0 });
+  });
+
   it('the client refuses a file over 3MB itself, with no HTTP call', async () => {
     const { http, calls } = fake(() => ({ status: 202, body: null }));
     const big = { ...file, bytes: Buffer.alloc(3 * 1024 * 1024 + 1) };

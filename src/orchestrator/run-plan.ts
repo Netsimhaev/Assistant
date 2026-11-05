@@ -34,7 +34,7 @@ import { planStepIsFeasible } from './catalogue.js';
 import { StepChannelError } from './step-error.js';
 import { runLocalTool, type LocalToolContext } from './local-tools.js';
 import { ATTACHMENT_TOOL, ATTACHMENTS_KEY, AttachmentRefs } from '../domain/attachment-ref.js';
-import { resolveAttachments, type ResolvedAttachment } from '../production/attachments.js';
+import { isDeliveryJob, resolveAttachments, type ResolvedAttachment } from '../production/attachments.js';
 import type { Job } from './jobs.js';
 
 /**
@@ -562,9 +562,13 @@ async function performStep(
   // First, before a local handler or any channel is touched: a step whose
   // attachments do not resolve to the exact approved bytes fails here, final,
   // and no adapter is ever called (spec §8.2, ruling C16).
-  const attachments = await stepAttachments(step.toolName, effectiveInput, request.job.businessId);
+  const attachments = await stepAttachments(step.toolName, effectiveInput, request.job);
 
   if (!needsChannel(step.toolName)) {
+    // A local step never carries attachments: `stepAttachments` above already
+    // refused the key on every tool but `mail.send`, which is not local, so a
+    // local handler never sees a file reference it would silently ignore.
+    //
     // A local step: nothing leaves the instance, so there is nothing to
     // connect to — and since 12/09 there is somewhere to send it. `runLocalTool`
     // performs the tools that have a handler (the memory family) and returns an
@@ -779,7 +783,7 @@ async function performStep(
   return { output: result.output, externalId: result.externalId, performed: true };
 }
 
-const ATTACHMENTS_NOT_SUPPORTED_HE = 'אפשר לצרף קבצים רק למייל — הפעולה לא בוצעה';
+const ATTACHMENTS_NOT_SUPPORTED_HE = 'אפשר לצרף קבצים רק למייל שמוסר מסמך שאושר — הפעולה לא בוצעה';
 const ATTACHMENT_INVALID_HE = 'פרטי הקובץ המצורף אינם תקינים — המייל לא נשלח';
 
 /**
@@ -794,13 +798,16 @@ const ATTACHMENT_INVALID_HE = 'פרטי הקובץ המצורף אינם תקי�
  * saw exactly them.
  *
  * Own key only, like every routing read here. Only `mail.send` may carry
- * attachments; the key on any other tool is refused rather than ignored, so a
- * payload that names a file is never quietly acted on without it.
+ * attachments — the key on any other tool, local ones included, is refused
+ * rather than ignored, so a payload that names a file is never quietly acted
+ * on without it. And only on a document DELIVERY job (a job a
+ * `document_cards.delivery_job_id` in this business names): a model-written
+ * plan that emits the field on any other job is refused before a file is read.
  */
 async function stepAttachments(
   toolName: string,
   effectiveInput: Record<string, unknown>,
-  businessId: string,
+  job: Job,
 ): Promise<ResolvedAttachment[]> {
   if (!Object.hasOwn(effectiveInput, ATTACHMENTS_KEY)) return [];
   if (toolName !== ATTACHMENT_TOOL) {
@@ -809,7 +816,10 @@ async function stepAttachments(
   const refs = AttachmentRefs.safeParse(effectiveInput[ATTACHMENTS_KEY]);
   if (!refs.success) throw new StepChannelError('attachment_invalid', ATTACHMENT_INVALID_HE, false);
   if (refs.data.length === 0) return [];
-  const resolved = await resolveAttachments(refs.data, businessId);
+  if (!(await isDeliveryJob(job.businessId, job.jobId))) {
+    throw new StepChannelError('attachments_not_supported', ATTACHMENTS_NOT_SUPPORTED_HE, false);
+  }
+  const resolved = await resolveAttachments(refs.data, job.businessId);
   if (!resolved.ok) throw new StepChannelError(resolved.code, resolved.he, false);
   return resolved.files;
 }
