@@ -19,14 +19,24 @@
 export interface FakeMessenger {
   readonly channel: 'whatsapp';
   send(input: { text: string; jobId: string | null }): Promise<{ ok: boolean; error?: string }>;
+  sendFile(input: {
+    filename: string;
+    mediaType: string;
+    bytes: Buffer;
+    caption: string;
+    jobId: string | null;
+  }): Promise<{ ok: boolean; error?: string }>;
   /** Everything the ASSISTANT said, in order — just the text. */
   readonly sentTexts: string[];
+  /** Every file sent to the owner, in order. */
+  readonly sentFiles: { filename: string; bytes: Buffer; caption: string }[];
   /** Makes the next `send` return `{ ok: false }`. Never throws. */
   failNext(): void;
 }
 
 export function createFakeMessenger(): FakeMessenger {
   const sentTexts: string[] = [];
+  const sentFiles: { filename: string; bytes: Buffer; caption: string }[] = [];
   let failNextCall = false;
 
   return {
@@ -41,7 +51,17 @@ export function createFakeMessenger(): FakeMessenger {
       return { ok: true };
     },
 
+    async sendFile(input) {
+      if (failNextCall) {
+        failNextCall = false;
+        return { ok: false, error: 'fake-messenger: forced failure' };
+      }
+      sentFiles.push({ filename: input.filename, bytes: input.bytes, caption: input.caption });
+      return { ok: true };
+    },
+
     sentTexts,
+    sentFiles,
 
     failNext() {
       failNextCall = true;

@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildPdf, visualOrder } from '../fixtures/build-pdf.js';
 import { runExtractor } from '../run-extractor.js';
 import type { Block, TextContent } from '../types.js';
-import { MAX_PDF_PAGES, PDF_LOAD_OPTIONS, extractPdf } from './pdf.js';
+import { MAX_PDF_PAGES, PDF_LOAD_OPTIONS, extractPdf, linesOf } from './pdf.js';
 
 // A pass-through spy on the library's own entry point: every call still
 // reaches the real `getDocument`, and the test can read back exactly what
@@ -267,5 +267,41 @@ describe('the PDF extractor inside the isolated child', () => {
     const path = await writePdf('child-broken.pdf', Buffer.from('%PDF-1.7\ngarbage', 'latin1'));
     const outcome = await runExtractor('pdf', path);
     expect(outcome).toMatchObject({ ok: false, code: 'extractor_failed' });
+  });
+});
+
+/**
+ * Inbound regression (review of task 8, ruling (a)): the incoming-document
+ * reader keeps its own joiner. Table cells a wide gap apart are separate
+ * cells and stay in plain positional order — they must never be regrouped
+ * into one reversed run, which is what the Chromium-output joiner does to
+ * split glyph runs.
+ */
+describe('linesOf — inbound table rows keep positional order', () => {
+  const cell = (str: string, dir: 'ltr' | 'rtl', x: number, width: number) => ({
+    str,
+    dir,
+    transform: [10, 0, 0, 10, x, 500],
+    width,
+    height: 10,
+  });
+
+  it('a Hebrew row of three cells ~6em apart reads right to left, cell by cell', () => {
+    const items = [
+      cell('Chair', 'ltr', 36, 25),
+      cell('AB-100', 'ltr', 121, 32),
+      cell('תיאור המוצר המלא', 'rtl', 213, 80),
+    ];
+    expect(linesOf(items)).toEqual(['תיאור המוצר המלא AB-100 Chair']);
+  });
+
+  it('an English row of four cells ~6em apart reads left to right, cell by cell', () => {
+    const items = [
+      cell('Item', 'ltr', 36, 20),
+      cell('Supplier', 'ltr', 116, 40),
+      cell('שולחן', 'rtl', 216, 28),
+      cell('כיסא', 'rtl', 304, 22),
+    ];
+    expect(linesOf(items)).toEqual(['Item Supplier שולחן כיסא']);
   });
 });

@@ -34,17 +34,23 @@
     "sdk:contact-resolver": "tsx src/sdk/run-contact-resolver.ts",
     "sdk:delegate": "tsx src/sdk/run-delegate.ts",
     "sdk:judge": "tsx src/sdk/run-judge.ts",
+    "sdk:doc-draft": "tsx src/sdk/run-doc-draft.ts",
     "sdk:mail-triage": "tsx src/sdk/run-mail-triage.ts",
+    "doc:render-check": "tsx src/production/run-render-check.ts",
     "connector:calendar": "tsx scripts/connector-calendar.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.234",
+    "docx": "^9.15.2",
     "dotenv": "^17.2.3",
     "exceljs": "^4.4.0",
+    "jszip": "^3.10.1",
     "mammoth": "^1.12.1",
     "nodemailer": "^10.1.7",
     "pdfjs-dist": "^6.4.299",
     "pg": "^8.16.3",
+    "playwright-core": "^1.64.1",
+    "pptxgenjs": "^4.0.1",
     "ulid": "^3.0.1",
     "zod": "^4.1.12"
   },
@@ -57,6 +63,7 @@
   },
   "overrides": {
     "uuid": "^11.1.1",
-    "argparse": "^2.0.1"
+    "argparse": "^2.0.1",
+    "image-size": "^2.0.3"
   }
 }

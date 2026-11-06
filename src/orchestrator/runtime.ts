@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
 import { storedCredentials } from '../governance/credential-store.js';
@@ -27,6 +28,7 @@ import type { TokenHttp } from './oauth-token.js';
 import type { CredentialHandle } from './adapters/types.js';
 import type { WhatsAppGateway } from '../whatsapp/gateway.js';
 import { canonicalHash } from '../util/canonical.js';
+import { PRODUCTION_TOOLS_MISSING_REASON } from '../production/render-error.js';
 
 /** Which vendor's code serves a binding's system. Matches `ConnectionBinding.provider`. */
 const GOOGLE_PROVIDER = 'google';
@@ -65,6 +67,19 @@ export interface Runtime {
      * Every real build of `notify` below sets it.
      */
     sendAlert?(subject: string, body: string): Promise<{ ok: boolean; error?: string }>;
+    /**
+     * `sendAlert` with one file attached — the document card's email to the
+     * owner (document production §10, D10). Same transport, credential and
+     * recipient as `sendAlert`; never throws. The idempotency key hashes the
+     * subject, the body and the file's sha256, so the caller puts something
+     * unique in the body (the card id) — two identical cards would otherwise
+     * collapse into one at the mail server while this reports `ok`.
+     */
+    sendAlertWithAttachment?(
+      subject: string,
+      body: string,
+      attachment: { filename: string; mediaType: string; bytes: Buffer },
+    ): Promise<{ ok: boolean; error?: string }>;
   };
   /**
    * The WhatsApp bridge, GREEN-API side only — never the messenger.
@@ -87,6 +102,17 @@ export interface Runtime {
    * `overrides.whatsappGateway` below.
    */
   whatsapp?: { gateway: WhatsAppGateway };
+  /**
+   * Whether document production can run on this server: both binaries it
+   * needs (`DOCUMENT_SOFFICE_PATH` for the LibreOffice page conversion of
+   * check 2, `DOCUMENT_CHROMIUM_PATH` for PDF printing and page images) are
+   * configured. When `available` is false a production fails with stage
+   * `failed` and `PRODUCTION_TOOLS_MISSING_REASON`
+   * (`src/production/page-images.ts`), and `warnings` says which path is
+   * missing. Optional so hand-built test runtimes keep typechecking; every
+   * real build sets it, and a reader treats an absent field as unavailable.
+   */
+  production?: { available: boolean; sofficePath: string | null; chromiumPath: string | null };
   /**
    * What could not be assembled, and why.
    *
@@ -151,6 +177,18 @@ const SMTP_KEYS = [
  */
 const GREEN_API_INSTANCE_REF_KEY = 'GREEN_API_INSTANCE_REF';
 const GREEN_API_TOKEN_REF_KEY = 'GREEN_API_TOKEN_REF';
+
+/**
+ * The document card email's idempotency key — content-derived, like
+ * `sendAlert`'s. Unique per notice only because every card notice carries
+ * its own `מזהה הודעה` line (`NOTICE_ID_LABEL`, `production/card.ts`): two
+ * notices of the same card are otherwise byte-identical, and the mail server
+ * would drop the second as a duplicate while the send reports ok.
+ */
+export function documentCardAlertKey(subject: string, body: string, bytes: Buffer): string {
+  const fileSha = createHash('sha256').update(bytes).digest('hex');
+  return `document-card-alert:${canonicalHash({ subject, body, fileSha })}`;
+}
 
 /**
  * Assemble a production runtime.
@@ -430,6 +468,34 @@ export async function buildRuntime(
               return { ok: false, error: error instanceof Error ? error.message : String(error) };
             }
           },
+          // The document card's email (document production §10): the same
+          // seam as `sendAlert` above, with the file attached.
+          async sendAlertWithAttachment(subject, body, attachment) {
+            try {
+              const credential = await withAlertDeadline(
+                credentials.resolve(notifyRef, config.businessId),
+                ALERT_TIMEOUT_MS,
+              );
+              if (credential === null) {
+                return { ok: false, error: `לא נמצא credential עבור ${notifyRef}` };
+              }
+              await withAlertDeadline(
+                transport.send(
+                  { to: [to], subject, body, attachments: [attachment] },
+                  {
+                    endpoint: null,
+                    credential,
+                    idempotencyKey: documentCardAlertKey(subject, body, attachment.bytes),
+                    signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
+                  },
+                ),
+                ALERT_TIMEOUT_MS,
+              );
+              return { ok: true };
+            } catch (error) {
+              return { ok: false, error: error instanceof Error ? error.message : String(error) };
+            }
+          },
         };
       }
     }
@@ -510,6 +576,30 @@ export async function buildRuntime(
     warnings.push(
       `no curation: ANTHROPIC_API_KEY not set — jobs will close normally, ` +
         `but the assistant will not learn anything from them`,
+    );
+  }
+
+  // Same switch discipline as the SMTP set: a server without LibreOffice or
+  // Chromium still starts (the scheduler has other work), but the operator is
+  // told, so "no document was produced" does not look like "none was asked".
+  // Presence only; whether the binary actually runs is what
+  // `npm run doc:render-check` checks (docs/11-pre-launch-checks.md).
+  const productionPath = (key: string): string | null => {
+    const value = env[key];
+    return value === undefined || value.length === 0 ? null : value;
+  };
+  const production = {
+    sofficePath: productionPath('DOCUMENT_SOFFICE_PATH'),
+    chromiumPath: productionPath('DOCUMENT_CHROMIUM_PATH'),
+  };
+  const missingProduction = [
+    ...(production.sofficePath === null ? ['DOCUMENT_SOFFICE_PATH'] : []),
+    ...(production.chromiumPath === null ? ['DOCUMENT_CHROMIUM_PATH'] : []),
+  ];
+  if (missingProduction.length > 0) {
+    warnings.push(
+      `no document production: ${missingProduction.join(', ')} not set — every document ` +
+        `production will fail ("${PRODUCTION_TOOLS_MISSING_REASON}")`,
     );
   }
 
@@ -642,6 +732,7 @@ export async function buildRuntime(
     credentials,
     ...(notify !== undefined ? { notify } : {}),
     ...(whatsapp !== undefined ? { whatsapp } : {}),
+    production: { available: missingProduction.length === 0, ...production },
     warnings,
   };
 }

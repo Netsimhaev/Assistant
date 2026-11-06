@@ -300,6 +300,7 @@ describe('a real transport failure, classified through the real adapter', () => 
     endpoint: null,
     businessId: 'test-business',
     idempotencyKey: 'test-idempotency-key',
+    attachments: [],
     signal: new AbortController().signal,
   };
 
@@ -484,6 +485,7 @@ describe('createSmtpTransport against a real SMTP conversation', () => {
       businessId: 'test-business',
       credential: createCredentialHandle('OFFICE_MAIL', 'pw'),
       idempotencyKey: 'real-socket',
+      attachments: [],
       signal: AbortSignal.timeout(8_000),
     } satisfies AdapterCall);
   }
@@ -526,6 +528,68 @@ describe('createSmtpTransport against a real SMTP conversation', () => {
       expect(Buffer.from(encoded, 'base64').toString('utf8')).toBe(body);
     } finally {
       await smtp.close();
+    }
+  });
+
+  async function sendWithAttachment(port: number, bytes: Buffer): Promise<unknown> {
+    const adapter = createMailAdapter({
+      system: 'office-mail',
+      transport: createSmtpTransport(
+        configWithoutAuth({ host: '127.0.0.1', port, allowCleartext: true, connectionTimeoutMs: 3_000, socketTimeoutMs: 3_000 }),
+      ),
+    });
+    return adapter.execute({
+      toolName: 'mail.send',
+      input: { to: ['dana@example.com'], subject: 'נושא', body: 'גוף' },
+      endpoint: null,
+      businessId: 'test-business',
+      credential: createCredentialHandle('OFFICE_MAIL', 'pw'),
+      idempotencyKey: 'real-socket-attachment',
+      attachments: [{ filename: 'הצעת מחיר.pdf', mediaType: 'application/pdf', bytes }],
+      signal: AbortSignal.timeout(8_000),
+    } satisfies AdapterCall);
+  }
+
+  it('SMTP message carries the attachment bytes (fake SMTP server like transport.test.ts)', async () => {
+    const smtp = await fakeSmtp('NEVER');
+    const bytes = Buffer.from('%PDF-1.7\n' + 'x'.repeat(5000) + '\n%%EOF');
+    try {
+      expect(await sendWithAttachment(smtp.port, bytes)).toMatchObject({ ok: true });
+      const raw = smtp.bodies[0] ?? '';
+      expect(raw).toMatch(/Content-Type: multipart\/mixed/i);
+      expect(raw).toMatch(/Content-Type: application\/pdf/i);
+      // The Hebrew name reaches the wire encoded, never as raw bytes in a header.
+      // nodemailer writes RFC 2231, with continuations for a long name.
+      expect(raw).toMatch(/filename\*(0\*)?=utf-8''/i);
+      const boundary = /boundary="?([^"\r\n;]+)"?/i.exec(raw)?.[1];
+      expect(boundary).toBeDefined();
+      const part = raw.split(`--${boundary}`).find((p) => /application\/pdf/i.test(p)) ?? '';
+      const encoded = part.split('\r\n\r\n').slice(1).join('').replace(/\s+/g, '');
+      expect(Buffer.from(encoded, 'base64').equals(bytes)).toBe(true);
+      // The text part is still the body.
+      expect(raw).toMatch(/Content-Type: text\/plain; charset=utf-8/i);
+    } finally {
+      await smtp.close();
+    }
+  });
+
+  it('with an attachment, a drop after the body is still delivery_unknown, a drop before it still retryable', async () => {
+    const bytes = Buffer.from('%PDF-1.7 attachment');
+    const after = await fakeSmtp('AFTER_BODY');
+    try {
+      const result = await sendWithAttachment(after.port, bytes);
+      expect(after.bodies).toHaveLength(1);
+      expect(result).toMatchObject({ ok: false, retryable: false, code: 'delivery_unknown' });
+    } finally {
+      await after.close();
+    }
+    const before = await fakeSmtp('EHLO');
+    try {
+      const result = await sendWithAttachment(before.port, bytes);
+      expect(before.bodies).toHaveLength(0);
+      expect(result).toMatchObject({ ok: false, retryable: true, code: 'transport_error' });
+    } finally {
+      await before.close();
     }
   });
 });

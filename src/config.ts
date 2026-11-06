@@ -1,4 +1,5 @@
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { config as loadDotenv } from 'dotenv';
 
 loadDotenv();
@@ -82,6 +83,30 @@ export const config = {
   documentRoot: resolve(required('DOCUMENT_ROOT')),
   documentInbox: optional('DOCUMENT_INBOX'),
   documentReadsPerDay: positiveInt('DOCUMENT_READS_PER_DAY', 20),
+  // Document productions per local day (charter zone), counting each draft
+  // call: a new production and every fix attempt (src/production/loop.ts).
+  // Over it a production fails before any model call. 0 refuses every one.
+  documentsPerDay: positiveInt('DOCUMENTS_PER_DAY', 20),
+  // Whole-process-tree resident-set cap for the headless Chromium that prints
+  // PDFs (`src/production/chromium.ts`). Enforced on Linux only, by sampling
+  // /proc, like `run-extractor.ts`.
+  chromiumRssCapMb: positiveInt('DOCUMENT_CHROMIUM_RSS_MB', 768),
+  // The Hebrew Regular face embedded in every produced PDF. Its three
+  // companions (Hebrew Bold, Noto Sans Regular/Bold for Latin and digits) are
+  // fixed file names in the SAME directory — see `PDF_FONT_FILES` in
+  // `src/production/render-pdf.ts`. Default resolves from the repo root (this
+  // file sits in `src/` or `dist/`, one level below it), never from the cwd.
+  productionFontPath: resolve(
+    optional('DOCUMENT_FONT_PATH') ??
+      resolve(dirname(fileURLToPath(import.meta.url)), '..', 'assets', 'fonts', 'NotoSansHebrew-Regular.ttf'),
+  ),
+  // The two binaries document production needs on the server
+  // (`src/production/page-images.ts`, `chromium.ts`): LibreOffice converts
+  // docx/xlsx/pptx to a TEMPORARY PDF for the page images of check 2 only,
+  // and headless Chromium prints PDFs and rasterises pages. Either absent =>
+  // `buildRuntime` warns and productions fail, never a throw at startup.
+  sofficePath: optional('DOCUMENT_SOFFICE_PATH'),
+  chromiumPath: optional('DOCUMENT_CHROMIUM_PATH'),
   // Model reads (triage calls) of incoming mail per day. A mail pulled after
   // the ceiling is recorded and shown as "not read — daily ceiling reached",
   // and is read on a later pass once the count resets (spec §5.4).

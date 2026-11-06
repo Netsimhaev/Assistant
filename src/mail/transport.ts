@@ -27,6 +27,12 @@ interface MinimalTransporter {
     /** Pinned so the wire format is what a string body produced (base64 under utf-8). */
     textEncoding: 'base64';
     messageId: string;
+    /**
+     * Present only when the send carries files. Buffers, so they need no
+     * read-tracking of their own: the body stream above is still what the
+     * DATA-ambiguity flag watches, and nodemailer reads it as the first part.
+     */
+    attachments?: { filename: string; content: Buffer; contentType: string; contentDisposition: 'attachment' }[];
   }): Promise<{ messageId: string }>;
 }
 
@@ -208,6 +214,13 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
       // costs nothing external and the caller can fix the input and retry.
       assertNoCrlf(message.subject, 'הנושא');
       for (const to of message.to) assertNoCrlf(to, 'הנמען');
+      const attachments = message.attachments ?? [];
+      for (const file of attachments) {
+        // nodemailer encodes the name, but the contract is "reject, never
+        // rewrite": a name or type that could break a part header is refused.
+        assertNoCrlf(file.filename, 'שם הקובץ המצורף');
+        assertNoCrlf(file.mediaType, 'סוג הקובץ המצורף');
+      }
 
       if (context.signal.aborted) {
         throw new Error('הבקשה בוטלה לפני שהחיבור נפתח');
@@ -277,6 +290,16 @@ export function createSmtpTransport(config: SmtpConfig): MailTransport {
             text,
             textEncoding: 'base64',
             messageId,
+            ...(attachments.length > 0
+              ? {
+                  attachments: attachments.map((file) => ({
+                    filename: file.filename,
+                    content: file.bytes,
+                    contentType: file.mediaType,
+                    contentDisposition: 'attachment' as const,
+                  })),
+                }
+              : {}),
           }),
           context.signal,
         );

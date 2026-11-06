@@ -8,6 +8,11 @@
  * the only honest way forward is the owner's word again — never a silent
  * second run. This module finds those jobs and asks.
  *
+ * **A document job is not a command to re-ask** (C17): a delivery job (any
+ * row of `document_deliveries`, migration 055) is skipped and its card
+ * returns to the owner instead (`reraiseFailedDeliveries`); a job that queued
+ * a production (`document_productions.origin_job_id`) is skipped too.
+ *
  * **A command job is a positive fact, twice over:** a `boss_instructions` row
  * (the job was born at the instruction door) AND a `confirmed`
  * `instruction_confirmations` row. A mail reply job with an `unknown` row has
@@ -189,6 +194,19 @@ const CANDIDATES_SQL = `
        AND NOT EXISTS (
          SELECT 1 FROM instruction_confirmations r
           WHERE r.business_id = j.business_id AND r.reask_of = j.job_id
+       )
+       -- A document delivery job is never re-asked as a command (document
+       -- production §5.7, C17): its card comes back instead
+       -- (reraiseFailedDeliveries, production/card.ts). document_deliveries
+       -- keeps every delivery job, not only a card's current one.
+       AND NOT EXISTS (
+         SELECT 1 FROM document_deliveries dd
+          WHERE dd.business_id = j.business_id AND dd.job_id = j.job_id
+       )
+       -- Nor is a job that queued a production: its card is the outcome.
+       AND NOT EXISTS (
+         SELECT 1 FROM document_productions dp
+          WHERE dp.business_id = j.business_id AND dp.origin_job_id = j.job_id
        )
   )
   SELECT job_id, phase, title, whatsapp_message_id, options, chosen_plan_hash, channel,

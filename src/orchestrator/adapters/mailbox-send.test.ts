@@ -54,6 +54,7 @@ function call(
     endpoint: null,
     businessId: 'test-business',
     idempotencyKey: 'k',
+    attachments: [],
     signal: new AbortController().signal,
   };
 }
@@ -267,5 +268,46 @@ describe('mailbox send adapter', () => {
     expect(await adapter.execute({ ...call(GOOD), toolName: 'calendar.read' })).toMatchObject({
       code: 'unsupported_tool',
     });
+  });
+});
+
+describe('mailbox send adapter: attachments', () => {
+  const pdf = (size: number) => ({ filename: 'הצעה.pdf', mediaType: 'application/pdf', bytes: Buffer.alloc(size, 1) });
+  const withAttachments = (input: unknown, attachments: AdapterCall['attachments']): AdapterCall => ({
+    ...call(input),
+    attachments,
+  });
+
+  it('hands the client the resolved attachments on a new message and on a reply', async () => {
+    const { client, sent, sentNew } = fakeClient({ externalId: 'x' });
+    const adapter = createMailboxSendAdapter({ replyTargets: goodTarget, system: 'mailbox', provider: 'google', client });
+    const files = [pdf(10)];
+    expect(await adapter.execute(withAttachments(NEW_MAIL, files))).toMatchObject({ ok: true });
+    expect(sentNew[0]?.message.attachments).toEqual(files);
+    expect(await adapter.execute(withAttachments(GOOD, files))).toMatchObject({ ok: true });
+    expect(sent[0]?.reply.attachments).toEqual(files);
+  });
+
+  it('Graph 4MB file → attachment_too_large_microsoft, final, with no client call', async () => {
+    const { client, sent, sentNew } = fakeClient({ externalId: 'x' });
+    const adapter = createMailboxSendAdapter({ replyTargets: goodTarget, system: 'mailbox', provider: 'microsoft', client });
+    for (const input of [NEW_MAIL, GOOD]) {
+      const result = await adapter.execute(withAttachments(input, [pdf(4 * 1024 * 1024)]));
+      expect(result).toMatchObject({ ok: false, retryable: false, code: 'attachment_too_large_microsoft' });
+      if (result.ok) throw new Error('unreachable');
+      expect(result.message).toBe('הקובץ גדול מדי לשליחה מ-Outlook בפרויקט הזה');
+    }
+    expect(sent).toHaveLength(0);
+    expect(sentNew).toHaveLength(0);
+    // Control: exactly 3MB goes through — the refusal above is the size check.
+    expect(await adapter.execute(withAttachments(NEW_MAIL, [pdf(3 * 1024 * 1024)]))).toMatchObject({ ok: true });
+    expect(sentNew).toHaveLength(1);
+  });
+
+  it('Gmail takes a 4MB file (the 3MB cap is Microsoft only)', async () => {
+    const { client, sentNew } = fakeClient({ externalId: 'x' });
+    const adapter = createMailboxSendAdapter({ replyTargets: goodTarget, system: 'mailbox', provider: 'google', client });
+    expect(await adapter.execute(withAttachments(NEW_MAIL, [pdf(4 * 1024 * 1024)]))).toMatchObject({ ok: true });
+    expect(sentNew).toHaveLength(1);
   });
 });

@@ -102,7 +102,7 @@ import { insertOrGetDocument, markExtracted, markRejected, markStored } from './
 import type { DocumentRecord, DocumentSource } from './types.js';
 
 /** §3.4: the original file's own size ceiling — independent of, and checked before, the content-level caps §5.3 enforces inside the extractor. */
-const MAX_ORIGINAL_BYTES = 25 * 1024 * 1024;
+export const MAX_ORIGINAL_BYTES = 25 * 1024 * 1024;
 
 /**
  * How much of the file `sniffMediaType` sees. The whole buffer is already

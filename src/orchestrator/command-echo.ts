@@ -1,5 +1,6 @@
 import type { PlanStep } from '../domain/plan.js';
 import { actionClassLabel } from '../domain/labels.js';
+import { ATTACHMENTS_KEY, AttachmentRef, formatAttachmentSize } from '../domain/attachment-ref.js';
 import type { ConfirmationOption } from '../governance/instruction-confirmations.js';
 import { READ_ONLY_TOOLS, classifyAction, isOutbound, refineActionClass } from '../policy/classify.js';
 import { markInvisibleControls, stripBidiControls } from '../util/bidi.js';
@@ -117,6 +118,25 @@ function renderKnown(key: string, value: unknown, currency: string): string {
 }
 
 const UNCLASSIFIED_LABEL = 'פעולה ללא סיווג';
+const ATTACHMENT_LABEL = 'קובץ מצורף';
+const ATTACHMENT_INVALID_LABEL = 'קובץ מצורף (לא תקין)';
+
+/**
+ * One line per attached file: `קובץ מצורף: <filename> · <size> · <sha12>` —
+ * never the raw ref as a "שדה נוסף" (document production §8.2). The size is
+ * the ref's claim, which the resolver checks against the version row and the
+ * file before anything is sent. An element that is not a valid ref is shown
+ * in full, marked invalid (the send refuses it anyway); nothing is hidden.
+ */
+function attachmentLines(value: unknown): string[] {
+  const elements = Array.isArray(value) ? value : [value];
+  return elements.map((element) => {
+    const ref = AttachmentRef.safeParse(element);
+    if (!ref.success) return `${ATTACHMENT_INVALID_LABEL}: ${renderScalar(element)}`;
+    const { filename, sizeBytes, sha256 } = ref.data;
+    return `${ATTACHMENT_LABEL}: ${inlineValue(filename)} · ${formatAttachmentSize(sizeBytes)} · ${sha256.slice(0, 12)}`;
+  });
+}
 
 /** Hidden only when positively known harmless: read-only AND not outbound. */
 function isHidden(toolName: string): boolean {
@@ -140,8 +160,11 @@ export function renderStepEcho(step: PlanStep, currency: string): string {
     if (!Object.hasOwn(step.input, key)) continue;
     lines.push(`${name}: ${renderKnown(key, step.input[key], currency)}`);
   }
+  if (Object.hasOwn(step.input, ATTACHMENTS_KEY)) {
+    lines.push(...attachmentLines(step.input[ATTACHMENTS_KEY]));
+  }
   const extras = Object.keys(step.input)
-    .filter((key) => !KNOWN_KEYS.has(key))
+    .filter((key) => !KNOWN_KEYS.has(key) && key !== ATTACHMENTS_KEY)
     .sort();
   for (const key of extras) {
     lines.push(`שדה נוסף: ${inlineValue(key)} = ${renderValue(step.input[key])}`);

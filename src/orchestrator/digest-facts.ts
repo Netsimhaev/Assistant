@@ -86,6 +86,18 @@ export interface DigestFacts {
     closedByEvidence: number;
     topStuck: readonly string[];
   };
+  /**
+   * Produced documents (document production §10): `produced` = cards
+   * created in the window (one per produced version); `sent` = delivery jobs
+   * of a SEND that closed in the window (`document_deliveries`, a bound
+   * `mail.send`); `waiting` is point-in-time — cards the owner can still act
+   * on (`open`/`failed_send`, version not superseded).
+   */
+  documents: {
+    produced: number;
+    sent: number;
+    waiting: number;
+  };
 }
 
 /** How many stuck ledger rows the digest names; the rest are counted. */
@@ -481,6 +493,31 @@ export async function collectDigestFacts(
 
   const ledger = await ledgerFacts(db, businessId, window, ceilings.timeZone, options.now ?? new Date());
 
+  // ---- produced documents: plain SQL on their own tables, like the ledger —
+  // nothing under `production/`, which sits an import away from the drafter.
+  const produced = await countOf(
+    db,
+    `SELECT count(*)::text AS n FROM document_cards
+      WHERE business_id = $1 AND created_at >= $2 AND created_at < $3`,
+    [businessId, start, end],
+  );
+  const sent = await countOf(
+    db,
+    `SELECT count(*)::text AS n FROM document_deliveries d
+       JOIN jobs j ON j.business_id = d.business_id AND j.job_id = d.job_id
+       JOIN job_plans p ON p.business_id = d.business_id AND p.job_id = d.job_id
+      WHERE d.business_id = $1 AND j.phase = 'closed' AND j.closed_at >= $2 AND j.closed_at < $3
+        AND jsonb_path_exists(p.plan, '$.steps[*] ? (@.toolName == "mail.send")')`,
+    [businessId, start, end],
+  );
+  const documentsWaiting = await countOf(
+    db,
+    `SELECT count(*)::text AS n FROM document_cards c
+       JOIN document_versions v ON v.version_id = c.version_id
+      WHERE c.business_id = $1 AND c.state IN ('open', 'failed_send') AND v.superseded_at IS NULL`,
+    [businessId],
+  );
+
   return {
     window,
     timeZone: ceilings.timeZone,
@@ -496,6 +533,7 @@ export async function collectDigestFacts(
       currency: ceilings.currency,
     },
     ledger,
+    documents: { produced, sent, waiting: documentsWaiting },
   };
 }
 

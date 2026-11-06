@@ -7,6 +7,7 @@
  * takes a label off, changes read state or relocates a message.
  * Every method returns a failure value rather than throwing.
  */
+import { randomBytes } from 'node:crypto';
 import type { HeaderFlags, IncomingMail, MailAttachment } from '../inbox-store.js';
 import { MAIL_LABELS } from '../mailbox.js';
 import {
@@ -160,17 +161,59 @@ function buildRaw(
   if (message.to.length === 0 || !message.to.every((a) => ADDRESS_SHAPE.test(a))) {
     return { failure: 'rejected', status: 0, message: 'mail recipient is not a plain address' };
   }
-  const lines = [
+  const headers = [
     `To: ${message.to.join(', ')}`,
     `Subject: ${subject}`,
     ...(threading === null || refs === null ? [] : [`In-Reply-To: ${threading.inReplyTo}`, `References: ${refs}`]),
     'MIME-Version: 1.0',
+  ];
+  const attachments = message.attachments ?? [];
+  if (!attachments.every((file) => MEDIA_TYPE_SHAPE.test(file.mediaType))) {
+    return { failure: 'rejected', status: 0, message: 'attachment media type is not a plain type/subtype' };
+  }
+  if (attachments.length === 0) {
+    // Byte-for-byte the single-part shape every send had before attachments.
+    return [...headers, 'Content-Type: text/plain; charset=UTF-8', 'Content-Transfer-Encoding: base64', '', encodedBody].join(
+      '\r\n',
+    );
+  }
+  // `=_` cannot occur in base64 text, and every part below is base64, so the
+  // boundary can never appear inside a part.
+  const boundary = `=_part_${randomBytes(16).toString('hex')}`;
+  const lines = [
+    ...headers,
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
     'Content-Type: text/plain; charset=UTF-8',
     'Content-Transfer-Encoding: base64',
     '',
     encodedBody,
   ];
+  for (const file of attachments) {
+    // RFC 2231 extended parameters for every name, Hebrew or not: the name is
+    // percent-encoded, so no byte of it can end the header line or the
+    // parameter. `mediaType` comes from the produced format (a closed set).
+    const name = rfc2231(file.filename);
+    lines.push(
+      `--${boundary}`,
+      `Content-Type: ${file.mediaType}; name*=UTF-8''${name}`,
+      `Content-Disposition: attachment; filename*=UTF-8''${name}`,
+      'Content-Transfer-Encoding: base64',
+      '',
+      (file.bytes.toString('base64').match(/.{1,76}/g) ?? []).join('\r\n'),
+    );
+  }
+  lines.push(`--${boundary}--`, '');
   return lines.join('\r\n');
+}
+
+/** A bare `type/subtype`, so a media type can never carry a parameter or a line break into a part header. */
+const MEDIA_TYPE_SHAPE = /^[a-z]+\/[a-z0-9.+-]+$/;
+
+/** RFC 2231 `attr-char` encoding: everything outside the unreserved set is %XX of its UTF-8 bytes. */
+function rfc2231(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
 export function createGmailClient(http: MailboxHttp = defaultMailboxHttp()): MailboxClient {

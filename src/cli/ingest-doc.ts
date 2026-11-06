@@ -18,6 +18,7 @@ import { closePool } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { loadArtifacts } from '../documents/store.js';
 import type { DocumentSource } from '../documents/types.js';
+import { documentSourceLabel } from '../documents/source-label.js';
 
 const SOURCES: readonly DocumentSource[] = ['manual', 'mail', 'api'];
 
@@ -97,7 +98,7 @@ export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise
   );
 
   log(`מסמך ${doc.documentId}`);
-  log(`מקור: ${doc.source}`);
+  log(`מקור: ${documentSourceLabel[doc.source]}`);
   log(`סטטוס: ${doc.status}`);
   log(`סוג מדיה: ${doc.mediaType}`);
 

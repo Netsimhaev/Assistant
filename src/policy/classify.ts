@@ -54,6 +54,10 @@ const TOOL_ACTION_CLASS: Record<string, ActionClass> = {
   // new `ActionClass` and a schema-version bump, deliberately.
   'code_execution': 'artifact.write',
   'doc.deliver': 'doc.deliver',
+  // Document production §9.2: copies an approved file into the owner's base
+  // folder. A filesystem write, so classified (never read-only — that would
+  // skip stages 5–10 and leave no audit row) and internal, so not outbound.
+  'doc.save': 'artifact.write',
   'memory.write_entity': 'memory.write_longterm',
   'memory.write_chunk': 'memory.write_longterm',
   'memory.upsert_preference': 'memory.write_longterm',
@@ -102,6 +106,15 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   // grants nothing: whatever it later causes to leave goes through the gate.
   'ledger.add',
   'ledger.update',
+  // Document production (spec §5.2, C2), on the `assert.evaluate` precedent:
+  // read-only by GATE STAGE, not by effect — it writes a production row and,
+  // later, a file into the internal production area, and reaches no person
+  // and no outside system. Classifying it would need a new `ActionClass`
+  // (every signed charter broken). Its boundary is `assertProductionWriter`
+  // inside the handler (stored provenance 'boss' AND a boss_instructions
+  // row), its own daily cap, and the quarantine of every model call; what it
+  // produces leaves only through a delivery job the owner approved.
+  'doc.produce',
   'crm.read',
   'accounting.read',
   'schema.map',
@@ -168,6 +181,9 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   // for numeric grounding. `false` was accurate only while nothing
   // implemented the tool: a step that reads nothing ingests nothing.
   'assert.evaluate': true,
+  // It reads the source documents it is pointed at — attachments and inbox
+  // files whose authors are not the business (spec §5.2).
+  'doc.produce': true,
 
   // — local composition, owner-authored data, and outbound writes —
   'mail.draft': false,
@@ -209,6 +225,7 @@ const INGESTS_EXTERNAL_CONTENT: Record<string, boolean> = {
   'media.publish': false,
   'file.write': false,
   'doc.deliver': false,
+  'doc.save': false,
   'memory.write_entity': false,
   'memory.write_chunk': false,
   'memory.upsert_preference': false,

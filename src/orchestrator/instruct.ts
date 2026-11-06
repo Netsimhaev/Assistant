@@ -121,6 +121,8 @@ import { renderConfirmationQuestion } from './command-echo.js';
 import { createJob, transition } from './jobs.js';
 import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { classMismatch } from './run-plan.js';
+import { DocProduceInput } from '../production/produce-input.js';
+import { resolveSourceDocuments, type SourceResolution } from '../production/source-resolver.js';
 
 export interface RunInstructionOptions {
   /**
@@ -172,6 +174,24 @@ export interface RunInstructionOptions {
    * would be asked about again, forever.
    */
   identityAsked?: boolean;
+  /**
+   * The source-document twin of `identityAsked` (document production §5.6,
+   * C19), set by the same answer routes on the same second pass. When a
+   * `doc.produce` step names a source that matches several documents, the
+   * owner is asked once which; on the second pass the step goes ahead and
+   * whatever is still ambiguous is a note on the card, never a guess and
+   * never a second question — the same coarse bound.
+   */
+  sourceAsked?: boolean;
+  /**
+   * Files the owner attached to this instruction on the dashboard (document
+   * production D14) — ids of documents the dashboard just ingested. Only ids
+   * that resolve to THIS business's documents are kept; they are stored on
+   * the instruction (`attached_document_ids`, migration 056), where
+   * `doc.produce` reads them as the owner's own sources, and the planner
+   * sees their ids and names (`PlanRequest.attachedDocuments`), never text.
+   */
+  attachedDocumentIds?: readonly string[];
 }
 
 export interface GrantedAuthorization {
@@ -322,10 +342,17 @@ export async function runInstruction(
     title: input.text.slice(0, 80),
   });
 
+  const attachedDocuments = await attachedDocumentsOf(businessId, options.attachedDocumentIds ?? []);
+
   let instruction: InstructionRecord;
   try {
     instruction = await saveInstruction(
-      { jobId: job.jobId, text: input.text, textOrigin },
+      {
+        jobId: job.jobId,
+        text: input.text,
+        textOrigin,
+        attachedDocumentIds: attachedDocuments.map((d) => d.documentId),
+      },
       { businessId },
     );
   } catch (err) {
@@ -385,6 +412,7 @@ export async function runInstruction(
     textOrigin,
     bundle: active.bundle,
     timeZone: active.charter.identity.timezone,
+    attachedDocuments,
   };
 
   // Spec §6: more than one person fits the name, so nothing is sent until the
@@ -475,6 +503,28 @@ export async function runInstruction(
     return { status: 'refused', reason: checked.reason };
   }
 
+  // Document production §5.6: a source named in words that fits several of
+  // the business's documents is asked about BEFORE anything is bound — once
+  // per chain (`sourceAsked`).
+  if (options.sourceAsked !== true) {
+    const sourceQuestion = await sourceQuestionFor(door, checked.plan);
+    if (sourceQuestion !== null) {
+      try {
+        await recordQuestion(instruction.instructionId, sourceQuestion, { businessId });
+      } catch {
+        // Swallowed by design, exactly as the planner's own question is.
+      }
+      return {
+        status: 'needs_answer',
+        jobId: job.jobId,
+        instructionId: instruction.instructionId,
+        question: sourceQuestion,
+        instructionText: instruction.text,
+        identityNote,
+      };
+    }
+  }
+
   return finishSingle(door, {
     plan: checked.plan,
     label: SINGLE_OPTION_LABEL,
@@ -498,6 +548,28 @@ interface DoorContext {
   bundle: PolicyBundle;
   /** The active charter's `identity.timezone`: the ledger's dates are the owner's wall clock. */
   timeZone: string;
+  /** Files the owner attached (ids + names), shown to every planner call of this instruction. */
+  attachedDocuments: readonly { documentId: string; name: string }[];
+}
+
+/**
+ * The attached ids that are this business's documents, with their names, in
+ * the order given. An id of another business, or none at all, is dropped:
+ * the dashboard only ever hands in ids it just ingested, and this is the
+ * second layer that keeps it so.
+ */
+async function attachedDocumentsOf(
+  businessId: string,
+  ids: readonly string[],
+): Promise<{ documentId: string; name: string }[]> {
+  if (ids.length === 0) return [];
+  const { rows } = await getPool().query<{ document_id: string; original_name: string }>(
+    `SELECT document_id, original_name FROM documents
+      WHERE business_id = $1 AND document_id = ANY($2::text[])
+      ORDER BY array_position($2::text[], document_id)`,
+    [businessId, [...new Set(ids)]],
+  );
+  return rows.map((r) => ({ documentId: r.document_id, name: r.original_name }));
 }
 
 /**
@@ -561,6 +633,7 @@ async function planAndCheck(
       // owner's own words (spec §10.6, `instruction-invariants.test.ts`).
       instruction: door.instruction.text,
       ...(resolvedContact === undefined ? {} : { resolvedContact }),
+      ...(door.attachedDocuments.length === 0 ? {} : { attachedDocuments: door.attachedDocuments }),
       provenance: 'boss',
       // Spec §10.10: on the instruction path the confirmation question is
       // the control, so the planner is shown the catalogue at `auto` — at
@@ -637,6 +710,31 @@ async function planAndCheck(
 
     const ledger = await ledgerStepProblem(door, step);
     if (ledger !== null) return { kind: 'refused', ...ledger };
+
+    // Spec §4.2: a plan that produces a document does ONLY that. The
+    // production job is parked and closed by the production loop, the card is
+    // its report, and delivery is a separate approved job — a second step
+    // beside it would run nowhere the owner can see or approve.
+    if (step.toolName === 'doc.produce' && plan.steps.length !== 1) {
+      return {
+        kind: 'refused',
+        reason: 'בקשת מסמך צריכה להיות לבדה בהוראה — השליחה או השמירה נעשות מכרטיס המסמך. אפשר לבקש את שאר הפעולות בהוראה נפרדת.',
+        audit: `instruction door: step ${step.id} doc.produce beside ${plan.steps.length - 1} other step(s)`,
+      };
+    }
+
+    // The same schema the `doc.produce` handler parses with: a step it would
+    // refuse is refused here, before the job is parked on it.
+    if (step.toolName === 'doc.produce') {
+      const parsed = DocProduceInput.safeParse(step.input);
+      if (!parsed.success) {
+        return {
+          kind: 'refused',
+          reason: 'התוכנית כוללת בקשת מסמך שאינה תקינה, ולכן לא רצה.',
+          audit: `instruction door: step ${step.id} doc.produce invalid (${parsed.error.issues[0]?.message ?? 'schema'})`,
+        };
+      }
+    }
   }
 
   return { kind: 'plan', plan };
@@ -677,6 +775,48 @@ async function ledgerStepProblem(
     return problem === null ? null : invalid(problem);
   }
   return null;
+}
+
+/**
+ * The clarifying question for the first `doc.produce` source hint that fits
+ * several documents, or `null` (document production §5.6, C19). The
+ * resolver is deterministic and scoped to this business. The answer comes
+ * back joined to the instruction, so the question asks for the FILE NAME —
+ * words the planner can carry into a hint — never a number it cannot.
+ */
+async function sourceQuestionFor(door: DoorContext, plan: Plan): Promise<string | null> {
+  for (const step of plan.steps) {
+    if (step.toolName !== 'doc.produce') continue;
+    const parsed = DocProduceInput.safeParse(step.input);
+    if (!parsed.success || (parsed.data.sourceHints ?? []).length === 0) continue;
+    let resolution: SourceResolution;
+    try {
+      resolution = await resolveSourceDocuments(door.businessId, parsed.data.sourceHints ?? [], [], getPool(), {
+        timeZone: door.timeZone,
+      });
+    } catch {
+      // A failed read asks nothing; the handler resolves again and notes
+      // what it cannot find.
+      continue;
+    }
+    const first = resolution.ambiguous[0];
+    if (first === undefined) continue;
+    return renderSourceQuestion(first.hint, first.candidates);
+  }
+  return null;
+}
+
+export function renderSourceQuestion(
+  hint: string,
+  candidates: readonly { name: string; sender: string | null; date: string }[],
+): string {
+  const lines = [`יש כמה מסמכים שמתאימים ל-"${toOneLine(hint)}" — לאיזה התכוונת?`];
+  candidates.forEach((candidate, index) => {
+    const sender = candidate.sender === null ? '' : ` · ${toOneLine(candidate.sender)}`;
+    lines.push(`${index + 1}. ${toOneLine(candidate.name)}${sender} · ${candidate.date}`);
+  });
+  lines.push('השיבי בשם הקובץ.');
+  return lines.join('\n');
 }
 
 /** What a plan's ledger steps will record, as the owner reads it (future tense, F-I4). */

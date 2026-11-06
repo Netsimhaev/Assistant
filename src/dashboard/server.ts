@@ -134,6 +134,26 @@ import {
 import { redeemRecoveryCode, remainingCodes } from './recovery.js';
 import { issueCsrfToken, verifyCsrfToken } from './csrf.js';
 import {
+  handleDocumentAddress,
+  handleDocumentApprove,
+  handleDocumentCard,
+  handleDocumentDownload,
+  handleDocumentFix,
+  handleDocumentList,
+  handleDocumentPreview,
+  handleDocumentSettingsGet,
+  handleDocumentSettingsPost,
+  productionToolsFromEnv,
+  type DocumentRouteOptions,
+} from './document-routes.js';
+import { boundaryOf, parseMultipart, type MultipartFile } from './multipart.js';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { MAX_ORIGINAL_BYTES, ingestDocument } from '../documents/ingest.js';
+import { attachedDocumentsForJob } from '../governance/instructions.js';
+import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
+import {
   renderApprovalCard,
   renderAutonomousActions,
   renderAutonomy,
@@ -226,6 +246,25 @@ export interface DashboardOptions {
    * caller passes it: absent, the model proposes (`proposeRuleWithModel`).
    */
   ruleProposer?: RuleProposer;
+  /**
+   * Test seam for the instruction door's planner (`POST /instruct`). No
+   * production caller passes it: absent, `runInstruction` uses the real one.
+   */
+  planner?: (request: PlanRequest) => Promise<PlanOutcome>;
+  /**
+   * The document production tools (`runtime.production`), for a fix request
+   * on a document card. Absent, read from the same env vars `buildRuntime`
+   * reads (`productionToolsFromEnv`).
+   */
+  production?: DocumentRouteOptions['production'];
+  /** Test seam for the upload cap; production leaves it unset (`MAX_ORIGINAL_BYTES`, the ingest's own). */
+  uploadMaxBytes?: number;
+}
+
+/** What the document screens and the upload need from `createServer`'s options. */
+interface InstructionDoorOptions extends DocumentRouteOptions {
+  planner?: (request: PlanRequest) => Promise<PlanOutcome>;
+  uploadMaxBytes?: number;
 }
 
 /**
@@ -1075,8 +1114,34 @@ async function handleInstructPost(
   businessId: string,
   session: Session,
   documentRoot: string | undefined,
+  doorOptions: InstructionDoorOptions = {},
 ): Promise<void> {
-  const form = await readFormBody(req);
+  // An attached file ("צרפי קובץ", document production D14) arrives as
+  // multipart; a plain instruction as an ordinary form. Either way CSRF is
+  // checked before anything is written.
+  const multipart = boundaryOf(req.headers['content-type']) !== null;
+  let form: URLSearchParams;
+  let upload: MultipartFile | null = null;
+  if (multipart) {
+    const read = await readUploadBody(req, req.headers['content-type'], doorOptions.uploadMaxBytes ?? MAX_ORIGINAL_BYTES);
+    if (!read.ok) {
+      // CSRF cannot be checked on a body that could not be read; nothing was written.
+      if (read.overCap) {
+        // The rest of the body is never buffered: answer with
+        // `Connection: close` (Node closes the socket once the answer is
+        // flushed), and discard whatever is still arriving meanwhile.
+        req.resume();
+        return sendHtml(res, 413, renderInstruct({ csrf: issueCsrfToken(session.sessionId), error: read.reason }), {
+          Connection: 'close',
+        });
+      }
+      return sendHtml(res, 400, renderInstruct({ csrf: issueCsrfToken(session.sessionId), error: read.reason }));
+    }
+    form = read.form;
+    upload = read.file;
+  } else {
+    form = await readFormBody(req);
+  }
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
     return sendHtml(res, 403, renderForbidden());
   }
@@ -1122,11 +1187,141 @@ async function handleInstructPost(
   // that every door has to say this out loud — the WhatsApp door is the one
   // that cannot (`whatsapp-door.ts`), because a voice note's text is a
   // transcription provider's output and nobody typed it.
+  // The attached file goes through the ordinary ingest, as an `instruction`
+  // document (never read by the conductor), under a temp path built from nothing the browser sent — the
+  // filename is stored verbatim as `original_name` and never used as a
+  // path. A refusal is the ingest's own Hebrew reason, and the instruction
+  // is not run: the owner asked for work ON this file.
+  // The two refusals `runInstruction` makes before it writes anything are
+  // made here first when a file came with the text, so a refused instruction
+  // never leaves an ingested upload behind (same messages).
+  if (upload !== null) {
+    const early =
+      text.trim().length === 0
+        ? 'ההוראה ריקה.'
+        : text.length > MAX_INSTRUCTION_CHARS
+          ? `ההוראה ארוכה מ-${MAX_INSTRUCTION_CHARS} תווים. להעברת מסמך יש תיקיית קליטה.`
+          : null;
+    if (early !== null) {
+      return sendHtml(res, 400, renderInstruct({ csrf: issueCsrfToken(session.sessionId), error: early }));
+    }
+  }
+  const attachedDocumentIds: string[] = [];
+  if (upload !== null) {
+    const ingested = await ingestUpload(upload, businessId, documentRoot);
+    if (!ingested.ok) {
+      return sendHtml(
+        res,
+        400,
+        renderInstruct({ csrf: issueCsrfToken(session.sessionId), error: `הקובץ לא נקלט: ${ingested.reason}` }),
+      );
+    }
+    attachedDocumentIds.push(ingested.documentId);
+  }
+
   const outcome = await runInstruction(
     { text },
-    { businessId, textOrigin: 'typed', channel: 'dashboard' },
+    {
+      businessId,
+      textOrigin: 'typed',
+      channel: 'dashboard',
+      ...(attachedDocumentIds.length > 0 ? { attachedDocumentIds } : {}),
+      ...(doorOptions.planner !== undefined ? { planner: doorOptions.planner } : {}),
+    },
   );
   await renderInstructionOutcome(res, session, outcome, businessId);
+}
+
+/** Room for the form fields and multipart framing beside the one file. */
+const UPLOAD_FRAMING_BYTES = MAX_BODY_BYTES;
+
+type UploadBody =
+  | { ok: true; form: URLSearchParams; file: MultipartFile | null }
+  /** `overCap`: the body was abandoned mid-stream — the caller must not read the request again. */
+  | { ok: false; reason: string; overCap: boolean };
+
+/**
+ * The multipart body of `POST /instruct`, bounded before it is parsed: the
+ * ingest's own size cap plus the form's framing. One file at most, refused
+ * past the cap — never truncated.
+ */
+async function readUploadBody(
+  req: IncomingMessage,
+  contentType: string | undefined,
+  maxFileBytes: number,
+): Promise<UploadBody> {
+  const tooLarge = `הקובץ גדול מ-${Math.max(1, Math.round(maxFileBytes / (1024 * 1024)))}MB.`;
+  // A declared length past the cap is refused before a byte is buffered.
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > maxFileBytes + UPLOAD_FRAMING_BYTES) {
+    return { ok: false, reason: tooLarge, overCap: true };
+  }
+  // Read with events rather than `for await`: leaving a `for await` early
+  // destroys the request — and its socket — before the refusal can be sent.
+  // Past the cap nothing more is buffered; the caller answers with
+  // `Connection: close` and the rest is discarded.
+  const chunks: Buffer[] = [];
+  const within = await new Promise<boolean>((resolveRead, rejectRead) => {
+    let total = 0;
+    const onData = (chunk: Buffer): void => {
+      total += chunk.length;
+      if (total > maxFileBytes + UPLOAD_FRAMING_BYTES) {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.resume();
+        resolveRead(false);
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = (): void => resolveRead(true);
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.once('error', rejectRead);
+  });
+  if (!within) return { ok: false, reason: tooLarge, overCap: true };
+  const parsed = parseMultipart(Buffer.concat(chunks), contentType, { maxFileBytes });
+  if (!parsed.ok) {
+    const reason =
+      parsed.code === 'too_many_files'
+        ? 'אפשר לצרף קובץ אחד בלבד להוראה.'
+        : parsed.code === 'file_too_large'
+          ? tooLarge
+          : 'לא הצלחתי לקרוא את הטופס.';
+    return { ok: false, reason, overCap: false };
+  }
+  const form = new URLSearchParams();
+  for (const [key, value] of parsed.fields) form.set(key, value);
+  return { ok: true, form, file: parsed.file };
+}
+
+/**
+ * Ingest one uploaded file as an `instruction` document (migration 060). The bytes are written to
+ * a fresh temp directory under a fixed name (`upload`) — the browser's
+ * filename is passed only as `originalName` — and the directory is removed
+ * whatever happens. A `rejected` document, or a `stored` one that carries a
+ * reason (a PDF that could not be read), is a refusal with that reason.
+ */
+async function ingestUpload(
+  file: MultipartFile,
+  businessId: string,
+  documentRoot: string | undefined,
+): Promise<{ ok: true; documentId: string } | { ok: false; reason: string }> {
+  const dir = await mkdtemp(join(tmpdir(), 'dashboard-upload-'));
+  try {
+    const path = join(dir, 'upload');
+    await writeFile(path, file.bytes, { flag: 'wx' });
+    const record = await ingestDocument(
+      { path, source: 'instruction', originalName: file.filename },
+      { businessId, ...(documentRoot !== undefined ? { documentRoot } : {}) },
+    );
+    if (record.status === 'rejected' || (record.status === 'stored' && record.reason !== null)) {
+      return { ok: false, reason: record.reason ?? 'הקובץ נדחה בקליטה.' };
+    }
+    return { ok: true, documentId: record.documentId };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -1519,6 +1714,12 @@ async function answerUnderClaim(
       // Spec §7.2: asked once per chain — this is the second pass, so the
       // identity question is suppressed even if a name is still ambiguous.
       identityAsked: true,
+      // Document production §5.6: the source-document question is bounded by
+      // the same second-pass flag.
+      sourceAsked: true,
+      // The files the owner attached to the original instruction stay his
+      // sources on the second pass (document production D14).
+      attachedDocumentIds: await attachedDocumentsForJob(jobId, { businessId }),
     },
   );
 
@@ -1677,7 +1878,13 @@ function planFingerprint(plan: ErasurePlan): string {
     mailIds: [...plan.mailIds].sort(),
     ledgerItemIds: [...plan.ledgerItemIds].sort(),
     ledgerRuleIds: [...plan.ledgerRuleIds].sort(),
+    productionIds: [...plan.productionIds].sort(),
     filePaths: [...plan.filePaths].sort(),
+    // Display-only to the executor (never deleted), but what the owner was
+    // told stays on his disk: a copy saved between the preview and the
+    // confirm re-shows the preview rather than going unmentioned.
+    savedCopies: [...plan.savedCopies].sort(),
+    filesNotDeleted: [...plan.filesNotDeleted].sort(),
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
     refusals: plan.refusals.map((r) => `${r.kind}:${r.detail}`).sort(),
@@ -2689,6 +2896,9 @@ const LEDGER_ACTION_PATH = /^\/ledger\/([^/]+)\/action$/;
 const LEDGER_RULE_DELETE_PATH = /^\/ledger\/rules\/([^/]+)\/delete$/;
 const MAIL_PATH = /^\/mail\/([^/]+)$/;
 const DOCUMENT_FILE_PATH = /^\/documents\/([^/]+)\/file$/;
+const DOCUMENT_CARD_PATH = /^\/documents\/(DC-[^/]+)$/;
+const DOCUMENT_CARD_GET_PATH = /^\/documents\/(DC-[^/]+)\/(download|preview)$/;
+const DOCUMENT_CARD_POST_PATH = /^\/documents\/(DC-[^/]+)\/(approve|fix|address)$/;
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
 const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
 const INSTRUCT_CONFIRM_PATH = /^\/instruct\/([^/]+)\/confirm$/;
@@ -2711,6 +2921,7 @@ async function route(
   documentRoot: string | undefined,
   oauthOptions: OAuthRouteOptions,
   setupOptions: SetupOptions = {},
+  doorOptions: InstructionDoorOptions = {},
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const requestUrl = new URL(req.url ?? '/', 'http://dashboard.local');
@@ -2858,7 +3069,39 @@ async function route(
 
   if (method === 'GET' && pathname === '/instruct') return handleInstructGet(res, businessId, session);
   if (method === 'POST' && pathname === '/instruct')
-    return handleInstructPost(req, res, businessId, session, documentRoot);
+    return handleInstructPost(req, res, businessId, session, documentRoot, doorOptions);
+
+  // Produced documents (document production §4, §8.1, D13): the list, the
+  // settings page, one card, its file and preview, and the owner's actions.
+  // `/documents/settings` before the card match, which would read it as an id.
+  if (method === 'GET' && pathname === '/documents') return handleDocumentList(res, businessId, session);
+  if (method === 'GET' && pathname === '/documents/settings') return handleDocumentSettingsGet(res, businessId, session);
+  if (method === 'POST' && pathname === '/documents/settings') {
+    return handleDocumentSettingsPost(res, businessId, session, await readFormBody(req));
+  }
+  const documentCardMatch = DOCUMENT_CARD_PATH.exec(pathname);
+  if (method === 'GET' && documentCardMatch?.[1] !== undefined) {
+    const cardId = decodePathSegment(documentCardMatch[1]);
+    return cardId === null ? notFound(res) : handleDocumentCard(res, businessId, session, cardId, documentRoot);
+  }
+  const documentGetMatch = DOCUMENT_CARD_GET_PATH.exec(pathname);
+  if (method === 'GET' && documentGetMatch?.[1] !== undefined) {
+    const cardId = decodePathSegment(documentGetMatch[1]);
+    if (cardId === null) return notFound(res);
+    return documentGetMatch[2] === 'download'
+      ? handleDocumentDownload(res, businessId, cardId, documentRoot)
+      : handleDocumentPreview(res, businessId, cardId, documentRoot);
+  }
+  const documentPostMatch = DOCUMENT_CARD_POST_PATH.exec(pathname);
+  if (method === 'POST' && documentPostMatch?.[1] !== undefined) {
+    const cardId = decodePathSegment(documentPostMatch[1]);
+    if (cardId === null) return notFound(res);
+    const form = await readFormBody(req);
+    const routeOptions = { ...doorOptions, ...(documentRoot !== undefined ? { documentRoot } : {}) };
+    if (documentPostMatch[2] === 'approve') return handleDocumentApprove(res, businessId, session, cardId, form, routeOptions);
+    if (documentPostMatch[2] === 'fix') return handleDocumentFix(res, businessId, session, cardId, form, routeOptions);
+    return handleDocumentAddress(res, businessId, session, cardId, form, routeOptions);
+  }
 
   // The OAuth consent ceremony (oauth-routes.ts): the dashboard is the only
   // place behind the owner's session, with CSRF and loopback binding, where
@@ -3001,7 +3244,12 @@ export function createServer(options: DashboardOptions = {}): Server {
       credentialKeyPath: oauthOptions.credentialKeyPath,
       ...(options.ruleProposer !== undefined ? { ruleProposer: options.ruleProposer } : {}),
     };
-    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions).catch((err: unknown) => {
+    const doorOptions: InstructionDoorOptions = {
+      production: options.production ?? productionToolsFromEnv(),
+      ...(options.planner !== undefined ? { planner: options.planner } : {}),
+      ...(options.uploadMaxBytes !== undefined ? { uploadMaxBytes: options.uploadMaxBytes } : {}),
+    };
+    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions, doorOptions).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {
         sendHtml(res, 500, renderServerError());

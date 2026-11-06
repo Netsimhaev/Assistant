@@ -41,6 +41,7 @@ function call(partial: {
     endpoint: partial.endpoint ?? null,
     businessId: 'test-business',
     idempotencyKey: partial.idempotencyKey ?? 'test-idempotency-key',
+    attachments: [],
     signal: partial.signal ?? new AbortController().signal,
   };
 }
@@ -296,6 +297,7 @@ describe('createGoogleCalendarAdapter', () => {
       endpoint: null,
       businessId: BUSINESS,
       idempotencyKey: 'e2e-1',
+      attachments: [],
       signal: AbortSignal.timeout(5_000),
     });
 

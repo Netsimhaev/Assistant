@@ -15,6 +15,7 @@
  * "ומדווחת" would single out one of two levels the code does not tell apart.
  */
 import type { ActionClass } from './action.js';
+import type { DocumentCardState, DocumentFormat, DocumentKind, ProductionStage } from './document-spec.js';
 import type { LedgerFamily, LedgerStatus } from './ledger.js';
 import type { AutonomyLevel, TrustLevel } from './trust.js';
 
@@ -101,3 +102,45 @@ export function autonomyLevelLabel(value: string): string {
 export function trustLevelLabel(value: string): string {
   return lookup(TRUST_LEVEL_HE, value);
 }
+
+export const documentKindLabel: Readonly<Record<DocumentKind, string>> = Object.freeze({
+  contract: 'חוזה',
+  protocol: 'פרוטוקול',
+  price_list: 'מחירון',
+  profit_table: 'טבלת רווחיות',
+  report: 'דוח',
+  letter: 'מכתב',
+  presentation: 'מצגת',
+  other: 'מסמך',
+});
+
+export const documentFormatLabel: Readonly<Record<DocumentFormat, string>> = Object.freeze({
+  xlsx: 'אקסל',
+  docx: 'וורד',
+  pptx: 'מצגת',
+  pdf: 'PDF',
+});
+
+export const productionStageLabel: Readonly<Record<ProductionStage, string>> = Object.freeze({
+  queued: 'בתור',
+  drafting: 'כותבת טיוטה',
+  building: 'בונה את הקובץ',
+  check1: 'בדיקה ראשונה',
+  check2: 'בדיקה שנייה',
+  fixing: 'מתקנת',
+  ready: 'מוכן לאישור',
+  failed_checks: 'נעצר בבדיקות',
+  failed: 'נכשל',
+});
+
+/**
+ * A document card's state, as the owner reads it on `/documents`. A new state
+ * is a compile error here until it has Hebrew.
+ */
+export const documentCardStateLabel: Readonly<Record<DocumentCardState, string>> = Object.freeze({
+  open: 'מחכה לבדיקתך',
+  approved: 'אושר לשליחה',
+  saved: 'אושר לשמירה',
+  superseded: 'הוחלף בגרסה חדשה',
+  failed_send: 'המסירה לא הושלמה',
+});

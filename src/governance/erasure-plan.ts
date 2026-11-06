@@ -234,12 +234,52 @@
  * is ever deleted — see `LEDGER_WHATSAPP_BATCHES_SCRUB_SET` for why. `ledger_settings` is one row per business of channels, hours
  * and modes: nothing in it can name anyone, so it is left out for the same
  * reason `autonomy_mode` is.
+ *
+ * **Migrations 053–058 added document production: four tables are wired in
+ * below, `document_settings` is not.** A production is the owner's request
+ * for a file, and every content column of it can name the person the file is
+ * for: `document_productions.instruction_text` (the request as typed),
+ * `.destination` (recipients, subject, body), `.work` (the drafted spec, the
+ * previous attempt, the card notes — an unauthorised address is named there)
+ * and `.findings`; `document_versions.spec` and its `check1`/`check2`
+ * results (a finding's `detail` quotes the spec); `document_cards
+ * .delivery_plans` (the plan per option, recipients included); and
+ * `document_deliveries.saved_paths` (where `doc.save` wrote each copy — the
+ * filename comes from the spec). All of them are discovery sources for the
+ * contact anchor, gathered onto one id list, `productionIds`. The window
+ * anchor matches a production's own `created_at`; the document anchor takes
+ * every production BUILT FROM the document (`source_document_ids`) — the
+ * produced file is derived from it, the `gov.verify` precedent above; and job
+ * membership takes a production whose origin job, or one of whose delivery
+ * jobs, is already in `jobIds`. Every production found then drags in its
+ * origin job and every delivery job its cards ever created
+ * (`document_deliveries.job_id`, `document_cards.delivery_job_id`): a
+ * delivery job's plan carries the recipient and the attachment's name.
+ *
+ * The produced files go with their rows — the version's `stored_path` and the
+ * card's preview image (`check2.previewPath`), joined to the document root
+ * here, like `documents`. The copies the owner SAVED into his base folder do
+ * not (spec C7): they are his files on his computer. The preview names each
+ * one (`savedCopies`, from `document_deliveries.saved_paths`, migrations 057/058)
+ * under "נשארים בתיקייה שלך", and nothing deletes them.
+ *
+ * A production that is still being worked on — a stage that is not terminal,
+ * or terminal with its side effects not yet run (`work.finished`) — refuses
+ * the erasure (`PRODUCTION_LIVE_CONDITION`): the loop would write a file under
+ * a row that is gone, and its origin job, parked with no wake time, would have
+ * no one left to close it. The source documents a production was built from
+ * are NOT dragged in by a contact or window anchor: they are separate
+ * documents with their own anchors (the known gap `MAIL_CONTENT_MATCHES`
+ * already names for document text). `boss_instructions.attached_document_ids`
+ * (056) is ids only and goes with its row. `document_settings` is one row per
+ * business — channels and a base folder — and names no one.
  */
-import { join } from 'node:path';
+import { isAbsolute, join, normalize, sep } from 'node:path';
 import { config } from '../config.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import { keptIds, type KeptItemKind } from './kept-items.js';
 import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
+import { TERMINAL_STAGES } from '../production/store.js';
 
 export { LIKE_ESCAPE };
 
@@ -321,7 +361,23 @@ export interface ErasurePlan {
   ledgerItemIds: string[];
   /** `ledger_critical_rules` of kind `counterparty` whose `match` names the contact. */
   ledgerRuleIds: string[];
+  /** `document_productions` rows to erase — see this module's header (migrations 053–058). */
+  productionIds: string[];
   filePaths: string[];
+  /**
+   * Copies of an erased production that `doc.save` wrote into the owner's
+   * base folder, by absolute path. Listed for the owner and NEVER deleted
+   * (spec C7) — they are his files. Never in `filePaths`.
+   */
+  savedCopies: string[];
+  /**
+   * Produced-file paths a version row names that fall OUTSIDE
+   * `produced/<businessId>/<productionId>/` — the only shape the loop writes.
+   * Never unlinked: the executor deletes exactly `filePaths`, and a row that
+   * points elsewhere is corrupt or tampered, not a file this erasure may
+   * touch. Shown to the owner so the refusal is not silent.
+   */
+  filesNotDeleted: string[];
   items: ErasureItem[];
   excluded: KeptExclusion[];
   refusals: ErasureRefusal[];
@@ -811,6 +867,50 @@ export const LEDGER_WHATSAPP_BATCHES_SCRUB_SET = `items = ARRAY(
      ORDER BY u.n)`;
 
 /**
+ * Document production's predicates (migrations 053–058). Each one is
+ * interpolated verbatim by `countItems` and by the executor, with the same
+ * parameters.
+ *
+ * `document_versions` cascades from `document_productions` and
+ * `document_cards` from `document_versions`; both are deleted EXPLICITLY and
+ * leaf first — cards, then versions, then productions — the
+ * `proposals`-before-`document_readings` lesson: a cascade that beat the
+ * explicit statement to the row would leave it reporting zero for a table
+ * that really lost rows. `document_versions` and the card's version carry no
+ * `business_id` of their own to trust alone (versions have none at all), so
+ * both are scoped through the production, which does.
+ *
+ * Parameters, in all three: `$1` businessId, `$2` productionIds.
+ */
+export const DOCUMENT_PRODUCTIONS_ERASED_PREDICATE = `business_id = $1 AND production_id = ANY ($2)`;
+export const DOCUMENT_VERSIONS_ERASED_PREDICATE = `production_id IN (
+    SELECT production_id FROM document_productions WHERE ${DOCUMENT_PRODUCTIONS_ERASED_PREDICATE})`;
+export const DOCUMENT_CARDS_ERASED_PREDICATE = `business_id = $1 AND version_id IN (
+    SELECT version_id FROM document_versions WHERE ${DOCUMENT_VERSIONS_ERASED_PREDICATE})`;
+
+/**
+ * `document_deliveries` (migration 055): one row per delivery job a card's
+ * approval created — ids, plus every path `doc.save` wrote (`saved_paths`, 057/058). Deleted by
+ * `job_id`, like `confirmed_step_claims`: every delivery job of an erased
+ * production is dragged into `jobIds` by `buildErasurePlan`, so this reaches
+ * all of them, and a delivery job the owner KEPT keeps its row with it.
+ *
+ * Parameters: `$1` businessId, `$2` jobIds.
+ */
+export const DOCUMENT_DELIVERIES_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
+
+/**
+ * A production still being worked on: a stage the loop has not finished, or
+ * a terminal stage whose side effects (closing the origin job, the card, the
+ * owner's message) have not run yet — the same `work.finished` flag the loop
+ * reads. Erasing one would let the loop write a file under a row that is gone
+ * and leave its origin job parked with no one to close it. Interpolated by
+ * the plan-time refusal and, under a row lock, by the executor's re-check.
+ */
+export const PRODUCTION_LIVE_CONDITION = `(stage NOT IN (${TERMINAL_STAGES.map((t) => `'${t}'`).join(', ')})
+    OR NOT coalesce((work ->> 'finished')::boolean, false))`;
+
+/**
  * `ledger_critical_rules` of kind `counterparty`: the `match` is a person's
  * name, address or domain. Found by a contact anchor only (a rule is the
  * owner's configuration, not an event a window brackets). Parameters: `$1`
@@ -858,6 +958,24 @@ const MAIL_CONTENT_MATCHES = `(from_address ILIKE $2 ${LIKE_ESCAPE}
       OR coalesce(body_text, '')  ILIKE $2 ${LIKE_ESCAPE}
       OR coalesce(summary, '')    ILIKE $2 ${LIKE_ESCAPE}
       OR ${jsonbContentMatches('attachments', '$2')})`;
+
+/**
+ * A production's own content columns (alias `p`), matched against a contact
+ * pattern (`$2`): the request as typed, the destination, the working record
+ * (drafted spec, previous attempt, card notes) and the findings. The JSONB
+ * ones go through `jsonbContentMatches`, so a name with `"` or a line break
+ * is still found. Never `format`/`kind`/`stage`/`source_document_ids` —
+ * closed sets and ids, not content.
+ */
+const PRODUCTION_CONTENT_MATCHES = `(p.instruction_text ILIKE $2 ${LIKE_ESCAPE}
+      OR ${jsonbContentMatches('p.destination', '$2')}
+      OR ${jsonbContentMatches('p.work', '$2')}
+      OR ${jsonbContentMatches('p.findings', '$2')})`;
+
+/** A version's content columns (alias `v`): the spec and both checks' results. */
+const VERSION_CONTENT_MATCHES = `(${jsonbContentMatches('v.spec', '$2')}
+      OR ${jsonbContentMatches('v.check1', '$2')}
+      OR ${jsonbContentMatches('v.check2', '$2')})`;
 
 /**
  * The `jobs` rows an erasure scrubs, and what gets emptied on them — as
@@ -943,6 +1061,17 @@ export const JOBS_SCRUB_SET = `title = NULL, awaiting_envelope_id = NULL`;
 export const STRANDED_PARENT_PREDICATE = `business_id = $1 AND job_id = ANY ($2)
   AND phase = 'followup' AND awaiting_envelope_id IS NOT NULL`;
 
+/**
+ * True only for a relative path that, normalised, starts with `prefix`
+ * (`produced/<businessId>/<productionId>/`) — so `..` segments, an absolute
+ * path or another production's folder never reach the unlink list.
+ */
+function isProducedPath(relative: string, prefix: string): boolean {
+  if (isAbsolute(relative)) return false;
+  const normalised = normalize(relative);
+  return normalised.startsWith(prefix) && !normalised.split(sep).includes('..');
+}
+
 async function idsFrom(
   db: Queryable,
   sql: string,
@@ -968,6 +1097,7 @@ export async function buildErasurePlan(
   const mailIds = new Set<string>();
   const ledgerItemIds = new Set<string>();
   const ledgerRuleIds = new Set<string>();
+  const productionIds = new Set<string>();
 
   if (anchor.kind === 'contact') {
     const pattern = `%${likeLiteral(anchor.identifier)}%`;
@@ -1217,6 +1347,27 @@ export async function buildErasurePlan(
       [businessId, pattern],
       'rule_id',
     )) ledgerRuleIds.add(ruleId);
+
+    // Document production, by its own content — every column of all four
+    // tables that can name a person, onto the production that owns it. See
+    // this module's header (migrations 053–058).
+    for (const productionId of await idsFrom(
+      db,
+      `SELECT production_id FROM document_productions p
+        WHERE p.business_id = $1
+          AND (${PRODUCTION_CONTENT_MATCHES}
+            OR EXISTS (SELECT 1 FROM document_versions v
+                        WHERE v.production_id = p.production_id
+                          AND (${VERSION_CONTENT_MATCHES}
+                            OR EXISTS (SELECT 1 FROM document_cards c
+                                        WHERE c.business_id = $1 AND c.version_id = v.version_id
+                                          AND ${jsonbContentMatches('c.delivery_plans', '$2')})
+                            OR EXISTS (SELECT 1 FROM document_deliveries d
+                                        WHERE d.business_id = $1 AND d.version_id = v.version_id
+                                          AND array_to_string(d.saved_paths, chr(10)) ILIKE $2 ${LIKE_ESCAPE}))))`,
+      [businessId, pattern],
+      'production_id',
+    )) productionIds.add(productionId);
   }
 
   if (anchor.kind === 'window') {
@@ -1252,10 +1403,30 @@ export async function buildErasurePlan(
       [businessId, anchor.fromIso, anchor.toIso],
       'item_id',
     )) ledgerItemIds.add(itemId);
+
+    // A production's own `created_at` — when the owner asked for it.
+    for (const productionId of await idsFrom(
+      db,
+      `SELECT production_id FROM document_productions
+        WHERE business_id = $1 AND created_at >= $2 AND created_at < $3`,
+      [businessId, anchor.fromIso, anchor.toIso],
+      'production_id',
+    )) productionIds.add(productionId);
   }
 
   if (anchor.kind === 'document') {
     documentIds.add(anchor.documentId);
+
+    // Every production BUILT FROM this document: the produced file and its
+    // spec are derived from it — the same reach the `gov.verify` closure
+    // below has for a draft derived from a document.
+    for (const productionId of await idsFrom(
+      db,
+      `SELECT production_id FROM document_productions
+        WHERE business_id = $1 AND $2 = ANY (source_document_ids)`,
+      [businessId, anchor.documentId],
+      'production_id',
+    )) productionIds.add(productionId);
   }
 
   // What every mail found above produced. Runs BEFORE the job→document and
@@ -1337,6 +1508,42 @@ export async function buildErasurePlan(
        SELECT job_id FROM ledger_events
         WHERE business_id = $1 AND item_id = ANY ($2) AND job_id IS NOT NULL`,
       [businessId, [...ledgerItemIds]],
+      'job_id',
+    )) jobIds.add(jobId);
+  }
+
+  // Document production, by job membership, then every job an erased
+  // production made or delivered through. After the ledger closure (its jobs
+  // can be a production's origin) and BEFORE the job→document and memory
+  // closures below, which read the jobs added here. One pass, like the
+  // ledger's.
+  if (jobIds.size > 0) {
+    for (const productionId of await idsFrom(
+      db,
+      `SELECT production_id FROM document_productions
+        WHERE business_id = $1 AND origin_job_id = ANY ($2)
+       UNION
+       SELECT v.production_id FROM document_deliveries d
+         JOIN document_versions v ON v.version_id = d.version_id
+        WHERE d.business_id = $1 AND d.job_id = ANY ($2)`,
+      [businessId, [...jobIds]],
+      'production_id',
+    )) productionIds.add(productionId);
+  }
+  if (productionIds.size > 0) {
+    for (const jobId of await idsFrom(
+      db,
+      `SELECT origin_job_id AS job_id FROM document_productions
+        WHERE business_id = $1 AND production_id = ANY ($2)
+       UNION
+       SELECT d.job_id FROM document_deliveries d
+         JOIN document_versions v ON v.version_id = d.version_id
+        WHERE d.business_id = $1 AND v.production_id = ANY ($2)
+       UNION
+       SELECT c.delivery_job_id AS job_id FROM document_cards c
+         JOIN document_versions v ON v.version_id = c.version_id
+        WHERE c.business_id = $1 AND v.production_id = ANY ($2) AND c.delivery_job_id IS NOT NULL`,
+      [businessId, [...productionIds]],
       'job_id',
     )) jobIds.add(jobId);
   }
@@ -1500,6 +1707,21 @@ export async function buildErasurePlan(
     }
   }
 
+  const productionList = [...productionIds];
+  if (productionList.length > 0) {
+    const { rows } = await db.query<{ production_id: string; stage: string }>(
+      `SELECT production_id, stage FROM document_productions
+        WHERE business_id = $1 AND production_id = ANY ($2) AND ${PRODUCTION_LIVE_CONDITION}`,
+      [businessId, productionList],
+    );
+    for (const row of rows) {
+      refusals.push({
+        kind: 'live_job',
+        detail: `הפקת המסמך ${row.production_id} עדיין בעבודה. חכה שתסתיים ואז מחק.`,
+      });
+    }
+  }
+
   const filePaths: string[] = [];
   if (documentList.length > 0) {
     const { rows } = await db.query<{ document_id: string; stored_path: string }>(
@@ -1533,6 +1755,47 @@ export async function buildErasurePlan(
     }
   }
 
+  // The produced files go with their rows: the version's file and the card's
+  // preview image, absolute, like `documents` above. Each is queued only when
+  // its relative form, normalised, sits under `produced/<businessId>/
+  // <productionId>/` — the one shape the loop writes — so a malformed
+  // `stored_path` or `check2.previewPath` can never point the unlink anywhere
+  // else; such a path goes to `filesNotDeleted`, shown, never unlinked.
+  //
+  // The copies `doc.save` wrote into the owner's base folder are listed,
+  // never deleted (spec C7): every delivery of an erased production, plus any
+  // delivery job already in `jobIds`.
+  const savedCopies: string[] = [];
+  const filesNotDeleted: string[] = [];
+  if (productionList.length > 0) {
+    const { rows } = await db.query<{ production_id: string; stored_path: string; preview_path: string | null }>(
+      `SELECT p.production_id, v.stored_path, v.check2 ->> 'previewPath' AS preview_path
+         FROM document_versions v
+         JOIN document_productions p ON p.production_id = v.production_id
+        WHERE p.business_id = $1 AND p.production_id = ANY ($2)`,
+      [businessId, productionList],
+    );
+    for (const row of rows) {
+      const prefix = join('produced', businessId, row.production_id) + sep;
+      for (const relative of row.preview_path === null ? [row.stored_path] : [row.stored_path, row.preview_path]) {
+        (isProducedPath(relative, prefix) ? filePaths : filesNotDeleted).push(join(documentRoot, relative));
+      }
+    }
+  }
+  if (productionList.length > 0 || jobIds.size > 0) {
+    const { rows } = await db.query<{ saved_path: string }>(
+      `SELECT DISTINCT u.saved_path FROM document_deliveries d, unnest(d.saved_paths) AS u(saved_path)
+        WHERE d.business_id = $1
+          AND (d.job_id = ANY ($2)
+            OR d.version_id IN (SELECT v.version_id FROM document_versions v
+                                  JOIN document_productions p ON p.production_id = v.production_id
+                                 WHERE p.business_id = $1 AND p.production_id = ANY ($3)))`,
+      [businessId, [...jobIds], productionList],
+    );
+    for (const row of rows) savedCopies.push(row.saved_path);
+    savedCopies.sort();
+  }
+
   const digestList = [...digestIds];
   const draftList = [...draftIds];
   const mailList = [...mailIds];
@@ -1540,7 +1803,7 @@ export async function buildErasurePlan(
   const ledgerRuleList = [...ledgerRuleIds];
   const items = await countItems(
     db, businessId, anchor, jobList, documentList, memoryIds, digestList, draftList, mailList,
-    ledgerItemList, ledgerRuleList,
+    ledgerItemList, ledgerRuleList, productionList,
   );
 
   return {
@@ -1553,7 +1816,10 @@ export async function buildErasurePlan(
     mailIds: mailList,
     ledgerItemIds: ledgerItemList,
     ledgerRuleIds: ledgerRuleList,
+    productionIds: productionList,
     filePaths,
+    savedCopies,
+    filesNotDeleted,
     items,
     excluded,
     refusals,
@@ -1579,6 +1845,7 @@ async function countItems(
   mailIds: string[],
   ledgerItemIds: string[],
   ledgerRuleIds: string[],
+  productionIds: string[],
 ): Promise<ErasureItem[]> {
   const one = async (
     table: string,
@@ -1751,6 +2018,33 @@ async function countItems(
       'delete',
       `SELECT count(*)::text AS n FROM ledger_critical_rules WHERE ${LEDGER_CRITICAL_RULES_ERASED_PREDICATE}`,
       [businessId, ledgerRuleIds],
+    ),
+    // Document production (migrations 053–058): cards, then versions, then
+    // productions, matching the executor's order — see
+    // `DOCUMENT_PRODUCTIONS_ERASED_PREDICATE`. Deliveries by job.
+    await one(
+      'document_deliveries',
+      'delete',
+      `SELECT count(*)::text AS n FROM document_deliveries WHERE ${DOCUMENT_DELIVERIES_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'document_cards',
+      'delete',
+      `SELECT count(*)::text AS n FROM document_cards WHERE ${DOCUMENT_CARDS_ERASED_PREDICATE}`,
+      [businessId, productionIds],
+    ),
+    await one(
+      'document_versions',
+      'delete',
+      `SELECT count(*)::text AS n FROM document_versions WHERE ${DOCUMENT_VERSIONS_ERASED_PREDICATE}`,
+      [businessId, productionIds],
+    ),
+    await one(
+      'document_productions',
+      'delete',
+      `SELECT count(*)::text AS n FROM document_productions WHERE ${DOCUMENT_PRODUCTIONS_ERASED_PREDICATE}`,
+      [businessId, productionIds],
     ),
     await one(
       'job_plans',

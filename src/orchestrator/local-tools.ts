@@ -70,7 +70,7 @@ import { StepChannelError } from './step-error.js';
 import { getPool } from '../db/pool.js';
 import type { Importance, LedgerStage } from '../domain/ledger.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { loadInstructionForJob } from '../governance/instructions.js';
+import { attachedDocumentsForJob, loadInstructionForJob } from '../governance/instructions.js';
 import {
   LEADING_HEBREW_PARTICLE,
   TRAILING_PUNCTUATION,
@@ -93,12 +93,33 @@ import {
 } from '../ledger/ledger-input.js';
 import { listCriticalRules, loadLedgerSettings, matchesCriticalRule } from '../ledger/settings.js';
 import { extractDomain, normaliseDomainString } from '../util/address.js';
+import { DocSaveInput, runDocSave } from '../production/save.js';
+import {
+  DocProduceInput,
+  productionLanguage,
+  sourceAmbiguousNote,
+  sourceMissingNote,
+  UNAUTHORISED_ADDRESS_NOTE,
+} from '../production/produce-input.js';
+import { resolveSourceDocuments } from '../production/source-resolver.js';
+import { createProduction, type ProductionDestination } from '../production/store.js';
+import { PRODUCTION_TOOLS_MISSING_REASON } from '../production/render-error.js';
+import { authorisedRecipients } from '../governance/typed-recipients.js';
+import { toOneLine } from '../util/bidi.js';
+import { withTransaction } from '../db/pool.js';
+import type { Runtime } from './runtime.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 
 export interface LocalToolContext {
   jobId: string;
   businessId: string;
   db?: Queryable;
+  /**
+   * Where produced files live (`doc.save` reads the approved version from
+   * under it). Threaded from the scheduler like the production loop's; this
+   * entry point alone falls back to `config.documentRoot`.
+   */
+  documentRoot?: string;
   /**
    * The active charter — required by `doc.fetch` (`readDocument` needs it to
    * build the reading prompt) and by nothing else today. Optional here so the
@@ -148,6 +169,14 @@ export interface LocalToolContext {
    * unaffected.
    */
   agent?: AgentId;
+  /**
+   * Whether this server can produce documents — `runtime.production`,
+   * threaded from `runDueJobs`. Read by `doc.produce` alone: absent or
+   * unavailable, it refuses up front (`PRODUCTION_TOOLS_MISSING_REASON`)
+   * and no production row is written, rather than queue a request the loop
+   * would only fail.
+   */
+  production?: Runtime['production'];
 }
 
 /**
@@ -384,6 +413,37 @@ export async function assertLedgerWriter(jobId: string, businessId: string, db: 
       false,
     );
   }
+}
+
+/**
+ * `doc.produce`'s boundary, in place of gate stages 5–10 it skips as a
+ * read-only tool (spec §5.2 (א)): the SAME SQL as `assertLedgerWriter` —
+ * stored `jobs.provenance = 'boss'` AND a `boss_instructions` row for the job,
+ * both read from the database by `(business_id, job_id)`, never from the
+ * payload or a context claim. A mail, a document or the conductor cannot
+ * queue a production. Runs before the payload is parsed.
+ */
+export async function assertProductionWriter(jobId: string, businessId: string, db: Queryable): Promise<void> {
+  const { rows } = await db.query<{ ok: boolean }>(
+    `SELECT (j.provenance = 'boss'
+             AND EXISTS (SELECT 1 FROM boss_instructions i
+                          WHERE i.business_id = j.business_id AND i.job_id = j.job_id)) AS ok
+       FROM jobs j
+      WHERE j.business_id = $1 AND j.job_id = $2`,
+    [businessId, jobId],
+  );
+  if (rows[0]?.ok !== true) {
+    throw new StepChannelError(
+      'production_not_boss_instruction',
+      `document production is only for a job opened by the owner's instruction (job ${jobId})`,
+      false,
+    );
+  }
+}
+
+/** The same "can this server produce" test the production loop applies (`loop.ts`). */
+function productionToolsUp(production: LocalToolContext['production']): boolean {
+  return production?.available === true && production.sofficePath !== null && production.chromiumPath !== null;
 }
 
 interface LedgerEnv {
@@ -678,6 +738,126 @@ const HANDLERS: Record<string, LocalHandler> = {
       { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) },
     );
     return renderRecalled(found);
+  },
+
+  /**
+   * Copies an approved produced document into the owner's base folder
+   * (document production §9.2). Every path rule, the delivery-job gate and
+   * the write-once-and-re-hash live in `production/save.ts`.
+   */
+  'doc.save': async (input, ctx) => {
+    const parsed = parseOrFail(DocSaveInput, input, 'doc.save');
+    return runDocSave(parsed, {
+      jobId: ctx.jobId,
+      businessId: ctx.businessId,
+      documentRoot: ctx.documentRoot ?? config.documentRoot,
+      ...(ctx.db ? { db: ctx.db } : {}),
+    });
+  },
+
+  /**
+   * Queues a document production (spec §5.5) and parks this job — nothing
+   * is drafted here. The production loop (`production/loop.ts`) drafts,
+   * builds and checks it, and closes this job from `followup` when it ends.
+   *
+   * In order: `assertProductionWriter` (before the payload is even parsed),
+   * the payload, whether this server can produce at all (refused up front,
+   * no row), then three rules applied in code, never trusted from the plan:
+   *   - recipients pass `authorisedRecipients` against the stored instruction
+   *     text and its `textOrigin` (the existing rule); the rest are dropped
+   *     and named on the card (`UNAUTHORISED_ADDRESS_NOTE`, C12);
+   *   - sources: explicit ids and hints go through `resolveSourceDocuments`
+   *     (this business only); what is ambiguous here (the door already asked
+   *     once) or missing is a note, never a guess;
+   *   - language: `productionLanguage` — English only on the owner's word.
+   * The production row and the park (`execute → followup`, `wake_at NULL`,
+   * so `wakeDueJobs` never wakes it) are one transaction: a crash between
+   * them would otherwise leave a job in `execute` that queues a second
+   * production on its next run.
+   *
+   * Files the owner attached to the instruction on the dashboard
+   * (`attachedDocumentsForJob`, migration 056) are added to the explicit
+   * sources whatever the plan said, and recorded as `ownerSourceIds` — the
+   * loop fences those as `boss` and every other source as
+   * `unknown_external` (`sourceProvenance`, loop.ts). The attached ids come
+   * from the instruction row, never from the plan.
+   */
+  'doc.produce': async (input, ctx) => {
+    const db = ctx.db ?? getPool();
+    await assertProductionWriter(ctx.jobId, ctx.businessId, db);
+    const parsed = parseOrFail(DocProduceInput, input, 'doc.produce');
+    if (!productionToolsUp(ctx.production)) {
+      throw new StepChannelError('production_tools_missing', PRODUCTION_TOOLS_MISSING_REASON, false);
+    }
+    const instruction = await loadInstructionForJob(ctx.jobId, { businessId: ctx.businessId, db });
+    if (instruction === null) throw new Error(`runLocalTool: doc.produce found no instruction for ${ctx.jobId}`);
+    const active = await loadActiveCharter(ctx.businessId, db);
+    if (active === null) throw new Error(`runLocalTool: doc.produce needs an active charter (${ctx.businessId})`);
+
+    const notes: string[] = [];
+    let destination: ProductionDestination;
+    if (parsed.destination.mode === 'send') {
+      const candidates = parsed.destination.to.map((address) => address.trim());
+      const authorised = authorisedRecipients({
+        instruction: instruction.text,
+        textOrigin: instruction.textOrigin,
+        actionClass: 'email.initiate',
+        candidates,
+        known: active.bundle.knownCounterparties,
+      });
+      for (const address of candidates) {
+        if (!authorised.includes(address)) notes.push(`${UNAUTHORISED_ADDRESS_NOTE}: ${toOneLine(address)}`);
+      }
+      destination = {
+        mode: 'send',
+        to: [...new Set(authorised)],
+        ...(parsed.destination.subject !== undefined ? { subject: parsed.destination.subject } : {}),
+        ...(parsed.destination.body !== undefined ? { body: parsed.destination.body } : {}),
+      };
+    } else {
+      destination = parsed.destination;
+    }
+
+    const attached = await attachedDocumentsForJob(ctx.jobId, { businessId: ctx.businessId, db });
+    const sources = await resolveSourceDocuments(
+      ctx.businessId,
+      parsed.sourceHints ?? [],
+      [...new Set([...attached, ...(parsed.sources ?? []).map((source) => source.documentId)])],
+      db,
+      { timeZone: active.charter.identity.timezone },
+    );
+    for (const { hint } of sources.ambiguous) notes.push(sourceAmbiguousNote(toOneLine(hint)));
+    for (const missing of sources.missing) notes.push(sourceMissingNote(toOneLine(missing)));
+
+    const productionId = await withTransaction(async (tx) => {
+      const id = await createProduction(
+        {
+          businessId: ctx.businessId,
+          originJobId: ctx.jobId,
+          instructionText: instruction.text,
+          textOrigin: instruction.textOrigin,
+          format: parsed.format,
+          language: productionLanguage(parsed.language, instruction.text),
+          kind: parsed.kind,
+          destination,
+          sourceDocumentIds: sources.resolved,
+          notes,
+          ownerSourceIds: sources.resolved.filter((id) => attached.includes(id)),
+        },
+        tx,
+      );
+      await transition(ctx.jobId, {
+        to: 'followup',
+        actor: 'orchestrator',
+        reason: `doc.produce: production ${id} queued`,
+        businessId: ctx.businessId,
+        expectFrom: 'execute',
+        wakeAt: null,
+        tx,
+      });
+      return id;
+    });
+    return { performed: true, parked: true, productionId };
   },
 
   /**
@@ -1220,6 +1400,25 @@ export const LOCAL_TOOL_CONTRACTS: readonly { toolName: string; payload: string 
   {
     toolName: 'memory.recall_shallow',
     payload: 'כמו `memory.recall`, ומחזיר לכל היותר שלוש תוצאות.',
+  },
+  {
+    toolName: 'doc.save',
+    payload:
+      '`{"producedVersionId": מזהה הגרסה שאושרה, "sha256": הגיבוב שלה, ' +
+      '"folder": תיקייה יחסית בתוך תיקיית הבסיס או null, "filename": השם הקנוני של הגרסה}` — ' +
+      'לא נקרא ישירות על ידי תוכנית; רץ רק במשימת המסירה של כרטיס מסמך שאושר, ולעולם אינו דורס קובץ.',
+  },
+  {
+    toolName: 'doc.produce',
+    payload:
+      '`{"format": "xlsx"|"docx"|"pptx"|"pdf", "kind": "contract"|"protocol"|"price_list"|"profit_table"|' +
+      '"report"|"letter"|"presentation"|"other", "language": "he"|"en" (רשות; ברירת המחדל עברית, ' +
+      'ואנגלית רק כשבעל העסק ביקש במפורש), "request": מה להפיק במשפט אחד או שניים, ' +
+      '"destination": `{"mode":"send","to":[כתובות כפי שנאמרו],"subject": (רשות),"body": (רשות)}` או ' +
+      '`{"mode":"save","folder": תיקייה יחסית או null}`, "sources": `[{"documentId": מזהה}]` (רשות), ' +
+      '"sourceHints": מילים שבהן בעל העסק תיאר מסמך מקור, למשל "המחירון של אלפא" (רשות)}` — ' +
+      'צעד יחיד בתוכנית שמבקשת מסמך. הוא רק מתזמן הפקה; המסמך נוצר, נבדק ומוצג לבעל העסק בכרטיס, ' +
+      'ושום דבר לא נשלח או נשמר בלי אישורו.',
   },
   {
     toolName: 'doc.fetch',

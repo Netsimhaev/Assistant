@@ -328,3 +328,63 @@ describe('gmail subject encoding', () => {
     expect(headerBlock.split('\r\n').some((l) => /^bcc:/i.test(l))).toBe(false);
   });
 });
+
+describe('gmail attachments (document production §8.2)', () => {
+  const file = { filename: 'הצעת מחיר.pdf', mediaType: 'application/pdf', bytes: Buffer.from('%PDF-1.7 bytes') };
+
+  it("Gmail raw MIME has a filename*=UTF-8'' part for a Hebrew name", async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: { id: 'new1' } }));
+    const r = await createGmailClient(http).sendNew(
+      'tok',
+      { to: ['dana@example.com'], subject: 'הצעה', body: 'שלום', attachments: [file] },
+      signal,
+    );
+    expect(r).toEqual({ externalId: 'new1' });
+    const raw = Buffer.from((calls[0]?.body as Record<string, string>)['raw']!, 'base64url').toString('utf8');
+    const boundary = /Content-Type: multipart\/mixed; boundary="([^"]+)"/.exec(raw)?.[1];
+    expect(boundary).toBeDefined();
+    const parts = raw.split(`--${boundary}`);
+    // preamble, text, attachment, closing "--"
+    expect(parts).toHaveLength(4);
+    expect(parts[3]?.startsWith('--')).toBe(true);
+    const [textHead, textBody] = parts[1]!.split('\r\n\r\n');
+    expect(textHead).toMatch(/Content-Type: text\/plain; charset=UTF-8/);
+    expect(Buffer.from(textBody!.replace(/\s+/g, ''), 'base64').toString('utf8')).toBe('שלום');
+    const [attHead, attBody] = parts[2]!.split('\r\n\r\n');
+    const encoded = encodeURIComponent('הצעת מחיר.pdf');
+    expect(attHead).toContain(`Content-Disposition: attachment; filename*=UTF-8''${encoded}`);
+    expect(attHead).toContain('Content-Type: application/pdf');
+    expect(attHead).toContain('Content-Transfer-Encoding: base64');
+    expect(Buffer.from(attBody!.replace(/\s+/g, ''), 'base64').equals(file.bytes)).toBe(true);
+  });
+
+  it('a reply carries the attachment and keeps its threading headers', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: { id: 'r1' } }));
+    await createGmailClient(http).sendReply(
+      'tok',
+      {
+        to: ['dana@example.com'],
+        subject: 'Re: x',
+        body: 'b',
+        inReplyTo: '<abc@example.com>',
+        references: null,
+        threadId: 't1',
+        providerMessageId: 'm1',
+        attachments: [file],
+      },
+      signal,
+    );
+    const body = calls[0]?.body as Record<string, string>;
+    expect(body['threadId']).toBe('t1');
+    const raw = Buffer.from(body['raw']!, 'base64url').toString('utf8');
+    expect(raw).toContain('In-Reply-To: <abc@example.com>');
+    expect(raw).toContain("filename*=UTF-8''");
+  });
+
+  it('a message with no attachments is still the single-part shape', async () => {
+    const { http, calls } = fake(() => ({ status: 200, body: { id: 'n' } }));
+    await createGmailClient(http).sendNew('tok', { to: ['dana@example.com'], subject: 's', body: 'b', attachments: [] }, signal);
+    const raw = Buffer.from((calls[0]?.body as Record<string, string>)['raw']!, 'base64url').toString('utf8');
+    expect(raw).not.toContain('multipart');
+  });
+});

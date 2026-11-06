@@ -262,4 +262,48 @@ export function logErrored(result: SchedulerPassResult): void {
         result.ledger.errored.map((e) => `${e.itemId}: ${e.error}`).join('; '),
     );
   }
+  // Document cards returned after a failed delivery (`production/card.ts`).
+  if (result.deliveriesReraisedError !== null) {
+    console.error(`document card re-raise failed: ${result.deliveriesReraisedError}`);
+  } else if (result.deliveriesReraised !== null) {
+    for (const e of result.deliveriesReraised.errored) {
+      console.error(`document card ${e.cardId} re-raise errored: ${e.error}`);
+    }
+  }
+  // Document production (`src/production/loop.ts`). Three different facts,
+  // and they must not read alike: it threw; it did not run at all (no
+  // production tools on this server — every queued request waits); it ran.
+  // A run with nothing to do is silent, like every other clean bucket here.
+  if (result.documentProductionsError !== null) {
+    console.error(`document production failed: ${result.documentProductionsError}`);
+  } else if (result.documentProductions === null) {
+    // Once per process: the condition is a fixed fact about this server, and
+    // the line every 30s would bury everything else in the log.
+    if (!productionNoticeLogged) {
+      productionNoticeLogged = true;
+      console.log(
+        'document production did not run: production tools are not installed ' +
+          '(DOCUMENT_SOFFICE_PATH / DOCUMENT_CHROMIUM_PATH) — each request fails with the tools reason',
+      );
+    }
+  } else {
+    const d = result.documentProductions;
+    if (d.advanced > 0 || d.ready > 0 || d.failedChecks > 0 || d.failed > 0 || d.skipped > 0) {
+      console.log(
+        `document production: ${d.advanced} stage move(s), ${d.ready} ready, ` +
+          `${d.failedChecks} stopped at checks, ${d.failed} failed, ${d.skipped} skipped`,
+      );
+    }
+    for (const e of d.errored) console.error(`document production ${e.productionId} errored: ${e.error}`);
+    for (const id of d.originJobMissing) {
+      console.error(`document production ${id} finished, but its origin job no longer exists`);
+    }
+  }
+}
+
+let productionNoticeLogged = false;
+
+/** Test seam: forget that the "did not run" line was printed. */
+export function resetProductionNoticeForTests(): void {
+  productionNoticeLogged = false;
 }

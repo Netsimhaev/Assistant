@@ -1,4 +1,5 @@
 import type { ActionClass } from '../domain/action.js';
+import { config } from '../config.js';
 import type { ConnectionBinding } from '../domain/connection.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel } from '../domain/trust.js';
@@ -33,6 +34,8 @@ import { bindPlanToJob, completedSteps } from './plan-store.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { StepChannelError } from './step-error.js';
 import { runLocalTool, type LocalToolContext } from './local-tools.js';
+import { ATTACHMENT_TOOL, ATTACHMENTS_KEY, AttachmentRefs } from '../domain/attachment-ref.js';
+import { deliveryVersionOf, resolveAttachments, type ResolvedAttachment } from '../production/attachments.js';
 import type { Job } from './jobs.js';
 
 /**
@@ -88,6 +91,12 @@ export interface RunPlanRequest {
    * minute for it. Production callers leave it unset and get the constant.
    */
   adapterTimeoutMs?: number;
+  /**
+   * Where produced files live — read by a `mail.send` attachment and by
+   * `doc.save`. Threaded from the scheduler; `runPlan` alone falls back to
+   * `config.documentRoot`.
+   */
+  documentRoot?: string;
   /** Passed through to the gate so a queued approval reaches the owner. */
   notify?: { notifier: ApprovalNotifier; dashboardBaseUrl: string };
   /**
@@ -121,6 +130,11 @@ export interface RunPlanRequest {
    * Production callers leave this unset and the real judge runs.
    */
   judge?: LocalToolContext['judge'];
+  /**
+   * Whether this server can produce documents (`runtime.production`), for
+   * `doc.produce` alone — threaded to `LocalToolContext.production`.
+   */
+  production?: LocalToolContext['production'];
   /**
    * The hard cap carried by the envelope that opened THIS JOB as a
    * delegation's child, forwarded to every step's `GateContext.autonomyCeiling`.
@@ -557,7 +571,17 @@ async function performStep(
   redactedInput: unknown,
   effectiveInput: Record<string, unknown>,
 ): Promise<StepEffect> {
+  // First, before a local handler or any channel is touched: a step whose
+  // attachments do not resolve to the exact approved bytes fails here, final,
+  // and no adapter is ever called (spec §8.2, ruling C16).
+  const documentRoot = request.documentRoot ?? config.documentRoot;
+  const attachments = await stepAttachments(step.toolName, effectiveInput, request.job, documentRoot);
+
   if (!needsChannel(step.toolName)) {
+    // A local step never carries attachments: `stepAttachments` above already
+    // refused the key on every tool but `mail.send`, which is not local, so a
+    // local handler never sees a file reference it would silently ignore.
+    //
     // A local step: nothing leaves the instance, so there is nothing to
     // connect to — and since 12/09 there is somewhere to send it. `runLocalTool`
     // performs the tools that have a handler (the memory family) and returns an
@@ -587,6 +611,8 @@ async function performStep(
       agent: step.agent,
       ...(request.reader !== undefined ? { reader: request.reader } : {}),
       ...(request.judge !== undefined ? { judge: request.judge } : {}),
+      ...(request.production !== undefined ? { production: request.production } : {}),
+      documentRoot,
     });
     // No `externalId`: nothing outside the instance issued a handle, and
     // inventing one would tell `verify` it had a far end to ask.
@@ -700,6 +726,8 @@ async function performStep(
         // second real send away.
         input: effectiveInput,
       }),
+      // Resolved from the effective payload above; `[]` when the step has none.
+      attachments,
       signal: AbortSignal.timeout(request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS),
     },
     request.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS,
@@ -768,6 +796,53 @@ async function performStep(
   // for `ok: false`), which is the adapter's own affirmation that the call
   // landed. See `StepEffect.performed`'s own docblock.
   return { output: result.output, externalId: result.externalId, performed: true };
+}
+
+const ATTACHMENTS_NOT_SUPPORTED_HE = 'אפשר לצרף קבצים רק למייל שמוסר מסמך שאושר — הפעולה לא בוצעה';
+const ATTACHMENT_INVALID_HE = 'פרטי הקובץ המצורף אינם תקינים — המייל לא נשלח';
+
+/**
+ * The files a step carries, resolved to the exact approved bytes — or a
+ * `StepChannelError`, final, before any adapter call.
+ *
+ * Read from the EFFECTIVE payload, never the redacted one (ruling C16):
+ * `attachments` is a routing field — it chooses WHICH file, as `to` chooses a
+ * recipient — so it follows "the approved payload is what routes" (review of
+ * 28/08). A charter redaction pattern that matches a hash or a filename must
+ * not break a send; the bytes themselves are never redacted, because the owner
+ * saw exactly them.
+ *
+ * Own key only, like every routing read here. Only `mail.send` may carry
+ * attachments — the key on any other tool, local ones included, is refused
+ * rather than ignored, so a payload that names a file is never quietly acted
+ * on without it. And only on a document DELIVERY job (a job a
+ * `document_cards.delivery_job_id` in this business names), and only for the
+ * version that card shows (`deliveryVersionOf`): a model-written plan that
+ * emits the field on any other job, or names any other version, is refused
+ * before a file is read.
+ */
+async function stepAttachments(
+  toolName: string,
+  effectiveInput: Record<string, unknown>,
+  job: Job,
+  documentRoot: string,
+): Promise<ResolvedAttachment[]> {
+  if (!Object.hasOwn(effectiveInput, ATTACHMENTS_KEY)) return [];
+  if (toolName !== ATTACHMENT_TOOL) {
+    throw new StepChannelError('attachments_not_supported', ATTACHMENTS_NOT_SUPPORTED_HE, false);
+  }
+  const refs = AttachmentRefs.safeParse(effectiveInput[ATTACHMENTS_KEY]);
+  if (!refs.success) throw new StepChannelError('attachment_invalid', ATTACHMENT_INVALID_HE, false);
+  if (refs.data.length === 0) return [];
+  // Not merely "a delivery job": every ref must name the very version the
+  // owner approved on the card that created this job (Task 14, carry (b)).
+  const approved = await deliveryVersionOf(job.businessId, job.jobId);
+  if (approved === null || refs.data.some((ref) => ref.producedVersionId !== approved)) {
+    throw new StepChannelError('attachments_not_supported', ATTACHMENTS_NOT_SUPPORTED_HE, false);
+  }
+  const resolved = await resolveAttachments(refs.data, job.businessId, documentRoot);
+  if (!resolved.ok) throw new StepChannelError(resolved.code, resolved.he, false);
+  return resolved.files;
 }
 
 /**

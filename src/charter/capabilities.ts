@@ -133,6 +133,11 @@ export const AGENT_ALLOWLISTS: Record<AgentId, string[]> = {
   // needs.
   'prod.docs': [
     'file.write',
+    // Document production §5.2 — queues a production; only an owner's
+    // instruction job may (`assertProductionWriter`, local-tools.ts).
+    'doc.produce',
+    // Document production §9.2 — only ever run on a delivery job (save.ts).
+    'doc.save',
     'memory.recall',
     'template.load',
     'agent.request_help',

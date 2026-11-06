@@ -114,9 +114,10 @@ export const PDF_LOAD_OPTIONS = {
 /** Items on one line sit within this fraction of the font size of each other's baseline. */
 const SAME_LINE_TOLERANCE = 0.5;
 /** A horizontal gap wider than this fraction of the font size is a word break. */
-const WORD_GAP = 0.15;
+export const WORD_GAP = 0.15;
 
-interface PlacedText {
+/** A text item placed on the page. `rtl` is pdf.js's own `dir` for the item. */
+export interface PlacedText {
   str: string;
   rtl: boolean;
   x: number;
@@ -186,12 +187,22 @@ function joinLine(items: PlacedText[]): string {
   return line;
 }
 
+/** Joins one line's items (already grouped by baseline) into its text. */
+export type LineJoiner = (items: PlacedText[]) => string;
+
 /**
  * A page's text items, as trimmed non-empty lines from the top of the page
  * down. One sort and one sweep, so a page of many tiny items costs
  * n log n — not one comparison per item per line.
+ *
+ * `joiner` defaults to this module's `joinLine`, which is what every
+ * INCOMING document is read with. The only other joiner is
+ * `joinChromiumLine` (`src/production/chromium-lines.ts`), used solely for
+ * the text of our own produced PDFs in check 2: it regroups glyph runs that
+ * headless Chromium splits into separate items, which would reorder table
+ * cells of an arbitrary incoming PDF.
  */
-function linesOf(items: readonly unknown[]): string[] {
+export function linesOf(items: readonly unknown[], joiner: LineJoiner = joinLine): string[] {
   const placed = items.map(placedOf).filter((p): p is PlacedText => p !== null);
   placed.sort((a, b) => b.y - a.y);
 
@@ -209,7 +220,7 @@ function linesOf(items: readonly unknown[]): string[] {
   }
   if (current.length > 0) lines.push(current);
 
-  return lines.map((line) => joinLine(line).trim()).filter((line) => line !== '');
+  return lines.map((line) => joiner(line).trim()).filter((line) => line !== '');
 }
 
 export async function extractPdf(sourcePath: string): Promise<DocumentArtifact[]> {

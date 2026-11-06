@@ -35,17 +35,9 @@ import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import { OUTLOOK_SUBJECT_NOTE, WARNING_PREFIXES, mailboxReplyRecipient, splitReplyDetail } from '../mail/reply-card.js';
 import { formatMinor } from '../util/money.js';
 
-/** The one escaping helper. Stringifies first (so numbers, booleans, `null` are safe to pass too), then escapes. */
-export function escapeHtml(value: unknown): string {
-  const str =
-    typeof value === 'string' ? value : value === null || value === undefined ? '' : String(value);
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
+// The one escaping helper; defined in `src/util/html.ts`, re-exported unchanged.
+import { escapeHtml } from '../util/html.js';
+export { escapeHtml };
 
 const esc = escapeHtml;
 
@@ -238,7 +230,7 @@ export function renderPendingList(options: {
 </header>
 ${options.modeFailed === true ? `<p class="error" role="alert">${esc(MODE_NOT_APPLIED_NOTICE)} <a href="/autonomy">כמה חופש לתת</a></p>` : ''}
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/documents">מסמכים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a></p>
 ${list}`,
   );
 }
@@ -1437,10 +1429,11 @@ export function renderInstruct(options: {
      ${confirmations}
      ${identityNote}
      ${pending}
-     <form method="POST" action="/instruct">
+     <form method="POST" action="/instruct" enctype="multipart/form-data">
        <input type="hidden" name="csrf" value="${esc(options.csrf)}">
        <textarea name="text" rows="4" maxlength="4000" required
                  placeholder="למשל: תשלחי לדנה dana@example.com את ההצעה"></textarea>
+       <label>צרפי קובץ (לא חובה, קובץ אחד) <input type="file" name="file"></label>
        <button>שלח</button>
      </form>
      <p class="muted">
@@ -1452,7 +1445,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/digest">מה קרה</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/documents">מסמכים</a> · <a href="/digest">מה קרה</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }
@@ -1540,6 +1533,13 @@ export const TABLE_LABELS: Record<string, string> = {
   ledger_reminders: 'תזכורות מהפנקס',
   ledger_whatsapp_batches: 'רשימות פנקס ממוספרות בוואטסאפ',
   ledger_critical_rules: 'כללי "קריטי" שנוקבים באדם',
+  // Migrations 053–058: document production — the request, every built
+  // version (its content and checks), the approval card, and the record of
+  // each delivery.
+  document_productions: 'בקשות להפקת מסמך',
+  document_versions: 'גרסאות של מסמכים שהופקו',
+  document_cards: 'כרטיסי מסמך',
+  document_deliveries: 'רישומי מסירה של מסמכים',
 };
 
 /**
@@ -1759,6 +1759,19 @@ function keptList(
     .join('');
 }
 
+/**
+ * The copies of an erased document the owner saved into his base folder
+ * (spec C7): named by path, and NOT deleted — they are his files. Shown so he
+ * knows the person's name still sits on his own disk, and can remove them
+ * himself if he wants.
+ */
+function savedCopiesSection(paths: readonly string[]): string {
+  if (paths.length === 0) return '';
+  return `<h2>נשארים בתיקייה שלך</h2>
+     <p class="muted">עותקים שנשמרו בתיקייה שהגדרת. המחיקה לא נוגעת בהם — אם תרצה, מחק אותם בעצמך.</p>
+     <ul>${paths.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`;
+}
+
 export function renderErasure(model: ErasureViewModel): string {
   const { plan } = model;
   const error = model.error === undefined ? '' : `<p class="error">${esc(model.error)}</p>`;
@@ -1838,6 +1851,10 @@ export function renderErasure(model: ErasureViewModel): string {
      <table><tr><th>מה</th><th>כמה</th><th>מה יקרה</th></tr>${rows}</table>
      ${nothing}
      ${plan.filePaths.length > 0 ? `<p>${plan.filePaths.length} קבצים יימחקו מהדיסק.</p>` : ''}
+     ${savedCopiesSection(plan.savedCopies)}
+     ${plan.filesNotDeleted.length > 0
+       ? `<p class="error">${plan.filesNotDeleted.length} קבצים שנרשמו להפקה נמצאים מחוץ לתיקיית ההפקה שלה, ולכן לא יימחקו:</p><ul>${plan.filesNotDeleted.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`
+       : ''}
      ${kept === '' ? '' : `<h2>יישמרו לפי הוראתך</h2><ul>${kept}</ul>`}
      ${excludable}
      <p class="muted">מסלול הביקורת יישמר — הוא אינו מחזיק שמות, כתובות או תוכן.</p>

@@ -1,11 +1,25 @@
 import { REDACTED } from '../../policy/redact.js';
 import { extractAddressCandidate } from '../../util/address.js';
-import type { AdapterCall, AdapterResult, CredentialHandle, ExternalAdapter } from './types.js';
+import type {
+  AdapterCall,
+  AdapterResult,
+  CredentialHandle,
+  ExternalAdapter,
+  OutgoingAttachment,
+} from './types.js';
 
 export interface MailMessage {
   to: string[];
   subject: string;
   body: string;
+  /**
+   * Resolved produced documents — `AdapterCall.attachments`, the exact
+   * approved bytes (document production §8.2). Absent or empty: a plain
+   * text message, as every send was before attachments existed. Optional so
+   * the notifier and the alert paths, which never attach anything, are not
+   * made to say so.
+   */
+  attachments?: readonly OutgoingAttachment[];
 }
 
 /**
@@ -177,7 +191,9 @@ export function createMailAdapter(options: MailAdapterOptions): ExternalAdapter 
 
       try {
         const sent = await options.transport.send(
-          { to, subject, body },
+          // The files come from `call.attachments`, never from `input`: the
+          // redacted payload may hold a masked ref (ruling C16).
+          { to, subject, body, ...(call.attachments.length > 0 ? { attachments: call.attachments } : {}) },
           {
             endpoint: call.endpoint,
             credential: call.credential,

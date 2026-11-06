@@ -329,3 +329,40 @@ describe('alreadyDoneLine', () => {
     expect(alreadyDoneLine(5)).toBe('כבר בוצע: 5 צעדים — הם לא יבוצעו שוב.');
   });
 });
+
+describe('attachments in the echo (document production §8.2)', () => {
+  const ref = {
+    producedVersionId: 'DV-01ABC-1',
+    sha256: 'ab12cd34ef56'.padEnd(64, '0'),
+    filename: 'הצעת מחיר',
+    sizeBytes: 1536,
+  };
+
+  it('echo renders the attachment line, not a raw field', () => {
+    const echo = renderStepEcho(
+      step('mail.send', { to: 'dana@acme.co.il', subject: 's', body: 'b', attachments: [ref] }),
+      'ILS',
+    );
+    expect(echo).toContain('קובץ מצורף: הצעת מחיר · 1.5 KB · ab12cd34ef56');
+    expect(echo).not.toContain('שדה נוסף');
+    expect(echo).not.toContain('DV-01ABC-1');
+  });
+
+  it('one line per attachment, and a malformed one is shown as invalid, never as a raw extra field', () => {
+    const echo = renderStepEcho(
+      step('mail.send', { to: 'a@b.co', subject: 's', body: 'b', attachments: [ref, { producedVersionId: 'x' }] }),
+      'ILS',
+    );
+    expect(echo.match(/^קובץ מצורף/gm)).toHaveLength(2);
+    expect(echo).toMatch(/^קובץ מצורף \(לא תקין\): /m);
+    expect(echo).not.toContain('שדה נוסף');
+  });
+
+  it('marks invisible controls in the filename', () => {
+    const echo = renderStepEcho(
+      step('mail.send', { to: 'a@b.co', subject: 's', body: 'b', attachments: [{ ...ref, filename: `x${RLO}fdp` }] }),
+      'ILS',
+    );
+    expect(echo).toContain('⟦U+202E⟧');
+  });
+});

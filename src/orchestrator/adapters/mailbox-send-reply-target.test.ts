@@ -43,6 +43,7 @@ function call(input: unknown, businessId: string = BUSINESS): AdapterCall {
     endpoint: null,
     businessId,
     idempotencyKey: 'k',
+    attachments: [],
     signal: new AbortController().signal,
   };
 }

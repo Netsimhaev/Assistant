@@ -1184,6 +1184,43 @@ describe('failedText', () => {
     expect(failedText('reply_target_lookup_failed — x')).not.toBe(FAILED_GENERIC_TEXT);
   });
 
+  it('maps every attachment refusal (document production §8.2) to its own Hebrew sentence', () => {
+    const codes = [
+      'attachment_not_found',
+      'attachment_hash_mismatch',
+      'attachment_name_mismatch',
+      'attachment_too_large',
+      'attachment_too_large_microsoft',
+      'attachment_invalid',
+      'attachments_not_supported',
+    ];
+    const texts = codes.map((code) => failedText(`${code} — x`));
+    for (const text of texts) {
+      expect(text).not.toBe(FAILED_GENERIC_TEXT);
+      expect(text).toMatch(/[א-ת]/);
+    }
+    expect(new Set(texts).size).toBe(codes.length);
+  });
+
+  it('maps every doc.save refusal (document production §9.2) to its own Hebrew sentence', () => {
+    const codes = [
+      'save_not_supported',
+      'save_no_base_folder',
+      'save_not_found',
+      'save_hash_mismatch',
+      'save_name_mismatch',
+      'save_folder_refused',
+      'save_names_exhausted',
+      'save_verify_failed',
+    ];
+    const texts = codes.map((code) => failedText(`${code} — x`));
+    for (const text of texts) {
+      expect(text).not.toBe(FAILED_GENERIC_TEXT);
+      expect(text).toMatch(/[א-ת]/);
+    }
+    expect(new Set(texts).size).toBe(codes.length);
+  });
+
   it('falls through to the generic text for anything unmapped, in every shape', () => {
     expect(failedText(null)).toBe(FAILED_GENERIC_TEXT);
     expect(failedText('some_future_code — details')).toBe(FAILED_GENERIC_TEXT);
@@ -1324,5 +1361,63 @@ describe('reportWhatsAppJobs — boss commands (spec §4.6)', () => {
     const messenger = fakeMessenger();
     await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
     expect(messenger.sentTexts).toEqual([]);
+  });
+});
+
+describe('reportWhatsAppJobs — document production (spec §4)', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+    charterCounter = 0;
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  const PRODUCE_PLAN = Plan.parse({
+    goal: 'להפיק מכתב',
+    steps: [
+      {
+        id: 's1',
+        agent: 'prod.docs',
+        intent: 'produce',
+        toolName: 'doc.produce',
+        input: { format: 'docx', kind: 'letter', request: 'מכתב', destination: { mode: 'save', folder: null } },
+      },
+    ],
+  });
+
+  /** A closed WhatsApp-linked job whose only step is doc.produce; `queued` adds its production row. */
+  async function producedJob(queued: boolean): Promise<string> {
+    const bundle = await install();
+    const job = await jobInExecute(bundle);
+    await bindPlanToJob(job.jobId, PRODUCE_PLAN, { businessId: BUSINESS });
+    await linkToWhatsApp(job.jobId);
+    if (queued) {
+      await getPool().query(
+        `INSERT INTO document_productions (production_id, business_id, origin_job_id, instruction_text, text_origin,
+                                           format, language, kind, destination, stage)
+         VALUES ($1, $2, $3, 'מכתב', 'typed', 'docx', 'he', 'letter', '{"mode":"save","folder":null}', 'ready')`,
+        [`DP-${job.jobId}`, BUSINESS, job.jobId],
+      );
+    }
+    await transition(job.jobId, { to: 'followup', actor: 'orchestrator', reason: 'parked', businessId: BUSINESS });
+    await transition(job.jobId, { to: 'closed', actor: 'orchestrator', reason: 'produced', businessId: BUSINESS });
+    return job.jobId;
+  }
+
+  it('a job whose only step is doc.produce and that queued a production is not reported — the card is the report', async () => {
+    await producedJob(true);
+    const messenger = fakeMessenger();
+    const report = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    expect(report.reported).toBe(0);
+    expect(messenger.sentTexts).toEqual([]);
+
+    // Control: the same job with no production row (the handler refused
+    // before queueing) IS reported — the exclusion keys on the production.
+    const refused = await producedJob(false);
+    const second = await reportWhatsAppJobs({ messenger, businessId: BUSINESS });
+    expect(second.reported).toBe(1);
+    expect(messenger.sentJobIds).toEqual([refused]);
   });
 });

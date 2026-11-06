@@ -18,6 +18,7 @@ function facts(over: Partial<DigestFacts> = {}): DigestFacts {
     permissionChanges: [],
     cost: { windowMinor: 0, rolling30Minor: 0, ceilingMinor: 50000, currency: 'ILS' },
     ledger: { open: 0, overdue: 0, stuck: 0, closedByEvidence: 0, topStuck: [] },
+    documents: { produced: 0, sent: 0, waiting: 0 },
     ...over,
   };
 }
@@ -330,5 +331,17 @@ describe('renderDigest', () => {
       expect(out.hadContent).toBe(true);
       expect(out.body).toContain('הפנקס:');
     });
+  });
+  it('says how many documents were produced, sent and are waiting — one line, verbatim', () => {
+    const out = renderDigest(facts({ documents: { produced: 3, sent: 1, waiting: 2 } }));
+    expect(out.body).toContain('הופקו 3 מסמכים, 1 נשלחו, 2 מחכים לבדיקתך');
+    expect(out.hadContent).toBe(true);
+    expect(renderDigest(facts()).body).not.toContain('הופקו');
+  });
+
+  it('cards merely waiting are not news on their own — the line shows, the window is still empty', () => {
+    const out = renderDigest(facts({ documents: { produced: 0, sent: 0, waiting: 2 } }));
+    expect(out.body).toContain('הופקו 0 מסמכים, 0 נשלחו, 2 מחכים לבדיקתך');
+    expect(out.hadContent).toBe(false);
   });
 });

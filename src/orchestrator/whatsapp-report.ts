@@ -310,6 +310,31 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   reply_recipient_mismatch: 'תשובה בתוך שיחה נשלחת רק לשולח המקורי',
   reply_target_lookup_failed: 'לא ניתן היה לבדוק את המייל שאליו עונים', // retryable
 
+  // Attachments on mail.send (document production §8.2): performStep's own
+  // refusals (run-plan.ts, production/attachments.ts) and the mailbox
+  // adapter's Microsoft cap. All final.
+  attachment_not_found: 'הקובץ המצורף לא נמצא',
+  attachment_hash_mismatch: 'הקובץ המצורף השתנה מאז שאושר',
+  attachment_too_large: 'הקבצים המצורפים גדולים מ-20MB',
+  attachment_too_large_microsoft: 'הקובץ גדול מדי לשליחה מ-Outlook בפרויקט הזה',
+  attachment_invalid: 'פרטי הקובץ המצורף אינם תקינים',
+  attachment_name_mismatch: 'שם הקובץ המצורף אינו השם שאושר',
+  attachments_not_supported: 'אפשר לצרף קבצים רק למייל שמוסר מסמך שאושר',
+
+  // doc.save (document production §9.2, production/save.ts). All final.
+  save_not_supported: 'אפשר לשמור קובץ רק ממסמך שאושר',
+  save_no_base_folder: 'לא הוגדרה תיקיית בסיס לשמירה',
+  save_not_found: 'המסמך לשמירה לא נמצא',
+  save_hash_mismatch: 'המסמך השתנה מאז שאושר ולא נשמר',
+  save_name_mismatch: 'שם הקובץ אינו השם שאושר',
+  save_folder_refused: 'התיקייה שבבקשה אינה תקינה',
+  save_names_exhausted: 'כבר יש בתיקייה 99 קבצים בשם הזה',
+  save_verify_failed: 'הקובץ שנשמר לא היה זהה למסמך שאושר ונמחק',
+
+  // doc.produce's own refusals (document production §5.2, local-tools.ts).
+  production_not_boss_instruction: 'אפשר להפיק מסמך רק לפי הוראה שלך',
+  production_tools_missing: 'הפקת מסמכים לא מוגדרת בשרת הזה',
+
   // run-due.ts's own plan-level rejections, under the `run_due:` namespace
   // `leadingCode` manufactures.
   'run_due:no_plan_bound': 'לא נמצאה תוכנית פעולה למשימה',
@@ -446,6 +471,21 @@ async function reportCandidates(
         AND NOT EXISTS (
           SELECT 1 FROM instruction_confirmations r
            WHERE r.business_id = j.business_id AND r.reask_of = j.job_id
+        )
+        -- Document production §4: a job whose plan's only step is
+        -- doc.produce and that queued a production is reported by its
+        -- document card, not by a sentence here.
+        AND NOT (
+          EXISTS (
+            SELECT 1 FROM job_plans p
+             WHERE p.business_id = j.business_id AND p.job_id = j.job_id
+               AND jsonb_array_length(p.plan -> 'steps') = 1
+               AND p.plan -> 'steps' -> 0 ->> 'toolName' = 'doc.produce'
+          )
+          AND EXISTS (
+            SELECT 1 FROM document_productions dp
+             WHERE dp.business_id = j.business_id AND dp.origin_job_id = j.job_id
+          )
         )
         AND NOT (
           j.phase = 'failed'

@@ -259,3 +259,150 @@ describe('graph client', () => {
     expect(calls.filter((c) => c.method === 'POST')).toHaveLength(1);
   });
 });
+
+describe('graph attachments (document production §8.2)', () => {
+  const file = {
+    filename: 'הצעה.docx',
+    mediaType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    bytes: Buffer.from('PK docx'),
+  };
+  const fileAttachment = {
+    '@odata.type': '#microsoft.graph.fileAttachment',
+    name: 'הצעה.docx',
+    contentType: file.mediaType,
+    contentBytes: file.bytes.toString('base64'),
+  };
+
+  it('sendNew puts a fileAttachment on the sendMail message', async () => {
+    const { http, calls } = fake(() => ({ status: 202, body: null }));
+    const r = await createGraphClient(http).sendNew(
+      'tok',
+      { to: ['dana@example.com'], subject: 's', body: 'b', attachments: [file] },
+      signal,
+    );
+    expect(r).toEqual({ externalId: null });
+    expect(calls).toHaveLength(1);
+    expect((calls[0]?.body as { message: { attachments: unknown } }).message.attachments).toEqual([fileAttachment]);
+  });
+
+  it('a reply with an attachment is createReply → add attachment → send', async () => {
+    const { http, calls } = fake((r) => {
+      if (r.url.endsWith('/createReply')) return { status: 201, body: { id: 'draft-9' } };
+      if (r.url.endsWith('/attachments')) return { status: 201, body: { id: 'att-1' } };
+      if (r.url.endsWith('/send')) return { status: 202, body: null };
+      return { status: 404, body: {} };
+    });
+    const r = await createGraphClient(http).sendReply(
+      'tok',
+      {
+        to: ['dana@example.com'],
+        subject: 'Re: x',
+        body: 'תודה',
+        inReplyTo: '<abc@example.com>',
+        references: null,
+        threadId: 'c1',
+        providerMessageId: 'g1',
+        attachments: [file],
+      },
+      signal,
+    );
+    expect(r).toEqual({ externalId: null });
+    expect(calls.map((c) => `${c.method} ${c.url.replace(/^.*\/v1\.0/, '')}`)).toEqual([
+      'POST /me/messages/g1/createReply',
+      'POST /me/messages/draft-9/attachments',
+      'POST /me/messages/draft-9/send',
+    ]);
+    expect(calls[0]?.body).toEqual({
+      message: { toRecipients: [{ emailAddress: { address: 'dana@example.com' } }], ccRecipients: [] },
+      comment: 'תודה',
+    });
+    expect(calls[1]?.body).toEqual(fileAttachment);
+    // The plain /reply endpoint is not used on this path.
+    expect(calls.some((c) => /\/reply$/.test(c.url))).toBe(false);
+  });
+
+  it('a failed attachment upload never sends the draft', async () => {
+    const { http, calls } = fake((r) => {
+      if (r.url.endsWith('/createReply')) return { status: 201, body: { id: 'draft-9' } };
+      if (r.url.endsWith('/attachments')) return { status: 400, body: { error: { message: 'bad' } } };
+      return { status: 202, body: null };
+    });
+    const r = await createGraphClient(http).sendReply(
+      'tok',
+      {
+        to: ['dana@example.com'],
+        subject: 'Re',
+        body: 'b',
+        inReplyTo: '<x>',
+        references: null,
+        threadId: 'c',
+        providerMessageId: 'g1',
+        attachments: [file],
+      },
+      signal,
+    );
+    expect(r).toMatchObject({ failure: 'rejected' });
+    expect(calls).toHaveLength(2);
+    expect(calls.some((c) => c.url.endsWith('/send'))).toBe(false);
+  });
+
+  it('any failure after createReply succeeded is final, never a retry that opens a second draft', async () => {
+    const reply = {
+      to: ['dana@example.com'],
+      subject: 'Re',
+      body: 'b',
+      inReplyTo: '<x>',
+      references: null,
+      threadId: 'c',
+      providerMessageId: 'g1',
+      attachments: [file],
+    };
+    const cases: Array<[string, (url: string) => number | null, string]> = [
+      ['a 503 on the attachment upload', (u) => (u.endsWith('/attachments') ? 503 : null), 'rejected'],
+      ['a 401 on the attachment upload', (u) => (u.endsWith('/attachments') ? 401 : null), 'rejected'],
+      ['a 503 on the send', (u) => (u.endsWith('/send') ? 503 : null), 'rejected'],
+    ];
+    for (const [label, statusFor, failure] of cases) {
+      const { http, calls } = fake((r) => {
+        const forced = statusFor(r.url);
+        if (forced !== null) return { status: forced, body: { error: { message: 'x' } } };
+        if (r.url.endsWith('/createReply')) return { status: 201, body: { id: 'draft-9' } };
+        if (r.url.endsWith('/attachments')) return { status: 201, body: {} };
+        return { status: 202, body: null };
+      });
+      const r = await createGraphClient(http).sendReply('tok', reply, signal);
+      expect(r, label).toMatchObject({ failure });
+      expect(calls[0]?.url, label).toMatch(/\/createReply$/);
+    }
+    // Control: a transient failure on createReply itself (no draft yet) stays retryable.
+    const { http } = fake(() => ({ status: 503, body: {} }));
+    expect(await createGraphClient(http).sendReply('tok', reply, signal)).toMatchObject({ failure: 'transient' });
+  });
+
+  it('a dropped connection on the final send stays the ambiguous status-0 answer', async () => {
+    const { http } = fake((r) => {
+      if (r.url.endsWith('/createReply')) return { status: 201, body: { id: 'draft-9' } };
+      if (r.url.endsWith('/attachments')) return { status: 201, body: {} };
+      return { status: 0, body: { error: { message: 'socket hang up' } } };
+    });
+    const r = await createGraphClient(http).sendReply(
+      'tok',
+      { to: ['dana@example.com'], subject: 'Re', body: 'b', inReplyTo: '<x>', references: null, threadId: 'c', providerMessageId: 'g1', attachments: [file] },
+      signal,
+    );
+    // status 0 → the adapter's terminal delivery_unknown, never a retry.
+    expect(r).toMatchObject({ failure: 'transient', status: 0 });
+  });
+
+  it('the client refuses a file over 3MB itself, with no HTTP call', async () => {
+    const { http, calls } = fake(() => ({ status: 202, body: null }));
+    const big = { ...file, bytes: Buffer.alloc(3 * 1024 * 1024 + 1) };
+    const r = await createGraphClient(http).sendNew(
+      'tok',
+      { to: ['dana@example.com'], subject: 's', body: 'b', attachments: [big] },
+      signal,
+    );
+    expect(r).toMatchObject({ failure: 'rejected' });
+    expect(calls).toHaveLength(0);
+  });
+});

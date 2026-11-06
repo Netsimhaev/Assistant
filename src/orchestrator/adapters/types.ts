@@ -134,7 +134,28 @@ export interface AdapterCall {
    * protected by this field, only handed it.
    */
   idempotencyKey: string;
+  /**
+   * The produced documents this send carries, already resolved to the exact
+   * approved bytes (`resolveAttachments`, `src/production/attachments.ts`):
+   * `performStep` read them from the EFFECTIVE payload, re-read them from
+   * disk and re-hashed them before this call was built (spec §8.2, ruling
+   * C16). `[]` means none.
+   *
+   * Required, like `endpoint`: an adapter written without noticing the field
+   * would silently send a mail the owner approved WITH a document as one
+   * without it. An adapter must take attachments from here and never from
+   * `input` — the redacted payload may hold a masked ref, and the bytes
+   * themselves are never redacted (the owner saw exactly them).
+   */
+  attachments: readonly OutgoingAttachment[];
   signal: AbortSignal;
+}
+
+/** One resolved file on an outbound send. `mediaType` comes from the produced format, never from the name. */
+export interface OutgoingAttachment {
+  filename: string;
+  mediaType: string;
+  bytes: Buffer;
 }
 
 export type AdapterResult =

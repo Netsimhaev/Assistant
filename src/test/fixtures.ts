@@ -83,6 +83,8 @@ export interface CharterOverrides {
    * post-signature mutation breaks the signature.
    */
   forbidden?: ForbiddenRule[];
+  /** Replaces the default `redactBeforeSending` patterns. */
+  redactBeforeSending?: string[];
 }
 
 /** A realistic small-business charter: an Israeli firm working Sun–Thu. */
@@ -238,7 +240,7 @@ export function buildCharter(overrides: CharterOverrides = {}): BusinessCharter 
 
     data: {
       retentionDays: { customer_pii: 730, financial: 2555 },
-      redactBeforeSending: ['\\b\\d{9}\\b'],
+      redactBeforeSending: overrides.redactBeforeSending ?? ['\\b\\d{9}\\b'],
       mayShareExternally: { health: 'never', legal: 'never', credentials: 'never' },
       subprocessorsAllowed: ['anthropic', 'google-workspace'],
     },

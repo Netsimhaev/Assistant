@@ -75,6 +75,21 @@ export interface WhatsAppGateway {
   sendMessage(input: {
     contactId: string; body: string; idempotencyKey: string;
   }): Promise<{ messageId: string; state: 'sent' | 'queued' | 'rejected' }>;
+  /**
+   * Send a file to a contact — optional: an implementation that cannot send
+   * files omits it, and `createBossMessenger` then offers no `sendFile`, so
+   * the caller records the channel as not connected rather than failing.
+   * Reached only through `BossMessenger.sendFile`, whose `contactId` is the
+   * principal's, fixed at construction (document production §8.3).
+   */
+  sendFile?(input: {
+    contactId: string;
+    filename: string;
+    mediaType: string;
+    bytes: Buffer;
+    caption: string;
+    idempotencyKey: string;
+  }): Promise<{ messageId: string; state: 'sent' | 'queued' | 'rejected' }>;
   health(): Promise<GatewayHealth>;
   /**
    * Registers the handler. Push and pull implementations both satisfy this.

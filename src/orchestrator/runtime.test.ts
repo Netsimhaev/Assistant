@@ -40,6 +40,8 @@ const BASE = {
   APPROVAL_NOTIFY_TO: 'boss@example.com',
   DASHBOARD_BASE_URL: 'http://127.0.0.1:8787',
   ANTHROPIC_API_KEY: 'sk-test-key',
+  DOCUMENT_SOFFICE_PATH: '/usr/bin/soffice',
+  DOCUMENT_CHROMIUM_PATH: '/usr/bin/chromium',
 };
 
 let DIR: string;
@@ -400,6 +402,33 @@ describe('buildRuntime', () => {
     expect(typo.warnings.join(' ')).not.toMatch(/SMTP_ALLOW_CLEARTEXT/);
     await typo.notify?.notifier.notify(approvalFixture(), 'http://127.0.0.1:8787/a/AP-test');
     expect(seen[0]?.['requireTLS']).toBe(true);
+  });
+
+  it('marks document production available when both binary paths are set', async () => {
+    const runtime = await buildRuntime(FULL);
+    expect(runtime.production).toEqual({
+      available: true,
+      sofficePath: '/usr/bin/soffice',
+      chromiumPath: '/usr/bin/chromium',
+    });
+    expect(runtime.warnings.join(' ')).not.toMatch(/DOCUMENT_SOFFICE_PATH|DOCUMENT_CHROMIUM_PATH/);
+  });
+
+  it('warns, and does not throw, when the LibreOffice or Chromium path is absent', async () => {
+    const { DOCUMENT_SOFFICE_PATH: _s, ...withoutSoffice } = FULL;
+    const noSoffice = await buildRuntime(withoutSoffice);
+    expect(noSoffice.production?.available).toBe(false);
+    expect(noSoffice.warnings.join(' ')).toMatch(/no document production: DOCUMENT_SOFFICE_PATH not set/);
+    expect(noSoffice.warnings.join(' ')).not.toMatch(/DOCUMENT_CHROMIUM_PATH/);
+
+    // Absent and explicitly empty are both "not set".
+    const withoutBoth: Record<string, string> = { ...FULL, DOCUMENT_SOFFICE_PATH: '' };
+    delete withoutBoth['DOCUMENT_CHROMIUM_PATH'];
+    const neither = await buildRuntime(withoutBoth);
+    expect(neither.production).toEqual({ available: false, sofficePath: null, chromiumPath: null });
+    expect(neither.warnings.join(' ')).toMatch(/DOCUMENT_SOFFICE_PATH, DOCUMENT_CHROMIUM_PATH not set/);
+    // Unrelated to mail: the rest of the runtime is still built.
+    expect(neither.registry.get('office-mail')).not.toBeNull();
   });
 
   it('warns when ANTHROPIC_API_KEY is absent, so curation-off does not look like nothing-to-remember', async () => {

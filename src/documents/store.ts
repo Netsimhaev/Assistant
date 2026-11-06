@@ -358,6 +358,16 @@ export const MAX_READ_ATTEMPTS = 3;
  * filter changes nothing else; the document is still stored, downloadable
  * and linked from its invoice row.
  *
+ * **Owner uploads are skipped too (`source = 'instruction'`, migration 060),
+ * and in a second layer by `boss_instructions.attached_document_ids`.** A file
+ * the owner attached to an instruction is his input, not a stranger's
+ * document: read here it would get a card under `unknown_external`. The
+ * source catches an upload whose instruction never wrote its row (refused,
+ * crashed); the attached-ids clause catches an upload whose bytes
+ * deduplicated into an earlier inbox row. Known cost: a LATER inbox file
+ * byte-identical to an owner upload dedups into the upload's row and is
+ * never read.
+ *
  * **Scanned PDFs are skipped.** A PDF none of whose pages yielded text is
  * `extracted` with `scanned_no_text` on its first artefact (ordinal 0,
  * `extractors/pdf.ts`). Reading it would be a paid model call on a brief
@@ -376,7 +386,15 @@ export async function documentsAwaitingRead(
       WHERE d.business_id = $1
         AND d.status = 'extracted'
         AND d.read_attempts < $2
-        AND d.source <> 'mail'
+        AND d.source NOT IN ('mail', 'instruction')
+        -- A file the owner attached to an instruction is HIS input to that
+        -- instruction, not a stranger's document: reading it here would
+        -- raise a card on his own upload under \`unknown_external\`.
+        AND NOT EXISTS (
+              SELECT 1 FROM boss_instructions bi
+               WHERE bi.business_id = d.business_id
+                 AND d.document_id = ANY (bi.attached_document_ids)
+            )
         AND NOT EXISTS (
               SELECT 1 FROM document_artifacts a
                WHERE a.document_id = d.document_id

@@ -9,7 +9,7 @@
  * start a scheduler loop.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { logErrored } from './scheduler-log.js';
+import { logErrored, resetProductionNoticeForTests } from './scheduler-log.js';
 import type { SchedulerPassResult } from './scheduler.js';
 
 /** A clean pass: every bucket empty, every error null. */
@@ -52,6 +52,10 @@ function cleanResult(): SchedulerPassResult {
     ledgerEvidenceError: null,
     ledger: null,
     ledgerError: null,
+    documentProductions: { advanced: 0, ready: 0, failedChecks: 0, failed: 0, skipped: 0, errored: [], originJobMissing: [] },
+    documentProductionsError: null,
+    deliveriesReraised: null,
+    deliveriesReraisedError: null,
   };
 }
 
@@ -123,7 +127,7 @@ describe('logErrored', () => {
     try {
       const result: SchedulerPassResult = {
         ...cleanResult(),
-        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
+        whatsappDoor: { polled: 3, instructed: 1, recordedOnly: 0, refused: 2, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
         whatsappReport: { reported: 0, deferred: 2, errored: ['job-a', 'job-b'] },
       };
       logErrored(result);
@@ -163,7 +167,7 @@ describe('logErrored', () => {
         ...cleanResult(),
         whatsappDoor: {
           polled: 1, instructed: 0, recordedOnly: 0, refused: 1, closed: 0, mailCardReplies: 0,
-          confirmationReplies: 0, ledgerReplies: 0, confirmErrored: [{ jobId: 'job-c', error: 'bound to nothing' }],
+          confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [{ jobId: 'job-c', error: 'bound to nothing' }],
           malformedSenderCount: 0,
         },
       });
@@ -179,7 +183,7 @@ describe('logErrored', () => {
     try {
       logErrored({
         ...cleanResult(),
-        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
+        whatsappDoor: { polled: 0, instructed: 0, recordedOnly: 0, refused: 0, closed: 0, mailCardReplies: 0, confirmationReplies: 0, ledgerReplies: 0, documentCardReplies: 0, confirmErrored: [], malformedSenderCount: 0 },
         whatsappError: 'reportCandidates query rejected',
       });
       const errored = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
@@ -242,6 +246,68 @@ describe('logErrored', () => {
     } finally {
       logSpy.mockRestore();
       errorSpy.mockRestore();
+    }
+  });
+});
+
+describe('logErrored: document production', () => {
+  const spy = () => ({
+    log: vi.spyOn(console, 'log').mockImplementation(() => {}),
+    error: vi.spyOn(console, 'error').mockImplementation(() => {}),
+  });
+
+  it('"did not run" (null) reads differently from "ran, nothing to do" (zeros, silent), and prints once per process', () => {
+    resetProductionNoticeForTests();
+    const s = spy();
+    try {
+      logErrored(cleanResult());
+      expect(s.log).not.toHaveBeenCalled();
+      logErrored({ ...cleanResult(), documentProductions: null });
+      logErrored({ ...cleanResult(), documentProductions: null });
+      expect(s.log).toHaveBeenCalledTimes(1);
+      expect(s.log).toHaveBeenCalledWith(expect.stringMatching(/^document production did not run: /));
+      expect(s.error).not.toHaveBeenCalled();
+    } finally {
+      s.log.mockRestore();
+      s.error.mockRestore();
+    }
+  });
+
+  it('a thrown loop prints its error, not "did not run"', () => {
+    const s = spy();
+    try {
+      logErrored({ ...cleanResult(), documentProductions: null, documentProductionsError: 'boom' });
+      expect(s.error).toHaveBeenCalledWith('document production failed: boom');
+      expect(s.log).not.toHaveBeenCalled();
+    } finally {
+      s.log.mockRestore();
+      s.error.mockRestore();
+    }
+  });
+
+  it('a pass that did work prints its counts and every errored production', () => {
+    const s = spy();
+    try {
+      logErrored({
+        ...cleanResult(),
+        documentProductions: {
+          advanced: 5,
+          ready: 1,
+          failedChecks: 0,
+          failed: 1,
+          skipped: 0,
+          errored: [{ productionId: 'DP-1', error: 'bang' }],
+          originJobMissing: ['DP-2'],
+        },
+      });
+      expect(s.log).toHaveBeenCalledWith(
+        'document production: 5 stage move(s), 1 ready, 0 stopped at checks, 1 failed, 0 skipped',
+      );
+      expect(s.error).toHaveBeenCalledWith('document production DP-1 errored: bang');
+      expect(s.error).toHaveBeenCalledWith('document production DP-2 finished, but its origin job no longer exists');
+    } finally {
+      s.log.mockRestore();
+      s.error.mockRestore();
     }
   });
 });

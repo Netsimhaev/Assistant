@@ -136,6 +136,8 @@ export async function runDueJobs(
     limit?: number;
     runtime?: Runtime;
     now?: Date;
+    /** Forwarded to `RunPlanRequest.documentRoot` (attachments, `doc.save`). */
+    documentRoot?: string;
     /**
      * Forwarded to `runPlanForJob`'s `RunPlanRequest.reader` — the seam that
      * keeps a test exercising `doc.fetch` through this real entry point from
@@ -273,8 +275,10 @@ export async function runDueJobs(
           rampLevel,
           ...(runtime.notify !== undefined ? { notify: runtime.notify } : {}),
           ...(options.now !== undefined ? { now: options.now } : {}),
+          ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
           ...(options.reader !== undefined ? { reader: options.reader } : {}),
           ...(options.judge !== undefined ? { judge: options.judge } : {}),
+          ...(runtime.production !== undefined ? { production: runtime.production } : {}),
           ...(governingEnvelope !== null
             ? { autonomyCeiling: governingEnvelope.constraints.autonomyCeiling }
             : {}),

@@ -41,6 +41,11 @@ import {
   APPROVAL_REQUESTS_SCRUBBED_PREDICATE,
   APPROVAL_REQUESTS_SCRUB_SET,
   DIGESTS_ERASED_PREDICATE,
+  DOCUMENT_CARDS_ERASED_PREDICATE,
+  DOCUMENT_DELIVERIES_ERASED_PREDICATE,
+  DOCUMENT_PRODUCTIONS_ERASED_PREDICATE,
+  DOCUMENT_VERSIONS_ERASED_PREDICATE,
+  PRODUCTION_LIVE_CONDITION,
   CHARTER_INTERVIEW_DRAFTS_ERASED_PREDICATE,
   JOBS_SCRUBBED_PREDICATE,
   JOBS_SCRUB_SET,
@@ -167,7 +172,7 @@ export async function executeErasure(
     );
   }
 
-  const { jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds, ledgerItemIds, ledgerRuleIds } = plan;
+  const { jobIds, documentIds, memoryIds, digestIds, draftIds, mailIds, ledgerItemIds, ledgerRuleIds, productionIds } = plan;
   const client = await getPool().connect();
   const results: ErasureItem[] = [];
   let txError: unknown;
@@ -221,6 +226,52 @@ export async function executeErasure(
         if (row.stranded && row.awaiting_envelope_id !== null) {
           stranded.push({ jobId: row.job_id, envelopeId: row.awaiting_envelope_id, phase: row.phase });
         }
+      }
+    }
+
+    // The same re-check for a production the plan erases: one the loop is
+    // still working on would write a file under a row this transaction
+    // deletes, and leave its origin job parked with no one to close it
+    // (`PRODUCTION_LIVE_CONDITION`, the predicate the preview's refusal
+    // used). `FOR UPDATE` also holds off a loop claim until the commit.
+    if (productionIds.length > 0) {
+      const { rows: liveProductions } = await client.query<{ production_id: string }>(
+        `SELECT production_id FROM document_productions
+          WHERE business_id = $1 AND production_id = ANY ($2) AND ${PRODUCTION_LIVE_CONDITION}
+          FOR UPDATE`,
+        [businessId, productionIds],
+      );
+      if (liveProductions.length > 0) {
+        throw new ErasureRefusedError(
+          liveProductions
+            .map((row) => `הפקת המסמך ${row.production_id} חזרה לעבודה מאז שהתצוגה המקדימה הוכנה; המחיקה בוטלה.`)
+            .join(' · '),
+        );
+      }
+
+      // And the cards, locked too: a card approved between the preview and
+      // the confirm has a delivery job the plan never listed — its plan and
+      // confirmation would survive this erasure, and the job would run
+      // against a version this transaction deletes. Any delivery job outside
+      // the plan's jobs (or the jobs the owner kept, which the plan also
+      // knows) refuses. `approveDocumentCard` takes the same row lock, so
+      // an approval after this read waits for the commit and then finds no
+      // card.
+      const known = new Set([
+        ...jobIds,
+        ...plan.excluded.filter((k) => k.itemKind === 'job').map((k) => k.itemId),
+      ]);
+      const { rows: lockedCards } = await client.query<{ card_id: string; delivery_job_id: string | null }>(
+        `SELECT card_id, delivery_job_id FROM document_cards WHERE ${DOCUMENT_CARDS_ERASED_PREDICATE} FOR UPDATE`,
+        [businessId, productionIds],
+      );
+      const raced = lockedCards.filter((row) => row.delivery_job_id !== null && !known.has(row.delivery_job_id));
+      if (raced.length > 0) {
+        throw new ErasureRefusedError(
+          raced
+            .map((row) => `כרטיס המסמך ${row.card_id} אושר מאז שהתצוגה המקדימה הוכנה; המחיקה בוטלה.`)
+            .join(' · '),
+        );
       }
     }
 
@@ -366,6 +417,34 @@ export async function executeErasure(
       'ledger_critical_rules',
       `DELETE FROM ledger_critical_rules WHERE ${LEDGER_CRITICAL_RULES_ERASED_PREDICATE}`,
       [businessId, ledgerRuleIds],
+    );
+    // Document production (migrations 053–058). Leaf first — cards, then
+    // versions, then productions: each cascades from the next, and a cascade
+    // that beat the explicit statement to the row would leave it reporting
+    // zero for a table that really lost rows. No foreign key to `documents`
+    // or `jobs`, so their place relative to those is free. Same predicates,
+    // same parameters, as `countItems` in `erasure-plan.ts`. The produced
+    // files are in `plan.filePaths` and go after the commit, with the rest;
+    // the owner's saved copies (`plan.savedCopies`) are never touched.
+    await del(
+      'document_deliveries',
+      `DELETE FROM document_deliveries WHERE ${DOCUMENT_DELIVERIES_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    await del(
+      'document_cards',
+      `DELETE FROM document_cards WHERE ${DOCUMENT_CARDS_ERASED_PREDICATE}`,
+      [businessId, productionIds],
+    );
+    await del(
+      'document_versions',
+      `DELETE FROM document_versions WHERE ${DOCUMENT_VERSIONS_ERASED_PREDICATE}`,
+      [businessId, productionIds],
+    );
+    await del(
+      'document_productions',
+      `DELETE FROM document_productions WHERE ${DOCUMENT_PRODUCTIONS_ERASED_PREDICATE}`,
+      [businessId, productionIds],
     );
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
