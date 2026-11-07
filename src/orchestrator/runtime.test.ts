@@ -760,6 +760,93 @@ describe('buildRuntime', () => {
     expect(runtime.registry.resolve('office-mail', 'api', 'mail.send')).not.toBeNull();
   });
 
+  it('registers the calendar adapter for the calendar binding only', async () => {
+    await installCharter(
+      buildCharter({
+        connections: [
+          {
+            system: 'calendar',
+            label: 'יומן העסק',
+            channel: 'api',
+            serves: ['calendar.read', 'calendar.write'],
+            target: null,
+            // The runtime reads the provider from the binding; the signed
+            // subprocessor is the OAuth ceremony's concern (oauth-routes).
+            subprocessor: null,
+          },
+          {
+            system: 'office-calendar',
+            label: 'יומן המשרד',
+            channel: 'api',
+            serves: ['calendar.read'],
+            target: 'legacy-calendar',
+            subprocessor: null,
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    for (const [system, provider] of [
+      ['calendar', 'microsoft'],
+      ['office-calendar', 'google'],
+    ] as const) {
+      await upsertBinding(
+        {
+          system,
+          status: 'live',
+          endpoint: null,
+          credentialRef: system === 'calendar' ? 'OAUTH_CALENDAR' : 'OAUTH_OFFICE_CALENDAR',
+          provider,
+          lastOkAt: null,
+          lastError: null,
+        },
+        { by: 'test' },
+      );
+    }
+
+    // Must not throw: the legacy read-only adapter is NOT registered under
+    // the `calendar` name next to the new one.
+    const runtime = await buildRuntime(FULL);
+    expect(runtime.registry.resolve('calendar', 'api', 'calendar.write')).not.toBeNull();
+    expect(runtime.registry.resolve('calendar', 'api', 'calendar.read')).not.toBeNull();
+    expect(runtime.registry.resolve('calendar', 'api', 'mail.send')).toBeNull();
+    // The legacy connection keeps its read-only adapter, unchanged.
+    expect(runtime.registry.resolve('office-calendar', 'api', 'calendar.read')).not.toBeNull();
+    expect(runtime.registry.resolve('office-calendar', 'api', 'calendar.write')).toBeNull();
+  });
+
+  it('does not register the calendar adapter for a calendar binding that has no provider', async () => {
+    await installCharter(
+      buildCharter({
+        connections: [
+          {
+            system: 'calendar',
+            label: 'יומן העסק',
+            channel: 'api',
+            serves: ['calendar.read', 'calendar.write'],
+            target: null,
+            subprocessor: 'google-workspace',
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    await upsertBinding(
+      {
+        system: 'calendar',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OAUTH_CALENDAR',
+        provider: null,
+        lastOkAt: null,
+        lastError: null,
+      },
+      { by: 'test' },
+    );
+    const runtime = await buildRuntime(FULL);
+    expect(runtime.registry.resolve('calendar', 'api', 'calendar.write')).toBeNull();
+  });
+
   /**
    * Final fix wave, item 6 (fix-round 2, finding I3) — the general case the
    * test above does not cover. There, `office-mail`'s charter connection

@@ -9,6 +9,7 @@
  * grant written onto it would poison the mail path (see `oauth-eligibility.ts`).
  */
 import type { CharterConnection } from '../domain/connection.js';
+import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import { MICROSOFT_TOKEN_ENDPOINT } from '../orchestrator/adapters/microsoft-token-http.js';
@@ -60,7 +61,32 @@ const MAILBOX_PROFILES: Record<MailProvider, OAuthProfile> = {
 };
 
 /**
- * `provider` is the owner's choice for the mailbox (the start route validates
+ * The business calendar (`CALENDAR_SYSTEM`), read AND write. Google: events
+ * only (no calendar management) plus the read-only calendar list, which is how
+ * the calendars to read are discovered. Microsoft: `Calendars.ReadWrite`.
+ */
+const CALENDAR_PROFILES: Record<MailProvider, OAuthProfile> = {
+  google: {
+    provider: 'google',
+    scopes: [
+      'https://www.googleapis.com/auth/calendar.events',
+      'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
+    ],
+    authorizeUrl: GOOGLE_AUTHORIZE_URL,
+    tokenUrl: GOOGLE_TOKEN_URL,
+    revokeUrl: GOOGLE_REVOKE_URL,
+  },
+  microsoft: {
+    provider: 'microsoft',
+    scopes: ['offline_access', 'User.Read', 'Calendars.ReadWrite'],
+    authorizeUrl: MICROSOFT_AUTHORIZE_URL,
+    tokenUrl: MICROSOFT_TOKEN_URL,
+    revokeUrl: null,
+  },
+};
+
+/**
+ * `provider` is the owner's choice for the mailbox / the calendar (the start route validates
  * it against `MailProvider`); it defaults to `'google'` so a caller that only
  * asks "is this connection eligible at all?" need not pick one. Calendar is
  * Google-only: asking for another provider is `null`.
@@ -71,6 +97,11 @@ export function oauthProfileFor(
 ): OAuthProfile | null {
   if (connection.system === MAILBOX_SYSTEM && connection.serves.includes('mail.send')) {
     return MAILBOX_PROFILES[provider];
+  }
+  // Checked BEFORE the legacy read-only branch: the calendar connection also
+  // serves `calendar.read`, and must get the read-write profile.
+  if (connection.system === CALENDAR_SYSTEM && connection.serves.includes('calendar.write')) {
+    return CALENDAR_PROFILES[provider];
   }
   if (connection.serves.includes('calendar.read')) {
     return provider === 'google' ? GOOGLE_CALENDAR_PROFILE : null;

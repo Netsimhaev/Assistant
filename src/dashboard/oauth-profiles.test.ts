@@ -53,6 +53,32 @@ describe('oauthProfileFor', () => {
     expect(profile?.scopes).toEqual(['https://www.googleapis.com/auth/calendar.readonly']);
   });
 
+  it('picks the read-write calendar profile per provider', () => {
+    const calendar: CharterConnection = { ...CALENDAR, system: 'calendar', serves: ['calendar.read', 'calendar.write'] };
+    const google = oauthProfileFor(calendar, 'google');
+    expect(google?.provider).toBe('google');
+    expect(google?.scopes).toEqual([
+      'https://www.googleapis.com/auth/calendar.events',
+      'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
+    ]);
+    expect(google?.revokeUrl).toBe('https://oauth2.googleapis.com/revoke');
+    const microsoft = oauthProfileFor(calendar, 'microsoft');
+    expect(microsoft?.provider).toBe('microsoft');
+    expect(microsoft?.scopes).toEqual(['offline_access', 'User.Read', 'Calendars.ReadWrite']);
+    expect(microsoft?.revokeUrl).toBeNull();
+  });
+
+  it('still gives the legacy read-only profile to office-calendar', () => {
+    expect(oauthProfileFor(CALENDAR)?.scopes).toEqual(['https://www.googleapis.com/auth/calendar.readonly']);
+    // The name is what earns the read-write profile, not serving both tools.
+    const lookalike: CharterConnection = { ...CALENDAR, serves: ['calendar.read', 'calendar.write'] };
+    expect(oauthProfileFor(lookalike)?.scopes).toEqual(['https://www.googleapis.com/auth/calendar.readonly']);
+    // The `calendar` system without write is not the read-write connection either.
+    expect(oauthProfileFor({ ...CALENDAR, system: 'calendar' })?.scopes).toEqual([
+      'https://www.googleapis.com/auth/calendar.readonly',
+    ]);
+  });
+
   it('office-mail is null, even though it serves mail.send', () => {
     expect(oauthProfileFor(OFFICE_MAIL)).toBeNull();
     expect(oauthProfileFor(OFFICE_MAIL, 'microsoft')).toBeNull();

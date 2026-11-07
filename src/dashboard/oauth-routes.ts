@@ -56,6 +56,8 @@ import { createGraphClient } from '../mail/providers/graph.js';
 import type { MailboxClient } from '../mail/providers/types.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
 import { mailboxProviderMatchesCharter } from '../charter/amend-mailbox.js';
+import { calendarProviderMatchesCharter } from '../charter/amend-calendar.js';
+import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import { verifyCsrfToken } from './csrf.js';
 import { escLabel, escapeHtml } from './views.js';
@@ -80,7 +82,9 @@ import {
  * single-use state row, and the callback reads it from there.
  */
 function chosenProvider(system: string, query: URLSearchParams | undefined): MailProvider | null {
-  if (system !== MAILBOX_SYSTEM) return 'google';
+  // The business calendar also takes a provider (checked against the signed
+  // charter below); the legacy read-only calendar connection stays Google-only.
+  if (system !== MAILBOX_SYSTEM && system !== CALENDAR_SYSTEM) return 'google';
   const raw = query?.get('provider') ?? null;
   return raw === 'google' || raw === 'microsoft' ? raw : null;
 }
@@ -455,6 +459,20 @@ export async function handleOAuthStart(
     );
   }
 
+  // The business calendar: same rule, same refusal -- only the provider signed.
+  if (system === CALENDAR_SYSTEM && !calendarProviderMatchesCharter(connection, provider)) {
+    return sendHtml(
+      res,
+      400,
+      page(
+        'ספק שלא נחתם',
+        errorBlock(
+          'התקנון החתום מתיר לחבר את היומן רק אצל הספק שנבחר בחתימה. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
+        ),
+      ),
+    );
+  }
+
   let key: Buffer;
   try {
     key = await loadKeyForRequest(options.credentialKeyPath);
@@ -487,7 +505,7 @@ export async function handleOAuthStart(
     system,
     sessionId: session.sessionId,
     codeVerifier,
-    ...(system === MAILBOX_SYSTEM ? { provider } : {}),
+    ...(system === MAILBOX_SYSTEM || system === CALENDAR_SYSTEM ? { provider } : {}),
   });
   const consentUrl = buildConsentUrl({
     provider,
@@ -574,6 +592,29 @@ export async function handleOAuthCallback(
           'ספק שלא נחתם',
           errorBlock(
             'התקנון הפעיל אינו מתיר עוד לחבר את תיבת המייל אצל הספק הזה (הוא השתנה מאז שהחיבור התחיל). לא נשמר דבר.',
+          ),
+        ),
+      );
+    }
+  }
+
+  // The business calendar: re-checked against the charter NOW, exactly like the
+  // mailbox above -- the charter may have been reverted or re-signed since start.
+  if (system === CALENDAR_SYSTEM) {
+    let calendar: CharterConnection | undefined;
+    try {
+      calendar = (await loadActiveCharter(businessId))?.charter.connections.find((c) => c.system === CALENDAR_SYSTEM);
+    } catch {
+      calendar = undefined;
+    }
+    if (calendar === undefined || !calendarProviderMatchesCharter(calendar, provider)) {
+      return sendHtml(
+        res,
+        400,
+        page(
+          'ספק שלא נחתם',
+          errorBlock(
+            'התקנון הפעיל אינו מתיר עוד לחבר את היומן אצל הספק הזה (הוא השתנה מאז שהחיבור התחיל). לא נשמר דבר.',
           ),
         ),
       );
