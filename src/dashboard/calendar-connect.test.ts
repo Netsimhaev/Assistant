@@ -212,6 +212,21 @@ describe('the way back', () => {
     expect(systems).toContain('office-calendar');
   });
 
+  it('never shows "active" next to the revert button: a grant with a non-live binding is not active', async () => {
+    await seedProviderApp('google');
+    await installSignedCalendar('google');
+    await connectLive();
+    await upsertBinding(
+      { system: CALENDAR_SYSTEM, status: 'disconnected', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null },
+      { businessId: BUSINESS, by: 'test' },
+    );
+    const baseUrl = await startServer();
+    const cookie = await login(baseUrl);
+    const status = await (await fetch(`${baseUrl}/connections/calendar`, { headers: { cookie } })).text();
+    expect(status).toContain('action="/connections/calendar/revert"');
+    expect(status).not.toContain('<b>פעיל</b>');
+  });
+
   it('offers no revert, and refuses one, while the calendar is live', async () => {
     await seedProviderApp('google');
     await installSignedCalendar('google');

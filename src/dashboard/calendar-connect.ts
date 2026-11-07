@@ -159,6 +159,10 @@ export async function handleCalendarStatus(res: ServerResponse, businessId: stri
 <p>חשבון: ${escLabel(grant.account)}</p>
 <p>${esc(NEEDS_REAUTH_NOTE)}</p>
 <p>${startLink}</p>`;
+  } else if (!working.working) {
+    state = `<p>מצב: <b>ההרשאה קיימת אך החיבור אינו פעיל</b> (${esc(PROVIDER_NAME[provider])}).</p>
+<p>חשבון: ${escLabel(grant.account)}</p>
+<p>${startLink}</p>`;
   } else {
     state = `<p>מצב: <b>פעיל</b> — ${esc(PROVIDER_NAME[provider])}.</p>
 <p>חשבון: ${escLabel(grant.account)}</p>

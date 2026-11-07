@@ -66,6 +66,7 @@ const LIST_TIMEOUT_MS = 10_000;
 const NOT_CONNECTED = 'היומן לא מחובר';
 const LIST_FAILED = 'היומן מחובר, אבל לא הצלחתי לקרוא עכשיו את רשימת היומנים';
 const NEEDS_REAUTH = 'היומן דורש אישור מחדש';
+const CREDENTIAL_ERROR = 'לא הצלחתי לפתוח את ההרשאה השמורה ליומן — אם זה חוזר, חבר את היומן מחדש.';
 
 type Calendars =
   | { listed: true; calendars: CalendarInfo[] }
@@ -102,7 +103,7 @@ async function listAccountCalendars(businessId: string, options: MeetingRouteOpt
     ...(options.calendarClient !== undefined ? { client: options.calendarClient } : {}),
   });
   if ('unavailable' in access) {
-    return { listed: false, reason: access.unavailable === 'needs_reauth' ? NEEDS_REAUTH : NOT_CONNECTED };
+    return { listed: false, reason: access.unavailable === 'needs_reauth' ? NEEDS_REAUTH : access.unavailable === 'credential_error' ? CREDENTIAL_ERROR : NOT_CONNECTED };
   }
   return listWith(access);
 }
@@ -135,10 +136,11 @@ function calendarsSection(calendars: Calendars, s: MeetingSettings): string {
 <p class="error" role="status">${esc(calendars.reason)}</p>
 <p class="muted">עד שהיומן יחובר אי אפשר לבחור יומנים. שאר ההגדרות נשמרות כרגיל, והבחירה הקודמת (אם הייתה) נשארת. <a href="/connections/calendar">למסך היומן</a></p>`;
   }
-  const readAll = s.readCalendarIds.length === 0;
   const rows = calendars.calendars
     .map((c) => {
-      const readChecked = readAll || s.readCalendarIds.includes(c.calendarId);
+      // An empty stored set means "every calendar": nothing is ticked, so saving the page
+      // as it stands keeps it empty instead of freezing today's list.
+      const readChecked = s.readCalendarIds.includes(c.calendarId);
       const writeChecked = s.writeCalendarId === c.calendarId || (s.writeCalendarId === null && c.primary);
       return `<tr>
   <td><label style="margin:0"><input type="checkbox" name="read" value="${esc(c.calendarId)}"${readChecked ? ' checked' : ''}> ${calendarName(c)}${c.primary ? ' (ראשי)' : ''}</label></td>
@@ -272,8 +274,9 @@ export async function handleMeetingSettingsPost(
     reminderHoursSoon: wholeNumber(form.get('reminderHoursSoon')),
   };
 
+  let fetched: Calendars | null = null;
   const refuse = async (message: string): Promise<void> => {
-    const calendars = await listAccountCalendars(businessId, options);
+    const calendars = fetched ?? (await listAccountCalendars(businessId, options));
     html(
       res,
       400,
@@ -294,6 +297,7 @@ export async function handleMeetingSettingsPost(
   // form offered them: a crafted id, or a read-only write calendar, is refused.
   if (listedInForm) {
     const calendars = await listAccountCalendars(businessId, options);
+    fetched = calendars;
     if (!calendars.listed) return refuse(LIST_LOST);
     const byId = new Map(calendars.calendars.map((c) => [c.calendarId, c] as const));
     if (submitted.readCalendarIds.some((id) => !byId.has(id))) return refuse(UNKNOWN_CALENDAR);

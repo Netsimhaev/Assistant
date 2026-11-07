@@ -63,11 +63,12 @@ async function bindCalendar(): Promise<void> {
   );
 }
 
-async function start(client?: CalendarClient): Promise<string> {
+async function start(client?: CalendarClient, credentials: CredentialSource = CREDENTIALS): Promise<string> {
   server = createServer({
     businessId: BUSINESS,
     port: 0,
-    ...(client !== undefined ? { calendarClient: client, calendarCredentials: CREDENTIALS } : { calendarCredentials: CREDENTIALS }),
+    ...(client !== undefined ? { calendarClient: client } : {}),
+    calendarCredentials: credentials,
   });
   await once(server, 'listening');
   return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -148,6 +149,59 @@ describe('GET /meetings/settings', () => {
     const cookie = await login(baseUrl);
     const html = await (await fetch(`${baseUrl}/meetings/settings`, { headers: { cookie } })).text();
     expect(html).toContain('לא הצלחתי לקרוא עכשיו את רשימת היומנים');
+  });
+});
+
+describe('read set round trip', () => {
+  it('shows no checkbox ticked for the default (all calendars) and keeps [] when saved as it stands', async () => {
+    await bindCalendar();
+    await saveMeetingSettings({ ...MEETING_DEFAULTS, readCalendarIds: [], locationKind: 'travel' }, { businessId: BUSINESS });
+    const baseUrl = await start(clientListing(CALENDARS));
+    const cookie = await login(baseUrl);
+    const html = await (await fetch(`${baseUrl}/meetings/settings`, { headers: { cookie } })).text();
+    expect(html).toContain('name="read"');
+    expect(html).not.toMatch(/name="read"[^>]*checked/);
+    const res = await post(baseUrl, cookie, baseFields(cookie, { calendarsListed: '1', write: 'primary-id' }));
+    expect(res.status).toBe(303);
+    expect((await loadMeetingSettings({ businessId: BUSINESS })).readCalendarIds).toEqual([]);
+  });
+
+  it('round-trips an explicit selection unchanged', async () => {
+    await bindCalendar();
+    await saveMeetingSettings(
+      { ...MEETING_DEFAULTS, readCalendarIds: ['primary-id', 'family-id'], writeCalendarId: 'primary-id', locationKind: 'travel' },
+      { businessId: BUSINESS },
+    );
+    const baseUrl = await start(clientListing(CALENDARS));
+    const cookie = await login(baseUrl);
+    const html = await (await fetch(`${baseUrl}/meetings/settings`, { headers: { cookie } })).text();
+    expect(html).toMatch(/name="read" value="primary-id" checked/);
+    expect(html).toMatch(/name="read" value="family-id" checked/);
+    expect(html).not.toMatch(/name="read" value="holidays-id" checked/);
+    const res = await post(baseUrl, cookie, [
+      ...baseFields(cookie, { calendarsListed: '1', write: 'primary-id' }),
+      ['read', 'primary-id'],
+      ['read', 'family-id'],
+    ]);
+    expect(res.status).toBe(303);
+    const s = await loadMeetingSettings({ businessId: BUSINESS });
+    expect(s.readCalendarIds).toEqual(['primary-id', 'family-id']);
+    expect(s.writeCalendarId).toBe('primary-id');
+  });
+});
+
+describe('credential failure', () => {
+  it('says the stored permission could not be opened, not "not connected"', async () => {
+    await bindCalendar();
+    const baseUrl = await start(clientListing(CALENDARS), {
+      async resolve() {
+        throw new Error('vault down');
+      },
+    });
+    const cookie = await login(baseUrl);
+    const html = await (await fetch(`${baseUrl}/meetings/settings`, { headers: { cookie } })).text();
+    expect(html).toContain('לא הצלחתי לפתוח את ההרשאה השמורה ליומן');
+    expect(html).not.toContain('היומן לא מחובר');
   });
 });
 
