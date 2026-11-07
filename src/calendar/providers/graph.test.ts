@@ -60,7 +60,7 @@ describe('graph calendar client', () => {
     if ('failure' in r) throw new Error('unexpected');
     expect(calls[0]!.url).toContain('/me/calendars/cal1/calendarView?');
     expect(calls[0]!.url).toContain('startDateTime=');
-    expect(calls[0]!.headers).toEqual({ Prefer: 'outlook.timezone="Asia/Jerusalem"' });
+    expect(calls[0]!.headers).toEqual({ Prefer: 'outlook.timezone="Asia/Jerusalem", outlook.body-content-type="text"' });
     expect(r.events.map((e) => e.eventId)).toEqual(['occ1', 'occ2']);
     expect(r.events[0]!.start).toBe('2026-11-10T07:00:00.000Z');
   });
@@ -137,5 +137,33 @@ describe('graph calendar client', () => {
       const r = await createGraphCalendarClient(http).deleteEvent('tok', 'cal1', 'e', signal);
       expect(r).toMatchObject({ failure, status });
     }
+  });
+
+  it('strips HTML from the description defensively', async () => {
+    const { http } = fake(() => ({
+      status: 200,
+      body: { value: [ev('h', { body: { contentType: 'text', content: '<html><p>Line one</p>Tom &amp; Jerry<br>two</html>' } })] },
+    }));
+    const r = await createGraphCalendarClient(http).listEvents('tok', Q, signal);
+    if ('failure' in r) throw new Error('unexpected');
+    expect(r.events[0]!.description).toBe('Line one\nTom & Jerry\ntwo');
+  });
+
+  it('falls back to the requested zone when the returned zone cannot be resolved', async () => {
+    const { http } = fake(() => ({
+      status: 200,
+      body: { value: [ev('z', { start: { dateTime: '2026-11-10T09:00:00.0000000', timeZone: 'Customized Time Zone' } })] },
+    }));
+    const r = await createGraphCalendarClient(http).listEvents('tok', Q, signal);
+    if ('failure' in r) throw new Error('unexpected');
+    expect(r.events[0]!.start).toBe('2026-11-10T07:00:00.000Z');
+  });
+
+  it('maps a non-2xx listEvents response to a failure', async () => {
+    const { http } = fake(() => ({ status: 503, body: { error: { message: 'busy' } } }));
+    expect(await createGraphCalendarClient(http).listEvents('tok', Q, signal)).toMatchObject({
+      failure: 'transient',
+      status: 503,
+    });
   });
 });

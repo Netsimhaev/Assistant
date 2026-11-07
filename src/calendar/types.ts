@@ -160,3 +160,27 @@ export async function guarded<T>(fn: () => Promise<T | CalendarFailure>): Promis
     return { failure: 'transient', status: 0, message: error instanceof Error ? error.message : String(error) };
   }
 }
+
+const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", nbsp: ' ' };
+
+/**
+ * Calendar descriptions may arrive as HTML (Outlook, Google). The owner-facing
+ * rendering is plain text, so turn line breaks into newlines, drop every other
+ * tag, decode the basic entities and trim. Entities are decoded last, so an
+ * escaped "&lt;b&gt;" stays literal text rather than becoming a tag.
+ */
+export function toPlainText(s: string): string {
+  return s
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p\s*>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&(amp|lt|gt|quot|#39|nbsp);/g, (_m, name: string) => ENTITIES[name] ?? '')
+    .trim();
+}
+
+export function plainOrNull(v: unknown): string | null {
+  const s = str(v);
+  if (s === null) return null;
+  const p = toPlainText(s);
+  return p === '' ? null : p;
+}

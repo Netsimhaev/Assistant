@@ -6,6 +6,7 @@ import {
   failureFromStatus,
   guarded,
   ok2xx,
+  plainOrNull,
   str,
   type AttendeeResponse,
   type CalendarClient,
@@ -38,7 +39,12 @@ function instantOf(point: unknown, fallbackZone: string): string | null {
   const time = m[2] ?? '';
   const sec = m[3] ?? '00';
   if (zone === 'UTC') return new Date(`${date}T${time}:${sec}.000Z`).toISOString();
-  return localToInstant(date, time, zone).toISOString();
+  try {
+    return localToInstant(date, time, zone).toISOString();
+  } catch {
+    // A zone name this runtime cannot resolve: the requested zone is the one Prefer asked for.
+    return localToInstant(date, time, fallbackZone).toISOString();
+  }
 }
 
 function toEvent(calendarId: string, raw: unknown, timeZone: string): CalendarEvent | null {
@@ -62,7 +68,7 @@ function toEvent(calendarId: string, raw: unknown, timeZone: string): CalendarEv
     end,
     allDay: e['isAllDay'] === true,
     location: str(asRecord(e['location'])['displayName']),
-    description: str(asRecord(e['body'])['content']),
+    description: plainOrNull(asRecord(e['body'])['content']),
     organizerIsSelf: e['isOrganizer'] === true,
     busy: e['showAs'] !== 'free',
     selfDeclined: asRecord(e['responseStatus'])['response'] === 'declined',
@@ -83,7 +89,7 @@ function bodyOf(w: Partial<EventWrite>): Record<string, unknown> {
   return b;
 }
 
-const prefer = (tz: string): Record<string, string> => ({ Prefer: `outlook.timezone="${tz}"` });
+const prefer = (tz: string): Record<string, string> => ({ Prefer: `outlook.timezone="${tz}", outlook.body-content-type="text"` });
 const cal = (id: string): string => `${BASE}/me/calendars/${encodeURIComponent(id)}`;
 
 export function createGraphCalendarClient(http: CalendarHttp = defaultCalendarHttp()): CalendarClient {

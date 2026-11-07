@@ -154,4 +154,16 @@ describe('google calendar client', () => {
     const http: CalendarHttp = { request: () => Promise.reject(new Error('boom')) };
     expect(await createGoogleCalendarClient(http).listCalendars('tok', signal)).toMatchObject({ failure: 'transient' });
   });
+
+  it('turns an HTML description into plain text', async () => {
+    const { http } = fake(() => ({
+      status: 200,
+      body: {
+        items: [timed('d', { description: 'Hello&nbsp;<b>there</b><br>see <a href="x">link</a> &lt;ok&gt; &quot;q&quot; it&#39;s<br/>' })],
+      },
+    }));
+    const r = await createGoogleCalendarClient(http).listEvents('tok', Q, signal);
+    if ('failure' in r) throw new Error('unexpected');
+    expect(r.events[0]!.description).toBe("Hello there\nsee link <ok> \"q\" it's");
+  });
 });
