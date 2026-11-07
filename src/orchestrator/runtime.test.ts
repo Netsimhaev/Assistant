@@ -770,9 +770,7 @@ describe('buildRuntime', () => {
             channel: 'api',
             serves: ['calendar.read', 'calendar.write'],
             target: null,
-            // The runtime reads the provider from the binding; the signed
-            // subprocessor is the OAuth ceremony's concern (oauth-routes).
-            subprocessor: null,
+            subprocessor: 'google-workspace',
           },
           {
             system: 'office-calendar',
@@ -787,7 +785,7 @@ describe('buildRuntime', () => {
       { businessId: BUSINESS },
     );
     for (const [system, provider] of [
-      ['calendar', 'microsoft'],
+      ['calendar', 'google'],
       ['office-calendar', 'google'],
     ] as const) {
       await upsertBinding(
@@ -813,6 +811,39 @@ describe('buildRuntime', () => {
     // The legacy connection keeps its read-only adapter, unchanged.
     expect(runtime.registry.resolve('office-calendar', 'api', 'calendar.read')).not.toBeNull();
     expect(runtime.registry.resolve('office-calendar', 'api', 'calendar.write')).toBeNull();
+  });
+
+  it('does not register the calendar adapter when the binding provider is not the signed one', async () => {
+    await installCharter(
+      buildCharter({
+        connections: [
+          {
+            system: 'calendar',
+            label: 'יומן העסק',
+            channel: 'api',
+            serves: ['calendar.read', 'calendar.write'],
+            target: null,
+            subprocessor: 'google-workspace',
+          },
+        ],
+      }),
+      { businessId: BUSINESS },
+    );
+    await upsertBinding(
+      {
+        system: 'calendar',
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OAUTH_CALENDAR',
+        provider: 'microsoft',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { by: 'test' },
+    );
+    const runtime = await buildRuntime(FULL);
+    expect(runtime.registry.resolve('calendar', 'api', 'calendar.write')).toBeNull();
+    expect(runtime.warnings.some((w) => w.includes('no calendar adapter') && w.includes('signed charter'))).toBe(true);
   });
 
   it('does not register the calendar adapter for a calendar binding that has no provider', async () => {

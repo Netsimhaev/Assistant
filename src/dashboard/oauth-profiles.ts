@@ -3,8 +3,10 @@
  * the consent ceremony uses for a charter-declared connection.
  *
  * Positive matching only. A connection earns a profile by NAME and by what it
- * serves -- `mailbox` serving `mail.send`, or any connection serving
- * `calendar.read` -- never by exclusion. `office-mail` also serves
+ * serves -- `mailbox` serving `mail.send`, the `calendar` system serving
+ * `calendar.write` (read-write, Google or Microsoft), or any other connection
+ * serving `calendar.read` (the legacy read-only Google profile) -- never by
+ * exclusion. `office-mail` also serves
  * `mail.send` and gets `null`: it is the static-SMTP connection, and an OAuth
  * grant written onto it would poison the mail path (see `oauth-eligibility.ts`).
  */
@@ -86,10 +88,12 @@ const CALENDAR_PROFILES: Record<MailProvider, OAuthProfile> = {
 };
 
 /**
- * `provider` is the owner's choice for the mailbox / the calendar (the start route validates
- * it against `MailProvider`); it defaults to `'google'` so a caller that only
- * asks "is this connection eligible at all?" need not pick one. Calendar is
- * Google-only: asking for another provider is `null`.
+ * `provider` is the owner's choice for the mailbox / the business calendar
+ * (the start route validates it against `MailProvider` and the signed charter);
+ * it defaults to `'google'` so a caller that only asks "is this connection
+ * eligible at all?" need not pick one. Mailbox and business calendar have a
+ * profile per provider. The legacy read-only calendar (any other connection
+ * serving `calendar.read`) is Google-only: another provider is `null`.
  */
 export function oauthProfileFor(
   connection: CharterConnection,

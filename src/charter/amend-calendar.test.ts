@@ -10,6 +10,7 @@ import {
   describeCalendarAmendment,
   signedCalendarProvider,
 } from './amend-calendar.js';
+import { buildMailboxAmendment } from './amend-mailbox.js';
 import { signCharter, verifyCharterSignature } from './sign.js';
 
 const NOW = new Date('2026-11-07T08:00:00.000Z');
@@ -91,7 +92,17 @@ describe('buildCalendarAmendment', () => {
       return copy;
     };
     expect(JSON.stringify(strip(amended))).toBe(JSON.stringify(strip(active)));
-    expect(amended.data.subprocessorsAllowed).toContain(CALENDAR_SUBPROCESSOR.microsoft);
+    // Absent subprocessor: appended after the existing ones, nothing else changes.
+    expect(active.data.subprocessorsAllowed).not.toContain(CALENDAR_SUBPROCESSOR.microsoft);
+    expect(amended.data.subprocessorsAllowed).toEqual([
+      ...active.data.subprocessorsAllowed,
+      CALENDAR_SUBPROCESSOR.microsoft,
+    ]);
+    // Already allowed: unchanged.
+    expect(active.data.subprocessorsAllowed).toContain(CALENDAR_SUBPROCESSOR.google);
+    expect(buildCalendarAmendment(active, NOW, 'google').data.subprocessorsAllowed).toEqual(
+      active.data.subprocessorsAllowed,
+    );
   });
 
   it('carries a new distinct version superseding the active one', () => {
@@ -149,6 +160,49 @@ describe('buildCalendarRevert', () => {
     const active = sign({ ...amended, connections: [...amended.connections, later] });
     const revert = buildCalendarRevert(active, NOW, before);
     expect(revert.connections.map((c) => c.system).sort()).toEqual(['later-system', 'office-calendar']);
+  });
+
+  it('refuses a previous charter that itself declares a calendar', () => {
+    const active = sign(buildCalendarAmendment(buildCharter({ connections: [OFFICE_CALENDAR] }), NOW, 'google'));
+    expect(() => buildCalendarRevert(active, NOW, active)).toThrow(/calendar/);
+  });
+
+  it('never resurrects non-calendar tools, and restores a dropped connection with its calendar tools only', () => {
+    const WORKSPACE: CharterConnection = {
+      system: 'workspace',
+      label: 'סביבת עבודה',
+      channel: 'api',
+      serves: ['mail.send', 'calendar.read'],
+      target: null,
+      subprocessor: null,
+    };
+    const before = buildCharter({ connections: [WORKSPACE] });
+    // Mailbox amendment took mail.send; the calendar amendment then dropped
+    // the remaining (calendar-only) workspace connection.
+    const withMailbox = sign(buildMailboxAmendment(before, NOW, 'google'));
+    const active = sign(buildCalendarAmendment(withMailbox, NOW, 'google'));
+    expect(active.connections.map((c) => c.system)).toEqual(['mailbox', 'calendar']);
+    // A stale `previous` (the charter before BOTH amendments) must not bring mail.send back.
+    const revert = sign(buildCalendarRevert(active, NOW, before));
+    expect(revert.connections.find((c) => c.system === 'workspace')?.serves).toEqual(['calendar.read']);
+    expect(revert.connections.filter((c) => c.serves.includes('mail.send')).map((c) => c.system)).toEqual(['mailbox']);
+  });
+
+  it('keeps the active version of a still-active connection and re-adds only its calendar tools', () => {
+    const before = buildCharter({ connections: [SHARED] });
+    const amended = buildCalendarAmendment(before, NOW, 'google');
+    // The owner later signed an extra tool onto the narrowed connection.
+    const active = sign({
+      ...amended,
+      connections: amended.connections.map((c) =>
+        c.system === 'workspace' ? { ...c, serves: ['crm.write', 'crm.read'] } : c,
+      ),
+    });
+    const revert = buildCalendarRevert(active, NOW, before);
+    const workspace = revert.connections.find((c) => c.system === 'workspace');
+    expect([...(workspace?.serves ?? [])].sort()).toEqual(
+      ['calendar.read', 'calendar.write', 'crm.read', 'crm.write'].sort(),
+    );
   });
 
   it('refuses when the active charter has no calendar connection', () => {

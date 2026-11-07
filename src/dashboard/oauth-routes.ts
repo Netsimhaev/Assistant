@@ -76,10 +76,11 @@ import {
 } from './oauth-profiles.js';
 
 /**
- * The provider for a ceremony start. `mailbox` takes the owner's choice from
- * the `provider` query parameter (validated against `MailProvider`); every
- * other system is Google-only (calendar). The value is then stored on the
- * single-use state row, and the callback reads it from there.
+ * The provider for a ceremony start. `mailbox` and `calendar` take the
+ * owner's choice from the `provider` query parameter (validated against
+ * `MailProvider`, then against the provider the signed charter names); every
+ * other system is the legacy read-only Google calendar. The value is stored on
+ * the single-use state row, and the callback reads it from there.
  */
 function chosenProvider(system: string, query: URLSearchParams | undefined): MailProvider | null {
   // The business calendar also takes a provider (checked against the signed
@@ -554,8 +555,9 @@ export async function handleOAuthCallback(
   // Trusted from here on -- the row this session actually opened, never the
   // query string.
   const system = consumed.system;
-  // The provider the owner chose at start, from the stored row. Only the
-  // mailbox records one; everything else is the Google calendar ceremony.
+  // The provider the owner chose at start, from the stored row. The mailbox
+  // and the business calendar record one; any other system is the legacy
+  // Google read-only calendar ceremony.
   const provider: MailProvider =
     consumed.provider === 'microsoft' ? 'microsoft' : 'google';
   const providerName = provider === 'microsoft' ? 'Microsoft' : 'Google';

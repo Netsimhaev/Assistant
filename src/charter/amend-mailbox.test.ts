@@ -3,6 +3,7 @@ import { BusinessCharter } from '../domain/charter.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { buildCharter } from '../test/fixtures.js';
 import { MAILBOX_SUBPROCESSOR, buildMailboxAmendment, buildMailboxRevert } from './amend-mailbox.js';
+import { buildCalendarAmendment } from './amend-calendar.js';
 import { signCharter, verifyCharterSignature } from './sign.js';
 
 const NOW = new Date('2026-10-21T08:00:00.000Z');
@@ -142,6 +143,23 @@ describe('buildMailboxRevert', () => {
     expect(revert.supersedes).toBe(active.charterVersion);
     expect(revert.charterVersion).not.toBe(before.charterVersion);
     expect(revert.charterVersion).not.toBe(active.charterVersion);
+    expect(verifyCharterSignature(revert)).toEqual({ valid: true });
+  });
+
+  it('keeps a calendar connected after the mailbox, and its subprocessor', () => {
+    const before = buildCharter({ connections: [OFFICE_MAIL, CALENDAR] });
+    const withMailbox = sign(buildMailboxAmendment(before, NOW, 'google'));
+    const active = sign(buildCalendarAmendment(withMailbox, NOW, 'microsoft'));
+    const revert = sign(buildMailboxRevert(active, before, NOW));
+    expect(revert.connections.map((c) => c.system).sort()).toEqual(['calendar', 'office-mail']);
+    // The legacy calendar tools are not brought back next to the calendar connection.
+    expect(revert.connections.filter((c) => c.serves.includes('calendar.read')).map((c) => c.system)).toEqual([
+      'calendar',
+    ]);
+    expect(revert.connections.find((c) => c.system === 'calendar')).toEqual(
+      active.connections.find((c) => c.system === 'calendar'),
+    );
+    expect(revert.data.subprocessorsAllowed).toContain('microsoft-365');
     expect(verifyCharterSignature(revert)).toEqual({ valid: true });
   });
 

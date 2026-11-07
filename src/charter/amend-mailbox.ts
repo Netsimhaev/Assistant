@@ -31,8 +31,10 @@
 import { ulid } from 'ulid';
 import type { BusinessCharter, UnsignedCharter } from '../domain/charter.js';
 import type { CharterConnection } from '../domain/connection.js';
+import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import type { MailProvider } from '../mail/mailbox.js';
+import { withoutCalendarTools } from './amend-calendar.js';
 
 /** The subprocessor identifier the signed charter names for each provider. */
 export const MAILBOX_SUBPROCESSOR: Readonly<Record<MailProvider, string>> = {
@@ -221,15 +223,30 @@ export function buildMailboxRevert(
     );
   }
   const { signature: _signature, ...rest } = structuredClone(active);
+  // A calendar connected AFTER the mailbox must survive the way back: the
+  // pre-mailbox connections are restored without calendar tools (the calendar
+  // connection owns them now) and the calendar connection and its
+  // subprocessor are kept from the active charter.
+  const calendar = active.connections.find((c) => c.system === CALENDAR_SYSTEM);
+  const restored = structuredClone(beforeMailbox.connections);
+  const subprocessorsAllowed = [...beforeMailbox.data.subprocessorsAllowed];
+  if (calendar !== undefined) {
+    const kept = withoutCalendarTools(restored.filter((c) => c.system !== CALENDAR_SYSTEM));
+    restored.length = 0;
+    restored.push(...kept, structuredClone(calendar));
+    if (calendar.subprocessor !== null && !subprocessorsAllowed.includes(calendar.subprocessor)) {
+      subprocessorsAllowed.push(calendar.subprocessor);
+    }
+  }
   return {
     ...rest,
     charterVersion: `${active.charterVersion}.mbx-revert-${ulid()}`,
     effectiveFrom: now.toISOString(),
     supersedes: active.charterVersion,
-    connections: structuredClone(beforeMailbox.connections),
+    connections: restored,
     data: {
       ...rest.data,
-      subprocessorsAllowed: [...beforeMailbox.data.subprocessorsAllowed],
+      subprocessorsAllowed,
     },
   };
 }

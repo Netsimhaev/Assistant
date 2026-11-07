@@ -19,6 +19,7 @@ import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import { replyTargetFor } from '../mail/inbox-store.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
+import { signedCalendarProvider } from '../charter/amend-calendar.js';
 import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarProvider } from '../calendar/calendar.js';
 import type { CalendarClient } from '../calendar/types.js';
@@ -741,6 +742,15 @@ export async function buildRuntime(
     const connection = connectionBySystem.get(binding.system);
     if (connection === undefined || connection.channel !== 'api') continue;
     if (!connection.serves.includes('calendar.read') || !connection.serves.includes('calendar.write')) continue;
+    // The binding's provider must be the one the owner SIGNED for: a binding
+    // pointing at another vendor would send calendar data through a
+    // subprocessor the signed charter does not name.
+    if (signedCalendarProvider(connection) !== binding.provider) {
+      warnings.push(
+        `no calendar adapter for "${binding.system}": the binding's provider is not the one the signed charter names`,
+      );
+      continue;
+    }
     if (systemAdapters.some((a) => a.system === binding.system)) {
       warnings.push(`no calendar adapter for "${binding.system}": an adapter is already registered under this system name`);
       continue;

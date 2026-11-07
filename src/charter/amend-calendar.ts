@@ -153,30 +153,64 @@ export function calendarProviderMatchesCharter(connection: CharterConnection, pr
 }
 
 /**
- * The way back. Removes the calendar connection and restores the connections
- * the amendment replaced (those in `previous` that served a calendar tool): a
- * narrowed one gets its original `serves` back, a dropped one returns. Every
- * other field -- including connections the owner signed after the amendment --
- * is the ACTIVE charter's. The calendar's subprocessor is removed from
+ * `connections` with the calendar tools removed from each, a connection left
+ * serving nothing dropped. The calendar connection itself is untouched. Used by
+ * the mailbox revert so restoring pre-mailbox connections never puts a calendar
+ * tool next to the calendar connection (the schema refuses two servers of the
+ * same tool for one target).
+ */
+export function withoutCalendarTools(connections: readonly CharterConnection[]): CharterConnection[] {
+  return splitConnections(connections.filter((c) => c.system !== CALENDAR_SYSTEM)).kept.concat(
+    connections.filter((c) => c.system === CALENDAR_SYSTEM).map((c) => structuredClone(c)),
+  );
+}
+
+/**
+ * The way back. Removes the calendar connection and gives back ONLY the
+ * calendar tools the amendment took:
+ *   - a connection still active keeps its ACTIVE version, with the calendar
+ *     tools it had in `previous` re-added (in `previous`'s order);
+ *   - a connection the amendment dropped returns with its calendar tools only.
+ * Non-calendar tools are never resurrected: a `mail.send` brought back next to
+ * `mailbox` would make `resolveChannel` refuse every send.
+ * Every other field -- including connections signed after the amendment -- is
+ * the ACTIVE charter's. The calendar's subprocessor is removed from
  * `subprocessorsAllowed` only when `previous` did not allow it and no remaining
  * connection names it. A new version superseding the active one.
+ *
+ * Throws `NoCalendarToRevertError` when the active charter has no calendar, and
+ * refuses a `previous` that itself declares one (it is then not the version
+ * before the calendar was added).
  */
 export function buildCalendarRevert(active: BusinessCharter, now: Date, previous: BusinessCharter): UnsignedCharter {
   const calendar = active.connections.find((c) => c.system === CALENDAR_SYSTEM);
   if (calendar === undefined) throw new NoCalendarToRevertError(active.charterVersion);
+  if (previous.connections.some((c) => c.system === CALENDAR_SYSTEM)) {
+    throw new Error(
+      `charter ${previous.charterVersion} already declares a calendar; it is not the version before the calendar amendment`,
+    );
+  }
 
-  const replaced = previous.connections.filter(servesCalendar);
-  const replacedBySystem = new Map(replaced.map((c) => [c.system, c] as const));
+  const isCalendarTool = (tool: string): boolean => CALENDAR_TOOLS.includes(tool);
+  const replacedBySystem = new Map(previous.connections.filter(servesCalendar).map((c) => [c.system, c] as const));
   const connections: CharterConnection[] = [];
   const seen = new Set<string>();
   for (const connection of active.connections) {
     if (connection.system === CALENDAR_SYSTEM) continue;
-    const original = replacedBySystem.get(connection.system);
-    connections.push(structuredClone(original ?? connection));
     seen.add(connection.system);
+    const original = replacedBySystem.get(connection.system);
+    if (original === undefined) {
+      connections.push(structuredClone(connection));
+      continue;
+    }
+    const current = new Set(connection.serves);
+    const ordered = original.serves.filter((t) => isCalendarTool(t) || current.has(t));
+    const serves = [...ordered, ...connection.serves.filter((t) => !ordered.includes(t))];
+    connections.push({ ...structuredClone(connection), serves });
   }
-  for (const original of replaced) {
-    if (!seen.has(original.system)) connections.push(structuredClone(original));
+  for (const original of replacedBySystem.values()) {
+    if (seen.has(original.system)) continue;
+    connections.push({ ...structuredClone(original), serves: original.serves.filter(isCalendarTool) });
   }
 
   const { signature: _signature, ...rest } = structuredClone(active);
