@@ -222,7 +222,7 @@ export function createCalendarAdapter(o: CalendarAdapterOptions): ExternalAdapte
     call: AdapterCall,
     token: string,
     input: Extract<CalendarWriteInput, { operation: 'create' }>,
-  ): Promise<AdapterResult | null> {
+  ): Promise<AdapterResult | null | 'already_converted'> {
     if (input.holdEventId === null) return null;
     let timeZone: string;
     try {
@@ -242,9 +242,24 @@ export function createCalendarAdapter(o: CalendarAdapterOptions): ExternalAdapte
       if (got.failure === 'transient') return fail(true, 'calendar_unavailable', MSG.unavailable);
       return fail(false, 'calendar_rejected', MSG.rejected);
     }
-    const alreadyConverted =
-      got.title === input.title && Date.parse(got.start) === Date.parse(input.start) && Date.parse(got.end) === Date.parse(input.end);
-    if (alreadyConverted && got.organizerIsSelf) return null;
+    // Already converted only when the event equals the FULL target write; any
+    // partial match (an owner meeting that merely shares title and times) falls
+    // through to the strict hold check below.
+    const norm = (xs: readonly string[]) => [...new Set(xs.map((x) => x.toLowerCase()))].sort();
+    const want = norm(input.attendees);
+    const have = norm(got.attendees.map((a) => a.email));
+    if (
+      got.organizerIsSelf &&
+      got.title === input.title &&
+      Date.parse(got.start) === Date.parse(input.start) &&
+      Date.parse(got.end) === Date.parse(input.end) &&
+      got.location === input.location &&
+      got.description === input.description &&
+      want.length === have.length &&
+      want.every((x, i) => x === have[i])
+    ) {
+      return 'already_converted';
+    }
     if (!got.organizerIsSelf || got.attendees.length > 0 || !got.title.startsWith(HOLD_TITLE_PREFIX)) {
       return fail(false, 'not_a_hold', MSG.notAHold);
     }
@@ -268,6 +283,9 @@ export function createCalendarAdapter(o: CalendarAdapterOptions): ExternalAdapte
           let ignoreTx: string | null = null;
           if (input.holdEventId !== null) {
             const notHold = await requireHold(call, token, input);
+            if (notHold === 'already_converted') {
+              return { ok: true, output: { operation: 'create', eventId: input.holdEventId }, externalId: input.holdEventId };
+            }
             if (notHold !== null) return notHold;
             ignore.add(input.holdEventId);
           } else if (o.provider === 'google') {

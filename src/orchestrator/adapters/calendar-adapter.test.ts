@@ -266,6 +266,36 @@ describe('calendar adapter', () => {
     expect(await adapter(client).execute(call('calendar.write', create()))).toMatchObject({ code: 'recheck_incomplete', retryable: false });
   });
 
+  it('does not take over an owner meeting that shares the hold target title and times', async () => {
+    const meeting = ev({ title: 'פגישה', attendees: [{ email: 'other@b.co', response: 'accepted' }] });
+    const { client, rec } = fakeClient({ got: meeting });
+    const r = await adapter(client).execute(call('calendar.write', create({ holdEventId: 'e1' })));
+    expect(r).toMatchObject({ ok: false, retryable: false, code: 'not_a_hold' });
+    expect(rec.calls.some((c) => c.op === 'update' || c.op === 'create')).toBe(false);
+  });
+
+  it('treats an exact full match of the target write as already converted, without writing', async () => {
+    const done = ev({
+      eventId: 'e1',
+      title: 'פגישה',
+      location: null,
+      description: null,
+      attendees: [{ email: 'A@B.co', response: 'accepted' }],
+    });
+    const { client, rec } = fakeClient({ got: done });
+    const r = await adapter(client).execute(call('calendar.write', create({ holdEventId: 'e1' })));
+    expect(r).toMatchObject({ ok: true, externalId: 'e1' });
+    expect(rec.calls.some((c) => c.op === 'update' || c.op === 'create' || c.op === 'delete')).toBe(false);
+  });
+
+  it('enforces location and description caps', async () => {
+    const { client } = fakeClient({});
+    const a = adapter(client);
+    expect(await a.execute(call('calendar.write', create({ location: 'x'.repeat(501) })))).toMatchObject({ code: 'invalid_input' });
+    expect(await a.execute(call('calendar.write', create({ description: 'x'.repeat(4001) })))).toMatchObject({ code: 'invalid_input' });
+    expect((await a.execute(call('calendar.write', create({ location: 'x'.repeat(500), description: 'y'.repeat(4000) })))).ok).toBe(true);
+  });
+
   it('enforces length caps', async () => {
     const { client } = fakeClient({});
     const a = adapter(client);
