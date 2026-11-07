@@ -32,6 +32,7 @@ import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
+import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import { OUTLOOK_SUBJECT_NOTE, WARNING_PREFIXES, mailboxReplyRecipient, splitReplyDetail } from '../mail/reply-card.js';
 import { formatMinor } from '../util/money.js';
 
@@ -823,6 +824,13 @@ ${
   options.charterStatus === 'ok' && !options.connections.some((c) => c.system === MAILBOX_SYSTEM)
     ? '<p><a href="/connections/mailbox">חיבור תיבת המייל של העסק (Gmail או Microsoft 365)</a></p>'
     : ''
+}
+${
+  options.charterStatus === 'ok' && !options.connections.some((c) => c.system === CALENDAR_SYSTEM)
+    ? '<p><a href="/connections/calendar">חיבור יומן העסק (Google Calendar או Microsoft 365) — קריאה וקביעת פגישות</a></p>'
+    : options.charterStatus === 'ok'
+      ? '<p><a href="/connections/calendar">מצב יומן העסק</a> · <a href="/meetings/settings">הגדרות הפגישות</a></p>'
+      : ''
 }
 ${sections === '' && notice === '' ? '<p>התקנון הפעיל אינו מצהיר על אף חיבור.</p>' : sections}`,
   );

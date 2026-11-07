@@ -3,11 +3,13 @@
  * grant: `GET /oauth/:system/start`, `GET /oauth/callback`, and
  * `POST /oauth/:system/revoke`.
  *
- * **Google only, today.** This ceremony hardcodes `provider: 'google'` and
- * one scope (`GOOGLE_CALENDAR_READONLY_SCOPE`) because that is the only
- * provider adapter this subproject wires (`orchestrator/adapters/
- * google-calendar.ts`). A second provider needs a real per-system mapping
- * here -- see spec 9, "the second provider, after the first one works live."
+ * **Three ceremonies, one handler.** The business `mailbox` and the business
+ * `calendar` take the provider from the `provider` query parameter (Google or
+ * Microsoft), accepted only when it is the provider the SIGNED charter names
+ * for that connection. Every other system is the legacy read-only Google
+ * Calendar connection (`GOOGLE_CALENDAR_READONLY_SCOPE`, `orchestrator/
+ * adapters/google-calendar.ts`). The scope set and the account lookup come
+ * from the per-system profile in `oauth-profiles.ts`.
  *
  * **The grant write lives here, and ONLY here (besides the token service).**
  * `oauth-consent.ts` builds URLs and exchanges codes; it never imports
@@ -436,7 +438,14 @@ export async function handleOAuthStart(
     return sendHtml(
       res,
       400,
-      page('ספק לא תקין', errorBlock('יש לבחור ספק דואר: google או microsoft. לא בוצעה כל פעולה.')),
+      page(
+        'ספק לא תקין',
+        errorBlock(
+          system === CALENDAR_SYSTEM
+            ? 'יש לבחור ספק יומן: google או microsoft. לא בוצעה כל פעולה.'
+            : 'יש לבחור ספק דואר: google או microsoft. לא בוצעה כל פעולה.',
+        ),
+      ),
     );
   }
   const profile = connection === undefined ? null : oauthProfileFor(connection, provider);
@@ -812,7 +821,8 @@ export async function handleOAuthCallback(
         }.</p>` +
         `<p class="muted">שימו לב: תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו. ` +
         `אם הוא כבר רץ, החיבור החדש ייכנס לתוקף רק אחרי שהוא יופעל מחדש.</p>` +
-        (system === MAILBOX_SYSTEM ? `<p><a href="/connections/mailbox">למצב תיבת המייל</a></p>` : ''),
+        (system === MAILBOX_SYSTEM ? `<p><a href="/connections/mailbox">למצב תיבת המייל</a></p>` : '') +
+        (system === CALENDAR_SYSTEM ? `<p><a href="/connections/calendar">למצב היומן</a> · <a href="/meetings/settings">להגדרות הפגישות</a></p>` : ''),
     ),
   );
 }

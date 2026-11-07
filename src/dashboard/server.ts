@@ -106,6 +106,15 @@ import {
   handleMailboxStatus,
 } from './mailbox-connect.js';
 import {
+  handleCalendarRevertPost,
+  handleCalendarSignGet,
+  handleCalendarSignPost,
+  handleCalendarStatus,
+} from './calendar-connect.js';
+import { handleMeetingSettingsGet, handleMeetingSettingsPost, type MeetingRouteOptions } from './meeting-routes.js';
+import type { CalendarClient } from '../calendar/types.js';
+import type { CredentialSource } from '../orchestrator/credentials.js';
+import {
   handleLedgerAction,
   handleLedgerGet,
   handleLedgerRuleDelete,
@@ -257,6 +266,14 @@ export interface DashboardOptions {
    * reads (`productionToolsFromEnv`).
    */
   production?: DocumentRouteOptions['production'];
+  /**
+   * Test seams for the meeting settings page (`/meetings/settings`): the
+   * credential source and the client its calendar list is read through. No
+   * production caller passes either — absent, the page builds the real
+   * credential source from the master key and uses the bound provider's client.
+   */
+  calendarCredentials?: CredentialSource;
+  calendarClient?: CalendarClient;
   /** Test seam for the upload cap; production leaves it unset (`MAX_ORIGINAL_BYTES`, the ingest's own). */
   uploadMaxBytes?: number;
 }
@@ -2922,6 +2939,7 @@ async function route(
   oauthOptions: OAuthRouteOptions,
   setupOptions: SetupOptions = {},
   doorOptions: InstructionDoorOptions = {},
+  meetingOptions: MeetingRouteOptions = { credentialKeyPath: undefined },
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const requestUrl = new URL(req.url ?? '/', 'http://dashboard.local');
@@ -3031,6 +3049,25 @@ async function route(
   }
   if (method === 'POST' && pathname === '/connections/mailbox/revert') {
     return handleMailboxRevertPost(res, businessId, session, await readFormBody(req));
+  }
+  // Connecting the business calendar: the same sign-then-connect order.
+  if (method === 'GET' && pathname === '/connections/calendar') {
+    return handleCalendarStatus(res, businessId, issueCsrfToken(session.sessionId));
+  }
+  if (method === 'GET' && pathname === '/connections/calendar/sign') {
+    return handleCalendarSignGet(res, businessId, issueCsrfToken(session.sessionId), requestUrl.searchParams, oauthOptions.credentialKeyPath);
+  }
+  if (method === 'POST' && pathname === '/connections/calendar/sign') {
+    return handleCalendarSignPost(res, businessId, session, await readFormBody(req), oauthOptions.credentialKeyPath);
+  }
+  if (method === 'POST' && pathname === '/connections/calendar/revert') {
+    return handleCalendarRevertPost(res, businessId, session, await readFormBody(req));
+  }
+  if (method === 'GET' && pathname === '/meetings/settings') {
+    return handleMeetingSettingsGet(res, businessId, session, requestUrl.searchParams, meetingOptions);
+  }
+  if (method === 'POST' && pathname === '/meetings/settings') {
+    return handleMeetingSettingsPost(res, businessId, session, await readFormBody(req), meetingOptions);
   }
   if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, businessId, session);
   if (method === 'POST' && pathname === '/digest/settings')
@@ -3249,7 +3286,12 @@ export function createServer(options: DashboardOptions = {}): Server {
       ...(options.planner !== undefined ? { planner: options.planner } : {}),
       ...(options.uploadMaxBytes !== undefined ? { uploadMaxBytes: options.uploadMaxBytes } : {}),
     };
-    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions, doorOptions).catch((err: unknown) => {
+    const meetingOptions: MeetingRouteOptions = {
+      credentialKeyPath: oauthOptions.credentialKeyPath,
+      ...(options.calendarCredentials !== undefined ? { calendarCredentials: options.calendarCredentials } : {}),
+      ...(options.calendarClient !== undefined ? { calendarClient: options.calendarClient } : {}),
+    };
+    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions, doorOptions, meetingOptions).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {
         sendHtml(res, 500, renderServerError());

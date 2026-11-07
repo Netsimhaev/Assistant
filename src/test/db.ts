@@ -22,6 +22,9 @@ export async function resetDatabase(): Promise<void> {
   await getPool().query(`
     TRUNCATE TABLE
       audit_log,
+      meeting_holds,
+      meetings,
+      meeting_settings,
       document_settings,
       document_deliveries,
       document_cards,
