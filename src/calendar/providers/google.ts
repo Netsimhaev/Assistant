@@ -85,6 +85,7 @@ function toEvent(calendarId: string, raw: unknown, timeZone: string): CalendarEv
     organizerIsSelf: asRecord(e['organizer'])['self'] === true,
     busy: e['transparency'] !== 'transparent',
     selfDeclined,
+    transactionId: null,
     attendees,
   };
 }

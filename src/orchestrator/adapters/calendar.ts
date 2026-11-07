@@ -27,7 +27,10 @@
  */
 import { z } from 'zod';
 import type { CalendarProvider } from '../../calendar/calendar.js';
+import { HOLD_TITLE_PREFIX } from '../../calendar/calendar.js';
 import { calendarClientFor } from '../../calendar/client-for.js';
+import { googleEventId } from '../../calendar/providers/google.js';
+import { graphTransactionId } from '../../calendar/providers/graph.js';
 import { isCalendarFailure } from '../../calendar/types.js';
 import type { CalendarClient, CalendarFailure, EventWrite } from '../../calendar/types.js';
 import type { AdapterCall, AdapterResult, ExternalAdapter } from './types.js';
@@ -50,12 +53,12 @@ export const CalendarWriteInput = z.discriminatedUnion('operation', [
       operation: z.literal('create'),
       calendarId,
       holdEventId: z.string().min(1).nullable(),
-      title: z.string().min(1),
+      title: z.string().min(1).max(300),
       start: IsoInstant,
       end: IsoInstant,
-      location: z.string().nullable(),
-      description: z.string().nullable(),
-      attendees: z.array(z.string().email()),
+      location: z.string().max(500).nullable(),
+      description: z.string().max(4000).nullable(),
+      attendees: z.array(z.string().email()).max(50),
     })
     .strict(),
   z.object({ operation: z.literal('move'), calendarId, eventId, start: IsoInstant, end: IsoInstant }).strict(),
@@ -64,9 +67,9 @@ export const CalendarWriteInput = z.discriminatedUnion('operation', [
       operation: z.literal('update'),
       calendarId,
       eventId,
-      location: z.string().nullable().optional(),
-      description: z.string().nullable().optional(),
-      attendees: z.array(z.string().email()).optional(),
+      location: z.string().max(500).nullable().optional(),
+      description: z.string().max(4000).nullable().optional(),
+      attendees: z.array(z.string().email()).max(50).optional(),
     })
     .strict(),
   z.object({ operation: z.literal('cancel'), calendarId, eventId }).strict(),
@@ -89,11 +92,12 @@ const MSG = {
   zoneUnavailable: 'אזור הזמן של העסק לא נקרא — לא נכתב דבר',
   slotTaken: 'המועד נתפס בינתיים — לא נכתב דבר',
   recheckIncomplete: 'לא ניתן היה לוודא שהמועד פנוי — לא נכתב דבר',
+  notAHold: 'האירוע שצוין אינו שמירת מקום של העוזרת — לא נכתב דבר',
   auth: 'החיבור ליומן נדחה — צריך לחבר אותו מחדש',
   notFound: 'האירוע לא נמצא ביומן',
   rejected: 'היומן דחה את הבקשה',
   unavailable: 'היומן אינו זמין כרגע',
-  deliveryUnknown: 'לא ניתן לאשר אם הפעולה בוצעה ביומן',
+  deliveryUnknown: 'לא ניתן לדעת אם השינוי ביומן נשמר — כדאי לבדוק ביומן',
 } as const;
 
 export interface CalendarAdapterOptions {
@@ -111,7 +115,8 @@ function fail(retryable: boolean, code: string, message: string): AdapterResult 
 function readFailure(f: CalendarFailure): AdapterResult {
   switch (f.failure) {
     case 'auth':
-      return fail(true, 'calendar_auth', MSG.auth);
+      // 401: a fresh token may work. 403: permission is genuinely absent -- final.
+      return fail(f.status === 401, 'calendar_auth', MSG.auth);
     case 'transient':
       return fail(true, 'calendar_unavailable', MSG.unavailable);
     case 'not_found':
@@ -132,7 +137,7 @@ function writeFailure(f: CalendarFailure): AdapterResult {
     case 'transient':
       return f.status === 429 || f.status >= 500
         ? fail(true, 'calendar_unavailable', MSG.unavailable)
-        : fail(false, 'delivery_unknown', MSG.deliveryUnknown);
+        : fail(false, 'calendar_delivery_unknown', MSG.deliveryUnknown);
     case 'not_found':
       return fail(false, 'event_not_found', MSG.notFound);
     case 'rejected':
@@ -170,6 +175,7 @@ export function createCalendarAdapter(o: CalendarAdapterOptions): ExternalAdapte
     start: string,
     end: string,
     ignore: ReadonlySet<string>,
+    ignoreTransactionId: string | null = null,
   ): Promise<AdapterResult | null> {
     let timeZone: string;
     try {
@@ -190,15 +196,57 @@ export function createCalendarAdapter(o: CalendarAdapterOptions): ExternalAdapte
     }
     if (isCalendarFailure(listed)) {
       // Auth stays final even though it was a read: same mapping as the write.
-      return listed.failure === 'auth' ? writeFailure(listed) : readFailure(listed);
+      if (listed.failure === 'auth') return writeFailure(listed);
+      if (listed.failure === 'transient') return fail(true, 'calendar_unavailable', MSG.unavailable);
+      return fail(false, 'recheck_incomplete', MSG.recheckIncomplete);
     }
-    if (listed.truncated) return fail(false, 'slot_taken', MSG.recheckIncomplete);
+    if (listed.truncated) return fail(false, 'recheck_incomplete', MSG.recheckIncomplete);
     const s = Date.parse(start);
     const e = Date.parse(end);
     for (const ev of listed.events) {
       if (ignore.has(ev.eventId)) continue;
+      if (ignoreTransactionId !== null && ev.transactionId === ignoreTransactionId) continue;
       if (!ev.busy || ev.selfDeclined) continue;
       if (Date.parse(ev.start) < e && Date.parse(ev.end) > s) return fail(false, 'slot_taken', MSG.slotTaken);
+    }
+    return null;
+  }
+
+  /**
+   * Only a real hold may be converted: the assistant's own placeholder (self
+   * organiser, no attendees, hold-prefixed title). A retry after a conversion
+   * that landed finds the event already carrying the target title and times,
+   * and proceeds (the update is idempotent).
+   */
+  async function requireHold(
+    call: AdapterCall,
+    token: string,
+    input: Extract<CalendarWriteInput, { operation: 'create' }>,
+  ): Promise<AdapterResult | null> {
+    if (input.holdEventId === null) return null;
+    let timeZone: string;
+    try {
+      timeZone = await o.timeZone();
+    } catch {
+      return fail(true, 'timezone_unavailable', MSG.zoneUnavailable);
+    }
+    let got: Awaited<ReturnType<CalendarClient['getEvent']>>;
+    try {
+      got = await client.getEvent(token, input.calendarId, input.holdEventId, timeZone, call.signal);
+    } catch {
+      return fail(true, 'calendar_unavailable', MSG.unavailable);
+    }
+    if (isCalendarFailure(got)) {
+      if (got.failure === 'not_found') return fail(false, 'not_a_hold', MSG.notAHold);
+      if (got.failure === 'auth') return writeFailure(got);
+      if (got.failure === 'transient') return fail(true, 'calendar_unavailable', MSG.unavailable);
+      return fail(false, 'calendar_rejected', MSG.rejected);
+    }
+    const alreadyConverted =
+      got.title === input.title && Date.parse(got.start) === Date.parse(input.start) && Date.parse(got.end) === Date.parse(input.end);
+    if (alreadyConverted && got.organizerIsSelf) return null;
+    if (!got.organizerIsSelf || got.attendees.length > 0 || !got.title.startsWith(HOLD_TITLE_PREFIX)) {
+      return fail(false, 'not_a_hold', MSG.notAHold);
     }
     return null;
   }
@@ -216,8 +264,19 @@ export function createCalendarAdapter(o: CalendarAdapterOptions): ExternalAdapte
     try {
       switch (input.operation) {
         case 'create': {
-          const ignore = new Set<string>(input.holdEventId === null ? [] : [input.holdEventId]);
-          const refusal = await recheck(call, token, input.calendarId, input.start, input.end, ignore);
+          const ignore = new Set<string>();
+          let ignoreTx: string | null = null;
+          if (input.holdEventId !== null) {
+            const notHold = await requireHold(call, token, input);
+            if (notHold !== null) return notHold;
+            ignore.add(input.holdEventId);
+          } else if (o.provider === 'google') {
+            // A retry after a create that landed must not trip over its own event.
+            ignore.add(googleEventId(call.idempotencyKey));
+          } else {
+            ignoreTx = graphTransactionId(call.idempotencyKey);
+          }
+          const refusal = await recheck(call, token, input.calendarId, input.start, input.end, ignore, ignoreTx);
           if (refusal !== null) return refusal;
           const body: EventWrite = {
             title: input.title,
@@ -255,11 +314,13 @@ export function createCalendarAdapter(o: CalendarAdapterOptions): ExternalAdapte
         }
         case 'cancel':
           outcome = await client.deleteEvent(token, input.calendarId, input.eventId, call.signal);
+          // Already gone is the state the owner asked for.
+          if (isCalendarFailure(outcome) && outcome.failure === 'not_found') outcome = { eventId: input.eventId };
           break;
       }
     } catch {
       // The request may have reached the provider; never retry it blindly.
-      return fail(false, 'delivery_unknown', MSG.deliveryUnknown);
+      return fail(false, 'calendar_delivery_unknown', MSG.deliveryUnknown);
     }
     if (isCalendarFailure(outcome)) return writeFailure(outcome);
     return { ok: true, output: { operation: input.operation, eventId: outcome.eventId }, externalId: outcome.eventId };

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { CalendarClient, CalendarEvent, CalendarFailure } from '../../calendar/types.js';
+import { HOLD_TITLE_PREFIX } from '../../calendar/calendar.js';
+import { googleEventId } from '../../calendar/providers/google.js';
+import { graphTransactionId } from '../../calendar/providers/graph.js';
 import { createCalendarAdapter } from './calendar.js';
 import { createCredentialHandle } from './types.js';
 import type { AdapterCall } from './types.js';
@@ -21,6 +24,7 @@ function ev(over: Partial<CalendarEvent>): CalendarEvent {
     organizerIsSelf: true,
     busy: true,
     selfDeclined: false,
+    transactionId: null,
     attendees: [],
     ...over,
   };
@@ -36,6 +40,7 @@ function fakeClient(opts: {
   list?: CalendarFailure;
   write?: CalendarFailure;
   throwOnWrite?: boolean;
+  got?: CalendarEvent | CalendarFailure;
 }): { client: CalendarClient; rec: Rec } {
   const rec: Rec = { calls: [] };
   const writeResult = (op: string, args: unknown[], id: string) => {
@@ -52,8 +57,9 @@ function fakeClient(opts: {
       if (opts.list) return opts.list;
       return { events: opts.events ?? [], truncated: opts.truncated ?? false };
     },
-    async getEvent() {
-      return ev({});
+    async getEvent(...args) {
+      rec.calls.push({ op: 'get', args });
+      return opts.got ?? ev({ title: `${HOLD_TITLE_PREFIX}x` });
     },
     async createEvent(...args) {
       return writeResult('create', args, 'new-1');
@@ -152,14 +158,14 @@ describe('calendar adapter', () => {
   it('refuses when the re-check list is truncated', async () => {
     const { client } = fakeClient({ truncated: true });
     const r = await adapter(client).execute(call('calendar.write', create()));
-    expect(r).toMatchObject({ ok: false, code: 'slot_taken' });
+    expect(r).toMatchObject({ ok: false, code: 'recheck_incomplete' });
   });
 
   it('converts a hold by id instead of creating a second event', async () => {
     const { client, rec } = fakeClient({ events: [ev({ eventId: 'hold-1' })] });
     const r = await adapter(client).execute(call('calendar.write', create({ holdEventId: 'hold-1' })));
     expect(r).toMatchObject({ ok: true, externalId: 'hold-1' });
-    expect(rec.calls.map((c) => c.op)).toEqual(['list', 'update']);
+    expect(rec.calls.map((c) => c.op)).toEqual(['get', 'list', 'update']);
     expect(rec.calls.some((c) => c.op === 'create')).toBe(false);
   });
 
@@ -181,19 +187,19 @@ describe('calendar adapter', () => {
   it('marks a thrown write delivery_unknown and not retryable', async () => {
     const { client } = fakeClient({ throwOnWrite: true });
     const r = await adapter(client).execute(call('calendar.write', create()));
-    expect(r).toMatchObject({ ok: false, retryable: false, code: 'delivery_unknown' });
+    expect(r).toMatchObject({ ok: false, retryable: false, code: 'calendar_delivery_unknown' });
   });
 
   it('retries a write only when the provider answered 5xx/429', async () => {
     const a5 = adapter(fakeClient({ write: { failure: 'transient', status: 503, message: '' } }).client);
     expect(await a5.execute(call('calendar.write', create()))).toMatchObject({ retryable: true, code: 'calendar_unavailable' });
     const a0 = adapter(fakeClient({ write: { failure: 'transient', status: 0, message: '' } }).client);
-    expect(await a0.execute(call('calendar.write', create()))).toMatchObject({ retryable: false, code: 'delivery_unknown' });
+    expect(await a0.execute(call('calendar.write', create()))).toMatchObject({ retryable: false, code: 'calendar_delivery_unknown' });
   });
 
   it('maps not_found and rejected', async () => {
     const nf = adapter(fakeClient({ write: { failure: 'not_found', status: 404, message: '' } }).client);
-    expect(await nf.execute(call('calendar.write', { operation: 'cancel', calendarId: CAL, eventId: 'x' }))).toMatchObject({
+    expect(await nf.execute(call('calendar.write', { operation: 'update', calendarId: CAL, eventId: 'x', location: 'a' }))).toMatchObject({
       code: 'event_not_found',
     });
     const rj = adapter(fakeClient({ write: { failure: 'rejected', status: 400, message: '' } }).client);
@@ -211,6 +217,60 @@ describe('calendar adapter', () => {
     const { client, rec } = fakeClient({});
     await adapter(client).execute(call('calendar.write', { operation: 'update', calendarId: CAL, eventId: 'e1', location: 'חיפה' }));
     expect(rec.calls[0]?.args[3]).toEqual({ location: 'חיפה' });
+  });
+
+  it('refuses to convert an event that is not a real hold', async () => {
+    const bad = [
+      ev({ title: 'פגישה עם לקוח', attendees: [] }),
+      ev({ title: `${HOLD_TITLE_PREFIX}x`, attendees: [{ email: 'a@b.co', response: 'accepted' }] }),
+      ev({ title: `${HOLD_TITLE_PREFIX}x`, organizerIsSelf: false }),
+    ];
+    for (const got of bad) {
+      const { client, rec } = fakeClient({ got });
+      const r = await adapter(client).execute(call('calendar.write', create({ holdEventId: 'e1' })));
+      expect(r).toMatchObject({ ok: false, retryable: false, code: 'not_a_hold', message: 'האירוע שצוין אינו שמירת מקום של העוזרת — לא נכתב דבר' });
+      expect(rec.calls.some((c) => c.op === 'update' || c.op === 'create')).toBe(false);
+    }
+  });
+
+  it('lets a retried create ignore its own event (Google key-derived id)', async () => {
+    const { client, rec } = fakeClient({ events: [ev({ eventId: googleEventId('idem-1') })] });
+    const r = await adapter(client).execute(call('calendar.write', create()));
+    expect(r.ok).toBe(true);
+    expect(rec.calls.map((c) => c.op)).toEqual(['list', 'create']);
+  });
+
+  it('lets a retried create ignore its own event (Graph transactionId)', async () => {
+    const { client } = fakeClient({ events: [ev({ eventId: 'g1', transactionId: graphTransactionId('idem-1') })] });
+    const a = createCalendarAdapter({ system: 'calendar', provider: 'microsoft', timeZone: async () => 'Asia/Jerusalem', client });
+    expect((await a.execute(call('calendar.write', create()))).ok).toBe(true);
+    const other = fakeClient({ events: [ev({ eventId: 'g2', transactionId: graphTransactionId('different') })] }).client;
+    const b = createCalendarAdapter({ system: 'calendar', provider: 'microsoft', timeZone: async () => 'Asia/Jerusalem', client: other });
+    expect(await b.execute(call('calendar.write', create()))).toMatchObject({ code: 'slot_taken' });
+  });
+
+  it('does not retry a 403 on a read', async () => {
+    const { client } = fakeClient({ list: { failure: 'auth', status: 403, message: 'x' } });
+    const r = await adapter(client).execute(call('calendar.read', { calendarId: CAL, fromIso: START, toIso: END }));
+    expect(r).toMatchObject({ ok: false, retryable: false, code: 'calendar_auth' });
+  });
+
+  it('treats a cancel of an already-deleted event as success', async () => {
+    const { client } = fakeClient({ write: { failure: 'not_found', status: 404, message: '' } });
+    const r = await adapter(client).execute(call('calendar.write', { operation: 'cancel', calendarId: CAL, eventId: 'gone' }));
+    expect(r).toMatchObject({ ok: true, externalId: 'gone' });
+  });
+
+  it('uses recheck_incomplete when the re-check list fails non-auth', async () => {
+    const { client } = fakeClient({ list: { failure: 'rejected', status: 400, message: '' } });
+    expect(await adapter(client).execute(call('calendar.write', create()))).toMatchObject({ code: 'recheck_incomplete', retryable: false });
+  });
+
+  it('enforces length caps', async () => {
+    const { client } = fakeClient({});
+    const a = adapter(client);
+    expect(await a.execute(call('calendar.write', create({ title: 'x'.repeat(301) })))).toMatchObject({ code: 'invalid_input' });
+    expect(await a.execute(call('calendar.write', create({ attendees: Array.from({ length: 51 }, (_, i) => `a${i}@b.co`) })))).toMatchObject({ code: 'invalid_input' });
   });
 
   it('refuses a payload with an unknown field', async () => {

@@ -315,6 +315,9 @@ const FAILURE_REASON_HE: Readonly<Record<string, string>> = {
   calendar_auth: 'החיבור ליומן נדחה — צריך לחבר אותו מחדש',
   event_not_found: 'האירוע לא נמצא ביומן',
   calendar_rejected: 'היומן דחה את הבקשה',
+  not_a_hold: 'האירוע שצוין אינו שמירת מקום של העוזרת — לא נכתב דבר',
+  calendar_delivery_unknown: 'לא ניתן לדעת אם השינוי ביומן נשמר — כדאי לבדוק ביומן',
+  recheck_incomplete: 'לא ניתן היה לוודא שהמועד פנוי — לא נכתב דבר',
 
   // Attachments on mail.send (document production §8.2): performStep's own
   // refusals (run-plan.ts, production/attachments.ts) and the mailbox

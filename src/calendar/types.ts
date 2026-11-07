@@ -20,6 +20,8 @@ export interface CalendarEvent {
   organizerIsSelf: boolean;
   busy: boolean;
   selfDeclined: boolean;
+  /** Graph create transactionId (replay detection); Google: null. */
+  transactionId: string | null;
   attendees: { email: string; response: AttendeeResponse }[];
 }
 

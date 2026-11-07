@@ -72,6 +72,7 @@ function toEvent(calendarId: string, raw: unknown, timeZone: string): CalendarEv
     organizerIsSelf: e['isOrganizer'] === true,
     busy: e['showAs'] !== 'free',
     selfDeclined: asRecord(e['responseStatus'])['response'] === 'declined',
+    transactionId: str(e['transactionId']),
     attendees,
   };
 }
@@ -91,6 +92,11 @@ function bodyOf(w: Partial<EventWrite>): Record<string, unknown> {
 
 const prefer = (tz: string): Record<string, string> => ({ Prefer: `outlook.timezone="${tz}", outlook.body-content-type="text"` });
 const cal = (id: string): string => `${BASE}/me/calendars/${encodeURIComponent(id)}`;
+
+/** Graph transactionId for a create, deterministic from the idempotency key. */
+export function graphTransactionId(idempotencyKey: string): string {
+  return createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 36);
+}
 
 export function createGraphCalendarClient(http: CalendarHttp = defaultCalendarHttp()): CalendarClient {
   return {
@@ -168,7 +174,7 @@ export function createGraphCalendarClient(http: CalendarHttp = defaultCalendarHt
 
     createEvent: (token, calendarId, write, idempotencyKey, signal) =>
       guarded(async () => {
-        const transactionId = createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 36);
+        const transactionId = graphTransactionId(idempotencyKey);
         const r = await http.request({
           method: 'POST',
           url: `${cal(calendarId)}/events`,
