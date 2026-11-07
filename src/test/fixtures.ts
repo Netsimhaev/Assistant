@@ -17,6 +17,7 @@ const BASE_AUTONOMY: Record<ActionClass, AutonomyLevel> = {
   'whatsapp.initiate': 'approve_required',
   'calendar.create': 'auto_notify',
   'calendar.move': 'auto_notify',
+  'calendar.update': 'approve_required',
   'calendar.cancel': 'approve_required',
   'quote.issue': 'approve_required',
   'discount.grant': 'approve_required',

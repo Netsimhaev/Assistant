@@ -283,6 +283,7 @@ export const REFINEMENT_ONLY_CLASSES: readonly ActionClass[] = [
   'email.initiate',
   'whatsapp.initiate',
   'calendar.move',
+  'calendar.update',
   'calendar.cancel',
 ];
 
@@ -424,7 +425,7 @@ export const REFINEMENT_RULES: readonly { base: ActionClass; rule: string }[] = 
   },
   {
     base: 'calendar.create',
-    rule: '`calendar.write` נחשב `calendar.create` כשאין `operation` או כשהוא `create`; `move` הופך אותו ל-`calendar.move`, וכל ערך אחר ל-`calendar.cancel`.',
+    rule: '`calendar.write` נחשב `calendar.create` כשאין `operation` או כשהוא `create`; `move` הופך אותו ל-`calendar.move`, `update` הופך אותו ל-`calendar.update`, `cancel` וכל ערך אחר ל-`calendar.cancel`.',
   },
   {
     base: 'browser.interact',
@@ -481,6 +482,7 @@ export function refineActionClass(
       const op = input['operation'];
       if (op === undefined || op === null || op === 'create') return 'calendar.create';
       if (op === 'move') return 'calendar.move';
+      if (op === 'update') return 'calendar.update';
       return 'calendar.cancel';
     }
     default:

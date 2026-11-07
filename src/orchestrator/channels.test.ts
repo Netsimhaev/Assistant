@@ -567,6 +567,7 @@ describe('resolving a channel', () => {
       'whatsapp.initiate': 'c_812',
       'calendar.create': 'c_812',
       'calendar.move': 'c_812',
+      'calendar.update': 'c_812',
       'calendar.cancel': 'c_812',
       'quote.issue': 'c_812',
       'discount.grant': 'c_812',

@@ -22,6 +22,7 @@ export const INTERVIEW_ROWS = [
   'whatsapp.initiate',
   'calendar.create',
   'calendar.move',
+  'calendar.update',
   'calendar.cancel',
   'quote.issue',
   'discount.grant',
@@ -80,6 +81,7 @@ export const ROW_EXAMPLES: Record<InterviewRow, string> = {
   'whatsapp.initiate': 'למשל: העוזרת שולחת הודעת וואטסאפ ראשונה למי שלא פנה אליך.',
   'calendar.create': 'למשל: העוזרת קובעת פגישה חדשה ביומן.',
   'calendar.move': 'למשל: העוזרת מזיזה פגישה קיימת לשעה אחרת.',
+  'calendar.update': 'למשל: העוזרת משנה מיקום או הערות של פגישה קיימת.',
   'calendar.cancel': 'למשל: העוזרת מבטלת פגישה שנקבעה.',
   'quote.issue': 'למשל: העוזרת שולחת ללקוח הצעת מחיר עם סכום.',
   'discount.grant': 'למשל: העוזרת מציעה ללקוח הנחה.',
@@ -97,12 +99,13 @@ export const ROW_EXAMPLES: Record<InterviewRow, string> = {
  * them. Reachability and availability of such a row are those of its base.
  */
 export const REFINES_FROM: Record<
-  'email.initiate' | 'whatsapp.initiate' | 'calendar.move' | 'calendar.cancel',
+  'email.initiate' | 'whatsapp.initiate' | 'calendar.move' | 'calendar.update' | 'calendar.cancel',
   ActionClass
 > = {
   'email.initiate': 'email.reply',
   'whatsapp.initiate': 'whatsapp.reply',
   'calendar.move': 'calendar.create',
+  'calendar.update': 'calendar.create',
   'calendar.cancel': 'calendar.create',
 };
 

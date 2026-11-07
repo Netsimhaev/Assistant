@@ -21,6 +21,7 @@ export const ActionClass = z.enum([
   // Scheduling
   'calendar.create',
   'calendar.move',
+  'calendar.update',
   'calendar.cancel',
   // Commercial commitments
   'quote.issue',
@@ -79,6 +80,7 @@ export const BASELINE_REVERSIBILITY: Record<ActionClass, Reversibility> = {
   'whatsapp.initiate': 'irreversible',
   'calendar.create': 'reversible',
   'calendar.move': 'reversible',
+  'calendar.update': 'reversible',
   'calendar.cancel': 'costly',
   'quote.issue': 'costly',
   'discount.grant': 'costly',
@@ -120,6 +122,7 @@ const NEVER_FULLY_AUTONOMOUS_TABLE: Record<ActionClass, boolean> = {
   'whatsapp.initiate': false,
   'calendar.create': false,
   'calendar.move': false,
+  'calendar.update': false,
   'calendar.cancel': false,
   'quote.issue': false,
   'discount.grant': false,
@@ -215,6 +218,7 @@ const ACTION_ADDRESSEE: Record<ActionClass, Addressee> = {
   'whatsapp.initiate': 'person',
   'calendar.create': 'person',
   'calendar.move': 'person',
+  'calendar.update': 'person',
   'calendar.cancel': 'person',
   'quote.issue': 'person',
   'discount.grant': 'person',

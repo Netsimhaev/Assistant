@@ -377,6 +377,7 @@ describe('addresseeOf is pinned class by class', () => {
     'whatsapp.initiate': 'person',
     'calendar.create': 'person',
     'calendar.move': 'person',
+    'calendar.update': 'person',
     'calendar.cancel': 'person',
     'quote.issue': 'person',
     'discount.grant': 'person',

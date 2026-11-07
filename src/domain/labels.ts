@@ -26,6 +26,7 @@ export const ACTION_CLASS_HE: Readonly<Record<ActionClass, string>> = Object.fre
   'whatsapp.initiate': 'שליחת הודעת וואטסאפ יזומה',
   'calendar.create': 'קביעת פגישה',
   'calendar.move': 'הזזת פגישה',
+  'calendar.update': 'עריכת פגישה',
   'calendar.cancel': 'ביטול פגישה',
   'quote.issue': 'הוצאת הצעת מחיר',
   'discount.grant': 'מתן הנחה',
