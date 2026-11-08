@@ -36,6 +36,7 @@
     "sdk:judge": "tsx src/sdk/run-judge.ts",
     "sdk:doc-draft": "tsx src/sdk/run-doc-draft.ts",
     "sdk:mail-triage": "tsx src/sdk/run-mail-triage.ts",
+    "sdk:meeting-extract": "tsx src/sdk/run-meeting-extract.ts",
     "doc:render-check": "tsx src/production/run-render-check.ts",
     "connector:calendar": "tsx scripts/connector-calendar.ts"
   },
