@@ -118,7 +118,10 @@ import { nameCarriesCancelWord } from './command-confirm.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { renderConfirmationQuestion } from './command-echo.js';
-import { answerScheduleQuery } from '../meetings/door.js';
+import { answerScheduleQuery, runMeetingOperation } from '../meetings/door.js';
+import type { CharterOperations } from '../meetings/free-time.js';
+import type { MeetingRequest } from '../meetings/request.js';
+import type { MeetingExtractor } from '../sdk/meeting-extractor.js';
 import type { CalendarClient } from '../calendar/types.js';
 import type { Runtime } from './runtime.js';
 import { createJob, transition } from './jobs.js';
@@ -201,6 +204,16 @@ export interface RunInstructionOptions {
    * before. Both doors (WhatsApp and the dashboard) pass it.
    */
   calendar?: { runtime: Pick<Runtime, 'credentials'>; client?: CalendarClient };
+  /**
+   * A meeting request already in structured form (the dashboard's meeting
+   * form): no extraction. Read only when `calendar` is present.
+   */
+  meetingRequest?: MeetingRequest;
+  /**
+   * The model call that turns meeting text into a `MeetingRequest`; injectable
+   * so tests never reach the billed model. Defaults to `runMeetingExtractor`.
+   */
+  meetingExtractor?: MeetingExtractor;
 }
 
 export interface GrantedAuthorization {
@@ -401,6 +414,33 @@ export async function runInstruction(
     businessId,
   });
 
+  const door: DoorContext = {
+    businessId,
+    jobId: job.jobId,
+    instruction,
+    planner,
+    channel: options.channel,
+    textOrigin,
+    bundle: active.bundle,
+    timeZone: active.charter.identity.timezone,
+    attachedDocuments,
+    operations: active.charter.operations,
+  };
+
+  // A meeting instruction (create / move / cancel / edit, calendar scheduling
+  // §7) is planned in code, not by the general planner: extracted, searched
+  // against the calendar, held, and parked on one confirmation. `null` means
+  // it was not a meeting instruction and the general path continues.
+  if (options.calendar !== undefined) {
+    const meeting = await runMeetingOperation(door, {
+      ...(options.meetingRequest !== undefined ? { request: options.meetingRequest } : {}),
+      ...(options.meetingExtractor !== undefined ? { extractor: options.meetingExtractor } : {}),
+      runtime: options.calendar.runtime,
+      ...(options.calendar.client !== undefined ? { client: options.calendar.client } : {}),
+    });
+    if (meeting !== null) return meeting;
+  }
+
   // Two positive sources, never a guess: addresses that appear in the text,
   // and contacts whose name appears in it. `emailAddressesIn` is the same
   // extractor the standing-authorisation path uses — resolving a NAME is
@@ -427,18 +467,6 @@ export async function runInstruction(
     // a read that never returned recognised nobody — which is a different
     // thing from recognising somebody ambiguously.
   }
-
-  const door: DoorContext = {
-    businessId,
-    jobId: job.jobId,
-    instruction,
-    planner,
-    channel: options.channel,
-    textOrigin,
-    bundle: active.bundle,
-    timeZone: active.charter.identity.timezone,
-    attachedDocuments,
-  };
 
   // Spec §6: more than one person fits the name, so nothing is sent until the
   // owner says which. Asked once per chain (§7.2): after an answer has come
@@ -562,8 +590,8 @@ export async function runInstruction(
   });
 }
 
-/** Everything one instruction's planning passes share. */
-interface DoorContext {
+/** Everything one instruction's planning passes share. Exported for the meeting door (`meetings/door.ts`). */
+export interface DoorContext {
   businessId: string;
   jobId: string;
   instruction: InstructionRecord;
@@ -575,7 +603,12 @@ interface DoorContext {
   timeZone: string;
   /** Files the owner attached (ids + names), shown to every planner call of this instruction. */
   attachedDocuments: readonly { documentId: string; name: string }[];
+  /** The active charter's `operations` (work week, hours, holidays): the meeting door's work windows. */
+  operations: CharterOperations;
 }
+
+/** `finishSingle` under the name the meeting door imports: it parks a meeting plan on one confirmation. */
+export { finishSingle as finishSinglePlan };
 
 /**
  * The attached ids that are this business's documents, with their names, in
@@ -1009,7 +1042,10 @@ async function planPerCandidate(
 
   const ledgerEchoes: (string | null)[] = [];
   for (const option of options) ledgerEchoes.push(await ledgerEchoOf(door, option.plan));
-  const rendered = renderConfirmationQuestion(options, { currency: door.bundle.ceilings.currency, ledgerEchoes });
+  const rendered = renderConfirmationQuestion(options, {
+    currency: door.bundle.ceilings.currency,
+    extraEchoes: ledgerEchoes,
+  });
   if ('refused' in rendered) {
     await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
     return { status: 'refused', reason: rendered.refused };
@@ -1061,6 +1097,11 @@ async function finishSingle(
     label: string;
     contactSource: ConfirmationOption['contactSource'];
     identityNote: string | null;
+    /**
+     * Shown above the step echoes in place of the ledger echo (the meeting
+     * door passes its summary here). Absent: the plan's ledger echo, as before.
+     */
+    extraEcho?: string;
   },
 ): Promise<InstructionOutcome> {
   const { plan } = single;
@@ -1079,7 +1120,7 @@ async function finishSingle(
     };
     const rendered = renderConfirmationQuestion([option], {
       currency: door.bundle.ceilings.currency,
-      ledgerEchoes: [await ledgerEchoOf(door, plan)],
+      extraEchoes: [single.extraEcho ?? (await ledgerEchoOf(door, plan))],
     });
     if ('refused' in rendered) {
       await failJob(door, 'instruction door: confirmation question refused (step too long to show)');

@@ -347,7 +347,7 @@ async function reaskOne(
   });
   const rendered = renderConfirmationQuestion([option], {
     currency: active.bundle.ceilings.currency,
-    ledgerEchoes: [ledgerEcho],
+    extraEchoes: [ledgerEcho],
     reask: candidate.uncertain,
     alreadyDone: chosen.plan.steps.length - residual.steps.length,
   });

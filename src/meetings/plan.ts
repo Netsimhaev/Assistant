@@ -21,10 +21,14 @@
  *     so an unrelated event in another calendar that shares that id would be
  *     ignored too — the final check is what refuses that plan.
  *
- * Holds: Task 11 calls this twice — a dry run with `holdEventIds` empty, then,
- * after placing a hold for each create, again with the real ids. The hold
- * events named in `holdEventIds` are ignored as busy time, so the second run
- * finds the same slot the hold was placed on instead of being blocked by it.
+ * Holds: the meeting door (`door.ts`) builds ONCE with `holdEventIds` empty,
+ * places a hold at each planned create slot, then substitutes the hold ids into
+ * exactly those create step inputs with `withHoldIds` — nothing is recomputed,
+ * so the slot the owner is asked about is the slot that was held. The hold
+ * events named in `holdEventIds` (still accepted) are ignored as busy time.
+ *
+ * `exclude` (optional): intervals treated as busy, unpadded — the slots the
+ * owner already turned down with "תני אחר".
  */
 import { HOLD_TITLE_PREFIX } from '../calendar/calendar.js';
 import type { CalendarEvent } from '../calendar/types.js';
@@ -247,6 +251,7 @@ export function buildMeetingPlan(o: {
   now: Date;
   resolveClient: (name: string) => ResolvedClient;
   holdEventIds: ReadonlyMap<number, string>;
+  exclude?: readonly Interval[];
 }): MeetingPlanResult {
   const { snapshot, settings, timeZone } = o;
   const search: Search = { operations: o.operations, settings, timeZone, now: o.now };
@@ -254,6 +259,7 @@ export function buildMeetingPlan(o: {
   const holdIds = new Set(o.holdEventIds.values());
   const calendars = new Map(snapshot.calendars.map((c) => [c.calendarId, c]));
   const ops = o.request.ops;
+  const excluded: Interval[] = (o.exclude ?? []).map((i) => ({ start: i.start, end: i.end }));
 
   if (snapshot.truncated && ops.some((op) => op.kind === 'create' || op.kind === 'move')) {
     return { kind: 'refused', reason: TRUNCATED_REFUSAL };
@@ -334,7 +340,7 @@ export function buildMeetingPlan(o: {
     const copy = original.get(t.event) as CalendarEvent;
     const durationMin = Math.round((Date.parse(t.event.end) - Date.parse(t.event.start)) / MIN_MS);
     const ignore = new Set([...holdIds, t.event.eventId]);
-    const busy = busyIntervals(working(), gap, ignore);
+    const busy = [...busyIntervals(working(), gap, ignore), ...excluded];
     const slot = findSlots(freeIntervals(windowWork(search, op.window), busy), durationMin, 1, o.now.getTime())[0];
     if (slot === undefined) {
       return {
@@ -364,7 +370,7 @@ export function buildMeetingPlan(o: {
     if (calendars.get(calendarId)?.canWrite !== true) return { kind: 'refused', reason: READ_ONLY_CALENDAR_REFUSAL };
 
     const durationMin = op.durationMinutes ?? settings.defaultDurationMinutes;
-    const busy = busyIntervals(working(), gap, holdIds);
+    const busy = [...busyIntervals(working(), gap, holdIds), ...excluded];
     const slot = findSlots(freeIntervals(windowWork(search, op.window), busy), durationMin, 1, o.now.getTime())[0];
     if (slot === undefined) {
       return {
@@ -468,6 +474,34 @@ export function buildMeetingPlan(o: {
     estimatedCostMinor: 0,
   };
   return { kind: 'plan', plan, changes, summary };
+}
+
+/**
+ * Substitute a placed hold's event id into each named create step's input —
+ * and nothing else: every other byte of the plan stays as built, so the slot
+ * the owner is asked about is exactly the slot that was held. Each changed
+ * input is re-validated with `CalendarWriteInput`. Throws on a step id the plan
+ * does not have, on a step that is not a create, or on an input that no longer
+ * validates: a hold id that cannot be placed is a plan that must not be offered.
+ */
+export function withHoldIds(plan: Plan, holdByStepId: ReadonlyMap<string, string>): Plan {
+  const known = new Set(plan.steps.map((step) => step.id));
+  for (const stepId of holdByStepId.keys()) {
+    if (!known.has(stepId)) throw new Error(`withHoldIds: plan has no step ${stepId}`);
+  }
+  const steps = plan.steps.map((step) => {
+    const hold = holdByStepId.get(step.id);
+    if (hold === undefined) return step;
+    if (step.toolName !== 'calendar.write' || step.input['operation'] !== 'create') {
+      throw new Error(`withHoldIds: step ${step.id} is not a calendar create`);
+    }
+    const input: Record<string, unknown> = { ...step.input, holdEventId: hold };
+    if (!CalendarWriteInput.safeParse(input).success) {
+      throw new Error(`withHoldIds: step ${step.id} does not validate with its hold id`);
+    }
+    return { ...step, input };
+  });
+  return { ...plan, steps };
 }
 
 /** The exact `calendar.write` bytes of one change. Never carries the internal note. */

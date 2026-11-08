@@ -284,6 +284,13 @@ describe('renderStepEcho', () => {
 });
 
 describe('renderConfirmationQuestion', () => {
+  it('an extra echo sits under the label and above the step echo, which is still shown', () => {
+    const r = renderConfirmationQuestion([option('לקבוע', [MAIL])], { currency: 'ILS', extraEchoes: ['סיכום הפגישה'] });
+    if (!('text' in r)) throw new Error('refused');
+    expect(r.text.startsWith('לקבוע\nסיכום הפגישה\n')).toBe(true);
+    expect(r.text.indexOf('סיכום הפגישה')).toBeLessThan(r.text.indexOf('אל: ronit@beta.co.il'));
+  });
+
   it('one option: label, echo, and the confirm hint last', () => {
     const r = renderConfirmationQuestion([option('לשלוח לרונית', [MAIL])], { currency: 'ILS' });
     if (!('text' in r)) throw new Error('refused');

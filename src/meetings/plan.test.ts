@@ -10,6 +10,7 @@ import {
   organizerRefusal,
   READ_ONLY_CALENDAR_REFUSAL,
   renderMeetingSummary,
+  withHoldIds,
   type MeetingPlanResult,
   type ResolvedClient,
 } from './plan.js';
@@ -384,5 +385,59 @@ describe('renderMeetingSummary', () => {
       'America/New_York',
     );
     expect(text).toContain("קביעה: דני — יום ג' 17/11, 03:00–04:00");
+  });
+});
+
+describe('withHoldIds', () => {
+  it('substitutes the hold id into exactly the named create step and changes nothing else', () => {
+    const r = plan(build({ ops: [create()] }, snap([])));
+    expect(r.plan.steps[0]?.input['holdEventId']).toBeNull();
+    const out = withHoldIds(r.plan, new Map([['m1', 'hold-ev-9']]));
+    expect(out.steps[0]?.input).toEqual({ ...r.plan.steps[0]?.input, holdEventId: 'hold-ev-9' });
+    expect({ ...out, steps: [] }).toEqual({ ...r.plan, steps: [] });
+    expect(r.plan.steps[0]?.input['holdEventId']).toBeNull(); // the input is not mutated
+  });
+
+  it('refuses a step id the plan does not have, and a step that is not a create', () => {
+    const r = plan(build({ ops: [create()] }, snap([])));
+    expect(() => withHoldIds(r.plan, new Map([['m9', 'x']]))).toThrow(/no step m9/);
+    const moved = plan(
+      build(
+        {
+          ops: [
+            {
+              kind: 'move',
+              clientName: 'רונית לוי',
+              onDate: null,
+              window: { fromDate: '2026-11-18', toDate: '2026-11-18', fromTime: null, toTime: null },
+            },
+          ],
+        },
+        snap([ev({ eventId: 'r1', title: 'רונית לוי', start: '2026-11-17T08:00:00Z', end: '2026-11-17T09:00:00Z' })]),
+      ),
+    );
+    expect(() => withHoldIds(moved.plan, new Map([['m1', 'x']]))).toThrow(/not a calendar create/);
+  });
+});
+
+describe('buildMeetingPlan exclude', () => {
+  it('treats an excluded interval as busy, unpadded', () => {
+    const first = plan(build({ ops: [create()] }, snap([])));
+    const start = Date.parse(String(first.plan.steps[0]?.input['start']));
+    const end = Date.parse(String(first.plan.steps[0]?.input['end']));
+    const r = plan(
+      buildMeetingPlan({
+        request: { ops: [create()] },
+        snapshot: snap([]),
+        settings: SETTINGS,
+        operations: OPS,
+        timeZone: TZ,
+        now: NOW,
+        resolveClient,
+        holdEventIds: new Map(),
+        exclude: [{ start, end }],
+      }),
+    );
+    expect(r.plan.steps[0]?.input['start']).toBe(new Date(end).toISOString());
   });
 });

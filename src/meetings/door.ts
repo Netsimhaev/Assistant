@@ -1,22 +1,45 @@
 /**
- * The instruction door's calendar entry (calendar scheduling, spec §7). In this
- * task: the schedule answer only. Called by `runInstruction` after the charter
- * load and BEFORE `createJob`, so a question about the schedule opens no job and
- * stores no instruction row — it is a read, answered in the channel it came in.
+ * The instruction door's calendar entry (calendar scheduling, spec §7). Two
+ * entries:
+ *   - `answerScheduleQuery` — called by `runInstruction` after the charter load
+ *     and BEFORE `createJob`, so a question about the schedule opens no job and
+ *     stores no instruction row: it is a read, answered in the channel it came in.
+ *   - `runMeetingOperation` — called after the job reached `understand`, before
+ *     contact resolution: a meeting change, planned in code and parked on one
+ *     boss confirmation (see its docblock).
  */
-import { resolveCalendarAccess } from '../calendar/client-for.js';
-import { isCalendarFailure, type CalendarClient } from '../calendar/types.js';
+import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
+import { isCalendarFailure, type CalendarClient, type CalendarEvent } from '../calendar/types.js';
+import { config } from '../config.js';
+import { getPool } from '../db/pool.js';
+import type { Plan } from '../domain/plan.js';
+import type { ConfirmationOption } from '../governance/instruction-confirmations.js';
+import { cancelConfirmation, loadConfirmation } from '../governance/instruction-confirmations.js';
+import { loadInstructionForJob, recordQuestion } from '../governance/instructions.js';
+import { appearsVerbatimIn } from '../governance/typed-recipients.js';
+import { listContacts, type Contact } from '../memory/contacts.js';
+import { resolveContacts } from '../memory/contact-resolver.js';
+import { finishSinglePlan, type DoorContext, type InstructionOutcome } from '../orchestrator/instruct.js';
+import { PhaseMovedError, transition } from '../orchestrator/jobs.js';
 import type { Runtime } from '../orchestrator/runtime.js';
+import { runMeetingExtractor, type ExtractorOutcome, type MeetingExtractor } from '../sdk/meeting-extractor.js';
+import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 import { busyIntervals, freeIntervals, workWindows, type CharterOperations, type Interval } from './free-time.js';
+import { createHold, releaseHold } from './holds.js';
+import { buildMeetingPlan, withHoldIds, type ResolvedClient } from './plan.js';
 import {
+  hhmm,
+  localDayLabel,
   loadMeetingResponses,
   parseScheduleQuery,
   renderSchedule,
   UNRECOGNIZED_RANGE_REPLY,
 } from './query.js';
+import { isMeetingInstruction, verifyTypedEmails, type MeetingRequest } from './request.js';
 import { loadMeetingSettings } from './settings.js';
 import { loadCalendarRange } from './snapshot.js';
+import { recordProposedMeetings } from './store.js';
 
 export const WHATSAPP_MAX_CHARS = 4_000;
 export const CALENDAR_NOT_CONNECTED_REPLY = 'היומן לא מחובר — אפשר לחבר אותו במסך החיבורים.';
@@ -117,4 +140,514 @@ export async function answerScheduleQuery(o: {
       maxChars: WHATSAPP_MAX_CHARS,
     }),
   };
+}
+
+// --- Meeting operations (spec §7.2–§7.5) -------------------------------------
+
+export const MEETING_NOT_UNDERSTOOD_REPLY =
+  'לא הצלחתי להבין את בקשת הפגישה — אפשר לנסח שוב או להשתמש בטופס במסך הפגישות.';
+export const MEETING_SETTINGS_REQUIRED_REPLY = 'צריך קודם להגדיר את הגדרות הפגישות.';
+export const HOLD_FAILED_REPLY = 'לא הצלחתי לשמור את המועד ביומן — אפשר לנסות שוב עוד מעט.';
+export const MEETING_PREPARE_FAILED_REPLY = 'לא הצלחתי להכין את הפגישה לאישור — אפשר לנסות שוב.';
+export const OTHER_SLOT_FAILED_REPLY = 'לא הצלחתי להכין מועד אחר — אפשר לנסח את בקשת הפגישה מחדש.';
+const NO_ALTERNATIVES = 'לא מצאתי בשבועיים הקרובים';
+
+/** "תני אחר" / "תציעי מועד אחר": the owner turns down the slot in the open meeting question. */
+export const OTHER_SLOT_PATTERN = /^(תני|תציעי)\s+(מועד\s+)?אחר/u;
+
+/**
+ * Markers kept in a meeting plan's `assumptions` so a later "תני אחר" can re-run
+ * it with no state table: the job whose stored instruction is the original
+ * meeting text, and every slot already turned down. Part of the plan's bytes
+ * (and hash); never rendered to anyone.
+ */
+const SOURCE_MARKER = 'meeting-source:';
+const EXCLUDE_MARKER = 'meeting-exclude:';
+
+const EXTRACT_TIMEOUT_MS = 60_000;
+const HOLD_TIMEOUT_MS = 20_000;
+/** Past the last date a request names: room for the "next free" alternatives (spec §7.3). */
+const ALTERNATIVE_DAYS = 14;
+
+type Unavailable = 'not_connected' | 'needs_reauth' | 'credential_error';
+type CreateOp = Extract<MeetingRequest['ops'][number], { kind: 'create' }>;
+
+function clean(value: string | null | undefined): string {
+  return value === null || value === undefined ? '' : toOneLine(stripBidiControls(value));
+}
+
+function norm(name: string): string {
+  return clean(name).trim().toLowerCase();
+}
+
+function unavailableReply(kind: Unavailable): string {
+  return kind === 'needs_reauth'
+    ? CALENDAR_NEEDS_REAUTH_REPLY
+    : kind === 'credential_error'
+      ? CALENDAR_CREDENTIAL_REPLY
+      : CALENDAR_NOT_CONNECTED_REPLY;
+}
+
+async function failMeetingJob(door: DoorContext, audit: string, reason: string): Promise<InstructionOutcome> {
+  await transition(door.jobId, {
+    to: 'failed',
+    actor: 'orchestrator',
+    reason: `meeting door: ${audit}`,
+    businessId: door.businessId,
+  });
+  return { status: 'refused', reason };
+}
+
+async function askMeetingQuestion(door: DoorContext, question: string): Promise<InstructionOutcome> {
+  try {
+    await recordQuestion(door.instruction.instructionId, question, { businessId: door.businessId });
+  } catch {
+    // Best effort, exactly as the instruction door's own questions are.
+  }
+  return {
+    status: 'needs_answer',
+    jobId: door.jobId,
+    instructionId: door.instruction.instructionId,
+    question,
+    instructionText: door.instruction.text,
+    identityNote: null,
+  };
+}
+
+/** The extractor, with a throw read as `failed`: an SDK failure is never a guess. */
+async function extractSafely(
+  extractor: MeetingExtractor,
+  text: string,
+  now: Date,
+  timeZone: string,
+): Promise<ExtractorOutcome> {
+  try {
+    return await extractor({
+      text,
+      today: localParts(now, timeZone).date,
+      timeZone,
+      signal: AbortSignal.timeout(EXTRACT_TIMEOUT_MS),
+    });
+  } catch (err) {
+    return { status: 'failed', reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * An email or phone the model returned survives only if it appears in the
+ * text the owner gave (`verifyTypedEmails`, and its twin for phones here): a
+ * phone left in the request is shown as the owner's own (`phoneVerified`).
+ */
+function verifyTyped(request: MeetingRequest, text: string): MeetingRequest {
+  const emailsChecked = verifyTypedEmails(request, text);
+  return {
+    ops: emailsChecked.ops.map((op) => {
+      if (op.kind !== 'create' || op.client.phone === null) return op;
+      if (appearsVerbatimIn(op.client.phone, text)) return op;
+      return { ...op, client: { ...op.client, phone: null } };
+    }),
+  };
+}
+
+/** Every date the request names, plus today; a day before and the alternatives after. */
+function snapshotRange(request: MeetingRequest, today: string, timeZone: string): { fromIso: string; toIso: string } {
+  const dates: string[] = [today];
+  for (const op of request.ops) {
+    if (op.kind === 'create' || op.kind === 'move') dates.push(op.window.fromDate, op.window.toDate);
+    if (op.kind !== 'create' && op.onDate !== null) dates.push(op.onDate);
+  }
+  dates.sort();
+  const first = dates[0] as string;
+  const last = dates[dates.length - 1] as string;
+  return {
+    fromIso: localToInstant(addDays(first, -1), '00:00', timeZone).toISOString(),
+    toIso: localToInstant(addDays(last, ALTERNATIVE_DAYS + 1), '00:00', timeZone).toISOString(),
+  };
+}
+
+function slotText(start: number, end: number, timeZone: string): string {
+  return `${localDayLabel(start, timeZone)} ${hhmm(start, timeZone)}–${hhmm(end, timeZone)}`;
+}
+
+function noSlotQuestion(dayListing: string, alternatives: Interval[], timeZone: string): string {
+  const alts =
+    alternatives.length === 0
+      ? NO_ALTERNATIVES
+      : alternatives.map((a) => slotText(a.start, a.end, timeZone)).join(', ');
+  return `${dayListing}\n\nהחלון מלא. אפשר: להזיז מישהו ("תזיזי את X"), לבקש מועדים אחרים — הפנויים הקרובים: ${alts} — או לתת מועד אחר.`;
+}
+
+/** Calendar text (title, location) reaches the owner only cleaned and on one line. */
+function ambiguousQuestion(name: string, candidates: CalendarEvent[], timeZone: string): string {
+  const lines = candidates.map((e, i) => {
+    const start = Date.parse(e.start);
+    const end = Date.parse(e.end);
+    const when = Number.isFinite(start) && Number.isFinite(end) ? slotText(start, end, timeZone) : '(מועד לא ידוע)';
+    const title = clean(e.title) || '(ללא כותרת)';
+    const location = clean(e.location);
+    return `${i + 1}. ${when} · ${title}${location === '' ? '' : ` · 📍 ${location}`}`;
+  });
+  return [`יש כמה פגישות עם ${clean(name)} — לאיזו הכוונה?`, ...lines].join('\n');
+}
+
+/** Same reading as the instruction door's: `boss` only when every contact involved is the owner's word. */
+function contactSourceOf(involved: readonly Contact[]): ConfirmationOption['contactSource'] {
+  if (involved.length === 0) return null;
+  return involved.every((c) => c.provenance === 'boss') ? 'boss' : 'unverified';
+}
+
+/** The create / move slots of a plan: what "תני אחר" turns down. */
+function slotsOf(plan: Plan): Interval[] {
+  const out: Interval[] = [];
+  for (const step of plan.steps) {
+    const op = step.input['operation'];
+    if (op !== 'create' && op !== 'move') continue;
+    const start = Date.parse(String(step.input['start']));
+    const end = Date.parse(String(step.input['end']));
+    if (Number.isFinite(start) && Number.isFinite(end)) out.push({ start, end });
+  }
+  return out;
+}
+
+function markersOf(plan: Plan): { sourceJobId: string | null; exclude: Interval[] } {
+  let sourceJobId: string | null = null;
+  const exclude: Interval[] = [];
+  for (const a of plan.assumptions) {
+    if (a.startsWith(SOURCE_MARKER)) sourceJobId = a.slice(SOURCE_MARKER.length);
+    if (a.startsWith(EXCLUDE_MARKER)) {
+      const [s, e] = a.slice(EXCLUDE_MARKER.length).split('/');
+      const start = Date.parse(s ?? '');
+      const end = Date.parse(e ?? '');
+      if (Number.isFinite(start) && Number.isFinite(end)) exclude.push({ start, end });
+    }
+  }
+  return { sourceJobId, exclude };
+}
+
+/**
+ * The latest pending meeting question in this channel, inside the question
+ * window: a job still parked in `plan`, born at the instruction door, with
+ * `meetings` rows of its own. Never this instruction's own job.
+ */
+async function pendingMeetingQuestion(door: DoorContext): Promise<{ jobId: string; plan: Plan } | null> {
+  const windowMinutes = config.whatsappQuestionWindowMinutes;
+  if (windowMinutes <= 0) return null;
+  const { rows } = await getPool().query<{ job_id: string }>(
+    `SELECT c.job_id
+       FROM instruction_confirmations c
+       JOIN jobs j ON j.business_id = c.business_id AND j.job_id = c.job_id AND j.phase = 'plan'
+      WHERE c.business_id = $1 AND c.channel = $2 AND c.state = 'pending' AND c.job_id <> $3
+        AND c.presented_at > now() - make_interval(mins => $4)
+        AND EXISTS (SELECT 1 FROM boss_instructions b WHERE b.business_id = c.business_id AND b.job_id = c.job_id)
+        AND EXISTS (SELECT 1 FROM meetings m WHERE m.business_id = c.business_id AND m.job_id = c.job_id)
+      ORDER BY c.presented_at DESC
+      LIMIT 1`,
+    [door.businessId, door.channel, door.jobId, windowMinutes],
+  );
+  const jobId = rows[0]?.job_id;
+  if (jobId === undefined) return null;
+  const confirmation = await loadConfirmation(jobId, { businessId: door.businessId });
+  const option = confirmation?.options[0];
+  if (confirmation === null || option === undefined || confirmation.options.length !== 1) return null;
+  return { jobId, plan: option.plan };
+}
+
+/** Best effort: a hold this misses is released by `sweepHolds` once its job is closed or failed. */
+async function releaseHoldIds(access: CalendarAccess, businessId: string, holdIds: readonly string[]): Promise<void> {
+  for (const holdId of holdIds) {
+    try {
+      await releaseHold({ access, businessId, holdId, signal: AbortSignal.timeout(HOLD_TIMEOUT_MS) });
+    } catch {
+      // swept later
+    }
+  }
+}
+
+async function releaseJobHolds(access: CalendarAccess, businessId: string, jobId: string): Promise<void> {
+  const { rows } = await getPool().query<{ hold_id: string }>(
+    `SELECT hold_id FROM meeting_holds WHERE business_id = $1 AND job_id = $2 AND state = 'held'`,
+    [businessId, jobId],
+  );
+  await releaseHoldIds(access, businessId, rows.map((r) => r.hold_id));
+}
+
+/** The proposal never reached the owner: its rows stop reading as proposed. */
+async function abandonProposed(door: DoorContext): Promise<void> {
+  try {
+    await getPool().query(
+      `UPDATE meetings SET state = 'abandoned', updated_at = now()
+        WHERE business_id = $1 AND job_id = $2 AND state = 'proposed'`,
+      [door.businessId, door.jobId],
+    );
+  } catch {
+    // best effort
+  }
+}
+
+/**
+ * The instruction door's meeting branch (spec §7.2–§7.5). Called by
+ * `runInstruction` after the job reached `understand`, only when the caller
+ * passed calendar access. `null`: not a meeting instruction, and the general
+ * planner continues.
+ *
+ * The plan is built in code (`buildMeetingPlan`) ONCE; a hold is placed at each
+ * planned create slot (the one documented gate bypass, `holds.ts`), the hold
+ * ids are substituted into exactly those create inputs (`withHoldIds`), and the
+ * plan parks on ONE boss confirmation through the instruction door's own
+ * `finishSingle` — so every write runs later through `runPlan` → the gate →
+ * `confirmedCommandCovers`, with no new exemption. Any failure after a hold
+ * was placed releases every hold this call placed.
+ *
+ * "תני אחר": the open meeting question in this channel is cancelled, its holds
+ * released, and the ORIGINAL meeting text (the job named by the plan's source
+ * marker, else the turned-down job itself) is extracted again with every slot
+ * already turned down treated as busy.
+ */
+export async function runMeetingOperation(
+  door: DoorContext,
+  o: {
+    request?: MeetingRequest;
+    extractor?: MeetingExtractor;
+    runtime: Pick<Runtime, 'credentials'>;
+    client?: CalendarClient;
+    now?: Date;
+  },
+): Promise<InstructionOutcome | null> {
+  const now = o.now ?? new Date();
+  const extractor = o.extractor ?? runMeetingExtractor;
+  const ownText = stripBidiControls(door.instruction.text).trim();
+
+  let request: MeetingRequest;
+  /** The text the request was read from — the one typed emails and phones are checked against. */
+  let sourceText = door.instruction.text;
+  let sourceJobId = door.jobId;
+  let exclude: Interval[] = [];
+  let access: CalendarAccess | null = null;
+
+  const resolveAccess = (): Promise<CalendarAccess | { unavailable: Unavailable }> =>
+    resolveCalendarAccess({
+      businessId: door.businessId,
+      runtime: o.runtime,
+      ...(o.client !== undefined ? { client: o.client } : {}),
+    });
+
+  if (o.request !== undefined) {
+    request = o.request;
+  } else if (OTHER_SLOT_PATTERN.test(ownText)) {
+    const previous = await pendingMeetingQuestion(door);
+    if (previous === null) return null;
+    const resolved = await resolveAccess();
+    if ('unavailable' in resolved) {
+      return failMeetingJob(door, `calendar ${resolved.unavailable}`, unavailableReply(resolved.unavailable));
+    }
+    access = resolved;
+
+    // The question is turned down first: nothing can confirm it any more, and its hold goes.
+    await cancelConfirmation(previous.jobId, 'meeting-door:other-slot', { businessId: door.businessId });
+    try {
+      await transition(previous.jobId, {
+        to: 'closed',
+        actor: 'human',
+        reason: 'meeting door: the owner asked for another slot',
+        businessId: door.businessId,
+        expectFrom: 'plan',
+      });
+    } catch (err) {
+      // Moved on by someone else (the settle sweep closes a cancelled question too).
+      if (!(err instanceof PhaseMovedError)) throw err;
+    }
+    await releaseJobHolds(access, door.businessId, previous.jobId);
+
+    const markers = markersOf(previous.plan);
+    sourceJobId = markers.sourceJobId ?? previous.jobId;
+    exclude = [...markers.exclude, ...slotsOf(previous.plan)];
+    const source = await loadInstructionForJob(sourceJobId, { businessId: door.businessId });
+    if (source === null) return failMeetingJob(door, 'source instruction not found', OTHER_SLOT_FAILED_REPLY);
+    sourceText = source.text;
+    const extracted = await extractSafely(extractor, sourceText, now, door.timeZone);
+    if (extracted.status !== 'extracted') {
+      return failMeetingJob(door, `re-extraction ${extracted.status}`, OTHER_SLOT_FAILED_REPLY);
+    }
+    request = verifyTyped(extracted.request, sourceText);
+  } else {
+    if (!isMeetingInstruction(door.instruction.text)) return null;
+    const extracted = await extractSafely(extractor, door.instruction.text, now, door.timeZone);
+    if (extracted.status === 'not_meeting') return null;
+    if (extracted.status === 'failed') {
+      return failMeetingJob(door, `extraction failed (${extracted.reason})`, MEETING_NOT_UNDERSTOOD_REPLY);
+    }
+    request = verifyTyped(extracted.request, door.instruction.text);
+  }
+
+  if (access === null) {
+    const resolved = await resolveAccess();
+    if ('unavailable' in resolved) {
+      return failMeetingJob(door, `calendar ${resolved.unavailable}`, unavailableReply(resolved.unavailable));
+    }
+    access = resolved;
+  }
+  const calendar: CalendarAccess = access;
+
+  const settings = await loadMeetingSettings({ businessId: door.businessId });
+  if (settings.locationKind === null) {
+    return failMeetingJob(door, 'meeting settings not set', MEETING_SETTINGS_REQUIRED_REPLY);
+  }
+
+  const range = snapshotRange(request, localParts(now, door.timeZone).date, door.timeZone);
+  let snapshot: Awaited<ReturnType<typeof loadCalendarRange>>;
+  try {
+    snapshot = await loadCalendarRange({
+      access: calendar,
+      businessId: door.businessId,
+      settings,
+      timeZone: door.timeZone,
+      fromIso: range.fromIso,
+      toIso: range.toIso,
+      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+    });
+  } catch {
+    return failMeetingJob(door, 'calendar read threw', CALENDAR_READ_FAILED_REPLY);
+  }
+  if (isCalendarFailure(snapshot)) {
+    return failMeetingJob(
+      door,
+      `calendar read ${snapshot.failure}`,
+      snapshot.failure === 'auth' ? CALENDAR_NEEDS_REAUTH_REPLY : CALENDAR_READ_FAILED_REPLY,
+    );
+  }
+
+  // A failed contact read degrades to no memory, like the instruction door's.
+  let contacts: Contact[] = [];
+  try {
+    contacts = await listContacts({ businessId: door.businessId });
+  } catch {
+    contacts = [];
+  }
+  const used: Contact[] = [];
+  const typedClients = request.ops.filter((op): op is CreateOp => op.kind === 'create');
+  const resolveClient = (name: string): ResolvedClient => {
+    const key = norm(name);
+    const typed = typedClients.find((op) => norm(op.client.name) === key);
+    let email: string | null = null;
+    let emailVerified = false;
+    let phone: string | null = null;
+    let phoneVerified = false;
+    if (typed !== undefined && typed.client.email !== null) {
+      // Survived `verifyTypedEmails`: it appears in the text the owner gave.
+      email = typed.client.email;
+      emailVerified = true;
+    }
+    if (typed !== undefined && typed.client.phone !== null) {
+      phone = typed.client.phone;
+      phoneVerified = appearsVerbatimIn(phone, sourceText);
+    }
+    if (email === null) {
+      const subjects = resolveContacts(name, contacts).subjects;
+      const matched = contacts.filter((c) => c.subjectKeys.some((k) => subjects.includes(k)));
+      const only = matched[0];
+      if (matched.length === 1 && only !== undefined && only.email !== null) {
+        email = only.email;
+        emailVerified = false;
+        if (!used.includes(only)) used.push(only);
+      }
+    }
+    return { name, email, emailVerified, phone, phoneVerified };
+  };
+
+  const result = buildMeetingPlan({
+    request,
+    snapshot,
+    settings,
+    operations: door.operations,
+    timeZone: door.timeZone,
+    now,
+    resolveClient,
+    holdEventIds: new Map(),
+    exclude,
+  });
+
+  switch (result.kind) {
+    case 'no_slot':
+      return askMeetingQuestion(door, noSlotQuestion(result.dayListing, result.alternatives, door.timeZone));
+    case 'ambiguous':
+      return askMeetingQuestion(door, ambiguousQuestion(result.clientName, result.candidates, door.timeZone));
+    case 'not_found':
+      return askMeetingQuestion(door, `לא מצאתי פגישה עם ${clean(result.clientName)} בטווח.`);
+    case 'refused':
+      return failMeetingJob(door, 'plan refused', result.reason);
+    case 'plan':
+      break;
+  }
+
+  const assumptions: string[] = [];
+  if (sourceJobId !== door.jobId) assumptions.push(`${SOURCE_MARKER}${sourceJobId}`);
+  for (const i of exclude) {
+    assumptions.push(`${EXCLUDE_MARKER}${new Date(i.start).toISOString()}/${new Date(i.end).toISOString()}`);
+  }
+  const built: Plan = { ...result.plan, assumptions };
+
+  // Holds at exactly the planned create slots, in the write calendar the plan
+  // chose (`settings.writeCalendarId ?? the snapshot's primary calendar`).
+  const placed: string[] = [];
+  const holdByStepId = new Map<string, string>();
+  for (const [i, change] of result.changes.entries()) {
+    if (change.op !== 'create') continue;
+    const step = built.steps[i];
+    let hold: Awaited<ReturnType<typeof createHold>> | null = null;
+    if (step !== undefined) {
+      try {
+        hold = await createHold({
+          access: calendar,
+          businessId: door.businessId,
+          jobId: door.jobId,
+          calendarId: change.calendarId,
+          start: change.start,
+          end: change.end,
+          clientName: change.client.name,
+          signal: AbortSignal.timeout(HOLD_TIMEOUT_MS),
+        });
+      } catch {
+        hold = null;
+      }
+    }
+    if (step === undefined || hold === null || isCalendarFailure(hold)) {
+      await releaseHoldIds(calendar, door.businessId, placed);
+      return failMeetingJob(door, 'hold could not be placed', HOLD_FAILED_REPLY);
+    }
+    placed.push(hold.holdId);
+    holdByStepId.set(step.id, hold.eventId);
+  }
+
+  const undo = async (audit: string): Promise<InstructionOutcome> => {
+    await releaseHoldIds(calendar, door.businessId, placed);
+    await abandonProposed(door);
+    return failMeetingJob(door, audit, MEETING_PREPARE_FAILED_REPLY);
+  };
+
+  let plan: Plan;
+  try {
+    plan = withHoldIds(built, holdByStepId);
+    await recordProposedMeetings({ businessId: door.businessId, jobId: door.jobId, plan, changes: result.changes });
+  } catch (err) {
+    return undo(`could not record the proposal (${err instanceof Error ? err.message : String(err)})`);
+  }
+
+  let outcome: InstructionOutcome;
+  try {
+    outcome = await finishSinglePlan(door, {
+      plan,
+      label: result.summary.split('\n')[0] || 'שינוי פגישות',
+      contactSource: contactSourceOf(used),
+      identityNote: null,
+      extraEcho: result.summary,
+    });
+  } catch (err) {
+    return undo(`could not park the confirmation (${err instanceof Error ? err.message : String(err)})`);
+  }
+  if (outcome.status === 'refused') {
+    // `finishSingle` already failed the job; the holds and rows are ours to undo.
+    await releaseHoldIds(calendar, door.businessId, placed);
+    await abandonProposed(door);
+  }
+  return outcome;
 }
