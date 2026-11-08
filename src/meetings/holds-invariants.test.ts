@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
  * who may import it, not about what it does when called.
  */
 describe('holds bypass invariants', () => {
-  it('writes no attendee but the empty list, and calls only createEvent and deleteEvent on the client', async () => {
+  it('writes no attendee but the empty list, and calls only createEvent, getEvent and deleteEvent on the client', async () => {
     const source = await readFile('src/meetings/holds.ts', 'utf8');
     const code = source
       .split('\n')
@@ -18,10 +18,15 @@ describe('holds bypass invariants', () => {
     expect(attendees.length).toBeGreaterThan(0);
     for (const a of attendees) expect(a).toBe('[]');
 
+    // The literal passed to createEvent may not smuggle attendees in by spread.
+    const at = code.indexOf('.client.createEvent(');
+    const literal = code.slice(at, code.indexOf('`hold:', at));
+    expect(literal).not.toContain('...');
+
     const methods = new Set([...code.matchAll(/\.client\.(\w+)\(/g)].map((m) => m[1]));
-    expect([...methods].sort()).toEqual(['createEvent', 'deleteEvent']);
+    expect([...methods].sort()).toEqual(['createEvent', 'deleteEvent', 'getEvent']);
     // No other way to reach the client.
-    expect(code).not.toMatch(/\b(updateEvent|getEvent|listEvents|listCalendars)\b/);
+    expect(code).not.toMatch(/\b(updateEvent|listEvents|listCalendars)\b/);
   });
 
   it('is imported only by door.ts and sync.ts', async () => {

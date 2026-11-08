@@ -8,7 +8,7 @@ import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { CALENDAR_SYSTEM, HOLD_TITLE_PREFIX } from '../calendar/calendar.js';
 import type { CalendarAccess } from '../calendar/client-for.js';
-import type { CalendarClient, EventWrite } from '../calendar/types.js';
+import type { CalendarClient, CalendarEvent, EventWrite } from '../calendar/types.js';
 import { createHold, markHoldConverted, releaseHold, sweepHolds } from './holds.js';
 
 const BUSINESS = config.businessId;
@@ -19,7 +19,13 @@ interface Call {
   args: unknown[];
 }
 
-function fake(opts: { deleteResult?: 'not_found' | 'transient' } = {}): { client: CalendarClient; calls: Call[] } {
+function fake(
+  opts: {
+    deleteResult?: 'not_found' | 'transient';
+    current?: Partial<CalendarEvent> | 'not_found';
+    createdId?: string;
+  } = {},
+): { client: CalendarClient; calls: Call[] } {
   const calls: Call[] = [];
   let n = 0;
   const unused = async (): Promise<never> => {
@@ -28,12 +34,31 @@ function fake(opts: { deleteResult?: 'not_found' | 'transient' } = {}): { client
   const client: CalendarClient = {
     listCalendars: unused,
     listEvents: unused,
-    getEvent: unused,
+    async getEvent(...args) {
+      calls.push({ op: 'get', args });
+      if (opts.current === 'not_found') return { failure: 'not_found', status: 404, message: 'x' };
+      return {
+        calendarId: 'cal-1',
+        eventId: String(args[2]),
+        title: `${HOLD_TITLE_PREFIX}דנה`,
+        start: '2026-11-10T08:00:00.000Z',
+        end: '2026-11-10T09:00:00.000Z',
+        allDay: false,
+        location: null,
+        description: null,
+        organizerIsSelf: true,
+        busy: true,
+        selfDeclined: false,
+        transactionId: null,
+        attendees: [],
+        ...(opts.current ?? {}),
+      };
+    },
     updateEvent: unused,
     async createEvent(...args) {
       calls.push({ op: 'create', args });
       n += 1;
-      return { eventId: `ev-${n}` };
+      return { eventId: opts.createdId ?? `ev-${n}` };
     },
     async deleteEvent(...args) {
       calls.push({ op: 'delete', args });
@@ -107,7 +132,7 @@ describe('holds', () => {
     expect(write.description).toBe('שמירת מקום של העוזרת — ממתינה לאישור שלך.');
     expect(write.title.startsWith(HOLD_TITLE_PREFIX)).toBe(true);
     expect(write.title).not.toMatch(/[‮\n]/);
-    expect(calls[0]?.args[3]).toBe(`hold:${jobId}`);
+    expect(calls[0]?.args[3]).toBe(`hold:${h.holdId}`);
     expect(await state(h.holdId)).toBe('held');
 
     const { rows } = await getPool().query<Record<string, unknown>>(
@@ -124,7 +149,7 @@ describe('holds', () => {
     const r = await releaseHold({ access: accessOf(client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
     expect(r).toBe('released');
     expect(calls.filter((c) => c.op === 'delete')).toHaveLength(1);
-    expect(calls[1]?.args[2]).toBe(h.eventId);
+    expect(calls.find((c) => c.op === 'delete')?.args[2]).toBe(h.eventId);
     expect(await state(h.holdId)).toBe('released');
     const again = await releaseHold({ access: accessOf(client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
     expect(again).toBe('already');
@@ -159,14 +184,54 @@ describe('holds', () => {
   it('does not delete a converted hold', async () => {
     const { client, calls } = fake();
     const h = await hold(client, await newJob());
-    await markHoldConverted({ businessId: BUSINESS, eventId: h.eventId });
+    await markHoldConverted({ businessId: BUSINESS, calendarId: 'cal-1', eventId: h.eventId });
     expect(await state(h.holdId)).toBe('converted');
     const r = await releaseHold({ access: accessOf(client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
     expect(r).toBe('already');
     expect(calls.filter((c) => c.op === 'delete')).toHaveLength(0);
   });
 
-  it('sweep releases holds of closed jobs and expired questions but not of executing jobs', async () => {
+  it.each([
+    ['attendees', { attendees: [{ email: 'a@b.co', response: 'accepted' as const }] }],
+    ['a non-prefix title', { title: 'פגישה עם דנה' }],
+    ['another organizer', { organizerIsSelf: false }],
+  ])('does not delete an event that is no longer a hold (%s) and marks it converted', async (_n, current) => {
+    const created = fake();
+    const h = await hold(created.client, await newJob());
+    const conv = fake({ current });
+    const r = await releaseHold({ access: accessOf(conv.client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
+    expect(r).toBe('already');
+    expect(conv.calls.filter((c) => c.op === 'delete')).toHaveLength(0);
+    expect(await state(h.holdId)).toBe('converted');
+  });
+
+  it('counts a getEvent not_found as released without a delete', async () => {
+    const created = fake();
+    const h = await hold(created.client, await newJob());
+    const gone = fake({ current: 'not_found' });
+    const r = await releaseHold({ access: accessOf(gone.client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
+    expect(r).toBe('released');
+    expect(gone.calls.filter((c) => c.op === 'delete')).toHaveLength(0);
+  });
+
+  it('never releases a hold of another business', async () => {
+    const { client, calls } = fake();
+    const h = await hold(client, await newJob());
+    const r = await releaseHold({ access: accessOf(client), businessId: 'other-biz', holdId: h.holdId, signal: SIGNAL });
+    expect(r).toMatchObject({ failure: 'rejected' });
+    expect(calls.filter((c) => c.op === 'delete')).toHaveLength(0);
+    expect(await state(h.holdId)).toBe('held');
+  });
+
+  it('does not delete an event another row already references when its own insert fails', async () => {
+    const first = fake({ createdId: 'shared-ev' });
+    await hold(first.client, await newJob());
+    const second = fake({ createdId: 'shared-ev' });
+    await expect(hold(second.client, await newJob())).rejects.toThrow();
+    expect(second.calls.filter((c) => c.op === 'delete')).toHaveLength(0);
+  });
+
+  it('sweep releases holds of closed jobs and stale questions but never of confirmed or executing jobs', async () => {
     await upsertBinding(
       {
         system: CALENDAR_SYSTEM,
@@ -180,30 +245,34 @@ describe('holds', () => {
       { businessId: BUSINESS, by: 'test' },
     );
     const { client } = fake();
+    const age = async (id: string): Promise<void> => {
+      await getPool().query("UPDATE meeting_holds SET created_at = now() - interval '2 hours' WHERE hold_id = $1", [id]);
+    };
     const closed = await hold(client, await newJob('closed'));
-    const orphan = await hold(client, await newJob('plan')); // no confirmation row: question gone
-    const executing = await hold(client, await newJob('execute'));
-    const asking = await newJob('plan');
-    await addConfirmation(asking, 'pending');
-    const waiting = await hold(client, asking);
-    const confirmedJob = await newJob('plan');
-    await addConfirmation(confirmedJob, 'confirmed');
-    const confirmed = await hold(client, confirmedJob);
-    const old = await newJob('plan');
-    await addConfirmation(old, 'pending');
-    const stale = await hold(client, old);
-    await getPool().query(
-      "UPDATE meeting_holds SET created_at = now() - interval '2 hours' WHERE hold_id = $1",
-      [stale.holdId],
-    );
+    const orphan = await hold(client, await newJob('plan')); // no confirmation row
+    const askingJob = await newJob('plan');
+    await addConfirmation(askingJob, 'pending');
+    const waiting = await hold(client, askingJob); // fresh and still asking
+    const staleJob = await newJob('plan');
+    await addConfirmation(staleJob, 'pending');
+    const stale = await hold(client, staleJob);
+    await age(stale.holdId);
+    const cancelledJob = await newJob('plan');
+    await addConfirmation(cancelledJob, 'cancelled');
+    const cancelled = await hold(client, cancelledJob);
+    const keep: string[] = [];
+    for (const phase of ['execute', 'verify', 'remember', 'followup', 'await_approval', 'plan']) {
+      const j = await newJob(phase);
+      await addConfirmation(j, 'confirmed');
+      const h = await hold(client, j);
+      await age(h.holdId);
+      keep.push(h.holdId);
+    }
 
     const out = await sweepHolds({ businessId: BUSINESS, runtime, client });
-    expect(out).toEqual({ released: 3, failed: 0 });
-    expect(await state(closed.holdId)).toBe('released');
-    expect(await state(orphan.holdId)).toBe('released');
-    expect(await state(stale.holdId)).toBe('released');
-    expect(await state(executing.holdId)).toBe('held');
+    expect(out).toEqual({ released: 4, failed: 0 });
+    for (const h of [closed, orphan, stale, cancelled]) expect(await state(h.holdId)).toBe('released');
     expect(await state(waiting.holdId)).toBe('held');
-    expect(await state(confirmed.holdId)).toBe('held');
+    for (const id of keep) expect(await state(id)).toBe('held');
   });
 });
