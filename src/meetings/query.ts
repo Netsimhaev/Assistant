@@ -26,7 +26,20 @@ export const TRUNCATED_SNAPSHOT_WARNING = '⚠️ ביומן יותר אירוע
 
 // --- Parsing ------------------------------------------------------------------
 
-const QUESTION = /מה\s+יש\s+לי|מה\s+ה?לו"?ז|מה\s+ב?ה?יומן/u;
+/**
+ * Trigger phrases, as WHOLE tokens ("סמה ביומן", "ליוסי" and "מה הלוז של דני" are not
+ * schedule questions). `לו"ז` is folded to `לוז` before tokenising.
+ */
+const TRIGGERS: readonly (readonly string[])[] = [
+  ['מה', 'יש', 'לי'],
+  ['מה', 'הלוז'],
+  ['מה', 'לוז'],
+  ['מה', 'ביומן'],
+  ['מה', 'יש', 'ביומן'],
+];
+/** Words that may sit beside the trigger without saying anything else. */
+const FILLERS: ReadonlySet<string> = new Set(['בבקשה', 'לי', 'אז', 'נא', 'ב', 'ל', 'ביום', 'ליום', 'יום']);
+const DATE_TOKEN = /^\d{1,2}\/\d{1,2}$/u;
 const WEEKDAY_INDEX: Readonly<Record<string, number>> = {
   ראשון: 0,
   שני: 1,
@@ -61,55 +74,101 @@ function isRealDate(y: number, m: number, d: number): boolean {
   return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d;
 }
 
+type RangeItem =
+  | { kind: 'date'; day: number; month: number }
+  | { kind: 'offset'; days: number }
+  | { kind: 'thisWeek'; next: boolean }
+  | { kind: 'week'; next: boolean }
+  | { kind: 'weekday'; index: number; next: boolean };
+
+/** `היום`, `למחר`, `בשלישי` … : the word itself, or the word after one ב/ל prefix. */
+function rangeWord(token: string): RangeItem | null {
+  for (const word of [token, token.startsWith('ב') || token.startsWith('ל') ? token.slice(1) : '']) {
+    if (word === '') continue;
+    if (word === 'היום') return { kind: 'offset', days: 0 };
+    if (word === 'מחר') return { kind: 'offset', days: 1 };
+    if (word === 'מחרתיים') return { kind: 'offset', days: 2 };
+    if (word === 'השבוע') return { kind: 'thisWeek', next: false };
+    if (word === 'שבוע') return { kind: 'week', next: false };
+    if (Object.hasOwn(WEEKDAY_INDEX, word)) return { kind: 'weekday', index: WEEKDAY_INDEX[word] as number, next: false };
+  }
+  return null;
+}
+
 /**
- * `null`: not a schedule question at all. `'unrecognized_range'`: it is one,
- * but no range word was found. Otherwise the inclusive local range.
+ * `null`: not a schedule question — it goes to the planner. The text counts as one
+ * ONLY when, besides the trigger ("מה יש לי", "מה הלוז", "מה ביומן"), every token is a
+ * range word, a range preposition, a date, or a filler: anything else ("מה יש לי
+ * במייל", "מה הלוז של דני מחר", "כמה יש לי בחשבון היום") is some other request.
+ * `'unrecognized_range'`: the bare trigger (or fillers only) with no range at all.
+ * Otherwise the inclusive local range.
  */
 export function parseScheduleQuery(text: string, now: Date, timeZone: string): QueryRange | 'unrecognized_range' | null {
-  const normalised = stripBidiControls(text).replace(/[״”“]/gu, '"').replace(/[׳’‘]/gu, "'");
-  if (!QUESTION.test(normalised)) return null;
+  const folded = stripBidiControls(text).replace(/לו["״”“]ז/gu, 'לוז');
+  const tokens = folded.split(/[^\p{L}\p{N}/]+/u).filter((t) => t !== '');
+
+  let rest: string[] | null = null;
+  for (let i = 0; i < tokens.length && rest === null; i += 1) {
+    for (const trigger of TRIGGERS) {
+      if (trigger.every((word, k) => tokens[i + k] === word)) {
+        rest = [...tokens.slice(0, i), ...tokens.slice(i + trigger.length)];
+        break;
+      }
+    }
+  }
+  if (rest === null) return null;
+
+  let item = null as RangeItem | null;
+  for (const token of rest) {
+    if (token === 'הבא') {
+      const current: RangeItem | null = item;
+      if (current === null || current.kind === 'date' || current.kind === 'offset' || current.next) return null;
+      item = { ...current, next: true };
+      continue;
+    }
+    if (FILLERS.has(token)) continue;
+    const parsed = DATE_TOKEN.test(token)
+      ? ((m) => ({ kind: 'date', day: Number(m[0]), month: Number(m[1]) }) as RangeItem)(token.split('/'))
+      : rangeWord(token);
+    if (parsed === null || item !== null) return null;
+    item = parsed;
+  }
+  if (item === null) return 'unrecognized_range';
 
   const today = localParts(now, timeZone);
   const todayIndex = WEEKDAY_ORDER.indexOf(today.weekday);
-  const tokens = normalised.split(/[^\p{L}\p{N}/]+/u).filter((t) => t !== '');
-  const has = (word: string): boolean => tokens.some((t) => t === word || t === `ל${word}` || t === `ב${word}`);
   const single = (date: string): QueryRange => ({ fromDate: date, toDate: date });
-
-  const dm = /(\d{1,2})\/(\d{1,2})/u.exec(normalised);
-  if (dm !== null) {
-    const day = Number(dm[1]);
-    const month = Number(dm[2]);
-    const year = Number(today.date.slice(0, 4));
-    if (!isRealDate(year, month, day)) return 'unrecognized_range';
-    let date = `${year}-${pad2(month)}-${pad2(day)}`;
-    // A date already past this year means the next occurrence.
-    if (date < today.date) {
-      if (!isRealDate(year + 1, month, day)) return 'unrecognized_range';
-      date = `${year + 1}-${pad2(month)}-${pad2(day)}`;
-    }
-    return single(date);
-  }
-
-  if (has('מחרתיים')) return single(addDays(today.date, 2));
-  if (has('מחר')) return single(addDays(today.date, 1));
-  if (tokens.includes('היום')) return single(today.date);
-
-  const weekIndex = tokens.findIndex((t) => t === 'שבוע' || t === 'בשבוע' || t === 'לשבוע');
-  if (weekIndex >= 0 && tokens[weekIndex + 1] === 'הבא') {
-    // Next Sunday through Saturday (today, if it is Saturday, is the last day of this week).
+  // Next Sunday through Saturday.
+  const nextWeek = (): QueryRange => {
     const start = addDays(today.date, 7 - todayIndex);
     return { fromDate: start, toDate: addDays(start, 6) };
-  }
-  if (tokens.includes('השבוע')) return { fromDate: today.date, toDate: addDays(today.date, 6 - todayIndex) };
+  };
 
-  for (const t of tokens) {
-    const name = Object.hasOwn(WEEKDAY_INDEX, t) ? t : t.startsWith('ב') ? t.slice(1) : '';
-    if (name !== '' && Object.hasOwn(WEEKDAY_INDEX, name)) {
-      // The next occurrence, today included.
-      return single(addDays(today.date, (((WEEKDAY_INDEX[name] as number) - todayIndex) % 7 + 7) % 7));
+  switch (item.kind) {
+    case 'date': {
+      const year = Number(today.date.slice(0, 4));
+      if (!isRealDate(year, item.month, item.day)) return 'unrecognized_range';
+      let date = `${year}-${pad2(item.month)}-${pad2(item.day)}`;
+      // A date already past this year means the next occurrence.
+      if (date < today.date) {
+        if (!isRealDate(year + 1, item.month, item.day)) return 'unrecognized_range';
+        date = `${year + 1}-${pad2(item.month)}-${pad2(item.day)}`;
+      }
+      return single(date);
+    }
+    case 'offset':
+      return single(addDays(today.date, item.days));
+    case 'week':
+      // "שבוע" alone says nothing about which week.
+      return item.next ? nextWeek() : 'unrecognized_range';
+    case 'thisWeek':
+      return item.next ? nextWeek() : { fromDate: today.date, toDate: addDays(today.date, 6 - todayIndex) };
+    case 'weekday': {
+      // The next occurrence, today included; "… הבא" is the one after it.
+      const coming = ((item.index - todayIndex) % 7 + 7) % 7;
+      return single(addDays(today.date, coming + (item.next ? 7 : 0)));
     }
   }
-  return 'unrecognized_range';
 }
 
 // --- Responses ----------------------------------------------------------------
@@ -145,13 +204,19 @@ function clean(value: string | null): string {
   return value === null ? '' : toOneLine(stripBidiControls(value));
 }
 
+/** First line with visible text: bidi controls are stripped BEFORE the emptiness test. */
 function firstLine(value: string | null): string {
   if (value === null) return '';
-  const line = value.split(/\r\n|[\r\n\u2028\u2029]/u).find((l) => toOneLine(l) !== '');
-  return line === undefined ? '' : clean(line);
+  for (const line of value.split(/\r\n|[\r\n\u2028\u2029]/u)) {
+    const cleaned = clean(line);
+    if (cleaned !== '') return cleaned;
+  }
+  return '';
 }
 
 function responseLine(event: CalendarEvent, responses: ReadonlyMap<string, MeetingResponse>): string {
+  // The owner declined it himself: still on the calendar, so still listed.
+  if (event.selfDeclined) return '  ❌ דחית';
   const known = responses.get(event.eventId);
   if (known !== undefined) return `  ${RESPONSE_LABEL[known]}`;
   if (event.attendees.length === 0) return '';
@@ -228,7 +293,6 @@ export function renderSchedule(o: {
     const dayStart = localToInstant(date, '00:00', tz).getTime();
     const dayEnd = localToInstant(addDays(date, 1), '00:00', tz).getTime();
     const events = o.snapshot.events
-      .filter((e) => !e.selfDeclined)
       .filter((e) => {
         const s = Date.parse(e.start);
         const en = Date.parse(e.end);
@@ -237,7 +301,7 @@ export function renderSchedule(o: {
       .sort((a, b) => Date.parse(a.start) - Date.parse(b.start) || a.title.localeCompare(b.title));
 
     const weekday = localParts(new Date(dayStart + 12 * 3_600_000), tz).weekday;
-    const pieces = [`*יום ${WEEKDAY_LETTER[weekday]} ${formatDate(date)} — ${meetingsLabel(events.length)}*`];
+    const pieces = [`*יום ${WEEKDAY_LETTER[weekday]} ${formatDate(date)} — ${meetingsLabel(events.filter((e) => !e.selfDeclined).length)}*`];
     for (const e of events) pieces.push(eventBlock(e, o.responses, tz));
     const free = o.free.get(date);
     if (free !== undefined) pieces.push(freeLine(free, o.windowEnds?.get(date), tz));
@@ -272,5 +336,8 @@ export function renderSchedule(o: {
     }
     break;
   }
-  return kept.join('\n\n') + tail + warning;
+  // Not even the first day's header fits: just the pointer, with no leading blank lines.
+  return [kept.join('\n\n'), CONTINUE_ON_DASHBOARD, ...(warning === '' ? [] : [TRUNCATED_SNAPSHOT_WARNING])]
+    .filter((part) => part !== '')
+    .join('\n\n');
 }

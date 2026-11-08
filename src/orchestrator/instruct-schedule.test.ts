@@ -92,7 +92,7 @@ describe('runInstruction: schedule answers', () => {
 
   it('asks for the range when the question has none, still without a job', async () => {
     const outcome = await runInstruction(
-      { text: 'מה יש לי בקרוב' },
+      { text: 'מה יש לי?' },
       { ...SCHEDULE_OPTIONS, calendar: { runtime: { credentials: CREDENTIALS } } },
     );
     expect(outcome).toEqual({ status: 'answered', text: 'לאיזה טווח? למשל "מחר", "השבוע" או "יום שלישי".' });
@@ -161,13 +161,60 @@ describe('both doors pass the calendar', () => {
     expect(await count('boss_instructions')).toBe(0);
   });
 
-  it('the WhatsApp door, the scheduler and the dashboard answer route each hand the calendar to runInstruction', () => {
+  it('the dashboard answer route answers a schedule question without consuming the parked question', async () => {
+    await bindCalendar();
+    await createOwner({ username: 'owner', password: 'correct horse battery staple', businessId: BUSINESS });
+    // A parked question: the planner asks for clarification.
+    const parkedOutcome = await runInstruction(
+      { text: 'תשלחי לרונית מחר' },
+      {
+        ...SCHEDULE_OPTIONS,
+        planner: async () => ({
+          status: 'planned',
+          plan: {
+            goal: 'לשלוח', assumptions: [], clarifyingQuestion: 'לאיזו רונית?', estimatedCostMinor: 0,
+            steps: [{ id: 's1', agent: 'comms.email', intent: 'לשלוח', toolName: 'mail.send', input: { to: 'dana@example.com', subject: 'נ', body: 'ג' }, dependsOn: [], expectedActionClass: 'email.initiate' }],
+          },
+        }),
+      },
+    );
+    if (parkedOutcome.status !== 'needs_answer') throw new Error(`expected a parked question, got ${parkedOutcome.status}`);
+    const jobsBefore = await count('jobs');
+
+    server = createServer({ businessId: BUSINESS, port: 0, calendarCredentials: CREDENTIALS, calendarClient: clientWith('לקוח מתשובה') });
+    await once(server, 'listening');
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const login = await fetch(`${baseUrl}/login`, {
+      method: 'POST',
+      body: new URLSearchParams({ username: 'owner', password: 'correct horse battery staple' }),
+      redirect: 'manual',
+    });
+    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] as string;
+    const sessionId = cookie.split('=')[1] as string;
+    const res = await fetch(`${baseUrl}/instruct/${parkedOutcome.jobId}/answer`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({ csrf: issueCsrfToken(sessionId), answer: 'מה יש לי מחר' }),
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('לקוח מתשובה');
+    expect(html).toContain('לאיזו רונית?'); // the parked question is still on the page, still answerable
+    const { rows } = await getPool().query<{ answer: string | null }>('SELECT answer FROM boss_instructions');
+    expect(rows[0]?.answer).toBeNull();
+    const job = await getPool().query<{ phase: string }>('SELECT phase FROM jobs WHERE job_id = $1', [parkedOutcome.jobId]);
+    expect(['closed', 'failed', 'halted']).not.toContain(job.rows[0]?.phase);
+    expect(await count('jobs')).toBe(jobsBefore);
+  });
+
+  it('the WhatsApp door, the scheduler and the dashboard hand the calendar on (behaviour: whatsapp-door-schedule.test.ts)', () => {
     const door = readFileSync('src/orchestrator/whatsapp-door.ts', 'utf8');
-    expect(door).toMatch(/\.\.\.\(ctx\.calendar !== undefined \? \{ calendar: ctx\.calendar \} : \{\}\)/);
+    expect(door).toMatch(/ctx\.calendar !== undefined && answered === null \? \{ calendar: ctx\.calendar \} : \{\}/);
     expect(door).toMatch(/\.\.\.\(options\.calendar !== undefined \? \{ calendar: options\.calendar \} : \{\}\)/);
     const scheduler = readFileSync('src/orchestrator/scheduler.ts', 'utf8');
     expect(scheduler).toMatch(/runWhatsAppDoor\(\{[\s\S]*?calendar: \{ runtime \}/);
     const server = readFileSync('src/dashboard/server.ts', 'utf8').replace(/\r\n/g, '\n');
-    expect((server.match(/\.\.\.\(calendar !== undefined \? \{ calendar \} : \{\}\)/g) ?? []).length).toBe(2);
+    expect((server.match(/\.\.\.\(calendar !== undefined \? \{ calendar \} : \{\}\)/g) ?? []).length).toBe(1);
+    expect(server).toMatch(/calendar: \(\) => calendarWiring\(meetingOptions\)/);
   });
 });

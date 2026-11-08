@@ -42,9 +42,38 @@ describe('parseScheduleQuery', () => {
     expect(parseScheduleQuery('שלום', NOW, TZ)).toBeNull();
   });
 
-  it('returns unrecognized_range for "מה יש לי בקרוב"', () => {
-    expect(parseScheduleQuery('מה יש לי בקרוב', NOW, TZ)).toBe('unrecognized_range');
+  it('returns unrecognized_range only for the bare trigger (or fillers) with no range', () => {
+    expect(parseScheduleQuery('מה יש לי?', NOW, TZ)).toBe('unrecognized_range');
+    expect(parseScheduleQuery('מה הלוז', NOW, TZ)).toBe('unrecognized_range');
+    expect(parseScheduleQuery('מה הלו"ז בבקשה', NOW, TZ)).toBe('unrecognized_range');
     expect(parseScheduleQuery('מה יש לי ב-31/02', NOW, TZ)).toBe('unrecognized_range');
+    expect(parseScheduleQuery('מה יש לי שבוע', NOW, TZ)).toBe('unrecognized_range');
+  });
+
+  it('is not fooled by look-alikes: anything beyond the trigger and a range goes to the planner', () => {
+    for (const text of [
+      'כמה יש לי בחשבון היום?',
+      'מה יש ליוסי מחר?',
+      'מה יש לי לשלם השבוע',
+      'מה הלוז של דני מחר',
+      'סמה ביומן מחר',
+      'מה יש לי במייל',
+      'מה יש לי לעשות',
+      'מה יש לי בקרוב',
+      'מה יש לי מחר ותשלחי לדנה',
+    ]) {
+      expect(parseScheduleQuery(text, NOW, TZ), text).toBeNull();
+    }
+  });
+
+  it('השבוע הבא and בשבוע הבא mean next week; weekday + הבא is the occurrence after the coming one', () => {
+    const q = (t: string) => parseScheduleQuery(t, NOW, TZ);
+    expect(q('מה יש לי השבוע הבא')).toEqual({ fromDate: '2026-11-15', toDate: '2026-11-21' });
+    expect(q('מה יש לי בשבוע הבא')).toEqual({ fromDate: '2026-11-15', toDate: '2026-11-21' });
+    expect(q('מה יש לי ביום שלישי הבא')).toEqual({ fromDate: '2026-11-24', toDate: '2026-11-24' });
+    expect(q('מה יש לי ביום שלישי')).toEqual({ fromDate: '2026-11-17', toDate: '2026-11-17' });
+    // "הבא" after a day word means nothing
+    expect(q('מה יש לי מחר הבא')).toBeNull();
   });
 });
 
@@ -131,15 +160,48 @@ describe('renderSchedule', () => {
     expect(text).toContain('*13:00–14:00 · ה*  ⚠️ לא עודכן');
   });
 
-  it('shows all-day events and skips events the owner declined', () => {
+  it('shows all-day events', () => {
     const events = [
       ev({ title: 'חג', allDay: true, start: iso('2026-11-12', '00:00'), end: iso('2026-11-13', '00:00') }),
-      ev({ eventId: 'q', title: 'נדחה', selfDeclined: true, start: iso(DAY, '09:00'), end: iso(DAY, '10:00') }),
     ];
     const text = renderSchedule({ range: { fromDate: DAY, toDate: DAY }, snapshot: snap(events), responses: new Map(), free: new Map(), timeZone: TZ, maxChars: 4000 });
     expect(text).toContain("*יום ה' 12/11 — פגישה אחת*");
     expect(text).toContain('*כל היום · חג*');
-    expect(text).not.toContain('נדחה');
+  });
+
+  it('lists an event the owner declined with ❌ דחית, outside the header count', () => {
+    const events = [
+      ev({ eventId: 'q', title: 'נדחה', selfDeclined: true, start: iso(DAY, '09:00'), end: iso(DAY, '10:00') }),
+      ev({ eventId: 'r', title: 'נשאר', start: iso(DAY, '11:00'), end: iso(DAY, '12:00') }),
+    ];
+    const text = renderSchedule({ range: { fromDate: DAY, toDate: DAY }, snapshot: snap(events), responses: new Map(), free: new Map(), timeZone: TZ, maxChars: 4000 });
+    expect(text).toContain("*יום ה' 12/11 — פגישה אחת*");
+    expect(text).toContain('*09:00–10:00 · נדחה*  ❌ דחית');
+    expect(text).toContain('*11:00–12:00 · נשאר*');
+    const onlyDeclined = renderSchedule({ range: { fromDate: DAY, toDate: DAY }, snapshot: snap(events.slice(0, 1)), responses: new Map(), free: new Map(), timeZone: TZ, maxChars: 4000 });
+    expect(onlyDeclined).toContain("*יום ה' 12/11 — אין פגישות*");
+    expect(onlyDeclined).toContain('❌ דחית');
+  });
+
+  it('prints no פנוי line for a non-work day inside a range (Saturday in השבוע)', () => {
+    const FRI = '2026-11-13';
+    const SAT = '2026-11-14';
+    const text = renderSchedule({
+      range: { fromDate: FRI, toDate: SAT }, snapshot: snap([]), responses: new Map(),
+      free: new Map([[FRI, [iv(FRI, '09:00', '18:00')]]]), timeZone: TZ, maxChars: 4000,
+    });
+    expect(text).toBe(["*יום ו' 13/11 — אין פגישות*", '', 'פנוי: 09:00–18:00', '', "*יום ש' 14/11 — אין פגישות*"].join('\n'));
+  });
+
+  it('returns just the pointer when not even the first day fits', () => {
+    const text = renderSchedule({ range: { fromDate: DAY, toDate: DAY }, snapshot: snap(THREE), responses: RESPONSES, free: new Map(), timeZone: TZ, maxChars: 30 });
+    expect(text).toBe(CONTINUE_ON_DASHBOARD);
+  });
+
+  it('falls through a bidi-only first description line to the next line', () => {
+    const events = [ev({ title: 'א', start: iso(DAY, '09:00'), end: iso(DAY, '10:00'), description: [String.fromCharCode(0x202e, 0x200f), 'השורה האמיתית'].join('\n') })];
+    const text = renderSchedule({ range: { fromDate: DAY, toDate: DAY }, snapshot: snap(events), responses: new Map(), free: new Map(), timeZone: TZ, maxChars: 4000 });
+    expect(text).toContain('📝 השורה האמיתית');
   });
 
   it('cuts at a day boundary over the limit and appends the continuation line', () => {

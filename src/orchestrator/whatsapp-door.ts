@@ -144,6 +144,7 @@ import {
   type StoredMessage,
 } from '../whatsapp/store.js';
 import { transcribeInbound, type TranscriptionProvider } from '../whatsapp/transcribe.js';
+import { answerScheduleQuery } from '../meetings/door.js';
 import { runInstruction, type InstructionOutcome, type RunInstructionOptions } from './instruct.js';
 import { linkWhatsAppMessage } from './jobs.js';
 import { handleMailCardMessage, isMailCardAction } from './whatsapp-mail-card.js';
@@ -893,6 +894,35 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     const claimed = await claimMessage(stored.id, { businessId: ctx.businessId });
     if (!claimed) return 'skipped'; // raced by another runner on this message.
 
+    // A schedule question ("מה יש לי מחר?") is a READ, judged on THIS message
+    // alone and BEFORE the route is decided: it must neither consume a parked
+    // question as its answer nor be parsed together with the parked half (a
+    // parked "…מחר…" would otherwise turn "…ביום שלישי" into tomorrow). It is
+    // answered with the schedule text ONLY — no route notice, no transcript
+    // echo — so the approved layout and its 4,000-character budget hold, and it
+    // opens no job, writes no instruction row and spends none of the daily
+    // instruction cap (nothing is recorded below). Open questions stay open.
+    if (ctx.calendar !== undefined) {
+      const schedule = await answerScheduleQuery({
+        text: heard,
+        businessId: ctx.businessId,
+        timeZone: ctx.charter.identity.timezone,
+        operations: ctx.charter.operations,
+        runtime: ctx.calendar.runtime,
+        ...(ctx.calendar.client !== undefined ? { client: ctx.calendar.client } : {}),
+      });
+      if (schedule !== null) {
+        await ctx.messenger.send({ text: schedule.answered, jobId: null });
+        await settleMessage(
+          stored.id,
+          'handled',
+          isAudio ? { transcript: heard } : {},
+          { businessId: ctx.businessId },
+        );
+        return 'instructed';
+      }
+    }
+
     // What this message IS — answer, closure, or new instruction (task 12).
     // Read from the record, never stored a second time; see
     // `whatsapp-routing.ts`'s own docblock for the derivation and for the
@@ -1053,7 +1083,10 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         ...(answered !== null ? { identityAsked: true, sourceAsked: true } : {}),
         ...(ctx.planner !== undefined ? { planner: ctx.planner } : {}),
         // The schedule answer ("מה יש לי מחר?"): calendar access for the early route.
-        ...(ctx.calendar !== undefined ? { calendar: ctx.calendar } : {}),
+        // Never on the answer pass: a schedule question was already answered
+        // above, on the new message alone, and the JOIN of a parked instruction
+        // and an answer is not a schedule question.
+        ...(ctx.calendar !== undefined && answered === null ? { calendar: ctx.calendar } : {}),
       },
     );
 
@@ -1146,16 +1179,6 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       await retireOpenInstruction(answered, {
         to: 'failed',
         reason: reasonForSupersededByWhatsAppAnswer(outcome.jobId),
-        businessId: ctx.businessId,
-      });
-    }
-
-    // A schedule question that arrived as an answer to a parked request: the
-    // parked request is closed, not superseded — no replacement job exists.
-    if (answered !== null && outcome.status === 'answered') {
-      await retireOpenInstruction(answered, {
-        to: 'closed',
-        reason: 'נענתה שאלת לו"ז',
         businessId: ctx.businessId,
       });
     }

@@ -24,6 +24,7 @@ import { DocumentAlreadySignedError, loadSignature } from '../governance/signatu
 import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
+import { answerScheduleQuery } from '../meetings/door.js';
 import { runInstruction, type RunInstructionOptions } from '../orchestrator/instruct.js';
 import { applyConfirmation, dashboardConfirmations } from '../orchestrator/command-confirm.js';
 import { loadConfirmation } from '../governance/instruction-confirmations.js';
@@ -1554,6 +1555,35 @@ async function handleInstructAnswer(
   const instruction = await loadInstructionForJob(jobId, { businessId });
   if (instruction === null) return sendHtml(res, 404, renderNotFound());
 
+  // A schedule question typed into the answer box is a READ, judged on the new
+  // text alone and BEFORE any claim: the parked question stays open and
+  // unclaimed, and nothing is parsed together with the parked half.
+  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
+  if (calendar !== undefined) {
+    const active = await loadActiveCharter(businessId);
+    if (active !== null) {
+      const schedule = await answerScheduleQuery({
+        text: form.get('answer') ?? '',
+        businessId,
+        timeZone: active.charter.identity.timezone,
+        operations: active.charter.operations,
+        runtime: calendar.runtime,
+        ...(calendar.client !== undefined ? { client: calendar.client } : {}),
+      });
+      if (schedule !== null) {
+        return sendHtml(
+          res,
+          200,
+          renderInstruct({
+            csrf: issueCsrfToken(session.sessionId),
+            answer: schedule.answered,
+            pending: [{ jobId, question: instruction.question, text: instruction.text }],
+          }),
+        );
+      }
+    }
+  }
+
   // Everything from the phase guard to the transition runs under one claim
   // on this job (I2). The guard is a read and `runInstruction` makes a live
   // model call before anything writes, so without this two POSTs — a
@@ -1564,7 +1594,7 @@ async function handleInstructAnswer(
   // handler. Two authorised plans for one answer, and an error saying
   // nothing happened.
   const claim = await withJobClaim(`instruct-answer:${businessId}:${jobId}`, async () =>
-    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? '', doorOptions),
+    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? ''),
   );
   if (!claim.claimed) {
     sendHtml(
@@ -1662,7 +1692,6 @@ async function answerUnderClaim(
   // recorded instruction as typed — see the call itself.
   instruction: { instructionId: string; text: string; textOrigin: InstructionTextOrigin },
   answer: string,
-  doorOptions: InstructionDoorOptions = {},
 ): Promise<void> {
   // Scoped to a job that is actually waiting on this answer — see
   // `handleInstructAnswer`'s docblock for the two ways skipping this check
@@ -1723,7 +1752,6 @@ async function answerUnderClaim(
     );
   }
 
-  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
   const outcome = await runInstruction(
     { text: `${instruction.text}\n\n${answer}` },
     {
@@ -1749,7 +1777,6 @@ async function answerUnderClaim(
       // The files the owner attached to the original instruction stay his
       // sources on the second pass (document production D14).
       attachedDocumentIds: await attachedDocumentsForJob(jobId, { businessId }),
-      ...(calendar !== undefined ? { calendar } : {}),
     },
   );
 
@@ -1774,17 +1801,9 @@ async function answerUnderClaim(
     );
   }
 
-  // A schedule question answered in place leaves no replacement job: the parked
-  // one is simply closed (the owner got what he asked for).
-  if (outcome.status === 'answered') {
-    await transition(jobId, {
-      to: 'closed',
-      actor: 'human',
-      reason: 'נענתה שאלת לו"ז',
-      businessId,
-    });
-    return renderInstructionOutcome(res, session, outcome, businessId);
-  }
+  // The answer pass never routes a schedule question (`calendar` is not passed
+  // above), so there is always a replacement job here.
+  if (outcome.status === 'answered') return renderInstructionOutcome(res, session, outcome, businessId);
 
   await transition(jobId, {
     to: 'failed',
