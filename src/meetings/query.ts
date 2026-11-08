@@ -242,6 +242,16 @@ export function localDayLabel(ms: number, timeZone: string): string {
   return `יום ${WEEKDAY_LETTER[parts.weekday]} ${formatDate(parts.date)}`;
 }
 
+/** `יום ג'` — the local weekday of an instant, without the date. */
+export function localWeekdayLabel(ms: number, timeZone: string): string {
+  return `יום ${WEEKDAY_LETTER[localParts(new Date(ms), timeZone).weekday]}`;
+}
+
+/** `17/11` — the local date of an instant. */
+export function localDateLabel(ms: number, timeZone: string): string {
+  return formatDate(localParts(new Date(ms), timeZone).date);
+}
+
 function formatDate(date: string): string {
   const [, m, d] = date.split('-').map(Number) as [number, number, number];
   return `${d}/${m}`;
