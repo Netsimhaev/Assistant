@@ -1012,6 +1012,8 @@ export async function schedulerPass(
         // A document-card fix ("תיקון: …") is a new production; the door
         // refuses it up front when this server cannot produce.
         ...(runtime.production !== undefined ? { production: runtime.production } : {}),
+        // The schedule answer reads the calendar through the runtime's credentials.
+        calendar: { runtime },
       });
     } catch (err) {
       whatsappError = err instanceof Error ? err.message : String(err);

@@ -340,6 +340,8 @@ const RECORDING_TOO_LARGE =
  */
 function composeAck(outcome: InstructionOutcome): string {
   if (outcome.status === 'refused') return outcome.reason;
+  // A schedule answer (calendar scheduling §7.1): the text IS the whole reply.
+  if (outcome.status === 'answered') return outcome.text;
   if (outcome.status === 'needs_answer') return outcome.question;
   // Boss command (spec §4): the confirmation question IS the ack — the owner
   // answers it in this chat (`handleConfirmationMessage`). It is sent only
@@ -468,6 +470,8 @@ interface ProcessContext {
    * needs to decide up front whether this server can produce at all.
    */
   production?: Runtime['production'];
+  /** Calendar access for the schedule answer — see `RunInstructionOptions.calendar`. */
+  calendar?: RunInstructionOptions['calendar'];
 }
 
 type ProcessOutcome =
@@ -1048,6 +1052,8 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         // a second pass is underway.
         ...(answered !== null ? { identityAsked: true, sourceAsked: true } : {}),
         ...(ctx.planner !== undefined ? { planner: ctx.planner } : {}),
+        // The schedule answer ("מה יש לי מחר?"): calendar access for the early route.
+        ...(ctx.calendar !== undefined ? { calendar: ctx.calendar } : {}),
       },
     );
 
@@ -1069,7 +1075,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     instructionRecorded = true;
 
     const ack = composeAck(outcome);
-    const jobId = outcome.status === 'refused' ? null : outcome.jobId;
+    const jobId = outcome.status === 'refused' || outcome.status === 'answered' ? null : outcome.jobId;
 
     // An answer whose re-run REFUSED closes the previous request before the
     // owner is told, rather than after — the one place this function departs
@@ -1136,10 +1142,20 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // the old opening message `'reported'`, which is what stops the report
     // pass telling him his answered instruction "failed"; see that
     // function's own docblock.
-    if (answered !== null && outcome.status !== 'refused') {
+    if (answered !== null && outcome.status !== 'refused' && outcome.status !== 'answered') {
       await retireOpenInstruction(answered, {
         to: 'failed',
         reason: reasonForSupersededByWhatsAppAnswer(outcome.jobId),
+        businessId: ctx.businessId,
+      });
+    }
+
+    // A schedule question that arrived as an answer to a parked request: the
+    // parked request is closed, not superseded — no replacement job exists.
+    if (answered !== null && outcome.status === 'answered') {
+      await retireOpenInstruction(answered, {
+        to: 'closed',
+        reason: 'נענתה שאלת לו"ז',
         businessId: ctx.businessId,
       });
     }
@@ -1158,7 +1174,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // did say it, whatever came of it.
     await settleMessage(
       stored.id,
-      jobId !== null ? 'handled' : 'failed',
+      jobId !== null || outcome.status === 'answered' ? 'handled' : 'failed',
       {
         ...(isAudio ? { transcript: heard } : {}),
         ...(jobId !== null ? { jobId } : {}),
@@ -1166,7 +1182,9 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       { businessId: ctx.businessId },
     );
 
-    return jobId !== null ? 'instructed' : 'refused';
+    // A schedule answer counts as instructed: the owner's request was served,
+    // it simply needed no job.
+    return jobId !== null || outcome.status === 'answered' ? 'instructed' : 'refused';
   } catch {
     // One poison message must not block the queue — the same isolation
     // `runDueJobs` gives each job. Three things, each gated on how far
@@ -1248,6 +1266,8 @@ export async function runWhatsAppDoor(options: {
   questionWindowMinutes?: number;
   /** `runtime.production`, for a document-card fix request — see `ProcessContext.production`. */
   production?: Runtime['production'];
+  /** Calendar access for the schedule answer ("מה יש לי מחר?"); absent: no schedule routing. */
+  calendar?: RunInstructionOptions['calendar'];
 }): Promise<DoorResult> {
   const businessId = options.businessId ?? config.businessId;
   const { gateway, messenger } = options;
@@ -1316,6 +1336,7 @@ export async function runWhatsAppDoor(options: {
       ? { questionWindowMinutes: options.questionWindowMinutes }
       : {}),
     ...(options.production !== undefined ? { production: options.production } : {}),
+    ...(options.calendar !== undefined ? { calendar: options.calendar } : {}),
   };
 
   for (const msg of ordered) {

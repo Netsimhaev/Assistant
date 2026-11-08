@@ -12,7 +12,7 @@ export interface Interval {
   end: number;
 }
 
-type CharterOperations = z.infer<typeof CharterOperationsSchema>;
+export type CharterOperations = z.infer<typeof CharterOperationsSchema>;
 const MIN_MS = 60_000;
 const SLOT_STEP_MS = 15 * MIN_MS;
 const DEFAULT_START = '09:00';

@@ -118,6 +118,9 @@ import { nameCarriesCancelWord } from './command-confirm.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { renderConfirmationQuestion } from './command-echo.js';
+import { answerScheduleQuery } from '../meetings/door.js';
+import type { CalendarClient } from '../calendar/types.js';
+import type { Runtime } from './runtime.js';
 import { createJob, transition } from './jobs.js';
 import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { classMismatch } from './run-plan.js';
@@ -192,6 +195,12 @@ export interface RunInstructionOptions {
    * sees their ids and names (`PlanRequest.attachedDocuments`), never text.
    */
   attachedDocumentIds?: readonly string[];
+  /**
+   * Calendar access for the schedule answer ("מה יש לי מחר?", calendar scheduling §7.1).
+   * Absent: a schedule question is NOT routed and goes to the general planner as
+   * before. Both doors (WhatsApp and the dashboard) pass it.
+   */
+  calendar?: { runtime: Pick<Runtime, 'credentials'>; client?: CalendarClient };
 }
 
 export interface GrantedAuthorization {
@@ -304,6 +313,8 @@ export type InstructionOutcome =
        */
       identityNote: string | null;
     }
+  /** A schedule question, answered in place: no job, no instruction row. */
+  | { status: 'answered'; text: string }
   | { status: 'refused'; reason: string };
 
 export async function runInstruction(
@@ -332,6 +343,20 @@ export async function runInstruction(
   const active = await loadActiveCharter(businessId);
   if (active === null) {
     return { status: 'refused', reason: 'אין תקנון פעיל — המתכנן נשען על הקטלוג והתקרות שבו.' };
+  }
+
+  // A schedule question is a read: answered here, before any job or instruction
+  // row exists (calendar scheduling §7.1).
+  if (options.calendar !== undefined) {
+    const schedule = await answerScheduleQuery({
+      text: input.text,
+      businessId,
+      timeZone: active.charter.identity.timezone,
+      operations: active.charter.operations,
+      runtime: options.calendar.runtime,
+      ...(options.calendar.client !== undefined ? { client: options.calendar.client } : {}),
+    });
+    if (schedule !== null) return { status: 'answered', text: schedule.answered };
   }
 
   const job = await createJob({

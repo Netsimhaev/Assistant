@@ -24,7 +24,7 @@ import { DocumentAlreadySignedError, loadSignature } from '../governance/signatu
 import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
-import { runInstruction } from '../orchestrator/instruct.js';
+import { runInstruction, type RunInstructionOptions } from '../orchestrator/instruct.js';
 import { applyConfirmation, dashboardConfirmations } from '../orchestrator/command-confirm.js';
 import { loadConfirmation } from '../governance/instruction-confirmations.js';
 import { loadJob, transition } from '../orchestrator/jobs.js';
@@ -111,7 +111,7 @@ import {
   handleCalendarSignPost,
   handleCalendarStatus,
 } from './calendar-connect.js';
-import { handleMeetingSettingsGet, handleMeetingSettingsPost, type MeetingRouteOptions } from './meeting-routes.js';
+import { calendarWiring, handleMeetingSettingsGet, handleMeetingSettingsPost, type MeetingRouteOptions } from './meeting-routes.js';
 import type { CalendarClient } from '../calendar/types.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
 import {
@@ -280,6 +280,8 @@ export interface DashboardOptions {
 
 /** What the document screens and the upload need from `createServer`'s options. */
 interface InstructionDoorOptions extends DocumentRouteOptions {
+  /** Calendar access for the schedule answer, resolved per request (the credential source is built lazily). Absent: no schedule routing. */
+  calendar?: () => Promise<RunInstructionOptions['calendar']>;
   planner?: (request: PlanRequest) => Promise<PlanOutcome>;
   uploadMaxBytes?: number;
 }
@@ -998,6 +1000,11 @@ export async function renderInstructionOutcome(
     sendHtml(res, 400, renderInstruct({ csrf, error: outcome.reason }));
     return;
   }
+  // A schedule answer: no job exists, so the text is the whole page content.
+  if (outcome.status === 'answered') {
+    sendHtml(res, 200, renderInstruct({ csrf, answer: outcome.text }));
+    return;
+  }
   if (outcome.status === 'needs_answer') {
     sendHtml(
       res,
@@ -1236,6 +1243,7 @@ async function handleInstructPost(
     attachedDocumentIds.push(ingested.documentId);
   }
 
+  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
   const outcome = await runInstruction(
     { text },
     {
@@ -1244,6 +1252,7 @@ async function handleInstructPost(
       channel: 'dashboard',
       ...(attachedDocumentIds.length > 0 ? { attachedDocumentIds } : {}),
       ...(doorOptions.planner !== undefined ? { planner: doorOptions.planner } : {}),
+      ...(calendar !== undefined ? { calendar } : {}),
     },
   );
   await renderInstructionOutcome(res, session, outcome, businessId);
@@ -1535,6 +1544,7 @@ async function handleInstructAnswer(
   businessId: string,
   session: Session,
   jobId: string,
+  doorOptions: InstructionDoorOptions = {},
 ): Promise<void> {
   const form = await readFormBody(req);
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
@@ -1554,7 +1564,7 @@ async function handleInstructAnswer(
   // handler. Two authorised plans for one answer, and an error saying
   // nothing happened.
   const claim = await withJobClaim(`instruct-answer:${businessId}:${jobId}`, async () =>
-    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? ''),
+    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? '', doorOptions),
   );
   if (!claim.claimed) {
     sendHtml(
@@ -1652,6 +1662,7 @@ async function answerUnderClaim(
   // recorded instruction as typed — see the call itself.
   instruction: { instructionId: string; text: string; textOrigin: InstructionTextOrigin },
   answer: string,
+  doorOptions: InstructionDoorOptions = {},
 ): Promise<void> {
   // Scoped to a job that is actually waiting on this answer — see
   // `handleInstructAnswer`'s docblock for the two ways skipping this check
@@ -1712,6 +1723,7 @@ async function answerUnderClaim(
     );
   }
 
+  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
   const outcome = await runInstruction(
     { text: `${instruction.text}\n\n${answer}` },
     {
@@ -1737,6 +1749,7 @@ async function answerUnderClaim(
       // The files the owner attached to the original instruction stay his
       // sources on the second pass (document production D14).
       attachedDocumentIds: await attachedDocumentsForJob(jobId, { businessId }),
+      ...(calendar !== undefined ? { calendar } : {}),
     },
   );
 
@@ -1759,6 +1772,18 @@ async function answerUnderClaim(
         error: `${outcome.reason} ${CLOSED_AFTER_REFUSAL_HERE}`,
       }),
     );
+  }
+
+  // A schedule question answered in place leaves no replacement job: the parked
+  // one is simply closed (the owner got what he asked for).
+  if (outcome.status === 'answered') {
+    await transition(jobId, {
+      to: 'closed',
+      actor: 'human',
+      reason: 'נענתה שאלת לו"ז',
+      businessId,
+    });
+    return renderInstructionOutcome(res, session, outcome, businessId);
   }
 
   await transition(jobId, {
@@ -3181,7 +3206,7 @@ async function route(
   const instructAnswerMatch = INSTRUCT_ANSWER_PATH.exec(pathname);
   if (method === 'POST' && instructAnswerMatch) {
     const jobId = instructAnswerMatch[1];
-    if (jobId !== undefined) return handleInstructAnswer(req, res, businessId, session, jobId);
+    if (jobId !== undefined) return handleInstructAnswer(req, res, businessId, session, jobId, doorOptions);
   }
 
   const instructConfirmMatch = INSTRUCT_CONFIRM_PATH.exec(pathname);
@@ -3281,15 +3306,16 @@ export function createServer(options: DashboardOptions = {}): Server {
       credentialKeyPath: oauthOptions.credentialKeyPath,
       ...(options.ruleProposer !== undefined ? { ruleProposer: options.ruleProposer } : {}),
     };
-    const doorOptions: InstructionDoorOptions = {
-      production: options.production ?? productionToolsFromEnv(),
-      ...(options.planner !== undefined ? { planner: options.planner } : {}),
-      ...(options.uploadMaxBytes !== undefined ? { uploadMaxBytes: options.uploadMaxBytes } : {}),
-    };
     const meetingOptions: MeetingRouteOptions = {
       credentialKeyPath: oauthOptions.credentialKeyPath,
       ...(options.calendarCredentials !== undefined ? { calendarCredentials: options.calendarCredentials } : {}),
       ...(options.calendarClient !== undefined ? { calendarClient: options.calendarClient } : {}),
+    };
+    const doorOptions: InstructionDoorOptions = {
+      production: options.production ?? productionToolsFromEnv(),
+      calendar: () => calendarWiring(meetingOptions),
+      ...(options.planner !== undefined ? { planner: options.planner } : {}),
+      ...(options.uploadMaxBytes !== undefined ? { uploadMaxBytes: options.uploadMaxBytes } : {}),
     };
     route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions, doorOptions, meetingOptions).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);

@@ -185,10 +185,12 @@ function reportOutcome(outcome: Awaited<ReturnType<typeof runInstruction>>): voi
     console.log('--- שאלת האישור ---');
     console.log(outcome.question);
     console.log(`identityNote: ${outcome.identityNote ?? '—'}`);
+  } else if (outcome.status === 'answered') {
+    console.log(`answered: ${outcome.text}`);
   } else {
     console.log(`reason: ${outcome.reason}`);
   }
-  if (outcome.status !== 'refused') created.push(outcome.jobId);
+  if (outcome.status !== 'refused' && outcome.status !== 'answered') created.push(outcome.jobId);
 }
 
 function reportPrompt(seen: PlanRequest | undefined, calls: number): void {

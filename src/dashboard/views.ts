@@ -1374,6 +1374,8 @@ export function renderInstruct(options: {
   confirmationQuestion?: string | null;
   /** Boss commands waiting on the owner's confirmation, each with its buttons. */
   confirmations?: PendingConfirmation[] | null;
+  /** A schedule answer ("מה יש לי מחר?"): calendar text, so `escLabel`. */
+  answer?: string | null;
 }): string {
   const error =
     options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
@@ -1416,6 +1418,11 @@ export function renderInstruct(options: {
       ? ''
       : `<p class="confirm" style="white-space: pre-wrap">${escLabel(options.confirmationQuestion)}</p>`;
 
+  const answer =
+    options.answer == null
+      ? ''
+      : `<p class="confirm" style="white-space: pre-wrap">${escLabel(options.answer)}</p>`;
+
   const confirmations =
     options.confirmations == null
       ? ''
@@ -1433,6 +1440,7 @@ export function renderInstruct(options: {
      ${grantNote}
      ${recordingNote}
      ${ledgerEcho}
+     ${answer}
      ${confirmationQuestion}
      ${confirmations}
      ${identityNote}

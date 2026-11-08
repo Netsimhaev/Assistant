@@ -393,7 +393,7 @@ export async function whatsappInstructionsToday(
 export async function recordWhatsAppInstructionAttempt(
   businessId: string,
   counts: {
-    status: 'planned' | 'needs_answer' | 'needs_confirmation' | 'refused';
+    status: 'planned' | 'needs_answer' | 'needs_confirmation' | 'refused' | 'answered';
     textLength: number;
   },
 ): Promise<void> {

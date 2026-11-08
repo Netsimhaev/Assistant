@@ -94,6 +94,20 @@ async function realCredentials(credentialKeyPath: string | undefined): Promise<C
   }
 }
 
+/**
+ * Calendar access for the instruction door's schedule answer: the same credential
+ * source and client seams the settings page uses. `undefined` when no usable
+ * credential source exists (no master key) — the door then does not route
+ * schedule questions, exactly as when nothing is connected.
+ */
+export async function calendarWiring(
+  options: MeetingRouteOptions,
+): Promise<{ runtime: { credentials: CredentialSource }; client?: CalendarClient } | undefined> {
+  const credentials = options.calendarCredentials ?? (await realCredentials(options.credentialKeyPath));
+  if (credentials === null) return undefined;
+  return { runtime: { credentials }, ...(options.calendarClient !== undefined ? { client: options.calendarClient } : {}) };
+}
+
 async function listAccountCalendars(businessId: string, options: MeetingRouteOptions): Promise<Calendars> {
   const credentials = options.calendarCredentials ?? (await realCredentials(options.credentialKeyPath));
   if (credentials === null) return { listed: false, reason: NOT_CONNECTED };
