@@ -11,6 +11,7 @@ import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { AttendeeResponse, CalendarClient, CalendarEvent } from '../calendar/types.js';
 import { closePool, getPool } from '../db/pool.js';
 import { saveActionUpdateSettings } from '../governance/action-update-settings.js';
+import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { resetDatabase } from '../test/db.js';
@@ -37,6 +38,7 @@ function fakeCalendar(responses: Map<string, { email: string; response: Attendee
     deleteEvent: unused,
     async getEvent(_token, calendarId, eventId) {
       gets.push(eventId);
+      if (eventId.startsWith('broken-')) return { failure: 'transient', status: 503, message: 'calendar down' };
       const attendees = responses.get(eventId);
       if (attendees === undefined) return { failure: 'not_found', status: 404, message: 'x' };
       const event: CalendarEvent = {
@@ -153,6 +155,9 @@ beforeEach(async () => {
   await resetDatabase();
   charterVersion = (await installMailboxCharter(B)).charterVersion;
   await connectCalendar();
+  // Reminders open a job only when the dial lets email.initiate reach a card;
+  // the default `off` hands the owner the text instead (its own test below).
+  await setAutonomyMode('ask', 'p_boss', { businessId: B });
 });
 afterAll(async () => {
   await closePool();
@@ -187,6 +192,23 @@ describe('proposed meetings', () => {
     expect(result).toMatchObject({ activated: 0, abandoned: 0 });
     expect((await row(waiting.meetingId)).state).toBe('proposed');
     expect((await row(unknown.meetingId)).state).toBe('proposed');
+  });
+
+  it('does not abandon an unknown write on a failed job, and alerts the owner once that it may have landed', async () => {
+    const uncertain = await seed({ step: { status: 'unknown', externalId: null }, phase: 'failed', name: 'רונית' });
+    const sent: { subject: string; body: string }[] = [];
+    const client = fakeCalendar(new Map()).client;
+    const first = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    const second = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+
+    expect(first).toMatchObject({ abandoned: 0, uncertainAlerts: 1 });
+    expect(second.uncertainAlerts).toBe(0);
+    expect((await row(uncertain.meetingId)).state).toBe('proposed');
+    expect(sent.map((s) => s.body)).toEqual(['ייתכן שהשינוי ביומן לרונית נשמר וייתכן שלא — כדאי לבדוק ביומן.']);
+    const audit = await getPool().query<{ reason: string }>(
+      `SELECT reason FROM audit_log WHERE reason LIKE 'meeting_write_uncertain:%'`,
+    );
+    expect(audit.rows.map((r) => r.reason)).toEqual([`meeting_write_uncertain:${uncertain.meetingId}`]);
   });
 
   it('abandons a proposed meeting whose job failed', async () => {
@@ -383,6 +405,7 @@ describe('unanswered meetings', () => {
     const { buildCharter } = await import('../test/fixtures.js');
     charterVersion = (await installCharter(buildCharter(), { businessId: B })).charterVersion;
     await connectCalendar();
+    await setAutonomyMode('ask', 'p_boss', { businessId: B });
     const { meetingId } = await seed({ state: 'active', eventId: 'ev-1', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
     const { client } = fakeCalendar(new Map([['ev-1', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
     const sent: { subject: string; body: string }[] = [];
@@ -391,5 +414,61 @@ describe('unanswered meetings', () => {
     expect(result.unansweredAlerts).toBe(1);
     expect(sent[0]?.body).toBe("⏳ דני כהן עדיין לא אישר את יום ג' 10:00 — אין תיבת מייל מחוברת, כדאי לעדכן אותו בעצמך.");
     expect((await row(meetingId)).reminder_job_id).toBeNull();
+  });
+
+  it('under the default off dial opens no job and hands the owner the reminder text, once', async () => {
+    await setAutonomyMode('off', 'p_boss', { businessId: B });
+    const { meetingId } = await seed({ state: 'active', eventId: 'ev-1', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
+    const { client } = fakeCalendar(new Map([['ev-1', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
+    const sent: { subject: string; body: string }[] = [];
+    const first = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    const second = await syncMeetings({
+      businessId: B,
+      runtime,
+      now: new Date(NOW.getTime() + 30 * HOUR),
+      client,
+      sendAlert: recordingAlert(sent),
+    });
+
+    expect(first).toMatchObject({ remindersOpened: 0, unansweredAlerts: 1 });
+    expect(second.unansweredAlerts).toBe(0);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.body).toBe(
+      "⏳ דני כהן עדיין לא אישר את יום ג' 10:00. הנה תזכורת מוכנה לשליחה:\n" +
+        "שלום דני כהן,\nרצינו לוודא שהפגישה ביום ג' 10/11 בשעה 10:00, המשרד, מתאימה לך. אפשר לאשר בהזמנת היומן או להשיב למייל הזה.",
+    );
+    const jobs = await getPool().query(`SELECT 1 FROM jobs WHERE business_id = $1 AND title LIKE 'תזכורת לפגישה:%'`, [B]);
+    expect(jobs.rowCount).toBe(0);
+    expect((await getPool().query('SELECT 1 FROM approval_requests WHERE business_id = $1', [B])).rowCount).toBe(0);
+    const r = await row(meetingId);
+    expect(r.reminder_claimed_at).not.toBeNull();
+    expect(r.unanswered_notified_at).not.toBeNull();
+    expect(r.reminder_job_id).toBeNull();
+  });
+
+  it('does not remind on a stale needs_action: the calendar read failed, or the calendar is unavailable', async () => {
+    const failed = await seed({ state: 'active', eventId: 'broken-1', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
+    const { client } = fakeCalendar(new Map());
+    const sent: { subject: string; body: string }[] = [];
+    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    expect(result).toMatchObject({ remindersOpened: 0, unansweredAlerts: 0 });
+    expect(result.errored).toEqual([{ meetingId: failed.meetingId, error: 'calendar down' }]);
+    expect((await row(failed.meetingId)).reminder_claimed_at).toBeNull();
+
+    // A readable event, but no calendar connection at all this pass.
+    await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [B]);
+    const ok = await seed({ state: 'active', eventId: 'ev-2', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
+    const reachable = fakeCalendar(new Map([['ev-2', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
+    const unavailable = await syncMeetings({
+      businessId: B,
+      runtime,
+      now: NOW,
+      client: reachable.client,
+      sendAlert: recordingAlert(sent),
+    });
+    expect(reachable.gets).toEqual([]);
+    expect(unavailable).toMatchObject({ remindersOpened: 0, unansweredAlerts: 0 });
+    expect((await row(ok.meetingId)).reminder_claimed_at).toBeNull();
+    expect(sent).toEqual([]);
   });
 });

@@ -49,6 +49,8 @@ async function seedMeeting(over: { email?: string | null; verified?: boolean } =
 beforeEach(async () => {
   await resetDatabase();
   charterVersion = (await installMailboxCharter(B)).charterVersion;
+  // Under the default `off` no job is ever opened (see the `off` test below).
+  await setAutonomyMode('ask', 'p_boss', { businessId: B });
 });
 afterAll(async () => {
   await closePool();
@@ -58,7 +60,7 @@ describe('openClientReminder', () => {
   it('opens a boss job in execute with one email.initiate mail.send step and the exact body', async () => {
     const meetingId = await seedMeeting();
     const opened = await openClientReminder({ businessId: B, meetingId, location: 'רחוב הרצל 1, תל אביב' });
-    if (!('jobId' in opened)) throw new Error(`expected a job, got ${opened.skipped}`);
+    if (!('jobId' in opened)) throw new Error(`expected a job, got ${JSON.stringify(opened)}`);
 
     const job = await loadJob(opened.jobId, { businessId: B });
     expect(job?.provenance).toBe('boss');
@@ -142,10 +144,29 @@ describe('openClientReminder', () => {
 
     await resetDatabase();
     charterVersion = (await installCharter(buildCharter(), { businessId: B })).charterVersion;
+    await setAutonomyMode('ask', 'p_boss', { businessId: B });
     const noMailbox = await seedMeeting();
     expect(await openClientReminder({ businessId: B, meetingId: noMailbox })).toEqual({ skipped: 'no_mailbox' });
     const { rows } = await getPool().query<{ n: string }>('SELECT count(*) AS n FROM jobs WHERE business_id = $1', [B]);
     expect(Number(rows[0]?.n)).toBe(1); // only the meeting's own job
+  });
+
+  it('under the default off dial opens no job and hands the owner the reminder text', async () => {
+    await setAutonomyMode('off', 'p_boss', { businessId: B });
+    const meetingId = await seedMeeting();
+    const result = await openClientReminder({ businessId: B, meetingId, location: 'המשרד' });
+    expect(result).toEqual({
+      draftedForOwner:
+        "שלום דני כהן,\nרצינו לוודא שהפגישה ביום ג' 10/11 בשעה 10:00, המשרד, מתאימה לך. אפשר לאשר בהזמנת היומן או להשיב למייל הזה.",
+    });
+    const jobs = await getPool().query<{ n: string }>('SELECT count(*) AS n FROM jobs WHERE business_id = $1', [B]);
+    expect(Number(jobs.rows[0]?.n)).toBe(1); // only the meeting's own job
+    expect((await getPool().query('SELECT 1 FROM approval_requests WHERE business_id = $1', [B])).rowCount).toBe(0);
+    const { rows } = await getPool().query<{ reminder_job_id: string | null }>(
+      'SELECT reminder_job_id FROM meetings WHERE meeting_id = $1',
+      [meetingId],
+    );
+    expect(rows[0]?.reminder_job_id).toBeNull();
   });
 
   it('omits the location when there is none, and cleans the name', () => {

@@ -8,7 +8,10 @@
  *      On activation of a move/update/cancel, earlier `active` rows of the
  *      same event → `done`; a move/update row starts its own response over
  *      (§8.1: a yes to the old time is not a yes to the new one); a `cancel`
- *      row goes straight to `done`.
+ *      row goes straight to `done`. A step whose record is `unknown` (the
+ *      write was sent and no answer came back) on a job that ended is NOT
+ *      abandoned: the row stays `proposed`, and the owner is told once that
+ *      the change may or may not have reached the calendar.
  *   2. Future `active` rows still waiting (`needs_action`/`tentative`) are read
  *      back from the calendar: the attendee whose email is the row's
  *      `client_email` carries the response. The calendar is the only source
@@ -17,16 +20,21 @@
  *      is sent: at most once, never twice.
  *   4. A meeting still unanswered after the wait (24h, or 2h when it starts in
  *      under a day — `meeting_settings`, measured from activation) → the slot
- *      is claimed, a client reminder is opened through the gate (never sent on
- *      its own, `reminder.ts`), and the owner is told once (§8.3).
+ *      is claimed, a client reminder is prepared (`reminder.ts`: a job through
+ *      the gate, or — under a dial that holds `email.initiate` at
+ *      `draft_only` — the text handed to the owner), and the owner is told
+ *      once (§8.3). Only rows whose calendar read SUCCEEDED this pass qualify:
+ *      a stale `needs_action` is not evidence that the client did not answer.
  *   5. `sweepHolds`.
  *
- * Nothing here throws on one meeting's failure: it is counted and the sweep
- * moves on. A calendar that cannot be reached skips step 2 only.
+ * Nothing here throws on one meeting's failure: it is recorded in `errored`
+ * and the sweep moves on. A calendar that cannot be reached skips steps 2 and
+ * 4 only.
  *
  * Calendar-derived and client text reaches the owner only through
  * `stripBidiControls` + `toOneLine`.
  */
+import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type AttendeeResponse, type CalendarClient } from '../calendar/types.js';
@@ -36,6 +44,7 @@ import { NOTIFY_TIMEOUT_MS } from '../governance/notify.js';
 import { deliver } from '../ledger/pass.js';
 import type { Runtime } from '../orchestrator/runtime.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
+import { canonicalHash } from '../util/canonical.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { markHoldConverted, sweepHolds } from './holds.js';
 import { hhmm, localWeekdayLabel } from './query.js';
@@ -50,8 +59,10 @@ export interface MeetingSyncResult {
   remindersOpened: number;
   unansweredAlerts: number;
   holdsReleased: number;
-  /** Per-meeting failures counted and skipped (the sweep never throws on one). */
-  errored: number;
+  /** Writes whose outcome is unknown, alerted to the owner this pass. */
+  uncertainAlerts: number;
+  /** Per-meeting failures, recorded and skipped (the sweep never throws on one). */
+  errored: { meetingId: string; error: string }[];
 }
 
 export type SendAlert = (subject: string, body: string) => Promise<{ ok: boolean; error?: string }>;
@@ -59,15 +70,20 @@ export type SendAlert = (subject: string, body: string) => Promise<{ ok: boolean
 const HOUR_MS = 60 * 60 * 1000;
 const SOON_MS = 24 * HOUR_MS;
 const CALENDAR_CALL_TIMEOUT_MS = 30_000;
-const ABANDON_PHASES = new Set(['failed', 'closed', 'halted']);
+const TERMINAL_PHASES = new Set(['failed', 'closed', 'halted']);
+/** Audit reason prefix for the once-only "the write may or may not have landed" alert. */
+export const UNCERTAIN_WRITE_REASON = 'meeting_write_uncertain';
 
 interface ProposedRow {
   meeting_id: string;
+  job_id: string;
   operation: 'create' | 'move' | 'update' | 'cancel';
   calendar_id: string;
   event_id: string | null;
+  client_name: string;
   client_email: string | null;
   phase: string | null;
+  charter_version: string | null;
   step_status: string | null;
   external_id: string | null;
 }
@@ -87,8 +103,23 @@ function clean(value: string): string {
   return toOneLine(stripBidiControls(value)).trim();
 }
 
+function message(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+interface OwnerChannels {
+  businessId: string;
+  sendAlert?: SendAlert;
+  messenger?: BossMessenger;
+  dashboardBaseUrl?: string;
+}
+
 /** Step 1 for one row. Returns what happened to it. */
-async function settleProposed(businessId: string, row: ProposedRow, now: Date): Promise<'activated' | 'abandoned' | null> {
+async function settleProposed(
+  businessId: string,
+  row: ProposedRow,
+  now: Date,
+): Promise<'activated' | 'abandoned' | 'uncertain' | null> {
   if (row.step_status === 'completed') {
     const eventId = row.external_id ?? row.event_id;
     const freshResponse = row.client_email === null ? 'not_updated' : 'needs_action';
@@ -121,23 +152,66 @@ async function settleProposed(businessId: string, row: ProposedRow, now: Date): 
     }
     return 'activated';
   }
-  if (row.phase === null || ABANDON_PHASES.has(row.phase)) {
-    const updated = await getPool().query(
-      `UPDATE meetings SET state = 'abandoned', updated_at = $3
-        WHERE business_id = $1 AND meeting_id = $2 AND state = 'proposed'`,
-      [businessId, row.meeting_id, now],
-    );
-    return (updated.rowCount ?? 0) > 0 ? 'abandoned' : null;
+  const terminal = row.phase === null || TERMINAL_PHASES.has(row.phase);
+  if (!terminal) return null;
+  if (row.step_status === 'unknown') {
+    // The write was sent and nothing authoritative came back: it may be in the
+    // calendar. Abandoning it would hide a meeting that exists; the row stays.
+    return 'uncertain';
   }
-  return null;
+  const updated = await getPool().query(
+    `UPDATE meetings SET state = 'abandoned', updated_at = $3
+      WHERE business_id = $1 AND meeting_id = $2 AND state = 'proposed'`,
+    [businessId, row.meeting_id, now],
+  );
+  return (updated.rowCount ?? 0) > 0 ? 'abandoned' : null;
+}
+
+/**
+ * Claim the once-only "uncertain write" alert for one meeting. The record is
+ * an audit row (no schema change: `unanswered_notified_at` means something
+ * else), taken under a per-meeting advisory lock so two passes alert once.
+ * Carries the meeting id and a hash only — never the client's name.
+ */
+async function claimUncertainAlert(businessId: string, row: ProposedRow): Promise<boolean> {
+  const reason = `${UNCERTAIN_WRITE_REASON}:${row.meeting_id}`;
+  return withTransaction(async (tx) => {
+    await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${businessId}:${reason}`]);
+    const { rows } = await tx.query('SELECT 1 FROM audit_log WHERE business_id = $1 AND reason = $2 LIMIT 1', [
+      businessId,
+      reason,
+    ]);
+    if (rows.length > 0) return false;
+    await appendAudit(
+      {
+        jobId: row.job_id,
+        actor: 'sched.meetings',
+        kind: 'incident',
+        reason,
+        inputHash: canonicalHash({ meetingId: row.meeting_id, operation: row.operation }),
+        provenance: 'boss',
+        charterVersion: row.charter_version ?? 'n/a',
+        envelopeId: null,
+        onBehalfOf: null,
+        actionClass: null,
+        risk: null,
+        outputHash: null,
+        artifacts: [],
+        costMinor: null,
+        tokens: null,
+      },
+      { businessId, tx },
+    );
+    return true;
+  });
+}
+
+export function uncertainWriteText(name: string): string {
+  return `ייתכן שהשינוי ביומן ל${clean(name)} נשמר וייתכן שלא — כדאי לבדוק ביומן.`;
 }
 
 /** The owner's alert, through each channel of the action-update settings; never throws. */
-async function alertOwner(
-  o: { businessId: string; sendAlert?: SendAlert; messenger?: BossMessenger; dashboardBaseUrl?: string },
-  subject: string,
-  text: string,
-): Promise<void> {
+async function alertOwner(o: OwnerChannels, subject: string, text: string): Promise<void> {
   let settings;
   try {
     settings = await loadActionUpdateSettings({ businessId: o.businessId });
@@ -166,23 +240,30 @@ export function declinedAlertText(name: string, startMs: number, timeZone: strin
   return `❌ ${clean(name)} דחה את ${when(startMs, timeZone)}. כתבי לי מועד חדש או "תציעי מועדים".`;
 }
 
-export function unansweredAlertText(
-  name: string,
-  startMs: number,
-  timeZone: string,
-  outcome: 'opened' | ReminderSkip | 'open_failed',
-): string {
+export type UnansweredOutcome =
+  | { kind: 'opened' }
+  | { kind: 'skipped'; reason: ReminderSkip }
+  | { kind: 'drafted_for_owner'; text: string }
+  | { kind: 'open_failed' };
+
+export function unansweredAlertText(name: string, startMs: number, timeZone: string, outcome: UnansweredOutcome): string {
   const head = `⏳ ${clean(name)} עדיין לא אישר את ${when(startMs, timeZone)}`;
-  switch (outcome) {
+  switch (outcome.kind) {
     case 'opened':
-    case 'already':
       return `${head} — הכנתי תזכורת לאישורך.`;
-    case 'no_email':
-      return `${head} — אין לו כתובת, כדאי לעדכן אותו בעצמך.`;
-    case 'no_mailbox':
-      return `${head} — אין תיבת מייל מחוברת, כדאי לעדכן אותו בעצמך.`;
+    case 'drafted_for_owner':
+      return `${head}. הנה תזכורת מוכנה לשליחה:\n${outcome.text}`;
     case 'open_failed':
       return `${head} — לא הצלחתי להכין תזכורת, כדאי לעדכן אותו בעצמך.`;
+    case 'skipped':
+      switch (outcome.reason) {
+        case 'already':
+          return `${head} — הכנתי תזכורת לאישורך.`;
+        case 'no_email':
+          return `${head} — אין לו כתובת, כדאי לעדכן אותו בעצמך.`;
+        case 'no_mailbox':
+          return `${head} — אין תיבת מייל מחוברת, כדאי לעדכן אותו בעצמך.`;
+      }
   }
 }
 
@@ -206,9 +287,13 @@ export async function syncMeetings(o: {
     remindersOpened: 0,
     unansweredAlerts: 0,
     holdsReleased: 0,
-    errored: 0,
+    uncertainAlerts: 0,
+    errored: [],
   };
-  const owner = {
+  const fail = (meetingId: string, err: unknown): void => {
+    result.errored.push({ meetingId, error: message(err) });
+  };
+  const owner: OwnerChannels = {
     businessId,
     ...(o.sendAlert !== undefined ? { sendAlert: o.sendAlert } : {}),
     ...(o.messenger !== undefined ? { messenger: o.messenger } : {}),
@@ -222,8 +307,8 @@ export async function syncMeetings(o: {
     [businessId],
   );
   const { rows: proposed } = await db.query<ProposedRow>(
-    `SELECT m.meeting_id, m.operation, m.calendar_id, m.event_id, m.client_email,
-            j.phase, r.status AS step_status, r.external_id
+    `SELECT m.meeting_id, m.job_id, m.operation, m.calendar_id, m.event_id, m.client_name, m.client_email,
+            j.phase, j.charter_version, r.status AS step_status, r.external_id
        FROM meetings m
        LEFT JOIN jobs j ON j.job_id = m.job_id AND j.business_id = m.business_id
        LEFT JOIN job_plans p ON p.job_id = m.job_id AND p.business_id = m.business_id
@@ -239,8 +324,12 @@ export async function syncMeetings(o: {
       const outcome = await settleProposed(businessId, row, now);
       if (outcome === 'activated') result.activated += 1;
       else if (outcome === 'abandoned') result.abandoned += 1;
-    } catch {
-      result.errored += 1;
+      else if (outcome === 'uncertain' && (await claimUncertainAlert(businessId, row))) {
+        await alertOwner(owner, 'שינוי ביומן שלא ידוע אם נשמר', uncertainWriteText(row.client_name));
+        result.uncertainAlerts += 1;
+      }
+    } catch (err) {
+      fail(row.meeting_id, err);
     }
   }
 
@@ -255,6 +344,8 @@ export async function syncMeetings(o: {
   if (timeZone !== null) {
     const tz = timeZone;
     const locations = new Map<string, string | null>();
+    /** Rows whose calendar read succeeded this pass — the only ones step 4 may remind. */
+    const readOk = new Set<string>();
 
     // 2. Read the waiting responses back from the calendar.
     const { rows: waiting } = await db.query<ActiveRow>(
@@ -288,9 +379,10 @@ export async function syncMeetings(o: {
               AbortSignal.timeout(CALENDAR_CALL_TIMEOUT_MS),
             );
             if (isCalendarFailure(event)) {
-              if (event.failure !== 'not_found') result.errored += 1;
+              if (event.failure !== 'not_found') fail(row.meeting_id, event.message);
               continue;
             }
+            readOk.add(row.meeting_id);
             locations.set(row.meeting_id, event.location);
             const email = (row.client_email as string).trim().toLowerCase();
             const attendee = event.attendees.find((a) => a.email.trim().toLowerCase() === email);
@@ -303,8 +395,8 @@ export async function syncMeetings(o: {
               [businessId, row.meeting_id, row.response, response, now],
             );
             if ((changed.rowCount ?? 0) > 0) result.responsesChanged += 1;
-          } catch {
-            result.errored += 1;
+          } catch (err) {
+            fail(row.meeting_id, err);
           }
         }
       }
@@ -325,21 +417,22 @@ export async function syncMeetings(o: {
       result.declinedAlerts += 1;
     }
 
-    // 4. Unanswered after the wait: claim, open a reminder, tell the owner once.
+    // 4. Unanswered after the wait: claim, prepare a reminder, tell the owner once.
     let settings;
     try {
       settings = await loadMeetingSettings({ businessId });
-    } catch {
+    } catch (err) {
       settings = null;
+      fail('*', err);
     }
-    if (settings !== null) {
+    if (settings !== null && readOk.size > 0) {
       const { rows: unanswered } = await db.query<ActiveRow>(
         `SELECT meeting_id, calendar_id, event_id, client_name, client_email, start_at, response, updated_at
            FROM meetings
           WHERE business_id = $1 AND state = 'active' AND response = 'needs_action'
-            AND reminder_claimed_at IS NULL AND start_at > $2
+            AND reminder_claimed_at IS NULL AND start_at > $2 AND meeting_id = ANY($3::text[])
           ORDER BY start_at, meeting_id`,
-        [businessId, now],
+        [businessId, now, [...readOk]],
       );
       for (const row of unanswered) {
         if (row.start_at === null) continue;
@@ -356,18 +449,24 @@ export async function syncMeetings(o: {
           );
           if ((claimed.rowCount ?? 0) === 0) continue;
 
-          let outcome: 'opened' | ReminderSkip | 'open_failed';
+          let outcome: UnansweredOutcome;
           try {
             const opened = await openClientReminder({
               businessId,
               meetingId: row.meeting_id,
               ...(locations.has(row.meeting_id) ? { location: locations.get(row.meeting_id) ?? null } : {}),
             });
-            outcome = 'jobId' in opened ? 'opened' : opened.skipped;
-            if (outcome === 'opened') result.remindersOpened += 1;
-          } catch {
-            outcome = 'open_failed';
-            result.errored += 1;
+            if ('jobId' in opened) {
+              outcome = { kind: 'opened' };
+              result.remindersOpened += 1;
+            } else if ('draftedForOwner' in opened) {
+              outcome = { kind: 'drafted_for_owner', text: opened.draftedForOwner };
+            } else {
+              outcome = { kind: 'skipped', reason: opened.skipped };
+            }
+          } catch (err) {
+            outcome = { kind: 'open_failed' };
+            fail(row.meeting_id, err);
           }
 
           const stamped = await db.query(
@@ -380,8 +479,8 @@ export async function syncMeetings(o: {
           const text = unansweredAlertText(row.client_name, startMs, tz, outcome);
           await alertOwner(owner, `⏳ ${clean(row.client_name)} עדיין לא אישר`, text);
           result.unansweredAlerts += 1;
-        } catch {
-          result.errored += 1;
+        } catch (err) {
+          fail(row.meeting_id, err);
         }
       }
     }
@@ -395,9 +494,9 @@ export async function syncMeetings(o: {
       ...(o.client ? { client: o.client } : {}),
     });
     result.holdsReleased = holds.released;
-    result.errored += holds.failed;
-  } catch {
-    result.errored += 1;
+    if (holds.failed > 0) result.errored.push({ meetingId: '*', error: `${holds.failed} hold(s) not released` });
+  } catch (err) {
+    fail('*', err);
   }
   return result;
 }

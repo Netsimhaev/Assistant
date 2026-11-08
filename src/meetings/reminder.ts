@@ -9,8 +9,17 @@
  * which joins on one, can never carry it — no `grantAuthorization`, no
  * approval. Its one step is `mail.send` with `{ to, subject, body }` only: no
  * threading field, so `refineActionClass` reads it as `email.initiate`, which
- * today's charter holds at `approve_required`. The owner gets a card; nothing
- * is sent on its own.
+ * today's charter holds at `approve_required`. Under the dial's `ask`/`learn`
+ * the owner gets a card; nothing is sent on its own.
+ *
+ * **Under a dial that holds `email.initiate` at `draft_only` (the default
+ * `off`), no job is opened.** The gate would refuse the step at stage 8, the
+ * job would fail without a card, and the failure would count toward
+ * `promote.ts`'s `failureCount` — while the owner had been told a card was
+ * waiting. So the CLAMPED ramp is read first, with `loadRampLevel` (the same
+ * function the runner feeds the gate), and at `draft_only` the reminder text
+ * is returned for the owner to send himself (`draftedForOwner`, without the
+ * `מזהה תזכורת` line, which exists only to defeat a mail provider's dedup).
  *
  * **The recipient is the row's `client_email`** — the address the invitation
  * went to. An unverified address is still that address, so it is reminded;
@@ -26,6 +35,7 @@ import { loadActiveCharter } from '../charter/store.js';
 import { getPool, type Queryable } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
+import { loadRampLevel } from '../orchestrator/ramp.js';
 import { bindPlanToJob, loadPlanBody } from '../orchestrator/plan-store.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { hhmm, localDateLabel, localWeekdayLabel } from './query.js';
@@ -57,7 +67,8 @@ export function reminderSubject(startMs: number, timeZone: string): string {
 }
 
 export function reminderBody(o: {
-  meetingId: string;
+  /** `null` drops the `מזהה תזכורת` line (the text handed to the owner). */
+  meetingId: string | null;
   clientName: string;
   startMs: number;
   location: string | null;
@@ -69,8 +80,8 @@ export function reminderBody(o: {
   return (
     `שלום ${name},\n` +
     `רצינו לוודא שהפגישה ב${when}${location === '' ? '' : `, ${location}`}, מתאימה לך. ` +
-    `אפשר לאשר בהזמנת היומן או להשיב למייל הזה.\n` +
-    `מזהה תזכורת: ${o.meetingId}`
+    `אפשר לאשר בהזמנת היומן או להשיב למייל הזה.` +
+    (o.meetingId === null ? '' : `\nמזהה תזכורת: ${o.meetingId}`)
   );
 }
 
@@ -94,7 +105,7 @@ export async function openClientReminder(o: {
   db?: Queryable;
   /** The event's current location, when the caller just read it from the calendar. */
   location?: string | null;
-}): Promise<{ jobId: string } | { skipped: ReminderSkip }> {
+}): Promise<{ jobId: string } | { draftedForOwner: string } | { skipped: ReminderSkip }> {
   const { businessId } = o;
   const db = o.db ?? getPool();
   const { rows } = await db.query<ReminderRow>(
@@ -109,11 +120,19 @@ export async function openClientReminder(o: {
   if (to === '' || row.start_at === null) return { skipped: 'no_email' };
 
   const active = await loadActiveCharter(businessId, db);
-  if (active === null || !charterServesMailSend(active)) return { skipped: 'no_mailbox' };
+  if (active === null) return { skipped: 'no_mailbox' };
   const timeZone = active.charter.identity.timezone;
   const startMs = row.start_at.getTime();
-
   const location = o.location !== undefined ? o.location : await storedLocation(row, businessId, db);
+
+  // The gate would refuse a draft_only step at stage 8: hand the text to the
+  // owner instead of opening a job that can only fail.
+  if ((await loadRampLevel('email.initiate', { businessId, db })) === 'draft_only') {
+    return {
+      draftedForOwner: reminderBody({ meetingId: null, clientName: row.client_name, startMs, location, timeZone }),
+    };
+  }
+  if (!charterServesMailSend(active)) return { skipped: 'no_mailbox' };
   const plan = Plan.parse({
     goal: `תזכורת לפגישה: ${clean(row.client_name).slice(0, 80)}`,
     steps: [

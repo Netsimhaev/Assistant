@@ -253,8 +253,11 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.meetingsError !== null) {
     console.error(`meetings sweep failed: ${result.meetingsError}`);
   }
-  if (result.meetings !== null && result.meetings.errored > 0) {
-    console.error(`meetings sweep: ${result.meetings.errored} meeting(s) errored`);
+  if (result.meetings !== null && result.meetings.errored.length > 0) {
+    console.error(
+      `meetings sweep: ${result.meetings.errored.length} meeting(s) errored: ` +
+        result.meetings.errored.map((e) => `${e.meetingId}: ${e.error}`).join('; '),
+    );
   }
   if (result.ledgerEvidence !== null && result.ledgerEvidence.errored.length > 0) {
     console.error(
