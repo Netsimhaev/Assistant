@@ -1082,11 +1082,15 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         // a second pass is underway.
         ...(answered !== null ? { identityAsked: true, sourceAsked: true } : {}),
         ...(ctx.planner !== undefined ? { planner: ctx.planner } : {}),
-        // The schedule answer ("מה יש לי מחר?"): calendar access for the early route.
-        // Never on the answer pass: a schedule question was already answered
-        // above, on the new message alone, and the JOIN of a parked instruction
-        // and an answer is not a schedule question.
-        ...(ctx.calendar !== undefined && answered === null ? { calendar: ctx.calendar } : {}),
+        // Calendar access: the schedule answer ("מה יש לי מחר?") and the meeting
+        // door. On the answer pass the schedule routing is OFF — a schedule
+        // question was already answered above, on the new message alone, and
+        // the JOIN of a parked instruction and an answer is not one — but the
+        // meeting door still runs, so an answer to a meeting question reaches it.
+        ...(ctx.calendar !== undefined ? { calendar: ctx.calendar } : {}),
+        ...(answered !== null
+          ? { scheduleRouting: false, answerTo: { jobId: answered.jobId, answer: heard } }
+          : {}),
       },
     );
 

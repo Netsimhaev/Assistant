@@ -209,12 +209,16 @@ describe('both doors pass the calendar', () => {
 
   it('the WhatsApp door, the scheduler and the dashboard hand the calendar on (behaviour: whatsapp-door-schedule.test.ts)', () => {
     const door = readFileSync('src/orchestrator/whatsapp-door.ts', 'utf8');
-    expect(door).toMatch(/ctx\.calendar !== undefined && answered === null \? \{ calendar: ctx\.calendar \} : \{\}/);
+    expect(door).toMatch(/\.\.\.\(ctx\.calendar !== undefined \? \{ calendar: ctx\.calendar \} : \{\}\)/);
+    // The answer pass keeps the calendar for the meeting door but turns the schedule routing off.
+    expect(door).toMatch(/answered !== null\s*\?\s*\{ scheduleRouting: false, answerTo:/);
     expect(door).toMatch(/\.\.\.\(options\.calendar !== undefined \? \{ calendar: options\.calendar \} : \{\}\)/);
     const scheduler = readFileSync('src/orchestrator/scheduler.ts', 'utf8');
     expect(scheduler).toMatch(/runWhatsAppDoor\(\{[\s\S]*?calendar: \{ runtime \}/);
     const server = readFileSync('src/dashboard/server.ts', 'utf8').replace(/\r\n/g, '\n');
     expect((server.match(/\.\.\.\(calendar !== undefined \? \{ calendar \} : \{\}\)/g) ?? []).length).toBe(1);
+    // The answer route: calendar for the meeting door, schedule routing off.
+    expect(server).toMatch(/calendar !== undefined \? \{ calendar, scheduleRouting: false, answerTo: \{ jobId, answer \} \}/);
     expect(server).toMatch(/calendar: \(\) => calendarWiring\(meetingOptions\)/);
   });
 });

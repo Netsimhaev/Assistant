@@ -1594,7 +1594,7 @@ async function handleInstructAnswer(
   // handler. Two authorised plans for one answer, and an error saying
   // nothing happened.
   const claim = await withJobClaim(`instruct-answer:${businessId}:${jobId}`, async () =>
-    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? ''),
+    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? '', calendar),
   );
   if (!claim.claimed) {
     sendHtml(
@@ -1692,6 +1692,7 @@ async function answerUnderClaim(
   // recorded instruction as typed — see the call itself.
   instruction: { instructionId: string; text: string; textOrigin: InstructionTextOrigin },
   answer: string,
+  calendar: RunInstructionOptions['calendar'],
 ): Promise<void> {
   // Scoped to a job that is actually waiting on this answer — see
   // `handleInstructAnswer`'s docblock for the two ways skipping this check
@@ -1777,6 +1778,11 @@ async function answerUnderClaim(
       // The files the owner attached to the original instruction stay his
       // sources on the second pass (document production D14).
       attachedDocumentIds: await attachedDocumentsForJob(jobId, { businessId }),
+      // Calendar access for the meeting door: an answer to a meeting question
+      // (which meeting, "תזיזי את X", another window) goes back to it. The
+      // schedule routing stays OFF: the joined text is not a schedule question,
+      // and one in the answer alone was handled read-only before the claim.
+      ...(calendar !== undefined ? { calendar, scheduleRouting: false, answerTo: { jobId, answer } } : {}),
     },
   );
 

@@ -16,7 +16,7 @@ import type { Plan } from '../domain/plan.js';
 import type { ConfirmationOption } from '../governance/instruction-confirmations.js';
 import { cancelConfirmation, loadConfirmation } from '../governance/instruction-confirmations.js';
 import { loadInstructionForJob, recordQuestion } from '../governance/instructions.js';
-import { appearsVerbatimIn } from '../governance/typed-recipients.js';
+import { appearsVerbatimIn, type InstructionTextOrigin } from '../governance/typed-recipients.js';
 import { listContacts, type Contact } from '../memory/contacts.js';
 import { resolveContacts } from '../memory/contact-resolver.js';
 import { finishSinglePlan, type DoorContext, type InstructionOutcome } from '../orchestrator/instruct.js';
@@ -150,7 +150,11 @@ export const MEETING_SETTINGS_REQUIRED_REPLY = 'צריך קודם להגדיר �
 export const HOLD_FAILED_REPLY = 'לא הצלחתי לשמור את המועד ביומן — אפשר לנסות שוב עוד מעט.';
 export const MEETING_PREPARE_FAILED_REPLY = 'לא הצלחתי להכין את הפגישה לאישור — אפשר לנסות שוב.';
 export const OTHER_SLOT_FAILED_REPLY = 'לא הצלחתי להכין מועד אחר — אפשר לנסח את בקשת הפגישה מחדש.';
+export const ALREADY_CONFIRMED_REPLY = 'הפגישה כבר אושרה — אם צריך לשנות אותה, כתבי לי שוב.';
+export const MEETING_SETTINGS_READ_FAILED_REPLY = 'לא הצלחתי לקרוא את הגדרות הפגישות — אפשר לנסות שוב עוד מעט.';
 const NO_ALTERNATIVES = 'לא מצאתי בשבועיים הקרובים';
+/** `decided_by` of a question turned down by "תני אחר", followed by the turning-down job's id. */
+const OTHER_SLOT_DECIDED_BY = 'meeting-door:other-slot:';
 
 /** "תני אחר" / "תציעי מועד אחר": the owner turns down the slot in the open meeting question. */
 export const OTHER_SLOT_PATTERN = /^(תני|תציעי)\s+(מועד\s+)?אחר/u;
@@ -327,7 +331,9 @@ function markersOf(plan: Plan): { sourceJobId: string | null; exclude: Interval[
 /**
  * The latest pending meeting question in this channel, inside the question
  * window: a job still parked in `plan`, born at the instruction door, with
- * `meetings` rows of its own. Never this instruction's own job.
+ * `meetings` rows of its own. Never this instruction's own job. A WhatsApp
+ * question counts only once it was DELIVERED (`delivered_at`, stamped after an
+ * `ok` send) — one the owner never received is not the slot he turned down.
  */
 async function pendingMeetingQuestion(door: DoorContext): Promise<{ jobId: string; plan: Plan } | null> {
   const windowMinutes = config.whatsappQuestionWindowMinutes;
@@ -337,7 +343,11 @@ async function pendingMeetingQuestion(door: DoorContext): Promise<{ jobId: strin
        FROM instruction_confirmations c
        JOIN jobs j ON j.business_id = c.business_id AND j.job_id = c.job_id AND j.phase = 'plan'
       WHERE c.business_id = $1 AND c.channel = $2 AND c.state = 'pending' AND c.job_id <> $3
-        AND c.presented_at > now() - make_interval(mins => $4)
+        AND (
+          (c.channel = 'whatsapp' AND c.delivered_at IS NOT NULL
+             AND c.delivered_at > now() - make_interval(mins => $4))
+          OR (c.channel <> 'whatsapp' AND c.presented_at > now() - make_interval(mins => $4))
+        )
         AND EXISTS (SELECT 1 FROM boss_instructions b WHERE b.business_id = c.business_id AND b.job_id = c.job_id)
         AND EXISTS (SELECT 1 FROM meetings m WHERE m.business_id = c.business_id AND m.job_id = c.job_id)
       ORDER BY c.presented_at DESC
@@ -350,6 +360,37 @@ async function pendingMeetingQuestion(door: DoorContext): Promise<{ jobId: strin
   const option = confirmation?.options[0];
   if (confirmation === null || option === undefined || confirmation.options.length !== 1) return null;
   return { jobId, plan: option.plan };
+}
+
+/**
+ * The meeting question a "תני אחר" job turned down — found through the
+ * `decided_by` that job wrote on it (`OTHER_SLOT_DECIDED_BY` + its job id), an
+ * existing column, so an answer to a question that "תני אחר" itself raised
+ * (no_slot after the re-search) still knows the original text and every slot
+ * already turned down.
+ */
+async function turnedDownBy(door: DoorContext, jobId: string): Promise<{ jobId: string; plan: Plan } | null> {
+  const { rows } = await getPool().query<{ job_id: string }>(
+    `SELECT job_id FROM instruction_confirmations
+      WHERE business_id = $1 AND state = 'cancelled' AND decided_by = $2
+      ORDER BY decided_at DESC
+      LIMIT 1`,
+    [door.businessId, `${OTHER_SLOT_DECIDED_BY}${jobId}`],
+  );
+  const turnedDown = rows[0]?.job_id;
+  if (turnedDown === undefined) return null;
+  const confirmation = await loadConfirmation(turnedDown, { businessId: door.businessId });
+  const option = confirmation?.options[0];
+  if (confirmation === null || option === undefined || confirmation.options.length !== 1) return null;
+  return { jobId: turnedDown, plan: option.plan };
+}
+
+/** "2", "מספר 2", "2." — a pick from the numbered "which meeting" question. */
+function pickedNumber(answer: string): number | null {
+  const m = /^\s*(?:מספר\s*)?(\d{1,2})\s*\.?\s*$/u.exec(stripBidiControls(answer));
+  if (m === null) return null;
+  const n = Number(m[1]);
+  return n >= 1 ? n : null;
 }
 
 /** Best effort: a hold this misses is released by `sweepHolds` once its job is closed or failed. */
@@ -398,10 +439,19 @@ async function abandonProposed(door: DoorContext): Promise<void> {
  * `confirmedCommandCovers`, with no new exemption. Any failure after a hold
  * was placed releases every hold this call placed.
  *
- * "תני אחר": the open meeting question in this channel is cancelled, its holds
- * released, and the ORIGINAL meeting text (the job named by the plan's source
- * marker, else the turned-down job itself) is extracted again with every slot
- * already turned down treated as busy.
+ * "תני אחר": the open meeting question in this channel is cancelled — only if
+ * it is still pending; one the owner confirmed meanwhile is left alone — its
+ * holds released, and the ORIGINAL meeting text (the job named by the plan's
+ * source marker, else the turned-down job itself) is extracted again with every
+ * slot already turned down treated as busy.
+ *
+ * Answer pass (`answerTo`): the joined text (parked instruction + answer) is
+ * extracted; a bare number picks that candidate of a "which meeting" question;
+ * an answer to a question "תני אחר" raised re-reads the original text joined
+ * with the answer, keeping every turned-down slot excluded.
+ *
+ * Verification (CLAUDE.md "תמלול אינו הקלדה"): an email or phone is verified
+ * only when the text it came from was TYPED and it appears there verbatim.
  */
 export async function runMeetingOperation(
   door: DoorContext,
@@ -411,6 +461,7 @@ export async function runMeetingOperation(
     runtime: Pick<Runtime, 'credentials'>;
     client?: CalendarClient;
     now?: Date;
+    answerTo?: { jobId: string; answer: string };
   },
 ): Promise<InstructionOutcome | null> {
   const now = o.now ?? new Date();
@@ -420,9 +471,12 @@ export async function runMeetingOperation(
   let request: MeetingRequest;
   /** The text the request was read from — the one typed emails and phones are checked against. */
   let sourceText = door.instruction.text;
+  /** Where `sourceText`'s bytes came from: verification needs typed AND verbatim. */
+  let sourceOrigin: InstructionTextOrigin = door.textOrigin;
   let sourceJobId = door.jobId;
   let exclude: Interval[] = [];
   let access: CalendarAccess | null = null;
+  let choose: ((clientName: string, candidates: readonly CalendarEvent[]) => CalendarEvent | null) | undefined;
 
   const resolveAccess = (): Promise<CalendarAccess | { unavailable: Unavailable }> =>
     resolveCalendarAccess({
@@ -431,9 +485,38 @@ export async function runMeetingOperation(
       ...(o.client !== undefined ? { client: o.client } : {}),
     });
 
+  if (o.answerTo !== undefined) {
+    const n = pickedNumber(o.answerTo.answer);
+    if (n !== null) choose = (_name, candidates) => candidates[n - 1] ?? null;
+  }
+  const parked =
+    o.answerTo !== undefined ? await loadInstructionForJob(o.answerTo.jobId, { businessId: door.businessId }) : null;
+
   if (o.request !== undefined) {
-    request = o.request;
-  } else if (OTHER_SLOT_PATTERN.test(ownText)) {
+    // The dashboard's meeting form: every field was typed by the owner into the
+    // form, so the door's `textOrigin` is 'typed' by construction, and the
+    // caller (Task 12) synthesizes the instruction text with each field
+    // verbatim — so the same `appearsVerbatimIn` check still runs on it.
+    request = verifyTyped(o.request, door.instruction.text);
+  } else if (o.answerTo !== undefined && parked !== null && OTHER_SLOT_PATTERN.test(stripBidiControls(parked.text).trim())) {
+    // An answer to a question a "תני אחר" raised: back to the original text, the
+    // turned-down slots still excluded.
+    const prior = await turnedDownBy(door, o.answerTo.jobId);
+    if (prior === null) return null;
+    const markers = markersOf(prior.plan);
+    sourceJobId = markers.sourceJobId ?? prior.jobId;
+    exclude = [...markers.exclude, ...slotsOf(prior.plan)];
+    const source = await loadInstructionForJob(sourceJobId, { businessId: door.businessId });
+    if (source === null) return failMeetingJob(door, 'source instruction not found', OTHER_SLOT_FAILED_REPLY);
+    sourceText = `${source.text}\n\n${o.answerTo.answer}`;
+    sourceOrigin = source.textOrigin === 'typed' && door.textOrigin === 'typed' ? 'typed' : 'transcribed';
+    const extracted = await extractSafely(extractor, sourceText, now, door.timeZone);
+    if (extracted.status === 'not_meeting') return null;
+    if (extracted.status === 'failed') {
+      return failMeetingJob(door, `extraction failed (${extracted.reason})`, MEETING_NOT_UNDERSTOOD_REPLY);
+    }
+    request = verifyTyped(extracted.request, sourceText);
+  } else if (o.answerTo === undefined && OTHER_SLOT_PATTERN.test(ownText)) {
     const previous = await pendingMeetingQuestion(door);
     if (previous === null) return null;
     const resolved = await resolveAccess();
@@ -442,8 +525,13 @@ export async function runMeetingOperation(
     }
     access = resolved;
 
-    // The question is turned down first: nothing can confirm it any more, and its hold goes.
-    await cancelConfirmation(previous.jobId, 'meeting-door:other-slot', { businessId: door.businessId });
+    // The question is turned down first — only if it is still pending. One the
+    // owner confirmed meanwhile (the dashboard, a second channel) is about to
+    // run: its job and its hold are not ours to touch.
+    const cancelled = await cancelConfirmation(previous.jobId, `${OTHER_SLOT_DECIDED_BY}${door.jobId}`, {
+      businessId: door.businessId,
+    });
+    if (!cancelled) return failMeetingJob(door, 'the turned-down question was already decided', ALREADY_CONFIRMED_REPLY);
     try {
       await transition(previous.jobId, {
         to: 'closed',
@@ -464,6 +552,9 @@ export async function runMeetingOperation(
     const source = await loadInstructionForJob(sourceJobId, { businessId: door.businessId });
     if (source === null) return failMeetingJob(door, 'source instruction not found', OTHER_SLOT_FAILED_REPLY);
     sourceText = source.text;
+    // The SOURCE instruction's origin, not this message's: "תני אחר" typed under a
+    // voice-note request does not make the recorded address typed.
+    sourceOrigin = source.textOrigin;
     const extracted = await extractSafely(extractor, sourceText, now, door.timeZone);
     if (extracted.status !== 'extracted') {
       return failMeetingJob(door, `re-extraction ${extracted.status}`, OTHER_SLOT_FAILED_REPLY);
@@ -488,7 +579,16 @@ export async function runMeetingOperation(
   }
   const calendar: CalendarAccess = access;
 
-  const settings = await loadMeetingSettings({ businessId: door.businessId });
+  let settings: Awaited<ReturnType<typeof loadMeetingSettings>>;
+  try {
+    settings = await loadMeetingSettings({ businessId: door.businessId });
+  } catch (err) {
+    return failMeetingJob(
+      door,
+      `meeting settings read threw (${err instanceof Error ? err.message : String(err)})`,
+      MEETING_SETTINGS_READ_FAILED_REPLY,
+    );
+  }
   if (settings.locationKind === null) {
     return failMeetingJob(door, 'meeting settings not set', MEETING_SETTINGS_REQUIRED_REPLY);
   }
@@ -532,14 +632,17 @@ export async function runMeetingOperation(
     let emailVerified = false;
     let phone: string | null = null;
     let phoneVerified = false;
+    // Verified only when the text was TYPED and the value appears in it
+    // verbatim (CLAUDE.md "תמלול אינו הקלדה"): a transcription is a model's
+    // output, and an address that appears only there is shown unverified.
+    const typedText = sourceOrigin === 'typed';
     if (typed !== undefined && typed.client.email !== null) {
-      // Survived `verifyTypedEmails`: it appears in the text the owner gave.
       email = typed.client.email;
-      emailVerified = true;
+      emailVerified = typedText && appearsVerbatimIn(email, sourceText);
     }
     if (typed !== undefined && typed.client.phone !== null) {
       phone = typed.client.phone;
-      phoneVerified = appearsVerbatimIn(phone, sourceText);
+      phoneVerified = typedText && appearsVerbatimIn(phone, sourceText);
     }
     if (email === null) {
       const subjects = resolveContacts(name, contacts).subjects;
@@ -564,6 +667,7 @@ export async function runMeetingOperation(
     resolveClient,
     holdEventIds: new Map(),
     exclude,
+    ...(choose !== undefined ? { choose } : {}),
   });
 
   switch (result.kind) {

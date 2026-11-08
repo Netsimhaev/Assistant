@@ -214,6 +214,21 @@ export interface RunInstructionOptions {
    * so tests never reach the billed model. Defaults to `runMeetingExtractor`.
    */
   meetingExtractor?: MeetingExtractor;
+  /**
+   * `false` on an answer pass (both answer routes): the joined text (parked
+   * instruction + answer) is never read as a schedule question — a schedule
+   * question in the answer was already answered, read-only, on the new text
+   * alone before the claim. Only the schedule routing is skipped: the meeting
+   * door still runs, so an answer to a meeting question reaches it. Absent:
+   * routed as before.
+   */
+  scheduleRouting?: boolean;
+  /**
+   * Set by both answer routes on the second pass: the parked instruction this
+   * text joins, and the owner's answer alone. The meeting door reads it to pick
+   * a numbered candidate ("2") and to keep a "תני אחר" chain's turned-down slots.
+   */
+  answerTo?: { jobId: string; answer: string };
 }
 
 export interface GrantedAuthorization {
@@ -359,8 +374,10 @@ export async function runInstruction(
   }
 
   // A schedule question is a read: answered here, before any job or instruction
-  // row exists (calendar scheduling §7.1).
-  if (options.calendar !== undefined) {
+  // row exists (calendar scheduling §7.1). Never on an answer pass
+  // (`scheduleRouting: false`): the join of a parked instruction and an answer
+  // is not a schedule question.
+  if (options.calendar !== undefined && options.scheduleRouting !== false) {
     const schedule = await answerScheduleQuery({
       text: input.text,
       businessId,
@@ -435,6 +452,7 @@ export async function runInstruction(
     const meeting = await runMeetingOperation(door, {
       ...(options.meetingRequest !== undefined ? { request: options.meetingRequest } : {}),
       ...(options.meetingExtractor !== undefined ? { extractor: options.meetingExtractor } : {}),
+      ...(options.answerTo !== undefined ? { answerTo: options.answerTo } : {}),
       runtime: options.calendar.runtime,
       ...(options.calendar.client !== undefined ? { client: options.calendar.client } : {}),
     });

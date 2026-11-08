@@ -66,6 +66,24 @@ const MEMORY: Record<string, ResolvedClient> = {
 const resolveClient = (name: string): ResolvedClient =>
   MEMORY[name] ?? { name, email: null, emailVerified: false, phone: null, phoneVerified: false };
 
+/** Like the door's: a value the request carries for this name is the typed one (verified); else memory. */
+function resolverFor(request: MeetingRequest): (name: string) => ResolvedClient {
+  return (name) => {
+    const mem = resolveClient(name);
+    const typed = request.ops.find(
+      (op): op is Extract<MeetingRequest['ops'][number], { kind: 'create' }> => op.kind === 'create' && op.client.name === name,
+    );
+    if (typed === undefined) return mem;
+    return {
+      name,
+      email: typed.client.email ?? mem.email,
+      emailVerified: typed.client.email !== null ? true : mem.emailVerified,
+      phone: typed.client.phone ?? mem.phone,
+      phoneVerified: typed.client.phone !== null ? true : mem.phoneVerified,
+    };
+  };
+}
+
 function build(request: MeetingRequest, snapshot: CalendarSnapshot, over: { holds?: Map<number, string>; settings?: MeetingSettings } = {}): MeetingPlanResult {
   return buildMeetingPlan({
     request,
@@ -74,7 +92,7 @@ function build(request: MeetingRequest, snapshot: CalendarSnapshot, over: { hold
     operations: OPS,
     timeZone: TZ,
     now: NOW,
-    resolveClient,
+    resolveClient: resolverFor(request),
     holdEventIds: over.holds ?? new Map(),
   });
 }
@@ -439,5 +457,25 @@ describe('buildMeetingPlan exclude', () => {
       }),
     );
     expect(r.plan.steps[0]?.input['start']).toBe(new Date(end).toISOString());
+  });
+});
+
+describe("verification is the resolver's, never forced", () => {
+  it('a request email or phone the resolver does not vouch for is shown unverified', () => {
+    const r = buildMeetingPlan({
+      request: { ops: [create()] },
+      snapshot: snap([]),
+      settings: SETTINGS,
+      operations: OPS,
+      timeZone: TZ,
+      now: NOW,
+      // e.g. a transcribed instruction: same values, not verified.
+      resolveClient: (name) => ({ name, email: 'dani@x.co', emailVerified: false, phone: '052-3334444', phoneVerified: false }),
+      holdEventIds: new Map(),
+    });
+    if (r.kind !== 'plan') throw new Error(r.kind);
+    expect(r.changes[0]?.client).toMatchObject({ emailVerified: false, phoneVerified: false });
+    expect(r.summary).toContain('תצא הזמנה אל dani@x.co (מהזיכרון — לא אומת)');
+    expect(r.summary).toContain('טלפון: 052-3334444" (מהזיכרון — לא אומת)');
   });
 });

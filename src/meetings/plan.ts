@@ -252,6 +252,13 @@ export function buildMeetingPlan(o: {
   resolveClient: (name: string) => ResolvedClient;
   holdEventIds: ReadonlyMap<number, string>;
   exclude?: readonly Interval[];
+  /**
+   * The owner's pick when a name matches several events (an answer to the
+   * "which meeting" question, by number). Called with the candidates in the
+   * same order the question listed them; a returned event must be one of
+   * them — anything else, or `null`, keeps the question.
+   */
+  choose?: (clientName: string, candidates: readonly CalendarEvent[]) => CalendarEvent | null;
 }): MeetingPlanResult {
   const { snapshot, settings, timeZone } = o;
   const search: Search = { operations: o.operations, settings, timeZone, now: o.now };
@@ -272,8 +279,14 @@ export function buildMeetingPlan(o: {
     const client = o.resolveClient(op.clientName);
     const found = matchEvents(snapshot, op.clientName, client.email, op.onDate, timeZone);
     if (found.length === 0) return { kind: 'not_found', clientName: op.clientName };
-    if (found.length > 1) return { kind: 'ambiguous', clientName: op.clientName, candidates: found };
-    const event = found[0] as CalendarEvent;
+    let event = found[0] as CalendarEvent;
+    if (found.length > 1) {
+      const picked = o.choose?.(op.clientName, found) ?? null;
+      if (picked === null || !found.includes(picked)) {
+        return { kind: 'ambiguous', clientName: op.clientName, candidates: found };
+      }
+      event = picked;
+    }
     if (!event.organizerIsSelf && event.attendees.length > 0) {
       return { kind: 'refused', reason: organizerRefusal(clean(op.clientName)) };
     }
@@ -381,16 +394,23 @@ export function buildMeetingPlan(o: {
       };
     }
 
-    // The typed email survived `verifyTypedEmails`; anything else is the caller's resolution.
+    // Verification is the caller's (`resolveClient`): typed text AND verbatim
+    // (CLAUDE.md "תמלול אינו הקלדה"). A value this plan uses is verified only
+    // when it is the very value `resolveClient` vouched for; nothing here
+    // marks a request value verified on its own say-so.
     const resolved = o.resolveClient(op.client.name);
+    const email = op.client.email ?? resolved.email;
+    const phone = op.client.phone ?? resolved.phone;
     const client: ResolvedClient = {
       name: op.client.name,
-      email: op.client.email ?? resolved.email,
-      emailVerified: op.client.email !== null ? true : resolved.emailVerified,
-      phone: op.client.phone ?? resolved.phone,
-      // A phone in the request is the instruction's (the caller checks it is typed,
-      // like `verifyTypedEmails`); one filled in from `resolveClient` carries its flag.
-      phoneVerified: op.client.phone !== null ? true : resolved.phoneVerified,
+      email,
+      emailVerified:
+        email !== null &&
+        resolved.email !== null &&
+        email.trim().toLowerCase() === resolved.email.trim().toLowerCase() &&
+        resolved.emailVerified,
+      phone,
+      phoneVerified: phone !== null && resolved.phone !== null && phone === resolved.phone && resolved.phoneVerified,
     };
     const location = op.location ?? (settings.locationKind === 'fixed' ? settings.fixedAddress : null);
     const synthetic: CalendarEvent = {
