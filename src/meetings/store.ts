@@ -35,6 +35,8 @@ export async function recordProposedMeetings(o: {
     let end: string;
     let internalNote: string | null = null;
     let notified: boolean;
+    let email: string | null = change.client.email;
+    let emailVerified = change.client.emailVerified;
     if (change.op === 'create') {
       calendarId = change.calendarId;
       const hold = step.input['holdEventId'];
@@ -49,6 +51,16 @@ export async function recordProposedMeetings(o: {
       start = change.start ?? change.event.start;
       end = change.end ?? change.event.end;
       notified = change.event.attendees.length > 0;
+      // The address the notice actually goes to is the event's attendee; the
+      // resolved email only when the event has none.
+      const attendee = change.event.attendees.find((a) => a.email.trim() !== '')?.email ?? null;
+      if (attendee !== null) {
+        email = attendee;
+        emailVerified =
+          change.client.emailVerified &&
+          change.client.email !== null &&
+          change.client.email.trim().toLowerCase() === attendee.trim().toLowerCase();
+      }
     }
     const base = values.length;
     values.push(
@@ -60,8 +72,8 @@ export async function recordProposedMeetings(o: {
       eventId,
       change.op,
       change.client.name,
-      change.client.email,
-      change.client.emailVerified,
+      email,
+      emailVerified,
       change.client.phone,
       internalNote,
       start,

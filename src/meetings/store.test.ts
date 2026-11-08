@@ -29,13 +29,13 @@ const CHANGES: PlannedChange[] = [
   {
     op: 'move',
     event: EVENT,
-    client: { name: 'רונית לוי', email: null, emailVerified: false, phone: null },
+    client: { name: 'רונית לוי', email: null, emailVerified: false, phone: null, phoneVerified: false },
     start: '2026-11-15T07:00:00.000Z',
     end: '2026-11-15T08:00:00.000Z',
   },
   {
     op: 'create',
-    client: { name: 'דני כהן', email: 'dani@x.co', emailVerified: true, phone: '052-1' },
+    client: { name: 'דני כהן', email: 'dani@x.co', emailVerified: true, phone: '052-1', phoneVerified: false },
     calendarId: 'primary',
     start: '2026-11-17T08:00:00.000Z',
     end: '2026-11-17T09:00:00.000Z',
@@ -98,6 +98,37 @@ describe('recordProposedMeetings', () => {
       step_id: 'm2', operation: 'create', event_id: 'hold-9', client_email: 'dani@x.co', client_email_verified: true,
       client_phone: '052-1', internal_note: 'פנימי', state: 'proposed', response: 'needs_action',
     });
+  });
+
+  it('records the event attendee as the email of a move, falling back to the resolved one', async () => {
+    const withAttendee: PlannedChange = {
+      op: 'cancel',
+      event: { ...EVENT, eventId: 'r2', attendees: [{ email: 'Ronit@Real.co', response: 'accepted' }] },
+      client: { name: 'רונית לוי', email: 'ronit@memory.co', emailVerified: false, phone: null, phoneVerified: false },
+    };
+    const noAttendee: PlannedChange = {
+      op: 'cancel',
+      event: { ...EVENT, eventId: 'r3' },
+      client: { name: 'רונית לוי', email: 'ronit@memory.co', emailVerified: false, phone: null, phoneVerified: false },
+    };
+    const step = (id: string, eventId: string): Plan['steps'][number] => ({
+      id, agent: 'sched.meetings', intent: 'meeting.cancel', toolName: 'calendar.write', dependsOn: [], expectedActionClass: 'calendar.cancel',
+      input: { operation: 'cancel', calendarId: 'primary', eventId },
+    });
+    await recordProposedMeetings({
+      businessId: BUSINESS,
+      jobId: 'J-3',
+      plan: { ...PLAN, steps: [step('m1', 'r2'), step('m2', 'r3')] },
+      changes: [withAttendee, noAttendee],
+    });
+    const { rows } = await getPool().query<{ step_id: string; client_email: string | null; response: string }>(
+      `SELECT step_id, client_email, response FROM meetings WHERE business_id = $1 AND job_id = 'J-3' ORDER BY step_id`,
+      [BUSINESS],
+    );
+    expect(rows).toEqual([
+      { step_id: 'm1', client_email: 'Ronit@Real.co', response: 'needs_action' },
+      { step_id: 'm2', client_email: 'ronit@memory.co', response: 'not_updated' },
+    ]);
   });
 
   it('refuses a change list that does not match the plan steps', async () => {

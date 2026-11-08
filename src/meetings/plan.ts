@@ -51,6 +51,8 @@ export interface ResolvedClient {
   email: string | null;
   emailVerified: boolean;
   phone: string | null;
+  /** The phone appeared verbatim in the owner's instruction (the caller decides, like `emailVerified`). */
+  phoneVerified: boolean;
 }
 
 export type PlannedChange =
@@ -124,6 +126,23 @@ function composeDescription(notes: string | null, phone: string | null): string 
   const parts: string[] = [];
   if (notes !== null && notes.trim() !== '') parts.push(notes);
   if (phone !== null && phone.trim() !== '') parts.push(`טלפון: ${phone}`);
+  return parts.length === 0 ? null : parts.join('\n');
+}
+
+const PHONE_LINE = /^טלפון: .+$/u;
+
+/**
+ * An edit of the client notes keeps the event's trailing `טלפון: …` line (the
+ * one a create wrote), after the new notes. `null` when nothing is left.
+ */
+export function editedDescription(current: string | null, notes: string | null): string | null {
+  const lines = (current ?? '').split(/\r\n|[\r\n]|\p{Zl}|\p{Zp}/u);
+  let last = '';
+  while (lines.length > 0 && last === '') last = (lines.pop() ?? '').trim();
+  const phoneLine = PHONE_LINE.test(last) ? last : null;
+  const parts: string[] = [];
+  if (notes !== null && notes.trim() !== '') parts.push(notes);
+  if (phoneLine !== null) parts.push(phoneLine);
   return parts.length === 0 ? null : parts.join('\n');
 }
 
@@ -321,7 +340,7 @@ export function buildMeetingPlan(o: {
       return {
         kind: 'no_slot',
         opIndex: index,
-        dayListing: dayListing(search, snapshot, busy, op.window),
+        dayListing: dayListing(search, working(), busy, op.window),
         alternatives: alternativesAfter(search, snapshot, busy, op.window.toDate, durationMin),
       };
     }
@@ -351,7 +370,7 @@ export function buildMeetingPlan(o: {
       return {
         kind: 'no_slot',
         opIndex: index,
-        dayListing: dayListing(search, snapshot, busy, op.window),
+        dayListing: dayListing(search, working(), busy, op.window),
         alternatives: alternativesAfter(search, snapshot, busy, op.window.toDate, durationMin),
       };
     }
@@ -363,6 +382,9 @@ export function buildMeetingPlan(o: {
       email: op.client.email ?? resolved.email,
       emailVerified: op.client.email !== null ? true : resolved.emailVerified,
       phone: op.client.phone ?? resolved.phone,
+      // A phone in the request is the instruction's (the caller checks it is typed,
+      // like `verifyTypedEmails`); one filled in from `resolveClient` carries its flag.
+      phoneVerified: op.client.phone !== null ? true : resolved.phoneVerified,
     };
     const location = op.location ?? (settings.locationKind === 'fixed' ? settings.fixedAddress : null);
     const synthetic: CalendarEvent = {
@@ -480,7 +502,9 @@ function stepInput(s: Staged): Record<string, unknown> {
         eventId: s.change.event.eventId,
       };
       if (s.change.location !== undefined) input['location'] = s.change.location;
-      if (s.change.clientNotes !== undefined) input['description'] = s.change.clientNotes;
+      if (s.change.clientNotes !== undefined) {
+        input['description'] = editedDescription(s.change.event.description, s.change.clientNotes);
+      }
       return input;
     }
     case 'cancel':
@@ -544,20 +568,39 @@ function whenPoint(start: string, timeZone: string): string {
   return `${localDayLabel(a, timeZone)} ${hhmm(a, timeZone)}`;
 }
 
-function beforeAfter(label: string, before: string | null, after: string | null): string {
-  const show = (v: string | null): string => {
-    const c = clean(v);
-    return c === '' ? '(ריק)' : `"${c}"`;
-  };
-  return `${label}: לפני ${show(before)} → אחרי ${show(after)}`;
+const SUMMARY_MARGIN = '    ';
+const SUMMARY_BREAKS = /\r\n|[^\P{Cc}\t]|\p{Zl}|\p{Zp}/u;
+
+/**
+ * A client-visible value, quoted, every line cleaned; a multi-line value keeps
+ * its lines, each continuation indented so none starts at column 0. Empty → `(ריק)`.
+ */
+function quoted(v: string | null | undefined): string {
+  const lines = (v ?? '').split(SUMMARY_BREAKS).map((line) => clean(line));
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  while (lines.length > 0 && lines[0] === '') lines.shift();
+  return lines.length === 0 ? '(ריק)' : `"${lines.join(`\n${SUMMARY_MARGIN}`)}"`;
 }
+
+function beforeAfter(label: string, before: string | null, after: string | null): string {
+  return `${label}: לפני ${quoted(before)} → אחרי ${quoted(after)}`;
+}
+
+const UNVERIFIED_MARKER = ' (מהזיכרון — לא אומת)';
 
 function changeBlock(c: PlannedChange, timeZone: string): string {
   const name = clean(c.client.name);
   switch (c.op) {
     case 'create': {
       const location = clean(c.location);
-      return `קביעה: ${name} — ${whenRange(c.start, c.end, timeZone)}${location === '' ? '' : `, ${location}`}`;
+      const head = `קביעה: ${name} — ${whenRange(c.start, c.end, timeZone)}${location === '' ? '' : `, ${location}`}`;
+      // Every field the client will see, word for word: the invite's description.
+      const description = composeDescription(c.clientNotes, c.client.phone);
+      if (description === null) return head;
+      const hasPhone = c.client.phone !== null && c.client.phone.trim() !== '';
+      // The phone line is always the description's last, so the marker follows the closing quote.
+      const marker = hasPhone && !c.client.phoneVerified ? UNVERIFIED_MARKER : '';
+      return `${head}\n${SUMMARY_MARGIN}פרטים ללקוח: ${quoted(description)}${marker}`;
     }
     case 'move':
       return `הזזה: ${name} — מ${whenPoint(c.event.start, timeZone)} ל${whenPoint(c.start ?? c.event.start, timeZone)}`;
@@ -566,7 +609,9 @@ function changeBlock(c: PlannedChange, timeZone: string): string {
     case 'update': {
       const lines = [`עריכה: ${name} — ${whenPoint(c.event.start, timeZone)}`];
       if (c.location !== undefined) lines.push(beforeAfter('מיקום', c.event.location, c.location));
-      if (c.clientNotes !== undefined) lines.push(beforeAfter('פרטים ללקוח', c.event.description, c.clientNotes));
+      if (c.clientNotes !== undefined) {
+        lines.push(beforeAfter('פרטים ללקוח', c.event.description, editedDescription(c.event.description, c.clientNotes)));
+      }
       return lines.join('\n');
     }
   }
@@ -578,7 +623,7 @@ function noticeLine(c: PlannedChange): string {
   const noMail = `⚠️ ל${name} אין כתובת מייל — הוא לא יקבל עדכון. תצטרך לעדכן אותו בעצמך.`;
   if (c.op === 'create') {
     if (c.client.email === null) return noMail;
-    const marker = c.client.emailVerified ? '' : ' (מהזיכרון — לא אומת)';
+    const marker = c.client.emailVerified ? '' : UNVERIFIED_MARKER;
     return `תצא הזמנה אל ${clean(c.client.email)}${marker}`;
   }
   const emails = c.event.attendees.map((a) => clean(a.email)).filter((e) => e !== '');

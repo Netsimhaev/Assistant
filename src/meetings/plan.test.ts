@@ -59,11 +59,11 @@ function snap(events: CalendarEvent[], over: Partial<CalendarSnapshot> = {}): Ca
 }
 
 const MEMORY: Record<string, ResolvedClient> = {
-  'רונית לוי': { name: 'רונית לוי', email: 'ronit@beta.co.il', emailVerified: false, phone: null },
-  'דנה': { name: 'דנה', email: 'dana@mem.co', emailVerified: false, phone: '050-1112222' },
+  'רונית לוי': { name: 'רונית לוי', email: 'ronit@beta.co.il', emailVerified: false, phone: null, phoneVerified: false },
+  'דנה': { name: 'דנה', email: 'dana@mem.co', emailVerified: false, phone: '050-1112222', phoneVerified: false },
 };
 const resolveClient = (name: string): ResolvedClient =>
-  MEMORY[name] ?? { name, email: null, emailVerified: false, phone: null };
+  MEMORY[name] ?? { name, email: null, emailVerified: false, phone: null, phoneVerified: false };
 
 function build(request: MeetingRequest, snapshot: CalendarSnapshot, over: { holds?: Map<number, string>; settings?: MeetingSettings } = {}): MeetingPlanResult {
   return buildMeetingPlan({
@@ -114,6 +114,63 @@ describe('buildMeetingPlan', () => {
     expect(r.summary).toContain("קביעה: דני כהן — יום ג' 17/11, 10:00–11:00, הרצל 5 רמת גן");
     expect(r.summary).toContain('תצא הזמנה אל dani@x.co');
     expect(r.summary).not.toContain('לא אומת');
+  });
+
+  it('shows the client-visible description in the summary, notes and phone, indented', () => {
+    const r = plan(build({ ops: [create()] }, snap([])));
+    const lines = r.summary.split('\n');
+    expect(lines).toContain('    פרטים ללקוח: "להביא חוזה חתום');
+    expect(lines).toContain('    טלפון: 052-3334444"');
+    // A typed phone carries no marker.
+    expect(r.summary).not.toContain('לא אומת');
+    // No line of the description starts at column 0.
+    expect(lines.filter((l) => l.startsWith('טלפון') || l.startsWith('להביא'))).toEqual([]);
+    // No description → no line.
+    const bare = plan(build({ ops: [create({ client: { name: 'יוסי', email: null, phone: null }, clientNotes: null })] }, snap([])));
+    expect(bare.summary).not.toContain('פרטים ללקוח');
+  });
+
+  it('marks a phone from memory unverified on the details line', () => {
+    const r = plan(build({ ops: [create({ client: { name: 'דנה', email: 'dana@typed.co', phone: null } })] }, snap([])));
+    expect(r.summary).toContain('    טלפון: 050-1112222" (מהזיכרון — לא אומת)');
+    // The email was typed: its notice carries no marker.
+    expect(r.summary.split('\n')).toContain('תצא הזמנה אל dana@typed.co');
+  });
+
+  it('an edit of the client notes keeps the event\'s phone line and shows the result', () => {
+    const s = snap([
+      ev({ eventId: 'r1', title: 'רונית לוי', description: 'ישן\nטלפון: 054-9998888', start: '2026-11-12T09:30:00Z', end: '2026-11-12T10:30:00Z' }),
+    ]);
+    const r = plan(build({ ops: [{ kind: 'edit', clientNotes: 'חדש', clientName: 'רונית לוי', onDate: null }] }, s));
+    expect(r.plan.steps[0]!.input['description']).toBe('חדש\nטלפון: 054-9998888');
+    expect(r.summary).toContain('פרטים ללקוח: לפני "ישן\n    טלפון: 054-9998888" → אחרי "חדש\n    טלפון: 054-9998888"');
+    // Clearing the notes leaves only the phone line.
+    const cleared = plan(build({ ops: [{ kind: 'edit', clientNotes: null, clientName: 'רונית לוי', onDate: null }] }, s));
+    expect(cleared.plan.steps[0]!.input['description']).toBe('טלפון: 054-9998888');
+  });
+
+  it('the no_slot day listing shows the working schedule, after an earlier cancel', () => {
+    // Tue 17/11: יוסי 09:00–18:00 local is cancelled first; רונית's move then
+    // needs Tue 09:00–10:00, which is taken by אלפא — no slot. The listing must
+    // not show יוסי (cancelled in the same request).
+    const s = snap([
+      ev({ eventId: 'y', title: 'יוסי', start: '2026-11-17T09:00:00Z', end: '2026-11-17T16:00:00Z' }),
+      ev({ eventId: 'a', title: 'אלפא', start: '2026-11-17T07:00:00Z', end: '2026-11-17T08:00:00Z' }),
+      ev({ eventId: 'r', title: 'רונית לוי', start: '2026-11-19T07:00:00Z', end: '2026-11-19T08:00:00Z' }),
+    ]);
+    const r = build(
+      {
+        ops: [
+          { kind: 'cancel', clientName: 'יוסי', onDate: null },
+          { kind: 'move', clientName: 'רונית לוי', onDate: null, window: { fromDate: '2026-11-17', toDate: '2026-11-17', fromTime: '09:00', toTime: '10:00' } },
+        ],
+      },
+      s,
+    );
+    expect(r.kind).toBe('no_slot');
+    if (r.kind !== 'no_slot') return;
+    expect(r.dayListing).toContain('אלפא');
+    expect(r.dayListing).not.toContain('יוסי');
   });
 
   it('a create without email or notes gets no attendee and a null description, and the summary warns', () => {
@@ -314,7 +371,7 @@ describe('renderMeetingSummary', () => {
       [
         {
           op: 'create',
-          client: { name: 'דני', email: null, emailVerified: false, phone: null },
+          client: { name: 'דני', email: null, emailVerified: false, phone: null, phoneVerified: false },
           calendarId: 'primary',
           start: '2026-11-17T08:00:00Z',
           end: '2026-11-17T09:00:00Z',
