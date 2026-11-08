@@ -36,8 +36,8 @@ import {
   renderSchedule,
   UNRECOGNIZED_RANGE_REPLY,
 } from './query.js';
-import { isMeetingInstruction, verifyTypedEmails, type MeetingRequest } from './request.js';
-import { loadMeetingSettings } from './settings.js';
+import { isMeetingInstruction, namesMeeting, verifyTypedEmails, type MeetingRequest } from './request.js';
+import { loadMeetingSettings, type MeetingSettings } from './settings.js';
 import { loadCalendarRange } from './snapshot.js';
 import { recordProposedMeetings } from './store.js';
 
@@ -485,6 +485,37 @@ export async function runMeetingOperation(
       ...(o.client !== undefined ? { client: o.client } : {}),
     });
 
+  /** Calendar access (reused when already resolved) and the meeting settings, or the refusal. */
+  type Readiness =
+    | { access: CalendarAccess; settings: MeetingSettings }
+    | { refusal: { audit: string; reply: string } };
+  const readiness = async (known: CalendarAccess | null = null): Promise<Readiness> => {
+    let resolvedAccess = known;
+    if (resolvedAccess === null) {
+      const resolved = await resolveAccess();
+      if ('unavailable' in resolved) {
+        return { refusal: { audit: `calendar ${resolved.unavailable}`, reply: unavailableReply(resolved.unavailable) } };
+      }
+      resolvedAccess = resolved;
+    }
+    let loaded: MeetingSettings;
+    try {
+      loaded = await loadMeetingSettings({ businessId: door.businessId });
+    } catch (err) {
+      return {
+        refusal: {
+          audit: `meeting settings read threw (${err instanceof Error ? err.message : String(err)})`,
+          reply: MEETING_SETTINGS_READ_FAILED_REPLY,
+        },
+      };
+    }
+    if (loaded.locationKind === null) {
+      return { refusal: { audit: 'meeting settings not set', reply: MEETING_SETTINGS_REQUIRED_REPLY } };
+    }
+    return { access: resolvedAccess, settings: loaded };
+  };
+  let preloaded: MeetingSettings | null = null;
+
   if (o.answerTo !== undefined) {
     const n = pickedNumber(o.answerTo.answer);
     if (n !== null) choose = (_name, candidates) => candidates[n - 1] ?? null;
@@ -562,36 +593,35 @@ export async function runMeetingOperation(
     request = verifyTyped(extracted.request, sourceText);
   } else {
     if (!isMeetingInstruction(door.instruction.text)) return null;
+    // The cheap checks before the billed extraction: a text that names a
+    // meeting outright, with no calendar or no settings, is refused without a
+    // model call. One with only a time word may not be a meeting, so it is
+    // still extracted — a `not_meeting` goes on to the general planner.
+    const ready = await readiness();
+    if ('refusal' in ready && namesMeeting(door.instruction.text)) {
+      return failMeetingJob(door, ready.refusal.audit, ready.refusal.reply);
+    }
     const extracted = await extractSafely(extractor, door.instruction.text, now, door.timeZone);
     if (extracted.status === 'not_meeting') return null;
     if (extracted.status === 'failed') {
       return failMeetingJob(door, `extraction failed (${extracted.reason})`, MEETING_NOT_UNDERSTOOD_REPLY);
     }
+    if ('refusal' in ready) return failMeetingJob(door, ready.refusal.audit, ready.refusal.reply);
+    access = ready.access;
+    preloaded = ready.settings;
     request = verifyTyped(extracted.request, door.instruction.text);
   }
 
-  if (access === null) {
-    const resolved = await resolveAccess();
-    if ('unavailable' in resolved) {
-      return failMeetingJob(door, `calendar ${resolved.unavailable}`, unavailableReply(resolved.unavailable));
-    }
-    access = resolved;
+  let settings: MeetingSettings;
+  if (access === null || preloaded === null) {
+    const ready = await readiness(access);
+    if ('refusal' in ready) return failMeetingJob(door, ready.refusal.audit, ready.refusal.reply);
+    access = ready.access;
+    settings = ready.settings;
+  } else {
+    settings = preloaded;
   }
   const calendar: CalendarAccess = access;
-
-  let settings: Awaited<ReturnType<typeof loadMeetingSettings>>;
-  try {
-    settings = await loadMeetingSettings({ businessId: door.businessId });
-  } catch (err) {
-    return failMeetingJob(
-      door,
-      `meeting settings read threw (${err instanceof Error ? err.message : String(err)})`,
-      MEETING_SETTINGS_READ_FAILED_REPLY,
-    );
-  }
-  if (settings.locationKind === null) {
-    return failMeetingJob(door, 'meeting settings not set', MEETING_SETTINGS_REQUIRED_REPLY);
-  }
 
   const range = snapshotRange(request, localParts(now, door.timeZone).date, door.timeZone);
   let snapshot: Awaited<ReturnType<typeof loadCalendarRange>>;

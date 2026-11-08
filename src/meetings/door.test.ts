@@ -34,6 +34,7 @@ import {
   CALENDAR_NOT_CONNECTED_REPLY,
   HOLD_FAILED_REPLY,
   MEETING_NOT_UNDERSTOOD_REPLY,
+  MEETING_SETTINGS_REQUIRED_REPLY,
 } from './door.js';
 import { sweepHolds } from './holds.js';
 import type { MeetingRequest } from './request.js';
@@ -438,14 +439,52 @@ describe('runMeetingOperation through runInstruction', () => {
     await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [BUSINESS]);
     const day = workDay();
     const cal = fakeCalendar();
-    const { extractor } = extractorOf({ status: 'extracted', request: createRequest(day) });
+    const { extractor, texts } = extractorOf({ status: 'extracted', request: createRequest(day) });
     const outcome = await instruct(`תקבעי פגישה עם דני כהן ביום ${day}`, cal.client, extractor);
 
     expect(outcome).toEqual({ status: 'refused', reason: CALENDAR_NOT_CONNECTED_REPLY });
+    // The text names a meeting: refused before the billed extraction.
+    expect(texts).toEqual([]);
     expect(cal.calls).toEqual([]);
     expect(await holds()).toEqual([]);
     const { rows } = await getPool().query<{ phase: string }>('SELECT phase FROM jobs WHERE business_id = $1', [BUSINESS]);
     expect(rows.map((r) => r.phase)).toEqual(['failed']);
+  });
+
+  it('refuses a meeting with no settings before the billed extraction', async () => {
+    await getPool().query(`DELETE FROM meeting_settings WHERE business_id = $1`, [BUSINESS]);
+    const cal = fakeCalendar();
+    const { extractor, texts } = extractorOf({ status: 'extracted', request: createRequest(workDay()) });
+    const outcome = await instruct('תקבעי תור לדני כהן מחר', cal.client, extractor);
+    expect(outcome).toEqual({ status: 'refused', reason: MEETING_SETTINGS_REQUIRED_REPLY });
+    expect(texts).toEqual([]);
+    expect(cal.calls).toEqual([]);
+  });
+
+  it('with no calendar, a text with only a time word is still extracted, and a non-meeting goes to the planner', async () => {
+    await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [BUSINESS]);
+    const cal = fakeCalendar();
+    const { extractor, texts } = extractorOf({ status: 'not_meeting' });
+    let planned = 0;
+    const outcome = await instruct('תעדכני את דני מחר', cal.client, extractor, {
+      planner: async () => {
+        planned += 1;
+        return { status: 'unparseable', raw: '', reason: 'stub' };
+      },
+    });
+    expect(texts).toEqual(['תעדכני את דני מחר']);
+    expect(planned).toBe(1);
+    expect(outcome.status === 'refused' && outcome.reason === CALENDAR_NOT_CONNECTED_REPLY).toBe(false);
+  });
+
+  it('with no calendar, a meeting read from a time word alone is refused after the extraction', async () => {
+    await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [BUSINESS]);
+    const cal = fakeCalendar();
+    const { extractor, texts } = extractorOf({ status: 'extracted', request: createRequest(workDay()) });
+    const outcome = await instruct('תקבעי לדני כהן מחר', cal.client, extractor);
+    expect(texts).toHaveLength(1);
+    expect(outcome).toEqual({ status: 'refused', reason: CALENDAR_NOT_CONNECTED_REPLY });
+    expect(cal.calls).toEqual([]);
   });
 
   it('refuses in Hebrew when the extractor throws, and fails the job', async () => {

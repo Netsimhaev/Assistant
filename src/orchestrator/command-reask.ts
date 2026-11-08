@@ -208,6 +208,14 @@ const CANDIDATES_SQL = `
          SELECT 1 FROM document_productions dp
           WHERE dp.business_id = j.business_id AND dp.origin_job_id = j.job_id
        )
+       -- Nor is a meeting job (calendar scheduling): its plan points at a hold
+       -- the sweep releases once the job fails, and the twin would carry no
+       -- meetings rows for sync to track. A yes could only fail not_a_hold;
+       -- the owner asks again and the meeting door re-searches and re-holds.
+       AND NOT EXISTS (
+         SELECT 1 FROM meetings m
+          WHERE m.business_id = j.business_id AND m.job_id = j.job_id
+       )
   )
   SELECT job_id, phase, title, whatsapp_message_id, options, chosen_plan_hash, channel,
          any_progress AS uncertain

@@ -33,6 +33,13 @@ const HOLD_DESCRIPTION = 'שמירת מקום של העוזרת — ממתינה
 const MAX_TITLE_CHARS = 300;
 /** A hold older than the question window plus this margin is released regardless. */
 const HOLD_GRACE_MINUTES = 15;
+/**
+ * A hold whose job is in `plan` with no pending question yet is released only
+ * past this age. The door moves the job to `plan` and binds the plan before
+ * `askAndPark` writes the pending row, so a sweep in another process inside
+ * that gap would otherwise release a hold the owner is about to confirm.
+ */
+const NO_QUESTION_GRACE_MINUTES = 5;
 const SWEEP_CALL_TIMEOUT_MS = 30_000;
 
 interface HoldRow {
@@ -249,15 +256,18 @@ export async function sweepHolds(o: {
                WHERE c.business_id = h.business_id AND c.job_id = h.job_id AND c.state = 'confirmed'
             )
             AND (
-              NOT EXISTS (
-                SELECT 1 FROM instruction_confirmations c
-                 WHERE c.business_id = h.business_id AND c.job_id = h.job_id AND c.state = 'pending'
+              (
+                NOT EXISTS (
+                  SELECT 1 FROM instruction_confirmations c
+                   WHERE c.business_id = h.business_id AND c.job_id = h.job_id AND c.state = 'pending'
+                )
+                AND h.created_at < now() - make_interval(mins => $3::int)
               )
               OR h.created_at < now() - make_interval(mins => $2::int)
             )
           )
         )`,
-    [o.businessId, config.whatsappQuestionWindowMinutes + HOLD_GRACE_MINUTES],
+    [o.businessId, config.whatsappQuestionWindowMinutes + HOLD_GRACE_MINUTES, NO_QUESTION_GRACE_MINUTES],
   );
   if (rows.length === 0) return { released: 0, failed: 0 };
 

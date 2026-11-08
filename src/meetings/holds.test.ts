@@ -260,6 +260,10 @@ describe('holds', () => {
     const cancelledJob = await newJob('plan');
     await addConfirmation(cancelledJob, 'cancelled');
     const cancelled = await hold(client, cancelledJob);
+    // Past the short grace a job with no pending question loses its hold.
+    for (const h of [orphan, cancelled]) {
+      await getPool().query("UPDATE meeting_holds SET created_at = now() - interval '6 minutes' WHERE hold_id = $1", [h.holdId]);
+    }
     const keep: string[] = [];
     for (const phase of ['execute', 'verify', 'remember', 'followup', 'await_approval', 'plan']) {
       const j = await newJob(phase);
@@ -274,5 +278,29 @@ describe('holds', () => {
     for (const h of [closed, orphan, stale, cancelled]) expect(await state(h.holdId)).toBe('released');
     expect(await state(waiting.holdId)).toBe('held');
     for (const id of keep) expect(await state(id)).toBe('held');
+  });
+
+  it('sweep keeps a fresh hold whose job is in plan before its question row exists (the door’s gap)', async () => {
+    await upsertBinding(
+      {
+        system: CALENDAR_SYSTEM,
+        status: 'live',
+        endpoint: null,
+        credentialRef: 'OAUTH_CALENDAR',
+        provider: 'google',
+        lastOkAt: null,
+        lastError: null,
+      },
+      { businessId: BUSINESS, by: 'test' },
+    );
+    const { client } = fake();
+    const gapJob = await newJob('plan'); // bound, moved to plan, no question yet
+    const fresh = await hold(client, gapJob);
+    expect(await sweepHolds({ businessId: BUSINESS, runtime, client })).toEqual({ released: 0, failed: 0 });
+    expect(await state(fresh.holdId)).toBe('held');
+    // The question row lands: still held.
+    await addConfirmation(gapJob, 'pending');
+    expect(await sweepHolds({ businessId: BUSINESS, runtime, client })).toEqual({ released: 0, failed: 0 });
+    expect(await state(fresh.holdId)).toBe('held');
   });
 });

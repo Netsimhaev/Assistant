@@ -69,6 +69,10 @@ function toEvent(calendarId: string, raw: unknown, timeZone: string): CalendarEv
   for (const a of attendeesRaw) {
     const r = asRecord(a);
     if (r['self'] === true && r['responseStatus'] === 'declined') selfDeclined = true;
+    // Google lists the owner's own entry among the attendees (usually first on
+    // events with guests). He is never the client: `attendees` holds the other
+    // side only, as Graph's does, so nothing downstream tracks or reminds him.
+    if (r['self'] === true) continue;
     const email = str(r['email']);
     if (email === null) continue;
     attendees.push({ email, response: RESPONSES[String(r['responseStatus'])] ?? 'needs_action' });

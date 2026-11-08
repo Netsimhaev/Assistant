@@ -31,10 +31,38 @@ const SHAPE = `{"ops":[
   {"kind":"edit","clientName":string,"onDate":"YYYY-MM-DD"|null,"location":string|null,"clientNotes":string|null}
 ]}`;
 
+const WEEKDAYS: ReadonlyArray<{ he: string; en: string }> = [
+  { he: 'ראשון', en: 'Sunday' },
+  { he: 'שני', en: 'Monday' },
+  { he: 'שלישי', en: 'Tuesday' },
+  { he: 'רביעי', en: 'Wednesday' },
+  { he: 'חמישי', en: 'Thursday' },
+  { he: 'שישי', en: 'Friday' },
+  { he: 'שבת', en: 'Saturday' },
+];
+
+/**
+ * The weekday of a local `YYYY-MM-DD` date. Computed in code because a model
+ * given a bare date gets the weekday wrong often enough that "ביום שלישי"
+ * would keep landing on the wrong day. A date-only string has no zone, so the
+ * UTC weekday of its midnight is its weekday everywhere. `null` when unreadable.
+ */
+export function weekdayOf(date: string): { he: string; en: string } | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  const ms = Date.parse(`${date}T00:00:00Z`);
+  if (Number.isNaN(ms)) return null;
+  return WEEKDAYS[new Date(ms).getUTCDay()] ?? null;
+}
+
 export function buildExtractorSystemPrompt(today: string, timeZone: string): string {
+  const weekday = weekdayOf(today);
+  const todayLine =
+    weekday === null
+      ? `Today's local date is ${today}.`
+      : `Today's local date is ${today}, which is ${weekday.en} (יום ${weekday.he}).`;
   return [
     "You turn a business owner's free-text instruction (usually Hebrew) about meetings into one JSON object. You have no tools and you only describe the request; you never act.",
-    `Today's local date is ${today}. The time zone is ${timeZone}. Resolve relative words (היום, מחר, מחרתיים, "ביום שלישי", "בשבוע הבא") to concrete dates using today.`,
+    `${todayLine} The time zone is ${timeZone}. The week starts on Sunday (יום ראשון) and ends on Saturday (שבת). Resolve relative words (היום, מחר, מחרתיים, "ביום שלישי", "בשבוע הבא") to concrete dates using today and its weekday.`,
     `Reply with exactly this JSON shape and nothing else (up to 8 ops):\n${SHAPE}`,
     'Rules:',
     '- Dates are YYYY-MM-DD. Times are HH:MM in 24-hour form.',

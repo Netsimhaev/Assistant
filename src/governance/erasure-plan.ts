@@ -1554,8 +1554,10 @@ export async function buildErasurePlan(
 
   // Meetings reached by job membership (a job found for any other reason —
   // its title, its plan): the meeting's own job and its reminder job both
-  // join, so the predicate and the preview agree. Runs before the ledger,
-  // production and document closures, which read the jobs added here.
+  // join, so the predicate and the preview agree. Runs twice: here, before
+  // the ledger, production and document closures (which read the jobs added
+  // here), and once more after them (see the final pass below), for a
+  // meeting whose own job only those closures reach.
   const closeMeetings = async (): Promise<void> => {
     if (jobIds.size === 0) return;
     const { rows } = await db.query<{ job_id: string; reminder_job_id: string | null }>(

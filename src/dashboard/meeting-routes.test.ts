@@ -145,6 +145,15 @@ describe('GET /meetings/settings', () => {
     expect(html).not.toContain('name="read"');
   });
 
+  it('labels the reminder as a wait for the client after the invite, not hours before the meeting', async () => {
+    const baseUrl = await start();
+    const cookie = await login(baseUrl);
+    const html = await (await fetch(`${baseUrl}/meetings/settings`, { headers: { cookie } })).text();
+    expect(html).toContain('כמה שעות לחכות לתשובת הלקוח לפני תזכורת');
+    expect(html).toContain('כשהפגישה בעוד פחות מ-24 שעות — כמה שעות לחכות לתשובה');
+    expect(html).not.toContain('לפני הפגישה לשלוח');
+  });
+
   it('says so when the calendars cannot be listed', async () => {
     await bindCalendar();
     const baseUrl = await start(clientListing({ failure: 'transient', status: 503, message: 'down' }));

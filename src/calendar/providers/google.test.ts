@@ -96,7 +96,29 @@ describe('google calendar client', () => {
     expect(by['busy']!.busy).toBe(true);
     expect(by['busy']!.selfDeclined).toBe(false);
     expect(by['declined']!.selfDeclined).toBe(true);
-    expect(by['declined']!.attendees[1]).toEqual({ email: 'x@y.co', response: 'accepted' });
+    expect(by['declined']!.attendees).toEqual([{ email: 'x@y.co', response: 'accepted' }]);
+  });
+
+  it('drops the owner’s own attendee entry, even when Google lists him first', async () => {
+    const { http } = fake(() => ({
+      status: 200,
+      body: {
+        items: [
+          timed('guests', {
+            organizer: { email: 'me@b.co', self: true },
+            attendees: [
+              { email: 'me@b.co', self: true, organizer: true, responseStatus: 'accepted' },
+              { email: 'dana@client.co', responseStatus: 'declined' },
+            ],
+          }),
+        ],
+      },
+    }));
+    const r = await createGoogleCalendarClient(http).listEvents('tok', Q, signal);
+    if ('failure' in r) throw new Error('unexpected');
+    expect(r.events[0]!.attendees).toEqual([{ email: 'dana@client.co', response: 'declined' }]);
+    expect(r.events[0]!.organizerIsSelf).toBe(true);
+    expect(r.events[0]!.selfDeclined).toBe(false);
   });
 
   it('maps all-day events to local-midnight instants in the given zone', async () => {

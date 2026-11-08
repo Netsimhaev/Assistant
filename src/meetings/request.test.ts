@@ -43,6 +43,11 @@ describe('isMeetingInstruction', () => {
     expect(isMeetingInstruction('תזיזי את הפגישה של דנה למחר')).toBe(true);
     expect(isMeetingInstruction('תבטלי את הפגישה ביום שלישי')).toBe(true);
   });
+  it('counts an appointment (תור / תורים) and an event (אירוע) as meeting words', () => {
+    expect(isMeetingInstruction('תקבעי תור לדני')).toBe(true);
+    expect(isMeetingInstruction('תבטלי את התורים של דנה')).toBe(true);
+    expect(isMeetingInstruction('תזיזי את האירוע עם רונית')).toBe(true);
+  });
   it('does not fire on a schedule question or a bare verb without a meeting/time word', () => {
     expect(isMeetingInstruction('מה יש לי מחר ביומן')).toBe(false);
     expect(isMeetingInstruction('תעדכני את דני')).toBe(false);

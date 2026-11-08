@@ -126,6 +126,21 @@ describe('graph calendar client', () => {
     expect(t1).not.toBe(t2);
   });
 
+  it('sends start and end converted to UTC, whatever offset the write carried', async () => {
+    const { http, calls } = fake(() => ({ status: 201, body: { id: 'new1' } }));
+    const c = createGraphCalendarClient(http);
+    await c.createEvent(
+      'tok',
+      'cal1',
+      { ...WRITE, start: '2026-11-10T09:00:00+02:00', end: '2026-11-10T10:00:00.000Z' },
+      'key-utc',
+      signal,
+    );
+    const body = calls[0]!.body as { start: unknown; end: unknown };
+    expect(body.start).toEqual({ dateTime: '2026-11-10T07:00:00.000', timeZone: 'UTC' });
+    expect(body.end).toEqual({ dateTime: '2026-11-10T10:00:00.000', timeZone: 'UTC' });
+  });
+
   it('maps 401 to auth, 404 to not_found, 503 to transient, 400 to rejected', async () => {
     for (const [status, failure] of [
       [401, 'auth'],

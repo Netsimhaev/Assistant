@@ -232,8 +232,9 @@ ${input.saved === true ? '<p role="status"><b>ההגדרות נשמרו.</b></p>
   <p class="muted">אם משאירים ריק: שעות הפעילות שבתקנון, ואם אין — 09:00 עד 18:00.</p>
   ${calendarsSection(input.calendars, s)}
   <h2>תזכורות ללקוח</h2>
-  ${numberField('reminderHours', 'כמה שעות לפני הפגישה לשלוח תזכורת', s.reminderHours, 'לפחות 1')}
-  ${numberField('reminderHoursSoon', 'כשהפגישה בתוך פחות מ-24 שעות — כמה שעות לפניה', s.reminderHoursSoon, 'לפחות 1')}
+  <p class="muted">הזמנה שהלקוח לא ענה עליה: העוזרת מחכה כאן לתשובה, ורק אז שולחת לו תזכורת אחת. הזמן נמדד מרגע שההזמנה נשלחה, לא לפני הפגישה.</p>
+  ${numberField('reminderHours', 'כמה שעות לחכות לתשובת הלקוח לפני תזכורת', s.reminderHours, 'לפחות 1')}
+  ${numberField('reminderHoursSoon', 'כשהפגישה בעוד פחות מ-24 שעות — כמה שעות לחכות לתשובה', s.reminderHoursSoon, 'לפחות 1')}
   <div><button type="submit">שמירה</button></div>
 </form>`;
   return page('הגדרות הפגישות', body);

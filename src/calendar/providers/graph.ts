@@ -77,11 +77,22 @@ function toEvent(calendarId: string, raw: unknown, timeZone: string): CalendarEv
   };
 }
 
+/**
+ * An instant as Graph's zone-less `dateTime` in UTC. The adapter accepts any
+ * offset (`+02:00` as well as `Z`), and stripping a `Z` alone would send a
+ * `+02:00` instant labelled UTC — two hours off. Converted, never relabelled.
+ */
+function utcDateTime(instant: string): string {
+  const ms = Date.parse(instant);
+  if (Number.isNaN(ms)) throw new Error('calendar write: unreadable instant');
+  return new Date(ms).toISOString().replace(/Z$/, '');
+}
+
 function bodyOf(w: Partial<EventWrite>): Record<string, unknown> {
   const b: Record<string, unknown> = {};
   if (w.title !== undefined) b['subject'] = w.title;
-  if (w.start !== undefined) b['start'] = { dateTime: w.start.replace(/Z$/, ''), timeZone: 'UTC' };
-  if (w.end !== undefined) b['end'] = { dateTime: w.end.replace(/Z$/, ''), timeZone: 'UTC' };
+  if (w.start !== undefined) b['start'] = { dateTime: utcDateTime(w.start), timeZone: 'UTC' };
+  if (w.end !== undefined) b['end'] = { dateTime: utcDateTime(w.end), timeZone: 'UTC' };
   if (w.location !== undefined) b['location'] = { displayName: w.location ?? '' };
   if (w.description !== undefined) b['body'] = { contentType: 'text', content: w.description ?? '' };
   if (w.attendees !== undefined) {

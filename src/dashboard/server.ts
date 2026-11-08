@@ -1815,8 +1815,9 @@ async function answerUnderClaim(
     );
   }
 
-  // The answer pass never routes a schedule question (`calendar` is not passed
-  // above), so there is always a replacement job here.
+  // The answer pass never routes a schedule question (`calendar` is passed for
+  // the meeting door, but with `scheduleRouting: false`), so an `answered`
+  // outcome cannot come from here and there is always a replacement job.
   if (outcome.status === 'answered') return renderInstructionOutcome(res, session, outcome, businessId);
 
   await transition(jobId, {
@@ -2056,10 +2057,17 @@ async function sendErasurePreview(
   );
 }
 
-/** The charter's zone for showing times, or `null` when the charter cannot be read. */
+/**
+ * The charter's zone for showing times, or `null` when the charter cannot be
+ * read. `loadActiveCharter`, locally caught — never `probeActiveCharter`, which
+ * is reserved for the install path and the readiness report.
+ */
 async function charterTimeZone(businessId: string): Promise<string | null> {
-  const probe = await probeActiveCharter(businessId);
-  return probe.ok && probe.active !== null ? probe.active.charter.identity.timezone : null;
+  try {
+    return (await loadActiveCharter(businessId))?.charter.identity.timezone ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**

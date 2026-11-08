@@ -72,7 +72,7 @@ const ACTION_VERBS: ReadonlySet<string> = new Set([
   'תשני', 'תשנה', 'לשנות', 'תשנו',
 ]);
 
-const MEETING_WORDS: ReadonlySet<string> = new Set(['פגישה', 'פגישות', 'פגישת', 'שיחה', 'ישיבה']);
+const MEETING_WORDS: ReadonlySet<string> = new Set(['פגישה', 'פגישות', 'פגישת', 'שיחה', 'ישיבה', 'תור', 'תורים', 'אירוע']);
 
 const TIME_WORDS: ReadonlySet<string> = new Set([
   'היום', 'מחר', 'מחרתיים', 'אתמול', 'שעה', 'שבוע', 'חודש', 'בוקר', 'צהריים', 'ערב',
@@ -110,6 +110,24 @@ function isMeetingOrTimeWord(token: string): boolean {
 export function isMeetingInstruction(text: string): boolean {
   const tokens = tokensOf(text);
   return hasVerb(tokens) && tokens.some(isMeetingOrTimeWord);
+}
+
+/**
+ * The text names a meeting outright (פגישה, תור, אירוע...), not only a time
+ * word. The meeting door refuses such an instruction on a missing calendar or
+ * missing settings WITHOUT paying for an extraction; one that carries only a
+ * time word ("תעדכני את דני מחר") may not be a meeting at all, so it is still
+ * extracted and, when it is not one, goes to the general planner as before.
+ */
+export function namesMeeting(text: string): boolean {
+  return tokensOf(text).some((token) => {
+    const variants = new Set<string>([token]);
+    if (token.length > 2 && PREFIXES.includes(token[0] as string)) variants.add(token.slice(1));
+    if (token.length > 3 && PREFIXES.includes(token[0] as string) && PREFIXES.includes(token[1] as string)) {
+      variants.add(token.slice(2));
+    }
+    return [...variants].some((v) => MEETING_WORDS.has(v));
+  });
 }
 
 /**
