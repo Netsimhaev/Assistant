@@ -1528,9 +1528,9 @@ describe('calendar scheduling', () => {
     const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
 
     expect(plan.calendarEventsKept).toEqual([
-      { calendarId: 'cal-1', eventId: 'ev-a', start: null },
-      { calendarId: 'cal-1', eventId: 'ev-held', start: '2026-12-01T09:00:00.000Z' },
-      { calendarId: 'cal-2', eventId: 'ev-b', start: '2026-12-02T09:00:00.000Z' },
+      { calendarId: 'cal-1', eventId: 'ev-a', start: null, kind: 'meeting' },
+      { calendarId: 'cal-1', eventId: 'ev-held', start: '2026-12-01T09:00:00.000Z', kind: 'hold' },
+      { calendarId: 'cal-2', eventId: 'ev-b', start: '2026-12-02T09:00:00.000Z', kind: 'meeting' },
     ]);
 
     // The preview names them under "נשארים ביומן שלך"; neither module has a
@@ -1544,5 +1544,76 @@ describe('calendar scheduling', () => {
     expect(html).toContain('נשארים ביומן שלך');
     expect(html).toContain('ev-b');
     expect(html).not.toContain('ev-other');
+  });
+
+  it('does not delete a meeting whose own job the owner kept when only its reminder job is erased', async () => {
+    const meetingJob = await bareJob('kept-meeting-job');
+    const reminder = await bareJob(`תזכורת ל-${RONIT}`);
+    await aMeeting('MT-kept', meetingJob, { eventId: 'ev-kept', reminderJobId: reminder });
+    await keepItem({ kind: 'job', itemId: meetingJob, note: 'לשמור' }, { businessId: BUSINESS });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.jobIds).toContain(reminder);
+    expect(plan.jobIds).not.toContain(meetingJob);
+    expect(plan.items.find((i) => i.table === 'meetings')?.count).toBe(0);
+    expect(plan.calendarEventsKept).toEqual([]);
+
+    await executeErasure(plan, { businessId: BUSINESS });
+    const left = await getPool().query('SELECT meeting_id FROM meetings');
+    expect(left.rows).toEqual([{ meeting_id: 'MT-kept' }]);
+  });
+
+  it('lists a converted hold once (the meeting wins) and marks a still-held one as a hold', async () => {
+    const job = await jobAbout(RONIT, 'hold-kinds');
+    await aMeeting('MT-conv', job, { eventId: 'ev-conv', startAt: '2026-12-03T09:00:00Z' });
+    await aHold('H-conv', job, 'ev-conv', 'converted');
+    await aHold('H-conv-only', job, 'ev-conv-only', 'converted');
+    await aHold('H-live', job, 'ev-live');
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.calendarEventsKept.map((e) => [e.eventId, e.kind])).toEqual([
+      ['ev-conv', 'meeting'],
+      ['ev-conv-only', 'hold'],
+      ['ev-live', 'hold'],
+    ]);
+    const html = renderErasure({
+      plan,
+      csrf: 'c',
+      planHash: 'h',
+      anchorLabel: RONIT,
+      timeZone: 'Asia/Jerusalem',
+    } as unknown as Parameters<typeof renderErasure>[0]);
+    expect(html).toContain('שמירת מקום — לא תנוקה עוד אוטומטית');
+    // 2026-12-03T09:00Z is 11:00 in Jerusalem (winter).
+    expect(html).toContain('2026-12-03 11:00');
+    const utc = renderErasure({
+      plan,
+      csrf: 'c',
+      planHash: 'h',
+      anchorLabel: RONIT,
+      timeZone: null,
+    } as unknown as Parameters<typeof renderErasure>[0]);
+    expect(utc).toContain('2026-12-03 09:00 UTC');
+  });
+
+  it('adds the reminder job of a meeting whose job joins only through the ledger closure', async () => {
+    // The item's origin job is found by name; the item's NUDGE job is the
+    // meeting's job, added only by the ledger closure — so only the final
+    // meetings pass can bring in that meeting's reminder job.
+    const origin = await jobAbout(RONIT, 'ledger-origin');
+    const nudge = await bareJob('nudge-job');
+    const reminder = await bareJob('late-reminder');
+    await getPool().query(
+      `INSERT INTO ledger_items (item_id, business_id, family, description, origin_job_id, nudge_job_id)
+       VALUES ('LI-late', $1, 'money_in', $2, $3, $4)`,
+      [BUSINESS, `לגבות מ-${RONIT}`, origin, nudge],
+    );
+    await aMeeting('MT-late', nudge, { reminderJobId: reminder });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.jobIds).toEqual(expect.arrayContaining([nudge, reminder]));
   });
 });

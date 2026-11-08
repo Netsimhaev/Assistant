@@ -341,6 +341,8 @@ export interface CalendarEventKept {
   calendarId: string;
   eventId: string;
   start: string | null;
+  /** `hold`: a tentative slot the assistant placed (its title may name the client). */
+  kind: 'meeting' | 'hold';
 }
 
 export interface KeptExclusion {
@@ -934,9 +936,17 @@ export const PRODUCTION_LIVE_CONDITION = `(stage NOT IN (${TERMINAL_STAGES.map((
  * so no cascade to order against. The calendar events themselves are never
  * deleted (see `ErasurePlan.calendarEventsKept`).
  *
+ * **Delete and count by the meeting's OWN job only.** The reminder job
+ * reaches a meeting only through discovery (`MEETINGS_REACHED_BY_JOB`), which
+ * puts BOTH jobs in `jobIds`; if the owner keeps the meeting's job, the
+ * meeting row must survive even when the reminder job is erased — a delete
+ * arm on `reminder_job_id` would silently override that keep.
+ *
  * Parameters, in both: `$1` businessId, `$2` jobIds.
  */
-export const MEETINGS_ERASED_PREDICATE = `business_id = $1
+export const MEETINGS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
+/** Discovery/closure only — never a delete predicate. Same parameters. */
+const MEETINGS_REACHED_BY_JOB = `business_id = $1
   AND (job_id = ANY ($2) OR reminder_job_id = ANY ($2))`;
 export const MEETING_HOLDS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
 
@@ -1546,16 +1556,18 @@ export async function buildErasurePlan(
   // its title, its plan): the meeting's own job and its reminder job both
   // join, so the predicate and the preview agree. Runs before the ledger,
   // production and document closures, which read the jobs added here.
-  if (jobIds.size > 0) {
+  const closeMeetings = async (): Promise<void> => {
+    if (jobIds.size === 0) return;
     const { rows } = await db.query<{ job_id: string; reminder_job_id: string | null }>(
-      `SELECT job_id, reminder_job_id FROM meetings WHERE ${MEETINGS_ERASED_PREDICATE}`,
+      `SELECT job_id, reminder_job_id FROM meetings WHERE ${MEETINGS_REACHED_BY_JOB}`,
       [businessId, [...jobIds]],
     );
     for (const row of rows) {
       jobIds.add(row.job_id);
       if (row.reminder_job_id !== null) jobIds.add(row.reminder_job_id);
     }
-  }
+  };
+  await closeMeetings();
 
   // The task ledger, by job membership, then what every erased item
   // produced. Runs after the mail closure (its jobs can be an item's origin)
@@ -1705,6 +1717,12 @@ export async function buildErasurePlan(
       'job_id',
     )) jobIds.add(jobId);
   }
+
+  // A final small pass of the meetings closure. The ledger, production and
+  // document closures above can add a job that is some meeting's own job
+  // (e.g. an item's origin job); that meeting's reminder job would otherwise
+  // never join `jobIds`, and its title and plan carry the client's name.
+  await closeMeetings();
 
   // Memories: by subject, by body, by source — and by the jobs above.
   // `jobIds` here is still the pre-exclusion set; see the note at the
@@ -1877,28 +1895,37 @@ export async function buildErasurePlan(
   // Taken from the final `jobList`, so a kept job's meeting is not listed.
   const calendarEventsKept: CalendarEventKept[] = [];
   if (jobList.length > 0) {
-    const { rows } = await db.query<{ calendar_id: string; event_id: string; start_at: Date | null }>(
-      `SELECT calendar_id, event_id, start_at FROM meetings
+    const { rows } = await db.query<{
+      calendar_id: string;
+      event_id: string;
+      start_at: Date | null;
+      kind: 'meeting' | 'hold';
+    }>(
+      `SELECT calendar_id, event_id, start_at, 'meeting' AS kind FROM meetings
         WHERE ${MEETINGS_ERASED_PREDICATE} AND event_id IS NOT NULL
-       UNION
-       SELECT calendar_id, event_id, start_at FROM meeting_holds
-        WHERE ${MEETING_HOLDS_ERASED_PREDICATE} AND state = 'held'`,
+       UNION ALL
+       SELECT calendar_id, event_id, start_at, 'hold' AS kind FROM meeting_holds
+        WHERE ${MEETING_HOLDS_ERASED_PREDICATE} AND state IN ('held', 'converted')`,
       [businessId, jobList],
     );
-    const seen = new Set<string>();
+    // A converted hold's event is usually the meeting's own: one entry, and
+    // the meeting wins over the hold.
+    const byEvent = new Map<string, CalendarEventKept>();
     for (const row of rows) {
       const key = JSON.stringify([row.calendar_id, row.event_id]);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      calendarEventsKept.push({
+      const existing = byEvent.get(key);
+      if (existing !== undefined && (existing.kind === 'meeting' || row.kind === 'hold')) continue;
+      byEvent.set(key, {
         calendarId: row.calendar_id,
         eventId: row.event_id,
         start: row.start_at === null ? null : row.start_at.toISOString(),
+        kind: row.kind,
       });
     }
-    calendarEventsKept.sort(
-      (a, b) => a.calendarId.localeCompare(b.calendarId) || a.eventId.localeCompare(b.eventId),
-    );
+    // Plain code-unit order, the same as the fingerprint's sort.
+    const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+    calendarEventsKept.push(...byEvent.values());
+    calendarEventsKept.sort((a, b) => cmp(a.calendarId, b.calendarId) || cmp(a.eventId, b.eventId));
   }
 
   const digestList = [...digestIds];

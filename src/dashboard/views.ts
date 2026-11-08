@@ -31,6 +31,7 @@ import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibilit
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { stripBidiControls } from '../util/bidi.js';
+import { localParts } from '../util/local-time.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import { OUTLOOK_SUBJECT_NOTE, WARNING_PREFIXES, mailboxReplyRecipient, splitReplyDetail } from '../mail/reply-card.js';
@@ -1619,6 +1620,8 @@ export interface ErasurePrefill {
 
 export interface ErasureViewModel {
   csrf: string;
+  /** The charter's time zone; absent when the charter cannot be read (times then show as UTC). */
+  timeZone?: string | null;
   anchorLabel: string;
   /** `null` before an anchor has been chosen: the entry form, and nothing else. */
   plan: ErasurePlan | null;
@@ -1795,16 +1798,21 @@ function savedCopiesSection(paths: readonly string[]): string {
 /**
  * Calendar events of erased meetings: NOT deleted — the calendar is the
  * owner's. Shown so he knows the client's name may still sit in the event
- * title there. The time is UTC, labelled, because this view has no charter
- * time zone to convert with.
+ * title there. The time is in the charter's zone (`timeZone`); `null` means
+ * the charter could not be read, and the time is then shown in UTC, labelled.
  */
-function calendarEventsKeptSection(events: readonly CalendarEventKept[]): string {
+function calendarEventsKeptSection(events: readonly CalendarEventKept[], timeZone: string | null): string {
   if (events.length === 0) return '';
-  const when = (start: string | null): string =>
-    start === null ? '' : ` — ${start.slice(0, 16).replace('T', ' ')} UTC`;
+  const when = (start: string | null): string => {
+    if (start === null) return '';
+    if (timeZone === null) return ` — ${start.slice(0, 16).replace('T', ' ')} UTC`;
+    const { date, time } = localParts(new Date(start), timeZone);
+    return ` — ${date} ${time}`;
+  };
+  const holdNote = ' — שמירת מקום — לא תנוקה עוד אוטומטית, אפשר למחוק אותה ביומן';
   return `<h2>נשארים ביומן שלך</h2>
      <p class="muted">אירועי היומן הם שלך והמחיקה לא נוגעת בהם — אם תרצה, מחק אותם ביומן בעצמך.</p>
-     <ul>${events.map((e) => `<li>${escLabel(e.eventId)}${when(e.start)}</li>`).join('')}</ul>`;
+     <ul>${events.map((e) => `<li>${escLabel(e.eventId)}${when(e.start)}${e.kind === 'hold' ? holdNote : ''}</li>`).join('')}</ul>`;
 }
 
 export function renderErasure(model: ErasureViewModel): string {
@@ -1887,7 +1895,7 @@ export function renderErasure(model: ErasureViewModel): string {
      ${nothing}
      ${plan.filePaths.length > 0 ? `<p>${plan.filePaths.length} קבצים יימחקו מהדיסק.</p>` : ''}
      ${savedCopiesSection(plan.savedCopies)}
-     ${calendarEventsKeptSection(plan.calendarEventsKept)}
+     ${calendarEventsKeptSection(plan.calendarEventsKept, model.timeZone ?? null)}
      ${plan.filesNotDeleted.length > 0
        ? `<p class="error">${plan.filesNotDeleted.length} קבצים שנרשמו להפקה נמצאים מחוץ לתיקיית ההפקה שלה, ולכן לא יימחקו:</p><ul>${plan.filesNotDeleted.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`
        : ''}

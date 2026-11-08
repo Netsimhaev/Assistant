@@ -1963,7 +1963,7 @@ function planFingerprint(plan: ErasurePlan): string {
     // Never deleted, but shown to the owner: an event added between the
     // preview and the confirm re-shows the preview.
     calendarEventsKept: plan.calendarEventsKept
-      .map((e) => `${e.calendarId}\u0000${e.eventId}\u0000${e.start ?? ''}`)
+      .map((e) => `${e.kind}\u0000${e.calendarId}\u0000${e.eventId}\u0000${e.start ?? ''}`)
       .sort(),
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
@@ -2049,10 +2049,17 @@ async function sendErasurePreview(
       anchorLabel: anchorLabelFor(anchor),
       plan,
       planHash: planFingerprint(plan),
+      timeZone: await charterTimeZone(businessId),
       prefill: prefillFor(anchor),
       ...(overrides.error === undefined ? {} : { error: overrides.error }),
     }),
   );
+}
+
+/** The charter's zone for showing times, or `null` when the charter cannot be read. */
+async function charterTimeZone(businessId: string): Promise<string | null> {
+  const probe = await probeActiveCharter(businessId);
+  return probe.ok && probe.active !== null ? probe.active.charter.identity.timezone : null;
 }
 
 /**
