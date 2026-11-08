@@ -109,4 +109,30 @@ describe('findSlots', () => {
     expect(findSlots(free, 30, 5, 100 * MIN)[0]!.start).toBe(210 * MIN);
     expect(findSlots(free, 30, 1, 0)).toHaveLength(1);
   });
+
+  it('offers one slot per free interval when no step is given', () => {
+    expect(findSlots([{ start: 0, end: 600 * MIN }], 60, 3, 0)).toEqual([{ start: 0, end: 60 * MIN }]);
+  });
+
+  it('with a step, offers several aligned, fully fitting candidates inside one interval', () => {
+    const slots = findSlots([{ start: 0, end: 300 * MIN }], 60, 3, 0, 90);
+    expect(slots).toEqual([
+      { start: 0, end: 60 * MIN },
+      { start: 90 * MIN, end: 150 * MIN },
+      { start: 180 * MIN, end: 240 * MIN },
+    ]);
+  });
+
+  it('a stepped candidate is rounded up to 15 minutes and must fit, and the limit holds', () => {
+    // 0, then 70 -> 75, then 145 -> 150 (150+60=210 > 200: does not fit).
+    expect(findSlots([{ start: 0, end: 200 * MIN }], 60, 5, 0, 70)).toEqual([
+      { start: 0, end: 60 * MIN },
+      { start: 75 * MIN, end: 135 * MIN },
+    ]);
+    expect(findSlots([{ start: 0, end: 600 * MIN }, { start: 900 * MIN, end: 1000 * MIN }], 60, 2, 0, 60)).toHaveLength(2);
+  });
+
+  it('a non-positive step behaves like no step', () => {
+    expect(findSlots([{ start: 0, end: 600 * MIN }], 60, 3, 0, 0)).toHaveLength(1);
+  });
 });

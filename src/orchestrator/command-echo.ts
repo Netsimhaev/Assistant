@@ -40,7 +40,20 @@ const KNOWN_FIELDS: readonly { key: string; name: string }[] = [
   { key: 'body', name: 'תוכן' },
   { key: 'amountMinor', name: 'סכום' },
   { key: 'inReplyTo', name: 'בתשובה ל' },
+  // calendar.write (calendar scheduling, Task 10). Values are still shown whole.
+  { key: 'operation', name: 'פעולה' },
+  { key: 'calendarId', name: 'יומן' },
+  { key: 'eventId', name: 'אירוע' },
+  { key: 'holdEventId', name: 'שמירת מקום' },
+  { key: 'title', name: 'כותרת' },
+  { key: 'start', name: 'התחלה' },
+  { key: 'end', name: 'סיום' },
+  { key: 'location', name: 'מיקום' },
+  { key: 'description', name: 'פרטים ללקוח' },
+  { key: 'attendees', name: 'משתתפים' },
 ];
+/** Multi-line known fields: every continuation line carries the fixed margin. */
+const BLOCK_KEYS: ReadonlySet<string> = new Set(['body', 'description']);
 const KNOWN_KEYS = new Set(KNOWN_FIELDS.map((f) => f.key));
 
 /** Fixed margin on every continuation line of a multi-line value. */
@@ -113,7 +126,7 @@ function renderKnown(key: string, value: unknown, currency: string): string {
   if (key === 'amountMinor' && typeof value === 'number' && Number.isSafeInteger(value)) {
     return formatMinor(value, currency);
   }
-  if (key === 'body' && typeof value === 'string') return blockValue(value);
+  if (BLOCK_KEYS.has(key) && typeof value === 'string') return blockValue(value);
   return renderValue(value);
 }
 

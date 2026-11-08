@@ -225,8 +225,15 @@ function responseLine(event: CalendarEvent, responses: ReadonlyMap<string, Meeti
   return `  ${RESPONSE_LABEL.needs_action}`;
 }
 
-function hhmm(ms: number, timeZone: string): string {
+/** Local `HH:MM` of an instant in the charter zone. */
+export function hhmm(ms: number, timeZone: string): string {
   return localParts(new Date(ms), timeZone).time;
+}
+
+/** `יום ג' 17/11` — the local day of an instant, in the same form as the schedule headers. */
+export function localDayLabel(ms: number, timeZone: string): string {
+  const parts = localParts(new Date(ms), timeZone);
+  return `יום ${WEEKDAY_LETTER[parts.weekday]} ${formatDate(parts.date)}`;
 }
 
 function formatDate(date: string): string {

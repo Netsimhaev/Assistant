@@ -118,14 +118,30 @@ function roundUp(ms: number): number {
  * (a window start or a padded-busy end) — or at `notBefore` when that is later —
  * rounded up to 15 minutes, and only if the whole duration fits.
  * (Epoch rounding equals local rounding: every zone offset is a multiple of 15 min.)
+ *
+ * `stepMinutes` (optional): inside each free interval, also offer a candidate
+ * every `stepMinutes` after the first one (each rounded up to 15 minutes and
+ * fully fitting), so several alternatives can come from one free day. Without
+ * it — or with a non-positive value — each interval offers one slot.
  */
-export function findSlots(free: Interval[], durationMinutes: number, limit: number, notBefore: number): Interval[] {
+export function findSlots(
+  free: Interval[],
+  durationMinutes: number,
+  limit: number,
+  notBefore: number,
+  stepMinutes?: number,
+): Interval[] {
   const duration = durationMinutes * MIN_MS;
+  const step = stepMinutes !== undefined && stepMinutes > 0 ? stepMinutes * MIN_MS : null;
   const out: Interval[] = [];
   for (const f of [...free].sort((a, b) => a.start - b.start)) {
     if (out.length >= limit) break;
-    const start = roundUp(Math.max(f.start, notBefore));
-    if (start >= notBefore && start + duration <= f.end) out.push({ start, end: start + duration });
+    let start = roundUp(Math.max(f.start, notBefore));
+    while (out.length < limit && start >= notBefore && start + duration <= f.end) {
+      out.push({ start, end: start + duration });
+      if (step === null) break;
+      start = roundUp(start + step);
+    }
   }
   return out;
 }
