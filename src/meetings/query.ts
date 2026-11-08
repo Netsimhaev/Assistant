@@ -214,15 +214,21 @@ function firstLine(value: string | null): string {
   return '';
 }
 
-function responseLine(event: CalendarEvent, responses: ReadonlyMap<string, MeetingResponse>): string {
+/** The response icon + label of one event (the schedule answer and the meetings screen share it); '' when nobody is invited. */
+export function eventResponseLabel(event: CalendarEvent, responses: ReadonlyMap<string, MeetingResponse>): string {
   // The owner declined it himself: still on the calendar, so still listed.
-  if (event.selfDeclined) return '  ❌ דחית';
+  if (event.selfDeclined) return '❌ דחית';
   const known = responses.get(event.eventId);
-  if (known !== undefined) return `  ${RESPONSE_LABEL[known]}`;
+  if (known !== undefined) return RESPONSE_LABEL[known];
   if (event.attendees.length === 0) return '';
-  if (event.attendees.some((a) => a.response === 'declined')) return `  ${RESPONSE_LABEL.declined}`;
-  if (event.attendees.every((a) => a.response === 'accepted')) return `  ${RESPONSE_LABEL.accepted}`;
-  return `  ${RESPONSE_LABEL.needs_action}`;
+  if (event.attendees.some((a) => a.response === 'declined')) return RESPONSE_LABEL.declined;
+  if (event.attendees.every((a) => a.response === 'accepted')) return RESPONSE_LABEL.accepted;
+  return RESPONSE_LABEL.needs_action;
+}
+
+function responseLine(event: CalendarEvent, responses: ReadonlyMap<string, MeetingResponse>): string {
+  const label = eventResponseLabel(event, responses);
+  return label === '' ? '' : `  ${label}`;
 }
 
 /** Local `HH:MM` of an instant in the charter zone. */

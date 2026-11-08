@@ -112,7 +112,15 @@ import {
   handleCalendarSignPost,
   handleCalendarStatus,
 } from './calendar-connect.js';
-import { calendarWiring, handleMeetingSettingsGet, handleMeetingSettingsPost, type MeetingRouteOptions } from './meeting-routes.js';
+import {
+  calendarWiring,
+  handleMeetingMarkPost,
+  handleMeetingNewPost,
+  handleMeetingSettingsGet,
+  handleMeetingSettingsPost,
+  handleMeetingsGet,
+  type MeetingRouteOptions,
+} from './meeting-routes.js';
 import type { CalendarClient } from '../calendar/types.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
 import {
@@ -2969,6 +2977,7 @@ const DOCUMENT_CARD_POST_PATH = /^\/documents\/(DC-[^/]+)\/(approve|fix|address)
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
 const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
 const INSTRUCT_CONFIRM_PATH = /^\/instruct\/([^/]+)\/confirm$/;
+const MEETING_MARK_PATH = /^\/meetings\/([^/]+)\/mark$/;
 const AUTONOMOUS_ACTION_MARK_PATH = /^\/autonomy\/actions\/([^/]+)\/([^/]+)\/mark$/;
 const OAUTH_START_PATH = /^\/oauth\/([^/]+)\/start$/;
 const OAUTH_REVOKE_PATH = /^\/oauth\/([^/]+)\/revoke$/;
@@ -3118,6 +3127,16 @@ async function route(
   }
   if (method === 'POST' && pathname === '/meetings/settings') {
     return handleMeetingSettingsPost(res, businessId, session, await readFormBody(req), meetingOptions);
+  }
+  if (method === 'GET' && pathname === '/meetings') return handleMeetingsGet(res, businessId, session, meetingOptions);
+  if (method === 'POST' && pathname === '/meetings/new') {
+    return handleMeetingNewPost(res, businessId, session, await readFormBody(req), meetingOptions);
+  }
+  const meetingMarkMatch = MEETING_MARK_PATH.exec(pathname);
+  if (method === 'POST' && meetingMarkMatch?.[1] !== undefined) {
+    const meetingId = decodePathSegment(meetingMarkMatch[1]);
+    if (meetingId === null) return notFound(res);
+    return handleMeetingMarkPost(res, businessId, session, meetingId, await readFormBody(req), meetingOptions);
   }
   if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, businessId, session);
   if (method === 'POST' && pathname === '/digest/settings')
