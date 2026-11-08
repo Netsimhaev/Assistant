@@ -337,6 +337,12 @@ export interface ErasureRefusal {
   detail: string;
 }
 
+export interface CalendarEventKept {
+  calendarId: string;
+  eventId: string;
+  start: string | null;
+}
+
 export interface KeptExclusion {
   itemKind: KeptItemKind;
   itemId: string;
@@ -378,6 +384,14 @@ export interface ErasurePlan {
    * touch. Shown to the owner so the refusal is not silent.
    */
   filesNotDeleted: string[];
+  /**
+   * Calendar events at Google/Microsoft that belong to erased meetings (rows
+   * with an `event_id`) and to erased still-held `meeting_holds`. Listed for
+   * the owner and NEVER deleted: the calendar is his, and this module has no
+   * calendar client at all. Sorted by calendar then event; `start` is an ISO
+   * instant or null. Included in `planFingerprint`.
+   */
+  calendarEventsKept: CalendarEventKept[];
   items: ErasureItem[];
   excluded: KeptExclusion[];
   refusals: ErasureRefusal[];
@@ -911,6 +925,28 @@ export const PRODUCTION_LIVE_CONDITION = `(stage NOT IN (${TERMINAL_STAGES.map((
     OR NOT coalesce((work ->> 'finished')::boolean, false))`;
 
 /**
+ * Calendar scheduling's predicates (migration 061). `meetings` holds a
+ * client's name, email, phone and the owner's note; it is job-anchored (the
+ * meeting's own job, or the client-reminder job it opened — the reminder
+ * job's title and plan carry the client's name too) AND a discovery source of
+ * its own in `buildErasurePlan`. `meeting_holds` holds ids and times only —
+ * deleted by `job_id`, never a discovery source. No foreign keys on either,
+ * so no cascade to order against. The calendar events themselves are never
+ * deleted (see `ErasurePlan.calendarEventsKept`).
+ *
+ * Parameters, in both: `$1` businessId, `$2` jobIds.
+ */
+export const MEETINGS_ERASED_PREDICATE = `business_id = $1
+  AND (job_id = ANY ($2) OR reminder_job_id = ANY ($2))`;
+export const MEETING_HOLDS_ERASED_PREDICATE = `business_id = $1 AND job_id = ANY ($2)`;
+
+/** A meeting's content columns against a contact pattern (`$2`). */
+const MEETING_CONTENT_MATCHES = `(client_name ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(client_email, '')  ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(client_phone, '')  ILIKE $2 ${LIKE_ESCAPE}
+      OR coalesce(internal_note, '') ILIKE $2 ${LIKE_ESCAPE})`;
+
+/**
  * `ledger_critical_rules` of kind `counterparty`: the `match` is a person's
  * name, address or domain. Found by a contact anchor only (a rule is the
  * owner's configuration, not an event a window brackets). Parameters: `$1`
@@ -1348,6 +1384,19 @@ export async function buildErasurePlan(
       'rule_id',
     )) ledgerRuleIds.add(ruleId);
 
+    // Meetings (migration 061), by their own content: client name/email/phone
+    // and the owner's note. A name only in an `internal_note` reaches no
+    // other table. Both the meeting's job and its reminder job are added.
+    const meetingsByContent = await db.query<{ job_id: string; reminder_job_id: string | null }>(
+      `SELECT job_id, reminder_job_id FROM meetings
+        WHERE business_id = $1 AND ${MEETING_CONTENT_MATCHES}`,
+      [businessId, pattern],
+    );
+    for (const row of meetingsByContent.rows) {
+      jobIds.add(row.job_id);
+      if (row.reminder_job_id !== null) jobIds.add(row.reminder_job_id);
+    }
+
     // Document production, by its own content — every column of all four
     // tables that can name a person, onto the production that owns it. See
     // this module's header (migrations 053–058).
@@ -1403,6 +1452,18 @@ export async function buildErasurePlan(
       [businessId, anchor.fromIso, anchor.toIso],
       'item_id',
     )) ledgerItemIds.add(itemId);
+
+    // A meeting's own `created_at`. (No document anchor reaches meetings: a
+    // meeting never references a document.)
+    const meetingsInWindow = await db.query<{ job_id: string; reminder_job_id: string | null }>(
+      `SELECT job_id, reminder_job_id FROM meetings
+        WHERE business_id = $1 AND created_at >= $2 AND created_at < $3`,
+      [businessId, anchor.fromIso, anchor.toIso],
+    );
+    for (const row of meetingsInWindow.rows) {
+      jobIds.add(row.job_id);
+      if (row.reminder_job_id !== null) jobIds.add(row.reminder_job_id);
+    }
 
     // A production's own `created_at` — when the owner asked for it.
     for (const productionId of await idsFrom(
@@ -1479,6 +1540,21 @@ export async function buildErasurePlan(
       [businessId, mailList],
       'document_id',
     )) documentIds.add(documentId);
+  }
+
+  // Meetings reached by job membership (a job found for any other reason —
+  // its title, its plan): the meeting's own job and its reminder job both
+  // join, so the predicate and the preview agree. Runs before the ledger,
+  // production and document closures, which read the jobs added here.
+  if (jobIds.size > 0) {
+    const { rows } = await db.query<{ job_id: string; reminder_job_id: string | null }>(
+      `SELECT job_id, reminder_job_id FROM meetings WHERE ${MEETINGS_ERASED_PREDICATE}`,
+      [businessId, [...jobIds]],
+    );
+    for (const row of rows) {
+      jobIds.add(row.job_id);
+      if (row.reminder_job_id !== null) jobIds.add(row.reminder_job_id);
+    }
   }
 
   // The task ledger, by job membership, then what every erased item
@@ -1796,6 +1872,35 @@ export async function buildErasurePlan(
     savedCopies.sort();
   }
 
+  // Calendar events that outlive the erasure (never deleted): the event of
+  // every erased meeting, and of every erased hold still holding its slot.
+  // Taken from the final `jobList`, so a kept job's meeting is not listed.
+  const calendarEventsKept: CalendarEventKept[] = [];
+  if (jobList.length > 0) {
+    const { rows } = await db.query<{ calendar_id: string; event_id: string; start_at: Date | null }>(
+      `SELECT calendar_id, event_id, start_at FROM meetings
+        WHERE ${MEETINGS_ERASED_PREDICATE} AND event_id IS NOT NULL
+       UNION
+       SELECT calendar_id, event_id, start_at FROM meeting_holds
+        WHERE ${MEETING_HOLDS_ERASED_PREDICATE} AND state = 'held'`,
+      [businessId, jobList],
+    );
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const key = JSON.stringify([row.calendar_id, row.event_id]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      calendarEventsKept.push({
+        calendarId: row.calendar_id,
+        eventId: row.event_id,
+        start: row.start_at === null ? null : row.start_at.toISOString(),
+      });
+    }
+    calendarEventsKept.sort(
+      (a, b) => a.calendarId.localeCompare(b.calendarId) || a.eventId.localeCompare(b.eventId),
+    );
+  }
+
   const digestList = [...digestIds];
   const draftList = [...draftIds];
   const mailList = [...mailIds];
@@ -1820,6 +1925,7 @@ export async function buildErasurePlan(
     filePaths,
     savedCopies,
     filesNotDeleted,
+    calendarEventsKept,
     items,
     excluded,
     refusals,
@@ -2045,6 +2151,19 @@ async function countItems(
       'delete',
       `SELECT count(*)::text AS n FROM document_productions WHERE ${DOCUMENT_PRODUCTIONS_ERASED_PREDICATE}`,
       [businessId, productionIds],
+    ),
+    // Calendar scheduling (migration 061): no foreign keys, so no order.
+    await one(
+      'meeting_holds',
+      'delete',
+      `SELECT count(*)::text AS n FROM meeting_holds WHERE ${MEETING_HOLDS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    ),
+    await one(
+      'meetings',
+      'delete',
+      `SELECT count(*)::text AS n FROM meetings WHERE ${MEETINGS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
     ),
     await one(
       'job_plans',

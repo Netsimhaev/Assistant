@@ -14,7 +14,7 @@
 import type { ApprovalRequest } from '../governance/approvals.js';
 import type { DocumentRecord } from '../documents/types.js';
 import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
-import type { ErasureAnchor, ErasureItem, ErasurePlan } from '../governance/erasure-plan.js';
+import type { CalendarEventKept, ErasureAnchor, ErasureItem, ErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
 import type { KeptItem } from '../governance/kept-items.js';
 import type { OAuthGrantSummary } from '../governance/oauth-grants.js';
@@ -1556,6 +1556,10 @@ export const TABLE_LABELS: Record<string, string> = {
   document_versions: 'גרסאות של מסמכים שהופקו',
   document_cards: 'כרטיסי מסמך',
   document_deliveries: 'רישומי מסירה של מסמכים',
+  // Migration 061: calendar scheduling — a client's name, email, phone and
+  // the owner's note on each meeting, and the tentative holds.
+  meetings: 'פגישות',
+  meeting_holds: 'שמירות מקום ביומן',
 };
 
 /**
@@ -1788,6 +1792,21 @@ function savedCopiesSection(paths: readonly string[]): string {
      <ul>${paths.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`;
 }
 
+/**
+ * Calendar events of erased meetings: NOT deleted — the calendar is the
+ * owner's. Shown so he knows the client's name may still sit in the event
+ * title there. The time is UTC, labelled, because this view has no charter
+ * time zone to convert with.
+ */
+function calendarEventsKeptSection(events: readonly CalendarEventKept[]): string {
+  if (events.length === 0) return '';
+  const when = (start: string | null): string =>
+    start === null ? '' : ` — ${start.slice(0, 16).replace('T', ' ')} UTC`;
+  return `<h2>נשארים ביומן שלך</h2>
+     <p class="muted">אירועי היומן הם שלך והמחיקה לא נוגעת בהם — אם תרצה, מחק אותם ביומן בעצמך.</p>
+     <ul>${events.map((e) => `<li>${escLabel(e.eventId)}${when(e.start)}</li>`).join('')}</ul>`;
+}
+
 export function renderErasure(model: ErasureViewModel): string {
   const { plan } = model;
   const error = model.error === undefined ? '' : `<p class="error">${esc(model.error)}</p>`;
@@ -1868,6 +1887,7 @@ export function renderErasure(model: ErasureViewModel): string {
      ${nothing}
      ${plan.filePaths.length > 0 ? `<p>${plan.filePaths.length} קבצים יימחקו מהדיסק.</p>` : ''}
      ${savedCopiesSection(plan.savedCopies)}
+     ${calendarEventsKeptSection(plan.calendarEventsKept)}
      ${plan.filesNotDeleted.length > 0
        ? `<p class="error">${plan.filesNotDeleted.length} קבצים שנרשמו להפקה נמצאים מחוץ לתיקיית ההפקה שלה, ולכן לא יימחקו:</p><ul>${plan.filesNotDeleted.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`
        : ''}

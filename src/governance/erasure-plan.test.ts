@@ -1399,3 +1399,150 @@ describe('document production', () => {
     expect(plan.filePaths).toContain(join(root, 'produced', BUSINESS, 'PR-esc', 'VER-esc1.preview.png'));
   });
 });
+
+/**
+ * Calendar scheduling (migration 061): `meetings` is a delete target by job
+ * (its own or its reminder job) AND a discovery source of its own;
+ * `meeting_holds` is deleted by job; the calendar events are never deleted
+ * and are listed instead.
+ */
+describe('calendar scheduling', () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  afterAll(async () => {
+    await closePool();
+  });
+
+  async function aMeeting(
+    meetingId: string,
+    jobId: string,
+    fields: {
+      stepId?: string;
+      clientName?: string;
+      internalNote?: string | null;
+      eventId?: string | null;
+      calendarId?: string;
+      startAt?: string | null;
+      reminderJobId?: string | null;
+      createdAt?: string;
+    },
+  ): Promise<void> {
+    await getPool().query(
+      `INSERT INTO meetings
+         (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation,
+          client_name, internal_note, start_at, reminder_job_id, created_at)
+       VALUES ($1, $2, $3, $11, $4, $5, 'create', $6, $7, $8, $9, coalesce($10::timestamptz, now()))`,
+      [
+        meetingId,
+        BUSINESS,
+        jobId,
+        fields.calendarId ?? 'cal-1',
+        fields.eventId ?? null,
+        fields.clientName ?? 'לקוח אחר',
+        fields.internalNote ?? null,
+        fields.startAt ?? null,
+        fields.reminderJobId ?? null,
+        fields.createdAt ?? null,
+        fields.stepId ?? 's1',
+      ],
+    );
+  }
+
+  async function aHold(holdId: string, jobId: string, eventId: string, state = 'held'): Promise<void> {
+    await getPool().query(
+      `INSERT INTO meeting_holds (hold_id, business_id, job_id, calendar_id, event_id, start_at, end_at, state)
+       VALUES ($1, $2, $3, 'cal-1', $4, '2026-12-01T09:00:00Z', '2026-12-01T10:00:00Z', $5)`,
+      [holdId, BUSINESS, jobId, eventId, state],
+    );
+  }
+
+  it('discovers a contact only named in a meeting internal note, with its job and reminder job', async () => {
+    const job = await bareJob('meeting-job');
+    const reminder = await bareJob('reminder-job');
+    const unrelated = await bareJob('unrelated-job');
+    await aMeeting('MT-1', job, { internalNote: `לזכור: ${RONIT} מעדיפה בבוקר`, reminderJobId: reminder });
+    await aMeeting('MT-2', unrelated, { internalNote: 'שום קשר' });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.jobIds).toEqual(expect.arrayContaining([job, reminder]));
+    expect(plan.jobIds).not.toContain(unrelated);
+    expect(plan.items.find((i) => i.table === 'meetings')?.count).toBe(1);
+
+    await executeErasure(plan, { businessId: BUSINESS });
+    const left = await getPool().query('SELECT meeting_id FROM meetings');
+    expect(left.rows).toEqual([{ meeting_id: 'MT-2' }]);
+  });
+
+  it('reaches the meeting and its reminder job from a job found some other way', async () => {
+    const job = await jobAbout(RONIT, 'via-plan');
+    const reminder = await bareJob('reminder-of-via-plan');
+    await aMeeting('MT-3', job, { reminderJobId: reminder });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.jobIds).toEqual(expect.arrayContaining([job, reminder]));
+    expect(plan.items.find((i) => i.table === 'meetings')?.count).toBe(1);
+  });
+
+  it('closes meetings by created_at for a window anchor', async () => {
+    const inside = await bareJob('win-inside');
+    const outside = await bareJob('win-outside');
+    await aMeeting('MT-in', inside, { createdAt: '2026-03-10T10:00:00Z' });
+    await aMeeting('MT-out', outside, { createdAt: '2026-05-10T10:00:00Z' });
+
+    const plan = await buildErasurePlan(
+      { kind: 'window', fromIso: '2026-03-01T00:00:00Z', toIso: '2026-04-01T00:00:00Z' },
+      { businessId: BUSINESS },
+    );
+
+    expect(plan.items.find((i) => i.table === 'meetings')?.count).toBe(1);
+  });
+
+  it('deletes meeting_holds with the job', async () => {
+    const job = await jobAbout(RONIT, 'hold-job');
+    const other = await bareJob('hold-other');
+    await aHold('H-1', job, 'ev-hold-1');
+    await aHold('H-2', other, 'ev-hold-2');
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+    expect(plan.items.find((i) => i.table === 'meeting_holds')?.count).toBe(1);
+
+    await executeErasure(plan, { businessId: BUSINESS });
+    const left = await getPool().query('SELECT hold_id FROM meeting_holds');
+    expect(left.rows).toEqual([{ hold_id: 'H-2' }]);
+  });
+
+  it('lists calendar events kept, sorted, from erased meetings and held holds only', async () => {
+    const job = await jobAbout(RONIT, 'kept-events');
+    const other = await bareJob('kept-other');
+    await aMeeting('MT-b', job, { stepId: 's1', eventId: 'ev-b', calendarId: 'cal-2', startAt: '2026-12-02T09:00:00Z' });
+    await aMeeting('MT-a', job, { stepId: 's2', eventId: 'ev-a', calendarId: 'cal-1', startAt: null });
+    await aMeeting('MT-none', job, { stepId: 's3', eventId: null });
+    await aHold('H-held', job, 'ev-held');
+    await aHold('H-released', job, 'ev-released', 'released');
+    await aMeeting('MT-other', other, { eventId: 'ev-other' });
+
+    const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
+
+    expect(plan.calendarEventsKept).toEqual([
+      { calendarId: 'cal-1', eventId: 'ev-a', start: null },
+      { calendarId: 'cal-1', eventId: 'ev-held', start: '2026-12-01T09:00:00.000Z' },
+      { calendarId: 'cal-2', eventId: 'ev-b', start: '2026-12-02T09:00:00.000Z' },
+    ]);
+
+    // The preview names them under "נשארים ביומן שלך"; neither module has a
+    // calendar client, so nothing there can be deleted.
+    const html = renderErasure({
+      plan,
+      csrf: 'c',
+      planHash: 'h',
+      anchorLabel: RONIT,
+    } as unknown as Parameters<typeof renderErasure>[0]);
+    expect(html).toContain('נשארים ביומן שלך');
+    expect(html).toContain('ev-b');
+    expect(html).not.toContain('ev-other');
+  });
+});

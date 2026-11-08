@@ -1960,6 +1960,11 @@ function planFingerprint(plan: ErasurePlan): string {
     // confirm re-shows the preview rather than going unmentioned.
     savedCopies: [...plan.savedCopies].sort(),
     filesNotDeleted: [...plan.filesNotDeleted].sort(),
+    // Never deleted, but shown to the owner: an event added between the
+    // preview and the confirm re-shows the preview.
+    calendarEventsKept: plan.calendarEventsKept
+      .map((e) => `${e.calendarId}\u0000${e.eventId}\u0000${e.start ?? ''}`)
+      .sort(),
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
     refusals: plan.refusals.map((r) => `${r.kind}:${r.detail}`).sort(),
