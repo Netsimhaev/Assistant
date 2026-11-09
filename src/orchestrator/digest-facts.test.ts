@@ -148,16 +148,24 @@ describe('collectDigestFacts', () => {
    * `kind`, and `id` is BIGSERIAL (migration 001:202-216).
    */
   it('reports the window cost and the rolling 30 days against the ceiling', async () => {
+    // Relative to now, not the fixed `WINDOW`: the rolling figure is measured
+    // against `now()`, and a seed on the fixed 2026-10-07 fell out of the
+    // 30 days on 2026-11-06 — a test that rots by the calendar.
+    const window = {
+      ...WINDOW,
+      start: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      end: new Date(Date.now() - 60 * 60 * 1000),
+    };
     await getPool().query(
       `INSERT INTO spend_ledger
          (business_id, job_id, action_class, amount_minor, currency, idempotency_key, at)
        VALUES ($1, 'J-ok', 'email.reply', 1250, 'ILS', 'k1', $2)`,
-      [BUSINESS, new Date('2026-10-07T07:00:00+03:00')],
+      [BUSINESS, new Date(Date.now() - 2 * 60 * 60 * 1000)],
     );
 
-    const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
+    const facts = await collectDigestFacts(window, CEILINGS, { businessId: BUSINESS });
     expect(facts.cost.windowMinor).toBe(1250);
-    expect(facts.cost.rolling30Minor).toBeGreaterThanOrEqual(1250);
+    expect(facts.cost.rolling30Minor).toBe(1250);
     expect(facts.cost.ceilingMinor).toBe(CEILINGS.monthlyMinor);
   });
 
