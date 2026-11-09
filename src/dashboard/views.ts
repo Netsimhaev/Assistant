@@ -14,7 +14,7 @@
 import type { ApprovalRequest } from '../governance/approvals.js';
 import type { DocumentRecord } from '../documents/types.js';
 import type { CharterConnection, ConnectionBinding } from '../domain/connection.js';
-import type { ErasureAnchor, ErasureItem, ErasurePlan } from '../governance/erasure-plan.js';
+import type { CalendarEventKept, ErasureAnchor, ErasureItem, ErasurePlan } from '../governance/erasure-plan.js';
 import type { ErasureOutcome } from '../governance/erasure.js';
 import type { KeptItem } from '../governance/kept-items.js';
 import type { OAuthGrantSummary } from '../governance/oauth-grants.js';
@@ -31,7 +31,9 @@ import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibilit
 import type { ReadingSummary } from './readings-list.js';
 import { isDocumentDecisionIntent } from './signable-intents.js';
 import { stripBidiControls } from '../util/bidi.js';
+import { localParts } from '../util/local-time.js';
 import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
+import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import { OUTLOOK_SUBJECT_NOTE, WARNING_PREFIXES, mailboxReplyRecipient, splitReplyDetail } from '../mail/reply-card.js';
 import { formatMinor } from '../util/money.js';
 
@@ -230,7 +232,7 @@ export function renderPendingList(options: {
 </header>
 ${options.modeFailed === true ? `<p class="error" role="alert">${esc(MODE_NOT_APPLIED_NOTICE)} <a href="/autonomy">כמה חופש לתת</a></p>` : ''}
 <p class="muted">קודי שחזור שנותרו: ${esc(options.remainingCodes)}</p>
-<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/documents">מסמכים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a></p>
+<p><a href="/instruct">מה לעשות</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/meetings">פגישות</a> · <a href="/documents">מסמכים</a> · <a href="/digest">מה קרה</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/setup/edit">ערוך את הכללים</a></p>
 ${list}`,
   );
 }
@@ -824,6 +826,13 @@ ${
     ? '<p><a href="/connections/mailbox">חיבור תיבת המייל של העסק (Gmail או Microsoft 365)</a></p>'
     : ''
 }
+${
+  options.charterStatus === 'ok' && !options.connections.some((c) => c.system === CALENDAR_SYSTEM)
+    ? '<p><a href="/connections/calendar">חיבור יומן העסק (Google Calendar או Microsoft 365) — קריאה וקביעת פגישות</a></p>'
+    : options.charterStatus === 'ok'
+      ? '<p><a href="/connections/calendar">מצב יומן העסק</a> · <a href="/meetings/settings">הגדרות הפגישות</a></p>'
+      : ''
+}
 ${sections === '' && notice === '' ? '<p>התקנון הפעיל אינו מצהיר על אף חיבור.</p>' : sections}`,
   );
 }
@@ -1326,7 +1335,7 @@ export interface PendingConfirmation {
  * option reads "אשר"; several read "אשר: <label>", because "אשר" alone would
  * not say which.
  */
-function confirmationCard(item: PendingConfirmation, csrf: string): string {
+export function confirmationCard(item: PendingConfirmation, csrf: string): string {
   const action = `/instruct/${esc(item.jobId)}/confirm`;
   const single = item.options.length === 1;
   const optionForms = item.options
@@ -1366,6 +1375,8 @@ export function renderInstruct(options: {
   confirmationQuestion?: string | null;
   /** Boss commands waiting on the owner's confirmation, each with its buttons. */
   confirmations?: PendingConfirmation[] | null;
+  /** A schedule answer ("מה יש לי מחר?"): calendar text, so `escLabel`. */
+  answer?: string | null;
 }): string {
   const error =
     options.error === undefined ? '' : `<p class="error">${esc(options.error)}</p>`;
@@ -1408,6 +1419,11 @@ export function renderInstruct(options: {
       ? ''
       : `<p class="confirm" style="white-space: pre-wrap">${escLabel(options.confirmationQuestion)}</p>`;
 
+  const answer =
+    options.answer == null
+      ? ''
+      : `<p class="confirm" style="white-space: pre-wrap">${escLabel(options.answer)}</p>`;
+
   const confirmations =
     options.confirmations == null
       ? ''
@@ -1425,6 +1441,7 @@ export function renderInstruct(options: {
      ${grantNote}
      ${recordingNote}
      ${ledgerEcho}
+     ${answer}
      ${confirmationQuestion}
      ${confirmations}
      ${identityNote}
@@ -1445,7 +1462,7 @@ export function renderInstruct(options: {
        גבוהה יותר.
        פעולה שנוגעת בכסף, חתימה על חוזה, או נמען שלא נקבת בכתובתו — תיעצר תמיד.
      </p>
-     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/documents">מסמכים</a> · <a href="/digest">מה קרה</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
+     <p><a href="/">לכרטיסי האישור</a> · <a href="/conversation">שיחת הוואטסאפ</a> · <a href="/readings">מה קראתי</a> · <a href="/mail">מיילים</a> · <a href="/ledger">הפנקס</a> · <a href="/meetings">פגישות</a> · <a href="/documents">מסמכים</a> · <a href="/digest">מה קרה</a> · <a href="/memory">מה נזכר</a> · <a href="/autonomy">כמה חופש לתת</a> · <a href="/connections">חיבורים</a> · <a href="/erase">מה לשכוח</a></p>
      ${logoutForm(options.csrf)}`,
   );
 }
@@ -1540,6 +1557,10 @@ export const TABLE_LABELS: Record<string, string> = {
   document_versions: 'גרסאות של מסמכים שהופקו',
   document_cards: 'כרטיסי מסמך',
   document_deliveries: 'רישומי מסירה של מסמכים',
+  // Migration 061: calendar scheduling — a client's name, email, phone and
+  // the owner's note on each meeting, and the tentative holds.
+  meetings: 'פגישות',
+  meeting_holds: 'שמירות מקום ביומן',
 };
 
 /**
@@ -1599,6 +1620,8 @@ export interface ErasurePrefill {
 
 export interface ErasureViewModel {
   csrf: string;
+  /** The charter's time zone; absent when the charter cannot be read (times then show as UTC). */
+  timeZone?: string | null;
   anchorLabel: string;
   /** `null` before an anchor has been chosen: the entry form, and nothing else. */
   plan: ErasurePlan | null;
@@ -1772,6 +1795,26 @@ function savedCopiesSection(paths: readonly string[]): string {
      <ul>${paths.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`;
 }
 
+/**
+ * Calendar events of erased meetings: NOT deleted — the calendar is the
+ * owner's. Shown so he knows the client's name may still sit in the event
+ * title there. The time is in the charter's zone (`timeZone`); `null` means
+ * the charter could not be read, and the time is then shown in UTC, labelled.
+ */
+function calendarEventsKeptSection(events: readonly CalendarEventKept[], timeZone: string | null): string {
+  if (events.length === 0) return '';
+  const when = (start: string | null): string => {
+    if (start === null) return '';
+    if (timeZone === null) return ` — ${start.slice(0, 16).replace('T', ' ')} UTC`;
+    const { date, time } = localParts(new Date(start), timeZone);
+    return ` — ${date} ${time}`;
+  };
+  const holdNote = ' — שמירת מקום — לא תנוקה עוד אוטומטית, אפשר למחוק אותה ביומן';
+  return `<h2>נשארים ביומן שלך</h2>
+     <p class="muted">אירועי היומן הם שלך והמחיקה לא נוגעת בהם — אם תרצה, מחק אותם ביומן בעצמך.</p>
+     <ul>${events.map((e) => `<li>${escLabel(e.eventId)}${when(e.start)}${e.kind === 'hold' ? holdNote : ''}</li>`).join('')}</ul>`;
+}
+
 export function renderErasure(model: ErasureViewModel): string {
   const { plan } = model;
   const error = model.error === undefined ? '' : `<p class="error">${esc(model.error)}</p>`;
@@ -1852,6 +1895,7 @@ export function renderErasure(model: ErasureViewModel): string {
      ${nothing}
      ${plan.filePaths.length > 0 ? `<p>${plan.filePaths.length} קבצים יימחקו מהדיסק.</p>` : ''}
      ${savedCopiesSection(plan.savedCopies)}
+     ${calendarEventsKeptSection(plan.calendarEventsKept, model.timeZone ?? null)}
      ${plan.filesNotDeleted.length > 0
        ? `<p class="error">${plan.filesNotDeleted.length} קבצים שנרשמו להפקה נמצאים מחוץ לתיקיית ההפקה שלה, ולכן לא יימחקו:</p><ul>${plan.filesNotDeleted.map((path) => `<li>${escLabel(path)}</li>`).join('')}</ul>`
        : ''}

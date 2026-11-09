@@ -51,6 +51,8 @@ import {
 import type { RunDueResult } from './run-due.js';
 import { buildRuntime } from './runtime.js';
 import { closeVerifiedJobs } from './verify.js';
+import { syncMeetings, type MeetingSyncResult } from '../meetings/sync.js';
+import type { CalendarClient } from '../calendar/types.js';
 import { scrubOldMailBodies } from './mail-retention.js';
 import type { CloseVerifiedResult } from './verify.js';
 import type { Runtime } from './runtime.js';
@@ -790,6 +792,17 @@ export interface SchedulerPassResult {
   ledger: LedgerPassResult | null;
   ledgerError: string | null;
   /**
+   * The meetings sweep (`syncMeetings`, calendar scheduling §8): proposed →
+   * active/abandoned/done, attendee responses read back, owner alerts on a
+   * decline or no answer, client reminders opened through the gate, holds
+   * swept. After `closeVerifiedJobs` (a meeting step completed this pass is
+   * activated this pass) and before the ledger pass. Reminder jobs it opens
+   * sit in `execute` and run on the next pass. `null` = it threw
+   * (`meetingsError` says why); a sweep with nothing to do is zeros.
+   */
+  meetings: MeetingSyncResult | null;
+  meetingsError: string | null;
+  /**
    * The document production loop (`src/production/loop.ts`), right after
    * `runDueJobs`. `null` = did not run: the server lacks the production tools
    * (`runtime.production` absent or unavailable — the same gate `buildRuntime`
@@ -905,6 +918,8 @@ export async function schedulerPass(
     mailDrafter?: PollMailboxOptions['drafter'];
     /** Test seam; production leaves it unset and act-mode nudges use `runNudgeDrafter`. */
     ledgerDrafter?: NudgeDrafter;
+    /** Test seam; production leaves it unset and the meetings sweep uses the real calendar client. */
+    calendarClient?: CalendarClient;
     /** Test seams for the production loop; production leaves them unset and uses the runtime's tools. */
     production?: Pick<RunProductionsOptions, 'drafter' | 'judge' | 'printer' | 'renderer' | 'onFinished' | 'documentRoot' | 'pdfAssets'>;
   } = {},
@@ -1012,6 +1027,8 @@ export async function schedulerPass(
         // A document-card fix ("תיקון: …") is a new production; the door
         // refuses it up front when this server cannot produce.
         ...(runtime.production !== undefined ? { production: runtime.production } : {}),
+        // The schedule answer reads the calendar through the runtime's credentials.
+        calendar: { runtime },
       });
     } catch (err) {
       whatsappError = err instanceof Error ? err.message : String(err);
@@ -1187,6 +1204,25 @@ export async function schedulerPass(
   }
   const verified = await closeVerifiedJobs(options);
 
+  // The meetings sweep, after the closes and before the ledger pass — see
+  // `SchedulerPassResult.meetings`. Guarded: a sweep that threw must not hide
+  // the rest of the pass.
+  let meetings: MeetingSyncResult | null = null;
+  let meetingsError: string | null = null;
+  try {
+    meetings = await syncMeetings({
+      businessId,
+      runtime,
+      ...(options.now !== undefined ? { now: options.now } : {}),
+      ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
+      ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
+      ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
+      ...(options.calendarClient !== undefined ? { client: options.calendarClient } : {}),
+    });
+  } catch (err) {
+    meetingsError = err instanceof Error ? err.message : String(err);
+  }
+
   // The ledger pass, after the closes (a nudge job closed this pass is
   // observed this pass) and before the report. Jobs it opens run next pass.
   // The drafter MUST default to the real one: without it act-mode nudge slots
@@ -1334,6 +1370,8 @@ export async function schedulerPass(
     ledgerEvidenceError,
     ledger,
     ledgerError,
+    meetings,
+    meetingsError,
     documentProductions,
     documentProductionsError,
     deliveriesReraised,

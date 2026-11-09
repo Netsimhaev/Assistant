@@ -56,6 +56,8 @@ import {
   LEDGER_WHATSAPP_BATCHES_SCRUBBED_PREDICATE,
   LEDGER_WHATSAPP_BATCHES_SCRUB_SET,
   LIVE_PHASES,
+  MEETING_HOLDS_ERASED_PREDICATE,
+  MEETINGS_ERASED_PREDICATE,
   MAIL_INVOICES_ERASED_PREDICATE,
   MAIL_MESSAGES_ERASED_PREDICATE,
   PROPOSALS_ERASED_PREDICATE,
@@ -445,6 +447,19 @@ export async function executeErasure(
       'document_productions',
       `DELETE FROM document_productions WHERE ${DOCUMENT_PRODUCTIONS_ERASED_PREDICATE}`,
       [businessId, productionIds],
+    );
+    // Calendar scheduling (migration 061). The calendar events themselves are
+    // never touched — `plan.calendarEventsKept` lists them. No foreign keys.
+    // Same predicates, same parameters, as `countItems` in `erasure-plan.ts`.
+    await del(
+      'meeting_holds',
+      `DELETE FROM meeting_holds WHERE ${MEETING_HOLDS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
+    );
+    await del(
+      'meetings',
+      `DELETE FROM meetings WHERE ${MEETINGS_ERASED_PREDICATE}`,
+      [businessId, jobIds],
     );
     await del('job_plans', 'DELETE FROM job_plans WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);
     await del('job_authorizations', 'DELETE FROM job_authorizations WHERE business_id=$1 AND job_id = ANY($2)', [businessId, jobIds]);

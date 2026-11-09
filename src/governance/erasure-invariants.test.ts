@@ -122,14 +122,21 @@ describe('what an erasure leaves behind', () => {
    * production's own discovery can reach it. `document_settings` holds no
    * person content.
    *
-   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one" count is spec §5.1's own
+   * **A twenty-second, also outside spec §5.1: calendar scheduling
+   * (migration 061)** — `meetings` (client name, email, phone, the owner's
+   * note), counted as one store. Seeded on a nameless job with a nameless
+   * reminder job, so only the meeting's own discovery can reach them.
+   * `meeting_holds` holds no content and is asserted deleted directly; the
+   * calendar events are never deleted and are asserted listed.
+   *
+   * **This "twelve, then thirteen, then fourteen, then sixteen, then seventeen, then eighteen, then nineteen, then twenty, then twenty-one, then twenty-two" count is spec §5.1's own
    * original content-store enumeration, growing as new content-bearing
    * tables were added to it — it is a DIFFERENT number from "how many
-   * tables `countItems`/the executor each name today" (32 since migrations 053–057; CLAUDE.md states
+   * tables `countItems`/the executor each name today" (34 since migrations 053–061; CLAUDE.md states
    * that figure, because it is the one a reader can grep `erasure-plan.ts`
    * and count directly). The two will not generally match: this file's
    * count tracks a design document's own enumeration of content-bearing
-   * stores, while the 32 also includes tables scrubbed as a consequence of
+   * stores, while the 34 also includes tables scrubbed as a consequence of
    * a kept-vs-erased JOB rather than discovered as a content store in their
    * own right (`jobs`, `job_steps`, `job_step_results`), and counts a table
    * once per table name regardless of how many `action`s `countItems` runs
@@ -600,7 +607,46 @@ describe('what an erasure leaves behind', () => {
       [productionDelivery.jobId, BUSINESS, `/home/owner/docs/הצעה ל-${PROBE}.docx`],
     );
 
+    // --- Migration 061: calendar scheduling. ----------------------------
+    //
+    // A meeting on a job that names nothing, so only the meeting's own
+    // discovery can reach it — with the probe in every content column a
+    // person can land in. The reminder job is a second nameless job: it must
+    // join `jobIds` through the meeting, not through its own (empty) title.
+    // The hold carries no content and is asserted deleted directly.
+    const meetingJob = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'פגישה',
+    });
+    const meetingReminderJob = await createJob({
+      charterVersion: bundle.charterVersion,
+      provenance: 'boss',
+      businessId: BUSINESS,
+      title: 'תזכורת',
+    });
+    await db.query(
+      `INSERT INTO meetings
+         (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation,
+          client_name, client_email, client_phone, internal_note, start_at, reminder_job_id)
+       VALUES ('MT-probe', $1, $2, 's1', 'cal-1', 'ev-probe', 'create', $3, $3, $4, $5,
+               '2026-12-01T09:00:00Z', $6)`,
+      [BUSINESS, meetingJob.jobId, PROBE, `050-${PROBE}`, `הערה על ${PROBE}`, meetingReminderJob.jobId],
+    );
+    await db.query(
+      `INSERT INTO meeting_holds (hold_id, business_id, job_id, calendar_id, event_id, start_at, end_at)
+       VALUES ('MH-probe', $1, $2, 'cal-1', 'ev-hold-probe', '2026-12-01T09:00:00Z', '2026-12-01T10:00:00Z')`,
+      [BUSINESS, meetingJob.jobId],
+    );
+
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
+    for (const table of ['meetings', 'meeting_holds']) {
+      expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
+    }
+    expect(plan.jobIds).toContain(meetingReminderJob.jobId);
+    // The calendar events outlive the erasure and the preview says so.
+    expect(plan.calendarEventsKept.map((e) => e.eventId)).toEqual(['ev-hold-probe', 'ev-probe']);
     for (const table of ['document_productions', 'document_versions', 'document_cards', 'document_deliveries']) {
       expect(plan.items.find((item) => item.table === table && item.action === 'delete')?.count, table).toBe(1);
     }

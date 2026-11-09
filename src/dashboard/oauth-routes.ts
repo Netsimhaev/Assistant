@@ -3,11 +3,13 @@
  * grant: `GET /oauth/:system/start`, `GET /oauth/callback`, and
  * `POST /oauth/:system/revoke`.
  *
- * **Google only, today.** This ceremony hardcodes `provider: 'google'` and
- * one scope (`GOOGLE_CALENDAR_READONLY_SCOPE`) because that is the only
- * provider adapter this subproject wires (`orchestrator/adapters/
- * google-calendar.ts`). A second provider needs a real per-system mapping
- * here -- see spec 9, "the second provider, after the first one works live."
+ * **Three ceremonies, one handler.** The business `mailbox` and the business
+ * `calendar` take the provider from the `provider` query parameter (Google or
+ * Microsoft), accepted only when it is the provider the SIGNED charter names
+ * for that connection. Every other system is the legacy read-only Google
+ * Calendar connection (`GOOGLE_CALENDAR_READONLY_SCOPE`, `orchestrator/
+ * adapters/google-calendar.ts`). The scope set and the account lookup come
+ * from the per-system profile in `oauth-profiles.ts`.
  *
  * **The grant write lives here, and ONLY here (besides the token service).**
  * `oauth-consent.ts` builds URLs and exchanges codes; it never imports
@@ -56,6 +58,8 @@ import { createGraphClient } from '../mail/providers/graph.js';
 import type { MailboxClient } from '../mail/providers/types.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
 import { mailboxProviderMatchesCharter } from '../charter/amend-mailbox.js';
+import { calendarProviderMatchesCharter } from '../charter/amend-calendar.js';
+import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import { connectionAcceptsOAuthCeremony } from '../orchestrator/oauth-eligibility.js';
 import { verifyCsrfToken } from './csrf.js';
 import { escLabel, escapeHtml } from './views.js';
@@ -74,13 +78,16 @@ import {
 } from './oauth-profiles.js';
 
 /**
- * The provider for a ceremony start. `mailbox` takes the owner's choice from
- * the `provider` query parameter (validated against `MailProvider`); every
- * other system is Google-only (calendar). The value is then stored on the
- * single-use state row, and the callback reads it from there.
+ * The provider for a ceremony start. `mailbox` and `calendar` take the
+ * owner's choice from the `provider` query parameter (validated against
+ * `MailProvider`, then against the provider the signed charter names); every
+ * other system is the legacy read-only Google calendar. The value is stored on
+ * the single-use state row, and the callback reads it from there.
  */
 function chosenProvider(system: string, query: URLSearchParams | undefined): MailProvider | null {
-  if (system !== MAILBOX_SYSTEM) return 'google';
+  // The business calendar also takes a provider (checked against the signed
+  // charter below); the legacy read-only calendar connection stays Google-only.
+  if (system !== MAILBOX_SYSTEM && system !== CALENDAR_SYSTEM) return 'google';
   const raw = query?.get('provider') ?? null;
   return raw === 'google' || raw === 'microsoft' ? raw : null;
 }
@@ -431,7 +438,14 @@ export async function handleOAuthStart(
     return sendHtml(
       res,
       400,
-      page('ספק לא תקין', errorBlock('יש לבחור ספק דואר: google או microsoft. לא בוצעה כל פעולה.')),
+      page(
+        'ספק לא תקין',
+        errorBlock(
+          system === CALENDAR_SYSTEM
+            ? 'יש לבחור ספק יומן: google או microsoft. לא בוצעה כל פעולה.'
+            : 'יש לבחור ספק דואר: google או microsoft. לא בוצעה כל פעולה.',
+        ),
+      ),
     );
   }
   const profile = connection === undefined ? null : oauthProfileFor(connection, provider);
@@ -450,6 +464,20 @@ export async function handleOAuthStart(
         'ספק שלא נחתם',
         errorBlock(
           'התקנון החתום מתיר לחבר את תיבת המייל רק אצל הספק שנבחר בחתימה. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
+        ),
+      ),
+    );
+  }
+
+  // The business calendar: same rule, same refusal -- only the provider signed.
+  if (system === CALENDAR_SYSTEM && !calendarProviderMatchesCharter(connection, provider)) {
+    return sendHtml(
+      res,
+      400,
+      page(
+        'ספק שלא נחתם',
+        errorBlock(
+          'התקנון החתום מתיר לחבר את היומן רק אצל הספק שנבחר בחתימה. לא בוצעה כל פעולה, ולא נפתח מסלול לספק.',
         ),
       ),
     );
@@ -487,7 +515,7 @@ export async function handleOAuthStart(
     system,
     sessionId: session.sessionId,
     codeVerifier,
-    ...(system === MAILBOX_SYSTEM ? { provider } : {}),
+    ...(system === MAILBOX_SYSTEM || system === CALENDAR_SYSTEM ? { provider } : {}),
   });
   const consentUrl = buildConsentUrl({
     provider,
@@ -536,8 +564,9 @@ export async function handleOAuthCallback(
   // Trusted from here on -- the row this session actually opened, never the
   // query string.
   const system = consumed.system;
-  // The provider the owner chose at start, from the stored row. Only the
-  // mailbox records one; everything else is the Google calendar ceremony.
+  // The provider the owner chose at start, from the stored row. The mailbox
+  // and the business calendar record one; any other system is the legacy
+  // Google read-only calendar ceremony.
   const provider: MailProvider =
     consumed.provider === 'microsoft' ? 'microsoft' : 'google';
   const providerName = provider === 'microsoft' ? 'Microsoft' : 'Google';
@@ -574,6 +603,29 @@ export async function handleOAuthCallback(
           'ספק שלא נחתם',
           errorBlock(
             'התקנון הפעיל אינו מתיר עוד לחבר את תיבת המייל אצל הספק הזה (הוא השתנה מאז שהחיבור התחיל). לא נשמר דבר.',
+          ),
+        ),
+      );
+    }
+  }
+
+  // The business calendar: re-checked against the charter NOW, exactly like the
+  // mailbox above -- the charter may have been reverted or re-signed since start.
+  if (system === CALENDAR_SYSTEM) {
+    let calendar: CharterConnection | undefined;
+    try {
+      calendar = (await loadActiveCharter(businessId))?.charter.connections.find((c) => c.system === CALENDAR_SYSTEM);
+    } catch {
+      calendar = undefined;
+    }
+    if (calendar === undefined || !calendarProviderMatchesCharter(calendar, provider)) {
+      return sendHtml(
+        res,
+        400,
+        page(
+          'ספק שלא נחתם',
+          errorBlock(
+            'התקנון הפעיל אינו מתיר עוד לחבר את היומן אצל הספק הזה (הוא השתנה מאז שהחיבור התחיל). לא נשמר דבר.',
           ),
         ),
       );
@@ -769,7 +821,8 @@ export async function handleOAuthCallback(
         }.</p>` +
         `<p class="muted">שימו לב: תזמון המשימות (ה-scheduler) קורא את רשימת החיבורים פעם אחת בלבד, בעת ההפעלה שלו. ` +
         `אם הוא כבר רץ, החיבור החדש ייכנס לתוקף רק אחרי שהוא יופעל מחדש.</p>` +
-        (system === MAILBOX_SYSTEM ? `<p><a href="/connections/mailbox">למצב תיבת המייל</a></p>` : ''),
+        (system === MAILBOX_SYSTEM ? `<p><a href="/connections/mailbox">למצב תיבת המייל</a></p>` : '') +
+        (system === CALENDAR_SYSTEM ? `<p><a href="/connections/calendar">למצב היומן</a> · <a href="/meetings/settings">להגדרות הפגישות</a></p>` : ''),
     ),
   );
 }

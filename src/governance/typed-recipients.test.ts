@@ -128,6 +128,7 @@ describe('authorisedRecipients', () => {
       'whatsapp.initiate',
       'calendar.create',
       'calendar.move',
+      'calendar.update',
       'calendar.cancel',
       'doc.deliver',
     ]);

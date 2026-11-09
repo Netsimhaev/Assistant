@@ -118,6 +118,12 @@ import { nameCarriesCancelWord } from './command-confirm.js';
 import { makePlan, type PlanOutcome, type PlanRequest } from '../sdk/planner.js';
 import { planStepIsFeasible } from './catalogue.js';
 import { renderConfirmationQuestion } from './command-echo.js';
+import { answerScheduleQuery, runMeetingOperation } from '../meetings/door.js';
+import type { CharterOperations } from '../meetings/free-time.js';
+import type { MeetingRequest } from '../meetings/request.js';
+import type { MeetingExtractor } from '../sdk/meeting-extractor.js';
+import type { CalendarClient } from '../calendar/types.js';
+import type { Runtime } from './runtime.js';
 import { createJob, transition } from './jobs.js';
 import { bindPlanToJob, planHashOf } from './plan-store.js';
 import { classMismatch } from './run-plan.js';
@@ -192,6 +198,37 @@ export interface RunInstructionOptions {
    * sees their ids and names (`PlanRequest.attachedDocuments`), never text.
    */
   attachedDocumentIds?: readonly string[];
+  /**
+   * Calendar access for the schedule answer ("מה יש לי מחר?", calendar scheduling §7.1).
+   * Absent: a schedule question is NOT routed and goes to the general planner as
+   * before. Both doors (WhatsApp and the dashboard) pass it.
+   */
+  calendar?: { runtime: Pick<Runtime, 'credentials'>; client?: CalendarClient };
+  /**
+   * A meeting request already in structured form (the dashboard's meeting
+   * form): no extraction. Read only when `calendar` is present.
+   */
+  meetingRequest?: MeetingRequest;
+  /**
+   * The model call that turns meeting text into a `MeetingRequest`; injectable
+   * so tests never reach the billed model. Defaults to `runMeetingExtractor`.
+   */
+  meetingExtractor?: MeetingExtractor;
+  /**
+   * `false` on an answer pass (both answer routes): the joined text (parked
+   * instruction + answer) is never read as a schedule question — a schedule
+   * question in the answer was already answered, read-only, on the new text
+   * alone before the claim. Only the schedule routing is skipped: the meeting
+   * door still runs, so an answer to a meeting question reaches it. Absent:
+   * routed as before.
+   */
+  scheduleRouting?: boolean;
+  /**
+   * Set by both answer routes on the second pass: the parked instruction this
+   * text joins, and the owner's answer alone. The meeting door reads it to pick
+   * a numbered candidate ("2") and to keep a "תני אחר" chain's turned-down slots.
+   */
+  answerTo?: { jobId: string; answer: string };
 }
 
 export interface GrantedAuthorization {
@@ -304,6 +341,8 @@ export type InstructionOutcome =
        */
       identityNote: string | null;
     }
+  /** A schedule question, answered in place: no job, no instruction row. */
+  | { status: 'answered'; text: string }
   | { status: 'refused'; reason: string };
 
 export async function runInstruction(
@@ -332,6 +371,22 @@ export async function runInstruction(
   const active = await loadActiveCharter(businessId);
   if (active === null) {
     return { status: 'refused', reason: 'אין תקנון פעיל — המתכנן נשען על הקטלוג והתקרות שבו.' };
+  }
+
+  // A schedule question is a read: answered here, before any job or instruction
+  // row exists (calendar scheduling §7.1). Never on an answer pass
+  // (`scheduleRouting: false`): the join of a parked instruction and an answer
+  // is not a schedule question.
+  if (options.calendar !== undefined && options.scheduleRouting !== false) {
+    const schedule = await answerScheduleQuery({
+      text: input.text,
+      businessId,
+      timeZone: active.charter.identity.timezone,
+      operations: active.charter.operations,
+      runtime: options.calendar.runtime,
+      ...(options.calendar.client !== undefined ? { client: options.calendar.client } : {}),
+    });
+    if (schedule !== null) return { status: 'answered', text: schedule.answered };
   }
 
   const job = await createJob({
@@ -376,6 +431,34 @@ export async function runInstruction(
     businessId,
   });
 
+  const door: DoorContext = {
+    businessId,
+    jobId: job.jobId,
+    instruction,
+    planner,
+    channel: options.channel,
+    textOrigin,
+    bundle: active.bundle,
+    timeZone: active.charter.identity.timezone,
+    attachedDocuments,
+    operations: active.charter.operations,
+  };
+
+  // A meeting instruction (create / move / cancel / edit, calendar scheduling
+  // §7) is planned in code, not by the general planner: extracted, searched
+  // against the calendar, held, and parked on one confirmation. `null` means
+  // it was not a meeting instruction and the general path continues.
+  if (options.calendar !== undefined) {
+    const meeting = await runMeetingOperation(door, {
+      ...(options.meetingRequest !== undefined ? { request: options.meetingRequest } : {}),
+      ...(options.meetingExtractor !== undefined ? { extractor: options.meetingExtractor } : {}),
+      ...(options.answerTo !== undefined ? { answerTo: options.answerTo } : {}),
+      runtime: options.calendar.runtime,
+      ...(options.calendar.client !== undefined ? { client: options.calendar.client } : {}),
+    });
+    if (meeting !== null) return meeting;
+  }
+
   // Two positive sources, never a guess: addresses that appear in the text,
   // and contacts whose name appears in it. `emailAddressesIn` is the same
   // extractor the standing-authorisation path uses — resolving a NAME is
@@ -402,18 +485,6 @@ export async function runInstruction(
     // a read that never returned recognised nobody — which is a different
     // thing from recognising somebody ambiguously.
   }
-
-  const door: DoorContext = {
-    businessId,
-    jobId: job.jobId,
-    instruction,
-    planner,
-    channel: options.channel,
-    textOrigin,
-    bundle: active.bundle,
-    timeZone: active.charter.identity.timezone,
-    attachedDocuments,
-  };
 
   // Spec §6: more than one person fits the name, so nothing is sent until the
   // owner says which. Asked once per chain (§7.2): after an answer has come
@@ -537,8 +608,8 @@ export async function runInstruction(
   });
 }
 
-/** Everything one instruction's planning passes share. */
-interface DoorContext {
+/** Everything one instruction's planning passes share. Exported for the meeting door (`meetings/door.ts`). */
+export interface DoorContext {
   businessId: string;
   jobId: string;
   instruction: InstructionRecord;
@@ -550,7 +621,12 @@ interface DoorContext {
   timeZone: string;
   /** Files the owner attached (ids + names), shown to every planner call of this instruction. */
   attachedDocuments: readonly { documentId: string; name: string }[];
+  /** The active charter's `operations` (work week, hours, holidays): the meeting door's work windows. */
+  operations: CharterOperations;
 }
+
+/** `finishSingle` under the name the meeting door imports: it parks a meeting plan on one confirmation. */
+export { finishSingle as finishSinglePlan };
 
 /**
  * The attached ids that are this business's documents, with their names, in
@@ -984,7 +1060,10 @@ async function planPerCandidate(
 
   const ledgerEchoes: (string | null)[] = [];
   for (const option of options) ledgerEchoes.push(await ledgerEchoOf(door, option.plan));
-  const rendered = renderConfirmationQuestion(options, { currency: door.bundle.ceilings.currency, ledgerEchoes });
+  const rendered = renderConfirmationQuestion(options, {
+    currency: door.bundle.ceilings.currency,
+    extraEchoes: ledgerEchoes,
+  });
   if ('refused' in rendered) {
     await failJob(door, 'instruction door: confirmation question refused (step too long to show)');
     return { status: 'refused', reason: rendered.refused };
@@ -1036,6 +1115,11 @@ async function finishSingle(
     label: string;
     contactSource: ConfirmationOption['contactSource'];
     identityNote: string | null;
+    /**
+     * Shown above the step echoes in place of the ledger echo (the meeting
+     * door passes its summary here). Absent: the plan's ledger echo, as before.
+     */
+    extraEcho?: string;
   },
 ): Promise<InstructionOutcome> {
   const { plan } = single;
@@ -1054,7 +1138,7 @@ async function finishSingle(
     };
     const rendered = renderConfirmationQuestion([option], {
       currency: door.bundle.ceilings.currency,
-      ledgerEchoes: [await ledgerEchoOf(door, plan)],
+      extraEchoes: [single.extraEcho ?? (await ledgerEchoOf(door, plan))],
     });
     if ('refused' in rendered) {
       await failJob(door, 'instruction door: confirmation question refused (step too long to show)');

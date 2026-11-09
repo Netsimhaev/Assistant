@@ -144,6 +144,7 @@ import {
   type StoredMessage,
 } from '../whatsapp/store.js';
 import { transcribeInbound, type TranscriptionProvider } from '../whatsapp/transcribe.js';
+import { answerScheduleQuery } from '../meetings/door.js';
 import { runInstruction, type InstructionOutcome, type RunInstructionOptions } from './instruct.js';
 import { linkWhatsAppMessage } from './jobs.js';
 import { handleMailCardMessage, isMailCardAction } from './whatsapp-mail-card.js';
@@ -340,6 +341,8 @@ const RECORDING_TOO_LARGE =
  */
 function composeAck(outcome: InstructionOutcome): string {
   if (outcome.status === 'refused') return outcome.reason;
+  // A schedule answer (calendar scheduling §7.1): the text IS the whole reply.
+  if (outcome.status === 'answered') return outcome.text;
   if (outcome.status === 'needs_answer') return outcome.question;
   // Boss command (spec §4): the confirmation question IS the ack — the owner
   // answers it in this chat (`handleConfirmationMessage`). It is sent only
@@ -468,6 +471,8 @@ interface ProcessContext {
    * needs to decide up front whether this server can produce at all.
    */
   production?: Runtime['production'];
+  /** Calendar access for the schedule answer — see `RunInstructionOptions.calendar`. */
+  calendar?: RunInstructionOptions['calendar'];
 }
 
 type ProcessOutcome =
@@ -889,6 +894,35 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     const claimed = await claimMessage(stored.id, { businessId: ctx.businessId });
     if (!claimed) return 'skipped'; // raced by another runner on this message.
 
+    // A schedule question ("מה יש לי מחר?") is a READ, judged on THIS message
+    // alone and BEFORE the route is decided: it must neither consume a parked
+    // question as its answer nor be parsed together with the parked half (a
+    // parked "…מחר…" would otherwise turn "…ביום שלישי" into tomorrow). It is
+    // answered with the schedule text ONLY — no route notice, no transcript
+    // echo — so the approved layout and its 4,000-character budget hold, and it
+    // opens no job, writes no instruction row and spends none of the daily
+    // instruction cap (nothing is recorded below). Open questions stay open.
+    if (ctx.calendar !== undefined) {
+      const schedule = await answerScheduleQuery({
+        text: heard,
+        businessId: ctx.businessId,
+        timeZone: ctx.charter.identity.timezone,
+        operations: ctx.charter.operations,
+        runtime: ctx.calendar.runtime,
+        ...(ctx.calendar.client !== undefined ? { client: ctx.calendar.client } : {}),
+      });
+      if (schedule !== null) {
+        await ctx.messenger.send({ text: schedule.answered, jobId: null });
+        await settleMessage(
+          stored.id,
+          'handled',
+          isAudio ? { transcript: heard } : {},
+          { businessId: ctx.businessId },
+        );
+        return 'instructed';
+      }
+    }
+
     // What this message IS — answer, closure, or new instruction (task 12).
     // Read from the record, never stored a second time; see
     // `whatsapp-routing.ts`'s own docblock for the derivation and for the
@@ -1048,6 +1082,15 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         // a second pass is underway.
         ...(answered !== null ? { identityAsked: true, sourceAsked: true } : {}),
         ...(ctx.planner !== undefined ? { planner: ctx.planner } : {}),
+        // Calendar access: the schedule answer ("מה יש לי מחר?") and the meeting
+        // door. On the answer pass the schedule routing is OFF — a schedule
+        // question was already answered above, on the new message alone, and
+        // the JOIN of a parked instruction and an answer is not one — but the
+        // meeting door still runs, so an answer to a meeting question reaches it.
+        ...(ctx.calendar !== undefined ? { calendar: ctx.calendar } : {}),
+        ...(answered !== null
+          ? { scheduleRouting: false, answerTo: { jobId: answered.jobId, answer: heard } }
+          : {}),
       },
     );
 
@@ -1069,7 +1112,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     instructionRecorded = true;
 
     const ack = composeAck(outcome);
-    const jobId = outcome.status === 'refused' ? null : outcome.jobId;
+    const jobId = outcome.status === 'refused' || outcome.status === 'answered' ? null : outcome.jobId;
 
     // An answer whose re-run REFUSED closes the previous request before the
     // owner is told, rather than after — the one place this function departs
@@ -1136,7 +1179,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // the old opening message `'reported'`, which is what stops the report
     // pass telling him his answered instruction "failed"; see that
     // function's own docblock.
-    if (answered !== null && outcome.status !== 'refused') {
+    if (answered !== null && outcome.status !== 'refused' && outcome.status !== 'answered') {
       await retireOpenInstruction(answered, {
         to: 'failed',
         reason: reasonForSupersededByWhatsAppAnswer(outcome.jobId),
@@ -1158,7 +1201,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // did say it, whatever came of it.
     await settleMessage(
       stored.id,
-      jobId !== null ? 'handled' : 'failed',
+      jobId !== null || outcome.status === 'answered' ? 'handled' : 'failed',
       {
         ...(isAudio ? { transcript: heard } : {}),
         ...(jobId !== null ? { jobId } : {}),
@@ -1166,7 +1209,9 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       { businessId: ctx.businessId },
     );
 
-    return jobId !== null ? 'instructed' : 'refused';
+    // A schedule answer counts as instructed: the owner's request was served,
+    // it simply needed no job.
+    return jobId !== null || outcome.status === 'answered' ? 'instructed' : 'refused';
   } catch {
     // One poison message must not block the queue — the same isolation
     // `runDueJobs` gives each job. Three things, each gated on how far
@@ -1248,6 +1293,8 @@ export async function runWhatsAppDoor(options: {
   questionWindowMinutes?: number;
   /** `runtime.production`, for a document-card fix request — see `ProcessContext.production`. */
   production?: Runtime['production'];
+  /** Calendar access for the schedule answer ("מה יש לי מחר?"); absent: no schedule routing. */
+  calendar?: RunInstructionOptions['calendar'];
 }): Promise<DoorResult> {
   const businessId = options.businessId ?? config.businessId;
   const { gateway, messenger } = options;
@@ -1316,6 +1363,7 @@ export async function runWhatsAppDoor(options: {
       ? { questionWindowMinutes: options.questionWindowMinutes }
       : {}),
     ...(options.production !== undefined ? { production: options.production } : {}),
+    ...(options.calendar !== undefined ? { calendar: options.calendar } : {}),
   };
 
   for (const msg of ordered) {

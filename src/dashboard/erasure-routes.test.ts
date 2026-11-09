@@ -179,6 +179,7 @@ describe('the erasure screen', () => {
         ledgerRuleIds: [],
         productionIds: [],
         savedCopies: [],
+        calendarEventsKept: [],
         filesNotDeleted: [],
         filePaths: [],
         items: [],
@@ -210,6 +211,7 @@ describe('the erasure screen', () => {
         ledgerRuleIds: [],
         productionIds: [],
         savedCopies: [],
+        calendarEventsKept: [],
         filesNotDeleted: [],
         filePaths: [],
         items: [],
@@ -942,6 +944,7 @@ describe('the smaller things the screen owes the owner', () => {
         ledgerRuleIds: [],
         productionIds: [],
         savedCopies: [],
+        calendarEventsKept: [],
         filesNotDeleted: [],
         filePaths: [],
         items: [],
@@ -1030,5 +1033,43 @@ describe('every table countItems can emit has a Hebrew label', () => {
 
     const missing = [...tables].filter((table) => !Object.hasOwn(TABLE_LABELS, table));
     expect(missing).toEqual([]);
+  });
+});
+
+describe('calendar events in the plan fingerprint', () => {
+  it('refuses when a different calendar event took the place of the one in the preview', async () => {
+    const baseUrl = await startServer();
+    const { jobId } = await seedRonit();
+    const db = getPool();
+    await db.query(
+      `INSERT INTO meetings (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation, client_name)
+       VALUES ('MT-fp', $1, $2, 's1', 'cal-1', 'ev-first', 'create', 'לקוח')`,
+      [BUSINESS, jobId],
+    );
+    const cookie = await signIn(baseUrl);
+    const previewHtml = await (
+      await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, { headers: { cookie } })
+    ).text();
+    expect(previewHtml).toContain('נשארים ביומן שלך');
+    const csrf = extractCsrf(previewHtml);
+    const planHash = extractPlanHash(previewHtml);
+
+    // Same counts, same ids — only the event the meeting points at moved.
+    await db.query(`UPDATE meetings SET event_id = 'ev-second' WHERE meeting_id = 'MT-fp'`);
+
+    const res = await fetch(`${baseUrl}/erase/confirm`, {
+      method: 'POST',
+      headers: { cookie },
+      body: new URLSearchParams({
+        csrf,
+        planHash,
+        anchor: JSON.stringify({ kind: 'contact', identifier: RONIT }),
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('השתנה מאז');
+    const left = await db.query(`SELECT 1 FROM meetings WHERE meeting_id = 'MT-fp'`);
+    expect(left.rows).toHaveLength(1);
   });
 });

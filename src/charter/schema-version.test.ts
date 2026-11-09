@@ -42,7 +42,7 @@ import { TrustLevel } from '../domain/trust.js';
  * when `CURRENT_SCHEMA_VERSION` was last bumped.
  */
 const FROZEN_AT_CURRENT_SCHEMA = {
-  schemaVersion: '1.2',
+  schemaVersion: '1.3',
   /** `CharterAutonomy.base` — one entry per member, no implicit default. */
   actionClasses: [
     'email.reply',
@@ -51,6 +51,7 @@ const FROZEN_AT_CURRENT_SCHEMA = {
     'whatsapp.initiate',
     'calendar.create',
     'calendar.move',
+    'calendar.update',
     'calendar.cancel',
     'quote.issue',
     'discount.grant',

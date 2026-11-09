@@ -78,6 +78,7 @@ export const TYPED_RECIPIENT_CLASSES: readonly ActionClass[] = [
   'whatsapp.initiate',
   'calendar.create',
   'calendar.move',
+  'calendar.update',
   'calendar.cancel',
   'doc.deliver',
 ];

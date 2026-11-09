@@ -52,6 +52,8 @@ function cleanResult(): SchedulerPassResult {
     ledgerEvidenceError: null,
     ledger: null,
     ledgerError: null,
+    meetings: null,
+    meetingsError: null,
     documentProductions: { advanced: 0, ready: 0, failedChecks: 0, failed: 0, skipped: 0, errored: [], originJobMissing: [] },
     documentProductionsError: null,
     deliveriesReraised: null,

@@ -48,6 +48,51 @@ const MAIL = step('mail.send', {
 });
 
 describe('renderStepEcho', () => {
+  it('labels calendar fields in the step echo', () => {
+    const echo = renderStepEcho(
+      {
+        id: 'm1',
+        agent: 'sched.meetings',
+        intent: 'meeting.create',
+        toolName: 'calendar.write',
+        dependsOn: [],
+        expectedActionClass: 'calendar.create',
+        input: {
+          operation: 'create',
+          calendarId: 'primary',
+          holdEventId: 'hold-1',
+          title: 'דני כהן',
+          start: '2026-11-17T08:00:00.000Z',
+          end: '2026-11-17T09:00:00.000Z',
+          location: 'הרצל 5',
+          description: 'להביא חוזה' + NL + 'טלפון: 052',
+          attendees: ['dani@x.co', 'b@y.co'],
+        },
+      },
+      'ILS',
+    );
+    const lines = echo.split(NL);
+    expect(lines[0]).toBe(ACTION_CLASS_HE['calendar.create']);
+    expect(lines).toContain('פעולה: create');
+    expect(lines).toContain('יומן: primary');
+    expect(lines).toContain('שמירת מקום: hold-1');
+    expect(lines).toContain('כותרת: דני כהן');
+    expect(lines).toContain('התחלה: 2026-11-17T08:00:00.000Z');
+    expect(lines).toContain('סיום: 2026-11-17T09:00:00.000Z');
+    expect(lines).toContain('מיקום: הרצל 5');
+    expect(lines).toContain('פרטים ללקוח: להביא חוזה');
+    expect(lines).toContain('    │ טלפון: 052');
+    expect(lines).toContain('משתתפים: dani@x.co, b@y.co');
+    expect(echo).not.toContain('שדה נוסף');
+    const update = renderStepEcho(
+      { id: 'm2', agent: 'sched.meetings', intent: 'x', toolName: 'calendar.write', dependsOn: [], expectedActionClass: 'calendar.update',
+        input: { operation: 'update', calendarId: 'primary', eventId: 'ev-7', location: null } },
+      'ILS',
+    );
+    expect(update).toContain('אירוע: ev-7');
+    expect(update).toContain('מיקום: null');
+  });
+
   it('shows the refined class label, not the raw id, and every known field', () => {
     const echo = renderStepEcho(MAIL, 'ILS');
     expect(echo).toContain(ACTION_CLASS_HE['email.reply']);
@@ -239,6 +284,13 @@ describe('renderStepEcho', () => {
 });
 
 describe('renderConfirmationQuestion', () => {
+  it('an extra echo sits under the label and above the step echo, which is still shown', () => {
+    const r = renderConfirmationQuestion([option('לקבוע', [MAIL])], { currency: 'ILS', extraEchoes: ['סיכום הפגישה'] });
+    if (!('text' in r)) throw new Error('refused');
+    expect(r.text.startsWith('לקבוע\nסיכום הפגישה\n')).toBe(true);
+    expect(r.text.indexOf('סיכום הפגישה')).toBeLessThan(r.text.indexOf('אל: ronit@beta.co.il'));
+  });
+
   it('one option: label, echo, and the confirm hint last', () => {
     const r = renderConfirmationQuestion([option('לשלוח לרונית', [MAIL])], { currency: 'ILS' });
     if (!('text' in r)) throw new Error('refused');

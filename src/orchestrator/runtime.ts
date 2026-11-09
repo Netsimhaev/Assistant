@@ -19,6 +19,11 @@ import { MAILBOX_SYSTEM } from '../mail/mailbox.js';
 import { replyTargetFor } from '../mail/inbox-store.js';
 import type { MailProvider } from '../mail/mailbox.js';
 import type { MailboxClient } from '../mail/providers/types.js';
+import { signedCalendarProvider } from '../charter/amend-calendar.js';
+import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
+import type { CalendarProvider } from '../calendar/calendar.js';
+import type { CalendarClient } from '../calendar/types.js';
+import { createCalendarAdapter } from './adapters/calendar.js';
 import { AdapterRegistry } from './adapters/registry.js';
 import { loadBindings } from './bindings.js';
 import { CREDENTIAL_REF_PATTERN } from './credentials.js';
@@ -287,6 +292,8 @@ export async function buildRuntime(
     calendarHttp?: CalendarHttp;
     /** Test seam: the mailbox client a send adapter uses, per provider. */
     mailboxClient?: (provider: MailProvider) => MailboxClient;
+    /** Test seam: the calendar client the calendar adapter uses, per provider. */
+    calendarClient?: (provider: CalendarProvider) => CalendarClient;
     /** Test seam only — see this function's docblock. No default exists yet. */
     whatsappGateway?: (creds: { instance: CredentialHandle; token: CredentialHandle }) => WhatsAppGateway;
   } = {},
@@ -654,6 +661,9 @@ export async function buildRuntime(
   );
   for (const binding of bindings) {
     if (binding.provider !== GOOGLE_PROVIDER) continue;
+    // The business calendar has its own read-write adapter (loop below); the
+    // legacy read-only adapter must never be registered under that name.
+    if (binding.system === CALENDAR_SYSTEM) continue;
     const connection = connectionBySystem.get(binding.system);
     // `connectionAcceptsOAuthCeremony` (`oauth-eligibility.ts`) is this same
     // channel-and-serves check, extracted (final fix wave, item 1) so the
@@ -717,6 +727,45 @@ export async function buildRuntime(
         provider,
         replyTargets: replyTargetFor,
         ...(overrides.mailboxClient !== undefined ? { client: overrides.mailboxClient(provider) } : {}),
+      }),
+    );
+  }
+
+  // The business calendar (read + write). Same discipline as the mailbox loop:
+  // the binding names the vendor, the charter's connection decides the tools.
+  // The time zone is ALWAYS the charter's, read fresh per call (never the
+  // process zone); a failed read makes the adapter answer `timezone_unavailable`
+  // (retryable) instead of guessing.
+  for (const binding of bindings) {
+    if (binding.system !== CALENDAR_SYSTEM) continue;
+    if (binding.provider !== 'google' && binding.provider !== 'microsoft') continue;
+    const connection = connectionBySystem.get(binding.system);
+    if (connection === undefined || connection.channel !== 'api') continue;
+    if (!connection.serves.includes('calendar.read') || !connection.serves.includes('calendar.write')) continue;
+    // The binding's provider must be the one the owner SIGNED for: a binding
+    // pointing at another vendor would send calendar data through a
+    // subprocessor the signed charter does not name.
+    if (signedCalendarProvider(connection) !== binding.provider) {
+      warnings.push(
+        `no calendar adapter for "${binding.system}": the binding's provider is not the one the signed charter names`,
+      );
+      continue;
+    }
+    if (systemAdapters.some((a) => a.system === binding.system)) {
+      warnings.push(`no calendar adapter for "${binding.system}": an adapter is already registered under this system name`);
+      continue;
+    }
+    const provider: CalendarProvider = binding.provider;
+    systemAdapters.push(
+      createCalendarAdapter({
+        system: binding.system,
+        provider,
+        timeZone: async () => {
+          const active = await loadActiveCharter();
+          if (active === null) throw new Error('no active charter: the business time zone is unknown');
+          return active.charter.identity.timezone;
+        },
+        ...(overrides.calendarClient !== undefined ? { client: overrides.calendarClient(provider) } : {}),
       }),
     );
   }

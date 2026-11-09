@@ -722,6 +722,25 @@ describe('reaskFailedCommands', () => {
     expect(await reaskFailedCommands({ businessId: BUSINESS })).toMatchObject({ reasked: [], errored: [] });
   });
 
+  it('a meeting job is never re-asked — its hold is gone and the twin would carry no meetings rows', async () => {
+    const { jobId, bundle } = await seedCommand();
+    await timeOut(jobId, bundle);
+    await getPool().query(
+      `INSERT INTO meetings (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation, client_name)
+       VALUES ('MT-reask', $1, $2, 's1', 'cal-1', 'hold-1', 'create', 'לקוח')`,
+      [BUSINESS, jobId],
+    );
+    expect(await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() })).toMatchObject({
+      reasked: [],
+      errored: [],
+    });
+    expect(await reasksOf(jobId)).toEqual([]);
+    // The same job without the meetings row is re-asked: the exclusion is the row.
+    await getPool().query(`DELETE FROM meetings WHERE meeting_id = 'MT-reask'`);
+    const again = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });
+    expect(again.reasked.map((r) => r.oldJobId)).toEqual([jobId]);
+  });
+
   it('the successor carries the old job’s WhatsApp message', async () => {
     const { jobId, bundle } = await seedCommand();
     const messageId = await linkToWhatsApp(jobId);

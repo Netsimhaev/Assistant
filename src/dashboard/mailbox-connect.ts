@@ -92,7 +92,7 @@ export function parseMailProvider(raw: string | null | undefined): MailProvider 
 
 // --- Rendering --------------------------------------------------------------
 
-function page(title: string, body: string): string {
+export function page(title: string, body: string): string {
   return `<!doctype html>
 <html lang="he" dir="rtl">
 <head>
@@ -117,18 +117,18 @@ ${body}
 
 const SECURITY_HEADERS = { 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY' } as const;
 
-function sendHtml(res: ServerResponse, status: number, body: string): void {
+export function sendHtml(res: ServerResponse, status: number, body: string): void {
   res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
   res.end(body);
 }
 
 /** 303 so the browser follows a POST with a GET. */
-function seeOther(res: ServerResponse, location: string): void {
+export function seeOther(res: ServerResponse, location: string): void {
   res.writeHead(303, { Location: location, ...SECURITY_HEADERS });
   res.end();
 }
 
-function errorPage(title: string, message: string): string {
+export function errorPage(title: string, message: string): string {
   return page(title, `<h1>${esc(title)}</h1><p class="error">${esc(message)}</p>`);
 }
 
@@ -347,11 +347,11 @@ async function lockActiveVersion(tx: Queryable, businessId: string, base: string
   if (rows[0]?.charter_version !== base) throw new StaleBaseError();
 }
 
-const STALE_MESSAGE =
+export const STALE_MESSAGE =
   'התקנון הפעיל השתנה מאז שהדף הוצג, ולכן מה שהוצג אינו מה שהיה נחתם. לא בוצעה כל פעולה — יש לפתוח את הדף מחדש.';
 
 /** Sign, install and record one owner-signed charter change, under the locked stale check. */
-async function installSigned(
+export async function installSigned(
   businessId: string,
   username: string,
   base: string,

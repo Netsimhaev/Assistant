@@ -250,6 +250,15 @@ export function logErrored(result: SchedulerPassResult): void {
   if (result.ledgerError !== null) {
     console.error(`ledger pass failed: ${result.ledgerError}`);
   }
+  if (result.meetingsError !== null) {
+    console.error(`meetings sweep failed: ${result.meetingsError}`);
+  }
+  if (result.meetings !== null && result.meetings.errored.length > 0) {
+    console.error(
+      `meetings sweep: ${result.meetings.errored.length} meeting(s) errored: ` +
+        result.meetings.errored.map((e) => `${e.meetingId}: ${e.error}`).join('; '),
+    );
+  }
   if (result.ledgerEvidence !== null && result.ledgerEvidence.errored.length > 0) {
     console.error(
       `ledger evidence: ${result.ledgerEvidence.errored.length} item(s) errored: ` +

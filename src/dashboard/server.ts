@@ -24,7 +24,8 @@ import { DocumentAlreadySignedError, loadSignature } from '../governance/signatu
 import type { SignatureRecord } from '../governance/signatures.js';
 import { decideAndSign } from '../governance/sign-decision.js';
 import { applyDecision, resumeAfterDecision } from '../orchestrator/resume.js';
-import { runInstruction } from '../orchestrator/instruct.js';
+import { answerScheduleQuery } from '../meetings/door.js';
+import { runInstruction, type RunInstructionOptions } from '../orchestrator/instruct.js';
 import { applyConfirmation, dashboardConfirmations } from '../orchestrator/command-confirm.js';
 import { loadConfirmation } from '../governance/instruction-confirmations.js';
 import { loadJob, transition } from '../orchestrator/jobs.js';
@@ -105,6 +106,23 @@ import {
   handleMailboxSignPost,
   handleMailboxStatus,
 } from './mailbox-connect.js';
+import {
+  handleCalendarRevertPost,
+  handleCalendarSignGet,
+  handleCalendarSignPost,
+  handleCalendarStatus,
+} from './calendar-connect.js';
+import {
+  calendarWiring,
+  handleMeetingMarkPost,
+  handleMeetingNewPost,
+  handleMeetingSettingsGet,
+  handleMeetingSettingsPost,
+  handleMeetingsGet,
+  type MeetingRouteOptions,
+} from './meeting-routes.js';
+import type { CalendarClient } from '../calendar/types.js';
+import type { CredentialSource } from '../orchestrator/credentials.js';
 import {
   handleLedgerAction,
   handleLedgerGet,
@@ -257,12 +275,22 @@ export interface DashboardOptions {
    * reads (`productionToolsFromEnv`).
    */
   production?: DocumentRouteOptions['production'];
+  /**
+   * Test seams for the meeting settings page (`/meetings/settings`): the
+   * credential source and the client its calendar list is read through. No
+   * production caller passes either — absent, the page builds the real
+   * credential source from the master key and uses the bound provider's client.
+   */
+  calendarCredentials?: CredentialSource;
+  calendarClient?: CalendarClient;
   /** Test seam for the upload cap; production leaves it unset (`MAX_ORIGINAL_BYTES`, the ingest's own). */
   uploadMaxBytes?: number;
 }
 
 /** What the document screens and the upload need from `createServer`'s options. */
 interface InstructionDoorOptions extends DocumentRouteOptions {
+  /** Calendar access for the schedule answer, resolved per request (the credential source is built lazily). Absent: no schedule routing. */
+  calendar?: () => Promise<RunInstructionOptions['calendar']>;
   planner?: (request: PlanRequest) => Promise<PlanOutcome>;
   uploadMaxBytes?: number;
 }
@@ -981,6 +1009,11 @@ export async function renderInstructionOutcome(
     sendHtml(res, 400, renderInstruct({ csrf, error: outcome.reason }));
     return;
   }
+  // A schedule answer: no job exists, so the text is the whole page content.
+  if (outcome.status === 'answered') {
+    sendHtml(res, 200, renderInstruct({ csrf, answer: outcome.text }));
+    return;
+  }
   if (outcome.status === 'needs_answer') {
     sendHtml(
       res,
@@ -1219,6 +1252,7 @@ async function handleInstructPost(
     attachedDocumentIds.push(ingested.documentId);
   }
 
+  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
   const outcome = await runInstruction(
     { text },
     {
@@ -1227,6 +1261,7 @@ async function handleInstructPost(
       channel: 'dashboard',
       ...(attachedDocumentIds.length > 0 ? { attachedDocumentIds } : {}),
       ...(doorOptions.planner !== undefined ? { planner: doorOptions.planner } : {}),
+      ...(calendar !== undefined ? { calendar } : {}),
     },
   );
   await renderInstructionOutcome(res, session, outcome, businessId);
@@ -1518,6 +1553,7 @@ async function handleInstructAnswer(
   businessId: string,
   session: Session,
   jobId: string,
+  doorOptions: InstructionDoorOptions = {},
 ): Promise<void> {
   const form = await readFormBody(req);
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) {
@@ -1526,6 +1562,35 @@ async function handleInstructAnswer(
 
   const instruction = await loadInstructionForJob(jobId, { businessId });
   if (instruction === null) return sendHtml(res, 404, renderNotFound());
+
+  // A schedule question typed into the answer box is a READ, judged on the new
+  // text alone and BEFORE any claim: the parked question stays open and
+  // unclaimed, and nothing is parsed together with the parked half.
+  const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
+  if (calendar !== undefined) {
+    const active = await loadActiveCharter(businessId);
+    if (active !== null) {
+      const schedule = await answerScheduleQuery({
+        text: form.get('answer') ?? '',
+        businessId,
+        timeZone: active.charter.identity.timezone,
+        operations: active.charter.operations,
+        runtime: calendar.runtime,
+        ...(calendar.client !== undefined ? { client: calendar.client } : {}),
+      });
+      if (schedule !== null) {
+        return sendHtml(
+          res,
+          200,
+          renderInstruct({
+            csrf: issueCsrfToken(session.sessionId),
+            answer: schedule.answered,
+            pending: [{ jobId, question: instruction.question, text: instruction.text }],
+          }),
+        );
+      }
+    }
+  }
 
   // Everything from the phase guard to the transition runs under one claim
   // on this job (I2). The guard is a read and `runInstruction` makes a live
@@ -1537,7 +1602,7 @@ async function handleInstructAnswer(
   // handler. Two authorised plans for one answer, and an error saying
   // nothing happened.
   const claim = await withJobClaim(`instruct-answer:${businessId}:${jobId}`, async () =>
-    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? ''),
+    answerUnderClaim(res, businessId, session, jobId, instruction, form.get('answer') ?? '', calendar),
   );
   if (!claim.claimed) {
     sendHtml(
@@ -1635,6 +1700,7 @@ async function answerUnderClaim(
   // recorded instruction as typed — see the call itself.
   instruction: { instructionId: string; text: string; textOrigin: InstructionTextOrigin },
   answer: string,
+  calendar: RunInstructionOptions['calendar'],
 ): Promise<void> {
   // Scoped to a job that is actually waiting on this answer — see
   // `handleInstructAnswer`'s docblock for the two ways skipping this check
@@ -1720,6 +1786,11 @@ async function answerUnderClaim(
       // The files the owner attached to the original instruction stay his
       // sources on the second pass (document production D14).
       attachedDocumentIds: await attachedDocumentsForJob(jobId, { businessId }),
+      // Calendar access for the meeting door: an answer to a meeting question
+      // (which meeting, "תזיזי את X", another window) goes back to it. The
+      // schedule routing stays OFF: the joined text is not a schedule question,
+      // and one in the answer alone was handled read-only before the claim.
+      ...(calendar !== undefined ? { calendar, scheduleRouting: false, answerTo: { jobId, answer } } : {}),
     },
   );
 
@@ -1743,6 +1814,11 @@ async function answerUnderClaim(
       }),
     );
   }
+
+  // The answer pass never routes a schedule question (`calendar` is passed for
+  // the meeting door, but with `scheduleRouting: false`), so an `answered`
+  // outcome cannot come from here and there is always a replacement job.
+  if (outcome.status === 'answered') return renderInstructionOutcome(res, session, outcome, businessId);
 
   await transition(jobId, {
     to: 'failed',
@@ -1885,6 +1961,11 @@ function planFingerprint(plan: ErasurePlan): string {
     // confirm re-shows the preview rather than going unmentioned.
     savedCopies: [...plan.savedCopies].sort(),
     filesNotDeleted: [...plan.filesNotDeleted].sort(),
+    // Never deleted, but shown to the owner: an event added between the
+    // preview and the confirm re-shows the preview.
+    calendarEventsKept: plan.calendarEventsKept
+      .map((e) => `${e.kind}\u0000${e.calendarId}\u0000${e.eventId}\u0000${e.start ?? ''}`)
+      .sort(),
     items: plan.items.map((item) => `${item.table}:${item.action}:${item.count}`).sort(),
     excluded: plan.excluded.map((k) => `${k.itemKind}:${k.itemId}`).sort(),
     refusals: plan.refusals.map((r) => `${r.kind}:${r.detail}`).sort(),
@@ -1969,10 +2050,24 @@ async function sendErasurePreview(
       anchorLabel: anchorLabelFor(anchor),
       plan,
       planHash: planFingerprint(plan),
+      timeZone: await charterTimeZone(businessId),
       prefill: prefillFor(anchor),
       ...(overrides.error === undefined ? {} : { error: overrides.error }),
     }),
   );
+}
+
+/**
+ * The charter's zone for showing times, or `null` when the charter cannot be
+ * read. `loadActiveCharter`, locally caught — never `probeActiveCharter`, which
+ * is reserved for the install path and the readiness report.
+ */
+async function charterTimeZone(businessId: string): Promise<string | null> {
+  try {
+    return (await loadActiveCharter(businessId))?.charter.identity.timezone ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -2902,6 +2997,7 @@ const DOCUMENT_CARD_POST_PATH = /^\/documents\/(DC-[^/]+)\/(approve|fix|address)
 const DECISION_PATH = /^\/a\/([^/]+)\/(approve|deny|sign)$/;
 const INSTRUCT_ANSWER_PATH = /^\/instruct\/([^/]+)\/answer$/;
 const INSTRUCT_CONFIRM_PATH = /^\/instruct\/([^/]+)\/confirm$/;
+const MEETING_MARK_PATH = /^\/meetings\/([^/]+)\/mark$/;
 const AUTONOMOUS_ACTION_MARK_PATH = /^\/autonomy\/actions\/([^/]+)\/([^/]+)\/mark$/;
 const OAUTH_START_PATH = /^\/oauth\/([^/]+)\/start$/;
 const OAUTH_REVOKE_PATH = /^\/oauth\/([^/]+)\/revoke$/;
@@ -2922,6 +3018,7 @@ async function route(
   oauthOptions: OAuthRouteOptions,
   setupOptions: SetupOptions = {},
   doorOptions: InstructionDoorOptions = {},
+  meetingOptions: MeetingRouteOptions = { credentialKeyPath: undefined },
 ): Promise<void> {
   const method = req.method ?? 'GET';
   const requestUrl = new URL(req.url ?? '/', 'http://dashboard.local');
@@ -3031,6 +3128,35 @@ async function route(
   }
   if (method === 'POST' && pathname === '/connections/mailbox/revert') {
     return handleMailboxRevertPost(res, businessId, session, await readFormBody(req));
+  }
+  // Connecting the business calendar: the same sign-then-connect order.
+  if (method === 'GET' && pathname === '/connections/calendar') {
+    return handleCalendarStatus(res, businessId, issueCsrfToken(session.sessionId));
+  }
+  if (method === 'GET' && pathname === '/connections/calendar/sign') {
+    return handleCalendarSignGet(res, businessId, issueCsrfToken(session.sessionId), requestUrl.searchParams, oauthOptions.credentialKeyPath);
+  }
+  if (method === 'POST' && pathname === '/connections/calendar/sign') {
+    return handleCalendarSignPost(res, businessId, session, await readFormBody(req), oauthOptions.credentialKeyPath);
+  }
+  if (method === 'POST' && pathname === '/connections/calendar/revert') {
+    return handleCalendarRevertPost(res, businessId, session, await readFormBody(req));
+  }
+  if (method === 'GET' && pathname === '/meetings/settings') {
+    return handleMeetingSettingsGet(res, businessId, session, requestUrl.searchParams, meetingOptions);
+  }
+  if (method === 'POST' && pathname === '/meetings/settings') {
+    return handleMeetingSettingsPost(res, businessId, session, await readFormBody(req), meetingOptions);
+  }
+  if (method === 'GET' && pathname === '/meetings') return handleMeetingsGet(res, businessId, session, meetingOptions);
+  if (method === 'POST' && pathname === '/meetings/new') {
+    return handleMeetingNewPost(res, businessId, session, await readFormBody(req), meetingOptions);
+  }
+  const meetingMarkMatch = MEETING_MARK_PATH.exec(pathname);
+  if (method === 'POST' && meetingMarkMatch?.[1] !== undefined) {
+    const meetingId = decodePathSegment(meetingMarkMatch[1]);
+    if (meetingId === null) return notFound(res);
+    return handleMeetingMarkPost(res, businessId, session, meetingId, await readFormBody(req), meetingOptions);
   }
   if (method === 'GET' && pathname === '/digest') return handleDigestGet(res, businessId, session);
   if (method === 'POST' && pathname === '/digest/settings')
@@ -3144,7 +3270,7 @@ async function route(
   const instructAnswerMatch = INSTRUCT_ANSWER_PATH.exec(pathname);
   if (method === 'POST' && instructAnswerMatch) {
     const jobId = instructAnswerMatch[1];
-    if (jobId !== undefined) return handleInstructAnswer(req, res, businessId, session, jobId);
+    if (jobId !== undefined) return handleInstructAnswer(req, res, businessId, session, jobId, doorOptions);
   }
 
   const instructConfirmMatch = INSTRUCT_CONFIRM_PATH.exec(pathname);
@@ -3244,12 +3370,18 @@ export function createServer(options: DashboardOptions = {}): Server {
       credentialKeyPath: oauthOptions.credentialKeyPath,
       ...(options.ruleProposer !== undefined ? { ruleProposer: options.ruleProposer } : {}),
     };
+    const meetingOptions: MeetingRouteOptions = {
+      credentialKeyPath: oauthOptions.credentialKeyPath,
+      ...(options.calendarCredentials !== undefined ? { calendarCredentials: options.calendarCredentials } : {}),
+      ...(options.calendarClient !== undefined ? { calendarClient: options.calendarClient } : {}),
+    };
     const doorOptions: InstructionDoorOptions = {
       production: options.production ?? productionToolsFromEnv(),
+      calendar: () => calendarWiring(meetingOptions),
       ...(options.planner !== undefined ? { planner: options.planner } : {}),
       ...(options.uploadMaxBytes !== undefined ? { uploadMaxBytes: options.uploadMaxBytes } : {}),
     };
-    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions, doorOptions).catch((err: unknown) => {
+    route(req, res, businessId, options.trustProxy ?? false, options.documentRoot, oauthOptions, setupOptions, doorOptions, meetingOptions).catch((err: unknown) => {
       console.error('dashboard request failed:', err instanceof Error ? err.message : err);
       if (!res.headersSent) {
         sendHtml(res, 500, renderServerError());

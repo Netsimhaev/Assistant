@@ -40,7 +40,20 @@ const KNOWN_FIELDS: readonly { key: string; name: string }[] = [
   { key: 'body', name: 'תוכן' },
   { key: 'amountMinor', name: 'סכום' },
   { key: 'inReplyTo', name: 'בתשובה ל' },
+  // calendar.write (calendar scheduling, Task 10). Values are still shown whole.
+  { key: 'operation', name: 'פעולה' },
+  { key: 'calendarId', name: 'יומן' },
+  { key: 'eventId', name: 'אירוע' },
+  { key: 'holdEventId', name: 'שמירת מקום' },
+  { key: 'title', name: 'כותרת' },
+  { key: 'start', name: 'התחלה' },
+  { key: 'end', name: 'סיום' },
+  { key: 'location', name: 'מיקום' },
+  { key: 'description', name: 'פרטים ללקוח' },
+  { key: 'attendees', name: 'משתתפים' },
 ];
+/** Multi-line known fields: every continuation line carries the fixed margin. */
+const BLOCK_KEYS: ReadonlySet<string> = new Set(['body', 'description']);
 const KNOWN_KEYS = new Set(KNOWN_FIELDS.map((f) => f.key));
 
 /** Fixed margin on every continuation line of a multi-line value. */
@@ -113,7 +126,7 @@ function renderKnown(key: string, value: unknown, currency: string): string {
   if (key === 'amountMinor' && typeof value === 'number' && Number.isSafeInteger(value)) {
     return formatMinor(value, currency);
   }
-  if (key === 'body' && typeof value === 'string') return blockValue(value);
+  if (BLOCK_KEYS.has(key) && typeof value === 'string') return blockValue(value);
   return renderValue(value);
 }
 
@@ -199,12 +212,15 @@ export function renderConfirmationQuestion(
     /** Steps of the original plan that completed and were dropped from this one; shown when > 0. */
     alreadyDone?: number;
     /**
-     * Per option (same order), what its ledger steps will record
-     * (`ledgerEchoForSteps`), or null. `renderStepEcho` hides read-only steps,
-     * and the ledger tools are read-only, so without this the owner would
-     * confirm a mixed plan without seeing what it writes to his ledger (T6).
+     * Per option (same order), an extra block shown right under the option's
+     * label and above its step echoes, or null. Two producers today: what an
+     * option's ledger steps will record (`ledgerEchoForSteps` — `renderStepEcho`
+     * hides read-only steps, and the ledger tools are read-only, so without
+     * this the owner would confirm a mixed plan without seeing what it writes
+     * to his ledger, T6), and a meeting plan's summary (`renderMeetingSummary`).
+     * An addition, never a replacement: every step echo is still rendered.
      */
-    ledgerEchoes?: readonly (string | null)[];
+    extraEchoes?: readonly (string | null)[];
   },
 ): { text: string } | { refused: string } {
   const multiple = options.length > 1;
@@ -213,8 +229,8 @@ export function renderConfirmationQuestion(
     const echoes = optionEchoes(option, opts.currency);
     if (!Array.isArray(echoes)) return echoes;
     const head = `${multiple ? `${index + 1}. ` : ''}${labelText(option.label)}${sourceMarker(option)}`;
-    const ledger = opts.ledgerEchoes?.[index] ?? null;
-    rendered.push([head, ...echoes, ...(ledger === null ? [] : [ledger])].join('\n'));
+    const extra = opts.extraEchoes?.[index] ?? null;
+    rendered.push([head, ...(extra === null ? [] : [extra]), ...echoes].join('\n'));
   }
 
   const parts: string[] = [];

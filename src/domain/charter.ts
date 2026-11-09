@@ -31,7 +31,7 @@ export const TimeOfDay = z
   .string()
   .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'expected HH:MM in 24-hour form');
 
-const IsoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD');
+export const IsoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD');
 
 /**
  * Can the runtime actually resolve this zone?
@@ -526,13 +526,17 @@ export const CharterSignature = z.object({
  * `src/charter/schema-version.test.ts` pins the membership of both such enums
  * against this version and fails with the remedy spelled out.
  *
+ * **Bumped to '1.3' — calendar.update.** `calendar.update` joined `ActionClass`
+ * (editing location/notes of an existing meeting); charters signed under 1.2
+ * declare one class fewer and must be re-signed.
+ *
  * What a bump costs, and why it is the honest price: a charter signed under
  * the old version must be **re-signed**, not reinterpreted. Filling the
  * missing class in with a restrictive default at read time would keep the
  * installation running, but it would also mean the code deciding, after the
  * fact, what a signed document says about an authority its owner never saw.
  */
-export const CURRENT_SCHEMA_VERSION = '1.2';
+export const CURRENT_SCHEMA_VERSION = '1.3';
 
 const BusinessCharterShape = z.object({
   schemaVersion: z.literal(CURRENT_SCHEMA_VERSION),
