@@ -13,7 +13,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { annotateAttachment, insertInvoice, linkAttachmentDocument, markOverCap, noteMailError, setCursor, settleMail } from '../mail/inbox-store.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { storedMail } from '../test/mailbox.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { installCharter } from '../charter/store.js';
@@ -386,9 +386,9 @@ describe('fix round 1', () => {
     );
     if (daysAgo > 0) {
       const db = getPool();
-      await db.query('ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update');
+      await testDb().query('ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update');
       await db.query("UPDATE audit_log SET at = now() - ($1 || ' days')::interval WHERE reason = 'mail_cursor_gap'", [String(daysAgo)]);
-      await db.query('ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update');
+      await testDb().query('ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update');
     }
   }
 

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import type { CharterConnection } from '../domain/connection.js';
@@ -788,7 +788,7 @@ describe('runInstruction', () => {
    * fails on the rejection instead of the assertions.
    */
   it('plans anyway when the contact read fails, and asks nothing', async () => {
-    await getPool().query('ALTER TABLE memories RENAME TO memories_hidden');
+    await testDb().query('ALTER TABLE memories RENAME TO memories_hidden');
     try {
       const outcome = await runInstruction(
         { text: 'תשיבי לרונית' },
@@ -807,7 +807,7 @@ describe('runInstruction', () => {
       // recognising something ambiguous.
       expect(outcome.identityNote).toBeNull();
     } finally {
-      await getPool().query('ALTER TABLE memories_hidden RENAME TO memories');
+      await testDb().query('ALTER TABLE memories_hidden RENAME TO memories');
     }
   });
 
@@ -816,7 +816,7 @@ describe('runInstruction', () => {
    * block when the read fails, rather than a stale or partial one.
    */
   it('hands the planner no memory block when the contact read fails', async () => {
-    await getPool().query('ALTER TABLE memories RENAME TO memories_hidden');
+    await testDb().query('ALTER TABLE memories RENAME TO memories_hidden');
     try {
       let seen: PlanRequest | undefined;
       const outcome = await runInstruction(
@@ -835,7 +835,7 @@ describe('runInstruction', () => {
       expect(outcome.status).toBe('needs_confirmation');
       expect(seen?.memoryBlock).toBeUndefined();
     } finally {
-      await getPool().query('ALTER TABLE memories_hidden RENAME TO memories');
+      await testDb().query('ALTER TABLE memories_hidden RENAME TO memories');
     }
   });
 });
@@ -1471,7 +1471,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
   });
 
   it('fails the job when the confirmation cannot be stored, and says so', async () => {
-    await getPool().query('ALTER TABLE instruction_confirmations RENAME TO instruction_confirmations_hidden');
+    await testDb().query('ALTER TABLE instruction_confirmations RENAME TO instruction_confirmations_hidden');
     try {
       const result = await runInstruction(
         { text: 'תשלחי ל-dana@example.com את ההצעה' },
@@ -1490,7 +1490,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
       // Never left parked in `plan` with no question anyone can answer.
       expect(jobs.rows[0]?.phase).toBe('failed');
     } finally {
-      await getPool().query('ALTER TABLE instruction_confirmations_hidden RENAME TO instruction_confirmations');
+      await testDb().query('ALTER TABLE instruction_confirmations_hidden RENAME TO instruction_confirmations');
     }
   });
 

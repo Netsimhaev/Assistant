@@ -10,7 +10,7 @@ import { AdapterRegistry } from '../orchestrator/adapters/registry.js';
 import { envCredentials } from '../orchestrator/credentials.js';
 import type { Runtime } from '../orchestrator/runtime.js';
 import { schedulerPass } from '../orchestrator/scheduler.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
 import { LEDGER_DEFAULTS, saveLedgerSettings } from './settings.js';
@@ -216,8 +216,7 @@ describe('schedulerPass ledger stages', () => {
   it('a real fault in both ledger stages is contained and the later stages still run', async () => {
     await installCharter(buildCharter({}), { businessId: B });
     await setModes('remind');
-    const pool = getPool();
-    await pool.query('ALTER TABLE ledger_items RENAME TO ledger_items_x');
+    await testDb().query('ALTER TABLE ledger_items RENAME TO ledger_items_x');
     try {
       const pass = await schedulerPass({ businessId: B, runtime: emptyRuntime(), now: NOW, inbox: null });
       expect(typeof pass.ledgerEvidenceError).toBe('string');
@@ -230,7 +229,7 @@ describe('schedulerPass ledger stages', () => {
       expect(pass.actionUpdatesError).toBeNull();
       expect(pass.verified).toBeDefined();
     } finally {
-      await pool.query('ALTER TABLE ledger_items_x RENAME TO ledger_items');
+      await testDb().query('ALTER TABLE ledger_items_x RENAME TO ledger_items');
     }
   });
 });

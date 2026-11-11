@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { appendAudit, queryAudit, verifyChain } from './log.js';
 import { GENESIS_HASH } from '../domain/audit.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -56,9 +56,9 @@ describe('hash-chained audit log', () => {
 
     // The append-only trigger blocks DELETE, so removal requires disabling it —
     // which is exactly the scenario the chain exists to make detectable.
-    await getPool().query('ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update');
+    await testDb().query('ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update');
     await getPool().query('DELETE FROM audit_log WHERE seq = $1', [middle.seq]);
-    await getPool().query('ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update');
+    await testDb().query('ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update');
 
     const verification = await verifyChain(BUSINESS, getPool());
     expect(verification.intact).toBe(false);
@@ -70,12 +70,12 @@ describe('hash-chained audit log', () => {
   it('detects an altered payload', async () => {
     await appendAudit(entry('original'), { businessId: BUSINESS });
 
-    await getPool().query('ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update');
+    await testDb().query('ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update');
     await getPool().query('UPDATE audit_log SET reason = $1 WHERE business_id = $2', [
       'tampered',
       BUSINESS,
     ]);
-    await getPool().query('ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update');
+    await testDb().query('ALTER TABLE audit_log ENABLE TRIGGER audit_log_no_update');
 
     const verification = await verifyChain(BUSINESS, getPool());
     expect(verification.intact).toBe(false);

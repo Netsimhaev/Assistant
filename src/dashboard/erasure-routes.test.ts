@@ -21,7 +21,7 @@ import type { Server } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
@@ -877,12 +877,12 @@ describe('the two ways a confirm ends other than cleanly', () => {
 
     let res: Response;
     try {
-      await getPool().query(
+      await testDb().query(
         `CREATE OR REPLACE FUNCTION erasure_audit_boom() RETURNS trigger AS $fn$
            BEGIN RAISE EXCEPTION 'audit unavailable'; END;
          $fn$ LANGUAGE plpgsql`,
       );
-      await getPool().query(
+      await testDb().query(
         `CREATE TRIGGER erasure_audit_boom BEFORE INSERT ON audit_log
            FOR EACH ROW EXECUTE FUNCTION erasure_audit_boom()`,
       );
@@ -897,8 +897,8 @@ describe('the two ways a confirm ends other than cleanly', () => {
         }),
       });
     } finally {
-      await getPool().query('DROP TRIGGER IF EXISTS erasure_audit_boom ON audit_log');
-      await getPool().query('DROP FUNCTION IF EXISTS erasure_audit_boom()');
+      await testDb().query('DROP TRIGGER IF EXISTS erasure_audit_boom ON audit_log');
+      await testDb().query('DROP FUNCTION IF EXISTS erasure_audit_boom()');
     }
 
     expect(res.status).toBe(200);

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool } from '../db/pool.js';
 import { queryAudit } from '../audit/log.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { activeScopes, KillSwitchAuditUnrecordedError, release, trip } from './killswitch.js';
 
 const BUSINESS = 'test-business';
@@ -26,7 +26,7 @@ afterAll(async () => {
 const FORCE_FAILURE = 'FORCE_AUDIT_FAILURE_SENTINEL';
 
 async function installAuditFailureTrigger(): Promise<void> {
-  await getPool().query(`
+  await testDb().query(`
     CREATE OR REPLACE FUNCTION test_force_audit_failure() RETURNS trigger AS $$
     BEGIN
       IF NEW.reason LIKE '%${FORCE_FAILURE}%' THEN
@@ -50,7 +50,7 @@ async function installAuditFailureTrigger(): Promise<void> {
 }
 
 async function removeAuditFailureTrigger(): Promise<void> {
-  await getPool().query(`
+  await testDb().query(`
     DROP TRIGGER IF EXISTS force_audit_failure ON audit_log;
     DROP FUNCTION IF EXISTS test_force_audit_failure();
   `);

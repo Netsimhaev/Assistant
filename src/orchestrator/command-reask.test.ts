@@ -9,7 +9,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withTransaction } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { saveInstruction } from '../governance/instructions.js';
@@ -753,7 +753,7 @@ describe('reaskFailedCommands', () => {
     const { jobId, bundle } = await seedCommand();
     await linkToWhatsApp(jobId);
     await timeOut(jobId, bundle);
-    await getPool().query(`
+    await testDb().query(`
       CREATE OR REPLACE FUNCTION reask_test_refuse_link() RETURNS trigger AS $$
       BEGIN
         IF NEW.whatsapp_message_id IS DISTINCT FROM OLD.whatsapp_message_id AND NEW.job_id <> '${jobId}' THEN
@@ -761,7 +761,7 @@ describe('reaskFailedCommands', () => {
         END IF;
         RETURN NEW;
       END $$ LANGUAGE plpgsql`);
-    await getPool().query(
+    await testDb().query(
       'CREATE TRIGGER reask_test_refuse_link BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION reask_test_refuse_link()',
     );
     try {
@@ -770,8 +770,8 @@ describe('reaskFailedCommands', () => {
       expect(result.errored.map((e) => e.jobId)).toEqual([jobId]);
       expect(await reasksOf(jobId)).toEqual([]);
     } finally {
-      await getPool().query('DROP TRIGGER reask_test_refuse_link ON jobs');
-      await getPool().query('DROP FUNCTION reask_test_refuse_link()');
+      await testDb().query('DROP TRIGGER reask_test_refuse_link ON jobs');
+      await testDb().query('DROP FUNCTION reask_test_refuse_link()');
     }
     // Nothing is lost: the next pass asks.
     const again = await reaskFailedCommands({ businessId: BUSINESS, messenger: fakeMessenger() });

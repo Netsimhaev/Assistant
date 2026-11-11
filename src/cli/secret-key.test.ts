@@ -9,7 +9,7 @@ import { closePool, getPool } from '../db/pool.js';
 import { putSecret, storedCredentials } from '../governance/credential-store.js';
 import { KEY_BYTES, MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
 import { encryptSecret } from '../governance/secret-cipher.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { RotationAuditUnrecordedError, runSecretKeyCli } from './secret-key.js';
 import type { SecretKeyCliDeps } from './secret-key.js';
 
@@ -395,7 +395,7 @@ describe('a rotation that committed says so even when its record does not', () =
     const oldKeyId = before[0]?.key_id;
     expect(oldKeyId).toBeDefined();
 
-    await getPool().query(
+    await testDb().query(
       `ALTER TABLE audit_log ADD CONSTRAINT tmp_reject_credential_change
          CHECK (kind <> 'credential_change') NOT VALID`,
     );
@@ -406,7 +406,7 @@ describe('a rotation that committed says so even when its record does not', () =
     } catch (error) {
       thrown = error;
     } finally {
-      await getPool().query('ALTER TABLE audit_log DROP CONSTRAINT tmp_reject_credential_change');
+      await testDb().query('ALTER TABLE audit_log DROP CONSTRAINT tmp_reject_credential_change');
     }
 
     // 1. The typed error, not the raw database error underneath it.

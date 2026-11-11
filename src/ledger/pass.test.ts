@@ -10,7 +10,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
 import { closePool, getPool } from '../db/pool.js';
 import type { LedgerItem } from '../domain/ledger.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { LEDGER_DEFAULTS, loadLedgerSettings, saveLedgerSettings, type LedgerSettings } from './settings.js';
@@ -342,7 +342,7 @@ describe('runLedgerPass', () => {
     const bad = await createLedgerItem(base({ description: 'רעה' }), { businessId: B, by: 'boss' });
     const good = await createLedgerItem(base({ description: 'טובה' }), { businessId: B, by: 'boss' });
     // A real DB failure on one item's claim, nothing stubbed in the pass.
-    await getPool().query(`
+    await testDb().query(`
       CREATE OR REPLACE FUNCTION test_ledger_reminder_boom() RETURNS trigger LANGUAGE plpgsql AS $$
       BEGIN
         IF NEW.item_id = '${bad.itemId}' THEN RAISE EXCEPTION 'boom for test'; END IF;
@@ -361,7 +361,7 @@ describe('runLedgerPass', () => {
       // The failed claim rolled back with its event.
       expect((await listLedgerEvents(bad.itemId, { businessId: B })).map((e) => e.kind)).toEqual(['created']);
     } finally {
-      await getPool().query(`DROP TRIGGER IF EXISTS test_ledger_reminder_boom ON ledger_reminders;
+      await testDb().query(`DROP TRIGGER IF EXISTS test_ledger_reminder_boom ON ledger_reminders;
         DROP FUNCTION IF EXISTS test_ledger_reminder_boom();`);
     }
   });

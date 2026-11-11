@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
@@ -848,7 +848,7 @@ describe('appendAudit failure after the delegation has already committed', () =>
    * `NEW.kind = 'delegation'` instead.
    */
   async function installDelegationAuditFailureTrigger(): Promise<void> {
-    await getPool().query(`
+    await testDb().query(`
       CREATE OR REPLACE FUNCTION test_force_delegation_audit_failure() RETURNS trigger AS $$
       BEGIN
         IF NEW.kind = 'delegation' THEN
@@ -866,7 +866,7 @@ describe('appendAudit failure after the delegation has already committed', () =>
   }
 
   async function removeDelegationAuditFailureTrigger(): Promise<void> {
-    await getPool().query('DROP TRIGGER IF EXISTS force_delegation_audit_failure ON audit_log');
+    await testDb().query('DROP TRIGGER IF EXISTS force_delegation_audit_failure ON audit_log');
   }
 
   afterEach(async () => {

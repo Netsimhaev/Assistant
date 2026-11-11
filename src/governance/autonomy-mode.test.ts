@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { loadAutonomyMode, rampBoundsForMode, setAutonomyMode } from './autonomy-mode.js';
 
 const BUSINESS = 'test-business';
@@ -66,7 +66,7 @@ describe('the owner dial', () => {
    * cannot throw — the same pattern `promote.test.ts` uses for `move()`.
    */
   it('does not move the dial when the audit entry cannot be written', async () => {
-    await getPool().query(`
+    await testDb().query(`
       CREATE OR REPLACE FUNCTION refuse_autonomy_mode_audit() RETURNS trigger AS $$
       BEGIN
         IF NEW.kind = 'autonomy_change' THEN
@@ -77,7 +77,7 @@ describe('the owner dial', () => {
       $$ LANGUAGE plpgsql
     `);
     try {
-      await getPool().query(`
+      await testDb().query(`
         CREATE TRIGGER refuse_autonomy_mode_audit_trigger
         BEFORE INSERT ON audit_log
         FOR EACH ROW EXECUTE FUNCTION refuse_autonomy_mode_audit()
@@ -90,10 +90,10 @@ describe('the owner dial', () => {
       // Nothing half-happened: the dial is still at its default.
       expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
     } finally {
-      await getPool().query(
+      await testDb().query(
         'DROP TRIGGER IF EXISTS refuse_autonomy_mode_audit_trigger ON audit_log',
       );
-      await getPool().query('DROP FUNCTION IF EXISTS refuse_autonomy_mode_audit()');
+      await testDb().query('DROP FUNCTION IF EXISTS refuse_autonomy_mode_audit()');
     }
 
     // Positive control: with the obstacle gone, the identical call moves it.
@@ -107,7 +107,7 @@ describe('the owner dial', () => {
    * constraint deliberately to prove the reader is defended on its own.
    */
   it('falls to off on a mode string this build does not know', async () => {
-    await getPool().query('ALTER TABLE autonomy_mode DROP CONSTRAINT autonomy_mode_known');
+    await testDb().query('ALTER TABLE autonomy_mode DROP CONSTRAINT autonomy_mode_known');
     try {
       await getPool().query(
         `INSERT INTO autonomy_mode (business_id, mode, updated_by) VALUES ($1, 'wide_open', 'x')`,
@@ -120,7 +120,7 @@ describe('the owner dial', () => {
       // test put there on purpose. Clean it up before restoring the
       // constraint, or the constraint can never come back.
       await getPool().query('DELETE FROM autonomy_mode WHERE business_id = $1', [BUSINESS]);
-      await getPool().query(
+      await testDb().query(
         `ALTER TABLE autonomy_mode ADD CONSTRAINT autonomy_mode_known
            CHECK (mode IN ('off', 'ask', 'learn'))`,
       );

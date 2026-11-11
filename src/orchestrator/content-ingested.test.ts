@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob, loadJob, markContentIngested } from './jobs.js';
@@ -67,7 +67,7 @@ describe('the content-ingested flag', () => {
     // fake, it is the real pre-migration insert path. Restored a few lines
     // down by re-running the migration file itself, which is the point: we
     // are proving what that file does to a row it did not create.
-    await getPool().query('ALTER TABLE jobs DROP COLUMN content_ingested');
+    await testDb().query('ALTER TABLE jobs DROP COLUMN content_ingested');
 
     // Everything from here until the migration file re-adds the column runs
     // inside try/finally: if any step throws, the column must still come
@@ -82,12 +82,12 @@ describe('the content-ingested flag', () => {
       await getPool().query('UPDATE jobs SET closed_at = now() WHERE job_id = $1', [closedJobId]);
 
       const sql = await readFile(MIGRATION_011, 'utf8');
-      await getPool().query(sql);
+      await testDb().query(sql);
 
       expect((await loadJob(openJobId, { businessId: BUSINESS }))?.contentIngested).toBe(true);
       expect((await loadJob(closedJobId, { businessId: BUSINESS }))?.contentIngested).toBe(false);
     } finally {
-      await getPool().query(
+      await testDb().query(
         'ALTER TABLE jobs ADD COLUMN IF NOT EXISTS content_ingested BOOLEAN NOT NULL DEFAULT false',
       );
     }

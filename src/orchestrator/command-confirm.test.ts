@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import type { Plan } from '../domain/plan.js';
@@ -824,13 +824,13 @@ describe('settleDecidedConfirmations', () => {
     await ask(fine, [SINGLE]);
     await cancelConfirmation(fine, 'owner', by);
 
-    await getPool().query(`
+    await testDb().query(`
       CREATE FUNCTION test_refuse_job_step() RETURNS trigger AS $$
       BEGIN
         IF NEW.job_id = '${broken}' THEN RAISE EXCEPTION 'refused for test'; END IF;
         RETURN NEW;
       END $$ LANGUAGE plpgsql`);
-    await getPool().query(
+    await testDb().query(
       'CREATE TRIGGER test_refuse_job_step BEFORE INSERT ON job_steps FOR EACH ROW EXECUTE FUNCTION test_refuse_job_step()',
     );
     try {
@@ -839,8 +839,8 @@ describe('settleDecidedConfirmations', () => {
       expect(result.errored.map((e) => e.jobId)).toEqual([broken]);
       expect(result.errored[0]?.error).toContain('refused for test');
     } finally {
-      await getPool().query('DROP TRIGGER test_refuse_job_step ON job_steps');
-      await getPool().query('DROP FUNCTION test_refuse_job_step()');
+      await testDb().query('DROP TRIGGER test_refuse_job_step ON job_steps');
+      await testDb().query('DROP FUNCTION test_refuse_job_step()');
     }
     expect(await phaseOf(fine)).toBe('closed');
     expect(await phaseOf(broken)).toBe('plan');

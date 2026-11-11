@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { config } from '../config.js';
+import { SafeLookupKey } from '../domain/charter.js';
 
 /**
  * Postgres returns BIGINT (oid 20) as a string by default to avoid silent
@@ -14,26 +15,170 @@ pg.types.setTypeParser(20, (value: string) => BigInt(value));
  * deliberate: anything that surfaces here is a decimal we must not float.
  */
 
-let pool: pg.Pool | undefined;
+const APP_POOL_DEFAULT_MAX = 10;
 
-export function getPool(): pg.Pool {
-  pool ??= new pg.Pool({
-    connectionString: config.databaseUrl,
-    max: 10,
+let pool: pg.Pool | undefined;
+let appPoolMax = APP_POOL_DEFAULT_MAX;
+let migratorPool: pg.Pool | undefined;
+
+function buildPool(connectionString: string, max: number): pg.Pool {
+  return new pg.Pool({
+    connectionString,
+    max,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
   });
+}
+
+/**
+ * The APPLICATION pool: logs in as a member of `assistant_app` — NOBYPASSRLS,
+ * owner of nothing. `withBusiness` checks out from this same pool.
+ *
+ * Kept for now; Task 12 deletes it from production code, at which point every
+ * query goes through `withBusiness`.
+ */
+export function getPool(): pg.Pool {
+  pool ??= buildPool(config.databaseUrl, appPoolMax);
   return pool;
 }
 
+/**
+ * The MIGRATOR pool — the role that owns every table. Migrations, `db:roles`
+ * and test seeding/teardown only (TRUNCATE, DDL, trigger toggles). Never a
+ * run-time path: a process that queries as the table owner is a process RLS
+ * does not apply to.
+ */
+export function getMigratorPool(): pg.Pool {
+  migratorPool ??= buildPool(config.databaseMigrateUrl, 4);
+  return migratorPool;
+}
+
 export async function closePool(): Promise<void> {
-  if (pool) {
-    await pool.end();
-    pool = undefined;
-  }
+  const open = [pool, migratorPool];
+  pool = undefined;
+  migratorPool = undefined;
+  await Promise.all(open.map((p) => p?.end()));
+}
+
+/**
+ * Test-only: rebuild the app pool with another `max`, so a test can prove the
+ * NEXT checkout of a connection is the very one that just errored (`max: 1`).
+ */
+export async function __setAppPoolMaxForTest(max: number): Promise<void> {
+  if (!config.isTest) throw new Error('__setAppPoolMaxForTest is test-only');
+  if (max === appPoolMax && pool !== undefined) return;
+  const old = pool;
+  pool = undefined;
+  appPoolMax = max;
+  await old?.end();
 }
 
 export type Queryable = Pick<pg.PoolClient, 'query'>;
+
+/**
+ * A connection scoped to one business. `app.business_id` is set on the
+ * session for as long as the caller holds it, and `app_business_id()` (what
+ * every RLS policy calls) returns it.
+ */
+export interface BusinessDb extends Queryable {
+  readonly businessId: string;
+  readonly inTransaction: boolean;
+}
+
+/** Global Constraints: `^[a-z0-9-]{3,63}$`, and a key that is safe as an object key. */
+const BUSINESS_ID_SHAPE = /^[a-z0-9-]{3,63}$/;
+
+export function isValidBusinessId(id: string): boolean {
+  return BUSINESS_ID_SHAPE.test(id) && SafeLookupKey.safeParse(id).success;
+}
+
+function assertBusinessId(id: string): void {
+  if (!isValidBusinessId(id)) {
+    // The id is not echoed: it may be whatever a caller passed in.
+    throw new Error('invalid business id — expected ^[a-z0-9-]{3,63}$');
+  }
+}
+
+function businessDb(client: pg.PoolClient, businessId: string, inTransaction: boolean): BusinessDb {
+  return {
+    businessId,
+    inTransaction,
+    query: client.query.bind(client) as Queryable['query'],
+  };
+}
+
+/**
+ * Run `fn` on one app-pool connection whose SESSION carries `businessId`.
+ *
+ * Session-level, never transaction-level (`set_config(..., false)`): code that
+ * holds a session advisory lock and queries outside a transaction must be
+ * covered too. In `finally` the setting is RESET before the connection goes
+ * back; a connection whose RESET fails is destroyed (`release(true)`), never
+ * returned — a pooled connection carrying business A that reaches a request
+ * for business B is exactly the leak the wall exists to prevent.
+ *
+ * The id is validated before the pool is touched.
+ */
+export async function withBusiness<T>(
+  businessId: string,
+  fn: (db: BusinessDb) => Promise<T>,
+): Promise<T> {
+  assertBusinessId(businessId);
+  const client = await getPool().connect();
+  let destroy = false;
+  try {
+    try {
+      await client.query("SELECT set_config('app.business_id', $1, false)", [businessId]);
+    } catch (error) {
+      destroy = true;
+      throw error;
+    }
+    return await fn(businessDb(client, businessId, false));
+  } finally {
+    if (!destroy) {
+      try {
+        await client.query('RESET app.business_id');
+      } catch {
+        // Aborted transaction, broken socket — either way the session may
+        // still carry the business. It must not be reused.
+        destroy = true;
+      }
+    }
+    client.release(destroy);
+  }
+}
+
+/**
+ * Run `fn` in a transaction on `db`. On a db already in a transaction it joins
+ * (runs `fn(db)`), so a throw anywhere rolls back the outermost one.
+ */
+export async function transaction<T>(
+  db: BusinessDb,
+  fn: (tx: BusinessDb) => Promise<T>,
+): Promise<T> {
+  if (db.inTransaction) return fn(db);
+  const tx: BusinessDb = { businessId: db.businessId, inTransaction: true, query: db.query };
+  await db.query('BEGIN');
+  try {
+    const result = await fn(tx);
+    await db.query('COMMIT');
+    return result;
+  } catch (error) {
+    await db.query('ROLLBACK').catch(() => {
+      // A failed rollback leaves the session in a transaction; `withBusiness`'s
+      // RESET then fails too and the connection is destroyed. The original
+      // error is the one worth propagating.
+    });
+    throw error;
+  }
+}
+
+export async function withBusinessTransaction<T>(
+  businessId: string,
+  fn: (tx: BusinessDb) => Promise<T>,
+): Promise<T> {
+  return withBusiness(businessId, (db) => transaction(db, fn));
+}
 
 /**
  * Run `fn` inside a transaction, rolling back on any throw.

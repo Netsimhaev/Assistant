@@ -13,7 +13,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter, type CharterOverrides } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
@@ -249,7 +249,7 @@ describe('each condition, flipped alone, falls to the normal path', () => {
     // cancelled row keeping its hash must still fall to the normal path.
     const s = await setup();
     const pool = getPool();
-    await pool.query(
+    await testDb().query(
       'ALTER TABLE instruction_confirmations DROP CONSTRAINT instruction_confirmations_chosen_iff_confirmed',
     );
     try {
@@ -260,7 +260,7 @@ describe('each condition, flipped alone, falls to the normal path', () => {
       await expectNormalPathDraftOnly(await evaluateToolCall('mail.send', SEND, s.ctx), s.jobId);
     } finally {
       await pool.query('DELETE FROM instruction_confirmations WHERE job_id = $1', [s.jobId]);
-      await pool.query(
+      await testDb().query(
         `ALTER TABLE instruction_confirmations ADD CONSTRAINT instruction_confirmations_chosen_iff_confirmed
            CHECK ((state = 'confirmed') = (chosen_plan_hash IS NOT NULL))`,
       );

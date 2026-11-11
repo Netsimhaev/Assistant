@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ulid } from 'ulid';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
@@ -94,7 +94,7 @@ async function insertProposal(proposalId: string, readingId: string, jobId: stri
  * for in it, but `kind` is exactly this row's discriminator.
  */
 async function installAuditFailureTrigger(): Promise<void> {
-  await getPool().query(`
+  await testDb().query(`
     CREATE OR REPLACE FUNCTION test_force_erasure_audit_failure() RETURNS trigger AS $$
     BEGIN
       IF NEW.kind = 'erasure' THEN
@@ -112,7 +112,7 @@ async function installAuditFailureTrigger(): Promise<void> {
 }
 
 async function removeAuditFailureTrigger(): Promise<void> {
-  await getPool().query(`
+  await testDb().query(`
     DROP TRIGGER IF EXISTS force_erasure_audit_failure ON audit_log;
     DROP FUNCTION IF EXISTS test_force_erasure_audit_failure();
   `);

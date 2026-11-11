@@ -17,6 +17,7 @@
     "test:watch": "vitest",
     "migrate": "tsx src/db/migrate.ts",
     "migrate:test": "tsx src/db/migrate.ts --test-db",
+    "db:roles": "tsx src/db/roles.ts",
     "sdk:know-reader": "tsx src/sdk/run-know-reader.ts",
     "sdk:read-document": "tsx src/sdk/run-read-document.ts",
     "sdk:propose": "tsx src/sdk/run-propose.ts",

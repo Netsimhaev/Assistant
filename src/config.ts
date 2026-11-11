@@ -49,13 +49,57 @@ function positiveInt(name: string, fallback: number): number {
 const isTest =
   process.env['NODE_ENV'] === 'test' || process.argv.includes('--test-db');
 
+/**
+ * The test-only logins. Fixed, public, and used ONLY when `isTest` — they
+ * exist so the suite runs as the real application role (a member of
+ * `assistant_app`, NOBYPASSRLS, owning nothing) instead of as the superuser
+ * in `TEST_DATABASE_URL`. Postgres roles are cluster-wide, so these names are
+ * deliberately distinct from any dev or production login: creating them never
+ * changes a password anyone else depends on.
+ */
+export const TEST_APP_USER = 'assistant_app_test';
+export const TEST_APP_PASSWORD = 'assistant-app-test-only';
+export const TEST_PLATFORM_USER = 'assistant_platform_test';
+export const TEST_PLATFORM_PASSWORD = 'assistant-platform-test-only';
+
+/** `TEST_DATABASE_URL` with another login, keeping host, port, database and params. */
+function withLogin(url: string, user: string, password: string): string {
+  const parsed = new URL(url);
+  parsed.username = user;
+  parsed.password = password;
+  return parsed.toString();
+}
+
+const testDatabaseUrl = isTest ? required('TEST_DATABASE_URL') : null;
+
 export const config = {
   isTest,
   /**
-   * Tests run against a separate database because they truncate between files.
-   * Pointing them at the dev database would silently destroy dev state.
+   * The APPLICATION login — a member of `assistant_app`, never the table
+   * owner, never BYPASSRLS. Tests run against a separate database because
+   * they truncate between files; pointing them at the dev database would
+   * silently destroy dev state. In tests the login is derived from
+   * `TEST_DATABASE_URL` (same host, port and database), so overriding that
+   * one variable moves all three pools together.
    */
-  databaseUrl: isTest ? required('TEST_DATABASE_URL') : required('DATABASE_URL'),
+  databaseUrl:
+    testDatabaseUrl !== null
+      ? withLogin(testDatabaseUrl, TEST_APP_USER, TEST_APP_PASSWORD)
+      : required('DATABASE_URL'),
+  /**
+   * The BYPASSRLS login, for the named cross-business operations only
+   * (`src/db/platform-pool.ts`). Required outside tests: a deploy that forgot
+   * it must not quietly reuse the app login for cross-business work.
+   */
+  databasePlatformUrl:
+    testDatabaseUrl !== null
+      ? withLogin(testDatabaseUrl, TEST_PLATFORM_USER, TEST_PLATFORM_PASSWORD)
+      : required('DATABASE_PLATFORM_URL'),
+  /**
+   * The migrator — owns every table, runs migrations and `db:roles`. Never
+   * used at run time. In tests it is `TEST_DATABASE_URL` itself, as before.
+   */
+  databaseMigrateUrl: testDatabaseUrl ?? required('DATABASE_MIGRATE_URL'),
   // Required, not defaulted. This key scopes the charter, the kill switch, the
   // spend ledger and the audit chain; a deploy that forgets it would run under
   // someone else's name and interleave two businesses' audit chains.

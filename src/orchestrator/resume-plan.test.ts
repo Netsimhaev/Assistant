@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -770,7 +770,7 @@ describe('the completion and the transition it belongs to are one write', () => 
     // cannot be written. If the completion were a second write after the
     // transition, the job would already be in `verify` — recorded as having
     // made progress it has no record of, and certain to re-run the step.
-    await getPool().query(`
+    await testDb().query(`
       CREATE FUNCTION refuse_step_result() RETURNS trigger AS $$
       BEGIN RAISE EXCEPTION 'injected failure'; END;
       $$ LANGUAGE plpgsql;
@@ -820,7 +820,7 @@ describe('the completion and the transition it belongs to are one write', () => 
       ]);
       expect(rows).toHaveLength(0);
     } finally {
-      await getPool().query(`
+      await testDb().query(`
         DROP TRIGGER refuse_step_result ON job_step_results;
         DROP FUNCTION refuse_step_result();
       `);

@@ -21,7 +21,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { decide, enqueueApproval } from '../governance/approvals.js';
@@ -656,7 +656,7 @@ describe('the evaluation pass', () => {
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
 
-    await getPool().query(`
+    await testDb().query(`
       CREATE OR REPLACE FUNCTION refuse_autonomy_audit() RETURNS trigger AS $$
       BEGIN
         IF NEW.kind = 'autonomy_change' THEN
@@ -667,7 +667,7 @@ describe('the evaluation pass', () => {
       $$ LANGUAGE plpgsql
     `);
     try {
-      await getPool().query(`
+      await testDb().query(`
         CREATE TRIGGER refuse_autonomy_audit_trigger
         BEFORE INSERT ON audit_log
         FOR EACH ROW EXECUTE FUNCTION refuse_autonomy_audit()
@@ -681,8 +681,8 @@ describe('the evaluation pass', () => {
       // And it is reported rather than swallowed.
       expect(blocked.errored).toContain('email.reply');
     } finally {
-      await getPool().query('DROP TRIGGER IF EXISTS refuse_autonomy_audit_trigger ON audit_log');
-      await getPool().query('DROP FUNCTION IF EXISTS refuse_autonomy_audit()');
+      await testDb().query('DROP TRIGGER IF EXISTS refuse_autonomy_audit_trigger ON audit_log');
+      await testDb().query('DROP FUNCTION IF EXISTS refuse_autonomy_audit()');
     }
 
     // Positive control: with the obstacle gone, the same evidence promotes.

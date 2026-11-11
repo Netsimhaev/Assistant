@@ -1,12 +1,12 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { closePool, getPool, withTransaction } from './pool.js';
+import { closePool, getMigratorPool } from './pool.js';
 
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), 'migrations');
 
 async function ensureMigrationsTable(): Promise<void> {
-  await getPool().query(`
+  await getMigratorPool().query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       name       TEXT PRIMARY KEY,
       applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -15,7 +15,7 @@ async function ensureMigrationsTable(): Promise<void> {
 }
 
 async function appliedMigrations(): Promise<Set<string>> {
-  const { rows } = await getPool().query<{ name: string }>(
+  const { rows } = await getMigratorPool().query<{ name: string }>(
     'SELECT name FROM schema_migrations',
   );
   return new Set(rows.map((row) => row.name));
@@ -34,10 +34,19 @@ export async function migrate(): Promise<string[]> {
     if (applied.has(file)) continue;
     const sql = await readFile(join(MIGRATIONS_DIR, file), 'utf8');
     // Each migration is one transaction: it applies whole or not at all.
-    await withTransaction(async (tx) => {
+    // On the MIGRATOR pool — the role that owns every table — never the app.
+    const tx = await getMigratorPool().connect();
+    try {
+      await tx.query('BEGIN');
       await tx.query(sql);
       await tx.query('INSERT INTO schema_migrations (name) VALUES ($1)', [file]);
-    });
+      await tx.query('COMMIT');
+    } catch (error) {
+      await tx.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      tx.release();
+    }
     ran.push(file);
   }
   return ran;
