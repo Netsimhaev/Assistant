@@ -9,7 +9,7 @@
  * business-scoped `replyTargetFor`, the same one `buildRuntime` wires.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../../db/pool.js';
+import { closePool, withBusiness } from '../../db/pool.js';
 import { replyTargetFor } from '../../mail/inbox-store.js';
 import { resetDatabase } from '../../test/db.js';
 import { fakeMailboxClient, storedMail } from '../../test/mailbox.js';
@@ -49,7 +49,10 @@ function call(input: unknown, businessId: string = BUSINESS): AdapterCall {
 }
 
 function adapterWith(client: ReturnType<typeof fakeMailboxClient>['client']) {
-  return createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client, replyTargets: replyTargetFor });
+  return createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client,
+    replyTargets: (businessId, internetMessageId, providerMessageId) =>
+      withBusiness(businessId, (db) => replyTargetFor(db, internetMessageId, providerMessageId)),
+  });
 }
 
 describe('mailbox adapter resolves an instruction reply from the stored mail', () => {

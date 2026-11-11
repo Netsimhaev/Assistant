@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   claimForReport, claimMessage, conversation, recordInbound, recordOutbound, settleMessage,
@@ -25,11 +25,11 @@ describe('whatsapp store', () => {
    * is not a control.
    */
   it('records an inbound message once, and returns null for a redelivery', async () => {
-    const first = await recordInbound({ ...base, providerMessageId: 'wamid.1' }, { businessId: BUSINESS });
+    const first = await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'wamid.1' }));
     expect(first).not.toBeNull();
-    const second = await recordInbound({ ...base, providerMessageId: 'wamid.1' }, { businessId: BUSINESS });
+    const second = await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'wamid.1' }));
     expect(second).toBeNull();
-    expect(await conversation({ businessId: BUSINESS })).toHaveLength(1);
+    expect(await withBusiness(BUSINESS, (db) => conversation(db))).toHaveLength(1);
   });
 
   /**
@@ -37,25 +37,25 @@ describe('whatsapp store', () => {
    * second email. Two concurrent claims on one row: exactly one wins.
    */
   it('lets exactly one caller claim a message', async () => {
-    const msg = await recordInbound({ ...base, providerMessageId: 'wamid.2' }, { businessId: BUSINESS });
+    const msg = await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'wamid.2' }));
     if (msg === null) throw new Error('unreachable');
     const [a, b] = await Promise.all([
-      claimMessage(msg.id, { businessId: BUSINESS }),
-      claimMessage(msg.id, { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => claimMessage(db, msg.id)),
+      withBusiness(BUSINESS, (db) => claimMessage(db, msg.id)),
     ]);
     expect([a, b].filter(Boolean)).toHaveLength(1);
   });
 
   it('hands out unclaimed inbound oldest first, and stops offering a claimed one', async () => {
-    await recordInbound({ ...base, providerMessageId: 'w.late', providerTimestamp: '2026-10-03T09:05:00.000Z' }, { businessId: BUSINESS });
-    const early = await recordInbound({ ...base, providerMessageId: 'w.early', providerTimestamp: '2026-10-03T09:01:00.000Z' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'w.late', providerTimestamp: '2026-10-03T09:05:00.000Z' }));
+    const early = await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'w.early', providerTimestamp: '2026-10-03T09:01:00.000Z' }));
     if (early === null) throw new Error('unreachable');
 
-    const queue = await unclaimedInbound({ businessId: BUSINESS });
+    const queue = await withBusiness(BUSINESS, (db) => unclaimedInbound(db));
     expect(queue.map((m) => m.providerMessageId)).toEqual(['w.early', 'w.late']);
 
-    await claimMessage(early.id, { businessId: BUSINESS });
-    expect((await unclaimedInbound({ businessId: BUSINESS })).map((m) => m.providerMessageId)).toEqual(['w.late']);
+    await withBusiness(BUSINESS, (db) => claimMessage(db, early.id));
+    expect((await withBusiness(BUSINESS, (db) => unclaimedInbound(db))).map((m) => m.providerMessageId)).toEqual(['w.late']);
   });
 
   it('settles a message with its transcript and job, and keeps outbound in the conversation', async () => {
@@ -66,16 +66,16 @@ describe('whatsapp store', () => {
     // the suite happens to run after 09:00 UTC on 2026-10-03 (fix round 1,
     // Minor 9).
     const past = new Date(Date.now() - 60_000).toISOString();
-    const msg = await recordInbound(
+    const msg = await withBusiness(BUSINESS, (db) => recordInbound(
+      db,
       { ...base, providerMessageId: 'w.3', body: null, mediaKind: 'audio', providerTimestamp: past },
-      { businessId: BUSINESS },
-    );
+    ));
     if (msg === null) throw new Error('unreachable');
-    await claimMessage(msg.id, { businessId: BUSINESS });
-    await settleMessage(msg.id, 'handled', { transcript: 'שלח לדנה', jobId: 'J-1' }, { businessId: BUSINESS });
-    await recordOutbound({ body: 'קיבלתי.', jobId: 'J-1' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => claimMessage(db, msg.id));
+    await withBusiness(BUSINESS, (db) => settleMessage(db, msg.id, 'handled', { transcript: 'שלח לדנה', jobId: 'J-1' }));
+    await withBusiness(BUSINESS, (db) => recordOutbound(db, { body: 'קיבלתי.', jobId: 'J-1' }));
 
-    const convo = await conversation({ businessId: BUSINESS });
+    const convo = await withBusiness(BUSINESS, (db) => conversation(db));
     expect(convo).toHaveLength(2);
     expect(convo[0]?.transcript).toBe('שלח לדנה');
     expect(convo[0]?.state).toBe('handled');
@@ -91,15 +91,15 @@ describe('whatsapp store', () => {
    */
   it('throws when settling an id that matches no row', async () => {
     await expect(
-      settleMessage('WA-does-not-exist', 'handled', {}, { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => settleMessage(db, 'WA-does-not-exist', 'handled', {})),
     ).rejects.toThrow();
   });
 
   /** One business must never read another's conversation. */
   it('confines every read to its own business', async () => {
-    await recordInbound({ ...base, providerMessageId: 'w.4' }, { businessId: BUSINESS });
-    expect(await conversation({ businessId: 'other-business' })).toEqual([]);
-    expect(await unclaimedInbound({ businessId: 'other-business' })).toEqual([]);
+    await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'w.4' }));
+    expect(await withBusiness('other-business', (db) => conversation(db))).toEqual([]);
+    expect(await withBusiness('other-business', (db) => unclaimedInbound(db))).toEqual([]);
   });
 });
 
@@ -126,63 +126,63 @@ describe('claimForReport', () => {
   }
 
   it('refuses to claim a message that has not been settled yet — still received or claimed', async () => {
-    const received = await recordInbound({ ...base, providerMessageId: 'w.5' }, { businessId: BUSINESS });
+    const received = await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'w.5' }));
     if (received === null) throw new Error('unreachable');
-    expect(await claimForReport(received.id, 'interim', { businessId: BUSINESS })).toBe(false);
-    expect(await claimForReport(received.id, 'terminal', { businessId: BUSINESS })).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, received.id, 'interim'))).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, received.id, 'terminal'))).toBe(false);
     expect(await stateOf(received.id)).toBe('received');
 
-    await claimMessage(received.id, { businessId: BUSINESS });
-    expect(await claimForReport(received.id, 'interim', { businessId: BUSINESS })).toBe(false);
-    expect(await claimForReport(received.id, 'terminal', { businessId: BUSINESS })).toBe(false);
+    await withBusiness(BUSINESS, (db) => claimMessage(db, received.id));
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, received.id, 'interim'))).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, received.id, 'terminal'))).toBe(false);
     expect(await stateOf(received.id)).toBe('claimed');
   });
 
   it('moves handled/failed to reported_interim on an interim claim, exactly once', async () => {
-    const msg = await recordInbound({ ...base, providerMessageId: 'w.6' }, { businessId: BUSINESS });
+    const msg = await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'w.6' }));
     if (msg === null) throw new Error('unreachable');
-    await claimMessage(msg.id, { businessId: BUSINESS });
-    await settleMessage(msg.id, 'handled', {}, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => claimMessage(db, msg.id));
+    await withBusiness(BUSINESS, (db) => settleMessage(db, msg.id, 'handled', {}));
 
-    expect(await claimForReport(msg.id, 'interim', { businessId: BUSINESS })).toBe(true);
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, msg.id, 'interim'))).toBe(true);
     expect(await stateOf(msg.id)).toBe('reported_interim');
 
     // Report-once for the interim notice itself: a second interim claim on
     // the same message must not succeed a second time.
-    expect(await claimForReport(msg.id, 'interim', { businessId: BUSINESS })).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, msg.id, 'interim'))).toBe(false);
     expect(await stateOf(msg.id)).toBe('reported_interim');
   });
 
   it('moves reported_interim to reported on a terminal claim — the owed second report', async () => {
-    const msg = await recordInbound({ ...base, providerMessageId: 'w.7' }, { businessId: BUSINESS });
+    const msg = await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'w.7' }));
     if (msg === null) throw new Error('unreachable');
-    await claimMessage(msg.id, { businessId: BUSINESS });
-    await settleMessage(msg.id, 'handled', {}, { businessId: BUSINESS });
-    await claimForReport(msg.id, 'interim', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => claimMessage(db, msg.id));
+    await withBusiness(BUSINESS, (db) => settleMessage(db, msg.id, 'handled', {}));
+    await withBusiness(BUSINESS, (db) => claimForReport(db, msg.id, 'interim'));
 
-    expect(await claimForReport(msg.id, 'terminal', { businessId: BUSINESS })).toBe(true);
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, msg.id, 'terminal'))).toBe(true);
     expect(await stateOf(msg.id)).toBe('reported');
   });
 
   it('moves handled/failed straight to reported on a terminal claim, skipping the interim state', async () => {
-    const msg = await recordInbound({ ...base, providerMessageId: 'w.8' }, { businessId: BUSINESS });
+    const msg = await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'w.8' }));
     if (msg === null) throw new Error('unreachable');
-    await claimMessage(msg.id, { businessId: BUSINESS });
-    await settleMessage(msg.id, 'failed', {}, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => claimMessage(db, msg.id));
+    await withBusiness(BUSINESS, (db) => settleMessage(db, msg.id, 'failed', {}));
 
-    expect(await claimForReport(msg.id, 'terminal', { businessId: BUSINESS })).toBe(true);
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, msg.id, 'terminal'))).toBe(true);
     expect(await stateOf(msg.id)).toBe('reported');
   });
 
   it('refuses every further claim once a message is reported — the final state', async () => {
-    const msg = await recordInbound({ ...base, providerMessageId: 'w.9' }, { businessId: BUSINESS });
+    const msg = await withBusiness(BUSINESS, (db) => recordInbound(db, { ...base, providerMessageId: 'w.9' }));
     if (msg === null) throw new Error('unreachable');
-    await claimMessage(msg.id, { businessId: BUSINESS });
-    await settleMessage(msg.id, 'handled', {}, { businessId: BUSINESS });
-    await claimForReport(msg.id, 'terminal', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => claimMessage(db, msg.id));
+    await withBusiness(BUSINESS, (db) => settleMessage(db, msg.id, 'handled', {}));
+    await withBusiness(BUSINESS, (db) => claimForReport(db, msg.id, 'terminal'));
 
-    expect(await claimForReport(msg.id, 'interim', { businessId: BUSINESS })).toBe(false);
-    expect(await claimForReport(msg.id, 'terminal', { businessId: BUSINESS })).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, msg.id, 'interim'))).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => claimForReport(db, msg.id, 'terminal'))).toBe(false);
     expect(await stateOf(msg.id)).toBe('reported');
   });
 });

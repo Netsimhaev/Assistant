@@ -275,10 +275,10 @@ describe('the planner never receives an instruction the owner did not write', ()
       ['ronit-cohen', 'רונית כהן', 'ronit@beta-log.example'],
       ['ronit-levi', 'רונית לוי', 'ronit.levi@gamma.example'],
     ] as const) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId: seed.jobId, kind: 'entity', subjectKey: key, body: { name, email } },
-        { businessId: BUSINESS },
-      );
+      ));
     }
 
     const requests: PlanRequest[] = [];

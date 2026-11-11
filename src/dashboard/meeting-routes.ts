@@ -134,11 +134,10 @@ export async function calendarWiring(
 async function listAccountCalendars(businessId: string, options: MeetingRouteOptions): Promise<Calendars> {
   const credentials = options.calendarCredentials ?? (await realCredentials(options.credentialKeyPath));
   if (credentials === null) return { listed: false, reason: NOT_CONNECTED };
-  const access = await resolveCalendarAccess({
-    businessId,
+  const access = await withBusiness(businessId, (db) => resolveCalendarAccess(db, { // TENANCY-TODO(task 10)
     runtime: { credentials },
     ...(options.calendarClient !== undefined ? { client: options.calendarClient } : {}),
-  });
+  }));
   if ('unavailable' in access) {
     return { listed: false, reason: access.unavailable === 'needs_reauth' ? NEEDS_REAUTH : access.unavailable === 'credential_error' ? CREDENTIAL_ERROR : NOT_CONNECTED };
   }
@@ -250,7 +249,7 @@ export async function handleMeetingSettingsGet(
   options: MeetingRouteOptions,
 ): Promise<void> {
   const [settings, calendars] = await Promise.all([
-    loadMeetingSettings({ businessId }),
+    withBusiness(businessId, (db) => loadMeetingSettings(db)), // TENANCY-TODO(task 10)
     listAccountCalendars(businessId, options),
   ]);
   html(
@@ -293,7 +292,7 @@ export async function handleMeetingSettingsPost(
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
 
-  const stored = await loadMeetingSettings({ businessId });
+  const stored = await withBusiness(businessId, (db) => loadMeetingSettings(db)); // TENANCY-TODO(task 10)
   const kindRaw = form.get('locationKind');
   const listedInForm = form.get('calendarsListed') === '1';
 
@@ -351,7 +350,7 @@ export async function handleMeetingSettingsPost(
     }
   }
 
-  const result = await saveMeetingSettings(submitted, { businessId });
+  const result = await withBusiness(businessId, (db) => saveMeetingSettings(db, submitted)); // TENANCY-TODO(task 10)
   if (!result.ok) return refuse(result.reason);
   seeOther(res, '/meetings/settings?saved=1');
 }
@@ -539,11 +538,10 @@ async function charterZone(businessId: string): Promise<{ timeZone: string; char
 async function loadTomorrow(businessId: string, timeZone: string, options: MeetingRouteOptions): Promise<Tomorrow> {
   const wiring = await calendarWiring(options);
   if (wiring === undefined) return { ok: false, reason: CALENDAR_NOT_CONNECTED_REPLY };
-  const access = await resolveCalendarAccess({
-    businessId,
+  const access = await withBusiness(businessId, (db) => resolveCalendarAccess(db, { // TENANCY-TODO(task 10)
     runtime: wiring.runtime,
     ...(wiring.client !== undefined ? { client: wiring.client } : {}),
-  });
+  }));
   if ('unavailable' in access) {
     return {
       ok: false,
@@ -559,18 +557,17 @@ async function loadTomorrow(businessId: string, timeZone: string, options: Meeti
   const tomorrow = addDaysIso(localParts(new Date(), timeZone).date, 1);
   const dayStart = localToInstant(tomorrow, '00:00', timeZone).getTime();
   const dayEnd = localToInstant(addDaysIso(tomorrow, 1), '00:00', timeZone).getTime();
-  const settings = await loadMeetingSettings({ businessId });
+  const settings = await withBusiness(businessId, (db) => loadMeetingSettings(db)); // TENANCY-TODO(task 10)
   let snapshot;
   try {
-    snapshot = await loadCalendarRange({
+    snapshot = await withBusiness(businessId, (db) => loadCalendarRange(db, { // TENANCY-TODO(task 10)
       access,
-      businessId,
       settings,
       timeZone,
       fromIso: new Date(dayStart).toISOString(),
       toIso: new Date(dayEnd).toISOString(),
       signal: AbortSignal.timeout(DAY_READ_TIMEOUT_MS),
-    });
+    }));
   } catch {
     return { ok: false, reason: CALENDAR_READ_FAILED_REPLY };
   }
@@ -586,10 +583,10 @@ async function loadTomorrow(businessId: string, timeZone: string, options: Meeti
     })
     .sort((a, b) => Date.parse(a.start) - Date.parse(b.start) || a.title.localeCompare(b.title));
 
-  const responses = await loadMeetingResponses(
-    businessId,
+  const responses = await withBusiness(businessId, (db) => loadMeetingResponses( // TENANCY-TODO(task 10)
+    db,
     events.map((e) => e.eventId),
-  );
+  ));
   const { rows: names } = await getPool().query<{ event_id: string; client_name: string }>(
     `SELECT DISTINCT ON (event_id) event_id, client_name FROM meetings
       WHERE business_id = $1 AND event_id = ANY($2::text[]) AND state IN ('proposed','active')

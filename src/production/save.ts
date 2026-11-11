@@ -58,7 +58,7 @@ import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, realpath, unlink, type FileHandle } from 'node:fs/promises';
 import { extname, isAbsolute, join, sep } from 'node:path';
 import { z } from 'zod';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { SafeLookupKey } from '../domain/charter.js';
 import type { DocumentKind } from '../domain/document-spec.js';
 import { documentKindLabel } from '../domain/labels.js';
@@ -342,19 +342,19 @@ function refuse(code: SaveFailureCode, he: string = SAVE_FAILURE_HE[code]): Step
  * every refusal; returns the absolute path that was written.
  */
 export async function runDocSave(
+  db: BusinessDb,
   input: DocSaveInput,
-  ctx: { jobId: string; businessId: string; documentRoot: string; db?: Queryable },
+  ctx: { jobId: string; documentRoot: string },
 ): Promise<{ performed: true; path: string }> {
-  const db = ctx.db ?? getPool();
   // The version must be the one the owner approved on the card that created
   // this delivery job (Task 14, carry (b)) — checked before any disk read.
-  const approved = await deliveryVersionOf(ctx.businessId, ctx.jobId, db);
+  const approved = await deliveryVersionOf(db, ctx.jobId);
   if (approved === null || approved !== input.producedVersionId) throw refuse('save_not_supported');
 
-  const settings = await loadDocumentSettings({ businessId: ctx.businessId, db });
+  const settings = await loadDocumentSettings({ businessId: db.businessId, db });
   if (settings.baseFolder === null) throw refuse('save_no_base_folder');
 
-  const version = await loadVersionFile(input.producedVersionId, ctx.businessId, db);
+  const version = await loadVersionFile(db, input.producedVersionId);
   if (version === null) throw refuse('save_not_found');
   if (version.sha256 !== input.sha256) throw refuse('save_hash_mismatch');
   // Exact, as for attachments: the name the owner confirmed is the name saved.
@@ -370,7 +370,7 @@ export async function runDocSave(
 
   const saved = await saveVersionToFolder(target.dir, target.name, read.bytes, version.sha256);
   if (!saved.ok) throw refuse(saved.code, saved.he);
-  await recordSavedPath(ctx, saved.path, db);
+  await recordSavedPath(db, ctx.jobId, saved.path);
   return { performed: true, path: saved.path };
 }
 
@@ -389,21 +389,17 @@ export async function runDocSave(
  * copy is missing from a later erasure preview. Logged — both a statement
  * that threw and one that matched no delivery row — so it is not silent.
  */
-async function recordSavedPath(
-  ctx: { jobId: string; businessId: string },
-  path: string,
-  db: Queryable,
-): Promise<void> {
+async function recordSavedPath(db: BusinessDb, jobId: string, path: string): Promise<void> {
   try {
     const { rowCount } = await db.query(
       `UPDATE document_deliveries SET saved_paths = array_append(saved_paths, $3)
         WHERE business_id = $1 AND job_id = $2`,
-      [ctx.businessId, ctx.jobId, path],
+      [db.businessId, jobId, path],
     );
     if ((rowCount ?? 0) === 0) {
-      console.error(`doc.save: the copy for job ${ctx.jobId} was written but no delivery row recorded its path`);
+      console.error(`doc.save: the copy for job ${jobId} was written but no delivery row recorded its path`);
     }
   } catch (err) {
-    console.error(`doc.save: the copy for job ${ctx.jobId} was written but its path was not recorded`, err);
+    console.error(`doc.save: the copy for job ${jobId} was written but its path was not recorded`, err);
   }
 }

@@ -15,7 +15,7 @@
  * saver writes all six keys.
  */
 import { monotonicFactory } from 'ulid';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { LedgerFamily, LedgerMode, type LedgerItem } from '../domain/ledger.js';
 import { domainMatches } from '../util/address.js';
 
@@ -113,14 +113,13 @@ function defaults(): LedgerSettings {
   };
 }
 
-export async function loadLedgerSettings(options: { businessId: string; db?: Queryable }): Promise<LedgerSettings> {
-  const db = options.db ?? getPool();
+export async function loadLedgerSettings(db: BusinessDb): Promise<LedgerSettings> {
   const { rows } = await db.query<SettingsRow>(
     `SELECT modes, to_whatsapp, to_email, to_screen, meeting_lead_minutes, meeting_lead_minutes_critical,
             due_lead_days_critical, nudge_after_business_days, checkin_every_days,
             checkin_every_days_critical, daily_hour
        FROM ledger_settings WHERE business_id = $1`,
-    [options.businessId],
+    [db.businessId],
   );
   const row = rows[0];
   return row === undefined ? defaults() : toSettings(row);
@@ -130,8 +129,9 @@ const inRange = (n: unknown, lo: number, hi: number): boolean =>
   typeof n === 'number' && Number.isInteger(n) && n >= lo && n <= hi;
 
 export async function saveLedgerSettings(
+  db: BusinessDb,
   s: LedgerSettings,
-  options: { businessId: string; updatedBy: string; db?: Queryable },
+  options: { updatedBy: string },
 ): Promise<void> {
   if (!(s.toWhatsApp || s.toEmail || s.toScreen)) throw new Error(NO_CHANNEL);
   if (s.modes.money_out === 'act') throw new Error(MONEY_OUT_ACT);
@@ -148,7 +148,6 @@ export async function saveLedgerSettings(
   if (!valid) throw new Error(BAD_VALUES);
 
   const modes = modesFrom(s.modes);
-  const db = options.db ?? getPool();
   await db.query(
     `INSERT INTO ledger_settings (business_id, modes, to_whatsapp, to_email, to_screen, meeting_lead_minutes,
         meeting_lead_minutes_critical, due_lead_days_critical, nudge_after_business_days, checkin_every_days,
@@ -169,7 +168,7 @@ export async function saveLedgerSettings(
            updated_at = now(),
            updated_by = EXCLUDED.updated_by`,
     [
-      options.businessId,
+      db.businessId,
       JSON.stringify(modes),
       s.toWhatsApp,
       s.toEmail,
@@ -219,12 +218,11 @@ function toRule(row: RuleRow): CriticalRule | null {
   return null;
 }
 
-export async function listCriticalRules(options: { businessId: string; db?: Queryable }): Promise<CriticalRule[]> {
-  const db = options.db ?? getPool();
+export async function listCriticalRules(db: BusinessDb): Promise<CriticalRule[]> {
   const { rows } = await db.query<RuleRow>(
     `SELECT rule_id, kind, family, amount_minor, match
        FROM ledger_critical_rules WHERE business_id = $1 ORDER BY rule_id`,
-    [options.businessId],
+    [db.businessId],
   );
   return rows.flatMap((r) => {
     const rule = toRule(r);
@@ -233,8 +231,9 @@ export async function listCriticalRules(options: { businessId: string; db?: Quer
 }
 
 export async function addCriticalRule(
+  db: BusinessDb,
   rule: NewCriticalRule,
-  options: { businessId: string; by: string; db?: Queryable },
+  options: { by: string },
 ): Promise<CriticalRule> {
   let family: LedgerFamily | null = null;
   let amountMinor: number | null = null;
@@ -253,25 +252,20 @@ export async function addCriticalRule(
     if (match === '') throw new Error('חובה להזין שם, כתובת או דומיין');
   }
   const ruleId = `LC-${ulid()}`;
-  const db = options.db ?? getPool();
   await db.query(
     `INSERT INTO ledger_critical_rules (rule_id, business_id, kind, family, amount_minor, match, created_by)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [ruleId, options.businessId, rule.kind, family, amountMinor, match, options.by],
+    [ruleId, db.businessId, rule.kind, family, amountMinor, match, options.by],
   );
   if (family !== null) return { ruleId, kind: 'family', family };
   if (amountMinor !== null) return { ruleId, kind: 'amount_over', amountMinor };
   return { ruleId, kind: 'counterparty', match: match ?? '' };
 }
 
-export async function removeCriticalRule(
-  ruleId: string,
-  options: { businessId: string; db?: Queryable },
-): Promise<void> {
-  const db = options.db ?? getPool();
+export async function removeCriticalRule(db: BusinessDb, ruleId: string): Promise<void> {
   await db.query(`DELETE FROM ledger_critical_rules WHERE rule_id = $1 AND business_id = $2`, [
     ruleId,
-    options.businessId,
+    db.businessId,
   ]);
 }
 

@@ -100,7 +100,8 @@ async function jobInExecute(bundle: PolicyBundle, provenance: TrustLevel = 'boss
  * against them.
  */
 async function linkToWhatsApp(jobId: string): Promise<{ messageId: string }> {
-  const message = await recordInbound(
+  const message = await withBusiness(BUSINESS, (db) => recordInbound(
+    db,
     {
       providerMessageId: `PM-${jobId}`,
       senderNumber: '+972500000000',
@@ -109,11 +110,10 @@ async function linkToWhatsApp(jobId: string): Promise<{ messageId: string }> {
       mediaKind: null,
       providerTimestamp: new Date().toISOString(),
     },
-    { businessId: BUSINESS },
-  );
+  ));
   if (message === null) throw new Error('setup: duplicate inbound message id');
   await withBusiness(BUSINESS, (db) => linkWhatsAppMessage(db, jobId, message.id));
-  await settleMessage(message.id, 'handled', {}, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => settleMessage(db, message.id, 'handled', {}));
   return { messageId: message.id };
 }
 

@@ -86,7 +86,7 @@
  * was — before anything downstream (the paid provider call, holding the
  * buffer any longer than necessary) happens.
  */
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { config } from '../config.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -248,11 +248,10 @@ const DAILY_CAP: Record<SenderKind, () => number> = {
  * why the kind filter is `whatsapp_transcription` specifically.
  */
 export async function whatsappTranscriptionsToday(
+  db: BusinessDb,
   senderKind: SenderKind,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<number> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM audit_log
       WHERE business_id = $1 AND kind = 'whatsapp_transcription' AND provenance = $2
@@ -263,10 +262,10 @@ export async function whatsappTranscriptionsToday(
 }
 
 export async function transcribeInbound(
+  db: BusinessDb,
   msg: NormalizedInboundMessage,
   senderKind: SenderKind,
   options: {
-    businessId: string;
     provider: TranscriptionProvider;
     maxSeconds?: number;
     /**
@@ -293,7 +292,7 @@ export async function transcribeInbound(
     downloadTimeoutMs?: number;
   },
 ): Promise<TranscribeOutcome> {
-  const { businessId, provider } = options;
+  const { provider } = options;
 
   if (msg.downloadAudio === undefined) {
     // A caller contract violation, not a property of the message — this
@@ -334,7 +333,7 @@ export async function transcribeInbound(
   }
 
   const perDay = DAILY_CAP[senderKind]();
-  const usedToday = await whatsappTranscriptionsToday(senderKind, { businessId });
+  const usedToday = await whatsappTranscriptionsToday(db, senderKind);
   if (usedToday >= perDay) {
     return { status: 'capped' };
   }
@@ -347,10 +346,10 @@ export async function transcribeInbound(
     );
     const text = result.text.trim();
     if (text === '') {
-      await recordAttempt(businessId, senderKind, { succeeded: false, seconds, textLength: 0 });
+      await recordAttempt(db, senderKind, { succeeded: false, seconds, textLength: 0 });
       return { status: 'failed', reason: CANNOT_UNDERSTAND };
     }
-    await recordAttempt(businessId, senderKind, { succeeded: true, seconds, textLength: text.length });
+    await recordAttempt(db, senderKind, { succeeded: true, seconds, textLength: text.length });
     return { status: 'transcribed', text };
   } catch {
     // The error itself is never recorded or surfaced — see the module
@@ -358,7 +357,7 @@ export async function transcribeInbound(
     // `whatsapp_transcription` entry on never carrying anything but counts
     // and the sender kind. An upstream error message (or a timeout message
     // naming nothing sensitive, but still just noise to a human) is neither.
-    await recordAttempt(businessId, senderKind, { succeeded: false, seconds, textLength: 0 });
+    await recordAttempt(db, senderKind, { succeeded: false, seconds, textLength: 0 });
     return { status: 'failed', reason: CANNOT_UNDERSTAND };
   }
 }
@@ -384,13 +383,13 @@ export async function transcribeInbound(
  * correct; the cost of not swallowing is losing the instruction outright.
  */
 async function recordAttempt(
-  businessId: string,
+  db: BusinessDb,
   senderKind: SenderKind,
   counts: { succeeded: boolean; seconds: number; textLength: number },
 ): Promise<void> {
   try {
-    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
-      bdb,
+    await appendAudit(
+      db,
       {
         actor: 'orchestrator',
         kind: 'whatsapp_transcription',
@@ -404,7 +403,7 @@ async function recordAttempt(
           ? `תמלול הודעת וואטסאפ · ${SENDER_LABEL[senderKind]} · הצליח · ${counts.seconds} שניות · ${counts.textLength} תווים`
           : `תמלול הודעת וואטסאפ · ${SENDER_LABEL[senderKind]} · נכשל · ${counts.seconds} שניות`,
       }
-    ));
+    );
   } catch {
     // Swallowed on purpose — see the docblock above.
   }

@@ -197,7 +197,7 @@ const NO_PLANNER = async (): Promise<PlanOutcome> => {
 };
 
 async function setup(): Promise<void> {
-  await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 5)
+  await withBusiness(BUSINESS, (bdb) => installCharter(
     bdb,
     buildCharter({ version: 'meeting-door', connections: [calendarConnection('google')] })
   ));
@@ -210,10 +210,10 @@ async function setup(): Promise<void> {
       lastOkAt: null,
       lastError: null,
     }, { by: 'test' }));
-  const saved = await saveMeetingSettings(
+  const saved = await withBusiness(BUSINESS, (db) => saveMeetingSettings(
+    db,
     { ...MEETING_DEFAULTS, locationKind: 'travel', workStart: '09:00', workEnd: '18:00', gapMinutes: 30 },
-    { businessId: BUSINESS },
-  );
+  ));
   expect(saved).toEqual({ ok: true });
 }
 
@@ -370,7 +370,7 @@ describe('runMeetingOperation through runInstruction', () => {
     expect(await withBusiness(BUSINESS, (db) => applyConfirmation(db, outcome.jobId, { kind: 'cancel' }, 'dashboard:owner'))).toBe(
       'cancelled',
     );
-    expect(await sweepHolds({ businessId: BUSINESS, runtime: { credentials: CREDENTIALS }, client: cal.client })).toEqual({
+    expect(await withBusiness(BUSINESS, (db) => sweepHolds(db, { runtime: { credentials: CREDENTIALS }, client: cal.client }))).toEqual({
       released: 1,
       failed: 0,
     });
@@ -575,7 +575,7 @@ describe('runMeetingOperation through runInstruction', () => {
   });
 
   it('a confirmed meeting runs under confirmedCommandCovers with the dial off', async () => {
-    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off'); // TENANCY-TODO(task 5)
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
     const day = workDay();
     const cal = fakeCalendar();
     const { extractor } = extractorOf({ status: 'extracted', request: createRequest(day, { email: 'dani@example.com' }) });
@@ -676,10 +676,10 @@ describe('runMeetingOperation — fix round 1', () => {
   });
 
   it('places the hold in the write calendar from the settings, not the primary', async () => {
-    const saved = await saveMeetingSettings(
+    const saved = await withBusiness(BUSINESS, (db) => saveMeetingSettings(
+      db,
       { ...MEETING_DEFAULTS, locationKind: 'travel', workStart: '09:00', workEnd: '18:00', writeCalendarId: 'team' },
-      { businessId: BUSINESS },
-    );
+    ));
     expect(saved).toEqual({ ok: true });
     const day = workDay();
     const cal = fakeCalendar([], { extraCalendars: ['team'] });

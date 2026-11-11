@@ -130,6 +130,7 @@ export async function recordCorrection(
   });
 
   await writeMemory(
+    db,
     {
       jobId: job.jobId,
       kind: 'preference',
@@ -138,7 +139,6 @@ export async function recordCorrection(
       body: { value: input.note },
       sourceRef: `סימון בדיעבד ${markId}`,
     },
-    { businessId, db },
   );
 
   return { markId, remembered: true };

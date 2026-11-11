@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { resolveSourceDocuments } from './source-resolver.js';
 
@@ -63,14 +63,14 @@ describe('resolveSourceDocuments', () => {
   it('one match resolves', async () => {
     const id = await doc('מחירון אלפא 2026.pdf');
     await doc('חוזה שכירות.docx');
-    const result = await resolveSourceDocuments(B, ['המחירון של אלפא'], [], getPool());
+    const result = await withBusiness(B, (db) => resolveSourceDocuments(db, ['המחירון של אלפא'], []));
     expect(result).toEqual({ resolved: [id], ambiguous: [], missing: [] });
   });
 
   it('two matches → ambiguous with 2 candidates', async () => {
     const a = await doc('מחירון 2025.pdf', { createdAt: '2026-09-01T10:00:00Z' });
     const b = await doc('מחירון 2026.pdf', { createdAt: '2026-10-01T10:00:00Z' });
-    const result = await resolveSourceDocuments(B, ['מחירון'], [], getPool());
+    const result = await withBusiness(B, (db) => resolveSourceDocuments(db, ['מחירון'], []));
     expect(result.resolved).toEqual([]);
     expect(result.missing).toEqual([]);
     expect(result.ambiguous).toHaveLength(1);
@@ -81,47 +81,47 @@ describe('resolveSourceDocuments', () => {
 
   it('shows at most three candidates', async () => {
     for (let i = 0; i < 5; i += 1) await doc(`הצעה ${i}.pdf`);
-    const result = await resolveSourceDocuments(B, ['הצעה'], [], getPool());
+    const result = await withBusiness(B, (db) => resolveSourceDocuments(db, ['הצעה'], []));
     expect(result.ambiguous[0]?.candidates).toHaveLength(3);
   });
 
   it('none → missing', async () => {
     await doc('חוזה שכירות.docx');
-    const result = await resolveSourceDocuments(B, ['מחירון'], [], getPool());
+    const result = await withBusiness(B, (db) => resolveSourceDocuments(db, ['מחירון'], []));
     expect(result).toEqual({ resolved: [], ambiguous: [], missing: ['מחירון'] });
   });
 
   it("another business's document never matches", async () => {
     await doc('מחירון אלפא.pdf', { business: OTHER });
     const other = await doc('מחירון בטא.pdf', { business: OTHER });
-    const result = await resolveSourceDocuments(B, ['מחירון'], [other], getPool());
+    const result = await withBusiness(B, (db) => resolveSourceDocuments(db, ['מחירון'], [other]));
     // The hint finds nothing here, and the explicit id of the other business
     // reads exactly like one that never existed.
     expect(result).toEqual({ resolved: [], ambiguous: [], missing: ['מחירון', other] });
     // Control: the same hint does resolve inside the other business.
-    expect((await resolveSourceDocuments(OTHER, ['מחירון'], [], getPool())).ambiguous).toHaveLength(1);
+    expect((await withBusiness(OTHER, (db) => resolveSourceDocuments(db, ['מחירון'], []))).ambiguous).toHaveLength(1);
   });
 
   it("matches the mail sender's domain and display name and the attachment type", async () => {
     const id = await doc('scan_0042.pdf');
     await mailWith(id, { address: 'billing@alpha-supply.co.il', name: 'אלפא אספקה' }, 'invoice');
     await doc('scan_0043.pdf');
-    expect((await resolveSourceDocuments(B, ['alpha-supply.co.il'], [], getPool())).resolved).toEqual([id]);
-    expect((await resolveSourceDocuments(B, ['החשבונית מאלפא'], [], getPool())).resolved).toEqual([id]);
-    const ambiguous = await resolveSourceDocuments(B, ['scan'], [], getPool());
+    expect((await withBusiness(B, (db) => resolveSourceDocuments(db, ['alpha-supply.co.il'], []))).resolved).toEqual([id]);
+    expect((await withBusiness(B, (db) => resolveSourceDocuments(db, ['החשבונית מאלפא'], []))).resolved).toEqual([id]);
+    const ambiguous = await withBusiness(B, (db) => resolveSourceDocuments(db, ['scan'], []));
     expect(ambiguous.ambiguous[0]?.candidates.find((c) => c.documentId === id)?.sender).toBe('אלפא אספקה');
   });
 
   it('matches a date', async () => {
     const id = await doc('דוח.pdf', { createdAt: '2026-10-05T09:00:00Z' });
     await doc('דוח.pdf', { createdAt: '2026-10-06T09:00:00Z' });
-    expect((await resolveSourceDocuments(B, ['הדוח מ-5/10'], [], getPool())).resolved).toEqual([id]);
+    expect((await withBusiness(B, (db) => resolveSourceDocuments(db, ['הדוח מ-5/10'], []))).resolved).toEqual([id]);
   });
 
   it('an explicit id of this business resolves; a rejected document never does', async () => {
     const id = await doc('a.pdf');
     const rejected = await doc('מחירון.pdf', { status: 'rejected' });
-    const result = await resolveSourceDocuments(B, ['מחירון'], [id, rejected], getPool());
+    const result = await withBusiness(B, (db) => resolveSourceDocuments(db, ['מחירון'], [id, rejected]));
     expect(result.resolved).toEqual([id]);
     expect(result.missing).toEqual(['מחירון', rejected]);
   });

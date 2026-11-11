@@ -163,7 +163,7 @@ describe('GET /meetings/settings', () => {
 describe('read set round trip', () => {
   it('shows no checkbox ticked for the default (all calendars) and keeps [] when saved as it stands', async () => {
     await bindCalendar();
-    await saveMeetingSettings({ ...MEETING_DEFAULTS, readCalendarIds: [], locationKind: 'travel' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => saveMeetingSettings(db, { ...MEETING_DEFAULTS, readCalendarIds: [], locationKind: 'travel' }));
     const baseUrl = await start(clientListing(CALENDARS));
     const cookie = await login(baseUrl);
     const html = await (await fetch(`${baseUrl}/meetings/settings`, { headers: { cookie } })).text();
@@ -171,15 +171,15 @@ describe('read set round trip', () => {
     expect(html).not.toMatch(/name="read"[^>]*checked/);
     const res = await post(baseUrl, cookie, baseFields(cookie, { calendarsListed: '1', write: 'primary-id' }));
     expect(res.status).toBe(303);
-    expect((await loadMeetingSettings({ businessId: BUSINESS })).readCalendarIds).toEqual([]);
+    expect((await withBusiness(BUSINESS, (db) => loadMeetingSettings(db))).readCalendarIds).toEqual([]);
   });
 
   it('round-trips an explicit selection unchanged', async () => {
     await bindCalendar();
-    await saveMeetingSettings(
+    await withBusiness(BUSINESS, (db) => saveMeetingSettings(
+      db,
       { ...MEETING_DEFAULTS, readCalendarIds: ['primary-id', 'family-id'], writeCalendarId: 'primary-id', locationKind: 'travel' },
-      { businessId: BUSINESS },
-    );
+    ));
     const baseUrl = await start(clientListing(CALENDARS));
     const cookie = await login(baseUrl);
     const html = await (await fetch(`${baseUrl}/meetings/settings`, { headers: { cookie } })).text();
@@ -192,7 +192,7 @@ describe('read set round trip', () => {
       ['read', 'family-id'],
     ]);
     expect(res.status).toBe(303);
-    const s = await loadMeetingSettings({ businessId: BUSINESS });
+    const s = await withBusiness(BUSINESS, (db) => loadMeetingSettings(db));
     expect(s.readCalendarIds).toEqual(['primary-id', 'family-id']);
     expect(s.writeCalendarId).toBe('primary-id');
   });
@@ -215,15 +215,15 @@ describe('credential failure', () => {
 
 describe('POST /meetings/settings', () => {
   it('saves the other fields when the calendar is not connected, keeping the stored calendar choice', async () => {
-    await saveMeetingSettings(
+    await withBusiness(BUSINESS, (db) => saveMeetingSettings(
+      db,
       { ...MEETING_DEFAULTS, readCalendarIds: ['family-id'], writeCalendarId: 'family-id', locationKind: 'travel' },
-      { businessId: BUSINESS },
-    );
+    ));
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const res = await post(baseUrl, cookie, baseFields(cookie, { gapMinutes: '45' }));
     expect(res.status).toBe(303);
-    const s = await loadMeetingSettings({ businessId: BUSINESS });
+    const s = await withBusiness(BUSINESS, (db) => loadMeetingSettings(db));
     expect(s.gapMinutes).toBe(45);
     expect(s.readCalendarIds).toEqual(['family-id']);
     expect(s.writeCalendarId).toBe('family-id');
@@ -239,7 +239,7 @@ describe('POST /meetings/settings', () => {
       ['read', 'family-id'],
     ]);
     expect(res.status).toBe(303);
-    const s = await loadMeetingSettings({ businessId: BUSINESS });
+    const s = await withBusiness(BUSINESS, (db) => loadMeetingSettings(db));
     expect(s.readCalendarIds).toEqual(['primary-id', 'family-id']);
     expect(s.writeCalendarId).toBe('primary-id');
   });
@@ -255,7 +255,7 @@ describe('POST /meetings/settings', () => {
     expect(unknown.status).toBe(400);
     const primaryUnread = await post(baseUrl, cookie, [...baseFields(cookie, { calendarsListed: '1', write: '' }), ['read', 'family-id']]);
     expect(primaryUnread.status).toBe(400);
-    expect((await loadMeetingSettings({ businessId: BUSINESS })).locationKind).toBeNull();
+    expect((await withBusiness(BUSINESS, (db) => loadMeetingSettings(db))).locationKind).toBeNull();
   });
 
   it('refuses in Hebrew without writing: bad CSRF, fixed without address, non-numbers', async () => {
@@ -268,7 +268,7 @@ describe('POST /meetings/settings', () => {
     const nan = await post(baseUrl, cookie, baseFields(cookie, { gapMinutes: '12abc' }));
     expect(nan.status).toBe(400);
     expect(await nan.text()).toContain('מספרים שלמים');
-    expect((await loadMeetingSettings({ businessId: BUSINESS })).locationKind).toBeNull();
+    expect((await withBusiness(BUSINESS, (db) => loadMeetingSettings(db))).locationKind).toBeNull();
   });
 });
 
@@ -341,10 +341,10 @@ function recordingCalendar(initial: CalendarEvent[] = []) {
 async function setupMeetings(): Promise<void> {
   await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'meetings-screen', connections: [calendarConnection('google')] }))); // TENANCY-TODO(task 10)
   await bindCalendar();
-  await saveMeetingSettings(
+  await withBusiness(BUSINESS, (db) => saveMeetingSettings(
+    db,
     { ...MEETING_DEFAULTS, locationKind: 'travel', workStart: '09:00', workEnd: '18:00', gapMinutes: 30 },
-    { businessId: BUSINESS },
-  );
+  ));
 }
 
 function meetingsPost(

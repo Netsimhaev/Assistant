@@ -270,7 +270,8 @@ async function aDocument(
   await mkdir(join(docRoot, businessId, documentId), { recursive: true });
   await writeFile(join(docRoot, rel), bytes);
   const sha256 = createHash('sha256').update(bytes).digest('hex');
-  await insertOrGetDocument(
+  await withBusiness(businessId, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -280,13 +281,13 @@ async function aDocument(
       byteSize: bytes.length,
       storedPath: rel,
     },
-    { businessId },
-  );
+  ));
   return { documentId, sha256 };
 }
 
 async function aReadingOf(documentId: string, businessId: string): Promise<string> {
-  const { record } = await saveReading(
+  const { record } = await withBusiness(businessId, (db) => saveReading(
+    db,
     {
       readingId: `RDG-${ulid()}`,
       documentId,
@@ -303,8 +304,7 @@ async function aReadingOf(documentId: string, businessId: string): Promise<strin
       promptVersion: 'v1',
       briefHash: ulid().padEnd(64, '0'),
     },
-    { businessId },
-  );
+  ));
   return record.readingId;
 }
 
@@ -351,7 +351,8 @@ async function aConductorRaisedApproval(
 ): Promise<{ approvalId: string; jobId: string }> {
   const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument(
+  await withBusiness(businessId, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -361,8 +362,7 @@ async function aConductorRaisedApproval(
       byteSize: 12,
       storedPath: `${businessId}/${documentId}/original.txt`,
     },
-    { businessId },
-  );
+  ));
   const readingId = await aReadingOf(documentId, businessId);
   return anApprovalForReading(businessId, bundle, readingId, MAILING_PROPOSAL);
 }
@@ -481,7 +481,8 @@ describe('GET /conversation', () => {
     const baseUrl = await startServer(BUSINESS);
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
-    await recordInbound(
+    await withBusiness(BUSINESS, (db) => recordInbound(
+      db,
       {
         providerMessageId: 'wamid.owner.1',
         senderNumber: '+972501111111',
@@ -490,11 +491,11 @@ describe('GET /conversation', () => {
         mediaKind: null,
         providerTimestamp: '2026-10-03T08:00:00.000Z',
       },
-      { businessId: BUSINESS },
-    );
+    ));
     // A bidi override in a stranger's own message, the same class
     // `conversation-view.test.ts` already proves `escLabel` strips.
-    await recordInbound(
+    await withBusiness(BUSINESS, (db) => recordInbound(
+      db,
       {
         providerMessageId: 'wamid.stranger.1',
         senderNumber: '+972509999999',
@@ -503,9 +504,8 @@ describe('GET /conversation', () => {
         mediaKind: null,
         providerTimestamp: '2026-10-03T08:05:00.000Z',
       },
-      { businessId: BUSINESS },
-    );
-    await recordOutbound({ body: 'קיבלתי, אני מטפלת בזה', jobId: null }, { businessId: BUSINESS });
+    ));
+    await withBusiness(BUSINESS, (db) => recordOutbound(db, { body: 'קיבלתי, אני מטפלת בזה', jobId: null }));
 
     const res = await fetch(`${baseUrl}/conversation`, { headers: { cookie } });
     expect(res.status).toBe(200);
@@ -627,7 +627,8 @@ describe('GET /readings', () => {
     // U+202E RIGHT-TO-LEFT OVERRIDE, exactly the payload
     // `document-for-approval`'s own bidi test uses.
     const originalName = 'invoice‮gpj.exe';
-    await insertOrGetDocument(
+    await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+      db,
       {
         documentId,
         source: 'manual',
@@ -637,10 +638,10 @@ describe('GET /readings', () => {
         byteSize: 10,
         storedPath: `${BUSINESS}/${documentId}/original.txt`,
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const { record } = await saveReading(
+    const { record } = await withBusiness(BUSINESS, (db) => saveReading(
+      db,
       {
         readingId: `RDG-${ulid()}`,
         documentId,
@@ -657,8 +658,7 @@ describe('GET /readings', () => {
         promptVersion: 'v1',
         briefHash: ulid().padEnd(64, '0'),
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const proposal: Proposal = {
       stance: 'advise_against',
@@ -1545,24 +1545,24 @@ describe('POST /instruct/:jobId/answer', () => {
       charterVersion: (await withBusiness(BUSINESS, async (db) => loadJob(db, jobId)))?.charterVersion ?? '',
       provenance: 'boss',
     }));
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-cohen-beta-log',
         body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
       },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-levi-gamma',
         body: { name: 'רונית לוי', company: 'גמא הרמה' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });

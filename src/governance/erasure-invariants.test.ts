@@ -210,10 +210,10 @@ describe('what an erasure leaves behind', () => {
        VALUES ('WA-unrelated-orphan', $1, 'wamid-unrelated-orphan', 'inbound', $2, 'other', $3, $4, now(), 'received', NULL)`,
       [BUSINESS, '+972500000000', 'מתי אפשר לקבוע תור לספר?', 'תמלול: מתי אפשר לקבוע תור לספר?'],
     );
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: job.jobId, kind: 'entity', subjectKey: PROBE, body: { email: PROBE } },
-      { businessId: BUSINESS },
-    );
+    ));
 
     // --- Migration 040's table. -------------------------------------------
     //
@@ -1055,10 +1055,10 @@ describe('what an erasure leaves behind', () => {
          VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
         [BUSINESS, job.jobId, identifier],
       );
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId: job.jobId, kind: 'entity', subjectKey: identifier, body: { email: identifier } },
-        { businessId: BUSINESS },
-      );
+      ));
       await getPool().query(
         `INSERT INTO whatsapp_messages
            (id, business_id, provider_message_id, direction, sender_number,
@@ -1329,10 +1329,10 @@ describe('what an erasure leaves behind', () => {
        VALUES ('WA-mail-card', $1, 'outbound', 'תשובה מוצעת: המחיר הוא 500', now(), 'handled', $2)`,
       [BUSINESS, replyJob],
     );
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: triageJob, kind: 'chunk', subjectKey: SENDER, body: { claim: 'שאלה על מחיר' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const plan = await buildErasurePlan({ kind: 'contact', identifier: NAME }, { businessId: BUSINESS });
     expect([...plan.jobIds].sort()).toEqual([triageJob, replyJob, failedReplyJob].sort());

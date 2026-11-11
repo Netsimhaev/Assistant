@@ -18,7 +18,7 @@
  * subjects may not appear at all — the block is filled in subject order, and
  * the character budget is the hard stop.
  */
-import { config } from '../config.js';
+import type { BusinessDb } from '../db/pool.js';
 import { recallMemories, MAX_RECALL, type MemoryRecord } from './store.js';
 
 export const MEMORY_BLOCK_BUDGET_CHARS = 3_000;
@@ -33,15 +33,15 @@ function renderRow(memory: MemoryRecord): string {
 }
 
 export async function recallForPlanning(
+  db: BusinessDb,
   subjects: string[],
-  options: { businessId?: string; budget?: number } = {},
+  options: { budget?: number } = {},
 ): Promise<string> {
-  const businessId = options.businessId ?? config.businessId;
   const budget = options.budget ?? MEMORY_BLOCK_BUDGET_CHARS;
 
   const found: MemoryRecord[] = [];
   for (const subject of subjects) {
-    found.push(...(await recallMemories({ subjectKey: subject, limit: MAX_RECALL }, { businessId })));
+    found.push(...(await recallMemories(db, { subjectKey: subject, limit: MAX_RECALL })));
   }
   if (found.length === 0) return '';
 

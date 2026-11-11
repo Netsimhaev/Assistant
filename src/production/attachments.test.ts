@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import {
   canonicalAttachmentName,
   resolveAttachments,
@@ -38,8 +38,7 @@ async function produced(
   opts: { businessId?: string; name?: string; recordSize?: number } = {},
 ): Promise<AttachmentRef> {
   const format = 'docx';
-  const productionId = await createProduction({
-    businessId: opts.businessId ?? B,
+  const productionId = await withBusiness(opts.businessId ?? B, (db) => createProduction(db, {
     originJobId: 'J-origin',
     instructionText: 'תכיני מכתב',
     textOrigin: 'typed',
@@ -48,19 +47,19 @@ async function produced(
     kind: 'letter',
     destination: { mode: 'save', folder: null },
     sourceDocumentIds: [],
-  });
+  }));
   const storedPath = `${DIR}/${productionId}.${format}`;
   await mkdir(join(config.documentRoot, DIR), { recursive: true });
   await writeFile(join(config.documentRoot, storedPath), bytes);
   const size = opts.recordSize ?? bytes.length;
-  const versionId = await saveVersion({
+  const versionId = await withBusiness(TEST_BUSINESS, (db) => saveVersion(db, {
     productionId,
     versionNo: 1,
     spec,
     storedPath,
     sha256: sha(bytes),
     sizeBytes: size,
-  });
+  }));
   return { producedVersionId: versionId, sha256: sha(bytes), filename: opts.name ?? 'הצעת מחיר.docx', sizeBytes: size };
 }
 
@@ -89,11 +88,11 @@ describe('resolveAttachments', () => {
       const storedPath = rows[0]!.stored_path;
       await rename(join(config.documentRoot, storedPath), join(otherRoot, storedPath));
 
-      const found = await resolveAttachments([ref], B, otherRoot);
+      const found = await withBusiness(B, (db) => resolveAttachments(db, [ref], otherRoot));
       expect(found.ok).toBe(true);
       if (found.ok) expect(found.files[0]?.bytes.equals(bytes)).toBe(true);
       // Control: the default root no longer holds it.
-      expect(await resolveAttachments([ref], B, config.documentRoot)).toMatchObject({ ok: false, code: 'attachment_not_found' });
+      expect(await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot))).toMatchObject({ ok: false, code: 'attachment_not_found' });
     } finally {
       await rm(otherRoot, { recursive: true, force: true });
     }
@@ -102,7 +101,7 @@ describe('resolveAttachments', () => {
   it('canonical name passes: exact bytes, the format MIME type, the name from the version spec', async () => {
     const bytes = Buffer.from('PK\x03\x04 docx bytes');
     const ref = await produced(bytes);
-    const result = await resolveAttachments([ref], B, config.documentRoot);
+    const result = await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot));
     expect(result).toEqual({
       ok: true,
       files: [
@@ -119,7 +118,7 @@ describe('resolveAttachments', () => {
     const bytes = Buffer.from('PK\x03\x04 docx bytes');
     for (const name of ['הצעה.pdf', 'הצעת מחיר', 'הצעת מחיר.DOCX', 'הצעת‮ מחיר.docx']) {
       const ref = await produced(bytes, { name });
-      const result = await resolveAttachments([ref], B, config.documentRoot);
+      const result = await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot));
       expect(result, name).toMatchObject({ ok: false, code: 'attachment_name_mismatch' });
       if (result.ok) throw new Error('unreachable');
       expect(result.he).toMatch(/שם/);
@@ -135,14 +134,14 @@ describe('resolveAttachments', () => {
     const bytes = Buffer.from('original bytes!!');
     const ref = await produced(bytes);
     // Control: unchanged, it resolves (so the refusal below is the hash check).
-    expect((await resolveAttachments([ref], B, config.documentRoot)).ok).toBe(true);
+    expect((await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot))).ok).toBe(true);
     // Same length, different bytes — the size check cannot catch it, only the hash.
     const { rows } = await getPool().query<{ stored_path: string }>(
       'SELECT stored_path FROM document_versions WHERE version_id = $1',
       [ref.producedVersionId],
     );
     await writeFile(join(config.documentRoot, rows[0]!.stored_path), Buffer.from('tampered bytes!!'));
-    const result = await resolveAttachments([ref], B, config.documentRoot);
+    const result = await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot));
     expect(result).toMatchObject({ ok: false, code: 'attachment_hash_mismatch' });
     if (result.ok) throw new Error('unreachable');
     expect(result.he).toMatch(/השתנה/);
@@ -150,29 +149,29 @@ describe('resolveAttachments', () => {
 
   it('a ref whose sha or size disagrees with the row → attachment_hash_mismatch', async () => {
     const ref = await produced(Buffer.from('abc'));
-    expect((await resolveAttachments([{ ...ref, sha256: 'a'.repeat(64) }], B, config.documentRoot)).ok).toBe(false);
-    expect(await resolveAttachments([{ ...ref, sizeBytes: 4 }], B, config.documentRoot)).toMatchObject({
+    expect((await withBusiness(B, (db) => resolveAttachments(db, [{ ...ref, sha256: 'a'.repeat(64) }], config.documentRoot))).ok).toBe(false);
+    expect(await withBusiness(B, (db) => resolveAttachments(db, [{ ...ref, sizeBytes: 4 }], config.documentRoot))).toMatchObject({
       ok: false,
       code: 'attachment_hash_mismatch',
     });
-    expect((await resolveAttachments([ref], B, config.documentRoot)).ok).toBe(true);
+    expect((await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot))).ok).toBe(true);
   });
 
   it('a version id from another business → attachment_not_found', async () => {
     const ref = await produced(Buffer.from('other business file'), { businessId: OTHER });
     // Control: its own business resolves it.
-    expect((await resolveAttachments([ref], OTHER, config.documentRoot)).ok).toBe(true);
-    expect(await resolveAttachments([ref], B, config.documentRoot)).toMatchObject({ ok: false, code: 'attachment_not_found' });
+    expect((await withBusiness(OTHER, (db) => resolveAttachments(db, [ref], config.documentRoot))).ok).toBe(true);
+    expect(await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot))).toMatchObject({ ok: false, code: 'attachment_not_found' });
   });
 
   it('an unknown id or a missing file → attachment_not_found', async () => {
     const ref = await produced(Buffer.from('xyz'));
-    expect(await resolveAttachments([{ ...ref, producedVersionId: 'DV-nope-1' }], B, config.documentRoot)).toMatchObject({
+    expect(await withBusiness(B, (db) => resolveAttachments(db, [{ ...ref, producedVersionId: 'DV-nope-1' }], config.documentRoot))).toMatchObject({
       ok: false,
       code: 'attachment_not_found',
     });
     await rm(join(config.documentRoot, DIR), { recursive: true, force: true });
-    expect(await resolveAttachments([ref], B, config.documentRoot)).toMatchObject({ ok: false, code: 'attachment_not_found' });
+    expect(await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot))).toMatchObject({ ok: false, code: 'attachment_not_found' });
   });
 
   it('a stored path escaping the document root → attachment_not_found, the file is never read', async () => {
@@ -181,7 +180,7 @@ describe('resolveAttachments', () => {
       '../outside.docx',
       ref.producedVersionId,
     ]);
-    expect(await resolveAttachments([ref], B, config.documentRoot)).toMatchObject({ ok: false, code: 'attachment_not_found' });
+    expect(await withBusiness(B, (db) => resolveAttachments(db, [ref], config.documentRoot))).toMatchObject({ ok: false, code: 'attachment_not_found' });
   });
 
   it('25MB total → attachment_too_large, before any file is opened', async () => {
@@ -189,9 +188,9 @@ describe('resolveAttachments', () => {
     // be the total computed from the rows.
     const a = await produced(Buffer.from('a'), { recordSize: 12.5 * 1024 * 1024 });
     const b = await produced(Buffer.from('b'), { recordSize: 12.5 * 1024 * 1024 });
-    expect(await resolveAttachments([a, b], B, config.documentRoot)).toMatchObject({ ok: false, code: 'attachment_too_large' });
+    expect(await withBusiness(B, (db) => resolveAttachments(db, [a, b], config.documentRoot))).toMatchObject({ ok: false, code: 'attachment_too_large' });
     // Control: one of them alone passes the cap and reaches the file check.
-    expect(await resolveAttachments([a], B, config.documentRoot)).toMatchObject({ ok: false, code: 'attachment_hash_mismatch' });
+    expect(await withBusiness(B, (db) => resolveAttachments(db, [a], config.documentRoot))).toMatchObject({ ok: false, code: 'attachment_hash_mismatch' });
   });
 });
 

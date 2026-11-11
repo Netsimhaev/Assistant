@@ -395,7 +395,8 @@ describe('runInstruction', () => {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
     }));
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'preference',
@@ -403,8 +404,7 @@ describe('runInstruction', () => {
         attribute: 'ערוץ מועדף',
         body: { value: 'טלפון' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const captured: { request: PlanRequest | null } = { request: null };
     const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית בכתובת ronit@beta-log.example' }, {
@@ -437,32 +437,32 @@ describe('runInstruction', () => {
     // uses for this exact pair — a single-word name would collide with itself
     // in `namePartsOf` (full name === its only part) and is not this test's
     // concern.
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-cohen-beta-log',
         body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
       },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-levi-gamma',
         body: { name: 'רונית לוי', company: 'גמא הרמה' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
     for (const [key, name, company] of [
       ['ronit-mizrahi-delta', 'רונית מזרחי', 'דלתא דפוס'],
       ['ronit-peretz-omega', 'רונית פרץ', 'אומגה שיווק'],
     ] as const) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId: seedJob.jobId, kind: 'entity', subjectKey: key, body: { name, company } },
-        { businessId: BUSINESS },
-      );
+      ));
     }
 
     const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית' }, {
@@ -501,24 +501,24 @@ describe('runInstruction', () => {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
     }));
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-cohen-nodetail',
         body: { name: 'רונית כהן' },
       },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-levi-nodetail',
         body: { name: 'רונית לוי' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית' }, {
         textOrigin: 'typed',
@@ -547,16 +547,17 @@ describe('runInstruction', () => {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
     }));
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-cohen-beta-log',
         body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה', email: 'ronit@beta-log.example' },
       },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'preference',
@@ -564,8 +565,7 @@ describe('runInstruction', () => {
         attribute: 'ערוץ מועדף',
         body: { value: 'טלפון' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     let seen: PlanRequest | undefined;
     const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית' }, {
@@ -596,24 +596,24 @@ describe('runInstruction', () => {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
     }));
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-cohen-beta-log',
         body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
       },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-levi-gamma',
         body: { name: 'רונית לוי', company: 'גמא הרמה' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית\n\nאני לא זוכר' }, {
         textOrigin: 'typed',
@@ -639,24 +639,24 @@ describe('runInstruction', () => {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
     }));
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-cohen-beta-log',
         body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
       },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-levi-gamma',
         body: { name: 'רונית לוי', company: 'גמא הרמה' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const outcome = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תשיבי לרונית\n\nאני לא זוכר' }, {
         textOrigin: 'typed',
@@ -778,24 +778,24 @@ describe('saying she went ahead without the memory when the planner asks too', (
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
     }));
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-cohen-beta-log',
         body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
       },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-levi-gamma',
         body: { name: 'רונית לוי', company: 'גמא הרמה' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
   }
 
   async function seedTwoMoreRonits(): Promise<void> {
@@ -809,10 +809,10 @@ describe('saying she went ahead without the memory when the planner asks too', (
       ['ronit-mizrahi-delta', 'רונית מזרחי', 'דלתא דפוס'],
       ['ronit-peretz-omega', 'רונית פרץ', 'אומגה שיווק'],
     ] as const) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId: seedJob.jobId, kind: 'entity', subjectKey: key, body: { name, company } },
-        { businessId: BUSINESS },
-      );
+      ));
     }
   }
 
@@ -1028,7 +1028,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     subjectKey: string,
     body: Record<string, string>,
   ): Promise<void> {
-    await writeMemory({ jobId, kind: 'entity', subjectKey, body }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => writeMemory(db, { jobId, kind: 'entity', subjectKey, body }));
   }
 
   /** Two people called רונית, each with an address — distinguishable, so both are planned. */
@@ -1430,15 +1430,16 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     it('hands the planner the open ledger items AFTER the memory block, to every planner call', async () => {
       const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
       const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: active!.charter.charterVersion, provenance: 'boss', title: 't' }));
-      const existing = await createLedgerItem(
+      const existing = await withBusiness(BUSINESS, (db) => createLedgerItem(
+        db,
         {
           family: 'money_in', description: 'פנקס קיים', dueAt: null, dueIsDateOnly: true, importance: 'normal',
           importanceManual: false, counterpartyName: null, counterpartyEmail: null, counterpartyEmailVerified: false,
           counterpartyDomain: null, reference: null, amountMinor: null, stages: [], proposedStages: null,
           originJobId: job.jobId,
         },
-        { businessId: BUSINESS, by: 'test' },
-      );
+        { by: 'test' },
+      ));
 
       const seen: PlanRequest[] = [];
       const result = await withBusiness(BUSINESS, (db) => runInstruction(db, { text: 'תרשמי חשבונית עבור dana@example.com' }, {
@@ -1480,15 +1481,16 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     async function anItem(description: string): Promise<string> {
       const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
       const job = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: active!.charter.charterVersion, provenance: 'boss', title: 't' }));
-      const created = await createLedgerItem(
+      const created = await withBusiness(BUSINESS, (db) => createLedgerItem(
+        db,
         {
           family: 'awaiting_reply', description, dueAt: null, dueIsDateOnly: false, importance: 'normal',
           importanceManual: false, counterpartyName: null, counterpartyEmail: null, counterpartyEmailVerified: false,
           counterpartyDomain: null, reference: null, amountMinor: null, stages: [], proposedStages: null,
           originJobId: job.jobId,
         },
-        { businessId: BUSINESS, by: 'test' },
-      );
+        { by: 'test' },
+      ));
       return created.itemId;
     }
 

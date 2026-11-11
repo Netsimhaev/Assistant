@@ -87,11 +87,12 @@ describe('GET /memory', () => {
     const boss = await jobWithProvenance('boss');
     const external = await jobWithProvenance('unknown_external');
 
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: boss.jobId, kind: 'preference', subjectKey: 'general', attribute: 'currency', body: { value: 'ILS' } },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: external.jobId,
         kind: 'chunk',
@@ -99,8 +100,7 @@ describe('GET /memory', () => {
         body: { text: `הלקוח החדש הוא ${RONIT}` },
         sourceRef: 'DOC-999',
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
@@ -133,7 +133,8 @@ describe('GET /memory', () => {
     const hostileSubject = 'ronit‮gpj.exe';
     const hostileSource = 'DOC-‮gpj.exe';
     const hostileBody = 'invoice‮gpj.exe';
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: boss.jobId,
         kind: 'entity',
@@ -141,12 +142,11 @@ describe('GET /memory', () => {
         body: {},
         sourceRef: hostileSource,
       },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: external.jobId, kind: 'chunk', subjectKey: 'attachment', body: { text: hostileBody } },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);

@@ -95,7 +95,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { loadActiveCharter, type ActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { renderArtifactFull } from '../documents/brief.js';
 import { loadArtifacts } from '../documents/store.js';
@@ -202,7 +202,6 @@ export interface ProductionFinished {
 }
 
 export interface RunProductionsOptions {
-  businessId?: string;
   /** Fixed instant for "today" and the cap's local midnight (tests). */
   now?: Date;
   budgetMs?: number;
@@ -227,7 +226,6 @@ export interface RunProductionsOptions {
   deadlines?: Partial<StageDeadlines>;
   /** Test seam: a throw here simulates a crash at that point. */
   checkpoint?: (event: CheckpointEvent, productionId: string) => Promise<void> | void;
-  db?: Queryable;
 }
 
 export type CheckpointEvent = 'version_saved' | 'check1_saved' | 'check2_saved';
@@ -292,16 +290,16 @@ interface LoadedSources {
   grounding: GroundingSources;
 }
 
-async function loadSources(p: Production, memoryIds: readonly string[], db: Queryable): Promise<LoadedSources> {
+async function loadSources(p: Production, memoryIds: readonly string[], db: BusinessDb): Promise<LoadedSources> {
   const fenced: FencedSource[] = [];
   if (p.sourceDocumentIds.length > 0) {
     const { rows } = await db.query<{ document_id: string }>(
       `SELECT document_id FROM documents WHERE business_id = $1 AND document_id = ANY($2::text[])
         ORDER BY array_position($2::text[], document_id)`,
-      [p.businessId, p.sourceDocumentIds],
+      [db.businessId, p.sourceDocumentIds],
     );
     for (const row of rows) {
-      const artifacts = await loadArtifacts(row.document_id, { businessId: p.businessId, db });
+      const artifacts = await loadArtifacts(db, row.document_id);
       fenced.push({
         documentId: row.document_id,
         provenance: sourceProvenance(p, row.document_id),
@@ -315,7 +313,7 @@ async function loadSources(p: Production, memoryIds: readonly string[], db: Quer
       `SELECT memory_id, body, provenance FROM memories
         WHERE business_id = $1 AND memory_id = ANY($2::text[])
         ORDER BY array_position($2::text[], memory_id)`,
-      [p.businessId, [...memoryIds]],
+      [db.businessId, [...memoryIds]],
     );
     for (const row of rows) memories.push({ memoryId: row.memory_id, body: memoryText(row.body), provenance: row.provenance });
   }
@@ -331,11 +329,11 @@ async function loadSources(p: Production, memoryIds: readonly string[], db: Quer
 }
 
 /** Positive scope: memories about the people this production is addressed to, nothing else. */
-async function recallFor(p: Production, db: Queryable): Promise<string[]> {
+async function recallFor(p: Production, db: BusinessDb): Promise<string[]> {
   if (p.destination.mode !== 'send') return [];
   const ids: string[] = [];
   for (const to of p.destination.to) {
-    for (const m of await recallMemories({ subjectKey: to.toLowerCase(), limit: 20 }, { businessId: p.businessId, db })) {
+    for (const m of await recallMemories(db, { subjectKey: to.toLowerCase(), limit: 20 })) {
       if (!ids.includes(m.memoryId)) ids.push(m.memoryId);
     }
   }
@@ -370,8 +368,7 @@ export function flaggedPagesOf(findings: readonly { where: string }[]): number[]
 // ---------------------------------------------------------------- the loop
 
 interface Ctx {
-  businessId: string;
-  db: Queryable;
+  db: BusinessDb;
   active: ActiveCharter;
   currency: string;
   drafter: Drafter;
@@ -403,6 +400,7 @@ interface MoveOptions {
 
 async function move(ctx: Ctx, p: Production, to: ProductionStage, o: MoveOptions = {}): Promise<StepOutcome> {
   const ok = await advanceStage(
+    ctx.db,
     p.productionId,
     p.stage,
     to,
@@ -411,7 +409,6 @@ async function move(ctx: Ctx, p: Production, to: ProductionStage, o: MoveOptions
       ...(o.findings === undefined ? {} : { findings: o.findings }),
       ...(o.attempt === undefined ? {} : { attempt: o.attempt }),
     },
-    ctx.db,
   );
   if (!ok) return 'lost';
   ctx.result.advanced += 1;
@@ -423,7 +420,7 @@ async function fail(ctx: Ctx, p: Production, reason: string, o: MoveOptions = {}
 }
 
 async function capReached(ctx: Ctx): Promise<boolean> {
-  const used = await productionsToday(ctx.businessId, ctx.active.charter.identity.timezone, ctx.db, ctx.now());
+  const used = await productionsToday(ctx.db, ctx.active.charter.identity.timezone, ctx.now());
   return used >= ctx.perDay;
 }
 
@@ -496,7 +493,7 @@ function relativeFilePath(p: Production, versionId: string, ext: string): string
 
 async function stepBuilding(ctx: Ctx, p: Production): Promise<StepOutcome> {
   const versionNo = p.attempt + 1;
-  const existing = await latestVersion(p.productionId, ctx.db);
+  const existing = await latestVersion(ctx.db, p.productionId);
   if (existing?.versionNo === versionNo) return move(ctx, p, 'check1', { work: { ...p.work, draft: null } });
 
   const parsed = DocumentSpec.safeParse(p.work.draft);
@@ -528,6 +525,7 @@ async function stepBuilding(ctx: Ctx, p: Production): Promise<StepOutcome> {
   await mkdir(dirname(full), { recursive: true });
   await writeFile(full, bytes);
   await saveVersion(
+    ctx.db,
     {
       productionId: p.productionId,
       versionNo,
@@ -536,7 +534,6 @@ async function stepBuilding(ctx: Ctx, p: Production): Promise<StepOutcome> {
       sha256: createHash('sha256').update(bytes).digest('hex'),
       sizeBytes: bytes.length,
     },
-    ctx.db,
   );
   await ctx.checkpoint('version_saved', p.productionId);
   return move(ctx, p, 'check1', { work: { ...p.work, draft: null } });
@@ -544,7 +541,7 @@ async function stepBuilding(ctx: Ctx, p: Production): Promise<StepOutcome> {
 
 /** The version this attempt built — or an invariant break. */
 async function attemptVersion(ctx: Ctx, p: Production): Promise<DocumentVersion> {
-  const version = await latestVersion(p.productionId, ctx.db);
+  const version = await latestVersion(ctx.db, p.productionId);
   if (version === null || version.versionNo !== p.attempt + 1) {
     throw new InvariantBroken(`production ${p.productionId} is in ${p.stage} with no version ${p.attempt + 1}`);
   }
@@ -623,10 +620,10 @@ async function stepCheck1(ctx: Ctx, p: Production): Promise<StepOutcome> {
     result = await ctx.check1({ spec, bytes, sources: sources.grounding, rendered, today, currency: ctx.currency });
   }
   await saveVersionCheck(
+    ctx.db,
     version.versionId,
     'check1',
     { passed: result.passed, findings: result.findings, pageCount: pages.pageCount, flaggedPages: flaggedPagesOf(result.findings) },
-    ctx.db,
   );
   await ctx.checkpoint('check1_saved', p.productionId);
   if (!result.passed) return failAttempt(ctx, p, spec, check1Findings(result.findings));
@@ -700,6 +697,7 @@ async function stepCheck2(ctx: Ctx, p: Production): Promise<StepOutcome> {
   }
   const passed = outcome.status === 'judged' && findings.length === 0;
   await saveVersionCheck(
+    ctx.db,
     version.versionId,
     'check2',
     {
@@ -710,7 +708,6 @@ async function stepCheck2(ctx: Ctx, p: Production): Promise<StepOutcome> {
       pageCount: seen.pageCount,
       previewPath,
     },
-    ctx.db,
   );
   await ctx.checkpoint('check2_saved', p.productionId);
   if (!passed) return failAttempt(ctx, p, spec, findings);
@@ -759,7 +756,7 @@ export function stageCostMs(stage: ProductionStage, deadlines: StageDeadlines, p
 }
 
 async function reload(ctx: Ctx, productionId: string): Promise<Production> {
-  const p = await loadProduction(ctx.businessId, productionId, ctx.db);
+  const p = await loadProduction(ctx.db, productionId);
   if (p === null) throw new Error(`production ${productionId} vanished`);
   return p;
 }
@@ -775,7 +772,7 @@ const isTerminal = (stage: ProductionStage): stage is ProductionFinished['stage'
  */
 async function finishedVersionId(ctx: Ctx, p: Production): Promise<string | null> {
   if (p.stage !== 'ready' && p.stage !== 'failed_checks') return null;
-  const version = await latestVersion(p.productionId, ctx.db);
+  const version = await latestVersion(ctx.db, p.productionId);
   return version !== null && version.versionNo === p.attempt + 1 ? version.versionId : null;
 }
 
@@ -786,25 +783,25 @@ async function finish(ctx: Ctx, p: Production): Promise<void> {
   const versionId = await finishedVersionId(ctx, p);
   const reason = stage === 'failed' ? (p.work.reason ?? RENDER_ERROR_HE.render_failed) : null;
 
-  if ((await withBusiness(p.businessId, (bdb) => loadJob(bdb, p.originJobId))) === null) { // TENANCY-TODO(task 5)
+  if ((await loadJob(ctx.db, p.originJobId)) === null) {
     // Deterministic: reported once, never retried into an endless `errored`.
     ctx.result.originJobMissing.push(p.productionId);
   } else {
     try {
-      await withBusiness(p.businessId, (db) => transition(db, p.originJobId, { // TENANCY-TODO(task 5)
+      await transition(ctx.db, p.originJobId, {
         to: stage === 'failed' ? 'failed' : 'closed',
         expectFrom: 'followup',
         actor: 'orchestrator',
         reason: stage === 'failed' ? `הפקת המסמך נכשלה: ${reason}` : `הפקת המסמך הסתיימה: ${productionStageLabel[stage]}`,
-      }));
+      });
     } catch (err) {
       if (!(err instanceof PhaseMovedError)) throw err;
       ctx.result.skipped += 1;
     }
   }
 
-  await withBusiness(p.businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
-    bdb,
+  await appendAudit(
+    ctx.db,
     {
       actor: 'orchestrator',
       kind: 'document_production',
@@ -818,18 +815,18 @@ async function finish(ctx: Ctx, p: Production): Promise<void> {
       tokens: null,
       reason: `הפקת מסמך · ${productionStageLabel[stage]}`,
     }
-  ));
+  );
 
   await ctx.onFinished({ productionId: p.productionId, versionId, stage, reason });
   // Merge, never overwrite, what the callback recorded on the row: the card
   // module claims `work.notified` inside `onFinished` (production/card.ts),
   // and `p.work` was read before it ran.
-  const current = await loadProduction(p.businessId, p.productionId, ctx.db);
+  const current = await loadProduction(ctx.db, p.productionId);
   await saveWork(
+    ctx.db,
     p.productionId,
     stage,
     { ...p.work, notified: p.work.notified || current?.work.notified === true, finished: true },
-    ctx.db,
   );
 
   if (stage === 'ready') ctx.result.ready += 1;
@@ -850,7 +847,7 @@ interface Budget {
 async function drive(ctx: Ctx, first: Production, budget: Budget): Promise<boolean> {
   let p = first;
   while (!isTerminal(p.stage)) {
-    const version = p.stage === 'check2' ? await latestVersion(p.productionId, ctx.db) : null;
+    const version = p.stage === 'check2' ? await latestVersion(ctx.db, p.productionId) : null;
     const pagesInHand = version !== null && ctx.pages.has(version.versionId);
     if (!budget.allows(stageCostMs(p.stage, ctx.deadlines, pagesInHand))) return false;
     let outcome: StepOutcome;
@@ -885,9 +882,11 @@ function newResult(): RunProductionsResult {
  * then, every claimable non-terminal production is ended `failed` with
  * `PRODUCTION_TOOLS_MISSING_REASON` and finished, so none waits forever.
  */
-export async function runDocumentProductions(options: RunProductionsOptions = {}): Promise<RunProductionsResult | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+export async function runDocumentProductions(
+  db: BusinessDb,
+  options: RunProductionsOptions = {},
+): Promise<RunProductionsResult | null> {
+  const businessId = db.businessId;
   const tools = options.production;
   const toolsUp = tools?.available === true && tools.sofficePath !== null && tools.chromiumPath !== null;
 
@@ -905,20 +904,19 @@ export async function runDocumentProductions(options: RunProductionsOptions = {}
   }
   const unavailable = printer === null || renderer === null;
 
-  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
+  const active = await loadActiveCharter(db);
   if (active === null) {
     if (unavailable) return null;
     throw new Error(`runDocumentProductions: no active charter for ${businessId}`);
   }
 
-  const images = options.images ?? createDbImageLoader(businessId, db);
+  const images = options.images ?? createDbImageLoader(db);
   const now = (): Date => options.now ?? new Date();
   const result = newResult();
   const unusable = async (): Promise<never> => {
     throw new Error('production tools are not available');
   };
   const ctx: Ctx = {
-    businessId,
     db,
     active,
     currency: active.bundle.ceilings.currency,
@@ -962,7 +960,7 @@ export async function runDocumentProductions(options: RunProductionsOptions = {}
 
   // Stragglers first: terminal rows whose side effects a crash interrupted.
   while (hasBudget()) {
-    const p = await claimUnfinished(businessId, holder, leaseMs, db, attempted);
+    const p = await claimUnfinished(db, holder, leaseMs, attempted);
     if (p === null) break;
     attempted.push(p.productionId);
     try {
@@ -970,12 +968,12 @@ export async function runDocumentProductions(options: RunProductionsOptions = {}
     } catch (err) {
       result.errored.push({ productionId: p.productionId, error: errorText(err) });
     } finally {
-      await releaseLease(p.productionId, holder, db);
+      await releaseLease(db, p.productionId, holder);
     }
   }
 
   while (hasBudget()) {
-    const p = await claimProduction(businessId, holder, leaseMs, db, attempted);
+    const p = await claimProduction(db, holder, leaseMs, attempted);
     if (p === null) break;
     attempted.push(p.productionId);
     let keepGoing = true;
@@ -990,7 +988,7 @@ export async function runDocumentProductions(options: RunProductionsOptions = {}
     } catch (err) {
       result.errored.push({ productionId: p.productionId, error: errorText(err) });
     } finally {
-      await releaseLease(p.productionId, holder, db);
+      await releaseLease(db, p.productionId, holder);
     }
     if (!keepGoing) break;
   }

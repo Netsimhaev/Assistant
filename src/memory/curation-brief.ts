@@ -13,8 +13,7 @@
  * here rather than in the validator because only this module reads the plan
  * and the reading together.
  */
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
-import { config } from '../config.js';
+import type { BusinessDb } from '../db/pool.js';
 import { messagesAPerson } from '../domain/action.js';
 import { ATTACHMENT_DOC_TYPE_LABELS } from '../domain/mail-triage.js';
 import type { Reading } from '../domain/reading.js';
@@ -96,10 +95,10 @@ function stepAddressesPerson(toolName: string, input: Record<string, unknown>): 
  * to add", not an error.
  */
 async function loadReadingForJob(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId: string; db: Queryable },
 ): Promise<Reading | null> {
-  const { rows } = await options.db.query<{ content: unknown }>(
+  const { rows } = await db.query<{ content: unknown }>(
     `SELECT r.content
        FROM proposals p
        JOIN document_readings r
@@ -107,7 +106,7 @@ async function loadReadingForJob(
       WHERE p.job_id = $1 AND p.business_id = $2
       ORDER BY p.created_at DESC, p.proposal_id DESC
       LIMIT 1`,
-    [jobId, options.businessId],
+    [jobId, db.businessId],
   );
   const row = rows[0];
   if (row === undefined || row.content === null || row.content === undefined) return null;
@@ -125,10 +124,10 @@ async function loadReadingForJob(
  * mail with no sender address touches nobody and yields no brief.
  */
 async function buildMailBrief(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId: string; db: Queryable },
 ): Promise<CurationBrief | null> {
-  const mail = await mailForJob(jobId, options);
+  const mail = await mailForJob(db, jobId);
   if (mail === null) return null;
   const sender = mail.fromAddress.trim();
   if (sender === '') return null;
@@ -159,17 +158,15 @@ async function buildMailBrief(
 }
 
 export async function buildCurationBrief(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<CurationBrief | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
 
-  const job = await withBusiness(businessId, (bdb) => loadJob(bdb, jobId)); // TENANCY-TODO(task 5)
+  const job = await loadJob(db, jobId);
   if (job === null) return null;
 
-  const stored = await withBusiness(businessId, (bdb) => loadPlanBody(bdb, jobId)); // TENANCY-TODO(task 5)
-  if (stored === null) return buildMailBrief(jobId, { businessId, db });
+  const stored = await loadPlanBody(db, jobId);
+  if (stored === null) return buildMailBrief(db, jobId);
 
   const recipients = new Set<string>();
   const entityIds = new Set<string>();
@@ -190,7 +187,7 @@ export async function buildCurationBrief(
     }
   }
 
-  const reading = await loadReadingForJob(jobId, { businessId, db });
+  const reading = await loadReadingForJob(db, jobId);
   if (reading !== null) {
     sections.push(`# מה נקרא במסמך\n${reading.summary}`);
     if (reading.findings.length > 0) {

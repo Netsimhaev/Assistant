@@ -6,8 +6,7 @@
  * own header for the argument.
  */
 
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { Reading } from '../domain/reading.js';
 import type { TrustLevel } from '../domain/trust.js';
 
@@ -26,7 +25,7 @@ export interface ReadingRecord {
   briefHash: string;
 }
 
-/** What a caller supplies. `businessId` rides on the options, as everywhere else here. */
+/** What a caller supplies. The business is `db`'s, as everywhere else here. */
 export interface NewReading {
   readingId: string;
   documentId: string;
@@ -85,11 +84,10 @@ const COLUMNS = `reading_id, business_id, document_id, status, reason, content,
  * quietly getting the row that won.
  */
 export async function saveReading(
+  db: BusinessDb,
   input: NewReading,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<{ record: ReadingRecord; created: boolean }> {
-  const db = options.db ?? getPool();
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   const inserted = await db.query<ReadingRow>(
     `INSERT INTO document_readings
@@ -116,11 +114,11 @@ export async function saveReading(
   if (row !== undefined) return { record: toReading(row), created: true };
 
   const existing = await findReadingForBrief(
+    db,
     input.documentId,
     input.briefHash,
     input.promptVersion,
     input.provenance,
-    { businessId, db },
   );
   if (existing === null) {
     // The insert conflicted and the conflicting row is not visible. That is
@@ -143,18 +141,17 @@ export async function saveReading(
  * own comment forbids.
  */
 export async function findReadingForBrief(
+  db: BusinessDb,
   documentId: string,
   briefHash: string,
   promptVersion: string,
   provenance: TrustLevel,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ReadingRecord | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<ReadingRow>(
     `SELECT ${COLUMNS} FROM document_readings
       WHERE business_id = $1 AND document_id = $2
         AND brief_hash = $3 AND prompt_version = $4 AND provenance = $5`,
-    [options.businessId ?? config.businessId, documentId, briefHash, promptVersion, provenance],
+    [db.businessId, documentId, briefHash, promptVersion, provenance],
   );
   const row = rows[0];
   return row === undefined ? null : toReading(row);
@@ -177,17 +174,16 @@ export async function findReadingForBrief(
  * silently.
  */
 export async function loadLatestReading(
+  db: BusinessDb,
   documentId: string,
   provenance: TrustLevel,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ReadingRecord | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<ReadingRow>(
     `SELECT ${COLUMNS} FROM document_readings
       WHERE business_id = $1 AND document_id = $2 AND provenance = $3
       ORDER BY created_at DESC, reading_id DESC
       LIMIT 1`,
-    [options.businessId ?? config.businessId, documentId, provenance],
+    [db.businessId, documentId, provenance],
   );
   const row = rows[0];
   return row === undefined ? null : toReading(row);

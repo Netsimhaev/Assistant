@@ -22,7 +22,7 @@
 import { createHash } from 'node:crypto';
 import { open } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import {
   FORMAT_MEDIA_TYPE,
   sanitizeAttachmentFilename,
@@ -111,16 +111,15 @@ function toVersionFile(versionId: string, row: VersionFileRow): VersionFile | nu
  * that never existed.
  */
 export async function loadVersionFile(
+  db: BusinessDb,
   versionId: string,
-  businessId: string,
-  db: Queryable = getPool(),
 ): Promise<VersionFile | null> {
   const { rows } = await db.query<VersionFileRow>(
     `SELECT v.stored_path, v.sha256, v.size_bytes, p.format, p.kind, v.spec->>'filename' AS spec_filename
        FROM document_versions v
        JOIN document_productions p ON p.production_id = v.production_id
       WHERE v.version_id = $1 AND p.business_id = $2`,
-    [versionId, businessId],
+    [versionId, db.businessId],
   );
   const row = rows[0];
   return row === undefined ? null : toVersionFile(versionId, row);
@@ -199,14 +198,13 @@ function fail(code: AttachmentFailureCode): ResolveAttachmentsResult {
  * document root, its size, and its re-computed hash.
  */
 export async function resolveAttachments(
+  db: BusinessDb,
   refs: readonly AttachmentRef[],
-  businessId: string,
   documentRoot: string,
-  db: Queryable = getPool(),
 ): Promise<ResolveAttachmentsResult> {
   const versions: VersionFile[] = [];
   for (const ref of refs) {
-    const version = await loadVersionFile(ref.producedVersionId, businessId, db);
+    const version = await loadVersionFile(db, ref.producedVersionId);
     if (version === null) return fail('attachment_not_found');
     if (version.sha256 !== ref.sha256 || version.sizeBytes !== ref.sizeBytes) {
       return fail('attachment_hash_mismatch');
@@ -245,10 +243,10 @@ export async function resolveAttachments(
  * field — on an instruction job, a mail reply, anything else — is refused
  * before any file is read.
  */
-export async function isDeliveryJob(businessId: string, jobId: string, db: Queryable = getPool()): Promise<boolean> {
+export async function isDeliveryJob(db: BusinessDb, jobId: string): Promise<boolean> {
   const { rowCount } = await db.query(
     'SELECT 1 FROM document_cards WHERE business_id = $1 AND delivery_job_id = $2 LIMIT 1',
-    [businessId, jobId],
+    [db.businessId, jobId],
   );
   return (rowCount ?? 0) > 0;
 }
@@ -266,13 +264,12 @@ export async function isDeliveryJob(businessId: string, jobId: string, db: Query
  * delivery job resolves to is the card the owner pressed.
  */
 export async function deliveryVersionOf(
-  businessId: string,
+  db: BusinessDb,
   jobId: string,
-  db: Queryable = getPool(),
 ): Promise<string | null> {
   const { rows } = await db.query<{ version_id: string }>(
     'SELECT version_id FROM document_cards WHERE business_id = $1 AND delivery_job_id = $2',
-    [businessId, jobId],
+    [db.businessId, jobId],
   );
   // Two cards naming one job cannot happen (one writer, one job per
   // approval); if it ever did, which version is approved is not knowable.

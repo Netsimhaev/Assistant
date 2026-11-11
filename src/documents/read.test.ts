@@ -38,7 +38,8 @@ function stubReader(raw: string) {
 
 async function anExtractedDocument(): Promise<string> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument(
+  await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -48,13 +49,12 @@ async function anExtractedDocument(): Promise<string> {
       byteSize: 20,
       storedPath: `${BUSINESS}/${documentId}/original.txt`,
     },
-    { businessId: BUSINESS },
-  );
-  await markExtracted(
+  ));
+  await withBusiness(BUSINESS, (db) => markExtracted(
+    db,
     documentId,
     [{ ordinal: 0, kind: 'text', partName: 'גוף', content: { blocks: [{ kind: 'paragraph', text: 'סכום: 1,200' }] }, flags: [] }],
-    { businessId: BUSINESS },
-  );
+  ));
   return documentId;
 }
 
@@ -65,7 +65,7 @@ beforeEach(async () => {
   // one. Install the same charter under the same business so the two tests
   // below that create real jobs against `bundle.charterVersion` satisfy the
   // constraint.
-  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 5)
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 });
 afterAll(async () => { await closePool(); });
 
@@ -73,10 +73,11 @@ describe('readDocument', () => {
   it('reads a document and stores the reading', async () => {
     const documentId = await anExtractedDocument();
     const { reader } = stubReader(JSON.stringify(READING_JSON));
-    const result = await readDocument(
+    const result = await withBusiness(BUSINESS, (db) => readDocument(
+      db,
       { documentId, bundle, provenance: 'unknown_external', jobId: null },
-      { businessId: BUSINESS, reader },
-    );
+      { reader },
+    ));
     expect(result.status).toBe('read');
     if (result.status !== 'read') throw new Error('expected a reading');
     expect(result.reading.summary).toBe('חשבונית מספק.');
@@ -101,13 +102,13 @@ describe('readDocument', () => {
     };
     const input = { documentId, bundle, provenance: 'boss' as const, jobId: null };
 
-    const fresh = await readDocument(input, { businessId: BUSINESS, reader });
+    const fresh = await withBusiness(BUSINESS, (db) => readDocument(db, input, { reader }));
     expect(fresh.status).toBe('read');
     expect(fresh.denials).toEqual(['tool_not_allowlisted']);
 
     // The second read runs no tools of its own, so its empty list is a fact
     // about this call and not the first call's list carried forward.
-    const cached = await readDocument(input, { businessId: BUSINESS, reader });
+    const cached = await withBusiness(BUSINESS, (db) => readDocument(db, input, { reader }));
     if (cached.status !== 'read') throw new Error('expected a reading');
     expect(cached.cached).toBe(true);
     expect(cached.denials).toEqual([]);
@@ -117,8 +118,8 @@ describe('readDocument', () => {
     const documentId = await anExtractedDocument();
     const { reader, calls } = stubReader(JSON.stringify(READING_JSON));
     const input = { documentId, bundle, provenance: 'unknown_external' as const, jobId: null };
-    await readDocument(input, { businessId: BUSINESS, reader });
-    const second = await readDocument(input, { businessId: BUSINESS, reader });
+    await withBusiness(BUSINESS, (db) => readDocument(db, input, { reader }));
+    const second = await withBusiness(BUSINESS, (db) => readDocument(db, input, { reader }));
     expect(calls).toHaveLength(1);
     expect(second.status).toBe('read');
     if (second.status !== 'read') throw new Error('expected a reading');
@@ -128,10 +129,11 @@ describe('readDocument', () => {
   it('records an unreadable outcome instead of throwing', async () => {
     const documentId = await anExtractedDocument();
     const { reader } = stubReader('לא הצלחתי');
-    const result = await readDocument(
+    const result = await withBusiness(BUSINESS, (db) => readDocument(
+      db,
       { documentId, bundle, provenance: 'unknown_external', jobId: null },
-      { businessId: BUSINESS, reader },
-    );
+      { reader },
+    ));
     expect(result.status).toBe('unreadable');
     if (result.status !== 'unreadable') throw new Error('expected unreadable');
     expect(result.record.status).toBe('unreadable');
@@ -141,10 +143,11 @@ describe('readDocument', () => {
   it('stores the source\'s trust level and never raises it', async () => {
     const documentId = await anExtractedDocument();
     const { reader } = stubReader(JSON.stringify(READING_JSON));
-    const result = await readDocument(
+    const result = await withBusiness(BUSINESS, (db) => readDocument(
+      db,
       { documentId, bundle, provenance: 'open_web', jobId: null },
-      { businessId: BUSINESS, reader },
-    );
+      { reader },
+    ));
     if (result.status !== 'read') throw new Error('expected a reading');
     expect(result.record.provenance).toBe('open_web');
   });
@@ -156,14 +159,16 @@ describe('readDocument', () => {
     // by a lookup (migration 014).
     const documentId = await anExtractedDocument();
     const { reader, calls } = stubReader(JSON.stringify(READING_JSON));
-    await readDocument(
+    await withBusiness(BUSINESS, (db) => readDocument(
+      db,
       { documentId, bundle, provenance: 'boss', jobId: null },
-      { businessId: BUSINESS, reader },
-    );
-    const second = await readDocument(
+      { reader },
+    ));
+    const second = await withBusiness(BUSINESS, (db) => readDocument(
+      db,
       { documentId, bundle, provenance: 'unknown_external', jobId: null },
-      { businessId: BUSINESS, reader },
-    );
+      { reader },
+    ));
     if (second.status !== 'read') throw new Error('expected a reading');
     expect(second.cached).toBe(false);
     expect(calls).toHaveLength(2);
@@ -190,10 +195,11 @@ describe('readDocument', () => {
       return interpretReaderResponse(JSON.stringify(READING_JSON), includedOrdinals, [], 1);
     };
 
-    const result = await readDocument(
+    const result = await withBusiness(BUSINESS, (db) => readDocument(
+      db,
       { documentId, bundle, provenance: 'boss', jobId: job.jobId },
-      { businessId: BUSINESS, reader },
-    );
+      { reader },
+    ));
 
     // The positive half matters: without it this test would pass even if the
     // read never happened at all.
@@ -208,10 +214,11 @@ describe('readDocument', () => {
     // A job id that resolves to nothing — a stale id, a typo, or a job
     // belonging to another business all look exactly like this to the UPDATE.
     await expect(
-      readDocument(
+      withBusiness(BUSINESS, (db) => readDocument(
+        db,
         { documentId, bundle, provenance: 'boss', jobId: `JOB-${ulid()}` },
-        { businessId: BUSINESS, reader },
-      ),
+        { reader },
+      )),
     ).rejects.toThrow(/content ingestion was not recorded/);
 
     // The read must not have happened, and nothing must have been stored:
@@ -234,14 +241,16 @@ describe('readDocument', () => {
     }));
     const { reader, calls } = stubReader(JSON.stringify(READING_JSON));
     // First read, with no job, populates the cache.
-    await readDocument(
+    await withBusiness(BUSINESS, (db) => readDocument(
+      db,
       { documentId, bundle, provenance: 'boss', jobId: null },
-      { businessId: BUSINESS, reader },
-    );
-    const second = await readDocument(
+      { reader },
+    ));
+    const second = await withBusiness(BUSINESS, (db) => readDocument(
+      db,
       { documentId, bundle, provenance: 'boss', jobId: job.jobId },
-      { businessId: BUSINESS, reader },
-    );
+      { reader },
+    ));
     if (second.status !== 'read') throw new Error('expected a reading');
 
     // Both halves are load-bearing. Without them this would pass for the
@@ -259,7 +268,8 @@ describe('readDocument', () => {
 
   it('reports no_artifacts for a document that was never extracted', async () => {
     const documentId = `DOC-${ulid()}`;
-    await insertOrGetDocument(
+    await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+      db,
       {
         documentId,
         source: 'manual',
@@ -269,13 +279,13 @@ describe('readDocument', () => {
         byteSize: 0,
         storedPath: `${BUSINESS}/${documentId}/original.txt`,
       },
-      { businessId: BUSINESS },
-    );
+    ));
     const { reader, calls } = stubReader(JSON.stringify(READING_JSON));
-    const result = await readDocument(
+    const result = await withBusiness(BUSINESS, (db) => readDocument(
+      db,
       { documentId, bundle, provenance: 'boss', jobId: null },
-      { businessId: BUSINESS, reader },
-    );
+      { reader },
+    ));
     expect(result.status).toBe('no_artifacts');
     expect(calls).toHaveLength(0);
   });

@@ -135,10 +135,11 @@ describe('the verification loop, end to end through schedulerPass', () => {
       const dir = await mkdtemp(join(tmpdir(), 'verif-loop-doc-'));
       const path = join(dir, 'quote.txt');
       await writeFile(path, 'הצעת מחיר: 11988 ש"ח. נא לאשר בכתב.', 'utf8');
-      const ingested = await ingestDocument(
+      const ingested = await withBusiness(BUSINESS, (db) => ingestDocument(
+        db,
         { path, source: 'manual' },
-        { businessId: BUSINESS, documentRoot: dir },
-      );
+        { documentRoot: dir },
+      ));
       expect(ingested.status).toBe('extracted');
 
       // An explicit, empty inbox: both conductor loops sit behind the same
@@ -297,10 +298,11 @@ describe('the verification loop, end to end through schedulerPass', () => {
       const dir = await mkdtemp(join(tmpdir(), 'verif-seam-doc-'));
       const path = join(dir, 'quote.txt');
       await writeFile(path, 'הצעת מחיר: 11988 ש"ח. נא לאשר בכתב.', 'utf8');
-      await ingestDocument(
+      await withBusiness(BUSINESS, (db) => ingestDocument(
+        db,
         { path, source: 'manual' },
-        { businessId: BUSINESS, documentRoot: dir },
-      );
+        { documentRoot: dir },
+      ));
       const inbox = await mkdtemp(join(tmpdir(), 'verif-seam-inbox-'));
 
       let judgeCalls = 0;

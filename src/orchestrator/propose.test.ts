@@ -56,7 +56,8 @@ async function aReadingFor(
   provenance: TrustLevel,
 ): Promise<{ documentId: string; readingId: string }> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument(
+  await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -66,9 +67,9 @@ async function aReadingFor(
       byteSize: 20,
       storedPath: `${BUSINESS}/${documentId}/original.txt`,
     },
-    { businessId: BUSINESS },
-  );
-  const { record } = await saveReading(
+  ));
+  const { record } = await withBusiness(BUSINESS, (db) => saveReading(
+    db,
     {
       readingId: `RDG-${ulid()}`,
       documentId,
@@ -85,8 +86,7 @@ async function aReadingFor(
       promptVersion: 'v1',
       briefHash: ulid().padEnd(64, '0'),
     },
-    { businessId: BUSINESS },
-  );
+  ));
   return { documentId, readingId: record.readingId };
 }
 

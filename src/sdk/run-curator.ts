@@ -91,7 +91,7 @@ async function main(): Promise<void> {
 
   console.log(`עסק: ${BUSINESS} · תקנון: ${charter.bundle.charterVersion}`);
 
-  const before = await recallMemories({ subjectKey: RONIT }, { businessId: BUSINESS });
+  const before = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: RONIT })); // TENANCY-TODO(task 7)
   console.log(`זיכרונות על ${RONIT} לפני הריצה: ${before.length}`);
 
   // 1. A job the owner opened, walked to `verify` the way the engine walks it.
@@ -141,7 +141,7 @@ async function main(): Promise<void> {
   console.log(`phase של המשימה: ${closed?.phase}`);
 
   // 3. What was actually written, read back from the table itself.
-  const after = await recallMemories({ subjectKey: RONIT }, { businessId: BUSINESS });
+  const after = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: RONIT })); // TENANCY-TODO(task 7)
   console.log('');
   console.log(`=== זיכרונות על ${RONIT} אחרי: ${after.length} (לפני: ${before.length}) ===`);
   for (const memory of after) {
@@ -164,7 +164,7 @@ async function main(): Promise<void> {
   for (const row of audit.rows) console.log(`- ${row.at} · ${row.reason}`);
 
   // 5. The half that is the feature: does it reach a prompt, labelled?
-  const block = await recallForPlanning([RONIT], { businessId: BUSINESS });
+  const block = await withBusiness(BUSINESS, (db) => recallForPlanning(db, [RONIT])); // TENANCY-TODO(task 7)
   console.log('');
   console.log('=== הבלוק שהמתכנן יקבל ===');
   console.log(block === '' ? '(ריק)' : block);

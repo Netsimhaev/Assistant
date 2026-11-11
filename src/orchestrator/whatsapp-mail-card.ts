@@ -290,17 +290,16 @@ export async function handleMailCardMessage(
   input: { msg: NormalizedInboundMessage; storedId: string; cards: readonly OpenMailCard[]; messenger: BossMessenger },
 ): Promise<MailCardOutcome> {
   const { msg, storedId, cards, messenger } = input;
-  const { businessId } = db;
   if (msg.mediaKind !== null) return 'passthrough';
   const text = msg.body ?? '';
   if (!isMailCardAction(text)) return 'passthrough';
 
-  const claimed = await claimMessage(storedId, { businessId });
+  const claimed = await claimMessage(db, storedId);
   if (!claimed) return 'skipped';
 
   const refuse = async (reply: string): Promise<'refused'> => {
     await messenger.send({ text: reply, jobId: null });
-    await settleMessage(storedId, 'failed', {}, { businessId });
+    await settleMessage(db, storedId, 'failed', {});
     return 'refused';
   };
 
@@ -315,7 +314,7 @@ export async function handleMailCardMessage(
   if (isClosureCommand(text)) {
     // Nothing to write: this inbound row is the record `openMailCards` reads.
     await messenger.send({ text: MAIL_CARD_CLOSED, jobId: null });
-    await settleMessage(storedId, 'handled', {}, { businessId });
+    await settleMessage(db, storedId, 'handled', {});
     return 'closed';
   }
 
@@ -380,10 +379,10 @@ async function approveCard(
     jobId: null,
   });
   await settleMessage(
+    ctx.db,
     ctx.storedId,
     'handled',
     card.jobId !== null ? { jobId: card.jobId } : {},
-    { businessId: ctx.db.businessId },
   );
   return 'decided';
 }
@@ -450,6 +449,6 @@ async function replaceBody(
       // does not count, so the fresh card is simply not open on WhatsApp.
       await ctx.messenger.send({ text: cardText, jobId: cardJobId });
     }, { lead: REPLACEMENT_LEAD });
-  await settleMessage(ctx.storedId, 'handled', { jobId }, { businessId: ctx.db.businessId });
+  await settleMessage(ctx.db, ctx.storedId, 'handled', { jobId });
   return 'replaced';
 }

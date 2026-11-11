@@ -67,10 +67,11 @@ function recordingMessenger(texts: string[], ok = true): BossMessenger {
 }
 
 async function setSettings(over: Partial<LedgerSettings>): Promise<void> {
-  await saveLedgerSettings(
+  await withBusiness(B, (db) => saveLedgerSettings(
+    db,
     { ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes }, meetingLeadMinutesCritical: [1440, 60], ...over },
-    { businessId: B, updatedBy: 'owner' },
-  );
+    { updatedBy: 'owner' },
+  ));
 }
 
 interface ReminderRow {
@@ -102,7 +103,7 @@ async function batches(): Promise<{ batch_id: string; items: string[]; sent_at: 
 
 beforeEach(async () => {
   await resetDatabase();
-  await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
+  await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({})));
 });
 afterAll(async () => {
   await closePool();
@@ -110,10 +111,10 @@ afterAll(async () => {
 
 describe('runLedgerPass', () => {
   it('sends one reminder per due slot and records the states', async () => {
-    const a = await createLedgerItem(base(), { businessId: B, by: 'boss' });
-    const b = await createLedgerItem(base({ description: 'חשבונית 456' }), { businessId: B, by: 'boss' });
+    const a = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
+    const b = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'חשבונית 456' }), { by: 'boss' }));
     const sent: Sent[] = [];
-    const result = await runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent) });
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) }));
 
     expect(result.reminded).toBe(2);
     expect(result.errored).toEqual([]);
@@ -129,16 +130,16 @@ describe('runLedgerPass', () => {
       expect(r.seen_at).toBeNull();
       expect(r.body).toContain('תזכורת:');
     }
-    const events = await listLedgerEvents(a.itemId, { businessId: B });
+    const events = await withBusiness(B, (db) => listLedgerEvents(db, a.itemId));
     expect(events.map((e) => e.kind)).toEqual(['created', 'reminded']);
   });
 
   it('a second pass sends nothing', async () => {
-    await createLedgerItem(base(), { businessId: B, by: 'boss' });
+    await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     const sent: Sent[] = [];
-    const first = await runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent) });
+    const first = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) }));
     expect(first.reminded).toBe(1);
-    const second = await runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent) });
+    const second = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) }));
     expect(second.reminded).toBe(0);
     // The slot was found and lost to the earlier claim — it ran, it did not send.
     expect(second.skipped).toBe(1);
@@ -147,11 +148,11 @@ describe('runLedgerPass', () => {
   });
 
   it('two concurrent passes send once', async () => {
-    await createLedgerItem(base(), { businessId: B, by: 'boss' });
+    await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     const sent: Sent[] = [];
     const [r1, r2] = await Promise.all([
-      runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent) }),
-      runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent) }),
+      withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) })),
+      withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) })),
     ]);
     expect(sent).toHaveLength(1);
     expect(r1.reminded + r2.reminded).toBe(1);
@@ -161,10 +162,10 @@ describe('runLedgerPass', () => {
 
   it('WhatsApp batches all reminders into one numbered message and stamps sent_at only on ok', async () => {
     await setSettings({ toWhatsApp: true, toEmail: false });
-    const a = await createLedgerItem(base({ description: 'ראשונה' }), { businessId: B, by: 'boss' });
-    const b = await createLedgerItem(base({ description: 'שנייה' }), { businessId: B, by: 'boss' });
+    const a = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'ראשונה' }), { by: 'boss' }));
+    const b = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'שנייה' }), { by: 'boss' }));
     const texts: string[] = [];
-    const result = await runLedgerPass({ businessId: B, now: NOW, messenger: recordingMessenger(texts) });
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, messenger: recordingMessenger(texts) }));
 
     expect(result.reminded).toBe(2);
     expect(texts).toHaveLength(1);
@@ -190,9 +191,9 @@ describe('runLedgerPass', () => {
 
   it('failed WhatsApp send leaves sent_at NULL', async () => {
     await setSettings({ toWhatsApp: true, toEmail: false });
-    await createLedgerItem(base(), { businessId: B, by: 'boss' });
+    await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     const texts: string[] = [];
-    const result = await runLedgerPass({ businessId: B, now: NOW, messenger: recordingMessenger(texts, false) });
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, messenger: recordingMessenger(texts, false) }));
     // The send was attempted.
     expect(texts).toHaveLength(1);
     expect(result.whatsappFailed).toBe(1);
@@ -204,17 +205,17 @@ describe('runLedgerPass', () => {
 
   it('a hanging WhatsApp send is failed by the deadline', async () => {
     await setSettings({ toWhatsApp: true, toEmail: false });
-    await createLedgerItem(base(), { businessId: B, by: 'boss' });
+    await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     const messenger: BossMessenger = { channel: 'whatsapp', send: () => new Promise(() => {}) };
-    const result = await runLedgerPass({ businessId: B, now: NOW, messenger, timeoutMs: 50 });
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, messenger, timeoutMs: 50 }));
     expect(result.whatsappFailed).toBe(1);
     expect((await batches())[0]?.sent_at).toBeNull();
   });
 
   it('a chosen channel with no seam is skipped_not_connected', async () => {
     await setSettings({ toWhatsApp: true, toEmail: true });
-    await createLedgerItem(base(), { businessId: B, by: 'boss' });
-    const result = await runLedgerPass({ businessId: B, now: NOW });
+    await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW }));
     expect(result.reminded).toBe(1);
     expect(result.skippedNotConnected).toBe(2);
     const row = (await reminders())[0];
@@ -225,9 +226,9 @@ describe('runLedgerPass', () => {
   });
 
   it('critical reminder is marked', async () => {
-    await createLedgerItem(base({ importance: 'critical' }), { businessId: B, by: 'boss' });
+    await withBusiness(B, (db) => createLedgerItem(db, base({ importance: 'critical' }), { by: 'boss' }));
     const sent: Sent[] = [];
-    await runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent) });
+    await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) }));
     const due = sent.find((s) => s.body.includes('תזכורת:'));
     expect(due).toBeDefined();
     expect(due?.subject.startsWith('⚠️ ')).toBe(true);
@@ -235,9 +236,9 @@ describe('runLedgerPass', () => {
   });
 
   it('the sent text carries the reminder id', async () => {
-    await createLedgerItem(base(), { businessId: B, by: 'boss' });
+    await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     const sent: Sent[] = [];
-    await runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent), dashboardBaseUrl: 'https://x.test/' });
+    await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent), dashboardBaseUrl: 'https://x.test/' }));
     const id = (await reminders())[0]?.reminder_id ?? 'missing';
     expect(sent[0]?.body).toContain(`מזהה תזכורת: ${id}`);
     expect(sent[0]?.body).toContain('https://x.test/ledger');
@@ -246,12 +247,12 @@ describe('runLedgerPass', () => {
   });
 
   it('nothing is sent for a cancelled item', async () => {
-    const cancelled = await createLedgerItem(base({ description: 'מבוטלת' }), { businessId: B, by: 'boss' });
-    await moveLedgerStatus(cancelled.itemId, ['open'], 'cancelled', { kind: 'cancelled', by: 'boss' }, { businessId: B });
-    const control = await createLedgerItem(base({ description: 'פתוחה' }), { businessId: B, by: 'boss' });
+    const cancelled = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'מבוטלת' }), { by: 'boss' }));
+    await withBusiness(B, (db) => moveLedgerStatus(db, cancelled.itemId, ['open'], 'cancelled', { kind: 'cancelled', by: 'boss' }));
+    const control = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'פתוחה' }), { by: 'boss' }));
 
     // The same item, were it open, would have a due slot in this pass.
-    const settings = await loadLedgerSettings({ businessId: B });
+    const settings = await withBusiness(B, (db) => loadLedgerSettings(db));
     const asOpen: LedgerItem = { ...cancelled, status: 'open' };
     expect(
       dueSlots(asOpen, settings, { now: NOW, timeZone: TZ, workweek: ['sun', 'mon', 'tue', 'wed', 'thu'], holidays: [], lastNudgeAt: null })
@@ -259,7 +260,7 @@ describe('runLedgerPass', () => {
     ).toBeGreaterThan(0);
 
     const sent: Sent[] = [];
-    const result = await runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent) });
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) }));
     // The pass ran: the open control item was reminded.
     expect(result.reminded).toBe(1);
     expect(sent).toHaveLength(1);
@@ -269,10 +270,11 @@ describe('runLedgerPass', () => {
   });
 
   it('a remind-mode awaiting_reply item is nudged again after nudgeAfterBusinessDays, not once ever', async () => {
-    const item = await createLedgerItem(
+    const item = await withBusiness(B, (db) => createLedgerItem(
+      db,
       base({ family: 'awaiting_reply', description: 'תשובה מרונית', counterpartyName: 'רונית', dueAt: null, amountMinor: null }),
-      { businessId: B, by: 'boss' },
-    );
+      { by: 'boss' },
+    ));
     // Created Sunday 2026-11-01 10:00 local. Sun–Thu week, 3 business days → Wed 11-04 08:00 local.
     await getPool().query(`UPDATE ledger_items SET created_at = $2 WHERE item_id = $1`, [
       item.itemId,
@@ -281,16 +283,16 @@ describe('runLedgerPass', () => {
     const sent: Sent[] = [];
     const alert = recordingAlert(sent);
 
-    const first = await runLedgerPass({ businessId: B, now: new Date('2026-11-04T07:00:00Z'), sendAlert: alert });
+    const first = await withBusiness(B, (db) => runLedgerPass(db, { now: new Date('2026-11-04T07:00:00Z'), sendAlert: alert }));
     expect(first.reminded).toBe(1);
     expect(sent[0]?.body).toContain('הגיע הזמן לחזור לרונית');
 
     // Next business day is NOT a new nudge: the cadence is counted from the last one.
-    const between = await runLedgerPass({ businessId: B, now: new Date('2026-11-08T07:00:00Z'), sendAlert: alert });
+    const between = await withBusiness(B, (db) => runLedgerPass(db, { now: new Date('2026-11-08T07:00:00Z'), sendAlert: alert }));
     expect(between.reminded).toBe(0);
 
     // Thu 11-05, Sun 11-08, Mon 11-09 → Mon 08:00 local.
-    const second = await runLedgerPass({ businessId: B, now: new Date('2026-11-09T07:00:00Z'), sendAlert: alert });
+    const second = await withBusiness(B, (db) => runLedgerPass(db, { now: new Date('2026-11-09T07:00:00Z'), sendAlert: alert }));
     expect(second.reminded).toBe(1);
     expect(sent).toHaveLength(2);
     const rows = await reminders();
@@ -299,21 +301,21 @@ describe('runLedgerPass', () => {
 
   it('an act-mode nudge slot is left unclaimed for the nudge stage', async () => {
     await setSettings({ modes: { ...LEDGER_DEFAULTS.modes, awaiting_reply: 'act' } });
-    const actItem = await createLedgerItem(
+    const actItem = await withBusiness(B, (db) => createLedgerItem(
+      db,
       base({ family: 'awaiting_reply', description: 'act', dueAt: null, amountMinor: null }),
-      { businessId: B, by: 'boss' },
-    );
+      { by: 'boss' },
+    ));
     await getPool().query(`UPDATE ledger_items SET created_at = $2 WHERE item_id = $1`, [
       actItem.itemId,
       new Date('2026-11-01T08:00:00Z'),
     ]);
     // A control in the same pass proves the pass ran.
-    const control = await createLedgerItem(base({ dueAt: new Date('2026-11-03T22:00:00Z') }), {
-      businessId: B,
+    const control = await withBusiness(B, (db) => createLedgerItem(db, base({ dueAt: new Date('2026-11-03T22:00:00Z') }), {
       by: 'boss',
-    });
+    }));
     const now = new Date('2026-11-04T07:00:00Z');
-    const settings = await loadLedgerSettings({ businessId: B });
+    const settings = await withBusiness(B, (db) => loadLedgerSettings(db));
     const slots = dueSlots({ ...actItem, createdAt: new Date('2026-11-01T08:00:00Z') }, settings, {
       now,
       timeZone: TZ,
@@ -324,23 +326,23 @@ describe('runLedgerPass', () => {
     expect(slots.map((s) => s.kind)).toEqual(['nudge']);
 
     const sent: Sent[] = [];
-    const result = await runLedgerPass({ businessId: B, now, sendAlert: recordingAlert(sent) });
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now, sendAlert: recordingAlert(sent) }));
     expect(result.reminded).toBe(1);
     expect((await reminders()).map((r) => r.item_id)).toEqual([control.itemId]);
   });
 
   it('a pass with no active charter returns the empty result', async () => {
     await getPool().query(`DELETE FROM charter_active WHERE business_id = $1`, [B]);
-    await createLedgerItem(base(), { businessId: B, by: 'boss' });
+    await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     const sent: Sent[] = [];
-    const result = await runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent) });
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) }));
     expect(result.reminded).toBe(0);
     expect(sent).toHaveLength(0);
   });
 
   it('an item whose claim fails is reported in errored and the next item is still reminded', async () => {
-    const bad = await createLedgerItem(base({ description: 'רעה' }), { businessId: B, by: 'boss' });
-    const good = await createLedgerItem(base({ description: 'טובה' }), { businessId: B, by: 'boss' });
+    const bad = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'רעה' }), { by: 'boss' }));
+    const good = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'טובה' }), { by: 'boss' }));
     // A real DB failure on one item's claim, nothing stubbed in the pass.
     await testDb().query(`
       CREATE OR REPLACE FUNCTION test_ledger_reminder_boom() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -352,14 +354,14 @@ describe('runLedgerPass', () => {
         FOR EACH ROW EXECUTE FUNCTION test_ledger_reminder_boom();`);
     try {
       const sent: Sent[] = [];
-      const result = await runLedgerPass({ businessId: B, now: NOW, sendAlert: recordingAlert(sent) });
+      const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: recordingAlert(sent) }));
       expect(result.errored).toEqual([{ itemId: bad.itemId, error: expect.stringContaining('boom for test') }]);
       expect(result.reminded).toBe(1);
       expect(sent).toHaveLength(1);
       expect(sent[0]?.body).toContain('טובה');
       expect((await reminders()).map((r) => r.item_id)).toEqual([good.itemId]);
       // The failed claim rolled back with its event.
-      expect((await listLedgerEvents(bad.itemId, { businessId: B })).map((e) => e.kind)).toEqual(['created']);
+      expect((await withBusiness(B, (db) => listLedgerEvents(db, bad.itemId))).map((e) => e.kind)).toEqual(['created']);
     } finally {
       await testDb().query(`DROP TRIGGER IF EXISTS test_ledger_reminder_boom ON ledger_reminders;
         DROP FUNCTION IF EXISTS test_ledger_reminder_boom();`);
@@ -367,14 +369,14 @@ describe('runLedgerPass', () => {
   });
 
   it('a throwing email send is a failed channel, not a failed item', async () => {
-    const bad = await createLedgerItem(base({ description: 'רעה' }), { businessId: B, by: 'boss' });
-    await createLedgerItem(base({ description: 'טובה' }), { businessId: B, by: 'boss' });
+    const bad = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'רעה' }), { by: 'boss' }));
+    await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'טובה' }), { by: 'boss' }));
     const sent: Sent[] = [];
     const alert = async (subject: string, body: string) => {
       if (body.includes('רעה')) throw new Error('boom');
       return recordingAlert(sent)(subject, body);
     };
-    const result = await runLedgerPass({ businessId: B, now: NOW, sendAlert: alert });
+    const result = await withBusiness(B, (db) => runLedgerPass(db, { now: NOW, sendAlert: alert }));
     // A throwing send is a failed channel, not a failed item.
     expect(result.reminded).toBe(2);
     expect(result.emailFailed).toBe(1);
@@ -386,22 +388,23 @@ describe('runLedgerPass', () => {
 describe('sendLedgerBatch', () => {
   it('returns empty and writes nothing for no entries', async () => {
     const texts: string[] = [];
-    const r = await sendLedgerBatch([], { businessId: B, messenger: recordingMessenger(texts) });
+    const r = await withBusiness(B, (db) => sendLedgerBatch(db, [], { messenger: recordingMessenger(texts) }));
     expect(r).toEqual({ state: 'empty', batchId: null });
     expect(texts).toHaveLength(0);
     expect(await batches()).toHaveLength(0);
   });
 
   it('numbers entries 1-based in insertion order', async () => {
-    const a = await createLedgerItem(base(), { businessId: B, by: 'boss' });
+    const a = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     const texts: string[] = [];
-    const r = await sendLedgerBatch(
+    const r = await withBusiness(B, (db) => sendLedgerBatch(
+      db,
       [
         { itemId: a.itemId, text: 'אחת' },
         { itemId: 'LI-x', text: 'שתיים' },
       ],
-      { businessId: B, messenger: recordingMessenger(texts) },
-    );
+      { messenger: recordingMessenger(texts) },
+    ));
     expect(r.state).toBe('sent');
     expect(texts[0]).toContain('1. אחת');
     expect(texts[0]).toContain('2. שתיים');

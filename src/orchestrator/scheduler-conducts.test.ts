@@ -249,10 +249,11 @@ describe('schedulerPass and the conductor', () => {
     const dir = await mkdtemp(join(tmpdir(), 'sched-doc-'));
     const path = join(dir, 'doc.txt');
     await writeFile(path, 'חוזה שיווק', 'utf8');
-    await ingestDocument(
+    await withBusiness(conductBusiness, (db) => ingestDocument(
+      db,
       { path, source: 'manual' },
-      { businessId: conductBusiness, documentRoot: dir },
-    );
+      { documentRoot: dir },
+    ));
 
     let reads = 0;
     let proposals = 0;
@@ -303,10 +304,11 @@ describe('schedulerPass and the conductor', () => {
     const dir = await mkdtemp(join(tmpdir(), 'sched-notify-doc-'));
     const path = join(dir, 'doc.txt');
     await writeFile(path, 'חוזה שיווק להתראה', 'utf8');
-    await ingestDocument(
+    await withBusiness(notifyBusiness, (db) => ingestDocument(
+      db,
       { path, source: 'manual' },
-      { businessId: notifyBusiness, documentRoot: dir },
-    );
+      { documentRoot: dir },
+    ));
 
     const notified: string[] = [];
     const runtime: Runtime = {

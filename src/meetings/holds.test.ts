@@ -84,16 +84,15 @@ async function newJob(phase = 'plan'): Promise<string> {
 }
 
 async function hold(client: CalendarClient, jobId: string, name = 'דנה לוי') {
-  const r = await createHold({
+  const r = await withBusiness(BUSINESS, (db) => createHold(db, {
     access: accessOf(client),
-    businessId: BUSINESS,
     jobId,
     calendarId: 'cal-1',
     start: '2026-11-10T08:00:00.000Z',
     end: '2026-11-10T09:00:00.000Z',
     clientName: name,
     signal: SIGNAL,
-  });
+  }));
   if ('failure' in r) throw new Error('hold failed');
   return r;
 }
@@ -115,7 +114,7 @@ const runtime = { credentials: { resolve: async () => ({ value: 'tok' }) } } as 
 
 beforeEach(async () => {
   await resetDatabase();
-  charterVersion = (await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 5)
+  charterVersion = (await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()))).charterVersion;
 });
 afterAll(async () => {
   await closePool();
@@ -146,12 +145,12 @@ describe('holds', () => {
   it('release deletes only a hold it created', async () => {
     const { client, calls } = fake();
     const h = await hold(client, await newJob());
-    const r = await releaseHold({ access: accessOf(client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
+    const r = await withBusiness(BUSINESS, (db) => releaseHold(db, { access: accessOf(client), holdId: h.holdId, signal: SIGNAL }));
     expect(r).toBe('released');
     expect(calls.filter((c) => c.op === 'delete')).toHaveLength(1);
     expect(calls.find((c) => c.op === 'delete')?.args[2]).toBe(h.eventId);
     expect(await state(h.holdId)).toBe('released');
-    const again = await releaseHold({ access: accessOf(client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
+    const again = await withBusiness(BUSINESS, (db) => releaseHold(db, { access: accessOf(client), holdId: h.holdId, signal: SIGNAL }));
     expect(again).toBe('already');
     expect(calls.filter((c) => c.op === 'delete')).toHaveLength(1);
   });
@@ -160,7 +159,7 @@ describe('holds', () => {
     const created = fake();
     const h = await hold(created.client, await newJob());
     const gone = fake({ deleteResult: 'not_found' });
-    const r = await releaseHold({ access: accessOf(gone.client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
+    const r = await withBusiness(BUSINESS, (db) => releaseHold(db, { access: accessOf(gone.client), holdId: h.holdId, signal: SIGNAL }));
     expect(r).toBe('released');
     expect(await state(h.holdId)).toBe('released');
   });
@@ -169,14 +168,14 @@ describe('holds', () => {
     const created = fake();
     const h = await hold(created.client, await newJob());
     const bad = fake({ deleteResult: 'transient' });
-    const r = await releaseHold({ access: accessOf(bad.client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
+    const r = await withBusiness(BUSINESS, (db) => releaseHold(db, { access: accessOf(bad.client), holdId: h.holdId, signal: SIGNAL }));
     expect(r).toMatchObject({ failure: 'transient' });
     expect(await state(h.holdId)).toBe('held');
   });
 
   it('refuses to release an event id with no held row', async () => {
     const { client, calls } = fake();
-    const r = await releaseHold({ access: accessOf(client), businessId: BUSINESS, holdId: 'H-nope', signal: SIGNAL });
+    const r = await withBusiness(BUSINESS, (db) => releaseHold(db, { access: accessOf(client), holdId: 'H-nope', signal: SIGNAL }));
     expect(r).toMatchObject({ failure: 'rejected' });
     expect(calls).toHaveLength(0);
   });
@@ -184,9 +183,9 @@ describe('holds', () => {
   it('does not delete a converted hold', async () => {
     const { client, calls } = fake();
     const h = await hold(client, await newJob());
-    await markHoldConverted({ businessId: BUSINESS, calendarId: 'cal-1', eventId: h.eventId });
+    await withBusiness(BUSINESS, (db) => markHoldConverted(db, { calendarId: 'cal-1', eventId: h.eventId }));
     expect(await state(h.holdId)).toBe('converted');
-    const r = await releaseHold({ access: accessOf(client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
+    const r = await withBusiness(BUSINESS, (db) => releaseHold(db, { access: accessOf(client), holdId: h.holdId, signal: SIGNAL }));
     expect(r).toBe('already');
     expect(calls.filter((c) => c.op === 'delete')).toHaveLength(0);
   });
@@ -199,7 +198,7 @@ describe('holds', () => {
     const created = fake();
     const h = await hold(created.client, await newJob());
     const conv = fake({ current });
-    const r = await releaseHold({ access: accessOf(conv.client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
+    const r = await withBusiness(BUSINESS, (db) => releaseHold(db, { access: accessOf(conv.client), holdId: h.holdId, signal: SIGNAL }));
     expect(r).toBe('already');
     expect(conv.calls.filter((c) => c.op === 'delete')).toHaveLength(0);
     expect(await state(h.holdId)).toBe('converted');
@@ -209,7 +208,7 @@ describe('holds', () => {
     const created = fake();
     const h = await hold(created.client, await newJob());
     const gone = fake({ current: 'not_found' });
-    const r = await releaseHold({ access: accessOf(gone.client), businessId: BUSINESS, holdId: h.holdId, signal: SIGNAL });
+    const r = await withBusiness(BUSINESS, (db) => releaseHold(db, { access: accessOf(gone.client), holdId: h.holdId, signal: SIGNAL }));
     expect(r).toBe('released');
     expect(gone.calls.filter((c) => c.op === 'delete')).toHaveLength(0);
   });
@@ -217,7 +216,7 @@ describe('holds', () => {
   it('never releases a hold of another business', async () => {
     const { client, calls } = fake();
     const h = await hold(client, await newJob());
-    const r = await releaseHold({ access: accessOf(client), businessId: 'other-biz', holdId: h.holdId, signal: SIGNAL });
+    const r = await withBusiness('other-biz', (db) => releaseHold(db, { access: accessOf(client), holdId: h.holdId, signal: SIGNAL }));
     expect(r).toMatchObject({ failure: 'rejected' });
     expect(calls.filter((c) => c.op === 'delete')).toHaveLength(0);
     expect(await state(h.holdId)).toBe('held');
@@ -270,7 +269,7 @@ describe('holds', () => {
       keep.push(h.holdId);
     }
 
-    const out = await sweepHolds({ businessId: BUSINESS, runtime, client });
+    const out = await withBusiness(BUSINESS, (db) => sweepHolds(db, { runtime, client }));
     expect(out).toEqual({ released: 4, failed: 0 });
     for (const h of [closed, orphan, stale, cancelled]) expect(await state(h.holdId)).toBe('released');
     expect(await state(waiting.holdId)).toBe('held');
@@ -290,11 +289,11 @@ describe('holds', () => {
     const { client } = fake();
     const gapJob = await newJob('plan'); // bound, moved to plan, no question yet
     const fresh = await hold(client, gapJob);
-    expect(await sweepHolds({ businessId: BUSINESS, runtime, client })).toEqual({ released: 0, failed: 0 });
+    expect(await withBusiness(BUSINESS, (db) => sweepHolds(db, { runtime, client }))).toEqual({ released: 0, failed: 0 });
     expect(await state(fresh.holdId)).toBe('held');
     // The question row lands: still held.
     await addConfirmation(gapJob, 'pending');
-    expect(await sweepHolds({ businessId: BUSINESS, runtime, client })).toEqual({ released: 0, failed: 0 });
+    expect(await withBusiness(BUSINESS, (db) => sweepHolds(db, { runtime, client }))).toEqual({ released: 0, failed: 0 });
     expect(await state(fresh.holdId)).toBe('held');
   });
 });

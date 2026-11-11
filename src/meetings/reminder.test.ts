@@ -50,7 +50,7 @@ beforeEach(async () => {
   await resetDatabase();
   charterVersion = (await installMailboxCharter(B)).charterVersion;
   // Under the default `off` no job is ever opened (see the `off` test below).
-  await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
+  await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss'));
 });
 afterAll(async () => {
   await closePool();
@@ -59,7 +59,7 @@ afterAll(async () => {
 describe('openClientReminder', () => {
   it('opens a boss job in execute with one email.initiate mail.send step and the exact body', async () => {
     const meetingId = await seedMeeting();
-    const opened = await openClientReminder({ businessId: B, meetingId, location: 'רחוב הרצל 1, תל אביב' });
+    const opened = await withBusiness(B, (db) => openClientReminder(db, { meetingId, location: 'רחוב הרצל 1, תל אביב' }));
     if (!('jobId' in opened)) throw new Error(`expected a job, got ${JSON.stringify(opened)}`);
 
     const job = await withBusiness(B, (db) => loadJob(db, opened.jobId));
@@ -87,7 +87,7 @@ describe('openClientReminder', () => {
 
   it('reminder job has no boss_instructions row and is not covered by the confirmed-command exemption', async () => {
     const meetingId = await seedMeeting();
-    const opened = await openClientReminder({ businessId: B, meetingId });
+    const opened = await withBusiness(B, (db) => openClientReminder(db, { meetingId }));
     if (!('jobId' in opened)) throw new Error('expected a job');
     const jobId = opened.jobId;
 
@@ -97,7 +97,7 @@ describe('openClientReminder', () => {
     const plan = (await withBusiness(B, (db) => loadPlanBody(db, jobId)))?.plan ?? Plan.parse(null);
     const step = plan.steps[0];
     if (step === undefined) throw new Error('no step');
-    const active = await withBusiness(B, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
+    const active = await withBusiness(B, (bdb) => loadActiveCharter(bdb));
     if (active === null) throw new Error('no charter');
     const facts = buildFacts(step.toolName, step.input, {
       provenance: 'boss',
@@ -105,7 +105,7 @@ describe('openClientReminder', () => {
       counterpartyTags: [],
       provenanceChainDerived: false,
     });
-    const covers = await withBusiness(B, (db) => confirmedCommandCovers(facts, { // TENANCY-TODO(task 5)
+    const covers = await withBusiness(B, (db) => confirmedCommandCovers(facts, {
       provenance: 'boss',
       chainDepth: 1,
       counterpartyTags: [],
@@ -119,7 +119,7 @@ describe('openClientReminder', () => {
     expect(covers).toBeNull();
 
     // And the gate, under `ask`, raises the owner's card and sends nothing.
-    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss'));
     const { client, sent, sentNew } = fakeMailboxClient();
     await withBusiness(B, (db) => runDueJobs(db, { runtime: mailboxRuntime(client), now: NOW }));
     expect(sent).toHaveLength(0);
@@ -131,30 +131,30 @@ describe('openClientReminder', () => {
 
   it('reminds an unverified address — it is where the invitation went', async () => {
     const meetingId = await seedMeeting({ verified: false });
-    expect('jobId' in (await openClientReminder({ businessId: B, meetingId }))).toBe(true);
+    expect('jobId' in (await withBusiness(B, (db) => openClientReminder(db, { meetingId })))).toBe(true);
   });
 
   it('skips a meeting with no email, one already reminded, and a charter with no mailbox', async () => {
     const noEmail = await seedMeeting({ email: null });
-    expect(await openClientReminder({ businessId: B, meetingId: noEmail })).toEqual({ skipped: 'no_email' });
+    expect(await withBusiness(B, (db) => openClientReminder(db, { meetingId: noEmail }))).toEqual({ skipped: 'no_email' });
 
     const once = await seedMeeting();
-    expect('jobId' in (await openClientReminder({ businessId: B, meetingId: once }))).toBe(true);
-    expect(await openClientReminder({ businessId: B, meetingId: once })).toEqual({ skipped: 'already' });
+    expect('jobId' in (await withBusiness(B, (db) => openClientReminder(db, { meetingId: once })))).toBe(true);
+    expect(await withBusiness(B, (db) => openClientReminder(db, { meetingId: once }))).toEqual({ skipped: 'already' });
 
     await resetDatabase();
-    charterVersion = (await withBusiness(B, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 5)
-    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
+    charterVersion = (await withBusiness(B, (bdb) => installCharter(bdb, buildCharter()))).charterVersion;
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss'));
     const noMailbox = await seedMeeting();
-    expect(await openClientReminder({ businessId: B, meetingId: noMailbox })).toEqual({ skipped: 'no_mailbox' });
+    expect(await withBusiness(B, (db) => openClientReminder(db, { meetingId: noMailbox }))).toEqual({ skipped: 'no_mailbox' });
     const { rows } = await getPool().query<{ n: string }>('SELECT count(*) AS n FROM jobs WHERE business_id = $1', [B]);
     expect(Number(rows[0]?.n)).toBe(1); // only the meeting's own job
   });
 
   it('under the default off dial opens no job and hands the owner the reminder text', async () => {
-    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'off', 'p_boss')); // TENANCY-TODO(task 5)
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'off', 'p_boss'));
     const meetingId = await seedMeeting();
-    const result = await openClientReminder({ businessId: B, meetingId, location: 'המשרד' });
+    const result = await withBusiness(B, (db) => openClientReminder(db, { meetingId, location: 'המשרד' }));
     expect(result).toEqual({
       draftedForOwner:
         "שלום דני כהן,\nרצינו לוודא שהפגישה ביום ג' 10/11 בשעה 10:00, המשרד, מתאימה לך. אפשר לאשר בהזמנת היומן או להשיב למייל הזה.",

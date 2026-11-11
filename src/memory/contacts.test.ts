@@ -10,7 +10,7 @@ import { listContacts } from './contacts.js';
 const BUSINESS = 'test-business';
 
 async function bossJob(version: string): Promise<string> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version }))); // TENANCY-TODO(task 5)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version })));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -29,17 +29,17 @@ describe('the contacts the resolver may match against', () => {
   });
 
   it('returns a live entity with its name, company and address', async () => {
-    await writeMemory(
+    await withBusiness(BUSINESS, async (db) => writeMemory(
+      db,
       {
         jobId: await bossJob('c1'),
         kind: 'entity',
         subjectKey: 'ronit-cohen-beta-log',
         body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה', email: 'ronit@beta-log.example' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const contacts = await listContacts({ businessId: BUSINESS });
+    const contacts = await withBusiness(BUSINESS, (db) => listContacts(db));
 
     expect(contacts).toHaveLength(1);
     expect(contacts[0]?.name).toBe('רונית כהן');
@@ -59,51 +59,51 @@ describe('the contacts the resolver may match against', () => {
    * ambiguity count would include people the owner was never shown.
    */
   it('skips an entity with no name', async () => {
-    await writeMemory(
+    await withBusiness(BUSINESS, async (db) => writeMemory(
+      db,
       {
         jobId: await bossJob('c2'),
         kind: 'entity',
         subjectKey: 'no-name-entity',
         body: { company: 'חברה בלי איש קשר' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    expect(await listContacts({ businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => listContacts(db))).toEqual([]);
   });
 
   it('skips a retired entity', async () => {
     const jobId = await bossJob('c3');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId,
         kind: 'entity',
         subjectKey: 'gone-entity',
         body: { name: 'מישהו שהיה' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
     // `kind` is required — self-review caught it missing here.
-    await retireMemories(
+    await withBusiness(BUSINESS, (db) => retireMemories(
+      db,
       { kind: 'entity', subjectKey: 'gone-entity', reason: 'בדיקה' },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    expect(await listContacts({ businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => listContacts(db))).toEqual([]);
   });
 
   it('does not return another businesses contacts', async () => {
-    await writeMemory(
+    await withBusiness(BUSINESS, async (db) => writeMemory(
+      db,
       {
         jobId: await bossJob('c4'),
         kind: 'entity',
         subjectKey: 'ours',
         body: { name: 'שלנו' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    expect(await listContacts({ businessId: 'someone-else' })).toEqual([]);
+    expect(await withBusiness('someone-else', (db) => listContacts(db))).toEqual([]);
   });
 
   /**
@@ -114,12 +114,12 @@ describe('the contacts the resolver may match against', () => {
   it('is not capped at the recall ceiling', async () => {
     const jobId = await bossJob('c5');
     for (let i = 0; i < 25; i += 1) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId, kind: 'entity', subjectKey: `contact-${i}`, body: { name: `איש ${i}` } },
-        { businessId: BUSINESS },
-      );
+      ));
     }
 
-    expect(await listContacts({ businessId: BUSINESS })).toHaveLength(25);
+    expect(await withBusiness(BUSINESS, (db) => listContacts(db))).toHaveLength(25);
   });
 });

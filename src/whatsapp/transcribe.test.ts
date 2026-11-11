@@ -35,7 +35,7 @@ function audioMsg(overrides: { seconds?: number } = {}): NormalizedInboundMessag
  * might keep.
  */
 async function seedWhatsappAuditRow(businessId: string, senderKind: SenderKind): Promise<void> {
-  await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+  await withBusiness(businessId, (bdb) => appendAudit(
     bdb,
     {
       actor: 'orchestrator',
@@ -63,9 +63,9 @@ describe('transcribeInbound', () => {
    */
   it('does not let a flood of non-principal audio stop the principal being transcribed', async () => {
     for (let i = 0; i < 20; i += 1) await seedWhatsappAuditRow(BUSINESS, 'other');
-    const other = await transcribeInbound(audioMsg(), 'other', { businessId: BUSINESS, provider: ok });
+    const other = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg(), 'other', { provider: ok }));
     expect(other.status).toBe('capped');
-    const boss = await transcribeInbound(audioMsg(), 'principal', { businessId: BUSINESS, provider: ok });
+    const boss = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg(), 'principal', { provider: ok }));
     expect(boss.status).toBe('transcribed');
   });
 
@@ -76,9 +76,9 @@ describe('transcribeInbound', () => {
    */
   it('counts the cap from audit rows, not from a maintained counter', async () => {
     for (let i = 0; i < 40; i += 1) await seedWhatsappAuditRow(BUSINESS, 'principal');
-    expect(await whatsappTranscriptionsToday('principal', { businessId: BUSINESS })).toBe(40);
+    expect(await withBusiness(BUSINESS, (db) => whatsappTranscriptionsToday(db, 'principal'))).toBe(40);
 
-    const outcome = await transcribeInbound(audioMsg(), 'principal', { businessId: BUSINESS, provider: ok });
+    const outcome = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg(), 'principal', { provider: ok }));
     expect(outcome.status).toBe('capped');
   });
 
@@ -92,7 +92,7 @@ describe('transcribeInbound', () => {
    */
   it('reserves the principal a budget larger than the other-sender cap', async () => {
     for (let i = 0; i < 21; i += 1) await seedWhatsappAuditRow(BUSINESS, 'principal');
-    const outcome = await transcribeInbound(audioMsg(), 'principal', { businessId: BUSINESS, provider: ok });
+    const outcome = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg(), 'principal', { provider: ok }));
     expect(outcome.status).toBe('transcribed');
   });
 
@@ -109,7 +109,7 @@ describe('transcribeInbound', () => {
    * will be named.
    */
   it('does not count an audit row of a different kind toward the transcription budget', async () => {
-    await withBusiness(BUSINESS, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+    await withBusiness(BUSINESS, (bdb) => appendAudit(
       bdb,
       {
         actor: 'orchestrator',
@@ -123,7 +123,7 @@ describe('transcribeInbound', () => {
         reason: 'some other boss-provenance event, not a transcription',
       }
     ));
-    expect(await whatsappTranscriptionsToday('principal', { businessId: BUSINESS })).toBe(0);
+    expect(await withBusiness(BUSINESS, (db) => whatsappTranscriptionsToday(db, 'principal'))).toBe(0);
   });
 
   /**
@@ -133,9 +133,8 @@ describe('transcribeInbound', () => {
    * because `maxSeconds: 5` is actually read.
    */
   it('refuses audio longer than the cap, and says how long it was', async () => {
-    const outcome = await transcribeInbound(audioMsg({ seconds: 10 }), 'principal', {
-      businessId: BUSINESS, provider: ok, maxSeconds: 5,
-    });
+    const outcome = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg({ seconds: 10 }), 'principal', { provider: ok, maxSeconds: 5,
+    }));
     expect(outcome).toEqual({ status: 'too_long', seconds: 10 });
   });
 
@@ -151,9 +150,8 @@ describe('transcribeInbound', () => {
    * ordinary 10.
    */
   it('refuses audio whose download exceeds the byte cap, independent of its reported duration', async () => {
-    const outcome = await transcribeInbound(audioMsg({ seconds: 10 }), 'principal', {
-      businessId: BUSINESS, provider: ok, maxBytes: 5,
-    });
+    const outcome = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg({ seconds: 10 }), 'principal', { provider: ok, maxBytes: 5,
+    }));
     expect(outcome).toEqual({ status: 'too_large', bytes: 'fake-audio-bytes'.length });
   });
 
@@ -175,7 +173,7 @@ describe('transcribeInbound', () => {
       mimeType: 'audio/ogg',
       seconds: 10,
     });
-    const outcome = await transcribeInbound(msg, 'principal', { businessId: BUSINESS, provider: ok });
+    const outcome = await withBusiness(BUSINESS, (db) => transcribeInbound(db, msg, 'principal', { provider: ok }));
     expect(outcome.status).toBe('too_large');
   });
 
@@ -201,19 +199,17 @@ describe('transcribeInbound', () => {
     const msg = audioMsg();
     msg.downloadAudio = () => new Promise(() => { /* never settles */ });
     await expect(
-      transcribeInbound(msg, 'principal', {
-        businessId: BUSINESS,
+      withBusiness(BUSINESS, (db) => transcribeInbound(db, msg, 'principal', {
         provider: ok,
         downloadTimeoutMs: 25,
-      }),
+      })),
     ).rejects.toThrow(/did not finish within/);
   });
 
   /** Never guesses. A failed transcription is a failure, not a best-effort string. */
   it('reports failure rather than inventing text when the provider throws', async () => {
-    const outcome = await transcribeInbound(audioMsg(), 'principal', {
-      businessId: BUSINESS, provider: async () => { throw new Error('upstream 503'); },
-    });
+    const outcome = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg(), 'principal', { provider: async () => { throw new Error('upstream 503'); },
+    }));
     expect(outcome.status).toBe('failed');
   });
 
@@ -223,9 +219,8 @@ describe('transcribeInbound', () => {
    * this must still be read as a failure rather than reported as text.
    */
   it('reports failure rather than transcribing empty or whitespace-only text', async () => {
-    const outcome = await transcribeInbound(audioMsg(), 'principal', {
-      businessId: BUSINESS, provider: async () => ({ text: '   ' }),
-    });
+    const outcome = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg(), 'principal', { provider: async () => ({ text: '   ' }),
+    }));
     expect(outcome.status).toBe('failed');
   });
 
@@ -235,10 +230,9 @@ describe('transcribeInbound', () => {
    * one, the same reasoning `recordCurationFailure` is built on.
    */
   it('writes an audit row on the failure path too', async () => {
-    await transcribeInbound(audioMsg(), 'principal', {
-      businessId: BUSINESS, provider: async () => { throw new Error('upstream 503'); },
-    });
-    expect(await whatsappTranscriptionsToday('principal', { businessId: BUSINESS })).toBe(1);
+    await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg(), 'principal', { provider: async () => { throw new Error('upstream 503'); },
+    }));
+    expect(await withBusiness(BUSINESS, (db) => whatsappTranscriptionsToday(db, 'principal'))).toBe(1);
   });
 
   /**
@@ -251,11 +245,10 @@ describe('transcribeInbound', () => {
    * `adapterTimeoutMs` already uses in `src/orchestrator/external.test.ts`.
    */
   it('gives up on a provider that never settles, within the deadline, instead of hanging forever', async () => {
-    const outcome = await transcribeInbound(audioMsg(), 'principal', {
-      businessId: BUSINESS,
+    const outcome = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg(), 'principal', {
       provider: () => new Promise(() => { /* never settles */ }),
       timeoutMs: 25,
-    });
+    }));
     expect(outcome.status).toBe('failed');
   });
 
@@ -271,11 +264,11 @@ describe('transcribeInbound', () => {
    */
   it('writes an audit row carrying counts and the sender kind only', async () => {
     const msg = audioMsg({ seconds: 10 });
-    const outcome = await transcribeInbound(msg, 'principal', { businessId: BUSINESS, provider: ok });
+    const outcome = await withBusiness(BUSINESS, (db) => transcribeInbound(db, msg, 'principal', { provider: ok }));
     expect(outcome.status).toBe('transcribed');
     if (outcome.status !== 'transcribed') throw new Error('unreachable');
 
-    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'whatsapp_transcription' })); // TENANCY-TODO(task 5)
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'whatsapp_transcription' }));
     expect(entries).toHaveLength(1);
     const entry = entries[0];
     expect(entry?.provenance).toBe('boss');
@@ -295,10 +288,10 @@ describe('transcribeInbound', () => {
   /** The two budgets are independent per business, same as every other cap here. */
   it('confines each business to its own daily budget', async () => {
     for (let i = 0; i < 20; i += 1) await seedWhatsappAuditRow(BUSINESS, 'other');
-    const sameBusiness = await transcribeInbound(audioMsg(), 'other', { businessId: BUSINESS, provider: ok });
+    const sameBusiness = await withBusiness(BUSINESS, (db) => transcribeInbound(db, audioMsg(), 'other', { provider: ok }));
     expect(sameBusiness.status).toBe('capped');
 
-    const otherBusiness = await transcribeInbound(audioMsg(), 'other', { businessId: 'other-business', provider: ok });
+    const otherBusiness = await withBusiness('other-business', (db) => transcribeInbound(db, audioMsg(), 'other', { provider: ok }));
     expect(otherBusiness.status).toBe('transcribed');
   });
 });

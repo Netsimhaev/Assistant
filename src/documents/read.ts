@@ -39,11 +39,10 @@
  * propagates, because that is not a property of the document.
  */
 
-import { withBusiness } from '../db/pool.js';
 import { createHash } from 'node:crypto';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { Reading } from '../domain/reading.js';
 import type { TrustLevel } from '../domain/trust.js';
@@ -75,8 +74,6 @@ export interface ReadDocumentInput {
 }
 
 export interface ReadDocumentOptions {
-  businessId?: string;
-  db?: Queryable;
   documentRoot?: string;
   /**
    * The one step that costs money, injectable so the composition can be tested
@@ -115,17 +112,15 @@ function hashBrief(brief: string): string {
 }
 
 export async function readDocument(
+  db: BusinessDb,
   input: ReadDocumentInput,
   options: ReadDocumentOptions = {},
 ): Promise<ReadDocumentResult> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const documentRoot = options.documentRoot ?? config.documentRoot;
   const reader = options.reader ?? runKnowReader;
 
-  const artifacts = await loadArtifacts(input.documentId, {
-    businessId,
-    ...(options.db !== undefined ? { db: options.db } : {}),
-  });
+  const artifacts = await loadArtifacts(db, input.documentId);
   if (artifacts.length === 0) {
     // Not a failed reading — there was nothing to read. Storing an
     // `unreadable` row here would blame the reader for the extractor's
@@ -138,7 +133,7 @@ export async function readDocument(
     // which is the cache lookup, not just the model call. See this module's
     // header.
     const jobId = input.jobId;
-    const matched = await withBusiness(businessId, (db) => markContentIngested(db, jobId)); // TENANCY-TODO(task 5)
+    const matched = await markContentIngested(db, jobId);
     // Fail closed on a zero-row match, for the reason `src/sdk/gate-hook.ts`
     // records at its own call site: `jobId` and `businessId` arrive here as
     // two independent caller-supplied fields, not read off a job row already
@@ -166,6 +161,7 @@ export async function readDocument(
   const briefHash = hashBrief(brief);
 
   const cached = await findReadingForBrief(
+    db,
     input.documentId,
     briefHash,
     READING_PROMPT_VERSION,
@@ -174,7 +170,6 @@ export async function readDocument(
     // a cache that ignored it would hand back a reading stamped `boss` for
     // material that arrived as `unknown_external` (migration 014).
     input.provenance,
-    { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
   );
   // A cache hit ran no tools of its own, so its denial list is empty as a
   // fact and not as an omission.
@@ -190,6 +185,7 @@ export async function readDocument(
   });
 
   const { record } = await saveReading(
+    db,
     {
       readingId: `RDG-${ulid()}`,
       documentId: input.documentId,
@@ -204,7 +200,6 @@ export async function readDocument(
       promptVersion: READING_PROMPT_VERSION,
       briefHash,
     },
-    { businessId, ...(options.db !== undefined ? { db: options.db } : {}) },
   );
 
   return fromRecord(record, false, outcome.denials);

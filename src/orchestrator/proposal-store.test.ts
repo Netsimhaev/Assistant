@@ -25,17 +25,17 @@ const PROPOSAL: Proposal = {
 
 async function aReading(): Promise<string> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument({
+  await withBusiness(BUSINESS, (db) => insertOrGetDocument(db, {
     documentId, source: 'manual', originalName: 'x.txt', mediaType: 'text/plain',
     sha256: ulid().padEnd(64, '0'), byteSize: 10,
     storedPath: `${BUSINESS}/${documentId}/original.txt`,
-  }, { businessId: BUSINESS });
-  const { record } = await saveReading({
+  }));
+  const { record } = await withBusiness(BUSINESS, (db) => saveReading(db, {
     readingId: `RDG-${ulid()}`, documentId, status: 'read', reason: null,
     content: { summary: 's', findings: [], intents: [{ intent: 'no_action', subject: { kind: 'sender' }, sourceRef: SOURCE, note: '' }], unreadable: [] },
     provenance: 'unknown_external', model: 'haiku', promptVersion: 'v1',
     briefHash: 'a'.repeat(64),
-  }, { businessId: BUSINESS });
+  }));
   return record.readingId;
 }
 

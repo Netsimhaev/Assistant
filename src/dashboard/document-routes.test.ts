@@ -22,7 +22,7 @@ import { attachedDocumentsForJob } from '../governance/instructions.js';
 import { buildDeliveryOptions, createDocumentCard, loadDocumentCard, typedAddressProblem } from '../production/card.js';
 import { advanceStage, createProduction, loadProduction, loadVersion, saveVersion, saveVersionCheck, type ProductionDestination } from '../production/store.js';
 import type { PlanOutcome, PlanRequest } from '../sdk/planner.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createOwner } from './auth.js';
 import { createServer, type DashboardOptions } from './server.js';
@@ -114,8 +114,7 @@ async function card(
   options: { destination?: ProductionDestination; stage?: 'ready' | 'failed_checks'; preview?: Buffer } = {},
 ): Promise<{ cardId: string; versionId: string; productionId: string; bytes: Buffer; path: string }> {
   seq += 1;
-  const productionId = await createProduction({
-    businessId: B,
+  const productionId = await withBusiness(B, (db) => createProduction(db, {
     originJobId: 'J-origin',
     instructionText: 'תכיני הצעת מחיר ותשלחי ל-dana@example.com',
     textOrigin: 'typed',
@@ -124,15 +123,15 @@ async function card(
     kind: 'letter',
     destination: options.destination ?? { mode: 'send', to: ['dana@example.com'] },
     sourceDocumentIds: [],
-  });
+  }));
   const bytes = Buffer.from(`docx bytes ${productionId} ${seq}`);
   const storedPath = `${DIR}/${productionId}.docx`;
   // Under the dashboard's own document root (M7): the download reads from
   // the root the server was given, never a second one.
   await mkdir(join(uploadRoot, DIR), { recursive: true });
   await writeFile(join(uploadRoot, storedPath), bytes);
-  const versionId = await saveVersion({ productionId, versionNo: 1, spec, storedPath, sha256: sha(bytes), sizeBytes: bytes.length });
-  await saveVersionCheck(versionId, 'check1', { passed: true, findings: [] });
+  const versionId = await withBusiness(TEST_BUSINESS, (db) => saveVersion(db, { productionId, versionNo: 1, spec, storedPath, sha256: sha(bytes), sizeBytes: bytes.length }));
+  await withBusiness(TEST_BUSINESS, (db) => saveVersionCheck(db, versionId, 'check1', { passed: true, findings: [] }));
   let previewPath: string | null = null;
   if (options.preview !== undefined) {
     // Under the dashboard's own document root — the root the production
@@ -141,13 +140,13 @@ async function card(
     await mkdir(join(uploadRoot, DIR), { recursive: true });
     await writeFile(join(uploadRoot, previewPath), options.preview);
   }
-  await saveVersionCheck(versionId, 'check2', { passed: options.stage !== 'failed_checks', status: 'judged', findings: [], previewPath });
-  expect(await advanceStage(productionId, 'queued', options.stage ?? 'ready', {
+  await withBusiness(TEST_BUSINESS, (db) => saveVersionCheck(db, versionId, 'check2', { passed: options.stage !== 'failed_checks', status: 'judged', findings: [], previewPath }));
+  expect(await withBusiness(TEST_BUSINESS, (db) => advanceStage(db, productionId, 'queued', options.stage ?? 'ready', {
     ...(options.stage === 'failed_checks'
       ? { findings: [{ check: 'check1' as const, code: 'ungrounded_number', where: 'p1', he: 'מספר שלא נמצא במקור' }] }
       : {}),
-  })).toBe(true);
-  const created = await createDocumentCard(versionId, { businessId: B });
+  }))).toBe(true);
+  const created = await withBusiness(B, (db) => createDocumentCard(db, versionId));
   return { cardId: created.cardId, versionId, productionId, bytes, path: join(uploadRoot, storedPath) };
 }
 
@@ -300,11 +299,11 @@ describe('/documents', () => {
     const a = await card();
     const baseUrl = await start();
     const cookie = await login(baseUrl);
-    expect((await loadDocumentCard(B, a.cardId))?.seenAt).toBe(null);
+    expect((await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))?.seenAt).toBe(null);
     const html = await (await get(baseUrl, cookie, '/documents')).text();
     expect(html).toContain('הצעת מחיר לאלפא');
     expect(html).toContain(`/documents/${a.cardId}`);
-    expect((await loadDocumentCard(B, a.cardId))?.seenAt).not.toBe(null);
+    expect((await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))?.seenAt).not.toBe(null);
   });
 
   it('the card shows both checks, the full echo of every option, and the buttons', async () => {
@@ -358,24 +357,24 @@ describe('/documents', () => {
 
   it('approve without CSRF is refused', async () => {
     const a = await card();
-    const option = (await loadDocumentCard(B, a.cardId))!.deliveryPlans[0]!;
+    const option = (await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))!.deliveryPlans[0]!;
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const res = await post(baseUrl, cookie, `/documents/${a.cardId}/approve`, { planHash: option.planHash, csrf: 'forged' });
     expect(res.status).toBe(403);
-    expect((await loadDocumentCard(B, a.cardId))?.state).toBe('open');
+    expect((await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))?.state).toBe('open');
     expect(await deliveryJobs()).toBe(0);
   });
 
   it('approve with CSRF and a shown plan hash creates the delivery job', async () => {
     const a = await card();
-    const option = (await loadDocumentCard(B, a.cardId))!.deliveryPlans.find((o) => o.option === 'send')!;
+    const option = (await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))!.deliveryPlans.find((o) => o.option === 'send')!;
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const csrf = await csrfOf(baseUrl, cookie, `/documents/${a.cardId}`);
     const res = await post(baseUrl, cookie, `/documents/${a.cardId}/approve`, { planHash: option.planHash, csrf });
     expect(res.status).toBe(303);
-    expect((await loadDocumentCard(B, a.cardId))?.state).toBe('approved');
+    expect((await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))?.state).toBe('approved');
     expect(await deliveryJobs()).toBe(1);
   });
 
@@ -387,7 +386,7 @@ describe('/documents', () => {
     const res = await post(baseUrl, cookie, `/documents/${a.cardId}/approve`, { to: 'evil@x.example', planHash: 'nothing', csrf });
     expect(res.status).toBe(409);
     expect(await deliveryJobs()).toBe(0);
-    expect((await loadProduction(B, a.productionId))?.destination).toEqual({ mode: 'send', to: [] });
+    expect((await withBusiness(B, (db) => loadProduction(db, a.productionId)))?.destination).toEqual({ mode: 'send', to: [] });
   });
 
   it('failed_checks card has no send button and the approve route refuses send', async () => {
@@ -401,14 +400,14 @@ describe('/documents', () => {
     expect(html).toContain('המסמך לא עבר את הבדיקות');
 
     // The send plan the card would have offered had the version passed.
-    const production = (await loadProduction(B, a.productionId))!;
-    const version = (await loadVersion(B, a.versionId))!;
+    const production = (await withBusiness(B, (db) => loadProduction(db, a.productionId)))!;
+    const version = (await withBusiness(B, (db) => loadVersion(db, a.versionId)))!;
     const send = buildDeliveryOptions({ ...production, stage: 'ready' }, version, 'ready').find((o) => o.option === 'send')!;
     const csrf = await csrfOf(baseUrl, cookie, `/documents/${a.cardId}`);
     const res = await post(baseUrl, cookie, `/documents/${a.cardId}/approve`, { planHash: send.planHash, csrf });
     expect(res.status).toBe(409);
     expect(await deliveryJobs()).toBe(0);
-    expect((await loadDocumentCard(B, a.cardId))?.state).toBe('open');
+    expect((await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))?.state).toBe('open');
   });
 
   it('C12: a send card with no authorised recipient takes a typed address and then offers it', async () => {
@@ -422,11 +421,11 @@ describe('/documents', () => {
     const csrf = await csrfOf(baseUrl, cookie, `/documents/${a.cardId}`);
     const bad = await post(baseUrl, cookie, `/documents/${a.cardId}/address`, { to: 'not an address', csrf });
     expect(bad.status).toBe(400);
-    expect((await loadDocumentCard(B, a.cardId))?.deliveryPlans.some((o) => o.option === 'send')).toBe(false);
+    expect((await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))?.deliveryPlans.some((o) => o.option === 'send')).toBe(false);
 
     const res = await post(baseUrl, cookie, `/documents/${a.cardId}/address`, { to: 'yossi@client.example', csrf });
     expect(res.status).toBe(303);
-    const after = (await loadDocumentCard(B, a.cardId))!;
+    const after = (await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))!;
     const send = after.deliveryPlans.find((o) => o.option === 'send')!;
     expect(send.plan.steps[0]?.input).toMatchObject({ to: ['yossi@client.example'] });
     // Nothing approved yet: the owner presses the new option like any other.
@@ -443,7 +442,7 @@ describe('/documents', () => {
     const cookie = await login(baseUrl);
     const res = await post(baseUrl, cookie, `/documents/${a.cardId}/address`, { to: 'yossi@client.example', csrf: 'forged' });
     expect(res.status).toBe(403);
-    expect((await loadProduction(B, a.productionId))?.destination).toEqual({ mode: 'send', to: [] });
+    expect((await withBusiness(B, (db) => loadProduction(db, a.productionId)))?.destination).toEqual({ mode: 'send', to: [] });
   });
 
   it('a fix request opens a new production and supersedes the card', async () => {
@@ -453,7 +452,7 @@ describe('/documents', () => {
     const csrf = await csrfOf(baseUrl, cookie, `/documents/${a.cardId}`);
     const res = await post(baseUrl, cookie, `/documents/${a.cardId}/fix`, { text: 'להוסיף מע"מ', csrf });
     expect(res.status).toBe(303);
-    expect((await loadDocumentCard(B, a.cardId))?.state).toBe('superseded');
+    expect((await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))?.state).toBe('superseded');
     const { rows } = await getPool().query<{ n: string }>('SELECT count(*)::text AS n FROM document_productions');
     expect(rows[0]?.n).toBe('2');
   });
@@ -573,6 +572,6 @@ describe('fix round 1 minors', () => {
     expect(await list.text()).toContain('לא הצלחתי לקרוא את התקנון');
     const one = await get(baseUrl, cookie, `/documents/${a.cardId}`);
     expect(one.status).toBe(503);
-    expect((await loadDocumentCard(B, a.cardId))?.seenAt).toBe(null);
+    expect((await withBusiness(B, (db) => loadDocumentCard(db, a.cardId)))?.seenAt).toBe(null);
   });
 });

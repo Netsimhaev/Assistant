@@ -39,7 +39,7 @@
  * negative test can prove the code ran.
  */
 import { monotonicFactory } from 'ulid';
-import { getPool, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import type { LedgerFamily, LedgerItem } from '../domain/ledger.js';
 import { NOTIFY_TIMEOUT_MS } from '../governance/notify.js';
 import { domainMatches, extractDomain } from '../util/address.js';
@@ -47,7 +47,7 @@ import type { BossMessenger } from '../whatsapp/messenger.js';
 import { deliver, type LedgerChannelState } from './pass.js';
 import { renderEvidenceNotice, type EvidenceNoticeFacts } from './render.js';
 import { loadLedgerSettings } from './settings.js';
-import { atomically, listLedgerItems, moveLedgerStatus } from './store.js';
+import { listLedgerItems, moveLedgerStatus } from './store.js';
 
 const ulid = monotonicFactory();
 
@@ -71,12 +71,10 @@ export interface EvidenceResult {
 }
 
 export interface EvidenceOptions {
-  businessId: string;
   sendAlert?: (subject: string, body: string) => Promise<{ ok: boolean; error?: string }>;
   /** Accepted for symmetry with the pass; never used — WhatsApp goes through the pass's batch. */
   messenger?: BossMessenger;
   dashboardBaseUrl?: string;
-  db?: Queryable;
   timeoutMs?: number;
   /** @internal Test seam: runs between finding the match and the claim+move. */
   beforeMove?: (itemId: string) => Promise<void>;
@@ -89,7 +87,7 @@ interface MailRow {
 }
 
 /** The earliest mail that is evidence for `item`, or null. */
-async function findEvidence(db: Queryable, item: LedgerItem): Promise<MailRow | null> {
+async function findEvidence(db: BusinessDb, item: LedgerItem): Promise<MailRow | null> {
   // Only a VERIFIED address is evidence (security review S1): an unverified
   // one may have come from a memory a stranger's document wrote, and a mail
   // from it would close the owner's item. Unverified → the vouched domain,
@@ -122,18 +120,17 @@ async function findEvidence(db: Queryable, item: LedgerItem): Promise<MailRow | 
   return null;
 }
 
-export async function closeLedgerByEvidence(o: EvidenceOptions): Promise<EvidenceResult> {
-  const { businessId } = o;
-  const db = o.db ?? getPool();
+export async function closeLedgerByEvidence(db: BusinessDb, o: EvidenceOptions = {}): Promise<EvidenceResult> {
+  const businessId = db.businessId;
   const timeoutMs = o.timeoutMs ?? NOTIFY_TIMEOUT_MS;
   const result: EvidenceResult = { closed: [], skipped: 0, considered: 0, errored: [], notices: [] };
-  const settings = await loadLedgerSettings({ businessId, db });
+  const settings = await loadLedgerSettings(db);
   const link =
     o.dashboardBaseUrl !== undefined && o.dashboardBaseUrl.length > 0
       ? `${o.dashboardBaseUrl.replace(/\/+$/, '')}/ledger`
       : null;
 
-  const items = (await listLedgerItems({ businessId, db, statuses: ['open'] })).filter((i) =>
+  const items = (await listLedgerItems(db, { statuses: ['open'] })).filter((i) =>
     EVIDENCE_FAMILIES.includes(i.family),
   );
 
@@ -147,7 +144,7 @@ export async function closeLedgerByEvidence(o: EvidenceOptions): Promise<Evidenc
       const facts: EvidenceNoticeFacts = { description: item.description, from: mail.from_address, subject: mail.subject };
       const text = renderEvidenceNotice(facts, 'email');
       const slot = `evidence:${mail.mail_id}`;
-      const reminderId = await atomically(o.db, async (tx) => {
+      const reminderId = await transaction(db, async (tx) => {
         const inserted = await tx.query<{ reminder_id: string }>(
           `INSERT INTO ledger_reminders (reminder_id, business_id, item_id, slot, kind, body)
            VALUES ($1, $2, $3, $4, 'evidence', $5)
@@ -158,11 +155,11 @@ export async function closeLedgerByEvidence(o: EvidenceOptions): Promise<Evidenc
         const id = inserted.rows[0]?.reminder_id;
         if (id === undefined) return null;
         const moved = await moveLedgerStatus(
+          tx,
           item.itemId,
           ['open'],
           'closed_by_evidence',
           { kind: 'closed_by_evidence', by: 'evidence', mailId: mail.mail_id },
-          { businessId, db: tx },
         );
         if (!moved) {
           await tx.query(`DELETE FROM ledger_reminders WHERE reminder_id = $1 AND business_id = $2`, [id, businessId]);

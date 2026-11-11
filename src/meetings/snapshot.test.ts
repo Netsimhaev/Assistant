@@ -1,8 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CalendarAccess } from '../calendar/client-for.js';
 import type { CalendarClient, CalendarEvent, CalendarInfo } from '../calendar/types.js';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import { busyIntervals } from './free-time.js';
 import { MEETING_DEFAULTS } from './settings.js';
 import { loadCalendarRange, SNAPSHOT_MAX_EVENTS } from './snapshot.js';
@@ -41,7 +41,7 @@ describe('loadCalendarRange', () => {
   it('reads every calendar when the read set is empty, ORs truncation, shrinks the budget', async () => {
     const seen: string[] = [];
     const a = access([cal('a'), cal('b')], { a: [event('a', 'x', '2026-11-10T08:00:00Z', '2026-11-10T09:00:00Z')], b: [] }, seen);
-    const r = await loadCalendarRange({ ...base, access: a, settings: settings([]) });
+    const r = await withBusiness(TEST_BUSINESS, (db) => loadCalendarRange(db, { ...base, access: a, settings: settings([]) }));
     if ('failure' in r) throw new Error('unexpected');
     expect(seen).toEqual([`a:${SNAPSHOT_MAX_EVENTS}`, `b:${SNAPSHOT_MAX_EVENTS - 1}`]);
     expect(r.truncated).toBe(true);
@@ -49,7 +49,7 @@ describe('loadCalendarRange', () => {
 
   it('reads only chosen calendars and skips an id no longer in the account', async () => {
     const seen: string[] = [];
-    const r = await loadCalendarRange({ ...base, access: access([cal('a'), cal('b')], {}, seen), settings: settings(['b', 'gone']) });
+    const r = await withBusiness(TEST_BUSINESS, (db) => loadCalendarRange(db, { ...base, access: access([cal('a'), cal('b')], {}, seen), settings: settings(['b', 'gone']) }));
     if ('failure' in r) throw new Error('unexpected');
     expect(seen).toHaveLength(1);
     expect(r.calendars.map((c) => c.calendarId)).toEqual(['b']);
@@ -60,7 +60,7 @@ describe('loadCalendarRange', () => {
       listCalendars: async () => [cal('a')],
       listEvents: async () => ({ failure: 'auth', status: 401, message: 'no' }),
     } as unknown as CalendarClient;
-    const r = await loadCalendarRange({ ...base, access: { client, token: 't', provider: 'google' }, settings: settings([]) });
+    const r = await withBusiness(TEST_BUSINESS, (db) => loadCalendarRange(db, { ...base, access: { client, token: 't', provider: 'google' }, settings: settings([]) }));
     expect(r).toMatchObject({ failure: 'auth' });
   });
 
@@ -71,7 +71,7 @@ describe('loadCalendarRange', () => {
               ('h2',$1,'j','a','ev-r','2026-11-10T10:00:00Z','2026-11-10T11:00:00Z','released')`,
       [BUSINESS],
     );
-    const r = await loadCalendarRange({ ...base, access: access([cal('a')], {}), settings: settings([]) });
+    const r = await withBusiness(TEST_BUSINESS, (db) => loadCalendarRange(db, { ...base, access: access([cal('a')], {}), settings: settings([]) }));
     if ('failure' in r) throw new Error('unexpected');
     expect(r.holds).toEqual([{ start: '2026-11-10T08:00:00.000Z', end: '2026-11-10T09:00:00.000Z', eventId: 'ev-h' }]);
     expect(busyIntervals(r, 0)).toEqual([{ start: Date.parse('2026-11-10T08:00:00Z'), end: Date.parse('2026-11-10T09:00:00Z') }]);

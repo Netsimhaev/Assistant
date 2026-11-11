@@ -48,7 +48,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const mail = await getMail(mailId, { businessId: config.businessId });
+  const mail = await withBusiness(config.businessId, (db) => getMail(db, mailId)); // TENANCY-TODO(task 7)
   if (mail === null) {
     console.error(`לא נמצא מייל במזהה ${mailId} בעסק ${config.businessId}.`);
     process.exitCode = 1;
@@ -69,7 +69,7 @@ async function main(): Promise<void> {
   if (mail.bodyText === '') console.log('(גוף ההודעה נמחק במדיניות השמירה — הסיווג רץ על הנושא בלבד)');
 
   // Reads the documents the poll pass already ingested; ingests nothing.
-  const entries = await attachmentEntries(mail, new Map(), config.businessId);
+  const entries = await withBusiness(config.businessId, (db) => attachmentEntries(db, mail, new Map())); // TENANCY-TODO(task 7)
   const briefAttachments = entries.map((e) => e.brief);
   const outcome = await runMailTriage({ bundle, mail, attachments: briefAttachments });
   if (outcome.status !== 'read') {

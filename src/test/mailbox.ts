@@ -91,7 +91,7 @@ export function incomingMail(overrides: Partial<IncomingMail> = {}): IncomingMai
 }
 
 export async function storedMail(businessId: string, overrides: Partial<IncomingMail> = {}): Promise<StoredMail> {
-  const mail = await recordIncoming(incomingMail(overrides), { businessId });
+  const mail = await withBusiness(businessId, (db) => recordIncoming(db, incomingMail(overrides)));
   if (mail === null) throw new Error('duplicate mail in test setup');
   return mail;
 }
@@ -127,7 +127,8 @@ export function fakeMailboxClient(results: SendResult[] = [{ externalId: 'SENT-1
 export function mailboxRuntime(client: MailboxClient): Runtime {
   return {
     registry: new AdapterRegistry([
-      createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client, replyTargets: replyTargetFor }),
+      createMailboxSendAdapter({ system: 'mailbox', provider: 'google', client, replyTargets: (businessId, internetMessageId, providerMessageId) =>
+        withBusiness(businessId, (db) => replyTargetFor(db, internetMessageId, providerMessageId)) }),
     ]),
     credentials: envCredentials({ [`${PREFIX}OAUTH_MAILBOX`]: 'access-token' }, PREFIX),
     warnings: [],

@@ -221,8 +221,7 @@ export async function closeVerifiedJobs(
         // It cannot fail the job: `curateJob` swallows its own errors and
         // reports them, because a job that did its work must not be
         // stranded by a model that did not answer.
-        const curation = await curateJob(jobId, {
-          businessId,
+        const curation = await curateJob(db, jobId, {
           ...(options.curator ? { curator: options.curator } : {}),
         });
         if (curation.ran) {

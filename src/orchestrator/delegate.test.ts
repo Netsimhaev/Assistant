@@ -111,7 +111,8 @@ async function seedAncestor(envelope: AgentEnvelope, childJobId: string): Promis
 
 async function anExtractedDocument(text: string): Promise<string> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument(
+  await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -121,13 +122,12 @@ async function anExtractedDocument(text: string): Promise<string> {
       byteSize: text.length,
       storedPath: `${BUSINESS}/${documentId}/original.txt`,
     },
-    { businessId: BUSINESS },
-  );
-  await markExtracted(
+  ));
+  await withBusiness(BUSINESS, (db) => markExtracted(
+    db,
     documentId,
     [{ ordinal: 0, kind: 'text', partName: 'גוף', content: { blocks: [{ kind: 'paragraph', text }] }, flags: [] }],
-    { businessId: BUSINESS },
-  );
+  ));
   return documentId;
 }
 

@@ -4,7 +4,7 @@
  * the numbered batch the owner actually received.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, type Queryable } from '../db/pool.js';
+import { closePool, getPool, type BusinessDb, type Queryable, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { recordInbound } from '../whatsapp/store.js';
@@ -60,24 +60,24 @@ function base(over: Partial<NewLedgerItem> = {}): NewLedgerItem {
 }
 
 async function item(over: Partial<NewLedgerItem> = {}): Promise<string> {
-  return (await createLedgerItem(base(over), { businessId: B, by: 'test' })).itemId;
+  return (await withBusiness(B, (db) => createLedgerItem(db, base(over), { by: 'test' }))).itemId;
 }
 
 async function load(itemId: string) {
-  const it = await loadLedgerItem(itemId, { businessId: B });
+  const it = await withBusiness(B, (db) => loadLedgerItem(db, itemId));
   if (it === null) throw new Error('missing item');
   return it;
 }
 
 async function kinds(itemId: string): Promise<string[]> {
-  return (await listLedgerEvents(itemId, { businessId: B })).map((e) => e.kind);
+  return (await withBusiness(B, (db) => listLedgerEvents(db, itemId))).map((e) => e.kind);
 }
 
 const APPLY = { businessId: B, by: 'owner', now: NOW, timeZone: TZ };
 
 beforeEach(async () => {
   await resetDatabase();
-  await saveLedgerSettings({ ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes } }, { businessId: B, updatedBy: 'owner' });
+  await withBusiness(B, (db) => saveLedgerSettings(db, { ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes } }, { updatedBy: 'owner' }));
 });
 
 afterAll(async () => {
@@ -187,23 +187,23 @@ describe('the ledger words are disjoint from every other WhatsApp answer', () =>
 describe('applyLedgerCommand', () => {
   it('done moves an open item to done with a done event by the actor', async () => {
     const id = await item();
-    expect(await applyLedgerCommand(id, { kind: 'done', n: null }, APPLY)).toBe('applied');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'done', n: null }, APPLY))).toBe('applied');
     expect((await load(id)).status).toBe('done');
-    const events = await listLedgerEvents(id, { businessId: B });
+    const events = await withBusiness(B, (db) => listLedgerEvents(db, id));
     expect(events.at(-1)).toMatchObject({ kind: 'done', byWhom: 'owner' });
   });
 
   it('done on an already-done item is not applicable and writes nothing', async () => {
     const id = await item();
-    await applyLedgerCommand(id, { kind: 'done', n: null }, APPLY);
+    await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'done', n: null }, APPLY));
     const before = await kinds(id);
-    expect(await applyLedgerCommand(id, { kind: 'done', n: null }, APPLY)).toBe('not_applicable');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'done', n: null }, APPLY))).toBe('not_applicable');
     expect(await kinds(id)).toEqual(before);
   });
 
   it('an item of another business is not applicable', async () => {
     const id = await item();
-    expect(await applyLedgerCommand(id, { kind: 'done', n: null }, { ...APPLY, businessId: 'other' })).toBe(
+    expect(await withBusiness('other', (db) => applyLedgerCommand(db, id, { kind: 'done', n: null }, { ...APPLY }))).toBe(
       'not_applicable',
     );
     expect((await load(id)).status).toBe('open');
@@ -212,7 +212,11 @@ describe('applyLedgerCommand', () => {
   it('a status moved between the read and the conditional update is a lost race', async () => {
     const id = await item();
     let raced = false;
-    const db: Queryable = {
+    // `inTransaction: true`: the store joins instead of issuing BEGIN on a
+    // pool, the way the old `atomically` used a caller's client as is.
+    const db: BusinessDb = {
+      businessId: B,
+      inTransaction: true,
       query: (async (text: string, params?: unknown[]) => {
         if (!raced && typeof text === 'string' && text.trimStart().startsWith('UPDATE ledger_items')) {
           raced = true;
@@ -221,14 +225,14 @@ describe('applyLedgerCommand', () => {
         return getPool().query(text, params);
       }) as Queryable['query'],
     };
-    expect(await applyLedgerCommand(id, { kind: 'done', n: null }, { ...APPLY, db })).toBe('lost_race');
+    expect(await applyLedgerCommand(db, id, { kind: 'done', n: null }, { ...APPLY })).toBe('lost_race');
     expect(raced).toBe(true);
     expect((await load(id)).status).toBe('cancelled');
   });
 
   it('cancel moves to cancelled', async () => {
     const id = await item();
-    expect(await applyLedgerCommand(id, { kind: 'cancel', n: null }, APPLY)).toBe('applied');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'cancel', n: null }, APPLY))).toBe('applied');
     expect((await load(id)).status).toBe('cancelled');
     expect(await kinds(id)).toContain('cancelled');
   });
@@ -237,30 +241,30 @@ describe('applyLedgerCommand', () => {
     const id = await item();
     const past = new Date('2026-01-01T00:00:00Z');
     await getPool().query(`UPDATE ledger_items SET evidence_after = $2 WHERE item_id = $1`, [id, past]);
-    await moveLedgerStatus(id, ['open'], 'closed_by_evidence', { kind: 'closed_by_evidence', by: 'system' }, { businessId: B });
-    expect(await applyLedgerCommand(id, { kind: 'reopen', n: null }, APPLY)).toBe('applied');
+    await withBusiness(B, (db) => moveLedgerStatus(db, id, ['open'], 'closed_by_evidence', { kind: 'closed_by_evidence', by: 'system' }));
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'reopen', n: null }, APPLY))).toBe('applied');
     const after = await load(id);
     expect(after.status).toBe('open');
     expect(after.closedAt).toBeNull();
     expect(after.evidenceAfter.getTime()).toBeGreaterThan(past.getTime());
     expect(await kinds(id)).toContain('reopened');
-    expect(await applyLedgerCommand(id, { kind: 'reopen', n: null }, APPLY)).toBe('not_applicable');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'reopen', n: null }, APPLY))).toBe('not_applicable');
   });
 
   it('held closes a meeting as done with a held event; not on another family', async () => {
     const meeting = await item({ family: 'meetings' });
-    expect(await applyLedgerCommand(meeting, { kind: 'held', n: null }, APPLY)).toBe('applied');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, meeting, { kind: 'held', n: null }, APPLY))).toBe('applied');
     expect((await load(meeting)).status).toBe('done');
     expect(await kinds(meeting)).toContain('held');
 
     const other = await item();
-    expect(await applyLedgerCommand(other, { kind: 'held', n: null }, APPLY)).toBe('not_applicable');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, other, { kind: 'held', n: null }, APPLY))).toBe('not_applicable');
     expect((await load(other)).status).toBe('open');
   });
 
   it('not_held writes an event and the meeting stays open', async () => {
     const meeting = await item({ family: 'meetings' });
-    expect(await applyLedgerCommand(meeting, { kind: 'not_held', n: null }, APPLY)).toBe('applied');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, meeting, { kind: 'not_held', n: null }, APPLY))).toBe('applied');
     expect((await load(meeting)).status).toBe('open');
     expect(await kinds(meeting)).toContain('not_held');
   });
@@ -268,10 +272,10 @@ describe('applyLedgerCommand', () => {
   it('snooze resets nudge_count and reopens a stuck item', async () => {
     const id = await item({ dueAt: new Date('2026-11-01T06:00:00Z'), dueIsDateOnly: true });
     await getPool().query(`UPDATE ledger_items SET nudge_count = 3 WHERE item_id = $1`, [id]);
-    await moveLedgerStatus(id, ['open'], 'stuck', { kind: 'stuck', by: 'system' }, { businessId: B });
+    await withBusiness(B, (db) => moveLedgerStatus(db, id, ['open'], 'stuck', { kind: 'stuck', by: 'system' }));
 
     expect(
-      await applyLedgerCommand(id, { kind: 'snooze', n: null, to: { date: '2026-11-10' } }, APPLY),
+      await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'snooze', n: null, to: { date: '2026-11-10' } }, APPLY)),
     ).toBe('applied');
     const after = await load(id);
     expect(after.status).toBe('open');
@@ -284,15 +288,15 @@ describe('applyLedgerCommand', () => {
 
   it('snooze revives an evidence-closed item but not a done or cancelled one', async () => {
     const closed = await item();
-    await moveLedgerStatus(closed, ['open'], 'closed_by_evidence', { kind: 'closed_by_evidence', by: 'system' }, { businessId: B });
-    expect(await applyLedgerCommand(closed, { kind: 'snooze', n: null, to: 'tomorrow' }, APPLY)).toBe('applied');
+    await withBusiness(B, (db) => moveLedgerStatus(db, closed, ['open'], 'closed_by_evidence', { kind: 'closed_by_evidence', by: 'system' }));
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, closed, { kind: 'snooze', n: null, to: 'tomorrow' }, APPLY))).toBe('applied');
     expect((await load(closed)).status).toBe('open');
 
     for (const status of ['done', 'cancelled'] as const) {
       const id = await item();
-      await moveLedgerStatus(id, ['open'], status, { kind: status, by: 'system' }, { businessId: B });
+      await withBusiness(B, (db) => moveLedgerStatus(db, id, ['open'], status, { kind: status, by: 'system' }));
       const before = await load(id);
-      expect(await applyLedgerCommand(id, { kind: 'snooze', n: null, to: 'tomorrow' }, APPLY)).toBe('not_applicable');
+      expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'snooze', n: null, to: 'tomorrow' }, APPLY))).toBe('not_applicable');
       const after = await load(id);
       expect(after.status).toBe(status);
       expect(after.dueAt).toEqual(before.dueAt);
@@ -302,7 +306,7 @@ describe('applyLedgerCommand', () => {
 
   it('snooze to tomorrow keeps a timed item’s hour', async () => {
     const id = await item({ dueAt: new Date('2026-11-03T12:30:00Z'), dueIsDateOnly: false }); // 14:30 local
-    expect(await applyLedgerCommand(id, { kind: 'snooze', n: null, to: 'tomorrow' }, APPLY)).toBe('applied');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'snooze', n: null, to: 'tomorrow' }, APPLY))).toBe('applied');
     const after = await load(id);
     expect(localParts(after.dueAt ?? new Date(0), TZ)).toMatchObject({ date: '2026-11-04', time: '14:30' });
     expect(after.dueIsDateOnly).toBe(false);
@@ -311,22 +315,22 @@ describe('applyLedgerCommand', () => {
   it('save_stages promotes the proposed stages, and only when there are some', async () => {
     const proposed = [{ title: 'שרטוט', done: false }];
     const id = await item({ family: 'projects', proposedStages: proposed });
-    expect(await applyLedgerCommand(id, { kind: 'save_stages', n: null }, APPLY)).toBe('applied');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'save_stages', n: null }, APPLY))).toBe('applied');
     const after = await load(id);
     expect(after.stages).toEqual(proposed);
     expect(after.proposedStages).toBeNull();
     expect(await kinds(id)).toContain('stages_saved');
-    expect(await applyLedgerCommand(id, { kind: 'save_stages', n: null }, APPLY)).toBe('not_applicable');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'save_stages', n: null }, APPLY))).toBe('not_applicable');
   });
 
   it('confirm_address verifies a present email; with no email it is not applicable', async () => {
     const id = await item();
-    expect(await applyLedgerCommand(id, { kind: 'confirm_address', n: null }, APPLY)).toBe('applied');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, id, { kind: 'confirm_address', n: null }, APPLY))).toBe('applied');
     expect((await load(id)).counterpartyEmailVerified).toBe(true);
     expect(await kinds(id)).toContain('address_confirmed');
 
     const none = await item({ counterpartyEmail: null });
-    expect(await applyLedgerCommand(none, { kind: 'confirm_address', n: null }, APPLY)).toBe('not_applicable');
+    expect(await withBusiness(B, (db) => applyLedgerCommand(db, none, { kind: 'confirm_address', n: null }, APPLY))).toBe('not_applicable');
     expect((await load(none)).counterpartyEmailVerified).toBe(false);
   });
 });
@@ -357,7 +361,8 @@ describe('handleLedgerWhatsApp', () => {
 
   async function inbound(text: string, at: Date): Promise<string> {
     seq += 1;
-    const stored = await recordInbound(
+    const stored = await withBusiness(B, (db) => recordInbound(
+      db,
       {
         providerMessageId: `wamid.ledger-${seq}`,
         senderNumber: '+972500000000',
@@ -366,24 +371,22 @@ describe('handleLedgerWhatsApp', () => {
         mediaKind: null,
         providerTimestamp: at.toISOString(),
       },
-      { businessId: B },
-    );
+    ));
     if (stored === null) throw new Error('not stored');
     return stored.id;
   }
 
   async function handle(text: string, inboundAt: Date) {
     const messageId = await inbound(text, inboundAt);
-    const outcome = await handleLedgerWhatsApp({
+    const outcome = await withBusiness(B, (db) => handleLedgerWhatsApp(db, {
       text,
       messageId,
       inboundAt,
-      businessId: B,
       by: 'whatsapp:+972500000000',
       now: NOW,
       timeZone: TZ,
       messenger,
-    });
+    }));
     return { outcome, messageId };
   }
 
@@ -413,7 +416,7 @@ describe('handleLedgerWhatsApp', () => {
     expect((await load(a)).status).toBe('open');
     expect(texts).toEqual(['עודכן: שני עם שבירה — בוצע']);
     expect(await messageState(messageId)).toBe('handled');
-    const events = await listLedgerEvents(b, { businessId: B });
+    const events = await withBusiness(B, (db) => listLedgerEvents(db, b));
     expect(events.at(-1)).toMatchObject({ kind: 'done', byWhom: 'whatsapp:+972500000000' });
   });
 
@@ -422,11 +425,10 @@ describe('handleLedgerWhatsApp', () => {
     await batch([a], T1);
     const messageId = await inbound('1 בוצע', T3);
     let calls = 0;
-    const outcome = await handleLedgerWhatsApp({
+    const outcome = await withBusiness(B, (db) => handleLedgerWhatsApp(db, {
       text: '1 בוצע',
       messageId,
       inboundAt: T3,
-      businessId: B,
       by: 'whatsapp:+972500000000',
       now: NOW,
       timeZone: TZ,
@@ -437,7 +439,7 @@ describe('handleLedgerWhatsApp', () => {
           throw new Error('gateway down');
         },
       },
-    });
+    }));
     expect(calls).toBe(1); // the reply was attempted
     expect(outcome).toBe('applied');
     expect((await load(a)).status).toBe('done');
@@ -533,7 +535,7 @@ describe('handleLedgerWhatsApp', () => {
   it('a not-applicable command is refused with the item’s current status', async () => {
     const a = await item({ description: 'משהו' });
     await batch([a], T1);
-    await applyLedgerCommand(a, { kind: 'done', n: null }, APPLY);
+    await withBusiness(B, (db) => applyLedgerCommand(db, a, { kind: 'done', n: null }, APPLY));
     expect((await handle('1 בוצע', T3)).outcome).toBe('refused');
     expect(texts[0]).toContain('משהו');
     expect(texts[0]).toContain('בוצע');
@@ -573,17 +575,16 @@ describe('handleLedgerWhatsApp', () => {
     const a = await item();
     await batch([a], T1);
     const call = async (text: string, accept: 'numbered' | 'bare') =>
-      handleLedgerWhatsApp({
+      withBusiness(B, async (db) => handleLedgerWhatsApp(db, {
         text,
         messageId: await inbound(text, T3),
         inboundAt: T3,
-        businessId: B,
         by: 'owner',
         now: NOW,
         timeZone: TZ,
         messenger,
         accept,
-      });
+      }));
     expect(await call('בוצע', 'numbered')).toBe('passthrough');
     expect(await call('1 בוצע', 'bare')).toBe('passthrough');
     expect((await load(a)).status).toBe('open');
@@ -595,16 +596,15 @@ describe('handleLedgerWhatsApp', () => {
     const a = await item();
     await batch([a], T1);
     const { messageId } = await handle('1 בוצע', T3);
-    const again = await handleLedgerWhatsApp({
+    const again = await withBusiness(B, (db) => handleLedgerWhatsApp(db, {
       text: '1 בוצע',
       messageId,
       inboundAt: T3,
-      businessId: B,
       by: 'owner',
       now: NOW,
       timeZone: TZ,
       messenger,
-    });
+    }));
     expect(again).toBe('skipped');
     expect((await kinds(a)).filter((k) => k === 'done')).toHaveLength(1);
     expect(texts).toHaveLength(1);

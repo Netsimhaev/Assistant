@@ -355,6 +355,7 @@ async function write(
   fields: { subjectKey: string; attribute?: string; body: Record<string, unknown>; sourceRef?: string },
 ): Promise<LocalToolResult> {
   const written = await writeMemory(
+    ctx.db,
     {
       jobId: ctx.jobId,
       kind,
@@ -363,7 +364,6 @@ async function write(
       body: fields.body,
       ...(fields.sourceRef !== undefined ? { sourceRef: fields.sourceRef } : {}),
     },
-    { businessId: ctx.db.businessId, db: ctx.db },
   );
   // The provenance is echoed back so the step's own record shows the trust
   // level this memory will carry forever after.
@@ -456,7 +456,7 @@ async function ledgerEnv(ctx: LocalToolContext): Promise<LedgerEnv> {
   await assertLedgerWriter(db, ctx.jobId);
   const active = await loadActiveCharter(ctx.db);
   if (active === null) throw new Error(`runLocalTool: ledger tools need an active charter (${ctx.db.businessId})`);
-  const settings = await loadLedgerSettings({ businessId: ctx.db.businessId, db });
+  const settings = await loadLedgerSettings(db);
   return { db, timeZone: active.charter.identity.timezone, dailyHour: settings.dailyHour, bundle: active.bundle };
 }
 
@@ -558,11 +558,12 @@ const HANDLERS: Record<string, LocalHandler> = {
       importance = 'critical';
       importanceManual = true;
     } else {
-      const rules = await listCriticalRules({ businessId: ctx.db.businessId, db: env.db });
+      const rules = await listCriticalRules(env.db);
       importance = matchesCriticalRule(facts, rules) ? 'critical' : 'normal';
     }
 
     const item = await createLedgerItem(
+      env.db,
       {
         ...facts,
         description: parsed.description,
@@ -576,7 +577,7 @@ const HANDLERS: Record<string, LocalHandler> = {
         proposedStages: parsed.proposedStages === undefined ? null : toStages(parsed.proposedStages),
         originJobId: ctx.jobId,
       },
-      { businessId: ctx.db.businessId, by: 'boss', db: env.db },
+      { by: 'boss' },
     );
     return {
       performed: true,
@@ -597,9 +598,7 @@ const HANDLERS: Record<string, LocalHandler> = {
   'ledger.update': async (input, ctx) => {
     const env = await ledgerEnv(ctx);
     const parsed = parseOrFail(LedgerUpdateInput, input, 'ledger.update');
-    const opts = { businessId: ctx.db.businessId, db: env.db };
-
-    const item = await loadLedgerItem(parsed.itemId, opts);
+    const item = await loadLedgerItem(env.db, parsed.itemId);
     if (item === null) {
       throw new StepChannelError('ledger_item_not_found', `ledger.update: no item ${parsed.itemId}`, false);
     }
@@ -641,10 +640,10 @@ const HANDLERS: Record<string, LocalHandler> = {
     let updated;
     try {
       updated = await updateLedgerItem(
+        env.db,
         parsed.itemId,
         patch,
         { kind: 'updated', by: 'boss', jobId: ctx.jobId, ...(parsed.note !== undefined ? { note: parsed.note } : {}) },
-        opts,
       );
     } catch (err) {
       if (err instanceof LedgerItemNotFoundError) {
@@ -692,13 +691,13 @@ const HANDLERS: Record<string, LocalHandler> = {
   'memory.retire': async (input, ctx) => {
     const parsed = parseOrFail(RetireInput, input, 'memory.retire');
     const retired = await retireMemories(
+      ctx.db,
       {
         kind: parsed.kind,
         subjectKey: parsed.subject,
         ...(parsed.preference !== undefined ? { attribute: parsed.preference } : {}),
         reason: parsed.reason,
       },
-      { businessId: ctx.db.businessId, db: ctx.db },
     );
     // Zero is a result, not a failure: "there was nothing to retire" is a true
     // answer to the question asked, and reporting it as an error would make
@@ -711,13 +710,13 @@ const HANDLERS: Record<string, LocalHandler> = {
   'memory.recall': async (input, ctx) => {
     const parsed = parseOrFail(RecallInput, input, 'memory.recall');
     const found = await recallMemories(
+      ctx.db,
       {
         ...(parsed.subject !== undefined ? { subjectKey: parsed.subject } : {}),
         ...(parsed.query !== undefined ? { keyword: parsed.query } : {}),
         ...(parsed.kind !== undefined ? { kind: parsed.kind } : {}),
         ...(parsed.limit !== undefined ? { limit: parsed.limit } : {}),
       },
-      { businessId: ctx.db.businessId, db: ctx.db },
     );
     return renderRecalled(found);
   },
@@ -728,12 +727,12 @@ const HANDLERS: Record<string, LocalHandler> = {
   'memory.recall_shallow': async (input, ctx) => {
     const parsed = parseOrFail(RecallInput, input, 'memory.recall_shallow');
     const found = await recallMemories(
+      ctx.db,
       {
         ...(parsed.subject !== undefined ? { subjectKey: parsed.subject } : {}),
         ...(parsed.query !== undefined ? { keyword: parsed.query } : {}),
         limit: 3,
       },
-      { businessId: ctx.db.businessId, db: ctx.db },
     );
     return renderRecalled(found);
   },
@@ -745,11 +744,9 @@ const HANDLERS: Record<string, LocalHandler> = {
    */
   'doc.save': async (input, ctx) => {
     const parsed = parseOrFail(DocSaveInput, input, 'doc.save');
-    return runDocSave(parsed, {
+    return runDocSave(ctx.db, parsed, {
       jobId: ctx.jobId,
-      businessId: ctx.db.businessId,
       documentRoot: ctx.documentRoot ?? config.documentRoot,
-      db: ctx.db,
     });
   },
 
@@ -818,10 +815,9 @@ const HANDLERS: Record<string, LocalHandler> = {
 
     const attached = await attachedDocumentsForJob(ctx.jobId, { businessId: ctx.db.businessId, db });
     const sources = await resolveSourceDocuments(
-      ctx.db.businessId,
+      db,
       parsed.sourceHints ?? [],
       [...new Set([...attached, ...(parsed.sources ?? []).map((source) => source.documentId)])],
-      db,
       { timeZone: active.charter.identity.timezone },
     );
     for (const { hint } of sources.ambiguous) notes.push(sourceAmbiguousNote(toOneLine(hint)));
@@ -829,8 +825,8 @@ const HANDLERS: Record<string, LocalHandler> = {
 
     const productionId = await transaction(db, async (tx) => {
       const id = await createProduction(
+        tx,
         {
-          businessId: ctx.db.businessId,
           originJobId: ctx.jobId,
           instructionText: instruction.text,
           textOrigin: instruction.textOrigin,
@@ -842,7 +838,6 @@ const HANDLERS: Record<string, LocalHandler> = {
           notes,
           ownerSourceIds: sources.resolved.filter((id) => attached.includes(id)),
         },
-        tx,
       );
       await transition(tx, ctx.jobId, {
         to: 'followup',
@@ -889,10 +884,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     // here if the count is already at the ceiling — the same conservative
     // trade the conductor's own docblock names (M1): it can only under-run
     // the budget, never exceed it.
-    const readsSoFar = await readingsToday({
-      businessId: ctx.db.businessId,
-      db: ctx.db,
-    });
+    const readsSoFar = await readingsToday(ctx.db);
     if (readsSoFar >= config.documentReadsPerDay) {
       // `DOCUMENT_READS_PER_DAY=0` is a legitimate ceiling (CLAUDE.md: an
       // operator turning document reads off entirely), and `positiveInt`
@@ -913,6 +905,7 @@ const HANDLERS: Record<string, LocalHandler> = {
       );
     }
     const outcome = await readDocument(
+      ctx.db,
       {
         documentId: parsed.documentId,
         bundle: ctx.bundle,
@@ -920,8 +913,6 @@ const HANDLERS: Record<string, LocalHandler> = {
         jobId: ctx.jobId,
       },
       {
-        businessId: ctx.db.businessId,
-        db: ctx.db,
         ...(ctx.reader !== undefined ? { reader: ctx.reader } : {}),
       },
     );
@@ -1170,7 +1161,6 @@ const HANDLERS: Record<string, LocalHandler> = {
    */
   'assert.evaluate': async (input, ctx) => {
     const parsed = parseOrFail(AssertEvaluateInput, input, 'assert.evaluate');
-    const dbOpts = { businessId: ctx.db.businessId, db: ctx.db };
 
     const delegation = await loadHelpRequestFromParentJob(ctx.db, ctx.jobId);
     if (delegation === null) {
@@ -1237,7 +1227,7 @@ const HANDLERS: Record<string, LocalHandler> = {
         `runLocalTool: assert.evaluate's child job ${childJobId} does not exist`,
       );
     }
-    const record = await loadLatestReading(parsed.documentId, child.provenance, dbOpts);
+    const record = await loadLatestReading(ctx.db, parsed.documentId, child.provenance);
     // Two shapes, one meaning: the delegation succeeded and came back with
     // nothing to judge. `ReadingRecord.content` is `Reading | null`, so a
     // record whose `status` is `unreadable` exists and carries nothing to
@@ -1257,7 +1247,7 @@ const HANDLERS: Record<string, LocalHandler> = {
       return { performed: true, status: 'not_judged', reason: 'unreadable' };
     }
 
-    const artifacts = await loadArtifacts(parsed.documentId, dbOpts);
+    const artifacts = await loadArtifacts(ctx.db, parsed.documentId);
     const verify = ctx.verifier ?? verifyDraft;
     const result = await verify({
       parentJobId: ctx.jobId,

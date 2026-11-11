@@ -20,10 +20,11 @@ async function anExtractedDocument(text: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'cond-'));
   const path = join(dir, 'note.txt');
   await writeFile(path, text, 'utf8');
-  const doc = await ingestDocument(
+  const doc = await withBusiness(BUSINESS, (db) => ingestDocument(
+    db,
     { path, source: 'manual' },
-    { businessId: BUSINESS, documentRoot: dir },
-  );
+    { documentRoot: dir },
+  ));
   expect(doc.status, 'fixture must produce an extracted document').toBe('extracted');
   return doc.documentId;
 }
@@ -35,7 +36,7 @@ describe('the conductor queries', () => {
 
   it('offers an extracted document that has never been read', async () => {
     const documentId = await anExtractedDocument('שלום');
-    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    const waiting = await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10));
     expect(waiting.map((d) => d.documentId)).toEqual([documentId]);
   });
 
@@ -54,7 +55,7 @@ describe('the conductor queries', () => {
                'unknown_external', 'test', 'v1', 'h')`,
       [BUSINESS, documentId],
     );
-    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    const waiting = await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10));
     expect(waiting.map((d) => d.documentId)).toEqual([documentId]);
   });
 
@@ -78,7 +79,7 @@ describe('the conductor queries', () => {
                'test', 'v1')`,
       [BUSINESS],
     );
-    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    const waiting = await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10));
     expect(waiting).toEqual([]);
   });
 
@@ -103,16 +104,16 @@ describe('the conductor queries', () => {
                'test', 'v1')`,
       [],
     );
-    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    const waiting = await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10));
     expect(waiting.map((d) => d.documentId)).toEqual([documentId]);
   });
 
   it('stops offering a document after three failures', async () => {
     const documentId = await anExtractedDocument('שלום');
     for (let i = 0; i < 3; i += 1) {
-      await recordReadFailure(documentId, `boom ${i}`, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (db) => recordReadFailure(db, documentId, `boom ${i}`));
     }
-    expect(await documentsAwaitingRead(10, { businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10))).toEqual([]);
 
     const { rows } = await getPool().query<{ read_attempts: number; read_error: string }>(
       `SELECT read_attempts, read_error FROM documents WHERE document_id = $1`,
@@ -124,9 +125,9 @@ describe('the conductor queries', () => {
 
   it('still offers a document after two failures', async () => {
     const documentId = await anExtractedDocument('שלום');
-    await recordReadFailure(documentId, 'once', { businessId: BUSINESS });
-    await recordReadFailure(documentId, 'twice', { businessId: BUSINESS });
-    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => recordReadFailure(db, documentId, 'once'));
+    await withBusiness(BUSINESS, (db) => recordReadFailure(db, documentId, 'twice'));
+    const waiting = await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10));
     expect(waiting.map((d) => d.documentId)).toEqual([documentId]);
   });
 
@@ -138,8 +139,8 @@ describe('the conductor queries', () => {
     const inboxFile = await anExtractedDocument('מסמך מתיקיית הקליטה');
     const foreignNamed = await anExtractedDocument('מסמך שעסק אחר נוקב בו');
     const db = getPool();
-    const own = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'cond-own' }))); // TENANCY-TODO(task 5)
-    const foreign = await withBusiness('someone-else', (bdb) => installCharter(bdb, buildCharter({ version: 'cond-foreign' }))); // TENANCY-TODO(task 5)
+    const own = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'cond-own' })));
+    const foreign = await withBusiness('someone-else', (bdb) => installCharter(bdb, buildCharter({ version: 'cond-foreign' })));
     const ownJob = await withBusiness(BUSINESS, (db) => createJob(db, { charterVersion: own.charterVersion, provenance: 'boss' }));
     const foreignJob = await withBusiness('someone-else', (db) => createJob(db, { charterVersion: foreign.charterVersion, provenance: 'boss' }));
     await db.query(
@@ -154,14 +155,14 @@ describe('the conductor queries', () => {
       [foreignJob.jobId, [foreignNamed]],
     );
 
-    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    const waiting = await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10));
     expect(waiting.map((d) => d.documentId).sort()).toEqual([inboxFile, foreignNamed].sort());
     expect(waiting.map((d) => d.documentId)).not.toContain(ownerUpload);
   });
 
   it('never offers another business\'s document', async () => {
     await anExtractedDocument('שלום');
-    expect(await documentsAwaitingRead(10, { businessId: 'someone-else' })).toEqual([]);
+    expect(await withBusiness('someone-else', (db) => documentsAwaitingRead(db, 10))).toEqual([]);
   });
 
   it('never offers a file uploaded with an instruction, even when no instruction row ever named it', async () => {
@@ -171,10 +172,10 @@ describe('the conductor queries', () => {
     const dir = await mkdtemp(join(tmpdir(), 'cond-'));
     const path = join(dir, 'upload');
     await writeFile(path, 'מחירון שהבעלים העלה', 'utf8');
-    const upload = await ingestDocument({ path, source: 'instruction' }, { businessId: BUSINESS, documentRoot: dir });
+    const upload = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path, source: 'instruction' }, { documentRoot: dir }));
     expect(upload.status).toBe('extracted');
     const inboxFile = await anExtractedDocument('מסמך מתיקיית הקליטה');
-    const waiting = await documentsAwaitingRead(10, { businessId: BUSINESS });
+    const waiting = await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10));
     expect(waiting.map((d) => d.documentId)).toEqual([inboxFile]);
   });
 
@@ -195,6 +196,6 @@ describe('the conductor queries', () => {
     // allows — `document_readings` references `documents (document_id)` alone.
     // That is the point: the count must exclude it on `business_id`, not on
     // whether the join happens to resolve.
-    expect(await readingsToday({ businessId: BUSINESS })).toBe(1);
+    expect(await withBusiness(BUSINESS, (db) => readingsToday(db))).toBe(1);
   });
 });

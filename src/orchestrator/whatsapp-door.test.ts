@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { closePool, getPool, withBusiness } from '../db/pool.js';
-import { resetDatabase, testDb } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { appendAudit } from '../audit/log.js';
@@ -459,24 +459,24 @@ describe('runWhatsAppDoor', () => {
       charterVersion: active.charter.charterVersion,
       provenance: 'boss',
     }));
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-cohen-beta-log',
         body: { name: 'רונית כהן', company: 'בטא לוגיסטיקה' },
       },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: seedJob.jobId,
         kind: 'entity',
         subjectKey: 'ronit-levi-gamma',
         body: { name: 'רונית לוי', company: 'גמא הרמה' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
     // Four in all, so the identity question itself is asked: two or three
     // distinguishable candidates are planned one by one instead (boss
     // command, spec §4.2).
@@ -484,10 +484,10 @@ describe('runWhatsAppDoor', () => {
       ['ronit-mizrahi-delta', 'רונית מזרחי', 'דלתא דפוס'],
       ['ronit-peretz-omega', 'רונית פרץ', 'אומגה שיווק'],
     ] as const) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId: seedJob.jobId, kind: 'entity', subjectKey: key, body: { name, company } },
-        { businessId: BUSINESS },
-      );
+      ));
     }
 
     const gateway = createFakeGateway();
@@ -1573,10 +1573,10 @@ describe('a side-effecting instruction over WhatsApp', () => {
       ['ronit-cohen', 'רונית כהן', 'ronit@beta-log.example'],
       ['ronit-levi', 'רונית לוי', 'ronit.levi@gamma.example'],
     ] as const) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId: seedJob.jobId, kind: 'entity', subjectKey: key, body: { name, email } },
-        { businessId: BUSINESS },
-      );
+      ));
     }
 
     const gateway = createFakeGateway();
@@ -1981,7 +1981,8 @@ describe('confirming a held command over WhatsApp', () => {
    */
   describe('ledger commands beside an open confirmation', () => {
     async function ledgerItem(description: string): Promise<string> {
-      const created = await createLedgerItem(
+      const created = await withBusiness(BUSINESS, (db) => createLedgerItem(
+        db,
         {
           family: 'awaiting_reply',
           description,
@@ -1999,8 +2000,8 @@ describe('confirming a held command over WhatsApp', () => {
           proposedStages: null,
           originJobId: 'J-ledger',
         },
-        { businessId: BUSINESS, by: 'test' },
-      );
+        { by: 'test' },
+      ));
       return created.itemId;
     }
 
@@ -2014,7 +2015,7 @@ describe('confirming a held command over WhatsApp', () => {
     }
 
     async function ledgerStatus(itemId: string): Promise<string | undefined> {
-      return (await loadLedgerItem(itemId, { businessId: BUSINESS }))?.status;
+      return (await withBusiness(BUSINESS, (db) => loadLedgerItem(db, itemId)))?.status;
     }
 
     it('"2 בוצע" with a two-option confirmation open closes the ledger item and confirms nothing', async () => {
@@ -2154,8 +2155,7 @@ describe('confirming a held command over WhatsApp', () => {
       deliveredAgoMs = 60_000,
     ): Promise<string> {
       docSeq += 1;
-      const productionId = await createProduction({
-        businessId: BUSINESS,
+      const productionId = await withBusiness(BUSINESS, (db) => createProduction(db, {
         originJobId: 'J-origin',
         instructionText: 'תכיני הצעת מחיר ל-dana@example.com',
         textOrigin: 'typed',
@@ -2164,17 +2164,17 @@ describe('confirming a held command over WhatsApp', () => {
         kind: 'letter',
         destination,
         sourceDocumentIds: [],
-      });
-      const versionId = await saveVersion({
+      }));
+      const versionId = await withBusiness(TEST_BUSINESS, (db) => saveVersion(db, {
         productionId,
         versionNo: 1,
         spec: DOC_SPEC,
         storedPath: `produced/x/${productionId}.docx`,
         sha256: `${docSeq}`.padStart(64, 'a'),
         sizeBytes: 10,
-      });
-      expect(await advanceStage(productionId, 'queued', 'ready', {})).toBe(true);
-      const created = await createDocumentCard(versionId, { businessId: BUSINESS });
+      }));
+      expect(await withBusiness(TEST_BUSINESS, (db) => advanceStage(db, productionId, 'queued', 'ready', {}))).toBe(true);
+      const created = await withBusiness(BUSINESS, (db) => createDocumentCard(db, versionId));
       await testDb().query(
         `UPDATE document_cards SET whatsapp_delivered_at = now() - make_interval(secs => $2::double precision / 1000)
           WHERE card_id = $1`,
@@ -2184,18 +2184,18 @@ describe('confirming a held command over WhatsApp', () => {
     }
 
     async function cardState(cardId: string): Promise<string | undefined> {
-      return (await loadDocumentCard(BUSINESS, cardId))?.state;
+      return (await withBusiness(BUSINESS, (db) => loadDocumentCard(db, cardId)))?.state;
     }
 
     it('"שלחי" with one document card approves its single send option', async () => {
       const cardId = await documentCard({ mode: 'send', to: ['dana@example.com'] });
-      expect((await loadDocumentCard(BUSINESS, cardId))?.deliveryPlans).toHaveLength(2);
+      expect((await withBusiness(BUSINESS, (db) => loadDocumentCard(db, cardId)))?.deliveryPlans).toHaveLength(2);
       gateway.enqueue(reply('שלחי'));
       const result = await pass();
 
       expect(result.documentCardReplies).toBe(1);
       expect(result.instructed).toBe(0);
-      const card = await loadDocumentCard(BUSINESS, cardId);
+      const card = await withBusiness(BUSINESS, (db) => loadDocumentCard(db, cardId));
       expect(card?.state).toBe('approved');
       expect(card?.deliveryJobId).not.toBe(null);
       expect(lastSent()).toBe(documentCardSent(['dana@example.com']));
@@ -2209,7 +2209,7 @@ describe('confirming a held command over WhatsApp', () => {
 
       expect(result.documentCardReplies).toBe(1);
       expect(result.ledgerReplies).toBe(0);
-      const card = await loadDocumentCard(BUSINESS, cardId);
+      const card = await withBusiness(BUSINESS, (db) => loadDocumentCard(db, cardId));
       expect(card?.state).toBe('saved');
       expect(lastSent()).toBe(DOCUMENT_CARD_SAVED);
     });
@@ -2367,7 +2367,7 @@ describe('confirming a held command over WhatsApp', () => {
 
     it('"שלחי" on a card with no send option asks for the dashboard and approves nothing', async () => {
       const cardId = await documentCard({ mode: 'save', folder: null });
-      expect((await loadDocumentCard(BUSINESS, cardId))?.deliveryPlans.map((o) => o.option)).toEqual(['save']);
+      expect((await withBusiness(BUSINESS, (db) => loadDocumentCard(db, cardId)))?.deliveryPlans.map((o) => o.option)).toEqual(['save']);
       gateway.enqueue(reply('שלחי'));
       const result = await pass();
       expect(lastSent()).toBe(DOCUMENT_CARD_SEVERAL_OPTIONS);
@@ -2377,8 +2377,8 @@ describe('confirming a held command over WhatsApp', () => {
 
     it('a typed address on the dashboard withdraws the card from WhatsApp until it is shown again', async () => {
       const cardId = await documentCard({ mode: 'send', to: [] });
-      expect((await addTypedRecipient(cardId, 'yossi@client.example', { businessId: BUSINESS })).status).toBe('added');
-      expect((await loadDocumentCard(BUSINESS, cardId))?.whatsappDeliveredAt).toBe(null);
+      expect((await withBusiness(BUSINESS, (db) => addTypedRecipient(db, cardId, 'yossi@client.example'))).status).toBe('added');
+      expect((await withBusiness(BUSINESS, (db) => loadDocumentCard(db, cardId)))?.whatsappDeliveredAt).toBe(null);
       gateway.enqueue(reply('שלחי'));
       const result = await pass(plannedWith(recallPlan()));
       expect(result.documentCardReplies).toBe(0);

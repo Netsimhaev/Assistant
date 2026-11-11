@@ -8,12 +8,9 @@
  */
 import type { AttachmentDocType } from '../domain/mail-triage.js';
 import { ulid } from 'ulid';
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
 import type { MailCategory, MailProvider } from './mailbox.js';
-
-type Options = { businessId?: string; db?: Queryable };
 
 export type MailState = 'received' | 'claimed' | 'over_cap' | 'triaged' | 'failed';
 
@@ -197,10 +194,6 @@ const COLUMNS = `mail_id, provider_message_id, thread_id, internet_message_id,
   categories, summary, is_person, job_id, reply_job_id, labels_applied,
   notified_at, error, triaged_at, created_at`;
 
-function ctx(options: Options): { businessId: string; db: Queryable } {
-  return { businessId: options.businessId ?? config.businessId, db: options.db ?? getPool() };
-}
-
 /**
  * Postgres refuses U+0000 in `text` and in `jsonb`, so one hostile mail with a
  * NUL in its subject, body or attachment name used to make `recordIncoming`
@@ -237,8 +230,8 @@ function sanitize(input: IncomingMail): IncomingMail {
 }
 
 /** Returns `null` on a duplicate `(business_id, provider_message_id)`. */
-export async function recordIncoming(raw: IncomingMail, options: Options = {}): Promise<StoredMail | null> {
-  const { businessId, db } = ctx(options);
+export async function recordIncoming(db: BusinessDb, raw: IncomingMail): Promise<StoredMail | null> {
+  const businessId = db.businessId;
   const input = sanitize(raw);
   const { rows } = await db.query<MailDbRow>(
     `INSERT INTO mail_messages
@@ -264,8 +257,8 @@ export async function recordIncoming(raw: IncomingMail, options: Options = {}): 
  * The mail whose triage job is this one, or `null`. The curation brief reads
  * the sender from here: the stored header, never anything a model said.
  */
-export async function mailForJob(jobId: string, options: Options = {}): Promise<StoredMail | null> {
-  const { businessId, db } = ctx(options);
+export async function mailForJob(db: BusinessDb, jobId: string): Promise<StoredMail | null> {
+  const businessId = db.businessId;
   const { rows } = await db.query<MailDbRow>(
     `SELECT ${COLUMNS} FROM mail_messages WHERE business_id = $1 AND job_id = $2 LIMIT 1`,
     [businessId, jobId],
@@ -275,8 +268,8 @@ export async function mailForJob(jobId: string, options: Options = {}): Promise<
 }
 
 /** Moves `received|over_cap` to `claimed`; the row count says who won. */
-export async function claimMail(mailId: string, options: Options = {}): Promise<boolean> {
-  const { businessId, db } = ctx(options);
+export async function claimMail(db: BusinessDb, mailId: string): Promise<boolean> {
+  const businessId = db.businessId;
   const res = await db.query(
     `UPDATE mail_messages SET state = 'claimed', claimed_at = now()
       WHERE business_id = $1 AND mail_id = $2 AND state IN ('received', 'over_cap')`,
@@ -292,8 +285,8 @@ export async function claimMail(mailId: string, options: Options = {}): Promise<
  * as stale. The orphaned triage job is the re-handler's to close — it knows
  * the mail's `job_id`. Returns how many rows moved.
  */
-export async function staleClaimsToReceived(minutes: number, options: Options = {}): Promise<number> {
-  const { businessId, db } = ctx(options);
+export async function staleClaimsToReceived(db: BusinessDb, minutes: number): Promise<number> {
+  const businessId = db.businessId;
   const res = await db.query(
     `UPDATE mail_messages SET state = 'received', claimed_at = NULL
       WHERE business_id = $1 AND state = 'claimed'
@@ -313,8 +306,8 @@ export const UNRECORDABLE_SUBJECT = '(לא ניתן לשמור את המייל)'
  * not kept. `ON CONFLICT DO NOTHING`: a real row, if one ever got written,
  * wins.
  */
-export async function recordUnrecordable(providerMessageId: string, options: Options = {}): Promise<void> {
-  const { businessId, db } = ctx(options);
+export async function recordUnrecordable(db: BusinessDb, providerMessageId: string): Promise<void> {
+  const businessId = db.businessId;
   await db.query(
     `INSERT INTO mail_messages
        (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
@@ -325,8 +318,8 @@ export async function recordUnrecordable(providerMessageId: string, options: Opt
   );
 }
 
-export async function settleMail(mailId: string, patch: SettlePatch, options: Options = {}): Promise<void> {
-  const { businessId, db } = ctx(options);
+export async function settleMail(db: BusinessDb, mailId: string, patch: SettlePatch): Promise<void> {
+  const businessId = db.businessId;
   const res = await db.query(
     `UPDATE mail_messages SET
         state = $3,
@@ -357,8 +350,8 @@ export async function settleMail(mailId: string, patch: SettlePatch, options: Op
  * it, and must not decide that mail's state. `settleMail` COALESCEs `error`,
  * so a later settle without an error keeps this one.
  */
-export async function noteMailError(mailId: string, error: string, options: Options = {}): Promise<void> {
-  const { businessId, db } = ctx(options);
+export async function noteMailError(db: BusinessDb, mailId: string, error: string): Promise<void> {
+  const businessId = db.businessId;
   const res = await db.query(
     'UPDATE mail_messages SET error = $3 WHERE business_id = $1 AND mail_id = $2',
     [businessId, mailId, error],
@@ -371,8 +364,8 @@ export async function noteMailError(mailId: string, error: string, options: Opti
  * finds reply jobs by. Written by the reply path itself, so the marker does not
  * depend on the poller settling the row.
  */
-export async function linkReplyJob(mailId: string, replyJobId: string, options: Options = {}): Promise<void> {
-  const { businessId, db } = ctx(options);
+export async function linkReplyJob(db: BusinessDb, mailId: string, replyJobId: string): Promise<void> {
+  const businessId = db.businessId;
   const res = await db.query(
     'UPDATE mail_messages SET reply_job_id = $3 WHERE business_id = $1 AND mail_id = $2',
     [businessId, mailId, replyJobId],
@@ -386,8 +379,8 @@ export async function linkReplyJob(mailId: string, replyJobId: string, options: 
  * `reply_job_id`, so a card built from some other payload that merely LOOKS
  * like a reply never gets the reply layout.
  */
-export async function isMailReplyJob(jobId: string, options: Options = {}): Promise<boolean> {
-  const { businessId, db } = ctx(options);
+export async function isMailReplyJob(db: BusinessDb, jobId: string): Promise<boolean> {
+  const businessId = db.businessId;
   const { rows } = await db.query(
     'SELECT 1 FROM mail_messages WHERE business_id = $1 AND reply_job_id = $2 LIMIT 1',
     [businessId, jobId],
@@ -417,7 +410,7 @@ export type ReplyTargetLookup = (
  *
  * The planner writes a reply as `mail.send` with `inReplyTo` only — it never
  * sees a provider's thread or message id — so the mailbox adapter resolves
- * them here. `businessId` is REQUIRED, with no `config.businessId` fallback,
+ * them here. The business is REQUIRED — it is `db`'s own, with no default,
  * for the same reason `CredentialSource.resolve` takes one: an omitted
  * business silently read as "the configured one" is how one business answers
  * on another's thread. The adapter passes the job's own business.
@@ -440,12 +433,11 @@ export type ReplyTargetLookup = (
  * already approved as the recipient, or the send is refused.
  */
 export async function replyTargetFor(
-  businessId: string,
+  db: BusinessDb,
   internetMessageId: string,
   providerMessageId: string | null,
-  options: { db?: Queryable } = {},
 ): Promise<ReplyTarget | null> {
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<{
     thread_id: string;
     provider_message_id: string;
@@ -478,11 +470,11 @@ export async function replyTargetFor(
  * the safe direction (no second card, so no second send), never a duplicate.
  */
 export async function claimFailedReply(
+  db: BusinessDb,
   mailId: string,
   failedJobId: string,
-  options: Options = {},
 ): Promise<boolean> {
-  const { businessId, db } = ctx(options);
+  const businessId = db.businessId;
   const res = await db.query(
     `UPDATE mail_messages SET reply_job_id = NULL
       WHERE business_id = $1 AND mail_id = $2 AND reply_job_id = $3`,
@@ -503,11 +495,11 @@ export async function claimFailedReply(
  * re-poll after a crash does not read, label or notify twice").
  */
 export async function recordMailProgress(
+  db: BusinessDb,
   mailId: string,
   progress: { labelsApplied?: string[]; notifiedAt?: string; jobId?: string },
-  options: Options = {},
 ): Promise<void> {
-  const { businessId, db } = ctx(options);
+  const businessId = db.businessId;
   const res = await db.query(
     `UPDATE mail_messages SET
         labels_applied = COALESCE($3::text[], labels_applied),
@@ -520,8 +512,8 @@ export async function recordMailProgress(
 }
 
 /** Whether an invoice row already exists for this mail — a re-handled mail must not add a second. */
-export async function hasInvoiceForMail(mailId: string, options: Options = {}): Promise<boolean> {
-  const { businessId, db } = ctx(options);
+export async function hasInvoiceForMail(db: BusinessDb, mailId: string): Promise<boolean> {
+  const businessId = db.businessId;
   const { rows } = await db.query(
     'SELECT 1 FROM mail_invoices WHERE business_id = $1 AND mail_id = $2 LIMIT 1',
     [businessId, mailId],
@@ -529,8 +521,8 @@ export async function hasInvoiceForMail(mailId: string, options: Options = {}): 
   return rows.length > 0;
 }
 
-export async function markOverCap(mailId: string, options: Options = {}): Promise<void> {
-  const { businessId, db } = ctx(options);
+export async function markOverCap(db: BusinessDb, mailId: string): Promise<void> {
+  const businessId = db.businessId;
   await db.query(
     `UPDATE mail_messages SET state = 'over_cap'
       WHERE business_id = $1 AND mail_id = $2 AND state IN ('received', 'over_cap')`,
@@ -539,8 +531,8 @@ export async function markOverCap(mailId: string, options: Options = {}): Promis
 }
 
 /** Rows in `received` or `over_cap`, oldest first. */
-export async function mailAwaitingTriage(limit: number, options: Options = {}): Promise<StoredMail[]> {
-  const { businessId, db } = ctx(options);
+export async function mailAwaitingTriage(db: BusinessDb, limit: number): Promise<StoredMail[]> {
+  const businessId = db.businessId;
   const { rows } = await db.query<MailDbRow>(
     `SELECT ${COLUMNS} FROM mail_messages
       WHERE business_id = $1 AND state IN ('received', 'over_cap')
@@ -551,8 +543,8 @@ export async function mailAwaitingTriage(limit: number, options: Options = {}): 
 }
 
 /** Rows whose `triaged_at` falls in the current day. */
-export async function mailReadsToday(options: Options = {}): Promise<number> {
-  const { businessId, db } = ctx(options);
+export async function mailReadsToday(db: BusinessDb): Promise<number> {
+  const businessId = db.businessId;
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM mail_messages
       WHERE business_id = $1 AND triaged_at >= date_trunc('day', now())`,
@@ -569,8 +561,8 @@ interface CursorRow {
   last_error: string | null;
 }
 
-export async function getCursor(options: Options = {}): Promise<MailCursor | null> {
-  const { businessId, db } = ctx(options);
+export async function getCursor(db: BusinessDb): Promise<MailCursor | null> {
+  const businessId = db.businessId;
   const { rows } = await db.query<CursorRow>(
     `SELECT provider, cursor, connected_at, last_poll_at, last_error
        FROM mailbox_cursor WHERE business_id = $1`,
@@ -594,8 +586,8 @@ export async function getCursor(options: Options = {}): Promise<MailCursor | nul
  * poll fields are replaced as given, `null` when omitted: a caller advancing
  * the cursor states its own poll outcome.
  */
-export async function setCursor(c: MailCursor, options: Options = {}): Promise<void> {
-  const { businessId, db } = ctx(options);
+export async function setCursor(db: BusinessDb, c: MailCursor): Promise<void> {
+  const businessId = db.businessId;
   await db.query(
     `INSERT INTO mailbox_cursor (business_id, provider, cursor, connected_at, last_poll_at, last_error)
      VALUES ($1, $2, $3, COALESCE($6::timestamptz, now()), $4, $5)
@@ -612,8 +604,8 @@ export async function setCursor(c: MailCursor, options: Options = {}): Promise<v
  * unique index — so a second for the same document is a no-op and returns
  * `null`. Rows with no document are not bound by it.
  */
-export async function insertInvoice(i: NewInvoice, options: Options = {}): Promise<string | null> {
-  const { businessId, db } = ctx(options);
+export async function insertInvoice(db: BusinessDb, i: NewInvoice): Promise<string | null> {
+  const businessId = db.businessId;
   const id = `INV-${ulid()}`;
   const res = await db.query(
     `INSERT INTO mail_invoices
@@ -652,12 +644,12 @@ function builder(businessId: string): {
  * written from provider text. Other elements are left exactly as they were.
  */
 export async function linkAttachmentDocument(
+  db: BusinessDb,
   mailId: string,
   attachmentId: string,
   documentId: string,
-  options: Options = {},
 ): Promise<void> {
-  const { businessId, db } = ctx(options);
+  const businessId = db.businessId;
   await db.query(
     `UPDATE mail_messages
         SET attachments = (
@@ -692,12 +684,12 @@ export interface AttachmentAnnotation {
  * string NUL-stripped (jsonb refuses U+0000), other elements untouched.
  */
 export async function annotateAttachment(
+  db: BusinessDb,
   mailId: string,
   attachmentId: string,
   annotation: AttachmentAnnotation,
-  options: Options = {},
 ): Promise<void> {
-  const { businessId, db } = ctx(options);
+  const businessId = db.businessId;
   const patch: Record<string, unknown> = {};
   if (annotation.docType !== undefined) patch['docType'] = noNul(annotation.docType);
   if (annotation.summary !== undefined) patch['summary'] = noNul(annotation.summary);
@@ -719,8 +711,8 @@ export async function annotateAttachment(
 }
 
 /** Whether an invoice row already links this mail to this document — one row per (mail, document). */
-export async function hasInvoiceForDocument(mailId: string, documentId: string, options: Options = {}): Promise<boolean> {
-  const { businessId, db } = ctx(options);
+export async function hasInvoiceForDocument(db: BusinessDb, mailId: string, documentId: string): Promise<boolean> {
+  const businessId = db.businessId;
   const { rows } = await db.query(
     'SELECT 1 FROM mail_invoices WHERE business_id = $1 AND mail_id = $2 AND document_id = $3 LIMIT 1',
     [businessId, mailId, documentId],
@@ -729,8 +721,8 @@ export async function hasInvoiceForDocument(mailId: string, documentId: string, 
 }
 
 /** One mail by id, scoped to its business. `null` when this business does not own it. */
-export async function getMail(mailId: string, options: Options = {}): Promise<StoredMail | null> {
-  const { businessId, db } = ctx(options);
+export async function getMail(db: BusinessDb, mailId: string): Promise<StoredMail | null> {
+  const businessId = db.businessId;
   const { rows } = await db.query<MailDbRow>(
     `SELECT ${COLUMNS} FROM mail_messages WHERE business_id = $1 AND mail_id = $2`,
     [businessId, mailId],
@@ -739,8 +731,8 @@ export async function getMail(mailId: string, options: Options = {}): Promise<St
   return row === undefined ? null : toStoredMail(row);
 }
 
-export async function searchMail(q: MailSearch, options: Options = {}): Promise<MailRow[]> {
-  const { businessId, db } = ctx(options);
+export async function searchMail(db: BusinessDb, q: MailSearch): Promise<MailRow[]> {
+  const businessId = db.businessId;
   const b = builder(businessId);
   if (q.text) {
     b.add(
@@ -797,8 +789,8 @@ function toInvoiceRow(row: InvoiceDbRow): InvoiceRow {
   };
 }
 
-export async function listInvoices(f: InvoiceFilter, options: Options = {}): Promise<InvoiceRow[]> {
-  const { businessId, db } = ctx(options);
+export async function listInvoices(db: BusinessDb, f: InvoiceFilter): Promise<InvoiceRow[]> {
+  const businessId = db.businessId;
   const b = builder(businessId);
   if (f.supplier) {
     b.add(

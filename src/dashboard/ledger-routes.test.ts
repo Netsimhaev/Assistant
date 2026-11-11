@@ -122,8 +122,8 @@ function settingsFields(over: Record<string, string> = {}): Record<string, strin
 
 describe('GET /ledger', () => {
   it('lists open items with the stuck list first', async () => {
-    await createLedgerItem(item({ description: 'פריט רגיל פתוח' }), { businessId: BUSINESS, by: 'boss' });
-    const stuck = await createLedgerItem(item({ description: 'פריט תקוע דחוף' }), { businessId: BUSINESS, by: 'boss' });
+    await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'פריט רגיל פתוח' }), { by: 'boss' }));
+    const stuck = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'פריט תקוע דחוף' }), { by: 'boss' }));
     await getPool().query(`UPDATE ledger_items SET status = 'stuck' WHERE item_id = $1`, [stuck.itemId]);
     const base = await start();
     const cookie = await login(base);
@@ -144,14 +144,14 @@ describe('GET /ledger', () => {
     const [y, m, d] = today.split('-').map(Number) as [number, number, number];
     const yesterday = new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10);
     // Stored at local midnight: already in the past by the instant, but its local date is today.
-    await createLedgerItem(item({ description: 'פריט שמועדו היום', dueAt: localToInstant(today, '00:00', tz), dueIsDateOnly: true }), {
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'פריט שמועדו היום', dueAt: localToInstant(today, '00:00', tz), dueIsDateOnly: true }), {
       by: 'boss',
-    });
-    await createLedgerItem(
+    }));
+    await withBusiness(BUSINESS, (db) => createLedgerItem(
+      db,
       item({ description: 'פריט שמועדו אתמול', dueAt: localToInstant(yesterday, '08:00', tz), dueIsDateOnly: true }),
-      { businessId: BUSINESS, by: 'boss' },
-    );
+      { by: 'boss' },
+    ));
     const base = await start();
     const cookie = await login(base);
     const html = await (await get(base, cookie, '/ledger?filter=overdue')).text();
@@ -160,8 +160,8 @@ describe('GET /ledger', () => {
   });
 
   it('an unknown filter reads as open', async () => {
-    await createLedgerItem(item({ description: 'פתוח' }), { businessId: BUSINESS, by: 'boss' });
-    const done = await createLedgerItem(item({ description: 'סגור לגמרי' }), { businessId: BUSINESS, by: 'boss' });
+    await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'פתוח' }), { by: 'boss' }));
+    const done = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'סגור לגמרי' }), { by: 'boss' }));
     await getPool().query(`UPDATE ledger_items SET status = 'done' WHERE item_id = $1`, [done.itemId]);
     const base = await start();
     const cookie = await login(base);
@@ -173,7 +173,7 @@ describe('GET /ledger', () => {
   });
 
   it('marks unseen reminders as seen', async () => {
-    const it1 = await createLedgerItem(item(), { businessId: BUSINESS, by: 'boss' });
+    const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item(), { by: 'boss' }));
     await getPool().query(
       `INSERT INTO ledger_reminders (reminder_id, business_id, item_id, slot, kind, body)
        VALUES ('LR-1', $1, $2, 's1', 'due', 'x')`,
@@ -204,7 +204,7 @@ describe('GET /ledger', () => {
     const FALLBACK_BODY = 'הגיע הזמן לחזור לדנה\n\nהכנתי טיוטה, אבל לא שלחתי (השליחה נכשלה):\nשלום דנה, רק מזכירה';
 
     it('an in-flight nudge reads "awaiting your approval", never as an unsent draft', async () => {
-      const it1 = await createLedgerItem(item({ family: 'warm_leads' }), { businessId: BUSINESS, by: 'boss' });
+      const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ family: 'warm_leads' }), { by: 'boss' }));
       // The opened job's claim row: no channel state (the old, wrong "draft" signal).
       await reminder(it1.itemId, 'LR-open', 'n1', 'שלום דנה, רק מזכירה', '2026-11-01T08:00:00Z');
       await getPool().query(`UPDATE ledger_items SET nudge_job_id = 'J-flight' WHERE item_id = $1`, [it1.itemId]);
@@ -217,7 +217,7 @@ describe('GET /ledger', () => {
     });
 
     it('a nudge that went out reads "sent", even after an earlier fallback', async () => {
-      const it1 = await createLedgerItem(item({ family: 'warm_leads' }), { businessId: BUSINESS, by: 'boss' });
+      const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ family: 'warm_leads' }), { by: 'boss' }));
       await event(it1.itemId, 'LE-f', 'nudge_fallback', '2026-11-01T08:00:00Z', 'J-old');
       await reminder(it1.itemId, 'LR-f', 'nudge_fallback:J-old', FALLBACK_BODY, '2026-11-01T08:00:00Z');
       await event(it1.itemId, 'LE-s', 'nudged', '2026-11-02T08:00:00Z', 'J-new');
@@ -230,7 +230,7 @@ describe('GET /ledger', () => {
     });
 
     it('the latest fallback with a draft and no later send reads "did not go out", with the draft', async () => {
-      const it1 = await createLedgerItem(item({ family: 'warm_leads' }), { businessId: BUSINESS, by: 'boss' });
+      const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ family: 'warm_leads' }), { by: 'boss' }));
       await event(it1.itemId, 'LE-s', 'nudged', '2026-11-01T08:00:00Z', 'J-old');
       await event(it1.itemId, 'LE-f', 'nudge_fallback', '2026-11-02T08:00:00Z', 'J-new');
       await reminder(it1.itemId, 'LR-f', 'nudge_fallback:J-new', FALLBACK_BODY, '2026-11-02T08:00:00Z');
@@ -244,7 +244,7 @@ describe('GET /ledger', () => {
   });
 
   it('a description with a bidi override is rendered stripped', async () => {
-    await createLedgerItem(item({ description: 'invoice‮gpj.exe' }), { businessId: BUSINESS, by: 'boss' });
+    await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'invoice‮gpj.exe' }), { by: 'boss' }));
     const base = await start();
     const cookie = await login(base);
     const html = await (await get(base, cookie, '/ledger')).text();
@@ -253,8 +253,8 @@ describe('GET /ledger', () => {
   });
 
   it("does not list another business's items", async () => {
-    await createLedgerItem(item({ description: 'של עסק אחר' }), { businessId: OTHER, by: 'boss' });
-    await createLedgerItem(item({ description: 'שלי' }), { businessId: BUSINESS, by: 'boss' });
+    await withBusiness(OTHER, (db) => createLedgerItem(db, item({ description: 'של עסק אחר' }), { by: 'boss' }));
+    await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ description: 'שלי' }), { by: 'boss' }));
     const base = await start();
     const cookie = await login(base);
     const html = await (await get(base, cookie, '/ledger')).text();
@@ -265,80 +265,80 @@ describe('GET /ledger', () => {
 
 describe('POST /ledger/:itemId/action', () => {
   it('done moves the status and records the event', async () => {
-    const it1 = await createLedgerItem(item(), { businessId: BUSINESS, by: 'boss' });
+    const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item(), { by: 'boss' }));
     const base = await start();
     const cookie = await login(base);
     const csrf = await csrfOf(base, cookie, '/ledger?filter=all');
     const res = await post(base, cookie, `/ledger/${it1.itemId}/action`, { action: 'done' }, csrf);
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/ledger');
-    expect((await loadLedgerItem(it1.itemId, { businessId: BUSINESS }))?.status).toBe('done');
-    const kinds = (await listLedgerEvents(it1.itemId, { businessId: BUSINESS })).map((e) => e.kind);
+    expect((await withBusiness(BUSINESS, (db) => loadLedgerItem(db, it1.itemId)))?.status).toBe('done');
+    const kinds = (await withBusiness(BUSINESS, (db) => listLedgerEvents(db, it1.itemId))).map((e) => e.kind);
     expect(kinds).toContain('done');
   });
 
   it('a missing CSRF token is 403 and the status is unchanged', async () => {
-    const it1 = await createLedgerItem(item(), { businessId: BUSINESS, by: 'boss' });
+    const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item(), { by: 'boss' }));
     const base = await start();
     const cookie = await login(base);
     // the page renders the form, so the handler is reachable and would act with a token
     expect(await (await get(base, cookie, '/ledger')).text()).toContain(`/ledger/${it1.itemId}/action`);
     const res = await post(base, cookie, `/ledger/${it1.itemId}/action`, { action: 'done' });
     expect(res.status).toBe(403);
-    expect((await loadLedgerItem(it1.itemId, { businessId: BUSINESS }))?.status).toBe('open');
+    expect((await withBusiness(BUSINESS, (db) => loadLedgerItem(db, it1.itemId)))?.status).toBe('open');
   });
 
   it("another business's item id is 404 and nothing changes", async () => {
-    const foreign = await createLedgerItem(item(), { businessId: OTHER, by: 'boss' });
+    const foreign = await withBusiness(OTHER, (db) => createLedgerItem(db, item(), { by: 'boss' }));
     const base = await start();
     const cookie = await login(base);
     const csrf = await csrfOf(base, cookie);
     const res = await post(base, cookie, `/ledger/${foreign.itemId}/action`, { action: 'done' }, csrf);
     expect(res.status).toBe(404);
-    expect((await loadLedgerItem(foreign.itemId, { businessId: OTHER }))?.status).toBe('open');
+    expect((await withBusiness(OTHER, (db) => loadLedgerItem(db, foreign.itemId)))?.status).toBe('open');
   });
 
   it('critical sets importance and the manual flag, with an event', async () => {
-    const it1 = await createLedgerItem(item(), { businessId: BUSINESS, by: 'boss' });
+    const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item(), { by: 'boss' }));
     const base = await start();
     const cookie = await login(base);
     const csrf = await csrfOf(base, cookie);
     const res = await post(base, cookie, `/ledger/${it1.itemId}/action`, { action: 'critical' }, csrf);
     expect(res.status).toBe(302);
-    const after = await loadLedgerItem(it1.itemId, { businessId: BUSINESS });
+    const after = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, it1.itemId));
     expect(after?.importance).toBe('critical');
     expect(after?.importanceManual).toBe(true);
-    expect((await listLedgerEvents(it1.itemId, { businessId: BUSINESS })).map((e) => e.kind)).toContain('updated');
+    expect((await withBusiness(BUSINESS, (db) => listLedgerEvents(db, it1.itemId))).map((e) => e.kind)).toContain('updated');
   });
 
   it('snooze with a real date moves the due date; an impossible date is refused', async () => {
-    const it1 = await createLedgerItem(item(), { businessId: BUSINESS, by: 'boss' });
+    const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item(), { by: 'boss' }));
     const base = await start();
     const cookie = await login(base);
     const csrf = await csrfOf(base, cookie);
     const bad = await post(base, cookie, `/ledger/${it1.itemId}/action`, { action: 'snooze', date: '2099-02-31' }, csrf);
     expect(bad.status).toBe(400);
     expect(await bad.text()).toContain('תאריך');
-    const before = await loadLedgerItem(it1.itemId, { businessId: BUSINESS });
+    const before = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, it1.itemId));
     expect(before?.dueAt?.toISOString()).toBe('2099-12-01T10:00:00.000Z');
     const ok = await post(base, cookie, `/ledger/${it1.itemId}/action`, { action: 'snooze', date: '2099-12-15' }, csrf);
     expect(ok.status).toBe(302);
-    const after = await loadLedgerItem(it1.itemId, { businessId: BUSINESS });
+    const after = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, it1.itemId));
     expect(after?.dueAt?.getTime()).toBeGreaterThan(before?.dueAt?.getTime() ?? 0);
   });
 
   it('an unknown action is refused and nothing changes', async () => {
-    const it1 = await createLedgerItem(item(), { businessId: BUSINESS, by: 'boss' });
+    const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item(), { by: 'boss' }));
     const base = await start();
     const cookie = await login(base);
     const csrf = await csrfOf(base, cookie);
     const res = await post(base, cookie, `/ledger/${it1.itemId}/action`, { action: 'erase' }, csrf);
     expect(res.status).toBe(400);
-    expect((await loadLedgerItem(it1.itemId, { businessId: BUSINESS }))?.status).toBe('open');
+    expect((await withBusiness(BUSINESS, (db) => loadLedgerItem(db, it1.itemId)))?.status).toBe('open');
   });
 
   it('an action that does not apply says so in Hebrew', async () => {
-    const it1 = await createLedgerItem(item({ family: 'money_in' }), { businessId: BUSINESS, by: 'boss' });
+    const it1 = await withBusiness(BUSINESS, (db) => createLedgerItem(db, item({ family: 'money_in' }), { by: 'boss' }));
     const base = await start();
     const cookie = await login(base);
     const csrf = await csrfOf(base, cookie);
@@ -364,7 +364,7 @@ describe('/ledger/settings', () => {
     const csrf = await csrfOf(base, cookie);
     const res = await post(base, cookie, '/ledger/settings', settingsFields({ mode_money_in: 'act', dailyHour: '9' }), csrf);
     expect(res.status).toBe(302);
-    const s = await loadLedgerSettings({ businessId: BUSINESS });
+    const s = await withBusiness(BUSINESS, (db) => loadLedgerSettings(db));
     expect(s.modes.money_in).toBe('act');
     expect(s.dailyHour).toBe(9);
     expect(s.modes.money_out).toBe('remind');
@@ -382,7 +382,7 @@ describe('/ledger/settings', () => {
     const html = await res.text();
     expect(html).toContain('חובה לבחור לפחות דרך תזכורת אחת');
     expect(html).toMatch(/name="dailyHour"[^>]*value="11"/);
-    expect((await loadLedgerSettings({ businessId: BUSINESS })).dailyHour).toBe(8);
+    expect((await withBusiness(BUSINESS, (db) => loadLedgerSettings(db))).dailyHour).toBe(8);
   });
 
   it('M3: meetings and projects are locked to remind, with the sentence; a forged act is refused', async () => {
@@ -398,13 +398,13 @@ describe('/ledger/settings', () => {
     const res = await post(base, cookie, '/ledger/settings', settingsFields({ mode_meetings: 'act' }), csrf);
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('בפגישות ובעבודות פתוחות');
-    expect((await loadLedgerSettings({ businessId: BUSINESS })).modes.meetings).toBe('remind');
+    expect((await withBusiness(BUSINESS, (db) => loadLedgerSettings(db))).modes.meetings).toBe('remind');
     // A locked radio is not submitted; a form without it saves as remind.
     const fields = settingsFields({ mode_warm_leads: 'act' });
     delete fields['mode_meetings'];
     delete fields['mode_projects'];
     expect((await post(base, cookie, '/ledger/settings', fields, await csrfOf(base, cookie))).status).toBe(302);
-    expect((await loadLedgerSettings({ businessId: BUSINESS })).modes.warm_leads).toBe('act');
+    expect((await withBusiness(BUSINESS, (db) => loadLedgerSettings(db))).modes.warm_leads).toBe('act');
   });
 
   it('money_out act cannot be saved', async () => {
@@ -414,7 +414,7 @@ describe('/ledger/settings', () => {
     const res = await post(base, cookie, '/ledger/settings', settingsFields({ mode_money_out: 'act' }), csrf);
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('כסף יוצא');
-    expect((await loadLedgerSettings({ businessId: BUSINESS })).modes.money_out).toBe('remind');
+    expect((await withBusiness(BUSINESS, (db) => loadLedgerSettings(db))).modes.money_out).toBe('remind');
   });
 
   it('an unknown mode value is refused rather than coerced', async () => {
@@ -423,7 +423,7 @@ describe('/ledger/settings', () => {
     const csrf = await csrfOf(base, cookie);
     const res = await post(base, cookie, '/ledger/settings', settingsFields({ mode_money_in: 'bogus' }), csrf);
     expect(res.status).toBe(400);
-    expect((await loadLedgerSettings({ businessId: BUSINESS })).modes.money_in).toBe('remind');
+    expect((await withBusiness(BUSINESS, (db) => loadLedgerSettings(db))).modes.money_in).toBe('remind');
   });
 
   it('a missing CSRF token is 403', async () => {
@@ -431,7 +431,7 @@ describe('/ledger/settings', () => {
     const cookie = await login(base);
     const res = await post(base, cookie, '/ledger/settings', settingsFields({ dailyHour: '9' }));
     expect(res.status).toBe(403);
-    expect((await loadLedgerSettings({ businessId: BUSINESS })).dailyHour).toBe(8);
+    expect((await withBusiness(BUSINESS, (db) => loadLedgerSettings(db))).dailyHour).toBe(8);
   });
 });
 
@@ -442,7 +442,7 @@ describe('critical rules', () => {
     const csrf = await csrfOf(base, cookie);
     const res = await post(base, cookie, '/ledger/rules', { kind: 'amount_over', amount: '1500.5' }, csrf);
     expect(res.status).toBe(302);
-    const rules = await listCriticalRules({ businessId: BUSINESS });
+    const rules = await withBusiness(BUSINESS, (db) => listCriticalRules(db));
     expect(rules).toHaveLength(1);
     expect(rules[0]).toMatchObject({ kind: 'amount_over', amountMinor: 150050 });
   });
@@ -454,7 +454,7 @@ describe('critical rules', () => {
     const res = await post(base, cookie, '/ledger/rules', { kind: 'amount_over', amount: '10.005' }, csrf);
     expect(res.status).toBe(400);
     expect(await res.text()).toContain('אגורות');
-    expect(await listCriticalRules({ businessId: BUSINESS })).toHaveLength(0);
+    expect(await withBusiness(BUSINESS, (db) => listCriticalRules(db))).toHaveLength(0);
   });
 
   it('adds family and counterparty rules, then deletes one', async () => {
@@ -463,13 +463,13 @@ describe('critical rules', () => {
     const csrf = await csrfOf(base, cookie);
     await post(base, cookie, '/ledger/rules', { kind: 'family', family: 'money_in' }, csrf);
     await post(base, cookie, '/ledger/rules', { kind: 'counterparty', match: 'Acme.co.il' }, csrf);
-    const rules = await listCriticalRules({ businessId: BUSINESS });
+    const rules = await withBusiness(BUSINESS, (db) => listCriticalRules(db));
     expect(rules).toHaveLength(2);
     const first = rules[0];
     if (!first) throw new Error('no rule');
     const del = await post(base, cookie, `/ledger/rules/${first.ruleId}/delete`, {}, csrf);
     expect(del.status).toBe(302);
-    expect(await listCriticalRules({ businessId: BUSINESS })).toHaveLength(1);
+    expect(await withBusiness(BUSINESS, (db) => listCriticalRules(db))).toHaveLength(1);
   });
 
   it('a rule without CSRF is 403 and writes nothing', async () => {
@@ -477,6 +477,6 @@ describe('critical rules', () => {
     const cookie = await login(base);
     const res = await post(base, cookie, '/ledger/rules', { kind: 'family', family: 'money_in' });
     expect(res.status).toBe(403);
-    expect(await listCriticalRules({ businessId: BUSINESS })).toHaveLength(0);
+    expect(await withBusiness(BUSINESS, (db) => listCriticalRules(db))).toHaveLength(0);
   });
 });

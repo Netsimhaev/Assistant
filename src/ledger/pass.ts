@@ -45,7 +45,7 @@
  */
 import { monotonicFactory } from 'ulid';
 import { loadActiveCharter, type ActiveCharter } from '../charter/store.js';
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import type { LedgerItem } from '../domain/ledger.js';
 import { NOTIFY_TIMEOUT_MS, withDeadline } from '../governance/notify.js';
 import type { NudgeDrafter } from '../sdk/nudge-drafter.js';
@@ -55,7 +55,7 @@ import type { EvidenceNotice } from './evidence.js';
 import { renderEvidenceNotice, renderReminder, renderWhatsAppBatch } from './render.js';
 import { dueSlots, type DueSlot } from './schedule.js';
 import { loadLedgerSettings, type LedgerSettings } from './settings.js';
-import { atomically, listLedgerItems } from './store.js';
+import { listLedgerItems } from './store.js';
 
 const ulid = monotonicFactory();
 
@@ -85,13 +85,11 @@ export type LedgerChannelState = 'sent' | 'failed' | 'skipped_not_connected';
 export type LedgerPassDrafter = NudgeDrafter;
 
 export interface LedgerPassOptions {
-  businessId: string;
   now?: Date;
   sendAlert?: (subject: string, body: string) => Promise<{ ok: boolean; error?: string }>;
   messenger?: BossMessenger;
   dashboardBaseUrl?: string;
   drafter?: LedgerPassDrafter;
-  db?: Queryable;
   /** Per-send deadline. Defaults to `NOTIFY_TIMEOUT_MS`. */
   timeoutMs?: number;
   /**
@@ -134,24 +132,24 @@ export async function deliver(send: () => Promise<{ ok: boolean }>, timeoutMs: n
  * The pass's single batch carries the evidence notices too (spec I5).
  */
 export async function sendLedgerBatch(
+  db: BusinessDb,
   entries: { itemId: string; text: string }[],
-  o: { businessId: string; messenger?: BossMessenger; db?: Queryable; timeoutMs?: number },
+  o: { messenger?: BossMessenger; timeoutMs?: number },
 ): Promise<{ state: LedgerChannelState | 'empty'; batchId: string | null }> {
   if (entries.length === 0) return { state: 'empty', batchId: null };
   const messenger = o.messenger;
   if (messenger === undefined) return { state: 'skipped_not_connected', batchId: null };
-  const db = o.db ?? getPool();
   const batchId = `LB-${ulid()}`;
   await db.query(
     `INSERT INTO ledger_whatsapp_batches (batch_id, business_id, items) VALUES ($1, $2, $3)`,
-    [batchId, o.businessId, entries.map((e) => e.itemId)],
+    [batchId, db.businessId, entries.map((e) => e.itemId)],
   );
   const text = renderWhatsAppBatch(entries.map((e, i) => ({ n: i + 1, text: e.text })));
   const state = await deliver(() => messenger.send({ text, jobId: null }), o.timeoutMs ?? NOTIFY_TIMEOUT_MS);
   if (state === 'sent') {
     await db.query(
       `UPDATE ledger_whatsapp_batches SET sent_at = now() WHERE batch_id = $1 AND business_id = $2`,
-      [batchId, o.businessId],
+      [batchId, db.businessId],
     );
   }
   return { state, batchId };
@@ -164,18 +162,17 @@ export async function sendLedgerBatch(
  * slot is left unclaimed and nothing is counted.
  */
 async function handleActNudge(
+  db: BusinessDb,
   item: LedgerItem,
   slot: DueSlot,
   ctx: { result: LedgerPassResult; options: LedgerPassOptions; active: ActiveCharter; now: Date },
 ): Promise<ClaimedReminder | null> {
   const drafter = ctx.options.drafter;
   if (drafter === undefined) return null;
-  const opened = await openNudge(item, slot, {
-    businessId: ctx.options.businessId,
+  const opened = await openNudge(db, item, slot, {
     active: ctx.active,
     drafter,
     now: ctx.now,
-    ...(ctx.options.db !== undefined ? { db: ctx.options.db } : {}),
   });
   switch (opened.outcome) {
     case 'opened':
@@ -203,7 +200,7 @@ async function handleActNudge(
  * claimed `nudge` reminder row. A remind-mode nudge leaves only the row, and
  * without it the cadence would restart from `created_at` — one nudge ever.
  */
-async function lastNudges(db: Queryable, businessId: string): Promise<Map<string, Date>> {
+async function lastNudges(db: BusinessDb, businessId: string): Promise<Map<string, Date>> {
   const { rows } = await db.query<{ item_id: string; last_at: Date }>(
     `SELECT item_id, max(at) AS last_at FROM (
        SELECT item_id, at FROM ledger_events
@@ -225,14 +222,14 @@ interface Claimed {
 }
 
 async function claim(
-  db: Queryable | undefined,
+  db: BusinessDb,
   businessId: string,
   item: LedgerItem,
   slot: DueSlot,
   rendered: { subject: string; body: string },
   now: Date,
 ): Promise<string | null> {
-  return atomically(db, async (tx) => {
+  return transaction(db, async (tx) => {
     const inserted = await tx.query<{ reminder_id: string }>(
       `INSERT INTO ledger_reminders (reminder_id, business_id, item_id, slot, kind, body, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -251,14 +248,13 @@ async function claim(
   });
 }
 
-export async function runLedgerPass(options: LedgerPassOptions): Promise<LedgerPassResult> {
-  const { businessId } = options;
-  const db = options.db ?? getPool();
+export async function runLedgerPass(db: BusinessDb, options: LedgerPassOptions = {}): Promise<LedgerPassResult> {
+  const businessId = db.businessId;
   const now = options.now ?? new Date();
   const timeoutMs = options.timeoutMs ?? NOTIFY_TIMEOUT_MS;
   const result = emptyResult();
 
-  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
+  const active = await loadActiveCharter(db);
   if (active === null) return result;
   const timeZone = active.charter.identity.timezone;
   const workweek = active.charter.operations.workweek;
@@ -269,7 +265,7 @@ export async function runLedgerPass(options: LedgerPassOptions): Promise<LedgerP
       ? `${options.dashboardBaseUrl.replace(/\/+$/, '')}/ledger`
       : null;
 
-  const settings: LedgerSettings = await loadLedgerSettings({ businessId, db });
+  const settings: LedgerSettings = await loadLedgerSettings(db);
   const batch: Claimed[] = [];
 
   /** Email one claimed reminder now; queue it for the pass's WhatsApp batch. */
@@ -303,14 +299,14 @@ export async function runLedgerPass(options: LedgerPassOptions): Promise<LedgerP
   // First the outcome of the nudges already in flight, so a refused one is
   // told this pass and its `nudge_fallback` resumes the cadence (R4).
   try {
-    const observed = await observeNudges({ businessId, now, ...(options.db !== undefined ? { db: options.db } : {}) });
+    const observed = await observeNudges(db, { now });
     result.nudgeFallbacks += observed.fallback.length;
     for (const r of observed.reminders) await dispatch(r.reminderId, r.item, r);
   } catch (err) {
     result.errored.push({ itemId: 'observe_nudges', error: err instanceof Error ? err.message : String(err) });
   }
 
-  const items = await listLedgerItems({ businessId, db, statuses: ['open'] });
+  const items = await listLedgerItems(db, { statuses: ['open'] });
   const lastNudge = await lastNudges(db, businessId);
 
   for (const item of items) {
@@ -324,12 +320,12 @@ export async function runLedgerPass(options: LedgerPassOptions): Promise<LedgerP
       });
       for (const slot of slots) {
         if (slot.kind === 'nudge' && settings.modes[item.family] === 'act') {
-          const reminder = await handleActNudge(item, slot, { result, options, active, now });
+          const reminder = await handleActNudge(db, item, slot, { result, options, active, now });
           if (reminder !== null) await dispatch(reminder.reminderId, reminder.item, reminder);
           continue;
         }
         const rendered = renderReminder(item, slot.kind, { timeZone, currency, now });
-        const reminderId = await claim(options.db, businessId, item, slot, rendered, now);
+        const reminderId = await claim(db, businessId, item, slot, rendered, now);
         if (reminderId === null) {
           result.skipped += 1;
           continue;
@@ -356,10 +352,9 @@ export async function runLedgerPass(options: LedgerPassOptions): Promise<LedgerP
     let state: LedgerChannelState;
     try {
       const sent = await sendLedgerBatch(
+        db,
         entries.map((e) => ({ itemId: e.itemId, text: e.text })),
         {
-          businessId,
-          db,
           timeoutMs,
           ...(options.messenger !== undefined ? { messenger: options.messenger } : {}),
         },

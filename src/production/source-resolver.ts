@@ -29,7 +29,7 @@
  * Only `extracted` and `stored` documents are candidates: a rejected file was
  * never kept for reading.
  */
-import type { Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { ATTACHMENT_DOC_TYPE_LABELS, AttachmentDocType } from '../domain/mail-triage.js';
 import { stripBidiControls } from '../util/bidi.js';
 import { extractDomain } from '../util/address.js';
@@ -155,10 +155,9 @@ function toDoc(row: Row, timeZone: string): Doc {
 }
 
 export async function resolveSourceDocuments(
-  businessId: string,
+  db: BusinessDb,
   hints: readonly string[],
   explicitIds: readonly string[],
-  db: Queryable,
   options: { timeZone?: string } = {},
 ): Promise<SourceResolution> {
   const timeZone = options.timeZone ?? 'UTC';
@@ -182,7 +181,7 @@ export async function resolveSourceDocuments(
         WHERE d.business_id = $1 AND d.status IN ('extracted', 'stored')
         ORDER BY d.created_at DESC, d.document_id DESC
         LIMIT $2`,
-      [businessId, SCAN_LIMIT],
+      [db.businessId, SCAN_LIMIT],
     );
     const docs = rows.map((row) => toDoc(row, timeZone));
 
@@ -209,7 +208,7 @@ export async function resolveSourceDocuments(
     const { rows } = await db.query<{ document_id: string }>(
       `SELECT document_id FROM documents
         WHERE business_id = $1 AND document_id = ANY($2::text[]) AND status IN ('extracted', 'stored')`,
-      [businessId, [...explicitIds]],
+      [db.businessId, [...explicitIds]],
     );
     const known = new Set(rows.map((row) => row.document_id));
     for (const id of explicitIds) {

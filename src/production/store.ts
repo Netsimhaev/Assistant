@@ -27,7 +27,7 @@
  */
 import { localParts, localToInstant } from '../util/local-time.js';
 import { z } from 'zod';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import {
   DocumentFormat,
   DocumentKind,
@@ -206,7 +206,6 @@ export function sourceProvenance(p: Pick<Production, 'work'>, documentId: string
 }
 
 export interface CreateProductionInput {
-  businessId: string;
   originJobId: string;
   instructionText: string;
   textOrigin: InstructionTextOrigin;
@@ -221,7 +220,7 @@ export interface CreateProductionInput {
   ownerSourceIds?: string[];
 }
 
-export async function createProduction(input: CreateProductionInput, db: Queryable = getPool()): Promise<string> {
+export async function createProduction(db: BusinessDb, input: CreateProductionInput): Promise<string> {
   const productionId = `DP-${ulid()}`;
   const destination = ProductionDestination.parse(input.destination);
   await db.query(
@@ -231,7 +230,7 @@ export async function createProduction(input: CreateProductionInput, db: Queryab
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
     [
       productionId,
-      input.businessId,
+      db.businessId,
       input.originJobId,
       input.instructionText,
       input.textOrigin,
@@ -247,13 +246,12 @@ export async function createProduction(input: CreateProductionInput, db: Queryab
 }
 
 export async function loadProduction(
-  businessId: string,
+  db: BusinessDb,
   productionId: string,
-  db: Queryable = getPool(),
 ): Promise<Production | null> {
   const { rows } = await db.query<ProductionRow>(
     'SELECT * FROM document_productions WHERE business_id = $1 AND production_id = $2',
-    [businessId, productionId],
+    [db.businessId, productionId],
   );
   const row = rows[0];
   return row === undefined ? null : toProduction(row);
@@ -265,10 +263,9 @@ export async function loadProduction(
  * production it already gave up on this pass (a lost race, an error).
  */
 export async function claimProduction(
-  businessId: string,
+  db: BusinessDb,
   holder: string,
   leaseMs: number,
-  db: Queryable = getPool(),
   exclude: readonly string[] = [],
 ): Promise<Production | null> {
   const { rows } = await db.query<ProductionRow>(
@@ -288,7 +285,7 @@ export async function claimProduction(
         AND stage NOT IN ('ready', 'failed_checks', 'failed')
         AND (lease_until IS NULL OR lease_until < now())
       RETURNING *`,
-    [businessId, holder, leaseMs, [...exclude]],
+    [db.businessId, holder, leaseMs, [...exclude]],
   );
   const row = rows[0];
   return row === undefined ? null : toProduction(row);
@@ -300,10 +297,9 @@ export async function claimProduction(
  * the origin job / telling the owner is resumed here — at least once.
  */
 export async function claimUnfinished(
-  businessId: string,
+  db: BusinessDb,
   holder: string,
   leaseMs: number,
-  db: Queryable = getPool(),
   exclude: readonly string[] = [],
 ): Promise<Production | null> {
   const { rows } = await db.query<ProductionRow>(
@@ -322,13 +318,13 @@ export async function claimUnfinished(
                FOR UPDATE SKIP LOCKED)
         AND (lease_until IS NULL OR lease_until < now())
       RETURNING *`,
-    [businessId, holder, leaseMs, [...exclude]],
+    [db.businessId, holder, leaseMs, [...exclude]],
   );
   const row = rows[0];
   return row === undefined ? null : toProduction(row);
 }
 
-export async function releaseLease(productionId: string, holder: string, db: Queryable = getPool()): Promise<void> {
+export async function releaseLease(db: BusinessDb, productionId: string, holder: string): Promise<void> {
   await db.query(
     `UPDATE document_productions SET lease_until = NULL, leased_by = NULL
       WHERE production_id = $1 AND leased_by = $2`,
@@ -347,11 +343,11 @@ export interface StagePatch {
  * `stage = from`: `false` means another runner already moved it (a skip).
  */
 export async function advanceStage(
+  db: BusinessDb,
   productionId: string,
   from: ProductionStage,
   to: ProductionStage,
   patch: StagePatch,
-  db: Queryable = getPool(),
 ): Promise<boolean> {
   const { rowCount } = await db.query(
     `UPDATE document_productions
@@ -375,12 +371,12 @@ export async function advanceStage(
 
 /** Overwrite the working record without moving the stage (conditional on the stage, like `advanceStage`). */
 export async function saveWork(
+  db: BusinessDb,
   productionId: string,
   stage: ProductionStage,
   work: ProductionWork,
-  db: Queryable = getPool(),
 ): Promise<boolean> {
-  return advanceStage(productionId, stage, stage, { work }, db);
+  return advanceStage(db, productionId, stage, stage, { work });
 }
 
 // ---------------------------------------------------------------- versions
@@ -449,7 +445,7 @@ export interface SaveVersionInput {
  * version_no)`: a re-run after a crash between the write and the stage move
  * returns the row already there.
  */
-export async function saveVersion(input: SaveVersionInput, db: Queryable = getPool()): Promise<string> {
+export async function saveVersion(db: BusinessDb, input: SaveVersionInput): Promise<string> {
   const versionId = versionIdFor(input.productionId, input.versionNo);
   await db.query(
     `WITH ins AS (
@@ -473,7 +469,7 @@ export async function saveVersion(input: SaveVersionInput, db: Queryable = getPo
   return versionId;
 }
 
-export async function latestVersion(productionId: string, db: Queryable = getPool()): Promise<DocumentVersion | null> {
+export async function latestVersion(db: BusinessDb, productionId: string): Promise<DocumentVersion | null> {
   const { rows } = await db.query<VersionRow>(
     `SELECT * FROM document_versions WHERE production_id = $1 ORDER BY version_no DESC LIMIT 1`,
     [productionId],
@@ -483,10 +479,10 @@ export async function latestVersion(productionId: string, db: Queryable = getPoo
 }
 
 export async function saveVersionCheck(
+  db: BusinessDb,
   versionId: string,
   check: 'check1' | 'check2',
   result: unknown,
-  db: Queryable = getPool(),
 ): Promise<void> {
   await db.query(`UPDATE document_versions SET ${check === 'check1' ? 'check1' : 'check2'} = $2 WHERE version_id = $1`, [
     versionId,
@@ -502,9 +498,8 @@ export async function saveVersionCheck(
  * midnight is not counted — at most two per such production.
  */
 export async function productionsToday(
-  businessId: string,
+  db: BusinessDb,
   timeZone: string,
-  db: Queryable = getPool(),
   now: Date = new Date(),
 ): Promise<number> {
   const start = localToInstant(localParts(now, timeZone).date, '00:00', timeZone);
@@ -513,22 +508,21 @@ export async function productionsToday(
              + COALESCE(SUM(attempt), 0))::text AS n
        FROM document_productions
       WHERE business_id = $1 AND created_at >= $2`,
-    [businessId, start],
+    [db.businessId, start],
   );
   return Number(rows[0]?.n ?? 0);
 }
 
 /** One version, found only when its production belongs to THIS business. */
 export async function loadVersion(
-  businessId: string,
+  db: BusinessDb,
   versionId: string,
-  db: Queryable = getPool(),
 ): Promise<DocumentVersion | null> {
   const { rows } = await db.query<VersionRow>(
     `SELECT v.* FROM document_versions v
        JOIN document_productions p ON p.production_id = v.production_id
       WHERE v.version_id = $1 AND p.business_id = $2`,
-    [versionId, businessId],
+    [versionId, db.businessId],
   );
   const row = rows[0];
   return row === undefined ? null : toVersion(row);

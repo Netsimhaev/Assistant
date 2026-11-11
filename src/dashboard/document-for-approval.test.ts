@@ -89,7 +89,8 @@ async function aReadingAcross(
   readingBusinessId: string,
 ): Promise<{ documentId: string; readingId: string }> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument(
+  await withBusiness(documentBusinessId, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -99,9 +100,9 @@ async function aReadingAcross(
       byteSize: 20,
       storedPath: `${documentBusinessId}/${documentId}/original.txt`,
     },
-    { businessId: documentBusinessId },
-  );
-  const { record } = await saveReading(
+  ));
+  const { record } = await withBusiness(readingBusinessId, (db) => saveReading(
+    db,
     {
       readingId: `RDG-${ulid()}`,
       documentId,
@@ -120,8 +121,7 @@ async function aReadingAcross(
       promptVersion: 'v1',
       briefHash: ulid().padEnd(64, '0'),
     },
-    { businessId: readingBusinessId },
-  );
+  ));
   return { documentId, readingId: record.readingId };
 }
 

@@ -72,7 +72,7 @@ describe('ledger.add / ledger.update', () => {
     expect(out.performed).toBe(true);
     expect(out['family']).toBe('money_in');
 
-    const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
+    const item = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, String(out['itemId'])));
     expect(item?.family).toBe('money_in');
     expect(item?.originJobId).toBe(jobId);
     // Date-only due: the owner's daily hour (8:00 default) in the charter zone.
@@ -84,7 +84,7 @@ describe('ledger.add / ledger.update', () => {
   it('keeps an explicit time and marks the due as timed', async () => {
     const jobId = await aJob();
     const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'meetings', description: 'פגישה עם דנה', dueDate: '2026-12-01', dueTime: '14:30' }, { ...{ jobId }, db }));
-    const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
+    const item = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, String(out['itemId'])));
     expect(item?.dueAt?.toISOString()).toBe(localToInstant('2026-12-01', '14:30', 'Asia/Jerusalem').toISOString());
     expect(item?.dueIsDateOnly).toBe(false);
   });
@@ -126,7 +126,7 @@ describe('ledger.add / ledger.update', () => {
     const jobId = await aJob({ instruction: 'תזכירי לי לגבות מדנה dana@acme.example עד ראשון' });
     const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'לגבות', counterpartyName: 'דנה', counterpartyEmail: 'Dana@Acme.example' }, { ...{ jobId }, db }));
     expect(out['counterpartyEmailVerified']).toBe(true);
-    const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
+    const item = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, String(out['itemId'])));
     expect(item?.counterpartyEmailVerified).toBe(true);
   });
 
@@ -138,7 +138,7 @@ describe('ledger.add / ledger.update', () => {
     const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'לגבות', counterpartyEmail: 'dana@acme.example' }, { ...{ jobId }, db }));
     expect(out.performed).toBe(true);
     expect(out['counterpartyEmailVerified']).toBe(false);
-    const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
+    const item = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, String(out['itemId'])));
     expect(item?.counterpartyEmail).toBe('dana@acme.example');
     expect(item?.counterpartyEmailVerified).toBe(false);
   });
@@ -161,7 +161,7 @@ describe('ledger.add / ledger.update', () => {
 
   async function addWithDomain(jobId: string, extra: Record<string, unknown> = {}) {
     const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'awaiting_reply', description: 'תשובה מאקמי', counterpartyDomain: 'Acme.example', ...extra }, { ...{ jobId }, db }));
-    const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
+    const item = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, String(out['itemId'])));
     return { out, item };
   }
 
@@ -225,7 +225,7 @@ describe('ledger.add / ledger.update', () => {
 
     // And the same payload with a deadline goes through: the refusal was the deadline.
     const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'projects', description: 'מצגת למשקיעים', dueDate: '2026-12-20', stages: ['טיוטה', 'עיצוב'] }, { ...{ jobId }, db }));
-    const item = await loadLedgerItem(String(out['itemId']), { businessId: BUSINESS });
+    const item = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, String(out['itemId'])));
     expect(item?.stages).toEqual([
       { title: 'טיוטה', done: false },
       { title: 'עיצוב', done: false },
@@ -258,10 +258,10 @@ describe('ledger.add / ledger.update', () => {
 
   it('critical rule marks importance', async () => {
     const jobId = await aJob();
-    await addCriticalRule({ kind: 'family', family: 'money_in' }, { businessId: BUSINESS, by: 'owner' });
+    await withBusiness(BUSINESS, (db) => addCriticalRule(db, { kind: 'family', family: 'money_in' }, { by: 'owner' }));
     const ruled = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'money_in', description: 'x' }, { ...{ jobId }, db }));
     expect(ruled['importance']).toBe('critical');
-    const ruledItem = await loadLedgerItem(String(ruled['itemId']), { businessId: BUSINESS });
+    const ruledItem = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, String(ruled['itemId'])));
     expect(ruledItem?.importanceManual).toBe(false);
 
     const other = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'meetings', description: 'y' }, { ...{ jobId }, db }));
@@ -269,7 +269,7 @@ describe('ledger.add / ledger.update', () => {
 
     const manual = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.add', { family: 'meetings', description: 'z', critical: true }, { ...{ jobId }, db }));
     expect(manual['importance']).toBe('critical');
-    const manualItem = await loadLedgerItem(String(manual['itemId']), { businessId: BUSINESS });
+    const manualItem = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, String(manual['itemId'])));
     expect(manualItem?.importanceManual).toBe(true);
   });
 
@@ -279,7 +279,7 @@ describe('ledger.add / ledger.update', () => {
     const itemId = String(added['itemId']);
     const out = await withBusiness(BUSINESS, (db) => runLocalTool('ledger.update', { itemId, stagesDone: [1], dueDate: '2026-12-27', note: 'הטיוטה מוכנה' }, { ...{ jobId }, db }));
     expect(out.performed).toBe(true);
-    const item = await loadLedgerItem(itemId, { businessId: BUSINESS });
+    const item = await withBusiness(BUSINESS, (db) => loadLedgerItem(db, itemId));
     expect(item?.stages).toEqual([
       { title: 'טיוטה', done: true },
       { title: 'עיצוב', done: false },
@@ -298,7 +298,8 @@ describe('ledger.add / ledger.update', () => {
 
   it('update refuses an item of another business', async () => {
     const otherJob = await aJob({ businessId: OTHER });
-    const foreign = await createLedgerItem(
+    const foreign = await withBusiness(OTHER, (db) => createLedgerItem(
+      db,
       {
         family: 'money_in',
         description: 'של עסק אחר',
@@ -316,14 +317,14 @@ describe('ledger.add / ledger.update', () => {
         proposedStages: null,
         originJobId: otherJob,
       },
-      { businessId: OTHER, by: 'test' },
-    );
+      { by: 'test' },
+    ));
     const jobId = await aJob();
     const code = await refusalCode(() =>
       withBusiness(BUSINESS, (db) => runLocalTool('ledger.update', { itemId: foreign.itemId, description: 'נחטף' }, { ...{ jobId }, db })),
     );
     expect(code).toBe('ledger_item_not_found');
-    const untouched = await loadLedgerItem(foreign.itemId, { businessId: OTHER });
+    const untouched = await withBusiness(OTHER, (db) => loadLedgerItem(db, foreign.itemId));
     expect(untouched?.description).toBe('של עסק אחר');
   });
 

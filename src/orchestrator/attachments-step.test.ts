@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
 import { closePool, withBusiness } from '../db/pool.js';
-import { resetDatabase, testDb } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -68,8 +68,7 @@ const paths = new Map<string, string>();
 let lastVersionId: string | null = null;
 
 async function produced(bytes: Buffer, versionNo = 1): Promise<AttachmentRef> {
-  const productionId = await createProduction({
-    businessId: BUSINESS,
+  const productionId = await withBusiness(BUSINESS, (db) => createProduction(db, {
     originJobId: 'J-origin',
     instructionText: 'תכיני מכתב',
     textOrigin: 'typed',
@@ -78,18 +77,18 @@ async function produced(bytes: Buffer, versionNo = 1): Promise<AttachmentRef> {
     kind: 'letter',
     destination: { mode: 'save', folder: null },
     sourceDocumentIds: [],
-  });
+  }));
   const storedPath = `${DIR}/${productionId}-${versionNo}.docx`;
   await mkdir(join(config.documentRoot, DIR), { recursive: true });
   await writeFile(join(config.documentRoot, storedPath), bytes);
-  const producedVersionId = await saveVersion({
+  const producedVersionId = await withBusiness(TEST_BUSINESS, (db) => saveVersion(db, {
     productionId,
     versionNo,
     spec,
     storedPath,
     sha256: sha(bytes),
     sizeBytes: bytes.length,
-  });
+  }));
   paths.set(producedVersionId, join(config.documentRoot, storedPath));
   lastVersionId = producedVersionId;
   return { producedVersionId, sha256: sha(bytes), filename: 'הצעה.docx', sizeBytes: bytes.length };

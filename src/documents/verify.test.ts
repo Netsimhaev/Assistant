@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { ulid } from 'ulid';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { insertOrGetDocument } from './store.js';
 import { verifyDocumentUnchanged } from './verify.js';
@@ -21,10 +21,10 @@ async function aStoredDocument(bytes: Buffer, sha256: string): Promise<string> {
   const rel = `${BUSINESS}/${documentId}/original.txt`;
   await mkdir(join(root, BUSINESS, documentId), { recursive: true });
   await writeFile(join(root, rel), bytes);
-  await insertOrGetDocument({
+  await withBusiness(BUSINESS, (db) => insertOrGetDocument(db, {
     documentId, source: 'manual', originalName: 'הסכם.docx', mediaType: 'text/plain',
     sha256, byteSize: bytes.length, storedPath: rel,
-  }, { businessId: BUSINESS });
+  }));
   return documentId;
 }
 
@@ -40,7 +40,7 @@ afterAll(async () => {
 describe('verifyDocumentUnchanged', () => {
   it('reports unchanged when the file still hashes to what intake recorded', async () => {
     const documentId = await aStoredDocument(BYTES, HASH);
-    const outcome = await verifyDocumentUnchanged(documentId, { businessId: BUSINESS, documentRoot: root });
+    const outcome = await withBusiness(BUSINESS, (db) => verifyDocumentUnchanged(db, documentId, { documentRoot: root }));
     expect(outcome.status).toBe('unchanged');
     if (outcome.status !== 'unchanged') throw new Error('expected unchanged');
     expect(outcome.sha256).toBe(HASH);
@@ -49,7 +49,7 @@ describe('verifyDocumentUnchanged', () => {
   it('reports changed when the file on disk was edited after intake', async () => {
     // The row keeps intake's hash; the bytes are someone else's.
     const documentId = await aStoredDocument(Buffer.from('הסכם שיווק — נוסח אחר', 'utf8'), HASH);
-    const outcome = await verifyDocumentUnchanged(documentId, { businessId: BUSINESS, documentRoot: root });
+    const outcome = await withBusiness(BUSINESS, (db) => verifyDocumentUnchanged(db, documentId, { documentRoot: root }));
     expect(outcome.status).toBe('changed');
     if (outcome.status !== 'changed') throw new Error('expected changed');
     expect(outcome.expected).toBe(HASH);
@@ -59,13 +59,13 @@ describe('verifyDocumentUnchanged', () => {
   it('reports missing when the file is gone', async () => {
     const documentId = await aStoredDocument(BYTES, HASH);
     await rm(join(root, BUSINESS, documentId), { recursive: true, force: true });
-    expect((await verifyDocumentUnchanged(documentId, { businessId: BUSINESS, documentRoot: root })).status)
+    expect((await withBusiness(BUSINESS, (db) => verifyDocumentUnchanged(db, documentId, { documentRoot: root }))).status)
       .toBe('missing');
   });
 
   it('reports unknown_document for an id this business does not own', async () => {
     const documentId = await aStoredDocument(BYTES, HASH);
-    expect((await verifyDocumentUnchanged(documentId, { businessId: 'other', documentRoot: root })).status)
+    expect((await withBusiness('other', (db) => verifyDocumentUnchanged(db, documentId, { documentRoot: root }))).status)
       .toBe('unknown_document');
   });
 
@@ -78,7 +78,7 @@ describe('verifyDocumentUnchanged', () => {
     // like: the row exists, something is at the path, it just isn't a file.
     await rm(filePath, { force: true });
     await mkdir(filePath);
-    const outcome = await verifyDocumentUnchanged(documentId, { businessId: BUSINESS, documentRoot: root });
+    const outcome = await withBusiness(BUSINESS, (db) => verifyDocumentUnchanged(db, documentId, { documentRoot: root }));
     expect(outcome.status).toBe('unreadable');
     if (outcome.status !== 'unreadable') throw new Error('expected unreadable');
     expect(outcome.cause.length).toBeGreaterThan(0);
@@ -122,11 +122,11 @@ describe('verifyDocumentUnchanged', () => {
     const unknown = await stored('של עסק אחר');
 
     const cases: [string, Promise<{ status: string }>][] = [
-      ['unchanged', verifyDocumentUnchanged(unchanged, { businessId: BUSINESS, documentRoot: root })],
-      ['changed', verifyDocumentUnchanged(changed, { businessId: BUSINESS, documentRoot: root })],
-      ['missing', verifyDocumentUnchanged(missing, { businessId: BUSINESS, documentRoot: root })],
-      ['unreadable', verifyDocumentUnchanged(unreadable, { businessId: BUSINESS, documentRoot: root })],
-      ['unknown_document', verifyDocumentUnchanged(unknown, { businessId: 'other', documentRoot: root })],
+      ['unchanged', withBusiness(BUSINESS, (db) => verifyDocumentUnchanged(db, unchanged, { documentRoot: root }))],
+      ['changed', withBusiness(BUSINESS, (db) => verifyDocumentUnchanged(db, changed, { documentRoot: root }))],
+      ['missing', withBusiness(BUSINESS, (db) => verifyDocumentUnchanged(db, missing, { documentRoot: root }))],
+      ['unreadable', withBusiness(BUSINESS, (db) => verifyDocumentUnchanged(db, unreadable, { documentRoot: root }))],
+      ['unknown_document', withBusiness('other', (db) => verifyDocumentUnchanged(db, unknown, { documentRoot: root }))],
     ];
 
     const seen: string[] = [];

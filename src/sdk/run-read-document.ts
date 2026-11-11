@@ -36,12 +36,12 @@ async function main(): Promise<void> {
   const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
   const bundle = active?.bundle ?? (await withBusiness(config.businessId, (bdb) => installCharter(bdb, buildCharter()))); // TENANCY-TODO(task 7)
 
-  const result = await readDocument({
+  const result = await withBusiness(config.businessId, (db) => readDocument(db, { // TENANCY-TODO(task 7)
     documentId,
     bundle,
     provenance: 'unknown_external',
     jobId: null,
-  });
+  }));
 
   if (result.status === 'no_artifacts') {
     console.log('למסמך הזה אין חלקים מופקים. הרץ קודם את הקליטה.');

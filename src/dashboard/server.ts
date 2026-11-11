@@ -647,7 +647,7 @@ const CONVERSATION_LIMIT = 200;
  * single OLDEST of the fetched batch — `fetched.slice(1)` — not the newest.
  */
 async function handleConversation(res: ServerResponse, businessId: string, session: Session): Promise<void> {
-  const fetched = await conversation({ businessId, limit: CONVERSATION_LIMIT + 1 });
+  const fetched = await withBusiness(businessId, (db) => conversation(db, { limit: CONVERSATION_LIMIT + 1 })); // TENANCY-TODO(task 10)
   const truncated = fetched.length > CONVERSATION_LIMIT;
   const messages = truncated ? fetched.slice(fetched.length - CONVERSATION_LIMIT) : fetched;
   sendHtml(res, 200, renderConversation({ messages, csrf: issueCsrfToken(session.sessionId), truncated }));
@@ -662,7 +662,7 @@ async function handleConversation(res: ServerResponse, businessId: string, sessi
  * single recall during planning.
  */
 async function handleMemory(res: ServerResponse, businessId: string, session: Session): Promise<void> {
-  const memories = await recallMemories({ limit: MAX_RECALL }, { businessId });
+  const memories = await withBusiness(businessId, (db) => recallMemories(db, { limit: MAX_RECALL })); // TENANCY-TODO(task 10)
   sendHtml(res, 200, renderMemory(memories, issueCsrfToken(session.sessionId)));
 }
 
@@ -1342,10 +1342,11 @@ async function ingestUpload(
   try {
     const path = join(dir, 'upload');
     await writeFile(path, file.bytes, { flag: 'wx' });
-    const record = await ingestDocument(
+    const record = await withBusiness(businessId, (db) => ingestDocument( // TENANCY-TODO(task 10)
+      db,
       { path, source: 'instruction', originalName: file.filename },
-      { businessId, ...(documentRoot !== undefined ? { documentRoot } : {}) },
-    );
+      { ...(documentRoot !== undefined ? { documentRoot } : {}) },
+    ));
     if (record.status === 'rejected' || (record.status === 'stored' && record.reason !== null)) {
       return { ok: false, reason: record.reason ?? 'הקובץ נדחה בקליטה.' };
     }
@@ -1566,14 +1567,13 @@ async function handleInstructAnswer(
   if (calendar !== undefined) {
     const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
     if (active !== null) {
-      const schedule = await answerScheduleQuery({
+      const schedule = await withBusiness(businessId, (db) => answerScheduleQuery(db, { // TENANCY-TODO(task 10)
         text: form.get('answer') ?? '',
-        businessId,
         timeZone: active.charter.identity.timezone,
         operations: active.charter.operations,
         runtime: calendar.runtime,
         ...(calendar.client !== undefined ? { client: calendar.client } : {}),
-      });
+      }));
       if (schedule !== null) {
         return sendHtml(
           res,
@@ -2352,7 +2352,7 @@ async function mailboxProviderOf(businessId: string): Promise<string | null> {
 
 /** The positive marker the reply layout and the reply edit rule key on. */
 async function isMailReplyCard(jobId: string | null, businessId: string): Promise<boolean> {
-  return jobId !== null && (await isMailReplyJob(jobId, { businessId }));
+  return jobId !== null && (await withBusiness(businessId, (db) => isMailReplyJob(db, jobId))); // TENANCY-TODO(task 10)
 }
 
 /** JSON.parse can hand back an object, an array, a string, a number, a boolean, or null — only the first is a tool payload. */
@@ -2623,10 +2623,9 @@ async function handleDecision(
       );
     }
 
-    const verifyResult = await verifyDocumentUnchanged(document.documentId, {
-      businessId,
+    const verifyResult = await withBusiness(businessId, (db) => verifyDocumentUnchanged(db, document.documentId, { // TENANCY-TODO(task 10)
       ...(documentRoot !== undefined ? { documentRoot } : {}),
-    });
+    }));
     if (verifyResult.status !== 'unchanged') {
       return sendHtml(
         res,

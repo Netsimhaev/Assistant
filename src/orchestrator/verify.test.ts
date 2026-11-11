@@ -239,10 +239,10 @@ describe('closeVerifiedJobs', () => {
 
     expect(result.closed).toContain(jobId);
     expect(result.curated).toContain(jobId);
-    const rows = await recallMemories(
+    const rows = await withBusiness(BUSINESS, (db) => recallMemories(
+      db,
       { subjectKey: 'dana@example.com', kind: 'chunk' },
-      { businessId: BUSINESS },
-    );
+    ));
     expect(rows).toHaveLength(1);
     expect(rows[0]?.body).toEqual({ value: '\u05de\u05e2\u05d3\u05d9\u05e4\u05d4 \u05ea\u05d9\u05d0\u05d5\u05dd \u05d1\u05d1\u05d5\u05e7\u05e8' });
   });

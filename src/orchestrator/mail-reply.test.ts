@@ -408,7 +408,7 @@ describe('the stage-8 exemption is a mailbox-reply-job exemption (R20)', () => {
     await withBusiness(BUSINESS, (db) => transition(db, job.jobId, {
       to: 'await_approval', actor: 'orchestrator', reason: 'test', 
     }));
-    if (options.linkToMail) await linkReplyJob(mail.mailId, job.jobId, { businessId: BUSINESS });
+    if (options.linkToMail) await withBusiness(BUSINESS, (db) => linkReplyJob(db, mail.mailId, job.jobId));
 
     await approve(approvalId);
     const { client, sent } = fakeClient();
@@ -682,8 +682,8 @@ describe('reraiseAfterFailedSend', () => {
     // separates them (a timing-free stand-in for the race).
     const listed = await testDb().query('SELECT 1 FROM mail_messages WHERE reply_job_id = $1', [raised.replyJobId]);
     expect(listed.rows).toHaveLength(1);
-    expect(await claimFailedReply(mail.mailId, raised.replyJobId, { businessId: BUSINESS })).toBe(true);
-    expect(await claimFailedReply(mail.mailId, raised.replyJobId, { businessId: BUSINESS })).toBe(false);
+    expect(await withBusiness(BUSINESS, (db) => claimFailedReply(db, mail.mailId, raised.replyJobId))).toBe(true);
+    expect(await withBusiness(BUSINESS, (db) => claimFailedReply(db, mail.mailId, raised.replyJobId))).toBe(false);
   });
 
   it('delivery_unknown carries the may-have-sent warning', async () => {

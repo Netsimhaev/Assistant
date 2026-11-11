@@ -5,7 +5,7 @@
  */
 import type { CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type CalendarEvent, type CalendarFailure, type CalendarInfo } from '../calendar/types.js';
-import { getPool } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { MeetingSettings } from './settings.js';
 
 export const SNAPSHOT_MAX_EVENTS = 500;
@@ -25,9 +25,8 @@ interface HoldRow {
   end_at: Date;
 }
 
-export async function loadCalendarRange(o: {
+export async function loadCalendarRange(db: BusinessDb, o: {
   access: CalendarAccess;
-  businessId: string;
   settings: MeetingSettings;
   timeZone: string;
   fromIso: string;
@@ -59,10 +58,10 @@ export async function loadCalendarRange(o: {
     if (r.truncated) truncated = true;
   }
 
-  const { rows } = await getPool().query<HoldRow>(
+  const { rows } = await db.query<HoldRow>(
     `SELECT event_id, start_at, end_at FROM meeting_holds
       WHERE business_id = $1 AND state = 'held' AND start_at < $3::timestamptz AND end_at > $2::timestamptz`,
-    [o.businessId, o.fromIso, o.toIso],
+    [db.businessId, o.fromIso, o.toIso],
   );
   const holds = rows.map((r) => ({ start: r.start_at.toISOString(), end: r.end_at.toISOString(), eventId: r.event_id }));
 

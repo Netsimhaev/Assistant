@@ -267,7 +267,7 @@ async function beginVerification(
     // that function's own docblock for what it still does NOT capture
     // (extraction-time caps recorded in `artifact.flags`, which it does not
     // read).
-    const artifacts = await loadArtifacts(ctx.documentId, { businessId: ctx.db.businessId });
+    const artifacts = await loadArtifacts(ctx.db, ctx.documentId);
     const sources = artifacts.map((artifact) => renderArtifactFull(artifact));
 
     // The delegation itself, unchanged — this task changes what happens
@@ -341,12 +341,12 @@ export interface ConductResult {
  * (M5).
  */
 async function recordReadFailureSafely(
+  db: BusinessDb,
   documentId: string,
   message: string,
-  businessId: string,
 ): Promise<void> {
   try {
-    await recordReadFailure(documentId, message, { businessId });
+    await recordReadFailure(db, documentId, message);
   } catch {
     // Swallowed on purpose — see the docblock above. The caller already
     // counts this document as failed; losing the written reason is a smaller
@@ -407,14 +407,14 @@ export async function conductPendingDocuments(
     const active = await loadActiveCharter(db);
     if (active === null) return;
 
-    const alreadyToday = await readingsToday({ businessId });
+    const alreadyToday = await readingsToday(db);
     let remaining = readsPerDay - alreadyToday;
     if (remaining <= 0) {
       result.ceilingReached = true;
       return;
     }
 
-    const waiting = await documentsAwaitingRead(limit, { businessId });
+    const waiting = await documentsAwaitingRead(db, limit);
 
     for (const document of waiting) {
       if (remaining <= 0) {
@@ -463,6 +463,7 @@ export async function conductPendingDocuments(
 
         stage = 'reading the document';
         const read = await readDocument(
+          db,
           {
             documentId: document.documentId,
             jobId: job.jobId,
@@ -470,13 +471,12 @@ export async function conductPendingDocuments(
             bundle: active.bundle,
           },
           {
-            businessId,
             ...(options.reader !== undefined ? { reader: options.reader } : {}),
           },
         );
 
         if (read.status !== 'read') {
-          await recordReadFailureSafely(document.documentId, `read: ${read.status}`, businessId);
+          await recordReadFailureSafely(db, document.documentId, `read: ${read.status}`);
           await transition(db, job.jobId, {
             to: 'failed',
             actor: 'orchestrator',
@@ -500,9 +500,9 @@ export async function conductPendingDocuments(
 
         if (proposed.status !== 'proposed') {
           await recordReadFailureSafely(
+            db,
             document.documentId,
             `propose: ${proposed.status}`,
-            businessId,
           );
           await transition(db, job.jobId, {
             to: 'failed',
@@ -594,7 +594,7 @@ export async function conductPendingDocuments(
       } catch (err) {
         // Per document, never per batch.
         const message = err instanceof Error ? err.message : String(err);
-        await recordReadFailureSafely(document.documentId, message, businessId);
+        await recordReadFailureSafely(db, document.documentId, message);
         result.failed += 1;
 
         // The document's failure is recorded above regardless. But a job may

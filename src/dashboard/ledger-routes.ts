@@ -170,7 +170,7 @@ async function renderListPage(
 ): Promise<void> {
   const now = new Date();
   const { timeZone, currency } = await charterContext(businessId);
-  const all = await listLedgerItems({ businessId });
+  const all = await withBusiness(businessId, (db) => listLedgerItems(db)); // TENANCY-TODO(task 10)
   const shown = all.filter((i) => matchesFilter(i, options.filter, now, timeZone));
   const follow = await followups(
     businessId,
@@ -178,7 +178,7 @@ async function renderListPage(
   );
   const rows: LedgerRowView[] = [];
   for (const item of shown) {
-    const events = await listLedgerEvents(item.itemId, { businessId });
+    const events = await withBusiness(businessId, (db) => listLedgerEvents(db, item.itemId)); // TENANCY-TODO(task 10)
     rows.push({ item, events: events.slice(-EVENTS_SHOWN), followup: follow.get(item.itemId) ?? null });
   }
   const body = renderLedger({
@@ -237,7 +237,7 @@ export async function handleLedgerAction(
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
 
-  const item = await loadLedgerItem(itemId, { businessId });
+  const item = await withBusiness(businessId, (db) => loadLedgerItem(db, itemId)); // TENANCY-TODO(task 10)
   if (item === null) return html(res, 404, renderNotFound());
 
   const refuse = (status: number, error: string): Promise<void> =>
@@ -246,12 +246,12 @@ export async function handleLedgerAction(
   const action = form.get('action') ?? '';
   if (action === 'critical') {
     if (item.status !== 'open' && item.status !== 'stuck') return refuse(409, NOT_APPLICABLE);
-    await updateLedgerItem(
+    await withBusiness(businessId, (db) => updateLedgerItem( // TENANCY-TODO(task 10)
+      db,
       itemId,
       { importance: 'critical', importanceManual: true },
       { kind: 'updated', by: session.username, note: 'importance=critical' },
-      { businessId },
-    );
+    ));
     return redirect(res, '/ledger');
   }
 
@@ -267,12 +267,11 @@ export async function handleLedgerAction(
   }
 
   const { timeZone } = await charterContext(businessId);
-  const outcome = await applyLedgerCommand(itemId, command, {
-    businessId,
+  const outcome = await withBusiness(businessId, (db) => applyLedgerCommand(db, itemId, command, { // TENANCY-TODO(task 10)
     by: session.username,
     now: new Date(),
     timeZone,
-  });
+  }));
   if (outcome === 'not_applicable') return refuse(409, NOT_APPLICABLE);
   if (outcome === 'lost_race') return refuse(409, LOST_RACE);
   redirect(res, '/ledger');
@@ -305,13 +304,13 @@ async function renderSettingsPage(
   error?: string,
 ): Promise<void> {
   const { currency } = await charterContext(businessId);
-  const shown = values ?? valuesFromSettings(await loadLedgerSettings({ businessId }));
+  const shown = values ?? valuesFromSettings(await withBusiness(businessId, (db) => loadLedgerSettings(db))); // TENANCY-TODO(task 10)
   html(
     res,
     status,
     renderLedgerSettings({
       values: shown,
-      rules: await listCriticalRules({ businessId }),
+      rules: await withBusiness(businessId, (db) => listCriticalRules(db)), // TENANCY-TODO(task 10)
       csrf: issueCsrfToken(session.sessionId),
       currency,
       ...(error !== undefined ? { error } : {}),
@@ -386,7 +385,7 @@ export async function handleLedgerSettingsPost(
     dailyHour: wholeNumber(values.dailyHour),
   };
   try {
-    await saveLedgerSettings(settings, { businessId, updatedBy: session.username });
+    await withBusiness(businessId, (db) => saveLedgerSettings(db, settings, { updatedBy: session.username })); // TENANCY-TODO(task 10)
   } catch (err) {
     return renderSettingsPage(res, businessId, session, 400, values, err instanceof Error ? err.message : BAD_VALUES);
   }
@@ -434,7 +433,7 @@ export async function handleLedgerRulePost(
     return refuse(BAD_VALUES);
   }
   try {
-    await addCriticalRule(rule, { businessId, by: session.username });
+    await withBusiness(businessId, (db) => addCriticalRule(db, rule, { by: session.username })); // TENANCY-TODO(task 10)
   } catch (err) {
     return refuse(err instanceof Error ? err.message : BAD_VALUES);
   }
@@ -449,6 +448,6 @@ export async function handleLedgerRuleDelete(
   form: URLSearchParams,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
-  await removeCriticalRule(ruleId, { businessId });
+  await withBusiness(businessId, (db) => removeCriticalRule(db, ruleId)); // TENANCY-TODO(task 10)
   redirect(res, '/ledger/settings');
 }

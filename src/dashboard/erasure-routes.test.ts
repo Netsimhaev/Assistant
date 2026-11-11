@@ -113,10 +113,10 @@ async function seedRonit(): Promise<{ jobId: string }> {
     provenance: 'boss',
     title: `מייל אל ${RONIT}`,
   }));
-  await writeMemory(
+  await withBusiness(BUSINESS, (db) => writeMemory(
+    db,
     { jobId: job.jobId, kind: 'entity', subjectKey: RONIT, body: {} },
-    { businessId: BUSINESS },
-  );
+  ));
   return { jobId: job.jobId };
 }
 
@@ -686,10 +686,10 @@ describe('what the owner authorised', () => {
 
     // The world moves. A second memory comes into scope after the owner read
     // the counts and before they clicked.
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'chunk', subjectKey: 'הערה', body: { note: RONIT } },
-      { businessId: BUSINESS },
-    );
+    ));
     expect(await memoryCount()).toBe(2);
 
     const res = await fetch(`${baseUrl}/erase/confirm`, {

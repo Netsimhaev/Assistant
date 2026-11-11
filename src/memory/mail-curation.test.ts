@@ -42,17 +42,17 @@ async function seedMailJob(): Promise<string> {
     title: 'מייל: חשבונית',
   }));
   const mail = await storedMail(BUSINESS, { fromAddress: SENDER });
-  await settleMail(
+  await withBusiness(BUSINESS, (db) => settleMail(
+    db,
     mail.mailId,
     { state: 'triaged', categories: ['invoice'], summary: 'חשבונית לאוקטובר', jobId: job.jobId },
-    { businessId: BUSINESS },
-  );
+  ));
   return job.jobId;
 }
 
 async function seedCurationRows(n: number, reason: string): Promise<void> {
   for (let i = 0; i < n; i += 1) {
-    await withBusiness(BUSINESS, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+    await withBusiness(BUSINESS, (bdb) => appendAudit(
       bdb,
       {
         actor: 'orchestrator',
@@ -72,7 +72,7 @@ async function seedCurationRows(n: number, reason: string): Promise<void> {
 
 async function pollOne(category: MailTriage['categories'], fromAddress: string, curator: () => Promise<CurationResult>) {
   await installMailboxCharter(BUSINESS);
-  await setCursor({ provider: 'google', cursor: 'C-0' }, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => setCursor(db, { provider: 'google', cursor: 'C-0' }));
   const mail = incomingMail({ providerMessageId: 'PM-X', fromAddress });
   const client = {
     initialCursor: async () => 'C-NEW',
@@ -104,7 +104,7 @@ describe('curation from mail', () => {
 
   it('curator brief includes attachment summaries and never PDF text', async () => {
     await installMailboxCharter(BUSINESS);
-    await setCursor({ provider: 'google', cursor: 'C-0' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setCursor(db, { provider: 'google', cursor: 'C-0' }));
     const bytes = buildPdf([['PDFCANARY invoice 77']]);
     const mail = incomingMail({
       providerMessageId: 'PM-CUR',
@@ -154,7 +154,7 @@ describe('curation from mail', () => {
 
   it('mail job brief touches exactly the sender address', async () => {
     const jobId = await seedMailJob();
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
     expect(brief).not.toBeNull();
     expect(brief?.touched).toEqual({ recipients: [SENDER], entityIds: [] });
     expect(brief?.text).toContain('חשבונית לאוקטובר');
@@ -162,7 +162,7 @@ describe('curation from mail', () => {
 
   it('candidate about another address is rejected by siftCandidates', async () => {
     const jobId = await seedMailJob();
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
     const result: CurationResult = {
       candidates: [
         { kind: 'chunk', subjectKey: SENDER, body: { note: 'ok' }, sourceRef: 'mail' },
@@ -174,9 +174,9 @@ describe('curation from mail', () => {
     expect(sifted.rejected).toHaveLength(1);
 
     // And end to end: only the sender's row is written, labelled with the job's provenance.
-    const outcome = await curateJob(jobId, { businessId: BUSINESS, scope: 'mail', curator: async () => result });
+    const outcome = await withBusiness(BUSINESS, (db) => curateJob(db, jobId, { scope: 'mail', curator: async () => result }));
     expect(outcome).toMatchObject({ ran: true, written: 1, rejected: 1, failed: false });
-    const memories = await recallMemories({ subjectKey: SENDER }, { businessId: BUSINESS });
+    const memories = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: SENDER }));
     expect(memories).toHaveLength(1);
     expect(memories[0]?.provenance).toBe('unknown_external');
   });
@@ -184,21 +184,21 @@ describe('curation from mail', () => {
   it('mail curation cap is counted apart from document curation', async () => {
     const jobId = await seedMailJob();
     await seedCurationRows(20, 'אצירה · 0 עובדות נשמרו · 0 נדחו');
-    expect(await curationRunsToday({ businessId: BUSINESS })).toBe(20);
-    expect(await curationRunsToday({ businessId: BUSINESS, scope: 'mail' })).toBe(0);
+    expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db))).toBe(20);
+    expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db, { scope: 'mail' }))).toBe(0);
 
     let calls = 0;
     const curator = async (): Promise<CurationResult> => {
       calls += 1;
       return { candidates: [] };
     };
-    const outcome = await curateJob(jobId, { businessId: BUSINESS, scope: 'mail', curator });
+    const outcome = await withBusiness(BUSINESS, (db) => curateJob(db, jobId, { scope: 'mail', curator }));
     expect(outcome.ran).toBe(true);
     expect(calls).toBe(1);
 
     // The mail run counts on the mail side only, prefixed in the audit row.
-    expect(await curationRunsToday({ businessId: BUSINESS, scope: 'mail' })).toBe(1);
-    expect(await curationRunsToday({ businessId: BUSINESS })).toBe(20);
+    expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db, { scope: 'mail' }))).toBe(1);
+    expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db))).toBe(20);
     const { rows } = await getPool().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'curation' AND reason LIKE 'mail:%'`,
       [BUSINESS],
@@ -206,7 +206,7 @@ describe('curation from mail', () => {
     expect(rows).toHaveLength(1);
 
     // And the mail ceiling does bind on its own count.
-    const capped = await curateJob(jobId, { businessId: BUSINESS, scope: 'mail', curator, runsPerDay: 1 });
+    const capped = await withBusiness(BUSINESS, (db) => curateJob(db, jobId, { scope: 'mail', curator, runsPerDay: 1 }));
     expect(capped.skipped).toBe('over_cap');
     expect(calls).toBe(1);
   });
@@ -219,7 +219,7 @@ describe('curation from mail', () => {
     });
     expect(result?.triaged).toBe(1);
     expect(curatorCalls).toBe(0);
-    expect(await curationRunsToday({ businessId: BUSINESS, scope: 'mail' })).toBe(0);
+    expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db, { scope: 'mail' }))).toBe(0);
   });
 
   it('an invoice mail is curated through the poll pass, a failing curator does not fail the mail', async () => {
@@ -235,7 +235,7 @@ describe('curation from mail', () => {
       [BUSINESS],
     );
     expect(rows).toEqual([{ state: 'triaged', error: 'curation_failed' }]);
-    expect(await curationRunsToday({ businessId: BUSINESS, scope: 'mail' })).toBe(1);
+    expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db, { scope: 'mail' }))).toBe(1);
   });
 
   it('mail brief carries neither the subject nor the body', async () => {
@@ -250,12 +250,12 @@ describe('curation from mail', () => {
       subject: 'SUBJECT-CANARY',
       bodyText: 'BODY-CANARY',
     });
-    await settleMail(
+    await withBusiness(BUSINESS, (db) => settleMail(
+      db,
       mail.mailId,
       { state: 'triaged', categories: ['question'], summary: 'שאלה על הצעה', jobId: job.jobId },
-      { businessId: BUSINESS },
-    );
-    const brief = await buildCurationBrief(job.jobId, { businessId: BUSINESS });
+    ));
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, job.jobId));
     expect(brief).not.toBeNull();
     expect(brief?.text).toContain('שאלה על הצעה');
     expect(brief?.text).not.toContain('SUBJECT-CANARY');
@@ -270,12 +270,12 @@ describe('curation from mail', () => {
       title: 'x',
     }));
     const mail = await storedMail(BUSINESS, { fromAddress: '' });
-    await settleMail(
+    await withBusiness(BUSINESS, (db) => settleMail(
+      db,
       mail.mailId,
       { state: 'triaged', categories: ['invoice'], summary: 's', jobId: job.jobId },
-      { businessId: BUSINESS },
-    );
-    expect(await buildCurationBrief(job.jobId, { businessId: BUSINESS })).toBeNull();
+    ));
+    expect(await withBusiness(BUSINESS, (db) => buildCurationBrief(db, job.jobId))).toBeNull();
   });
 
   it('mail scope never retires: an existing non-boss preference survives, the claim lands as a chunk', async () => {
@@ -289,12 +289,11 @@ describe('curation from mail', () => {
       provenance: 'staff',
       title: 'seed',
     }));
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: staffJob.jobId, kind: 'preference', subjectKey: SENDER, attribute: 'bank', body: { value: 'OLD' }, sourceRef: 'seed' },
-      { businessId: BUSINESS },
-    );
-    const outcome = await curateJob(jobId, {
-      businessId: BUSINESS,
+    ));
+    const outcome = await withBusiness(BUSINESS, (db) => curateJob(db, jobId, {
       scope: 'mail',
       curator: async () => ({
         candidates: [
@@ -302,7 +301,7 @@ describe('curation from mail', () => {
           { kind: 'entity', subjectKey: SENDER, body: { name: 'x' }, sourceRef: 'mail' },
         ],
       }),
-    });
+    }));
     expect(outcome).toMatchObject({ written: 2, failed: false });
     const { rows } = await getPool().query<{ kind: string; retired_at: Date | null; body: unknown }>(
       'SELECT kind, retired_at, body FROM memories WHERE business_id = $1 AND subject_key = $2',

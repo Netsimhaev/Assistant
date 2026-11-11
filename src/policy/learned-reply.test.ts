@@ -72,10 +72,10 @@ async function setup(
   // dropped the reply-job predicate would still find a row by From alone.
   const link = options.link ?? 'this';
   const mail = await storedMail(BUSINESS);
-  if (link === 'this') await linkReplyJob(mail.mailId, job.jobId, { businessId: BUSINESS });
+  if (link === 'this') await withBusiness(BUSINESS, (db) => linkReplyJob(db, mail.mailId, job.jobId));
   if (link === 'other-business') {
     const foreign = await storedMail('other-business');
-    await linkReplyJob(foreign.mailId, job.jobId, { businessId: 'other-business' });
+    await withBusiness('other-business', (db) => linkReplyJob(db, foreign.mailId, job.jobId));
   }
   return {
     jobId: job.jobId,

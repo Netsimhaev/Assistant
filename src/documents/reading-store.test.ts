@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import type { Reading } from '../domain/reading.js';
 import { insertOrGetDocument } from './store.js';
@@ -23,7 +23,8 @@ const READING: Reading = {
 
 async function aDocument(businessId = BUSINESS): Promise<string> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument(
+  await withBusiness(businessId, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -33,8 +34,7 @@ async function aDocument(businessId = BUSINESS): Promise<string> {
       byteSize: 10,
       storedPath: `${businessId}/${documentId}/original.txt`,
     },
-    { businessId },
-  );
+  ));
   return documentId;
 }
 
@@ -59,7 +59,7 @@ afterAll(async () => { await closePool(); });
 describe('saveReading', () => {
   it('stores a successful reading and hands it back', async () => {
     const documentId = await aDocument();
-    const { record, created } = await saveReading(newReading(documentId), { businessId: BUSINESS });
+    const { record, created } = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
     expect(created).toBe(true);
     expect(record.status).toBe('read');
     expect(record.content?.summary).toBe('הצעת מחיר.');
@@ -68,10 +68,10 @@ describe('saveReading', () => {
 
   it('stores an unreadable outcome, because a failed attempt is a fact', async () => {
     const documentId = await aDocument();
-    const { record } = await saveReading(
+    const { record } = await withBusiness(BUSINESS, (db) => saveReading(
+      db,
       newReading(documentId, { status: 'unreadable', reason: 'no JSON object in the response', content: null }),
-      { businessId: BUSINESS },
-    );
+    ));
     expect(record.status).toBe('unreadable');
     expect(record.reason).toBe('no JSON object in the response');
     expect(record.content).toBeNull();
@@ -79,23 +79,23 @@ describe('saveReading', () => {
 
   it('returns the existing row instead of a second one for the same brief', async () => {
     const documentId = await aDocument();
-    const first = await saveReading(newReading(documentId), { businessId: BUSINESS });
-    const second = await saveReading(newReading(documentId), { businessId: BUSINESS });
+    const first = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
+    const second = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
     expect(second.created).toBe(false);
     expect(second.record.readingId).toBe(first.record.readingId);
   });
 
   it('treats a different prompt version as a different question', async () => {
     const documentId = await aDocument();
-    await saveReading(newReading(documentId), { businessId: BUSINESS });
-    const second = await saveReading(newReading(documentId, { promptVersion: 'v2' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
+    const second = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId, { promptVersion: 'v2' })));
     expect(second.created).toBe(true);
   });
 
   it('treats a different brief as a different reading', async () => {
     const documentId = await aDocument();
-    await saveReading(newReading(documentId), { businessId: BUSINESS });
-    const second = await saveReading(newReading(documentId, { briefHash: 'b'.repeat(64) }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
+    const second = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId, { briefHash: 'b'.repeat(64) })));
     expect(second.created).toBe(true);
   });
 
@@ -105,18 +105,22 @@ describe('saveReading', () => {
     // readings, not one — and neither lookup may be served the other's row,
     // or the cache becomes a way to raise a trust level (migration 014).
     const documentId = await aDocument();
-    const boss = await saveReading(newReading(documentId, { provenance: 'boss' }), { businessId: BUSINESS });
-    const stranger = await saveReading(
+    const boss = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId, { provenance: 'boss' })));
+    const stranger = await withBusiness(BUSINESS, (db) => saveReading(
+      db,
       newReading(documentId, { provenance: 'unknown_external' }),
-      { businessId: BUSINESS },
-    );
+    ));
     expect(stranger.created).toBe(true);
     expect(stranger.record.readingId).not.toBe(boss.record.readingId);
 
-    const asBoss = await findReadingForBrief(documentId, 'a'.repeat(64), 'v1', 'boss', { businessId: BUSINESS });
-    const asStranger = await findReadingForBrief(
-      documentId, 'a'.repeat(64), 'v1', 'unknown_external', { businessId: BUSINESS },
-    );
+    const asBoss = await withBusiness(BUSINESS, (db) => findReadingForBrief(db, documentId, 'a'.repeat(64), 'v1', 'boss'));
+    const asStranger = await withBusiness(BUSINESS, (db) => findReadingForBrief(
+      db,
+      documentId,
+      'a'.repeat(64),
+      'v1',
+      'unknown_external',
+    ));
     expect(asBoss?.readingId).toBe(boss.record.readingId);
     expect(asBoss?.provenance).toBe('boss');
     expect(asStranger?.readingId).toBe(stranger.record.readingId);
@@ -126,7 +130,7 @@ describe('saveReading', () => {
   it('refuses a read row with no content', async () => {
     const documentId = await aDocument();
     await expect(
-      saveReading(newReading(documentId, { content: null }), { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId, { content: null }))),
     ).rejects.toThrow();
   });
 });
@@ -134,22 +138,22 @@ describe('saveReading', () => {
 describe('findReadingForBrief', () => {
   it('finds the reading made from this exact brief', async () => {
     const documentId = await aDocument();
-    const { record } = await saveReading(newReading(documentId), { businessId: BUSINESS });
-    const found = await findReadingForBrief(documentId, 'a'.repeat(64), 'v1', 'unknown_external', { businessId: BUSINESS });
+    const { record } = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
+    const found = await withBusiness(BUSINESS, (db) => findReadingForBrief(db, documentId, 'a'.repeat(64), 'v1', 'unknown_external'));
     expect(found?.readingId).toBe(record.readingId);
   });
 
   it('returns null for a brief nobody has read', async () => {
     const documentId = await aDocument();
     expect(
-      await findReadingForBrief(documentId, 'c'.repeat(64), 'v1', 'unknown_external', { businessId: BUSINESS }),
+      await withBusiness(BUSINESS, (db) => findReadingForBrief(db, documentId, 'c'.repeat(64), 'v1', 'unknown_external')),
     ).toBeNull();
   });
 
   it('does not cross the business boundary', async () => {
     const documentId = await aDocument();
-    await saveReading(newReading(documentId), { businessId: BUSINESS });
-    const found = await findReadingForBrief(documentId, 'a'.repeat(64), 'v1', 'unknown_external', { businessId: OTHER_BUSINESS });
+    await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
+    const found = await withBusiness(OTHER_BUSINESS, (db) => findReadingForBrief(db, documentId, 'a'.repeat(64), 'v1', 'unknown_external'));
     expect(found).toBeNull();
   });
 });
@@ -164,14 +168,14 @@ describe('loadLatestReading', () => {
     // an hour with a direct query, and the assertion names the second
     // reading specifically, by id. Reversing the ORDER BY must fail this.
     const documentId = await aDocument();
-    const first = await saveReading(newReading(documentId), { businessId: BUSINESS });
+    const first = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
     await getPool().query(
       `UPDATE document_readings SET created_at = now() - interval '1 hour' WHERE reading_id = $1`,
       [first.record.readingId],
     );
-    const second = await saveReading(newReading(documentId, { promptVersion: 'v2' }), { businessId: BUSINESS });
+    const second = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId, { promptVersion: 'v2' })));
 
-    const latest = await loadLatestReading(documentId, 'unknown_external', { businessId: BUSINESS });
+    const latest = await withBusiness(BUSINESS, (db) => loadLatestReading(db, documentId, 'unknown_external'));
     expect(latest).not.toBeNull();
     expect(latest?.readingId).toBe(second.record.readingId);
     expect(latest?.promptVersion).toBe('v2');
@@ -179,7 +183,7 @@ describe('loadLatestReading', () => {
 
   it('returns null when a document has never been read', async () => {
     const documentId = await aDocument();
-    expect(await loadLatestReading(documentId, 'unknown_external', { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => loadLatestReading(db, documentId, 'unknown_external'))).toBeNull();
   });
 
   it('does not hand back a reading made under a different trust level', async () => {
@@ -187,16 +191,16 @@ describe('loadLatestReading', () => {
     // here: a lookup under one provenance must never return another
     // provenance's row, even when that row is newer.
     const documentId = await aDocument();
-    const boss = await saveReading(newReading(documentId, { provenance: 'boss' }), { businessId: BUSINESS });
-    const stranger = await saveReading(
+    const boss = await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId, { provenance: 'boss' })));
+    const stranger = await withBusiness(BUSINESS, (db) => saveReading(
+      db,
       newReading(documentId, { provenance: 'unknown_external', promptVersion: 'v2' }),
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const asBoss = await loadLatestReading(documentId, 'boss', { businessId: BUSINESS });
+    const asBoss = await withBusiness(BUSINESS, (db) => loadLatestReading(db, documentId, 'boss'));
     expect(asBoss?.readingId).toBe(boss.record.readingId);
 
-    const asStranger = await loadLatestReading(documentId, 'unknown_external', { businessId: BUSINESS });
+    const asStranger = await withBusiness(BUSINESS, (db) => loadLatestReading(db, documentId, 'unknown_external'));
     expect(asStranger?.readingId).toBe(stranger.record.readingId);
   });
 });
@@ -204,7 +208,7 @@ describe('loadLatestReading', () => {
 describe('the readings table', () => {
   it('drops a document\'s readings when the document is deleted', async () => {
     const documentId = await aDocument();
-    await saveReading(newReading(documentId), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => saveReading(db, newReading(documentId)));
     await getPool().query('DELETE FROM documents WHERE document_id = $1', [documentId]);
     const { rows } = await getPool().query(
       'SELECT 1 FROM document_readings WHERE document_id = $1',

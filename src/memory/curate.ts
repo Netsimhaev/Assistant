@@ -19,7 +19,7 @@
  * when the model never answered, and `CurationOutcome.failed` says plainly
  * that something went wrong rather than reading like a quiet no-op.
  */
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { config } from '../config.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -40,7 +40,6 @@ export interface CurationOutcome {
 }
 
 export interface CurateJobOptions {
-  businessId?: string;
   /** Injected by tests. Production leaves it unset and gets the billed call. */
   curator?: Curator;
   /** Defaults to `config.curationRunsPerDay`. Injected by tests, same as `ConductOptions.readsPerDay`. */
@@ -66,10 +65,10 @@ const MAIL_PREFIX = 'mail:';
  * candidates, which is precisely a call that was paid for.
  */
 export async function curationRunsToday(
-  options: { businessId?: string; db?: Queryable; scope?: CurationScope } = {},
+  db: BusinessDb,
+  options: { scope?: CurationScope } = {},
 ): Promise<number> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM audit_log
       WHERE business_id = $1 AND kind = 'curation' AND at >= date_trunc('day', now())
@@ -80,10 +79,11 @@ export async function curationRunsToday(
 }
 
 export async function curateJob(
+  db: BusinessDb,
   jobId: string,
   options: CurateJobOptions = {},
 ): Promise<CurationOutcome> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const scope = options.scope ?? 'default';
   const prefix = scope === 'mail' ? MAIL_PREFIX : '';
   const idle: CurationOutcome = { ran: false, skipped: null, written: 0, rejected: 0, failed: false };
@@ -102,14 +102,14 @@ export async function curateJob(
     // A mail's triage job carries no plan by design; its brief comes from the
     // stored mail row, and the caller decides which categories qualify.
     if (scope === 'default') {
-      const stored = await withBusiness(businessId, (db) => loadPlanBody(db, jobId)); // TENANCY-TODO(task 5)
+      const stored = await loadPlanBody(db, jobId);
       if (stored === null) return { ...idle, skipped: 'no_plan' };
       if (!jobQualifiesForCuration(stored.plan)) return { ...idle, skipped: 'not_qualified' };
       // A document delivery job (document production §5.7, C18) is never
       // curated — positive marker, its `document_deliveries` row (055). Its
       // mail.send step would otherwise qualify, and the delivery teaches
       // nothing the owner did not already approve byte for byte.
-      const delivery = await getPool().query(
+      const delivery = await db.query(
         'SELECT 1 FROM document_deliveries WHERE business_id = $1 AND job_id = $2',
         [businessId, jobId],
       );
@@ -123,7 +123,7 @@ export async function curateJob(
     }
     const runsPerDay =
       options.runsPerDay ?? (scope === 'mail' ? config.mailCurationPerDay : config.curationRunsPerDay);
-    if ((await curationRunsToday({ businessId, scope })) >= runsPerDay) {
+    if ((await curationRunsToday(db, { scope })) >= runsPerDay) {
       return { ...idle, skipped: 'over_cap' };
     }
 
@@ -131,7 +131,7 @@ export async function curateJob(
     // be built from it (see `buildCurationBrief`'s own null cases). Same
     // shape, different cause — collapsing them was an honesty-of-reporting
     // gap fix round 1 flagged (minor 7).
-    const brief = await buildCurationBrief(jobId, { businessId });
+    const brief = await buildCurationBrief(db, jobId);
     if (brief === null) return { ...idle, skipped: 'no_brief' };
 
     const curator = options.curator ?? curateWithModel;
@@ -145,8 +145,9 @@ export async function curateJob(
       // fact the assistant already holds about a known sender. A chunk has no
       // uniqueness, so nothing is retired; the claim is kept as a labelled claim.
       const resolved =
-        scope === 'mail' ? asMailChunk(candidate) : await resolveConflict(candidate, jobId, businessId);
+        scope === 'mail' ? asMailChunk(candidate) : await resolveConflict(db, candidate, jobId);
       await writeMemory(
+        db,
         {
           jobId,
           kind: resolved.kind,
@@ -155,13 +156,12 @@ export async function curateJob(
           body: resolved.body,
           sourceRef: candidate.sourceRef,
         },
-        { businessId },
       );
       written += 1;
     }
 
-    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
-      bdb,
+    await appendAudit(
+      db,
       {
         actor: 'orchestrator',
         kind: 'curation',
@@ -175,7 +175,7 @@ export async function curateJob(
         tokens: null,
         reason: `${prefix}אצירה · ${written} עובדות נשמרו · ${rejected} נדחו`,
       }
-    ));
+    );
 
     return { ran: true, skipped: null, written, rejected, failed: false };
   } catch (err) {
@@ -187,7 +187,7 @@ export async function curateJob(
     // error's constructor name is recorded, never its message — a message
     // could echo back a candidate's subject or body, which is exactly what
     // this audit kind must never carry.
-    await recordCurationFailure(businessId, jobId, written, rejected, err, prefix);
+    await recordCurationFailure(db, jobId, written, rejected, err, prefix);
     // `ran` reflects whether any effect actually happened: writes that
     // completed before the failure are real and must not be reported
     // alongside `ran: false`, which fix round 1 (minor 8) called
@@ -204,7 +204,7 @@ export async function curateJob(
  * knowledge is a smaller loss than losing the job over an audit write.
  */
 async function recordCurationFailure(
-  businessId: string,
+  db: BusinessDb,
   jobId: string,
   written: number,
   rejected: number,
@@ -213,8 +213,8 @@ async function recordCurationFailure(
 ): Promise<void> {
   const errorKind = err instanceof Error ? err.constructor.name : 'unknown';
   try {
-    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
-      bdb,
+    await appendAudit(
+      db,
       {
         actor: 'orchestrator',
         kind: 'curation',
@@ -226,7 +226,7 @@ async function recordCurationFailure(
         tokens: null,
         reason: `${prefix}אצירה נכשלה · ${written} עובדות נשמרו לפני הכשל · ${rejected} נדחו · שגיאה: ${errorKind}`,
       }
-    ));
+    );
   } catch {
     // Swallowed on purpose — see the docblock above.
   }
@@ -269,20 +269,21 @@ function asMailChunk(candidate: CurationCandidate): { kind: 'chunk'; body: Recor
  * return zero or one.
  */
 async function resolveConflict(
+  db: BusinessDb,
   candidate: CurationCandidate,
   jobId: string,
-  businessId: string,
 ): Promise<{ kind: 'entity' | 'preference' | 'chunk'; body: Record<string, unknown> }> {
+  const businessId = db.businessId;
   if (candidate.kind === 'chunk') return { kind: 'chunk', body: candidate.body };
 
-  const { rows: jobRows } = await getPool().query<{ provenance: string }>(
+  const { rows: jobRows } = await db.query<{ provenance: string }>(
     'SELECT provenance FROM jobs WHERE job_id = $1 AND business_id = $2',
     [jobId, businessId],
   );
   const incoming = jobRows[0]?.provenance;
 
   const attribute = candidate.kind === 'preference' ? (candidate.attribute ?? null) : null;
-  const { rows: liveRows } = await getPool().query<{ provenance: string }>(
+  const { rows: liveRows } = await db.query<{ provenance: string }>(
     `SELECT provenance FROM memories
        WHERE business_id = $1 AND kind = $2 AND subject_key = $3
          AND attribute IS NOT DISTINCT FROM $4 AND retired_at IS NULL

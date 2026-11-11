@@ -230,7 +230,8 @@ async function reasksOf(oldJobId: string): Promise<Array<{ job_id: string; busin
 
 /** The door's WhatsApp bookkeeping: an inbound message recorded, linked to the job, settled. */
 async function linkToWhatsApp(jobId: string): Promise<string> {
-  const message = await recordInbound(
+  const message = await withBusiness(BUSINESS, (db) => recordInbound(
+    db,
     {
       providerMessageId: `PM-${jobId}`,
       senderNumber: '+972500000000',
@@ -239,11 +240,10 @@ async function linkToWhatsApp(jobId: string): Promise<string> {
       mediaKind: null,
       providerTimestamp: new Date().toISOString(),
     },
-    { businessId: BUSINESS },
-  );
+  ));
   if (message === null) throw new Error('setup: duplicate inbound message id');
   await withBusiness(BUSINESS, (db) => linkWhatsAppMessage(db, jobId, message.id));
-  await settleMessage(message.id, 'handled', {}, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => settleMessage(db, message.id, 'handled', {}));
   return message.id;
 }
 

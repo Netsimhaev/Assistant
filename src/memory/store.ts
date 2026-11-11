@@ -26,8 +26,7 @@
  * named after the layer it is not.
  */
 import { randomUUID } from 'node:crypto';
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { TrustLevel } from '../domain/trust.js';
 
 /** What a memory is. Closed here and closed again by a CHECK in migration 024. */
@@ -104,11 +103,10 @@ export interface WriteMemoryInput {
  * business asks when a decision it made last quarter stops making sense.
  */
 export async function writeMemory(
+  db: BusinessDb,
   input: WriteMemoryInput,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<MemoryRecord> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const job = await db.query<{ provenance: string }>(
     'SELECT provenance FROM jobs WHERE job_id = $1 AND business_id = $2',
@@ -170,11 +168,10 @@ export async function writeMemory(
  * indistinguishable from one that worked.
  */
 export async function retireMemories(
+  db: BusinessDb,
   input: { kind: MemoryKind; subjectKey: string; attribute?: string | null; reason: string },
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<number> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const attribute = input.kind === 'preference' ? (input.attribute ?? null) : null;
 
   const result = await db.query(
@@ -213,11 +210,10 @@ export const MAX_RECALL = 20;
  * everything" is not a question this store answers.
  */
 export async function recallMemories(
+  db: BusinessDb,
   query: RecallQuery,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<MemoryRecord[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const where: string[] = ['business_id = $1', 'retired_at IS NULL'];
   const params: unknown[] = [businessId];

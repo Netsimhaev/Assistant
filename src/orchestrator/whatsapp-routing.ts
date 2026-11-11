@@ -251,7 +251,7 @@ export async function retireOpenInstruction(
 ): Promise<void> {
   const messageId = await whatsAppMessageOf(db, instruction.jobId);
   if (messageId !== null) {
-    await claimForReport(messageId, 'terminal', { businessId: db.businessId });
+    await claimForReport(db, messageId, 'terminal');
   }
   await transition(db, instruction.jobId, {
     to: options.to,

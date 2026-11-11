@@ -40,13 +40,13 @@ describe('resolveCalendarAccess', () => {
   });
 
   it('is not_connected when the business has no calendar binding', async () => {
-    const r = await resolveCalendarAccess({ businessId: BUSINESS, runtime: neverCalled });
+    const r = await withBusiness(BUSINESS, (db) => resolveCalendarAccess(db, { runtime: neverCalled }));
     expect(r).toEqual({ unavailable: 'not_connected' });
   });
 
   it('is not_connected when the binding is not live', async () => {
     await bind('disconnected');
-    const r = await resolveCalendarAccess({ businessId: BUSINESS, runtime: neverCalled });
+    const r = await withBusiness(BUSINESS, (db) => resolveCalendarAccess(db, { runtime: neverCalled }));
     expect(r).toEqual({ unavailable: 'not_connected' });
   });
 
@@ -68,24 +68,23 @@ describe('resolveCalendarAccess', () => {
     );
     await bind();
     await revokeGrant(CALENDAR_SYSTEM, BUSINESS, 'owner');
-    const r = await resolveCalendarAccess({ businessId: BUSINESS, runtime: neverCalled });
+    const r = await withBusiness(BUSINESS, (db) => resolveCalendarAccess(db, { runtime: neverCalled }));
     expect(r).toEqual({ unavailable: 'needs_reauth' });
   });
 
   it('is credential_error when resolving the credential throws', async () => {
     await bind();
-    const r = await resolveCalendarAccess({
-      businessId: BUSINESS,
+    const r = await withBusiness(BUSINESS, (db) => resolveCalendarAccess(db, {
       runtime: runtimeWith(async () => {
         throw new Error('vault down');
       }),
-    });
+    }));
     expect(r).toEqual({ unavailable: 'credential_error' });
   });
 
   it('returns the client, token and provider when everything resolves', async () => {
     await bind();
-    const r = await resolveCalendarAccess({ businessId: BUSINESS, runtime: runtimeWith(async () => ({ value: 'tok' })) });
+    const r = await withBusiness(BUSINESS, (db) => resolveCalendarAccess(db, { runtime: runtimeWith(async () => ({ value: 'tok' })) }));
     expect(r).toMatchObject({ token: 'tok', provider: 'google' });
   });
 });

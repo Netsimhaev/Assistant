@@ -245,22 +245,22 @@ export async function pollMailbox(db: BusinessDb, options: PollMailboxOptions): 
   const binding = (await loadBindings(db)).find((b) => b.system === MAILBOX_SYSTEM);
   if (binding === undefined || binding.status !== 'live') return null;
   if (binding.provider !== 'google' && binding.provider !== 'microsoft') return null;
-  const cursor = await getCursor({ businessId });
+  const cursor = await getCursor(db);
   if (cursor === null) return null;
 
   // A poller that crashed after `claimMail` left its rows `claimed`, which
   // nothing re-reads. Returned to `received` here, at the top of every pass
   // of a connected mailbox; the orphaned triage job is failed when the mail
   // is handled again (`handleMail`).
-  await staleClaimsToReceived(STALE_CLAIM_MINUTES, { businessId });
+  await staleClaimsToReceived(db, STALE_CLAIM_MINUTES);
 
   const provider: MailProvider = binding.provider;
   const ref = binding.credentialRef ?? MAILBOX_CREDENTIAL_REF;
 
   const writeCursor = (patch: Partial<MailCursor>): Promise<void> =>
     setCursor(
+      db,
       { provider: cursor.provider, cursor: cursor.cursor, lastPollAt: now.toISOString(), lastError: null, ...patch },
-      { businessId },
     );
 
   if (cursor.provider !== provider) {
@@ -352,7 +352,7 @@ export async function pollMailbox(db: BusinessDb, options: PollMailboxOptions): 
       return { ...result, status: 'error', error: listed.message };
     }
   } else {
-    const failure = await recordBatch(listed.messages, cursor, result, businessId);
+    const failure = await recordBatch(db, listed.messages, cursor, result);
     if (failure === null) {
       await writeCursor({ cursor: listed.nextCursor });
     } else {
@@ -383,15 +383,15 @@ export async function pollMailbox(db: BusinessDb, options: PollMailboxOptions): 
   };
 
   const readsPerDay = options.readsPerDay ?? config.mailReadsPerDay;
-  let remaining = readsPerDay - (await mailReadsToday({ businessId }));
-  const waiting = await mailAwaitingTriage(options.limit ?? DEFAULT_TRIAGE_LIMIT, { businessId });
+  let remaining = readsPerDay - (await mailReadsToday(db));
+  const waiting = await mailAwaitingTriage(db, options.limit ?? DEFAULT_TRIAGE_LIMIT);
   for (const mail of waiting) {
     if (remaining <= 0) {
-      await markOverCap(mail.mailId, { businessId });
+      await markOverCap(db, mail.mailId);
       result.overCap += 1;
       continue;
     }
-    if (!(await claimMail(mail.mailId, { businessId }))) continue;
+    if (!(await claimMail(db, mail.mailId))) continue;
     remaining -= 1;
     await handleMail(mail, pass);
   }
@@ -442,15 +442,15 @@ export const UNRECORDABLE_AFTER_PASSES = 3;
  * nothing to key on and is never skipped — the cursor stays, loudly.
  */
 async function recordBatch(
+  db: BusinessDb,
   messages: readonly IncomingMail[],
   cursor: MailCursor,
   result: MailPollResult,
-  businessId: string,
 ): Promise<{ lastError: string; error: string } | null> {
   let failure: { lastError: string; error: string } | null = null;
   for (const incoming of messages) {
     try {
-      const stored = await recordIncoming(incoming, { businessId });
+      const stored = await recordIncoming(db, incoming);
       if (stored !== null) result.recorded += 1;
       continue;
     } catch (error) {
@@ -465,7 +465,7 @@ async function recordBatch(
       const previous = /^record_failed:([0-9a-f]{12}):(\d+)$/.exec(cursor.lastError ?? '');
       const count = previous !== null && previous[1] === key ? Number(previous[2]) + 1 : 1;
       if (count >= UNRECORDABLE_AFTER_PASSES) {
-        await recordUnrecordable(incoming.providerMessageId, { businessId });
+        await recordUnrecordable(db, incoming.providerMessageId);
         continue;
       }
       failure = { lastError: `record_failed:${key}:${count}`, error: message(error) };
@@ -496,7 +496,6 @@ interface PassContext {
 
 async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
   const { db, result } = pass;
-  const { businessId } = db;
   let job: Job | null = null;
   let settled = false;
   try {
@@ -512,7 +511,7 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
       title: `מייל: ${mail.subject}`,
     });
     // Written at once, so a crash from here on leaves the job findable.
-    await recordMailProgress(mail.mailId, { jobId: job.jobId }, { businessId });
+    await recordMailProgress(db, mail.mailId, { jobId: job.jobId });
     await transition(db, job.jobId, {
       to: 'understand',
       actor: 'orchestrator',
@@ -521,7 +520,7 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
 
     // Before the call, so the reader sees what the attachments say (§9.3).
     const ingested = await ingestAttachments(mail, pass);
-    const entries = await attachmentEntries(mail, ingested, businessId);
+    const entries = await attachmentEntries(db, mail, ingested);
 
     // Counted before the call: a call that throws was still made and billed.
     result.triaged += 1;
@@ -535,7 +534,7 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     const shown = shownAttachmentCount(briefAttachments);
     const checked = keepValidAttachments(outcome.triage, shown);
     const triage: MailTriage = checked.triage;
-    if (checked.dropped > 0) await noteMailError(mail.mailId, 'attachment_reading_dropped', { businessId });
+    if (checked.dropped > 0) await noteMailError(db, mail.mailId, 'attachment_reading_dropped');
 
     const automated = isAutomatedSender(mail.headerFlags, mail.fromAddress);
     const { categories, isPerson } = finalCategories(triage, automated);
@@ -569,13 +568,14 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
       !automated &&
       triage.categories.includes('invoice') &&
       !(triage.invoice === null && firstInvoice !== undefined);
-    if (bodyInvoice && !(await hasInvoiceForMail(mail.mailId, { businessId }))) {
+    if (bodyInvoice && !(await hasInvoiceForMail(db, mail.mailId))) {
       const linked =
         firstInvoice !== undefined
           ? { documentId: firstInvoice.documentId, fileName: firstInvoice.entry.attachment.filename }
           : (documents.find((d) => d.mediaType === 'application/pdf') ?? documents[0] ?? null);
       const fromAttachment = firstInvoice?.triaged.invoice ?? null;
       await insertInvoice(
+        db,
         {
           mailId: mail.mailId,
           supplierAddress: mail.fromAddress,
@@ -586,7 +586,6 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
           fileName: linked?.fileName ?? null,
           receivedAt: mail.receivedAt,
         },
-        { businessId },
       );
     }
 
@@ -595,8 +594,9 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     // migration 046's unique index under `insertInvoice`. Unverified like the
     // body's — no module under `src/policy/` reads it.
     for (const { triaged: a, entry, documentId } of invoiceAttachments) {
-      if (await hasInvoiceForDocument(mail.mailId, documentId, { businessId })) continue;
+      if (await hasInvoiceForDocument(db, mail.mailId, documentId)) continue;
       await insertInvoice(
+        db,
         {
           mailId: mail.mailId,
           supplierAddress: mail.fromAddress,
@@ -607,7 +607,6 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
           fileName: entry.attachment.filename,
           receivedAt: mail.receivedAt,
         },
-        { businessId },
       );
     }
 
@@ -631,11 +630,12 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
           if (raised.approvalId !== null) await presentCardOnWhatsApp(mail, raised.approvalId, pass);
         }
       } catch {
-        await noteMailError(mail.mailId, 'reply_failed', { businessId });
+        await noteMailError(db, mail.mailId, 'reply_failed');
       }
     }
 
     await settleMail(
+      db,
       mail.mailId,
       {
         state: 'triaged',
@@ -647,7 +647,6 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
         ...(notifiedAt !== null ? { notifiedAt } : {}),
         ...(replyJobId !== undefined ? { replyJobId } : {}),
       },
-      { businessId },
     );
     settled = true;
 
@@ -658,15 +657,14 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
       mail.fromAddress.trim() !== ''
     ) {
       try {
-        const curated = await curateJob(job.jobId, {
-          businessId,
+        const curated = await curateJob(db, job.jobId, {
           scope: 'mail',
           runsPerDay: config.mailCurationPerDay,
           ...(pass.curator !== undefined ? { curator: pass.curator } : {}),
         });
-        if (curated.failed) await noteCurationFailure(mail, job.jobId, businessId);
+        if (curated.failed) await noteCurationFailure(db, mail, job.jobId);
       } catch {
-        await noteCurationFailure(mail, job.jobId, businessId);
+        await noteCurationFailure(db, mail, job.jobId);
       }
     }
 
@@ -686,7 +684,7 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
       // from the owner over bookkeeping. Noted, and the job is left to
       // `failOrphanedJob` should the mail ever be handled again.
       try {
-        await noteMailError(mail.mailId, 'job_close_failed', { businessId });
+        await noteMailError(db, mail.mailId, 'job_close_failed');
       } catch {
         // Best effort.
       }
@@ -696,9 +694,9 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
     const reason = message(error).slice(0, 500);
     try {
       await settleMail(
+        db,
         mail.mailId,
         { state: 'failed', error: reason, ...(job !== null ? { jobId: job.jobId } : {}) },
-        { businessId },
       );
     } catch {
       // Best effort: the database is having the same bad moment. The row
@@ -723,11 +721,11 @@ async function handleMail(mail: StoredMail, pass: PassContext): Promise<void> {
  * one error string (last write wins): note the failure only when nothing more
  * telling — a refused label, a lost attachment — is already on the row.
  */
-async function noteCurationFailure(mail: StoredMail, jobId: string, businessId: string): Promise<void> {
+async function noteCurationFailure(db: BusinessDb, mail: StoredMail, jobId: string): Promise<void> {
   try {
-    const current = await mailForJob(jobId, { businessId });
+    const current = await mailForJob(db, jobId);
     if (current !== null && current.error === null) {
-      await noteMailError(mail.mailId, 'curation_failed', { businessId });
+      await noteMailError(db, mail.mailId, 'curation_failed');
     }
   } catch {
     // Best effort.
@@ -783,7 +781,7 @@ async function applyLabels(
   jobId: string,
   pass: PassContext,
 ): Promise<string[]> {
-  const { businessId } = pass.db;
+  const { db } = pass;
   const applied = [...mail.labelsApplied];
   const wanted = (['invoice', 'question'] as const)
     .filter((c) => categories.includes(c))
@@ -801,7 +799,7 @@ async function applyLabels(
   }
   const ids = pass.labelIds;
   if (ids === 'failed') {
-    await noteMailError(mail.mailId, 'label_failed', { businessId });
+    await noteMailError(db, mail.mailId, 'label_failed');
     return applied;
   }
 
@@ -812,11 +810,11 @@ async function applyLabels(
         ? null
         : await pass.client.addLabel(pass.token, mail.providerMessageId, label, labelId, AbortSignal.timeout(CALL_TIMEOUT_MS));
     if (added !== true) {
-      await noteMailError(mail.mailId, 'label_failed', { businessId });
+      await noteMailError(db, mail.mailId, 'label_failed');
       continue;
     }
     applied.push(label);
-    await recordMailProgress(mail.mailId, { labelsApplied: applied }, { businessId });
+    await recordMailProgress(db, mail.mailId, { labelsApplied: applied });
     pass.result.labelled += 1;
     // Numbers and hashes only: never the subject, never an address.
     await appendAudit(
@@ -886,9 +884,9 @@ function storedNotRead(document: DocumentRecord): AttachmentNotRead {
  * ingested rather than failing the mail.
  */
 export async function attachmentEntries(
+  db: BusinessDb,
   mail: StoredMail,
   ingested: ReadonlyMap<string, IngestedAttachment>,
-  businessId: string,
 ): Promise<AttachmentEntry[]> {
   const out: AttachmentEntry[] = [];
   for (const attachment of mail.attachments) {
@@ -904,12 +902,12 @@ export async function attachmentEntries(
       continue;
     }
     try {
-      const document = await loadDocument(documentId, { businessId });
+      const document = await loadDocument(db, documentId);
       if (document === null || document.status !== 'extracted') {
         out.push(notRead(document?.status === 'stored' ? storedNotRead(document) : 'not_ingested'));
         continue;
       }
-      const artifacts = await loadArtifacts(documentId, { businessId });
+      const artifacts = await loadArtifacts(db, documentId);
       if (artifacts[0]?.flags.includes('scanned_no_text') === true) {
         out.push(notRead('scanned', true));
         continue;
@@ -952,7 +950,7 @@ async function recordAttachmentReadings(
   entries: readonly AttachmentEntry[],
   pass: PassContext,
 ): Promise<void> {
-  const { businessId } = pass.db;
+  const { db } = pass;
   const shown = shownAttachmentCount(entries.map((e) => e.brief));
   for (const [index, entry] of entries.entries()) {
     const said = index < shown ? triage.attachments.find((a) => a.index === index) : undefined;
@@ -964,9 +962,9 @@ async function recordAttachmentReadings(
       ...(entry.documentId !== null ? { scanned: entry.scanned } : {}),
     };
     try {
-      await annotateAttachment(mail.mailId, entry.attachment.attachmentId, annotation, { businessId });
+      await annotateAttachment(db, mail.mailId, entry.attachment.attachmentId, annotation);
     } catch {
-      await noteMailError(mail.mailId, 'attachment_failed', { businessId });
+      await noteMailError(db, mail.mailId, 'attachment_failed');
     }
   }
 }
@@ -998,19 +996,19 @@ async function recordAttachmentReadings(
  * first attachment always starts.
  */
 async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<Map<string, IngestedAttachment>> {
-  const { businessId } = pass.db;
+  const { db } = pass;
   const out = new Map<string, IngestedAttachment>();
   const deadline = Date.now() + pass.attachmentBudgetMs;
   let taken = 0;
   for (const attachment of mail.attachments) {
     if (!isIngestible(attachment)) continue;
     if (attachment.size > MAX_ATTACHMENT_BYTES) {
-      await noteMailError(mail.mailId, 'attachment_too_large', { businessId });
+      await noteMailError(db, mail.mailId, 'attachment_too_large');
       continue;
     }
     if (taken >= MAX_ATTACHMENTS_PER_MAIL) break;
     if (taken > 0 && Date.now() >= deadline) {
-      await noteMailError(mail.mailId, 'attachment_budget_exceeded', { businessId });
+      await noteMailError(db, mail.mailId, 'attachment_budget_exceeded');
       break;
     }
     taken += 1;
@@ -1027,8 +1025,9 @@ async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<M
         const path = join(dir, 'attachment');
         await writeFile(path, bytes);
         const document = await ingestDocument(
+          db,
           { path, source: 'mail', originalName: attachment.filename },
-          { businessId, documentRoot: pass.documentRoot },
+          { documentRoot: pass.documentRoot },
         );
         out.set(attachment.attachmentId, {
           documentId: document.documentId,
@@ -1038,15 +1037,15 @@ async function ingestAttachments(mail: StoredMail, pass: PassContext): Promise<M
         // Persist the link so the owner can download it from the mail screen.
         // Never fatal: the document is already ingested either way.
         try {
-          await linkAttachmentDocument(mail.mailId, attachment.attachmentId, document.documentId, { businessId });
+          await linkAttachmentDocument(db, mail.mailId, attachment.attachmentId, document.documentId);
         } catch {
-          await noteMailError(mail.mailId, 'attachment_failed', { businessId });
+          await noteMailError(db, mail.mailId, 'attachment_failed');
         }
       } finally {
         await rm(dir, { recursive: true, force: true });
       }
     } catch {
-      await noteMailError(mail.mailId, 'attachment_failed', { businessId });
+      await noteMailError(db, mail.mailId, 'attachment_failed');
     }
   }
   return out;
@@ -1065,7 +1064,7 @@ async function notifyOwner(
   jobId: string,
   pass: PassContext,
 ): Promise<string | null> {
-  const { businessId } = pass.db;
+  const { db } = pass;
   if (!isPerson) return null;
   if (!categories.includes('invoice') && !categories.includes('question')) return null;
   // No sender to name — and `raiseMailReply` refuses the card for the same reason.
@@ -1081,11 +1080,11 @@ async function notifyOwner(
       jobId,
     );
   } catch {
-    await noteMailError(mail.mailId, 'notify_failed', { businessId });
+    await noteMailError(db, mail.mailId, 'notify_failed');
     return null;
   }
   const at = new Date().toISOString();
-  await recordMailProgress(mail.mailId, { notifiedAt: at }, { businessId });
+  await recordMailProgress(db, mail.mailId, { notifiedAt: at });
   pass.result.notified += 1;
   return at;
 }
@@ -1105,6 +1104,6 @@ async function presentCardOnWhatsApp(mail: StoredMail, approvalId: string, pass:
   try {
     await presentMailCard(pass.db, approvalId, pass.notifyBoss);
   } catch {
-    await noteMailError(mail.mailId, 'card_present_failed', { businessId: pass.db.businessId });
+    await noteMailError(pass.db, mail.mailId, 'card_present_failed');
   }
 }

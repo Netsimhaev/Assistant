@@ -5,9 +5,8 @@
  * `ledger_events.business_id` is not tied to the item by a foreign key.
  * Every status move is a conditional UPDATE; losing the race returns false.
  */
-import pg from 'pg';
 import { monotonicFactory } from 'ulid';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import {
   LedgerStage,
   type Importance,
@@ -61,11 +60,6 @@ export type LedgerPatch = Partial<
     | 'counterpartyEmailVerified'
   >
 >;
-
-interface StoreOpts {
-  businessId: string;
-  db?: Queryable;
-}
 
 interface ItemRow {
   item_id: string;
@@ -152,17 +146,8 @@ function toLedgerEvent(row: EventRow): LedgerEvent {
   };
 }
 
-/**
- * Run `fn` atomically. No `db` or a pool: open our own transaction. A client
- * (assumed already inside the caller's transaction): use it as is.
- */
-export async function atomically<T>(db: Queryable | undefined, fn: (tx: Queryable) => Promise<T>): Promise<T> {
-  if (db === undefined || db instanceof pg.Pool) return withTransaction(fn);
-  return fn(db);
-}
-
 async function insertEvent(
-  tx: Queryable,
+  tx: BusinessDb,
   businessId: string,
   itemId: string,
   event: { kind: LedgerEventKind; by: string; jobId?: string; mailId?: string; note?: string },
@@ -175,10 +160,11 @@ async function insertEvent(
 }
 
 export async function createLedgerItem(
+  db: BusinessDb,
   item: NewLedgerItem,
-  opts: { businessId: string; by: string; db?: Queryable },
+  opts: { by: string },
 ): Promise<LedgerItem> {
-  return atomically(opts.db, async (tx) => {
+  return transaction(db, async (tx) => {
     const res = await tx.query<ItemRow>(
       `INSERT INTO ledger_items
          (item_id, business_id, family, description, due_at, due_is_date_only, importance, importance_manual,
@@ -188,7 +174,7 @@ export async function createLedgerItem(
        RETURNING *`,
       [
         `LI-${ulid()}`,
-        opts.businessId,
+        tx.businessId,
         item.family,
         item.description,
         item.dueAt,
@@ -208,24 +194,25 @@ export async function createLedgerItem(
     );
     const row = res.rows[0];
     if (!row) throw new Error('ledger insert returned no row');
-    await insertEvent(tx, opts.businessId, row.item_id, { kind: 'created', by: opts.by, jobId: item.originJobId });
+    await insertEvent(tx, tx.businessId, row.item_id, { kind: 'created', by: opts.by, jobId: item.originJobId });
     return toLedgerItem(row);
   });
 }
 
-export async function loadLedgerItem(itemId: string, opts: StoreOpts): Promise<LedgerItem | null> {
-  const db = opts.db ?? getPool();
+export async function loadLedgerItem(db: BusinessDb, itemId: string): Promise<LedgerItem | null> {
   const res = await db.query<ItemRow>(
     'SELECT * FROM ledger_items WHERE business_id = $1 AND item_id = $2',
-    [opts.businessId, itemId],
+    [db.businessId, itemId],
   );
   const row = res.rows[0];
   return row ? toLedgerItem(row) : null;
 }
 
-export async function listLedgerItems(opts: StoreOpts & { statuses?: LedgerStatus[] }): Promise<LedgerItem[]> {
-  const db = opts.db ?? getPool();
-  const params: unknown[] = [opts.businessId];
+export async function listLedgerItems(
+  db: BusinessDb,
+  opts: { statuses?: LedgerStatus[] } = {},
+): Promise<LedgerItem[]> {
+  const params: unknown[] = [db.businessId];
   let where = 'business_id = $1';
   if (opts.statuses) {
     params.push(opts.statuses);
@@ -258,13 +245,13 @@ const PATCH_COLUMNS: Record<keyof LedgerPatch, { column: string; cast?: string; 
 };
 
 export async function updateLedgerItem(
+  db: BusinessDb,
   itemId: string,
   patch: LedgerPatch,
   event: { kind: LedgerEventKind; by: string; jobId?: string; note?: string },
-  opts: StoreOpts,
 ): Promise<LedgerItem> {
-  return atomically(opts.db, async (tx) => {
-    const params: unknown[] = [opts.businessId, itemId];
+  return transaction(db, async (tx) => {
+    const params: unknown[] = [tx.businessId, itemId];
     const sets: string[] = ['updated_at = now()'];
     for (const key of Object.keys(PATCH_COLUMNS) as (keyof LedgerPatch)[]) {
       if (!Object.hasOwn(patch, key)) continue;
@@ -279,7 +266,7 @@ export async function updateLedgerItem(
     );
     const row = res.rows[0];
     if (!row) throw new LedgerItemNotFoundError(itemId);
-    await insertEvent(tx, opts.businessId, itemId, event);
+    await insertEvent(tx, tx.businessId, itemId, event);
     return toLedgerItem(row);
   });
 }
@@ -287,32 +274,31 @@ export async function updateLedgerItem(
 const CLOSING: readonly LedgerStatus[] = ['closed_by_evidence', 'done', 'cancelled'];
 
 export async function moveLedgerStatus(
+  db: BusinessDb,
   itemId: string,
   from: LedgerStatus[],
   to: LedgerStatus,
   event: { kind: LedgerEventKind; by: string; jobId?: string; mailId?: string; note?: string },
-  opts: StoreOpts,
 ): Promise<boolean> {
   const closedAt = CLOSING.includes(to) ? 'now()' : 'NULL';
   const evidence = to === 'open' ? ', evidence_after = now()' : '';
-  return atomically(opts.db, async (tx) => {
+  return transaction(db, async (tx) => {
     const res = await tx.query(
       `UPDATE ledger_items
          SET status = $3, closed_at = ${closedAt}, updated_at = now()${evidence}
        WHERE business_id = $1 AND item_id = $2 AND status = ANY($4)`,
-      [opts.businessId, itemId, to, from],
+      [tx.businessId, itemId, to, from],
     );
     if ((res.rowCount ?? 0) === 0) return false;
-    await insertEvent(tx, opts.businessId, itemId, event);
+    await insertEvent(tx, tx.businessId, itemId, event);
     return true;
   });
 }
 
-export async function listLedgerEvents(itemId: string, opts: StoreOpts): Promise<LedgerEvent[]> {
-  const db = opts.db ?? getPool();
+export async function listLedgerEvents(db: BusinessDb, itemId: string): Promise<LedgerEvent[]> {
   const res = await db.query<EventRow>(
     'SELECT * FROM ledger_events WHERE business_id = $1 AND item_id = $2 ORDER BY at ASC, event_id ASC',
-    [opts.businessId, itemId],
+    [db.businessId, itemId],
   );
   return res.rows.map(toLedgerEvent);
 }

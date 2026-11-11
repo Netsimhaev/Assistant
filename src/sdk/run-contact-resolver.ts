@@ -130,20 +130,21 @@ async function seedContact(
   }));
   created.push(job.jobId);
 
-  await writeMemory(
+  await withBusiness(BUSINESS, (db) => writeMemory( // TENANCY-TODO(task 7)
+    db,
     {
       jobId: job.jobId,
       kind: 'entity',
       subjectKey: person.entityId,
       body: { name: person.name, company: person.company, email: person.email },
     },
-    { businessId: BUSINESS },
-  );
+  ));
 
   // A preference stored under the ADDRESS, not the entity id — that is where
   // the curator writes, and the split between the two keys is exactly what
   // `listContacts` returning both subject keys exists to bridge (spec §8).
-  await writeMemory(
+  await withBusiness(BUSINESS, (db) => writeMemory( // TENANCY-TODO(task 7)
+    db,
     {
       jobId: job.jobId,
       kind: 'preference',
@@ -152,8 +153,7 @@ async function seedContact(
       body: { value: `מעדיפה שכל מה שקשור להצעות מחיר יגיע במייל ולא בטלפון (${person.company})` },
       sourceRef: 'הרצה חיה של פותר אנשי הקשר',
     },
-    { businessId: BUSINESS },
-  );
+  ));
 }
 
 function reportOutcome(outcome: Awaited<ReturnType<typeof runInstruction>>): void {
@@ -230,7 +230,7 @@ async function main(): Promise<void> {
     console.log(`  ${person.name} · ${person.company} · ${person.email}`);
   }
 
-  const contacts = await listContacts({ businessId: BUSINESS });
+  const contacts = await withBusiness(BUSINESS, (db) => listContacts(db)); // TENANCY-TODO(task 7)
   console.log(`\nרשימת המועמדים שנבנתה: ${contacts.length} אנשי קשר`);
 
   // ---------------------------------------------------------------- RUN A
@@ -325,10 +325,10 @@ async function cleanup(): Promise<void> {
       { kind: 'preference' as const, subjectKey: person.email, attribute: 'ערוץ מועדף' },
     ]) {
       try {
-        await retireMemories(
+        await withBusiness(BUSINESS, (db) => retireMemories( // TENANCY-TODO(task 7)
+          db,
           { ...target, reason: 'live contact-resolver probe: seeded data' },
-          { businessId: BUSINESS },
-        );
+        ));
       } catch (err) {
         console.error(`  לא הצלחתי לגרוע ${target.subjectKey}: ${err instanceof Error ? err.message : String(err)}`);
       }

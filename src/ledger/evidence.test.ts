@@ -3,7 +3,7 @@
  * the owner is always told who the sender was.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { closeLedgerByEvidence } from './evidence.js';
@@ -36,7 +36,7 @@ function base(over: Partial<NewLedgerItem> = {}): NewLedgerItem {
 }
 
 async function statusOf(itemId: string): Promise<string | undefined> {
-  const all = await listLedgerItems({ businessId: B });
+  const all = await withBusiness(B, (db) => listLedgerItems(db));
   return all.find((i) => i.itemId === itemId)?.status;
 }
 
@@ -85,10 +85,11 @@ function recorders() {
 
 beforeEach(async () => {
   await resetDatabase();
-  await saveLedgerSettings(
+  await withBusiness(B, (db) => saveLedgerSettings(
+    db,
     { ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes }, meetingLeadMinutesCritical: [1440, 60], toWhatsApp: true },
-    { businessId: B, updatedBy: 'owner' },
-  );
+    { updatedBy: 'owner' },
+  ));
 });
 afterAll(async () => {
   await closePool();
@@ -96,14 +97,14 @@ afterAll(async () => {
 
 describe('closeLedgerByEvidence', () => {
   it('closes an awaiting_reply item on a mail from the counterparty', async () => {
-    const item = await createLedgerItem(base(), { businessId: B, by: 'owner' });
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'owner' }));
     await setEvidenceAfter(item.itemId, T0);
     const mailId = await addMail({ from: 'Dana@Acme.co.il', createdAt: T1 });
     const r = recorders();
-    const res = await closeLedgerByEvidence({ businessId: B, sendAlert: r.sendAlert, messenger: r.messenger });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db, { sendAlert: r.sendAlert, messenger: r.messenger }));
     expect(res.closed).toEqual([{ itemId: item.itemId, mailId }]);
     expect(await statusOf(item.itemId)).toBe('closed_by_evidence');
-    const events = await listLedgerEvents(item.itemId, { businessId: B });
+    const events = await withBusiness(B, (db) => listLedgerEvents(db, item.itemId));
     expect(events.at(-1)).toMatchObject({ kind: 'closed_by_evidence', mailId, byWhom: 'evidence' });
     // Email goes now; WhatsApp is NOT sent here (I5): the notice is handed to
     // the ledger pass, which puts it first in the pass's single batch.
@@ -118,61 +119,63 @@ describe('closeLedgerByEvidence', () => {
   });
 
   it('returns no WhatsApp notice when WhatsApp is not chosen', async () => {
-    await saveLedgerSettings(
+    await withBusiness(B, (db) => saveLedgerSettings(
+      db,
       { ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes }, meetingLeadMinutesCritical: [1440, 60], toWhatsApp: false },
-      { businessId: B, updatedBy: 'owner' },
-    );
-    const item = await createLedgerItem(base(), { businessId: B, by: 'owner' });
+      { updatedBy: 'owner' },
+    ));
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'owner' }));
     await setEvidenceAfter(item.itemId, T0);
     await addMail({ from: 'dana@acme.co.il', createdAt: T1 });
-    const res = await closeLedgerByEvidence({ businessId: B });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(res.closed).toHaveLength(1); // it ran and closed
     expect(res.notices).toEqual([]);
   });
 
   it('does not close on a mail older than evidence_after', async () => {
-    const item = await createLedgerItem(base(), { businessId: B, by: 'owner' });
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'owner' }));
     await setEvidenceAfter(item.itemId, T2);
     await addMail({ from: 'dana@acme.co.il', createdAt: T1 });
     await addMail({ from: 'dana@acme.co.il', createdAt: T2 }); // strictly after: equal does not count
-    const res = await closeLedgerByEvidence({ businessId: B });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(res.closed).toEqual([]);
     expect(res.considered).toBe(1); // the item was examined
     expect(await statusOf(item.itemId)).toBe('open');
   });
 
   it('money_in without reference never closes', async () => {
-    const noRef = await createLedgerItem(base({ family: 'money_in', reference: null }), { businessId: B, by: 'owner' });
-    const withRef = await createLedgerItem(base({ family: 'money_in', reference: 'INV-77' }), { businessId: B, by: 'owner' });
+    const noRef = await withBusiness(B, (db) => createLedgerItem(db, base({ family: 'money_in', reference: null }), { by: 'owner' }));
+    const withRef = await withBusiness(B, (db) => createLedgerItem(db, base({ family: 'money_in', reference: 'INV-77' }), { by: 'owner' }));
     await setEvidenceAfter(noRef.itemId, T0);
     await setEvidenceAfter(withRef.itemId, T0);
     const mailId = await addMail({ from: 'dana@acme.co.il', subject: 'לגבי INV-77', createdAt: T1 });
-    const res = await closeLedgerByEvidence({ businessId: B });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(res.closed).toEqual([{ itemId: withRef.itemId, mailId }]);
     expect(res.considered).toBe(2); // the no-reference item was examined and refused on its own rule
     expect(await statusOf(noRef.itemId)).toBe('open');
   });
 
   it('money_in closes only when the reference appears', async () => {
-    const item = await createLedgerItem(base({ family: 'money_in', reference: 'INV-77' }), { businessId: B, by: 'owner' });
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base({ family: 'money_in', reference: 'INV-77' }), { by: 'owner' }));
     await setEvidenceAfter(item.itemId, T0);
     await addMail({ from: 'dana@acme.co.il', subject: 'שלום', body: 'INV-78 שולם', createdAt: T1 });
-    const miss = await closeLedgerByEvidence({ businessId: B });
+    const miss = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(miss.closed).toEqual([]);
     expect(miss.considered).toBe(1);
     const hit = await addMail({ from: 'dana@acme.co.il', subject: 'x', body: 'שולם inv-77 היום', createdAt: T2 });
-    const res = await closeLedgerByEvidence({ businessId: B });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(res.closed).toEqual([{ itemId: item.itemId, mailId: hit }]);
   });
 
   it('an unverified address is not evidence; the same address verified is', async () => {
-    const unverified = await createLedgerItem(
+    const unverified = await withBusiness(B, (db) => createLedgerItem(
+      db,
       base({ counterpartyEmail: 'dana@acme.co.il', counterpartyEmailVerified: false, counterpartyDomain: null }),
-      { businessId: B, by: 'owner' },
-    );
+      { by: 'owner' },
+    ));
     await setEvidenceAfter(unverified.itemId, T0);
     await addMail({ from: 'dana@acme.co.il', createdAt: T1 });
-    const res = await closeLedgerByEvidence({ businessId: B });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(res.considered).toBe(1); // examined, and refused on the unverified address
     expect(res.closed).toEqual([]);
     expect(await statusOf(unverified.itemId)).toBe('open');
@@ -180,40 +183,42 @@ describe('closeLedgerByEvidence', () => {
     await getPool().query(`UPDATE ledger_items SET counterparty_email_verified = true WHERE item_id = $1`, [
       unverified.itemId,
     ]);
-    const again = await closeLedgerByEvidence({ businessId: B });
+    const again = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(again.closed.map((c) => c.itemId)).toEqual([unverified.itemId]);
   });
 
   it('an unverified address falls back to the vouched domain', async () => {
-    const item = await createLedgerItem(
+    const item = await withBusiness(B, (db) => createLedgerItem(
+      db,
       base({ counterpartyEmail: 'dana@evil.example', counterpartyEmailVerified: false, counterpartyDomain: 'acme.co.il' }),
-      { businessId: B, by: 'owner' },
-    );
+      { by: 'owner' },
+    ));
     await setEvidenceAfter(item.itemId, T0);
     await addMail({ from: 'dana@evil.example', createdAt: T1 });
     const mailId = await addMail({ from: 'bob@acme.co.il', createdAt: T2 });
-    const res = await closeLedgerByEvidence({ businessId: B });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(res.closed).toEqual([{ itemId: item.itemId, mailId }]);
   });
 
   it('domain match accepts a subdomain', async () => {
-    const item = await createLedgerItem(
+    const item = await withBusiness(B, (db) => createLedgerItem(
+      db,
       base({ counterpartyEmail: null, counterpartyEmailVerified: false, counterpartyDomain: 'acme.co.il' }),
-      { businessId: B, by: 'owner' },
-    );
+      { by: 'owner' },
+    ));
     await setEvidenceAfter(item.itemId, T0);
     await addMail({ from: 'x@evilacme.co.il', createdAt: T1 }); // lookalike, not a subdomain
     const mailId = await addMail({ from: 'bob@mail.acme.co.il', createdAt: T2 });
-    const res = await closeLedgerByEvidence({ businessId: B });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(res.closed).toEqual([{ itemId: item.itemId, mailId }]);
   });
 
   it('the notice names the sender', async () => {
-    const item = await createLedgerItem(base({ description: 'תשובה מדנה' }), { businessId: B, by: 'owner' });
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base({ description: 'תשובה מדנה' }), { by: 'owner' }));
     await setEvidenceAfter(item.itemId, T0);
     await addMail({ from: 'dana@acme.co.il', subject: 'שורה 1\nשורה 2', createdAt: T1 });
     const r = recorders();
-    const res = await closeLedgerByEvidence({ businessId: B, sendAlert: r.sendAlert, messenger: r.messenger });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db, { sendAlert: r.sendAlert, messenger: r.messenger }));
     const expectedEmail =
       "סגרתי 'תשובה מדנה' — הגיע מייל מ-dana@acme.co.il: שורה 1 שורה 2. אם זה לא נכון, אפשר לפתוח מחדש בדשבורד.";
     const expectedWa =
@@ -229,21 +234,21 @@ describe('closeLedgerByEvidence', () => {
   });
 
   it('reopen then rerun does not close again on the same mail', async () => {
-    const item = await createLedgerItem(base(), { businessId: B, by: 'owner' });
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'owner' }));
     await setEvidenceAfter(item.itemId, T0);
     await addMail({ from: 'dana@acme.co.il', createdAt: new Date(Date.now() - 60_000) });
-    const first = await closeLedgerByEvidence({ businessId: B });
+    const first = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(first.closed).toHaveLength(1);
     expect(
-      await moveLedgerStatus(
+      await withBusiness(B, (db) => moveLedgerStatus(
+        db,
         item.itemId,
         ['closed_by_evidence'],
         'open',
         { kind: 'reopened', by: 'owner' },
-        { businessId: B },
-      ),
+      )),
     ).toBe(true);
-    const second = await closeLedgerByEvidence({ businessId: B });
+    const second = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(second.closed).toEqual([]);
     expect(second.skipped).toBe(0); // rejected by evidence_after, not by the claim fallback
     expect(second.considered).toBe(1); // the item was examined and the old mail rejected
@@ -253,43 +258,43 @@ describe('closeLedgerByEvidence', () => {
   });
 
   it('an item with neither email nor domain is never closed but is considered', async () => {
-    const item = await createLedgerItem(
+    const item = await withBusiness(B, (db) => createLedgerItem(
+      db,
       base({ counterpartyEmail: null, counterpartyEmailVerified: false, counterpartyDomain: null }),
-      { businessId: B, by: 'owner' },
-    );
+      { by: 'owner' },
+    ));
     await setEvidenceAfter(item.itemId, T0);
     await addMail({ from: 'dana@acme.co.il', createdAt: T1 });
-    const res = await closeLedgerByEvidence({ businessId: B });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(res.considered).toBe(1);
     expect(res.closed).toEqual([]);
     expect(await statusOf(item.itemId)).toBe('open');
   });
 
   it("another business's mail never matches", async () => {
-    const item = await createLedgerItem(base(), { businessId: B, by: 'owner' });
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'owner' }));
     await setEvidenceAfter(item.itemId, T0);
     await addMail({ from: 'dana@acme.co.il', createdAt: T1, businessId: 'other-business' });
-    const res = await closeLedgerByEvidence({ businessId: B });
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db));
     expect(res.closed).toEqual([]);
     expect(res.considered).toBe(1);
     expect(await statusOf(item.itemId)).toBe('open');
   });
 
   it('a lost race sends nothing and counts skipped', async () => {
-    const item = await createLedgerItem(base(), { businessId: B, by: 'owner' });
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'owner' }));
     await setEvidenceAfter(item.itemId, T0);
     await addMail({ from: 'dana@acme.co.il', createdAt: T1 });
     const r = recorders();
     let calls = 0;
-    const res = await closeLedgerByEvidence({
-      businessId: B,
+    const res = await withBusiness(B, (db) => closeLedgerByEvidence(db, {
       sendAlert: r.sendAlert,
       messenger: r.messenger,
       beforeMove: async () => {
         calls += 1;
-        await moveLedgerStatus(item.itemId, ['open'], 'done', { kind: 'done', by: 'owner' }, { businessId: B });
+        await withBusiness(B, (db) => moveLedgerStatus(db, item.itemId, ['open'], 'done', { kind: 'done', by: 'owner' }));
       },
-    });
+    }));
     expect(calls).toBe(1);
     expect(res.closed).toEqual([]);
     expect(res.skipped).toBe(1);

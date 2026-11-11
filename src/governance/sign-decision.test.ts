@@ -85,7 +85,8 @@ function risk(): RiskAssessment {
 
 async function aDocument(): Promise<string> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument(
+  await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -95,8 +96,7 @@ async function aDocument(): Promise<string> {
       byteSize: 12,
       storedPath: `${BUSINESS}/${documentId}/original.txt`,
     },
-    { businessId: BUSINESS },
-  );
+  ));
   return documentId;
 }
 

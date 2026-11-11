@@ -11,7 +11,7 @@
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type CalendarClient, type CalendarEvent } from '../calendar/types.js';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
 import type { ConfirmationOption } from '../governance/instruction-confirmations.js';
 import { cancelConfirmation, loadConfirmation } from '../governance/instruction-confirmations.js';
@@ -54,9 +54,8 @@ function addDays(date: string, n: number): string {
   return new Date(Date.UTC(y, mo - 1, d + n)).toISOString().slice(0, 10);
 }
 
-export async function answerScheduleQuery(o: {
+export async function answerScheduleQuery(db: BusinessDb, o: {
   text: string;
-  businessId: string;
   timeZone: string;
   operations: CharterOperations;
   runtime: Pick<Runtime, 'credentials'>;
@@ -68,8 +67,7 @@ export async function answerScheduleQuery(o: {
   if (range === null) return null;
   if (range === 'unrecognized_range') return { answered: UNRECOGNIZED_RANGE_REPLY };
 
-  const access = await resolveCalendarAccess({
-    businessId: o.businessId,
+  const access = await resolveCalendarAccess(db, {
     runtime: o.runtime,
     ...(o.client !== undefined ? { client: o.client } : {}),
   });
@@ -84,16 +82,15 @@ export async function answerScheduleQuery(o: {
     };
   }
 
-  const settings = await loadMeetingSettings({ businessId: o.businessId });
+  const settings = await loadMeetingSettings(db);
   // A day either side: an event just outside the range still pads the edge of a work window.
   const fromMs = localToInstant(addDays(range.fromDate, -1), '00:00', o.timeZone).getTime();
   const toMs = localToInstant(addDays(range.toDate, 2), '00:00', o.timeZone).getTime();
 
   let snapshot;
   try {
-    snapshot = await loadCalendarRange({
+    snapshot = await loadCalendarRange(db, {
       access,
-      businessId: o.businessId,
       settings,
       timeZone: o.timeZone,
       fromIso: new Date(fromMs).toISOString(),
@@ -126,7 +123,7 @@ export async function answerScheduleQuery(o: {
   }
 
   const responses = await loadMeetingResponses(
-    o.businessId,
+    db,
     snapshot.events.map((e) => e.eventId),
   );
   return {
@@ -337,7 +334,7 @@ function markersOf(plan: Plan): { sourceJobId: string | null; exclude: Interval[
 async function pendingMeetingQuestion(door: DoorContext): Promise<{ jobId: string; plan: Plan } | null> {
   const windowMinutes = config.whatsappQuestionWindowMinutes;
   if (windowMinutes <= 0) return null;
-  const { rows } = await getPool().query<{ job_id: string }>(
+  const { rows } = await door.db.query<{ job_id: string }>(
     `SELECT c.job_id
        FROM instruction_confirmations c
        JOIN jobs j ON j.business_id = c.business_id AND j.job_id = c.job_id AND j.phase = 'plan'
@@ -369,7 +366,7 @@ async function pendingMeetingQuestion(door: DoorContext): Promise<{ jobId: strin
  * already turned down.
  */
 async function turnedDownBy(door: DoorContext, jobId: string): Promise<{ jobId: string; plan: Plan } | null> {
-  const { rows } = await getPool().query<{ job_id: string }>(
+  const { rows } = await door.db.query<{ job_id: string }>(
     `SELECT job_id FROM instruction_confirmations
       WHERE business_id = $1 AND state = 'cancelled' AND decided_by = $2
       ORDER BY decided_at DESC
@@ -393,28 +390,28 @@ function pickedNumber(answer: string): number | null {
 }
 
 /** Best effort: a hold this misses is released by `sweepHolds` once its job is closed or failed. */
-async function releaseHoldIds(access: CalendarAccess, businessId: string, holdIds: readonly string[]): Promise<void> {
+async function releaseHoldIds(db: BusinessDb, access: CalendarAccess, holdIds: readonly string[]): Promise<void> {
   for (const holdId of holdIds) {
     try {
-      await releaseHold({ access, businessId, holdId, signal: AbortSignal.timeout(HOLD_TIMEOUT_MS) });
+      await releaseHold(db, { access, holdId, signal: AbortSignal.timeout(HOLD_TIMEOUT_MS) });
     } catch {
       // swept later
     }
   }
 }
 
-async function releaseJobHolds(access: CalendarAccess, businessId: string, jobId: string): Promise<void> {
-  const { rows } = await getPool().query<{ hold_id: string }>(
+async function releaseJobHolds(db: BusinessDb, access: CalendarAccess, jobId: string): Promise<void> {
+  const { rows } = await db.query<{ hold_id: string }>(
     `SELECT hold_id FROM meeting_holds WHERE business_id = $1 AND job_id = $2 AND state = 'held'`,
-    [businessId, jobId],
+    [db.businessId, jobId],
   );
-  await releaseHoldIds(access, businessId, rows.map((r) => r.hold_id));
+  await releaseHoldIds(db, access, rows.map((r) => r.hold_id));
 }
 
 /** The proposal never reached the owner: its rows stop reading as proposed. */
 async function abandonProposed(door: DoorContext): Promise<void> {
   try {
-    await getPool().query(
+    await door.db.query(
       `UPDATE meetings SET state = 'abandoned', updated_at = now()
         WHERE business_id = $1 AND job_id = $2 AND state = 'proposed'`,
       [door.db.businessId, door.jobId],
@@ -478,8 +475,7 @@ export async function runMeetingOperation(
   let choose: ((clientName: string, candidates: readonly CalendarEvent[]) => CalendarEvent | null) | undefined;
 
   const resolveAccess = (): Promise<CalendarAccess | { unavailable: Unavailable }> =>
-    resolveCalendarAccess({
-      businessId: door.db.businessId,
+    resolveCalendarAccess(door.db, {
       runtime: o.runtime,
       ...(o.client !== undefined ? { client: o.client } : {}),
     });
@@ -499,7 +495,7 @@ export async function runMeetingOperation(
     }
     let loaded: MeetingSettings;
     try {
-      loaded = await loadMeetingSettings({ businessId: door.db.businessId });
+      loaded = await loadMeetingSettings(door.db);
     } catch (err) {
       return {
         refusal: {
@@ -573,7 +569,7 @@ export async function runMeetingOperation(
       // Moved on by someone else (the settle sweep closes a cancelled question too).
       if (!(err instanceof PhaseMovedError)) throw err;
     }
-    await releaseJobHolds(access, door.db.businessId, previous.jobId);
+    await releaseJobHolds(door.db, access, previous.jobId);
 
     const markers = markersOf(previous.plan);
     sourceJobId = markers.sourceJobId ?? previous.jobId;
@@ -624,9 +620,8 @@ export async function runMeetingOperation(
   const range = snapshotRange(request, localParts(now, door.timeZone).date, door.timeZone);
   let snapshot: Awaited<ReturnType<typeof loadCalendarRange>>;
   try {
-    snapshot = await loadCalendarRange({
+    snapshot = await loadCalendarRange(door.db, {
       access: calendar,
-      businessId: door.db.businessId,
       settings,
       timeZone: door.timeZone,
       fromIso: range.fromIso,
@@ -647,7 +642,7 @@ export async function runMeetingOperation(
   // A failed contact read degrades to no memory, like the instruction door's.
   let contacts: Contact[] = [];
   try {
-    contacts = await listContacts({ businessId: door.db.businessId });
+    contacts = await listContacts(door.db);
   } catch {
     contacts = [];
   }
@@ -728,9 +723,8 @@ export async function runMeetingOperation(
     let hold: Awaited<ReturnType<typeof createHold>> | null = null;
     if (step !== undefined) {
       try {
-        hold = await createHold({
+        hold = await createHold(door.db, {
           access: calendar,
-          businessId: door.db.businessId,
           jobId: door.jobId,
           calendarId: change.calendarId,
           start: change.start,
@@ -743,7 +737,7 @@ export async function runMeetingOperation(
       }
     }
     if (step === undefined || hold === null || isCalendarFailure(hold)) {
-      await releaseHoldIds(calendar, door.db.businessId, placed);
+      await releaseHoldIds(door.db, calendar, placed);
       return failMeetingJob(door, 'hold could not be placed', HOLD_FAILED_REPLY);
     }
     placed.push(hold.holdId);
@@ -751,7 +745,7 @@ export async function runMeetingOperation(
   }
 
   const undo = async (audit: string): Promise<InstructionOutcome> => {
-    await releaseHoldIds(calendar, door.db.businessId, placed);
+    await releaseHoldIds(door.db, calendar, placed);
     await abandonProposed(door);
     return failMeetingJob(door, audit, MEETING_PREPARE_FAILED_REPLY);
   };
@@ -759,7 +753,7 @@ export async function runMeetingOperation(
   let plan: Plan;
   try {
     plan = withHoldIds(built, holdByStepId);
-    await recordProposedMeetings({ businessId: door.db.businessId, jobId: door.jobId, plan, changes: result.changes });
+    await recordProposedMeetings(door.db, { jobId: door.jobId, plan, changes: result.changes });
   } catch (err) {
     return undo(`could not record the proposal (${err instanceof Error ? err.message : String(err)})`);
   }
@@ -778,7 +772,7 @@ export async function runMeetingOperation(
   }
   if (outcome.status === 'refused') {
     // `finishSingle` already failed the job; the holds and rows are ours to undo.
-    await releaseHoldIds(calendar, door.db.businessId, placed);
+    await releaseHoldIds(door.db, calendar, placed);
     await abandonProposed(door);
   }
   return outcome;

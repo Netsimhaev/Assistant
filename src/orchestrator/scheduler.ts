@@ -1083,12 +1083,11 @@ export async function schedulerPass(
   }
   if (ledgerHasCharter) {
     try {
-      ledgerEvidence = await closeLedgerByEvidence({
-        businessId,
+      ledgerEvidence = await withBusiness(businessId, (db) => closeLedgerByEvidence(db, { // TENANCY-TODO(task 9)
         ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
         ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
         ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
-      });
+      }));
     } catch (err) {
       ledgerEvidenceError = err instanceof Error ? err.message : String(err);
     }
@@ -1157,17 +1156,16 @@ export async function schedulerPass(
   let documentProductions: RunProductionsResult | null = null;
   let documentProductionsError: string | null = null;
   try {
-    documentProductions = await runDocumentProductions({
-      businessId,
+    documentProductions = await withBusiness(businessId, (db) => runDocumentProductions(db, { // TENANCY-TODO(task 9)
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(runtime.production !== undefined ? { production: runtime.production } : {}),
       ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
       // Ruling R4: a finished production becomes a card (or one failure
       // notice) on the owner's chosen channels. A test seam below may
       // replace it.
-      onFinished: (finished) => onProductionFinished(finished, { businessId, ...cardSeams }),
+      onFinished: (finished) => onProductionFinished(db, finished, cardSeams),
       ...options.production,
-    });
+    }));
   } catch (err) {
     documentProductionsError = err instanceof Error ? err.message : String(err);
   }
@@ -1195,7 +1193,7 @@ export async function schedulerPass(
   let deliveriesReraised: ReraiseResult | null = null;
   let deliveriesReraisedError: string | null = null;
   try {
-    deliveriesReraised = await reraiseFailedDeliveries({ businessId, ...cardSeams });
+    deliveriesReraised = await withBusiness(businessId, (db) => reraiseFailedDeliveries(db, cardSeams)); // TENANCY-TODO(task 9)
   } catch (err) {
     deliveriesReraisedError = err instanceof Error ? err.message : String(err);
   }
@@ -1207,15 +1205,14 @@ export async function schedulerPass(
   let meetings: MeetingSyncResult | null = null;
   let meetingsError: string | null = null;
   try {
-    meetings = await syncMeetings({
-      businessId,
+    meetings = await withBusiness(businessId, (db) => syncMeetings(db, { // TENANCY-TODO(task 9)
       runtime,
       ...(options.now !== undefined ? { now: options.now } : {}),
       ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
       ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
       ...(runtime.notify !== undefined ? { dashboardBaseUrl: runtime.notify.dashboardBaseUrl } : {}),
       ...(options.calendarClient !== undefined ? { client: options.calendarClient } : {}),
-    });
+    }));
   } catch (err) {
     meetingsError = err instanceof Error ? err.message : String(err);
   }
@@ -1227,8 +1224,7 @@ export async function schedulerPass(
   let ledger: LedgerPassResult | null = null;
   if (ledgerHasCharter) {
     try {
-      ledger = await runLedgerPass({
-        businessId,
+      ledger = await withBusiness(businessId, (db) => runLedgerPass(db, { // TENANCY-TODO(task 9)
         ...(options.now !== undefined ? { now: options.now } : {}),
         ...(runtime.notify?.sendAlert !== undefined ? { sendAlert: runtime.notify.sendAlert } : {}),
         ...(whatsappMessenger !== null ? { messenger: whatsappMessenger } : {}),
@@ -1236,7 +1232,7 @@ export async function schedulerPass(
         drafter: options.ledgerDrafter ?? runNudgeDrafter,
         // Spec I5: this pass's evidence notices go first in the pass's ONE batch.
         ...(ledgerEvidence !== null ? { evidenceNotices: ledgerEvidence.notices } : {}),
-      });
+      }));
     } catch (err) {
       ledgerError = err instanceof Error ? err.message : String(err);
     }

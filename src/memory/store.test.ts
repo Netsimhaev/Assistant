@@ -16,7 +16,7 @@ import {
 const BUSINESS = 'test-business';
 
 async function aJob(provenance: TrustLevel, title = 'memory'): Promise<string> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `mem-${title}-${provenance}` }))); // TENANCY-TODO(task 5)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `mem-${title}-${provenance}` })));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,
@@ -36,12 +36,12 @@ describe('the memory store', () => {
 
   it('writes and recalls an entity', async () => {
     const jobId = await aJob('boss');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'entity', subjectKey: 'c_812', body: { name: 'אלפא ציוד טכני' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const found = await recallMemories({ subjectKey: 'c_812' }, { businessId: BUSINESS });
+    const found = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'c_812' }));
     expect(found).toHaveLength(1);
     expect(found[0]?.body).toEqual({ name: 'אלפא ציוד טכני' });
     expect(found[0]?.kind).toBe('entity');
@@ -60,16 +60,16 @@ describe('the memory store', () => {
     const bossJob = await aJob('boss', 'owner-said');
     const documentJob = await aJob('unknown_external', 'supplier-said');
 
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: bossJob, kind: 'chunk', subjectKey: 'c_900', body: { text: 'הבעלים אמר' } },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: documentJob, kind: 'chunk', subjectKey: 'c_900', body: { text: 'הספק אמר' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const found = await recallMemories({ subjectKey: 'c_900' }, { businessId: BUSINESS });
+    const found = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'c_900' }));
     expect(found).toHaveLength(2);
     const byText = new Map(found.map((m) => [String(m.body['text']), m.provenance]));
     expect(byText.get('הבעלים אמר')).toBe('boss');
@@ -93,44 +93,44 @@ describe('the memory store', () => {
       provenance: 'boss',
     };
 
-    await writeMemory(sneaky, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => writeMemory(db, sneaky));
 
-    const found = await recallMemories({ subjectKey: 'c_evil' }, { businessId: BUSINESS });
+    const found = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'c_evil' }));
     expect(found[0]?.provenance).toBe('unknown_external');
   });
 
   it('refuses a write whose job does not resolve, rather than defaulting', async () => {
     await expect(
-      writeMemory(
+      withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId: 'J-does-not-exist', kind: 'chunk', subjectKey: 'x', body: {} },
-        { businessId: BUSINESS },
-      ),
+      )),
     ).rejects.toBeInstanceOf(MemoryJobUnresolvedError);
   });
 
   it('does not read another business’s memories', async () => {
     const jobId = await aJob('boss');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'entity', subjectKey: 'c_812', body: { name: 'שלנו' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const other = await recallMemories({ subjectKey: 'c_812' }, { businessId: 'someone-else' });
+    const other = await withBusiness('someone-else', (db) => recallMemories(db, { subjectKey: 'c_812' }));
     expect(other).toEqual([]);
   });
 
   it('replaces an entity and retires what it replaced, rather than deleting it', async () => {
     const jobId = await aJob('boss');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'entity', subjectKey: 'c_812', body: { phone: '03-1111111' } },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'entity', subjectKey: 'c_812', body: { phone: '03-2222222' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const live = await recallMemories({ subjectKey: 'c_812' }, { businessId: BUSINESS });
+    const live = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'c_812' }));
     expect(live).toHaveLength(1);
     expect(live[0]?.body).toEqual({ phone: '03-2222222' });
 
@@ -148,19 +148,19 @@ describe('the memory store', () => {
   it('keeps one live value per preference attribute, and separate ones apart', async () => {
     const jobId = await aJob('boss');
     const pref = (attribute: string, value: string) =>
-      writeMemory(
+      withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId, kind: 'preference', subjectKey: 'c_812', attribute, body: { value } },
-        { businessId: BUSINESS },
-      );
+      ));
 
     await pref('meeting_time', 'בוקר');
     await pref('language', 'עברית');
     await pref('meeting_time', 'אחר הצהריים');
 
-    const found = await recallMemories(
+    const found = await withBusiness(BUSINESS, (db) => recallMemories(
+      db,
       { subjectKey: 'c_812', kind: 'preference' },
-      { businessId: BUSINESS },
-    );
+    ));
     expect(found).toHaveLength(2);
     const byAttribute = new Map(found.map((m) => [m.attribute, String(m.body['value'])]));
     expect(byAttribute.get('meeting_time')).toBe('אחר הצהריים');
@@ -170,52 +170,52 @@ describe('the memory store', () => {
   it('accumulates chunks instead of replacing them', async () => {
     const jobId = await aJob('boss');
     for (const text of ['ראשון', 'שני', 'שלישי']) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId, kind: 'chunk', subjectKey: 'c_812', body: { text } },
-        { businessId: BUSINESS },
-      );
+      ));
     }
-    const found = await recallMemories({ subjectKey: 'c_812' }, { businessId: BUSINESS });
+    const found = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'c_812' }));
     expect(found).toHaveLength(3);
   });
 
   it('retires by subject and stops returning what it retired', async () => {
     const jobId = await aJob('boss');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'entity', subjectKey: 'c_gone', body: { name: 'ספק שסגר' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
     expect(
-      await retireMemories(
+      await withBusiness(BUSINESS, (db) => retireMemories(
+        db,
         { kind: 'entity', subjectKey: 'c_gone', reason: 'הספק סגר' },
-        { businessId: BUSINESS },
-      ),
+      )),
     ).toBe(1);
 
-    expect(await recallMemories({ subjectKey: 'c_gone' }, { businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'c_gone' }))).toEqual([]);
 
     // Retiring again touches nothing, and says so rather than reporting success.
     expect(
-      await retireMemories(
+      await withBusiness(BUSINESS, (db) => retireMemories(
+        db,
         { kind: 'entity', subjectKey: 'c_gone', reason: 'שוב' },
-        { businessId: BUSINESS },
-      ),
+      )),
     ).toBe(0);
   });
 
   it('finds a memory by a word in its text', async () => {
     const jobId = await aJob('boss');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'chunk', subjectKey: 'c_812', body: { text: 'מעדיפים משלוח בבוקר' } },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'chunk', subjectKey: 'c_999', body: { text: 'תנאי תשלום שוטף plus 60' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const found = await recallMemories({ keyword: 'משלוח' }, { businessId: BUSINESS });
+    const found = await withBusiness(BUSINESS, (db) => recallMemories(db, { keyword: 'משלוח' }));
     expect(found).toHaveLength(1);
     expect(found[0]?.subjectKey).toBe('c_812');
   });
@@ -227,16 +227,16 @@ describe('the memory store', () => {
    */
   it('treats a wildcard character in a keyword as a literal', async () => {
     const jobId = await aJob('boss');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'chunk', subjectKey: 'c_1', body: { text: 'הנחה של 5% על ההזמנה' } },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'chunk', subjectKey: 'c_2', body: { text: 'אין הנחה' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    expect(await recallMemories({ keyword: '5%' }, { businessId: BUSINESS })).toHaveLength(1);
+    expect(await withBusiness(BUSINESS, (db) => recallMemories(db, { keyword: '5%' }))).toHaveLength(1);
 
     // A bare `%` is the wildcard that would match every row in the store. It
     // must match only the row that literally contains a percent sign — which
@@ -244,7 +244,7 @@ describe('the memory store', () => {
     // "escaped correctly" from both "matched everything" (2) and "matched
     // nothing" (0). The first draft of this test expected 0 and was simply
     // wrong about its own fixture.
-    const percent = await recallMemories({ keyword: '%' }, { businessId: BUSINESS });
+    const percent = await withBusiness(BUSINESS, (db) => recallMemories(db, { keyword: '%' }));
     expect(percent).toHaveLength(1);
     expect(String(percent[0]?.body['text'])).toContain('5%');
   });
@@ -252,15 +252,15 @@ describe('the memory store', () => {
   it('caps how much one recall may return, whatever it was asked for', async () => {
     const jobId = await aJob('boss');
     for (let i = 0; i < MAX_RECALL + 5; i += 1) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId, kind: 'chunk', subjectKey: 'c_many', body: { text: `פריט ${i}` } },
-        { businessId: BUSINESS },
-      );
+      ));
     }
-    const found = await recallMemories(
+    const found = await withBusiness(BUSINESS, (db) => recallMemories(
+      db,
       { subjectKey: 'c_many', limit: 1_000 },
-      { businessId: BUSINESS },
-    );
+    ));
     expect(found).toHaveLength(MAX_RECALL);
   });
 });

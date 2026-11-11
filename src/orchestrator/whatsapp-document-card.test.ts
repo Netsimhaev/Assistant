@@ -18,7 +18,7 @@ import { FORGET_VERBS } from '../governance/forget-command.js';
 import { LEDGER_COMMAND_WORDS } from '../ledger/whatsapp-command.js';
 import { addTypedRecipient, approveDocumentCard, createDocumentCard, loadDocumentCard } from '../production/card.js';
 import { advanceStage, createProduction, saveVersion, type ProductionDestination } from '../production/store.js';
-import { resetDatabase, testDb } from '../test/db.js';
+import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { CANCEL_WORDS, CONFIRM_WORDS, REPLY_STOPLIST } from './command-confirm.js';
@@ -91,8 +91,7 @@ const spec: DocxSpec = {
 let seq = 0;
 async function card(destination: ProductionDestination, deliveredAgoMs: number | null): Promise<string> {
   seq += 1;
-  const productionId = await createProduction({
-    businessId: B,
+  const productionId = await withBusiness(B, (db) => createProduction(db, {
     originJobId: 'J-o',
     instructionText: 'תכיני הצעה',
     textOrigin: 'typed',
@@ -101,21 +100,21 @@ async function card(destination: ProductionDestination, deliveredAgoMs: number |
     kind: 'letter',
     destination,
     sourceDocumentIds: [],
-  });
+  }));
   const bytes = Buffer.from(`docx ${productionId}`);
   const storedPath = `${DIR}/${productionId}.docx`;
   await mkdir(join(config.documentRoot, DIR), { recursive: true });
   await writeFile(join(config.documentRoot, storedPath), bytes);
-  const versionId = await saveVersion({
+  const versionId = await withBusiness(TEST_BUSINESS, (db) => saveVersion(db, {
     productionId,
     versionNo: 1,
     spec,
     storedPath,
     sha256: createHash('sha256').update(bytes).digest('hex'),
     sizeBytes: bytes.length,
-  });
-  expect(await advanceStage(productionId, 'queued', 'ready', {})).toBe(true);
-  const created = await createDocumentCard(versionId, { businessId: B });
+  }));
+  expect(await withBusiness(TEST_BUSINESS, (db) => advanceStage(db, productionId, 'queued', 'ready', {}))).toBe(true);
+  const created = await withBusiness(B, (db) => createDocumentCard(db, versionId));
   if (deliveredAgoMs !== null) {
     await testDb().query(
       `UPDATE document_cards SET whatsapp_delivered_at = now() - make_interval(secs => $2::double precision / 1000)
@@ -139,43 +138,41 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
   });
 
   const save = async (cardId: string): Promise<string> =>
-    (await loadDocumentCard(B, cardId))!.deliveryPlans.find((o) => o.option === 'save')!.planHash;
+    (await withBusiness(B, (db) => loadDocumentCard(db, cardId)))!.deliveryPlans.find((o) => o.option === 'save')!.planHash;
 
   it('approves a whatsapp answer sent after delivery and inside the window', async () => {
     const cardId = await card({ mode: 'save', folder: null }, 60_000);
-    const outcome = await approveDocumentCard(cardId, await save(cardId), 'whatsapp', {
-      businessId: B,
+    const outcome = await withBusiness(B, async (db) => approveDocumentCard(db, cardId, await save(cardId), 'whatsapp', {
       whatsappInboundAt: new Date(),
-    });
+    }));
     expect(outcome.status).toBe('approved');
   });
 
   it('refuses a whatsapp answer sent before the card was delivered', async () => {
     const cardId = await card({ mode: 'save', folder: null }, 60_000);
-    const outcome = await approveDocumentCard(cardId, await save(cardId), 'whatsapp', {
-      businessId: B,
+    const outcome = await withBusiness(B, async (db) => approveDocumentCard(db, cardId, await save(cardId), 'whatsapp', {
       whatsappInboundAt: new Date(Date.now() - 120_000),
-    });
+    }));
     expect(outcome.status).toBe('not_answerable');
-    expect((await loadDocumentCard(B, cardId))?.state).toBe('open');
+    expect((await withBusiness(B, (db) => loadDocumentCard(db, cardId)))?.state).toBe('open');
   });
 
   it('refuses a whatsapp answer to a card no longer delivered (withdrawn) or past the window, or with no timestamp', async () => {
     const never = await card({ mode: 'save', folder: null }, null);
     expect(
-      (await approveDocumentCard(never, await save(never), 'whatsapp', { businessId: B, whatsappInboundAt: new Date() })).status,
+      (await withBusiness(B, async (db) => approveDocumentCard(db, never, await save(never), 'whatsapp', { whatsappInboundAt: new Date() }))).status,
     ).toBe('not_answerable');
     const old = await card({ mode: 'save', folder: null }, (config.whatsappQuestionWindowMinutes + 5) * 60_000);
     expect(
-      (await approveDocumentCard(old, await save(old), 'whatsapp', { businessId: B, whatsappInboundAt: new Date() })).status,
+      (await withBusiness(B, async (db) => approveDocumentCard(db, old, await save(old), 'whatsapp', { whatsappInboundAt: new Date() }))).status,
     ).toBe('not_answerable');
     const fresh = await card({ mode: 'save', folder: null }, 60_000);
-    expect((await approveDocumentCard(fresh, await save(fresh), 'whatsapp', { businessId: B })).status).toBe('not_answerable');
+    expect((await withBusiness(B, async (db) => approveDocumentCard(db, fresh, await save(fresh), 'whatsapp'))).status).toBe('not_answerable');
   });
 
   it('the dashboard is not time-gated', async () => {
     const cardId = await card({ mode: 'save', folder: null }, null);
-    expect((await approveDocumentCard(cardId, await save(cardId), 'dashboard', { businessId: B })).status).toBe('approved');
+    expect((await withBusiness(B, async (db) => approveDocumentCard(db, cardId, await save(cardId), 'dashboard'))).status).toBe('approved');
   });
 
   it('a typed address clears the WhatsApp delivery and re-sends the card, showing the address', async () => {
@@ -193,14 +190,14 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
         ON CONFLICT (business_id) DO UPDATE SET to_whatsapp = true, to_email = false, to_screen = true`,
       [B],
     );
-    const before = (await loadDocumentCard(B, cardId))!.whatsappDeliveredAt!;
-    const outcome = await addTypedRecipient(cardId, 'yossi@client.example', { businessId: B, messenger });
+    const before = (await withBusiness(B, (db) => loadDocumentCard(db, cardId)))!.whatsappDeliveredAt!;
+    const outcome = await withBusiness(B, (db) => addTypedRecipient(db, cardId, 'yossi@client.example', { messenger }));
     expect(outcome).toMatchObject({ status: 'added', resend: 'sent' });
     // The card as it now stands — with the typed address in its echo — was
     // sent again, and only that new delivery is answerable.
     expect(files).toHaveLength(1);
     expect(files[0]).toContain('yossi@client.example');
-    const after = (await loadDocumentCard(B, cardId))!;
+    const after = (await withBusiness(B, (db) => loadDocumentCard(db, cardId)))!;
     expect(after.whatsappState).toBe('sent');
     expect(after.whatsappDeliveredAt!.getTime()).toBeGreaterThan(before.getTime());
   });
@@ -208,9 +205,9 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
   it('a typed address with no notification seams leaves the card withdrawn and its channel states untouched', async () => {
     const cardId = await card({ mode: 'send', to: [] }, 60_000);
     await testDb().query(`UPDATE document_cards SET email_state = 'sent', whatsapp_state = 'sent' WHERE card_id = $1`, [cardId]);
-    const outcome = await addTypedRecipient(cardId, 'yossi@client.example', { businessId: B });
+    const outcome = await withBusiness(B, (db) => addTypedRecipient(db, cardId, 'yossi@client.example'));
     expect(outcome).toMatchObject({ status: 'added', resend: 'skipped_no_seams' });
-    const after = (await loadDocumentCard(B, cardId))!;
+    const after = (await withBusiness(B, (db) => loadDocumentCard(db, cardId)))!;
     expect(after.whatsappDeliveredAt).toBe(null);
     expect(after.emailState).toBe('sent');
     expect(after.whatsappState).toBe('sent');
@@ -232,10 +229,10 @@ describe('the WhatsApp time gate inside approveDocumentCard', () => {
         return { ok: true };
       },
     } as unknown as BossMessenger;
-    const outcome = await addTypedRecipient(cardId, 'yossi@client.example', { businessId: B, messenger });
+    const outcome = await withBusiness(B, (db) => addTypedRecipient(db, cardId, 'yossi@client.example', { messenger }));
     expect(outcome).toMatchObject({ status: 'added', resend: 'skipped_charter_unreadable' });
     expect(sent).toEqual([]);
-    const after = (await loadDocumentCard(B, cardId))!;
+    const after = (await withBusiness(B, (db) => loadDocumentCard(db, cardId)))!;
     expect(after.deliveryPlans.some((o) => o.option === 'send')).toBe(true);
     expect(after.whatsappDeliveredAt).toBe(null);
     expect(after.whatsappState).toBe('sent');

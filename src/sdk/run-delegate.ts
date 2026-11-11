@@ -163,10 +163,10 @@ async function main(): Promise<void> {
   await writeFile(tmpPath, probeText, 'utf8');
   let documentId: string;
   try {
-    const document = await ingestDocument(
+    const document = await withBusiness(BUSINESS, (db) => ingestDocument( // TENANCY-TODO(task 7)
+      db,
       { path: tmpPath, source: 'manual', originalName: `${PROBE}.txt` },
-      { businessId: BUSINESS },
-    );
+    ));
     console.log(`מסמך ${document.documentId} · סטטוס ${document.status}`);
     if (document.status !== 'extracted') {
       throw new Error(`הקליטה לא הפיקה מסמך שאפשר לקרוא (${document.status}: ${document.reason ?? '—'})`);
@@ -280,7 +280,7 @@ async function main(): Promise<void> {
   // ------------------------------------------------------------- RUN THE CHILD
   banner('שלב 2: הילד רץ — קריאה חיה אמיתית אל know.reader (doc.fetch)');
   console.log(`DOCUMENT_READS_PER_DAY = ${config.documentReadsPerDay}`);
-  const readsSoFarToday = await readingsToday({ businessId: BUSINESS });
+  const readsSoFarToday = await withBusiness(BUSINESS, (db) => readingsToday(db)); // TENANCY-TODO(task 7)
   console.log(`קריאות מסמך שנוצלו כבר היום: ${readsSoFarToday}`);
   if (readsSoFarToday >= config.documentReadsPerDay) {
     console.log(

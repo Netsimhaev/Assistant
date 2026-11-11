@@ -159,7 +159,7 @@ function stubTriage(byMessage: Record<string, MailTriage> | MailTriage): Triage 
 
 async function setup(): Promise<{ bundle: PolicyBundle; documentRoot: string }> {
   const bundle = await installMailboxCharter(BUSINESS);
-  await setCursor({ provider: 'google', cursor: 'C-0' }, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (db) => setCursor(db, { provider: 'google', cursor: 'C-0' }));
   const documentRoot = await mkdtemp(join(tmpdir(), 'mail-poll-'));
   return { bundle, documentRoot };
 }
@@ -237,7 +237,7 @@ describe('pollMailbox', () => {
     expect(triage.calls).toBe(1);
     expect(fake.ensureCalls).toBe(1);
     expect(fake.labelled).toEqual([{ providerMessageId: 'PM-INV', label: MAIL_LABELS.invoice }]);
-    expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-1');
+    expect((await withBusiness(BUSINESS, (db) => getCursor(db)))?.cursor).toBe('C-1');
 
     const [row] = await mailRows();
     expect(row?.state).toBe('triaged');
@@ -593,7 +593,7 @@ describe('pollMailbox', () => {
 
     expect(result?.status).toBe('needs_reauth');
     expect(fake.listCalls).toHaveLength(0);
-    const cursor = await getCursor({ businessId: BUSINESS });
+    const cursor = await withBusiness(BUSINESS, (db) => getCursor(db));
     expect(cursor?.cursor).toBe('C-0');
     expect(cursor?.lastError).toBe('needs_reauth');
   });
@@ -618,7 +618,7 @@ describe('pollMailbox', () => {
     expect(result.status).toBe('error');
     expect(result.recorded).toBe(2);
     expect((await mailRows()).map((r) => r.provider_message_id)).toEqual(['PM-1', 'PM-2']);
-    const cursor = await getCursor({ businessId: BUSINESS });
+    const cursor = await withBusiness(BUSINESS, (db) => getCursor(db));
     expect(cursor?.cursor).toBe('C-0');
     expect(cursor?.lastError).not.toBeNull();
     // Fix round 1: a record failure no longer stalls everything already stored.
@@ -639,11 +639,11 @@ describe('pollMailbox', () => {
 
     for (const _ of [1, 2]) {
       expect(expectOk(await run()).status).toBe('error');
-      expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-0');
+      expect((await withBusiness(BUSINESS, (db) => getCursor(db)))?.cursor).toBe('C-0');
     }
     const third = expectOk(await run());
     expect(third.status).toBe('ok');
-    expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-1');
+    expect((await withBusiness(BUSINESS, (db) => getCursor(db)))?.cursor).toBe('C-1');
     const { rows } = await getPool().query<{ state: string; error: string | null; subject: string }>(
       "SELECT state, error, subject FROM mail_messages WHERE provider_message_id = 'PM-BROKEN'",
     );
@@ -660,7 +660,7 @@ describe('pollMailbox', () => {
     );
 
     expect(result).toMatchObject({ status: 'ok', recorded: 1, triaged: 1 });
-    expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-1');
+    expect((await withBusiness(BUSINESS, (db) => getCursor(db)))?.cursor).toBe('C-1');
   });
 
   it('a failed attachment fetch keeps the notice, the invoice row (without a document) and the card', async () => {
@@ -872,7 +872,7 @@ describe('pollMailbox', () => {
 
     expect(result.status).toBe('error');
     expect(result.error).toContain('503');
-    expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-0');
+    expect((await withBusiness(BUSINESS, (db) => getCursor(db)))?.cursor).toBe('C-0');
   });
 
   it('an auth failure on listing reports needs_reauth', async () => {
@@ -882,7 +882,7 @@ describe('pollMailbox', () => {
     const result = await withBusiness(BUSINESS, (db) => pollMailbox(db, { curator: stubCurator, runtime: mailboxRuntime(fake.client), client: fake.client, triage: stubTriage(OTHER_TRIAGE), drafter: stubDrafter(), documentRoot }));
 
     expect(result?.status).toBe('needs_reauth');
-    expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-0');
+    expect((await withBusiness(BUSINESS, (db) => getCursor(db)))?.cursor).toBe('C-0');
   });
 
   it('an expired cursor is re-taken with a gap flag and no backfill', async () => {
@@ -896,7 +896,7 @@ describe('pollMailbox', () => {
 
     expect(result).toMatchObject({ status: 'ok', gap: true, recorded: 0 });
     expect(fake.listCalls).toEqual(['C-0']);
-    const cursor = await getCursor({ businessId: BUSINESS });
+    const cursor = await withBusiness(BUSINESS, (db) => getCursor(db));
     expect(cursor?.cursor).toBe('C-FRESH');
     expect(cursor?.lastError).toBe('cursor_expired_gap');
 
@@ -1180,7 +1180,7 @@ describe('pollMailbox', () => {
       const tmp = await mkdtemp(join(tmpdir(), 'legacy-pdf-'));
       const path = join(tmp, 'old.pdf');
       await writeFile(path, bytes);
-      const legacy = await ingestDocument({ path, source: 'mail', originalName: 'old.pdf' }, { businessId: BUSINESS, documentRoot });
+      const legacy = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path, source: 'mail', originalName: 'old.pdf' }, { documentRoot }));
       await testDb().query('DELETE FROM document_artifacts WHERE business_id = $1 AND document_id = $2', [BUSINESS, legacy.documentId]);
       await testDb().query("UPDATE documents SET status = 'stored', reason = NULL WHERE business_id = $1 AND document_id = $2", [BUSINESS, legacy.documentId]);
       const mail = incomingMail({ providerMessageId: 'PM-LG', attachments: [pdfAttachment(bytes, 'A-1', 'old.pdf')] });

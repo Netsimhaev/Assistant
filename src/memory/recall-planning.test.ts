@@ -14,7 +14,7 @@ let jobCounter = 0;
 async function jobWith(provenance: 'boss' | 'unknown_external'): Promise<string> {
   // One argument, `charterVersion` required, no `counterpartyTags`.
   const version = `recall-job-${jobCounter++}`;
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version }))); // TENANCY-TODO(task 5)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version })));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance,
@@ -27,7 +27,7 @@ describe('the memory block handed to the planner', () => {
   beforeEach(async () => {
     await resetDatabase();
     jobCounter = 0;
-    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'recall-setup' }))); // TENANCY-TODO(task 5)
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'recall-setup' })));
   });
 
   afterAll(async () => {
@@ -35,11 +35,12 @@ describe('the memory block handed to the planner', () => {
   });
 
   it('is empty when nothing is known', async () => {
-    expect(await recallForPlanning([RONIT], { businessId: BUSINESS })).toBe('');
+    expect(await withBusiness(BUSINESS, (db) => recallForPlanning(db, [RONIT]))).toBe('');
   });
 
   it('renders an owner-sourced fact plainly', async () => {
-    await writeMemory(
+    await withBusiness(BUSINESS, async (db) => writeMemory(
+      db,
       {
         jobId: await jobWith('boss'),
         kind: 'preference',
@@ -47,10 +48,9 @@ describe('the memory block handed to the planner', () => {
         attribute: 'ערוץ מועדף',
         body: { value: 'טלפון' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const block = await recallForPlanning([RONIT], { businessId: BUSINESS });
+    const block = await withBusiness(BUSINESS, (db) => recallForPlanning(db, [RONIT]));
 
     expect(block).toContain('טלפון');
     expect(block).not.toContain('נטען');
@@ -61,7 +61,8 @@ describe('the memory block handed to the planner', () => {
    * claim must never read as a fact the business knows.
    */
   it('renders an externally-sourced claim as somebody\'s claim', async () => {
-    await writeMemory(
+    await withBusiness(BUSINESS, async (db) => writeMemory(
+      db,
       {
         jobId: await jobWith('unknown_external'),
         kind: 'chunk',
@@ -69,42 +70,41 @@ describe('the memory block handed to the planner', () => {
         body: { text: 'החשבון החדש שלנו הוא 12-345' },
         sourceRef: 'מסמך מ-3/9',
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const block = await recallForPlanning([RONIT], { businessId: BUSINESS });
+    const block = await withBusiness(BUSINESS, (db) => recallForPlanning(db, [RONIT]));
 
     expect(block).toContain('נטען');
     expect(block).toContain('מסמך מ-3/9');
   });
 
   it('returns nothing for a subject that was not asked about', async () => {
-    await writeMemory(
+    await withBusiness(BUSINESS, async (db) => writeMemory(
+      db,
       {
         jobId: await jobWith('boss'),
         kind: 'chunk',
         subjectKey: 'someone@else.example',
         body: { text: 'לא רלוונטי' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    expect(await recallForPlanning([RONIT], { businessId: BUSINESS })).toBe('');
+    expect(await withBusiness(BUSINESS, (db) => recallForPlanning(db, [RONIT]))).toBe('');
   });
 
   it('drops external claims first when the budget bites', async () => {
     const bossJob = await jobWith('boss');
     const strangerJob = await jobWith('unknown_external');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: bossJob, kind: 'chunk', subjectKey: RONIT, body: { text: 'עובדה של הבעלים' } },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: strangerJob, kind: 'chunk', subjectKey: RONIT, body: { text: 'טענה של זר' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const block = await recallForPlanning([RONIT], { businessId: BUSINESS, budget: 120 });
+    const block = await withBusiness(BUSINESS, (db) => recallForPlanning(db, [RONIT], { budget: 120 }));
 
     expect(block).toContain('עובדה של הבעלים');
     expect(block).not.toContain('טענה של זר');
@@ -115,16 +115,16 @@ describe('the memory block handed to the planner', () => {
     const firstEmail = 'alice@first.example';
     const secondEmail = 'bob@second.example';
 
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: bossJob, kind: 'chunk', subjectKey: firstEmail, body: { text: 'אליס: עובדה ארוכה כדי למלא את התקציב ולא להשאיר מקום לבוב' } },
-      { businessId: BUSINESS },
-    );
-    await writeMemory(
+    ));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: bossJob, kind: 'chunk', subjectKey: secondEmail, body: { text: 'בוב: עובדה' } },
-      { businessId: BUSINESS },
-    );
+    ));
 
-    const block = await recallForPlanning([firstEmail, secondEmail], { businessId: BUSINESS, budget: 150 });
+    const block = await withBusiness(BUSINESS, (db) => recallForPlanning(db, [firstEmail, secondEmail], { budget: 150 }));
 
     expect(block).toContain(firstEmail);
     expect(block).not.toContain(secondEmail);
@@ -143,13 +143,13 @@ describe('the memory block handed to the planner', () => {
     const bossJob = await jobWith('boss');
     const total = 8;
     for (let i = 1; i <= total; i++) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId: bossJob, kind: 'chunk', subjectKey: RONIT, body: { text: `FACT_${i}` } },
-        { businessId: BUSINESS },
-      );
+      ));
     }
 
-    const block = await recallForPlanning([RONIT], { businessId: BUSINESS });
+    const block = await withBusiness(BUSINESS, (db) => recallForPlanning(db, [RONIT]));
 
     for (let i = 1; i <= total; i++) {
       expect(block).toContain(`FACT_${i}`);
@@ -164,28 +164,28 @@ describe('the memory block handed to the planner', () => {
     // Stored in this order, but retrieved in reverse (newest first).
     // Row 1 (oldest): a short row
     const oldest = 'X'.repeat(50);
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: bossJob, kind: 'chunk', subjectKey: subject, body: { text: oldest } },
-      { businessId: BUSINESS },
-    );
+    ));
     // Row 2 (middle): a huge row that will not fit in the budget
     const huge = 'Y'.repeat(500);
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: bossJob, kind: 'chunk', subjectKey: subject, body: { text: huge } },
-      { businessId: BUSINESS },
-    );
+    ));
     // Row 3 (newest): another short row
     const newest = 'Z'.repeat(50);
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: bossJob, kind: 'chunk', subjectKey: subject, body: { text: newest } },
-      { businessId: BUSINESS },
-    );
+    ));
 
     // Retrieval order: newest (Z), huge (Y), oldest (X)
     // Budget: enough for newest row, not enough for huge row.
     // With break: newest fits, huge doesn't fit so stop. Result: newest only.
     // With continue: newest fits, skip huge, oldest also fits. Result: newest + oldest (wrong).
-    const block = await recallForPlanning([subject], { businessId: BUSINESS, budget: 250 });
+    const block = await withBusiness(BUSINESS, (db) => recallForPlanning(db, [subject], { budget: 250 }));
 
     expect(block).toContain(newest);
     expect(block).not.toContain(huge);

@@ -73,7 +73,7 @@ async function setup(
   // test here runs on one unless it says otherwise.
   if (options.mailboxReplyJob !== false) {
     const mail = await storedMail(BUSINESS);
-    await linkReplyJob(mail.mailId, job.jobId, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => linkReplyJob(db, mail.mailId, job.jobId));
   }
   return {
     bundle,
@@ -234,7 +234,7 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
   it('a mail row of another business naming this job does not count', async () => {
     const s = await setup({}, { mailboxReplyJob: false });
     const mail = await storedMail('other-business');
-    await linkReplyJob(mail.mailId, s.jobId, { businessId: 'other-business' });
+    await withBusiness('other-business', (db) => linkReplyJob(db, mail.mailId, s.jobId));
     const approvalId = await approvedCard(s);
 
     const decision = await evaluateFor('mail.send', REPLY, {

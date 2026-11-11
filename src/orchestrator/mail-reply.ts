@@ -103,22 +103,21 @@ export async function raiseMailReply(
   options: RaiseMailReplyOptions = {},
 ): Promise<RaisedReply | null> {
   const { mail, triage, bundle } = input;
-  const businessId = db.businessId;
 
   // Positive checks, before anything costs money. An unparseable sender is
   // '' (Task 3's mapping): no one to answer.
   if (mail.fromAddress.trim() === '') {
-    await noteMailError(mail.mailId, 'no_sender', { businessId });
+    await noteMailError(db, mail.mailId, 'no_sender');
     return null;
   }
   if (mail.internetMessageId === null || mail.internetMessageId.trim() === '') {
-    await noteMailError(mail.mailId, 'no_message_id', { businessId });
+    await noteMailError(db, mail.mailId, 'no_message_id');
     return null;
   }
   // A question always carries a gist (`mailTriageProblems`), but this is
   // typed nullable and a drafter without one has nothing to say.
   if (triage.replyGist === null) {
-    await noteMailError(mail.mailId, 'no_reply_gist', { businessId });
+    await noteMailError(db, mail.mailId, 'no_reply_gist');
     return null;
   }
 
@@ -184,7 +183,6 @@ async function raiseReplyCard(
   input: ReplyCardInput,
   options: { notify?: NotifyTarget } = {},
 ): Promise<RaisedReply> {
-  const { businessId } = db;
   const recipient = mailboxReplyRecipient(input.payload);
   if (recipient === null) throw new Error('raiseReplyCard: payload is not a mailbox reply');
   const payload = input.payload;
@@ -265,7 +263,7 @@ async function raiseReplyCard(
         actor: 'orchestrator',
         reason: LEARNED_NO_CARD_REASON,
       });
-      await linkReplyJob(input.mailId, job.jobId, { businessId });
+      await linkReplyJob(db, input.mailId, job.jobId);
       return { replyJobId: job.jobId, approvalId: null };
     }
 
@@ -304,7 +302,7 @@ async function raiseReplyCard(
       reason: `mail reply: ${approvalId}`,
     });
 
-    await linkReplyJob(input.mailId, job.jobId, { businessId });
+    await linkReplyJob(db, input.mailId, job.jobId);
     return { replyJobId: job.jobId, approvalId };
   } catch (error) {
     // A card already queued would otherwise sit pending on a failed job: the
@@ -474,7 +472,7 @@ export async function reraiseAfterFailedSend(
       result.skipped += 1;
       continue;
     }
-    if (!(await claimFailedReply(row.mail_id, row.job_id, { businessId }))) continue;
+    if (!(await claimFailedReply(db, row.mail_id, row.job_id))) continue;
 
     // Per row: one failure must not stop the rest of the batch. The claim is
     // already spent, so this failed job will not be offered again — the mail
@@ -500,7 +498,7 @@ export async function reraiseAfterFailedSend(
     } catch {
       result.failed += 1;
       try {
-        await noteMailError(row.mail_id, 'reraise_failed', { businessId });
+        await noteMailError(db, row.mail_id, 'reraise_failed');
       } catch {
         // The database is having the same bad moment; the count still says so.
       }
@@ -533,7 +531,6 @@ async function reraiseLearnedReplies(
   options: RaiseMailReplyOptions,
   result: ReraiseResult,
 ): Promise<void> {
-  const { businessId } = db;
   const { rows } = await db.query<FailedLearnedRow>(
     `SELECT m.mail_id, j.job_id, m.subject AS original_subject, m.from_name, m.reply_to,
             (EXISTS (
@@ -571,7 +568,7 @@ async function reraiseLearnedReplies(
       result.skipped += 1;
       continue;
     }
-    if (!(await claimFailedReply(row.mail_id, row.job_id, { businessId }))) continue;
+    if (!(await claimFailedReply(db, row.mail_id, row.job_id))) continue;
 
     try {
       const raised = await raiseReplyCard(
@@ -592,7 +589,7 @@ async function reraiseLearnedReplies(
     } catch {
       result.failed += 1;
       try {
-        await noteMailError(row.mail_id, 'reraise_failed', { businessId });
+        await noteMailError(db, row.mail_id, 'reraise_failed');
       } catch {
         // Best effort, as in the first branch.
       }

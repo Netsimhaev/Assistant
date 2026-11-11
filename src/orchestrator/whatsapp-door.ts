@@ -520,7 +520,7 @@ async function tellOwnerAndSettle(
   text: string,
 ): Promise<void> {
   await ctx.messenger.send({ text, jobId: null });
-  await settleMessage(messageId, 'failed', {}, { businessId: ctx.db.businessId });
+  await settleMessage(ctx.db, messageId, 'failed', {});
 }
 
 /**
@@ -588,7 +588,7 @@ async function handleConfirmationMessage(input: {
   const readings: ConfirmReading[] = confirmations.map((c) => readConfirmation(text, c.options));
   if (readings.every((r) => r.kind === 'none')) return 'passthrough';
 
-  const claimed = await claimMessage(storedId, { businessId: ctx.db.businessId });
+  const claimed = await claimMessage(ctx.db, storedId);
   if (!claimed) return 'skipped';
 
   const reply = async (
@@ -599,9 +599,7 @@ async function handleConfirmationMessage(input: {
     // Linked to the job when one is known, so the outbound row says which
     // held command it answered.
     await ctx.messenger.send({ text: replyText, jobId });
-    await settleMessage(storedId, state, jobId !== null ? { jobId } : {}, {
-      businessId: ctx.db.businessId,
-    });
+    await settleMessage(ctx.db, storedId, state, jobId !== null ? { jobId } : {});
   };
 
   const { mailCards: cards, questions, documentCards } = open;
@@ -690,6 +688,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       : 'other';
 
     stored = await recordInbound(
+      ctx.db,
       {
         providerMessageId: msg.providerMessageId,
         senderNumber: msg.senderNumber,
@@ -698,7 +697,6 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         mediaKind: msg.mediaKind,
         providerTimestamp: msg.providerTimestamp,
       },
-      { businessId: ctx.db.businessId },
     );
     // A redelivery of a message already recorded — the unique index decided,
     // not a prior read (`recordInbound`'s own docblock). Nothing to settle:
@@ -725,7 +723,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       // or spend anything, and no reply, ever. `established` stays `false`:
       // even if the settle below throws, a stranger gets no message from
       // this assistant, full stop.
-      await settleMessage(stored.id, 'handled', {}, { businessId: ctx.db.businessId });
+      await settleMessage(ctx.db, stored.id, 'handled', {});
       return 'recordedOnly';
     }
 
@@ -758,7 +756,6 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
             text: msg.body,
             messageId: stored.id,
             inboundAt: new Date(msg.providerTimestamp),
-            businessId: ctx.db.businessId,
             by: principalActor(msg.senderNumber),
             now: new Date(),
             timeZone: ctx.charter.identity.timezone,
@@ -766,7 +763,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
           }
         : null;
     if (typedLedger !== null) {
-      const ledger = await handleLedgerWhatsApp({ ...typedLedger, accept: 'numbered' });
+      const ledger = await handleLedgerWhatsApp(ctx.db, { ...typedLedger, accept: 'numbered' });
       if (ledger === 'applied') return 'ledger';
       if (ledger !== 'passthrough') return ledger;
     }
@@ -782,7 +779,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     if (confirmAnswer !== 'passthrough') return confirmAnswer;
 
     if (typedLedger !== null) {
-      const ledger = await handleLedgerWhatsApp({ ...typedLedger, accept: 'bare' });
+      const ledger = await handleLedgerWhatsApp(ctx.db, { ...typedLedger, accept: 'bare' });
       if (ledger === 'applied') return 'ledger';
       if (ledger !== 'passthrough') return ledger;
     }
@@ -808,13 +805,12 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         // Every other open thing counts against the card (C9, and the
         // confirmation reader's own collision rule): "שמרי" could as well be
         // the answer to an open clarifying question.
-        const handled = await handleDocumentCardMessage({
+        const handled = await handleDocumentCardMessage(ctx.db, {
           msg,
           storedId: stored.id,
           cards: open.documentCards,
           othersOpen: open.mailCards.length + open.questions.length + open.confirmations.length,
           messenger: ctx.messenger,
-          businessId: ctx.db.businessId,
           production: ctx.production,
           ...windowOverride,
         });
@@ -857,8 +853,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         await tellOwnerAndSettle(ctx, stored.id, NO_TRANSCRIBER);
         return 'refused';
       }
-      const transcribed = await transcribeInbound(msg, senderKind, {
-        businessId: ctx.db.businessId,
+      const transcribed = await transcribeInbound(ctx.db, msg, senderKind, {
         provider: ctx.provider,
       });
       if (transcribed.status === 'too_long') {
@@ -888,7 +883,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
 
     // The line that matters for crash safety — see the module docblock.
     // Nothing above this can open a job; everything below it can.
-    const claimed = await claimMessage(stored.id, { businessId: ctx.db.businessId });
+    const claimed = await claimMessage(ctx.db, stored.id);
     if (!claimed) return 'skipped'; // raced by another runner on this message.
 
     // A schedule question ("מה יש לי מחר?") is a READ, judged on THIS message
@@ -900,9 +895,8 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // opens no job, writes no instruction row and spends none of the daily
     // instruction cap (nothing is recorded below). Open questions stay open.
     if (ctx.calendar !== undefined) {
-      const schedule = await answerScheduleQuery({
+      const schedule = await answerScheduleQuery(ctx.db, {
         text: heard,
-        businessId: ctx.db.businessId,
         timeZone: ctx.charter.identity.timezone,
         operations: ctx.charter.operations,
         runtime: ctx.calendar.runtime,
@@ -911,10 +905,10 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
       if (schedule !== null) {
         await ctx.messenger.send({ text: schedule.answered, jobId: null });
         await settleMessage(
+          ctx.db,
           stored.id,
           'handled',
           isAudio ? { transcript: heard } : {},
-          { businessId: ctx.db.businessId },
         );
         return 'instructed';
       }
@@ -965,10 +959,10 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         jobId: null,
       });
       await settleMessage(
+        ctx.db,
         stored.id,
         'handled',
         isAudio ? { transcript: heard } : {},
-        { businessId: ctx.db.businessId },
       );
       return 'closed';
     }
@@ -982,25 +976,25 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
         jobId: null,
       });
       await settleMessage(
+        ctx.db,
         stored.id,
         'failed',
         isAudio ? { transcript: heard } : {},
-        { businessId: ctx.db.businessId },
       );
       return 'refused';
     }
 
-    const usedToday = await whatsappInstructionsToday(ctx.db.businessId);
+    const usedToday = await whatsappInstructionsToday(ctx.db);
     if (usedToday >= config.whatsappInstructionsPerDay) {
       await ctx.messenger.send({
         text: withTranscriptEcho(isAudio, heard, INSTRUCTION_CAP_REACHED),
         jobId: null,
       });
       await settleMessage(
+        ctx.db,
         stored.id,
         'failed',
         isAudio ? { transcript: heard } : {},
-        { businessId: ctx.db.businessId },
       );
       return 'refused';
     }
@@ -1092,7 +1086,7 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // write must agree on which business's ledger they touch, or the cap
     // this pair exists to enforce means nothing for any business this door
     // is explicitly given.
-    await recordWhatsAppInstructionAttempt(ctx.db.businessId, {
+    await recordWhatsAppInstructionAttempt(ctx.db, {
       status: outcome.status,
       textLength: text.length,
     });
@@ -1189,13 +1183,13 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     // throwing. The transcript is worth keeping either way: the owner really
     // did say it, whatever came of it.
     await settleMessage(
+      ctx.db,
       stored.id,
       jobId !== null || outcome.status === 'answered' ? 'handled' : 'failed',
       {
         ...(isAudio ? { transcript: heard } : {}),
         ...(jobId !== null ? { jobId } : {}),
       },
-      { businessId: ctx.db.businessId },
     );
 
     // A schedule answer counts as instructed: the owner's request was served,
@@ -1224,13 +1218,13 @@ async function processOne(msg: NormalizedInboundMessage, ctx: ProcessContext): P
     //      own settle failing) stays silent — Decision 4 again: a stranger
     //      gets no reply, ever, not even an apology for a crash.
     if (attemptedInstruction && !instructionRecorded) {
-      await recordWhatsAppInstructionAttempt(ctx.db.businessId, {
+      await recordWhatsAppInstructionAttempt(ctx.db, {
         status: 'refused',
         textLength: text.length,
       });
     }
     if (stored !== null) {
-      await settleMessage(stored.id, 'failed', {}, { businessId: ctx.db.businessId }).catch(() => {
+      await settleMessage(ctx.db, stored.id, 'failed', {}).catch(() => {
         // Best-effort: the message is already unrecoverable from this pass's
         // point of view, and a second failure here must not take the rest of
         // the batch down with it.

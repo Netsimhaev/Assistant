@@ -282,7 +282,7 @@ describe('POST /connections/mailbox/sign', () => {
     // Signing binds nothing: no grant, no binding, no cursor — nothing reads
     // or sends through the mailbox until the ceremony completes.
     expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'mailbox')).toBe(false);
-    expect(await getCursor({ businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => getCursor(db))).toBeNull();
 
     const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'charter_change' })); // TENANCY-TODO(task 10)
     expect(audit).toHaveLength(1);
@@ -359,7 +359,7 @@ describe('the OAuth ceremony for the signed mailbox', () => {
     expect(await res.text()).toContain('href="/connections/mailbox"');
 
     expect(log.calls).toEqual([{ provider: 'microsoft', token: 'ms-access' }]);
-    const cursor = await getCursor({ businessId: BUSINESS });
+    const cursor = await withBusiness(BUSINESS, (db) => getCursor(db));
     expect(cursor?.provider).toBe('microsoft');
     expect(cursor?.cursor).toBe('cursor-microsoft');
     expect(Date.parse(cursor?.connectedAt ?? '')).toBeGreaterThanOrEqual(before - 1000);
@@ -386,7 +386,7 @@ describe('the OAuth ceremony for the signed mailbox', () => {
     expect(res.status).toBe(502);
     expect(await readGrantBySystem('mailbox', BUSINESS, key)).toBeNull();
     expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'mailbox')).toBe(false);
-    expect(await getCursor({ businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => getCursor(db))).toBeNull();
   });
 });
 
@@ -640,7 +640,7 @@ describe('fix round 1: callback', () => {
     expect(res.status).toBe(400);
     expect(await readGrantBySystem('mailbox', BUSINESS, key)).toBeNull();
     expect((await withBusiness(BUSINESS, (db) => loadBindings(db))).some((b) => b.system === 'mailbox')).toBe(false);
-    expect(await getCursor({ businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => getCursor(db))).toBeNull();
   });
 
   it('renders the provider-sourced account through escLabel (no bidi override reaches the page)', async () => {

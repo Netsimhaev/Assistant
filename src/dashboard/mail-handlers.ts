@@ -149,7 +149,8 @@ export async function handleMailList(res: ServerResponse, businessId: string, ur
   const timeZone = await charterTimeZone(businessId);
   const fromIso = dayStartIso(filters.from, timeZone);
   const toIso = dayEndIso(filters.to, timeZone);
-  const rows = await searchMail(
+  const rows = await withBusiness(businessId, (db) => searchMail( // TENANCY-TODO(task 10)
+    db,
     {
       ...(filters.q !== '' ? { text: filters.q } : {}),
       ...(filters.sender !== '' ? { sender: filters.sender } : {}),
@@ -158,11 +159,10 @@ export async function handleMailList(res: ServerResponse, businessId: string, ur
       ...(CATEGORIES.includes(filters.category) ? { category: filters.category as MailCategory } : {}),
       limit: MAIL_LIMIT,
     },
-    { businessId },
-  );
+  ));
   const [mailboxStatus, cursor, gapAt, downloadable] = await Promise.all([
     mailboxBannerStatus(businessId),
-    getCursor({ businessId }),
+    withBusiness(businessId, (db) => getCursor(db)), // TENANCY-TODO(task 10)
     recentGapAt(businessId),
     downloadableDocuments(businessId, rows.flatMap((m) => m.attachments.map((a) => a.documentId))),
   ]);
@@ -193,7 +193,8 @@ export async function handleInvoices(res: ServerResponse, businessId: string, ur
   const timeZone = await charterTimeZone(businessId);
   const fromIso = dayStartIso(filters.from, timeZone);
   const toIso = dayEndIso(filters.to, timeZone);
-  const rows = await listInvoices(
+  const rows = await withBusiness(businessId, (db) => listInvoices( // TENANCY-TODO(task 10)
+    db,
     {
       ...(filters.supplier !== '' ? { supplier: filters.supplier } : {}),
       ...(filters.number !== '' ? { invoiceNumber: filters.number } : {}),
@@ -201,8 +202,7 @@ export async function handleInvoices(res: ServerResponse, businessId: string, ur
       ...(fromIso !== null ? { fromIso } : {}),
       ...(toIso !== null ? { toIso } : {}),
     },
-    { businessId },
-  );
+  ));
   html(res, 200, renderInvoices({ groups: groupInvoices(rows), filters, timeZone, csrf }));
 }
 
@@ -275,7 +275,7 @@ export async function handleMailDocuments(res: ServerResponse, businessId: strin
 }
 
 export async function handleMailDetail(res: ServerResponse, businessId: string, mailId: string): Promise<void> {
-  const mail = await getMail(mailId, { businessId });
+  const mail = await withBusiness(businessId, (db) => getMail(db, mailId)); // TENANCY-TODO(task 10)
   if (mail === null) return notFound(res);
   const timeZone = await charterTimeZone(businessId);
   const db = getPool();
@@ -323,7 +323,7 @@ export async function handleDocumentFile(
   documentId: string,
   documentRoot: string | undefined,
 ): Promise<void> {
-  const doc = await loadDocument(documentId, { businessId });
+  const doc = await withBusiness(businessId, (db) => loadDocument(db, documentId)); // TENANCY-TODO(task 10)
   if (doc === null || (doc.status !== 'extracted' && doc.status !== 'stored')) return notFound(res);
 
   const root = resolve(documentRoot ?? config.documentRoot);

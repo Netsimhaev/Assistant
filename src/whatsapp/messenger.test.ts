@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
-import type { Queryable } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import type { BusinessDb, Queryable } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createFakeGateway } from './fake-gateway.js';
 import { createBossMessenger } from './messenger.js';
@@ -23,7 +23,7 @@ describe('createBossMessenger', () => {
     expect(gateway.sent).toHaveLength(1);
     expect(gateway.sent[0]).toMatchObject({ contactId: CONTACT_ID, body: 'קיבלתי.' });
 
-    const convo = await conversation({ businessId: BUSINESS });
+    const convo = await withBusiness(BUSINESS, (db) => conversation(db));
     expect(convo).toHaveLength(1);
     expect(convo[0]).toMatchObject({
       direction: 'outbound', body: 'קיבלתי.', jobId: 'J-1', state: 'handled',
@@ -69,7 +69,7 @@ describe('createBossMessenger', () => {
     const outcome = await messenger.send({ text: 'הניסיון נכשל', jobId: 'J-2' });
     expect(outcome.ok).toBe(false);
 
-    const convo = await conversation({ businessId: BUSINESS });
+    const convo = await withBusiness(BUSINESS, (db) => conversation(db));
     expect(convo).toHaveLength(1);
     expect(convo[0]).toMatchObject({
       direction: 'outbound', body: 'הניסיון נכשל', jobId: 'J-2', state: 'failed',
@@ -90,7 +90,7 @@ describe('createBossMessenger', () => {
     const outcome = await messenger.send({ text: 'תקלת רשת', jobId: 'J-3' });
     expect(outcome.ok).toBe(false);
 
-    const convo = await conversation({ businessId: BUSINESS });
+    const convo = await withBusiness(BUSINESS, (db) => conversation(db));
     expect(convo).toHaveLength(1);
     expect(convo[0]).toMatchObject({
       direction: 'outbound', body: 'תקלת רשת', jobId: 'J-3', state: 'failed',
@@ -116,7 +116,7 @@ describe('createBossMessenger', () => {
     const gateway = createFakeGateway();
     const messenger = createBossMessenger({ gateway, contactId: CONTACT_ID, businessId: BUSINESS });
     await messenger.send({ text: 'קיבלתי.', jobId: null });
-    expect(await conversation({ businessId: 'other-business' })).toEqual([]);
+    expect(await withBusiness('other-business', (db) => conversation(db))).toEqual([]);
   });
 
   // --- Fix round 1, Important 2: three brief-specified behaviours that no
@@ -189,7 +189,9 @@ describe('createBossMessenger', () => {
    */
   it('still reports a successful send even when recording the attempt fails', async () => {
     const gateway = createFakeGateway();
-    const refusingDb: Queryable = {
+    const refusingDb: BusinessDb = {
+      businessId: BUSINESS,
+      inTransaction: false,
       query: (() => Promise.reject(new Error('injected db failure'))) as Queryable['query'],
     };
     const messenger = createBossMessenger({

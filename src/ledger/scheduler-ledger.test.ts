@@ -64,14 +64,15 @@ async function backdate(itemId: string): Promise<void> {
 }
 
 async function setModes(awaitingReply: 'remind' | 'act'): Promise<void> {
-  await saveLedgerSettings(
+  await withBusiness(B, (db) => saveLedgerSettings(
+    db,
     {
       ...LEDGER_DEFAULTS,
       modes: { ...LEDGER_DEFAULTS.modes, awaiting_reply: awaitingReply },
       meetingLeadMinutesCritical: [1440, 60],
     },
-    { businessId: B, updatedBy: 'owner' },
-  );
+    { updatedBy: 'owner' },
+  ));
 }
 
 beforeEach(async () => {
@@ -83,9 +84,9 @@ afterAll(async () => {
 
 describe('schedulerPass ledger stages', () => {
   it('one pass closes by evidence before it reminds', async () => {
-    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({})));
     await setModes('remind');
-    const item = await createLedgerItem(base(), { businessId: B, by: 'boss' });
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     await backdate(item.itemId);
     // The counterparty's reply, newer than the item's evidence_after.
     await getPool().query(
@@ -117,12 +118,13 @@ describe('schedulerPass ledger stages', () => {
   });
 
   it('one pass with an evidence closure and a due reminder sends ONE WhatsApp batch, the notice first', async () => {
-    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
-    await saveLedgerSettings(
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({})));
+    await withBusiness(B, (db) => saveLedgerSettings(
+      db,
       { ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes }, meetingLeadMinutesCritical: [1440, 60], toWhatsApp: true },
-      { businessId: B, updatedBy: 'owner' },
-    );
-    const closing = await createLedgerItem(base(), { businessId: B, by: 'boss' });
+      { updatedBy: 'owner' },
+    ));
+    const closing = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     await backdate(closing.itemId);
     await getPool().query(
       `INSERT INTO mail_messages (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
@@ -131,7 +133,8 @@ describe('schedulerPass ledger stages', () => {
       [B, new Date('2026-11-02T09:00:00Z')],
     );
     // A money_in item due today: its `due` slot (09:00 local) is due at NOW.
-    const due = await createLedgerItem(
+    const due = await withBusiness(B, (db) => createLedgerItem(
+      db,
       base({
         family: 'money_in',
         description: 'חשבונית 9 של יוסי',
@@ -140,8 +143,8 @@ describe('schedulerPass ledger stages', () => {
         dueAt: new Date('2026-11-04T07:00:00Z'),
         dueIsDateOnly: true,
       }),
-      { businessId: B, by: 'boss' },
-    );
+      { by: 'boss' },
+    ));
     const gateway = createFakeGateway();
     const runtime = { ...emptyRuntime(), whatsapp: { gateway } } as unknown as Runtime;
     const pass = await schedulerPass({ businessId: B, runtime, now: NOW, inbox: null });
@@ -172,9 +175,9 @@ describe('schedulerPass ledger stages', () => {
   });
 
   it('a throwing nudge drafter is contained and does not stop the rest of the pass', async () => {
-    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({})));
     await setModes('act');
-    const item = await createLedgerItem(base(), { businessId: B, by: 'boss' });
+    const item = await withBusiness(B, (db) => createLedgerItem(db, base(), { by: 'boss' }));
     await backdate(item.itemId);
     const pass = await schedulerPass({
       businessId: B,
@@ -214,7 +217,7 @@ describe('schedulerPass ledger stages', () => {
   });
 
   it('a real fault in both ledger stages is contained and the later stages still run', async () => {
-    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({})));
     await setModes('remind');
     await testDb().query('ALTER TABLE ledger_items RENAME TO ledger_items_x');
     try {

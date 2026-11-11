@@ -30,7 +30,7 @@ import { monotonicFactory } from 'ulid';
 import type { ActiveCharter } from '../charter/store.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import type { LedgerFamily, LedgerItem } from '../domain/ledger.js';
 import { Plan } from '../domain/plan.js';
 import { canTransition, JobPhase } from '../domain/job.js';
@@ -43,7 +43,7 @@ import { toOneLine } from '../util/bidi.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 import { renderReminder } from './render.js';
 import type { DueSlot } from './schedule.js';
-import { atomically, loadLedgerItem, moveLedgerStatus } from './store.js';
+import { loadLedgerItem, moveLedgerStatus } from './store.js';
 
 const ulid = monotonicFactory();
 
@@ -111,7 +111,7 @@ function dueText(item: LedgerItem, timeZone: string): string | null {
 /** Thrown inside a transaction only to roll it back; never escapes this module. */
 class Rollback extends Error {}
 
-async function claimSlot(tx: Queryable, businessId: string, itemId: string, slot: string, body: string, now: Date) {
+async function claimSlot(tx: BusinessDb, businessId: string, itemId: string, slot: string, body: string, now: Date) {
   const inserted = await tx.query<{ reminder_id: string }>(
     `INSERT INTO ledger_reminders (reminder_id, business_id, item_id, slot, kind, body, created_at)
      VALUES ($1, $2, $3, $4, 'nudge', $5, $6)
@@ -123,7 +123,7 @@ async function claimSlot(tx: Queryable, businessId: string, itemId: string, slot
 }
 
 async function insertEvent(
-  tx: Queryable,
+  tx: BusinessDb,
   businessId: string,
   itemId: string,
   kind: 'nudged' | 'nudge_fallback' | 'updated',
@@ -162,7 +162,7 @@ function stuckText(item: LedgerItem, count: number): { subject: string; body: st
  * the charter zone: `nudged` events today, plus nudge jobs opened today that
  * are still in flight (not yet observed, so not yet a `nudged` event).
  */
-async function nudgesToday(db: Queryable, businessId: string, now: Date, timeZone: string): Promise<number> {
+async function nudgesToday(db: BusinessDb, businessId: string, now: Date, timeZone: string): Promise<number> {
   const start = localToInstant(localParts(now, timeZone).date, '00:00', timeZone);
   const { rows } = await db.query<{ n: string }>(
     `SELECT (
@@ -179,18 +179,17 @@ async function nudgesToday(db: Queryable, businessId: string, now: Date, timeZon
 }
 
 export async function openNudge(
+  db: BusinessDb,
   item: LedgerItem,
   slot: DueSlot,
   o: {
-    businessId: string;
     active: ActiveCharter;
     drafter: NudgeDrafter;
-    db?: Queryable;
     now?: Date;
   },
 ): Promise<OpenNudgeResult> {
-  const { businessId, active } = o;
-  const db = o.db ?? getPool();
+  const businessId = db.businessId;
+  const { active } = o;
   const now = o.now ?? new Date();
   const r: RenderCtx = { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency, now };
 
@@ -206,7 +205,7 @@ export async function openNudge(
   const to = item.counterpartyEmailVerified && item.counterpartyEmail !== null ? item.counterpartyEmail : null;
   if (to === null) {
     const text = fallbackText(item, NO_ADDRESS_REASON, null, r);
-    const reminderId = await atomically(o.db, async (tx) => {
+    const reminderId = await transaction(db, async (tx) => {
       const id = await claimSlot(tx, businessId, item.itemId, slot.slot, text.body, now);
       if (id !== null) await insertEvent(tx, businessId, item.itemId, 'nudge_fallback', null, 'no_address');
       return id;
@@ -221,13 +220,13 @@ export async function openNudge(
     const text = stuckText(item, current.nudge_count);
     let reminderId: string | null = null;
     try {
-      reminderId = await atomically(o.db, async (tx) => {
+      reminderId = await transaction(db, async (tx) => {
         const moved = await moveLedgerStatus(
+          tx,
           item.itemId,
           ['open'],
           'stuck',
           { kind: 'stuck', by: 'system', note: `nudges ${current.nudge_count}/${max}` },
-          { businessId, db: tx },
         );
         if (!moved) throw new Rollback();
         const id = await claimSlot(tx, businessId, item.itemId, slot.slot, text.body, now);
@@ -247,12 +246,12 @@ export async function openNudge(
   }
 
   // Claim before drafting: a racing pass finds the slot taken and drafts nothing.
-  const reminderId = await atomically(o.db, (tx) => claimSlot(tx, businessId, item.itemId, slot.slot, '', now));
+  const reminderId = await transaction(db, (tx) => claimSlot(tx, businessId, item.itemId, slot.slot, '', now));
   if (reminderId === null) return { outcome: 'claimed_elsewhere', reminder: null };
 
   const fallback = async (reason: string, draft: string | null, outcome: OpenNudgeOutcome, note: string) => {
     const text = fallbackText(item, reason, draft, r);
-    await atomically(o.db, async (tx) => {
+    await transaction(db, async (tx) => {
       await tx.query(`UPDATE ledger_reminders SET body = $3 WHERE reminder_id = $1 AND business_id = $2`, [
         reminderId,
         businessId,
@@ -300,25 +299,25 @@ export async function openNudge(
   let jobId: string | null = null;
   let linked = false;
   try {
-    const job = await withBusiness(businessId, (db) => createJob(db, { // TENANCY-TODO(task 5)
+    const job = await createJob(db, {
       charterVersion: active.bundle.charterVersion,
       // A literal, not a parameter: the item was born from an owner
       // instruction. No boss_instructions row is written for this job, ever.
       provenance: 'boss',
       title: `פולואפ: ${toOneLine(item.description).slice(0, 80)}`,
-    }));
+    });
     jobId = job.jobId;
     for (const to2 of ['understand', 'plan'] as const) {
-      await withBusiness(businessId, (db) => transition(db, job.jobId, { // TENANCY-TODO(task 5)
+      await transition(db, job.jobId, {
         to: to2,
         actor: 'orchestrator',
         reason: 'ledger nudge: following up on a ledger item',
-      }));
+      });
     }
-    const bound = await withBusiness(businessId, (db) => bindPlanToJob(db, job.jobId, plan)); // TENANCY-TODO(task 5)
+    const bound = await bindPlanToJob(db, job.jobId, plan);
     if (bound.status === 'conflict') throw new Error(`ledger nudge: plan conflict on fresh job ${job.jobId}`);
 
-    const link = await atomically(o.db, async (tx) => {
+    const link = await transaction(db, async (tx) => {
       const set = await tx.query(
         `UPDATE ledger_items SET nudge_job_id = $3, updated_at = now()
           WHERE business_id = $1 AND item_id = $2 AND nudge_job_id IS NULL AND status = 'open'`,
@@ -331,21 +330,21 @@ export async function openNudge(
       return (set.rowCount ?? 0) > 0;
     });
     if (!link) {
-      await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'closed', actor: 'orchestrator', reason: 'ledger nudge: item moved on' })); // TENANCY-TODO(task 5)
+      await transition(db, job.jobId, { to: 'closed', actor: 'orchestrator', reason: 'ledger nudge: item moved on' });
       return { outcome: 'claimed_elsewhere', reminder: null };
     }
     linked = true;
-    await withBusiness(businessId, (db) => transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'ledger nudge: to the gate' })); // TENANCY-TODO(task 5)
+    await transition(db, job.jobId, { to: 'execute', actor: 'orchestrator', reason: 'ledger nudge: to the gate' });
     return { outcome: 'opened', reminder: null };
   } catch (err) {
     if (jobId !== null) {
       const openedJobId = jobId;
       try {
-        await withBusiness(businessId, (db) => transition(db, openedJobId, { // TENANCY-TODO(task 5)
+        await transition(db, openedJobId, {
           to: 'failed',
           actor: 'orchestrator',
           reason: `ledger_nudge_open_failed — ${err instanceof Error ? err.message : String(err)}`,
-        }));
+        });
       } catch {
         // Already terminal or unreachable; observeNudges reads whatever it is.
       }
@@ -396,9 +395,8 @@ export interface ObservedNudges {
  * Idempotent: every clear is `WHERE nudge_job_id = $job`, and the counter,
  * the event and the reminder claim ride in the same transaction as the clear.
  */
-export async function observeNudges(o: { businessId: string; db?: Queryable; now?: Date }): Promise<ObservedNudges> {
-  const { businessId } = o;
-  const db = o.db ?? getPool();
+export async function observeNudges(db: BusinessDb, o: { now?: Date } = {}): Promise<ObservedNudges> {
+  const businessId = db.businessId;
   const now = o.now ?? new Date();
   const out: ObservedNudges = { sent: [], fallback: [], reminders: [] };
 
@@ -418,7 +416,7 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
   );
   if (rows.length === 0) return out;
 
-  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
+  const active = await loadActiveCharter(db);
   const r: RenderCtx | null =
     active === null ? null : { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency, now };
 
@@ -438,19 +436,19 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
           WHERE business_id = $1 AND job_id = $2 AND state = 'pending'`,
         [businessId, row.job_id],
       );
-      for (const card of cards) await withBusiness(businessId, (bdb) => cancelPendingApproval(bdb, card.approval_id)); // TENANCY-TODO(task 5)
+      for (const card of cards) await cancelPendingApproval(db, card.approval_id);
       try {
-        await withBusiness(businessId, (db) => transition(db, row.job_id, { // TENANCY-TODO(task 5)
+        await transition(db, row.job_id, {
           to: canTransition(phase, 'closed') ? 'closed' : 'failed',
           actor: 'orchestrator',
           reason: 'ledger nudge: item no longer open — nudge cancelled',
           expectFrom: phase,
-        }));
+        });
       } catch (err) {
         if (err instanceof PhaseMovedError) continue;
         throw err;
       }
-      await atomically(o.db, async (tx) => {
+      await transaction(db, async (tx) => {
         const cleared = await tx.query(
           `UPDATE ledger_items SET nudge_job_id = NULL, updated_at = now()
             WHERE business_id = $1 AND item_id = $2 AND nudge_job_id = $3`,
@@ -471,12 +469,12 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
     let observedPhase: string = row.phase;
     if (STALLABLE_PHASES.has(phase) && row.created_at.getTime() < now.getTime() - STALLED_AFTER_MS) {
       try {
-        await withBusiness(businessId, (db) => transition(db, row.job_id, { // TENANCY-TODO(task 5)
+        await transition(db, row.job_id, {
           to: 'failed',
           actor: 'orchestrator',
           reason: 'ledger_nudge_stalled — the linked nudge job never reached execute',
           expectFrom: phase,
-        }));
+        });
         observedPhase = 'failed';
       } catch (err) {
         if (err instanceof PhaseMovedError) continue;
@@ -491,7 +489,7 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
         [businessId, row.job_id],
       );
       const wasSent = (performed.rowCount ?? 0) > 0;
-      const counted = await atomically(o.db, async (tx) => {
+      const counted = await transaction(db, async (tx) => {
         const cleared = await tx.query(
           `UPDATE ledger_items
               SET nudge_job_id = NULL, updated_at = now()${wasSent ? ', nudge_count = nudge_count + 1' : ''}
@@ -518,16 +516,16 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
     const reason = code !== null && isGateDenialCode(code) ? GATE_REFUSED_REASON : SEND_FAILED_REASON;
     let draft = '';
     try {
-      const body = (await withBusiness(businessId, (bdb) => loadPlanBody(bdb, row.job_id)))?.plan.steps[0]?.input['body']; // TENANCY-TODO(task 5)
+      const body = (await loadPlanBody(db, row.job_id))?.plan.steps[0]?.input['body'];
       if (typeof body === 'string') draft = body;
     } catch {
       // An unreadable stored plan: the owner is still told, without the draft.
     }
-    const item = await loadLedgerItem(row.item_id, { businessId, db });
+    const item = await loadLedgerItem(db, row.item_id);
     if (item === null) continue;
     const text = r === null ? null : fallbackText(item, reason, draft === '' ? null : draft, r);
 
-    const reminderId = await atomically(o.db, async (tx) => {
+    const reminderId = await transaction(db, async (tx) => {
       const cleared = await tx.query(
         `UPDATE ledger_items SET nudge_job_id = NULL, updated_at = now()
           WHERE business_id = $1 AND item_id = $2 AND nudge_job_id = $3`,

@@ -34,7 +34,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { loadDocument } from './store.js';
 
 export type VerifyOutcome =
@@ -62,15 +62,13 @@ function readErrorCause(err: unknown, code: string | undefined): string {
 }
 
 export async function verifyDocumentUnchanged(
+  db: BusinessDb,
   documentId: string,
-  options: { businessId?: string; db?: Queryable; documentRoot?: string } = {},
+  options: { documentRoot?: string } = {},
 ): Promise<VerifyOutcome> {
   const documentRoot = options.documentRoot ?? config.documentRoot;
 
-  const document = await loadDocument(documentId, {
-    ...(options.businessId !== undefined ? { businessId: options.businessId } : {}),
-    ...(options.db !== undefined ? { db: options.db } : {}),
-  });
+  const document = await loadDocument(db, documentId);
   if (document === null) return { status: 'unknown_document' };
 
   const absolutePath = join(documentRoot, document.storedPath);

@@ -17,7 +17,7 @@ async function seedJob(provenance: 'boss' | 'unknown_external', toolName = 'mail
   // A fresh version per call: `charter_versions`' primary key is
   // (business_id, charter_version), and several tests here call `seedJob`
   // more than once against the same BUSINESS.
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `curation-${randomUUID()}` }))); // TENANCY-TODO(task 5)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `curation-${randomUUID()}` })));
   // `createJob` takes ONE argument and requires `charterVersion`. There is no
   // `counterpartyTags` on it — preflight for Task 2 caught this shape.
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
@@ -90,8 +90,7 @@ describe('the curator', () => {
   it('writes what the model returned, with provenance from the job', async () => {
     const jobId = await seedJob('unknown_external');
 
-    const outcome = await curateJob(jobId, {
-      businessId: BUSINESS,
+    const outcome = await withBusiness(BUSINESS, (db) => curateJob(db, jobId, {
       curator: curatorReturning([
         {
           kind: 'preference',
@@ -101,10 +100,10 @@ describe('the curator', () => {
           sourceRef: 'גוף ההודעה',
         },
       ]),
-    });
+    }));
 
     expect(outcome.written).toBe(1);
-    const [memory] = await recallMemories({ subjectKey: RONIT }, { businessId: BUSINESS });
+    const [memory] = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: RONIT }));
     // The model never said this; it was read from the job row.
     expect(memory?.provenance).toBe('unknown_external');
   });
@@ -114,12 +113,11 @@ describe('the curator', () => {
     // this mistake) — `mail.draft` is genuinely outside both tables.
     const jobId = await seedJob('boss', 'mail.draft');
 
-    const outcome = await curateJob(jobId, {
-      businessId: BUSINESS,
+    const outcome = await withBusiness(BUSINESS, (db) => curateJob(db, jobId, {
       curator: async () => {
         throw new Error('the model must not be called for this job');
       },
-    });
+    }));
 
     expect(outcome).toMatchObject({ ran: false, skipped: 'not_qualified', written: 0 });
   });
@@ -127,19 +125,18 @@ describe('the curator', () => {
   it('refuses a candidate about somebody the job never touched, and writes the rest', async () => {
     const jobId = await seedJob('boss');
 
-    const outcome = await curateJob(jobId, {
-      businessId: BUSINESS,
+    const outcome = await withBusiness(BUSINESS, (db) => curateJob(db, jobId, {
       curator: curatorReturning([
         { kind: 'chunk', subjectKey: RONIT, body: { text: 'טוב' }, sourceRef: 'x' },
         { kind: 'chunk', subjectKey: 'dana@rival.example', body: { text: 'רע' }, sourceRef: 'x' },
       ]),
-    });
+    }));
 
     expect(outcome).toMatchObject({ written: 1, rejected: 1 });
-    const stranger = await recallMemories(
+    const stranger = await withBusiness(BUSINESS, (db) => recallMemories(
+      db,
       { subjectKey: 'dana@rival.example' },
-      { businessId: BUSINESS },
-    );
+    ));
     expect(stranger).toEqual([]);
   });
 
@@ -149,7 +146,8 @@ describe('the curator', () => {
    */
   it('keeps the owner’s preference live and records the external claim as a chunk', async () => {
     const bossJob = await seedJob('boss');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: bossJob,
         kind: 'preference',
@@ -157,12 +155,10 @@ describe('the curator', () => {
         attribute: 'ערוץ מועדף',
         body: { value: 'מייל' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const strangerJob = await seedJob('unknown_external');
-    await curateJob(strangerJob, {
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => curateJob(db, strangerJob, {
       curator: curatorReturning([
         {
           kind: 'preference',
@@ -172,7 +168,7 @@ describe('the curator', () => {
           sourceRef: 'מסמך של הספק',
         },
       ]),
-    });
+    }));
 
     const preferenceRows = await liveRows('preference', RONIT, 'ערוץ מועדף');
     expect(preferenceRows).toHaveLength(1);
@@ -195,7 +191,8 @@ describe('the curator', () => {
    */
   it('protects the owner’s preference even behind many newer rows on the same subject', async () => {
     const bossJob = await seedJob('boss');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: bossJob,
         kind: 'preference',
@@ -203,13 +200,13 @@ describe('the curator', () => {
         attribute: 'ערוץ מועדף',
         body: { value: 'מייל' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     // Six newer, unrelated preferences on the same subject — enough to push
     // the row above past `recallMemories`' default limit of 5.
     for (let i = 0; i < 6; i += 1) {
-      await writeMemory(
+      await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         {
           jobId: bossJob,
           kind: 'preference',
@@ -217,13 +214,11 @@ describe('the curator', () => {
           attribute: `תכונה-${i}`,
           body: { value: `x${i}` },
         },
-        { businessId: BUSINESS },
-      );
+      ));
     }
 
     const strangerJob = await seedJob('unknown_external');
-    await curateJob(strangerJob, {
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => curateJob(db, strangerJob, {
       curator: curatorReturning([
         {
           kind: 'preference',
@@ -233,7 +228,7 @@ describe('the curator', () => {
           sourceRef: 'מסמך של הספק',
         },
       ]),
-    });
+    }));
 
     const preferenceRows = await liveRows('preference', RONIT, 'ערוץ מועדף');
     expect(preferenceRows).toHaveLength(1);
@@ -243,7 +238,8 @@ describe('the curator', () => {
 
   it('replaces the old row when both came from the same trust level', async () => {
     const first = await seedJob('boss');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: first,
         kind: 'preference',
@@ -251,12 +247,10 @@ describe('the curator', () => {
         attribute: 'ערוץ מועדף',
         body: { value: 'מייל' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const second = await seedJob('boss');
-    await curateJob(second, {
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => curateJob(db, second, {
       curator: curatorReturning([
         {
           kind: 'preference',
@@ -266,7 +260,7 @@ describe('the curator', () => {
           sourceRef: 'x',
         },
       ]),
-    });
+    }));
 
     const preferenceRows = await liveRows('preference', RONIT, 'ערוץ מועדף');
     expect(preferenceRows).toHaveLength(1);
@@ -280,7 +274,8 @@ describe('the curator', () => {
    */
   it('lets a boss claim replace an external one at the same key', async () => {
     const externalJob = await seedJob('unknown_external');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       {
         jobId: externalJob,
         kind: 'preference',
@@ -288,12 +283,10 @@ describe('the curator', () => {
         attribute: 'ערוץ מועדף',
         body: { value: 'וואטסאפ' },
       },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const bossJob = await seedJob('boss');
-    await curateJob(bossJob, {
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => curateJob(db, bossJob, {
       curator: curatorReturning([
         {
           kind: 'preference',
@@ -303,7 +296,7 @@ describe('the curator', () => {
           sourceRef: 'x',
         },
       ]),
-    });
+    }));
 
     const preferenceRows = await liveRows('preference', RONIT, 'ערוץ מועדף');
     expect(preferenceRows).toHaveLength(1);
@@ -319,12 +312,11 @@ describe('the curator', () => {
   it('records a curation audit row carrying counts and no subject', async () => {
     const jobId = await seedJob('boss');
 
-    await curateJob(jobId, {
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => curateJob(db, jobId, {
       curator: curatorReturning([
         { kind: 'chunk', subjectKey: RONIT, body: { text: 'סיכום' }, sourceRef: 'x' },
       ]),
-    });
+    }));
 
     const { rows } = await getPool().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'curation'`,
@@ -344,12 +336,11 @@ describe('the curator', () => {
   it('records a curation audit row and reports failed when the model throws', async () => {
     const jobId = await seedJob('boss');
 
-    const outcome = await curateJob(jobId, {
-      businessId: BUSINESS,
+    const outcome = await withBusiness(BUSINESS, (db) => curateJob(db, jobId, {
       curator: async () => {
         throw new Error('model unavailable');
       },
-    });
+    }));
 
     expect(outcome).toMatchObject({ ran: false, written: 0, failed: true });
 
@@ -368,14 +359,13 @@ describe('the curator', () => {
     const jobId = await seedJob('boss');
     let called = false;
 
-    const outcome = await curateJob(jobId, {
-      businessId: BUSINESS,
+    const outcome = await withBusiness(BUSINESS, (db) => curateJob(db, jobId, {
       runsPerDay: 0,
       curator: async () => {
         called = true;
         return { candidates: [] };
       },
-    });
+    }));
 
     expect(outcome).toMatchObject({ ran: false, skipped: 'over_cap', written: 0, failed: false });
     expect(called).toBe(false);
@@ -387,7 +377,7 @@ describe('the curator', () => {
     delete process.env['ANTHROPIC_API_KEY'];
 
     try {
-      const outcome = await curateJob(jobId, { businessId: BUSINESS });
+      const outcome = await withBusiness(BUSINESS, (db) => curateJob(db, jobId));
       expect(outcome).toMatchObject({ ran: false, skipped: 'no_key', written: 0, failed: false });
     } finally {
       if (original !== undefined) process.env['ANTHROPIC_API_KEY'] = original;
@@ -395,16 +385,15 @@ describe('the curator', () => {
   });
 
   it('curationRunsToday counts curation audit rows written today', async () => {
-    expect(await curationRunsToday({ businessId: BUSINESS })).toBe(0);
+    expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db))).toBe(0);
 
     const jobId = await seedJob('boss');
-    await curateJob(jobId, {
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => curateJob(db, jobId, {
       curator: curatorReturning([
         { kind: 'chunk', subjectKey: RONIT, body: { text: 'x' }, sourceRef: 'x' },
       ]),
-    });
+    }));
 
-    expect(await curationRunsToday({ businessId: BUSINESS })).toBe(1);
+    expect(await withBusiness(BUSINESS, (db) => curationRunsToday(db))).toBe(1);
   });
 });

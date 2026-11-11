@@ -1,9 +1,7 @@
-import pg from 'pg';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import {
   advanceStage,
   claimProduction,
@@ -20,7 +18,6 @@ const B = 'test-business';
 const TZ = 'Asia/Jerusalem';
 
 const input = (over: Partial<CreateProductionInput> = {}): CreateProductionInput => ({
-  businessId: B,
   originJobId: 'J-origin',
   instructionText: 'תכיני מכתב ללקוח',
   textOrigin: 'typed',
@@ -52,66 +49,62 @@ afterAll(async () => {
 
 describe('production store', () => {
   it('creates a queued production and reads it back', async () => {
-    const id = await createProduction(input({ destination: { mode: 'send', to: ['dana@acme.co.il'] } }));
-    const p = await loadProduction(B, id);
+    const id = await withBusiness(B, (db) => createProduction(db, input({ destination: { mode: 'send', to: ['dana@acme.co.il'] } })));
+    const p = await withBusiness(B, (db) => loadProduction(db, id));
     expect(p?.stage).toBe('queued');
     expect(p?.attempt).toBe(0);
     expect(p?.work).toEqual(EMPTY_WORK);
     expect(p?.destination).toEqual({ mode: 'send', to: ['dana@acme.co.il'] });
-    expect(await loadProduction('other-business', id)).toBeNull();
+    expect(await withBusiness('other-business', (db) => loadProduction(db, id))).toBeNull();
   });
 
   it('a claim leases the row; a second claim gets nothing until the lease lapses', async () => {
-    const id = await createProduction(input());
-    const first = await claimProduction(B, 'a', 60_000);
+    const id = await withBusiness(B, (db) => createProduction(db, input()));
+    const first = await withBusiness(B, (db) => claimProduction(db, 'a', 60_000));
     expect(first?.productionId).toBe(id);
     expect(first?.leasedBy).toBe('a');
-    expect(await claimProduction(B, 'b', 60_000)).toBeNull();
+    expect(await withBusiness(B, (db) => claimProduction(db, 'b', 60_000))).toBeNull();
     await getPool().query(`UPDATE document_productions SET lease_until = now() - interval '1 second'`);
-    expect((await claimProduction(B, 'b', 60_000))?.leasedBy).toBe('b');
+    expect((await withBusiness(B, (db) => claimProduction(db, 'b', 60_000)))?.leasedBy).toBe('b');
   });
 
   it('never claims a terminal production, nor one of another business', async () => {
-    const id = await createProduction(input());
+    const id = await withBusiness(B, (db) => createProduction(db, input()));
     await getPool().query(`UPDATE document_productions SET stage = 'ready' WHERE production_id = $1`, [id]);
-    await createProduction(input({ businessId: 'other-business' }));
-    expect(await claimProduction(B, 'a', 60_000)).toBeNull();
+    await withBusiness('other-business', (db) => createProduction(db, input()));
+    expect(await withBusiness(B, (db) => claimProduction(db, 'a', 60_000))).toBeNull();
     // Control: a queued one of this business is claimed.
-    const live = await createProduction(input());
-    expect((await claimProduction(B, 'a', 60_000))?.productionId).toBe(live);
+    const live = await withBusiness(B, (db) => createProduction(db, input()));
+    expect((await withBusiness(B, (db) => claimProduction(db, 'a', 60_000)))?.productionId).toBe(live);
   });
 
   it('two concurrent claims from two pools → exactly one wins', async () => {
-    await createProduction(input());
-    const other = new pg.Pool({ connectionString: config.databaseUrl, max: 2 });
-    try {
-      const results = await Promise.all([
-        claimProduction(B, 'pool-a', 60_000, getPool()),
-        claimProduction(B, 'pool-b', 60_000, other),
-      ]);
-      expect(results.filter((r) => r !== null)).toHaveLength(1);
-    } finally {
-      await other.end();
-    }
+    await withBusiness(B, (db) => createProduction(db, input()));
+    // Two connections — each `withBusiness` checks out its own.
+    const results = await Promise.all([
+      withBusiness(B, (db) => claimProduction(db, 'pool-a', 60_000)),
+      withBusiness(B, (db) => claimProduction(db, 'pool-b', 60_000)),
+    ]);
+    expect(results.filter((r) => r !== null)).toHaveLength(1);
   });
 
   it('advanceStage is conditional on the stage it moves from', async () => {
-    const id = await createProduction(input());
-    expect(await advanceStage(id, 'queued', 'drafting', { work: { ...EMPTY_WORK, drafted: true } })).toBe(true);
-    expect(await advanceStage(id, 'queued', 'drafting', {})).toBe(false);
-    const p = await loadProduction(B, id);
+    const id = await withBusiness(B, (db) => createProduction(db, input()));
+    expect(await withBusiness(TEST_BUSINESS, (db) => advanceStage(db, id, 'queued', 'drafting', { work: { ...EMPTY_WORK, drafted: true } }))).toBe(true);
+    expect(await withBusiness(TEST_BUSINESS, (db) => advanceStage(db, id, 'queued', 'drafting', {}))).toBe(false);
+    const p = await withBusiness(B, (db) => loadProduction(db, id));
     expect(p?.stage).toBe('drafting');
     expect(p?.work.drafted).toBe(true);
   });
 
   it('saveVersion is idempotent per version number and supersedes earlier versions', async () => {
-    const id = await createProduction(input());
+    const id = await withBusiness(B, (db) => createProduction(db, input()));
     const sha = 'a'.repeat(64);
-    const v1 = await saveVersion({ productionId: id, versionNo: 1, spec, storedPath: 'x/1.docx', sha256: sha, sizeBytes: 10 });
-    const again = await saveVersion({ productionId: id, versionNo: 1, spec, storedPath: 'x/1.docx', sha256: sha, sizeBytes: 10 });
+    const v1 = await withBusiness(TEST_BUSINESS, (db) => saveVersion(db, { productionId: id, versionNo: 1, spec, storedPath: 'x/1.docx', sha256: sha, sizeBytes: 10 }));
+    const again = await withBusiness(TEST_BUSINESS, (db) => saveVersion(db, { productionId: id, versionNo: 1, spec, storedPath: 'x/1.docx', sha256: sha, sizeBytes: 10 }));
     expect(again).toBe(v1);
-    const v2 = await saveVersion({ productionId: id, versionNo: 2, spec, storedPath: 'x/2.docx', sha256: sha, sizeBytes: 11 });
-    const latest = await latestVersion(id);
+    const v2 = await withBusiness(TEST_BUSINESS, (db) => saveVersion(db, { productionId: id, versionNo: 2, spec, storedPath: 'x/2.docx', sha256: sha, sizeBytes: 11 }));
+    const latest = await withBusiness(TEST_BUSINESS, (db) => latestVersion(db, id));
     expect(latest?.versionId).toBe(v2);
     expect(latest?.spec).toEqual(spec);
     const { rows } = await getPool().query<{ version_id: string; superseded: boolean }>(
@@ -128,10 +121,10 @@ describe('production store', () => {
     // 2026-11-04 01:00 local = 2026-11-03T23:00Z; local midnight = 22:00Z.
     const now = new Date('2026-11-03T23:00:00Z');
     const drafted = { ...EMPTY_WORK, drafted: true };
-    const a = await createProduction(input());
-    const b = await createProduction(input());
-    const yesterday = await createProduction(input());
-    await createProduction(input()); // queued, never drafted: not counted
+    const a = await withBusiness(B, (db) => createProduction(db, input()));
+    const b = await withBusiness(B, (db) => createProduction(db, input()));
+    const yesterday = await withBusiness(B, (db) => createProduction(db, input()));
+    await withBusiness(B, (db) => createProduction(db, input())); // queued, never drafted: not counted
     await getPool().query(`UPDATE document_productions SET work = $2, attempt = 2 WHERE production_id = $1`, [a, drafted]);
     await getPool().query(`UPDATE document_productions SET work = $2 WHERE production_id = $1`, [b, drafted]);
     await getPool().query(
@@ -139,26 +132,26 @@ describe('production store', () => {
       [yesterday, drafted],
     );
     await getPool().query(`UPDATE document_productions SET created_at = '2026-11-03T22:30:00Z' WHERE production_id <> $1`, [yesterday]);
-    expect(await productionsToday(B, TZ, getPool(), now)).toBe(4); // a: 1+2, b: 1
+    expect(await withBusiness(B, (db) => productionsToday(db, TZ, now))).toBe(4); // a: 1+2, b: 1
   });
 
   it('an unreadable working record fails closed (throws), never reads as empty', async () => {
-    const id = await createProduction(input());
-    expect((await loadProduction(B, id))?.work).toEqual(EMPTY_WORK);
+    const id = await withBusiness(B, (db) => createProduction(db, input()));
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.work).toEqual(EMPTY_WORK);
     await getPool().query(`UPDATE document_productions SET work = '{"drafted":"yes"}' WHERE production_id = $1`, [id]);
-    await expect(loadProduction(B, id)).rejects.toThrow(/unreadable work record/);
+    await expect(withBusiness(B, (db) => loadProduction(db, id))).rejects.toThrow(/unreadable work record/);
   });
 
   it('findings live in their own column; advanceStage writes them apart from work', async () => {
-    const id = await createProduction(input());
+    const id = await withBusiness(B, (db) => createProduction(db, input()));
     const f = [{ check: 'spec' as const, code: 'cap_exceeded', where: 'document', he: 'x' }];
-    expect(await advanceStage(id, 'queued', 'fixing', { findings: f })).toBe(true);
+    expect(await withBusiness(TEST_BUSINESS, (db) => advanceStage(db, id, 'queued', 'fixing', { findings: f }))).toBe(true);
     const { rows } = await getPool().query<{ findings: unknown; work: unknown }>(
       'SELECT findings, work FROM document_productions WHERE production_id = $1',
       [id],
     );
     expect(rows[0]!.findings).toEqual(f);
     expect(rows[0]!.work).toEqual(EMPTY_WORK);
-    expect((await loadProduction(B, id))?.findings).toEqual(f);
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.findings).toEqual(f);
   });
 });

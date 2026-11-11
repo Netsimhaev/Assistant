@@ -20,7 +20,7 @@ const SOURCE = { ordinal: 0, locator: null };
 type StepSpec = Pick<PlanStep, 'id' | 'agent' | 'toolName' | 'input'> & { intent?: string };
 
 async function seedJob(title: string): Promise<string> {
-  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'curation' }))); // TENANCY-TODO(task 5)
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'curation' })));
   const job = await withBusiness(BUSINESS, (db) => createJob(db, {
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -48,7 +48,8 @@ async function seedJobWithPlan(toolName: string, input: Record<string, unknown>)
 /** A document + reading + proposal, linked to `jobId` the way `documentForApproval` walks it. */
 async function seedReadingForJob(jobId: string, content: Reading): Promise<void> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument(
+  await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -58,9 +59,9 @@ async function seedReadingForJob(jobId: string, content: Reading): Promise<void>
       byteSize: 10,
       storedPath: `${BUSINESS}/${documentId}/original.txt`,
     },
-    { businessId: BUSINESS },
-  );
-  const { record } = await saveReading(
+  ));
+  const { record } = await withBusiness(BUSINESS, (db) => saveReading(
+    db,
     {
       readingId: `RDG-${ulid()}`,
       documentId,
@@ -72,8 +73,7 @@ async function seedReadingForJob(jobId: string, content: Reading): Promise<void>
       promptVersion: 'v1',
       briefHash: `${ulid()}`.padEnd(64, 'a'),
     },
-    { businessId: BUSINESS },
-  );
+  ));
   const proposalContent: Proposal = {
     stance: 'no_action',
     headline: 'נקרא, אין מה לעשות',
@@ -105,7 +105,7 @@ describe('the brief the curator is asked about', () => {
 
   it('returns null for a job with no bound plan', async () => {
     const jobId = await seedJob('ללא תוכנית');
-    expect(await buildCurationBrief(jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId))).toBeNull();
   });
 
   it('carries the job title and the outgoing body into the text', async () => {
@@ -115,7 +115,7 @@ describe('the brief the curator is asked about', () => {
       body: 'סיכמנו שנדבר בטלפון ולא במייל',
     });
 
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
 
     expect(brief).not.toBeNull();
     expect(brief?.text).toContain('לשלוח לרונית עדכון');
@@ -135,7 +135,7 @@ describe('the brief the curator is asked about', () => {
       body: 'טקסט',
     });
 
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
 
     expect(brief?.touched.recipients).toEqual(['ronit@beta-log.example']);
   });
@@ -164,7 +164,7 @@ describe('the brief the curator is asked about', () => {
       },
     ]);
 
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
 
     expect(brief?.touched.recipients).toEqual(['ronit@beta-log.example']);
     expect(brief?.touched.recipients).not.toContain('lead@stranger.example');
@@ -177,7 +177,7 @@ describe('the brief the curator is asked about', () => {
       body: 'א'.repeat(MAX_BRIEF_CHARS + 5_000),
     });
 
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
 
     expect(brief!.text.length).toBeLessThanOrEqual(MAX_BRIEF_CHARS);
     expect(brief!.text).toContain('[קוצץ]');
@@ -200,7 +200,7 @@ describe('the brief the curator is asked about', () => {
       unreadable: [],
     });
 
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
 
     expect(brief?.text).toContain('הצעת מחיר מספק חדש על סך 4,000 ש"ח');
     expect(brief?.text).toContain('סכום: 4000 ש"ח');
@@ -228,7 +228,7 @@ describe('the brief the curator is asked about', () => {
       unreadable: [],
     });
 
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
 
     expect(brief?.touched.entityIds).toEqual(['supplier-beta-log']);
   });
@@ -248,7 +248,7 @@ describe('the brief the curator is asked about', () => {
       body: 'טקסט',
     });
 
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
 
     expect(brief?.text).toContain('נושאים מותרים');
     expect(brief?.text).toContain('ronit@beta-log.example');
@@ -260,7 +260,7 @@ describe('the brief the curator is asked about', () => {
       { id: 's1', agent: 'ops.systems', toolName: 'artifact.write', input: { path: 'x.txt' } },
     ]);
 
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
 
     expect(brief?.touched.recipients).toEqual([]);
     expect(brief?.touched.entityIds).toEqual([]);
@@ -282,7 +282,7 @@ describe('the brief the curator is asked about', () => {
       body: 'א'.repeat(MAX_BRIEF_CHARS + 5_000),
     });
 
-    const brief = await buildCurationBrief(jobId, { businessId: BUSINESS });
+    const brief = await withBusiness(BUSINESS, (db) => buildCurationBrief(db, jobId));
 
     expect(brief!.text).toContain('[קוצץ]');
     expect(brief!.text).toContain('נושאים מותרים');

@@ -29,7 +29,8 @@ let seq = 0;
 async function doc(businessId: string, name: string): Promise<string> {
   seq += 1;
   const documentId = `DOC-owner-${seq}`;
-  await insertOrGetDocument(
+  await withBusiness(businessId, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -39,8 +40,7 @@ async function doc(businessId: string, name: string): Promise<string> {
       byteSize: 1,
       storedPath: `${businessId}/${documentId}/original.txt`,
     },
-    { businessId },
-  );
+  ));
   await getPool().query(`UPDATE documents SET status = 'extracted' WHERE document_id = $1`, [documentId]);
   return documentId;
 }
@@ -74,7 +74,7 @@ async function ownerJob(text: string, attached: string[]): Promise<Job> {
 
 beforeEach(async () => {
   await resetDatabase();
-  await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'v-owner' }))); // TENANCY-TODO(task 5)
+  await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'v-owner' })));
 });
 afterAll(async () => {
   await closePool();
@@ -103,7 +103,7 @@ describe('owner-attached sources', () => {
   it('the planner prompt lists the attached files in a fence, after the instruction', async () => {
     const prompt = buildPlannerPrompt(
       {
-        bundle: (await withBusiness(B, (bdb) => loadActiveCharter(bdb)))!.bundle, // TENANCY-TODO(task 5)
+        bundle: (await withBusiness(B, (bdb) => loadActiveCharter(bdb)))!.bundle,
         intents: [],
         instruction: 'הוראה',
         attachedDocuments: [{ documentId: 'DOC-1', name: 'a\nb.xlsx' }],
@@ -123,7 +123,7 @@ describe('owner-attached sources', () => {
     const job = await ownerJob('תכיני מכתב לפי המחירון', [mine]);
     const result = await withBusiness(B, (db) => runLocalTool('doc.produce', { format: 'docx', kind: 'letter', request: 'מכתב', destination: { mode: 'save', folder: null } }, { ...{ jobId: job.jobId, production: AVAILABLE }, db }));
     const productionId = (result as unknown as { productionId: string }).productionId;
-    const production = await loadProduction(B, productionId);
+    const production = await withBusiness(B, (db) => loadProduction(db, productionId));
     expect(production?.sourceDocumentIds).toEqual([mine]);
     expect(production?.work.ownerSourceIds).toEqual([mine]);
   });
@@ -139,14 +139,13 @@ describe('owner-attached sources', () => {
         destination: { mode: 'save', folder: null },
         sources: [{ documentId: inbox }],
       }, { ...{ jobId: job.jobId, production: AVAILABLE }, db }));
-    const production = await loadProduction(B, (result as unknown as { productionId: string }).productionId);
+    const production = await withBusiness(B, (db) => loadProduction(db, (result as unknown as { productionId: string }).productionId));
     expect([...(production?.sourceDocumentIds ?? [])].sort()).toEqual([mine, inbox].sort());
     expect(production?.work.ownerSourceIds).toEqual([mine]);
   });
 
   it('the loop fences an owner source as boss and every other source as unknown_external', async () => {
-    const productionId = await createProduction({
-      businessId: B,
+    const productionId = await withBusiness(B, (db) => createProduction(db, {
       originJobId: 'J-x',
       instructionText: 'x',
       textOrigin: 'typed',
@@ -156,8 +155,8 @@ describe('owner-attached sources', () => {
       destination: { mode: 'save', folder: null },
       sourceDocumentIds: ['DOC-a', 'DOC-b'],
       ownerSourceIds: ['DOC-a'],
-    });
-    const production = (await loadProduction(B, productionId))!;
+    }));
+    const production = (await withBusiness(B, (db) => loadProduction(db, productionId)))!;
     expect(sourceProvenance(production, 'DOC-a')).toBe('boss');
     expect(sourceProvenance(production, 'DOC-b')).toBe('unknown_external');
     const { rows } = await getPool().query<{ work: { ownerSourceIds: string[] } }>(

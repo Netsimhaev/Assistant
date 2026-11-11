@@ -681,7 +681,6 @@ export async function reportWhatsAppJobs(
   db: BusinessDb,
   options: { messenger: BossMessenger; dashboardBaseUrl?: string },
 ): Promise<ReportResult> {
-  const businessId = db.businessId;
   const dashboardBaseUrl = options.dashboardBaseUrl ?? DEFAULT_DASHBOARD_BASE_URL;
 
   const candidates = await reportCandidates(db);
@@ -716,7 +715,7 @@ export async function reportWhatsAppJobs(
       // Claimed right before the send — see the module docblock on why
       // classification runs first. A lost race (another pass already made
       // this claim) is not an error: it means nothing is left to do.
-      const claimed = await claimForReport(candidate.messageId, claimKind, { businessId });
+      const claimed = await claimForReport(db, candidate.messageId, claimKind);
       if (!claimed) continue;
 
       await options.messenger.send({ text, jobId: candidate.jobId });

@@ -62,7 +62,7 @@
  */
 import type { WhatsAppGateway } from './gateway.js';
 import { recordOutbound, settleMessage } from './store.js';
-import type { Queryable } from '../db/pool.js';
+import { withBusiness, type BusinessDb } from '../db/pool.js';
 import { createHash } from 'node:crypto';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -112,13 +112,12 @@ export interface CreateBossMessengerOptions {
   businessId: string;
   now?: () => Date;
   /**
-   * Test-only. Overrides the pooled connection `recordAttempt` writes
-   * through — the same escape hatch `recordOutbound`/`settleMessage`
-   * (`src/whatsapp/store.ts`) already expose as `options.db`, so a test can
-   * inject a connection that rejects without touching the real pool.
+   * Test-only. Overrides the connection `recordAttempt` writes through —
+   * by default a fresh `withBusiness(businessId, …)` per write — so a test
+   * can inject a connection that rejects without touching the real pool.
    * Production callers never pass this.
    */
-  db?: Queryable;
+  db?: BusinessDb;
 }
 
 /**
@@ -191,14 +190,16 @@ async function recordAttempt(
   input: { text: string; jobId: string | null },
   businessId: string,
   outcome: 'sent' | 'failed',
-  db: Queryable | undefined,
+  db: BusinessDb | undefined,
 ): Promise<void> {
   try {
-    const dbOption = db !== undefined ? { businessId, db } : { businessId };
-    const row = await recordOutbound({ body: input.text, jobId: input.jobId }, dbOption);
-    if (outcome === 'failed') {
-      await settleMessage(row.id, 'failed', {}, dbOption);
-    }
+    const write = async (bdb: BusinessDb): Promise<void> => {
+      const row = await recordOutbound(bdb, { body: input.text, jobId: input.jobId });
+      if (outcome === 'failed') {
+        await settleMessage(bdb, row.id, 'failed', {});
+      }
+    };
+    await (db !== undefined ? write(db) : withBusiness(businessId, write));
   } catch {
     // Best-effort, by design — see this function's docblock.
   }

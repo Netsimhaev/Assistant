@@ -3,7 +3,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import JSZip from 'jszip';
 import mammoth from 'mammoth';
@@ -256,20 +256,22 @@ describe('createDbImageLoader', () => {
 
   it('loads the file of this business', async () => {
     await seed('DOC-a', 'biz-1', rel('a.png'));
-    const got = await createDbImageLoader('biz-1')('DOC-a');
+    const got = await withBusiness('biz-1', (db) => createDbImageLoader(db)('DOC-a'));
     expect(got?.mediaType).toBe('image/png');
     expect(got?.bytes.equals(PNG)).toBe(true);
   });
 
   it('does not serve a document of another business', async () => {
     await seed('DOC-b', 'biz-2', rel('a.png'));
-    expect(await createDbImageLoader('biz-1')('DOC-b')).toBeNull();
+    expect(await withBusiness('biz-1', (db) => createDbImageLoader(db)('DOC-b'))).toBeNull();
     // and the renderer turns that into unknown_image
     await expect(
-      renderDocx(spec({ blocks: [{ type: 'image', documentId: 'DOC-b' }] }), {
-        currency: 'ILS',
-        images: createDbImageLoader('biz-1'),
-      }),
+      withBusiness('biz-1', (db) =>
+        renderDocx(spec({ blocks: [{ type: 'image', documentId: 'DOC-b' }] }), {
+          currency: 'ILS',
+          images: createDbImageLoader(db),
+        }),
+      ),
     ).rejects.toMatchObject({ code: 'unknown_image' });
   });
 
@@ -278,24 +280,24 @@ describe('createDbImageLoader', () => {
     const outside = join(tmpdir(), `docx-loader-outside-${process.pid}.png`);
     await writeFile(outside, PNG); // exists, so only the containment check can refuse it
     await seed('DOC-abs', 'biz-1', outside);
-    expect(await createDbImageLoader('biz-1')('DOC-t')).toBeNull();
-    expect(await createDbImageLoader('biz-1')('DOC-abs')).toBeNull();
+    expect(await withBusiness('biz-1', (db) => createDbImageLoader(db)('DOC-t'))).toBeNull();
+    expect(await withBusiness('biz-1', (db) => createDbImageLoader(db)('DOC-abs'))).toBeNull();
     await rm(outside, { force: true });
     // control: the same file by its relative path loads
     await seed('DOC-ok', 'biz-1', rel('a.png'));
-    expect(await createDbImageLoader('biz-1')('DOC-ok')).not.toBeNull();
+    expect(await withBusiness('biz-1', (db) => createDbImageLoader(db)('DOC-ok'))).not.toBeNull();
   });
 
   it('returns null for a missing file and rethrows other I/O errors', async () => {
     await seed('DOC-m', 'biz-1', rel('missing.png'));
-    expect(await createDbImageLoader('biz-1')('DOC-m')).toBeNull();
+    expect(await withBusiness('biz-1', (db) => createDbImageLoader(db)('DOC-m'))).toBeNull();
     await seed('DOC-dir', 'biz-1', rel('.'));
-    await expect(createDbImageLoader('biz-1')('DOC-dir')).rejects.toBeDefined();
+    await expect(withBusiness('biz-1', (db) => createDbImageLoader(db)('DOC-dir'))).rejects.toBeDefined();
   });
 
   it('refuses a file over 20MB', async () => {
     await writeFile(join(dir, 'big.png'), Buffer.alloc(20 * 1024 * 1024 + 1));
     await seed('DOC-big', 'biz-1', rel('big.png'));
-    await expect(createDbImageLoader('biz-1')('DOC-big')).rejects.toMatchObject({ code: 'image_too_large' });
+    await expect(withBusiness('biz-1', (db) => createDbImageLoader(db)('DOC-big'))).rejects.toMatchObject({ code: 'image_too_large' });
   });
 });

@@ -136,7 +136,6 @@ function claimNameFor(name: string): string {
 export async function scanInbox(db: BusinessDb, options: ScanInboxOptions): Promise<ScanResult> {
   const { inbox } = options;
   const scope = {
-    businessId: db.businessId,
     ...(options.documentRoot !== undefined ? { documentRoot: options.documentRoot } : {}),
   };
 
@@ -176,6 +175,7 @@ export async function scanInbox(db: BusinessDb, options: ScanInboxOptions): Prom
     let document;
     try {
       document = await ingestDocument(
+        db,
         { path: claimed, source: 'manual', originalName: name },
         scope,
       );

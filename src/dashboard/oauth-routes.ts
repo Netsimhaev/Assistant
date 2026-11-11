@@ -795,8 +795,8 @@ export async function handleOAuthCallback(
       }, { by: session.username });
     if (mailboxCursor !== null) {
       await setCursor(
+        tx,
         { provider, cursor: mailboxCursor, connectedAt: new Date().toISOString() },
-        { businessId, db: tx },
       );
     }
   });

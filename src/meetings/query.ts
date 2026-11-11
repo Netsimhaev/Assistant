@@ -8,7 +8,7 @@
  * through `stripBidiControls` + `toOneLine` before it is placed in the answer.
  */
 import type { CalendarEvent } from '../calendar/types.js';
-import { getPool } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 import type { Interval } from './free-time.js';
@@ -175,16 +175,16 @@ export function parseScheduleQuery(text: string, now: Date, timeZone: string): Q
 
 /** The assistant's own record of each meeting's invitee response, by calendar event id. */
 export async function loadMeetingResponses(
-  businessId: string,
+  db: BusinessDb,
   eventIds: readonly string[],
 ): Promise<Map<string, MeetingResponse>> {
   const out = new Map<string, MeetingResponse>();
   if (eventIds.length === 0) return out;
-  const { rows } = await getPool().query<{ event_id: string; response: MeetingResponse }>(
+  const { rows } = await db.query<{ event_id: string; response: MeetingResponse }>(
     `SELECT DISTINCT ON (event_id) event_id, response FROM meetings
       WHERE business_id = $1 AND event_id = ANY($2::text[]) AND state IN ('proposed','active')
       ORDER BY event_id, updated_at DESC`,
-    [businessId, [...eventIds]],
+    [db.businessId, [...eventIds]],
   );
   for (const r of rows) out.set(r.event_id, r.response);
   return out;

@@ -11,9 +11,7 @@
  * cannot be matched by name, and including it would let an ambiguity count
  * contain a candidate the owner could never be shown (spec §4).
  */
-import type { Queryable } from '../db/pool.js';
-import { getPool } from '../db/pool.js';
-import { config } from '../config.js';
+import type { BusinessDb } from '../db/pool.js';
 import { TrustLevel } from '../domain/trust.js';
 
 export interface Contact {
@@ -48,10 +46,9 @@ function readString(body: Record<string, unknown>, field: string): string | null
 }
 
 export async function listContacts(
-  options: { businessId?: string; db?: Queryable } = {},
+  db: BusinessDb,
 ): Promise<Contact[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rows } = await db.query<ContactRow>(
     `SELECT subject_key, body, provenance FROM memories

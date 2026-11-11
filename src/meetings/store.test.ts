@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CalendarEvent } from '../calendar/types.js';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
 import { resetDatabase } from '../test/db.js';
 import type { PlannedChange } from './plan.js';
@@ -78,9 +78,9 @@ describe('recordProposedMeetings', () => {
   afterAll(closePool);
 
   it('records proposed meeting rows keyed by job and step', async () => {
-    await recordProposedMeetings({ businessId: BUSINESS, jobId: 'J-1', plan: PLAN, changes: CHANGES });
+    await withBusiness(BUSINESS, (db) => recordProposedMeetings(db, { jobId: 'J-1', plan: PLAN, changes: CHANGES }));
     // A second call for the same job and steps writes nothing.
-    await recordProposedMeetings({ businessId: BUSINESS, jobId: 'J-1', plan: PLAN, changes: CHANGES });
+    await withBusiness(BUSINESS, (db) => recordProposedMeetings(db, { jobId: 'J-1', plan: PLAN, changes: CHANGES }));
 
     const { rows } = await getPool().query<Row>(
       `SELECT step_id, operation, event_id, client_name, client_email, client_email_verified, client_phone,
@@ -115,12 +115,11 @@ describe('recordProposedMeetings', () => {
       id, agent: 'sched.meetings', intent: 'meeting.cancel', toolName: 'calendar.write', dependsOn: [], expectedActionClass: 'calendar.cancel',
       input: { operation: 'cancel', calendarId: 'primary', eventId },
     });
-    await recordProposedMeetings({
-      businessId: BUSINESS,
+    await withBusiness(BUSINESS, (db) => recordProposedMeetings(db, {
       jobId: 'J-3',
       plan: { ...PLAN, steps: [step('m1', 'r2'), step('m2', 'r3')] },
       changes: [withAttendee, noAttendee],
-    });
+    }));
     const { rows } = await getPool().query<{ step_id: string; client_email: string | null; response: string }>(
       `SELECT step_id, client_email, response FROM meetings WHERE business_id = $1 AND job_id = 'J-3' ORDER BY step_id`,
       [BUSINESS],
@@ -133,7 +132,7 @@ describe('recordProposedMeetings', () => {
 
   it('refuses a change list that does not match the plan steps', async () => {
     await expect(
-      recordProposedMeetings({ businessId: BUSINESS, jobId: 'J-2', plan: PLAN, changes: CHANGES.slice(0, 1) }),
+      withBusiness(BUSINESS, (db) => recordProposedMeetings(db, { jobId: 'J-2', plan: PLAN, changes: CHANGES.slice(0, 1) })),
     ).rejects.toThrow();
   });
 });

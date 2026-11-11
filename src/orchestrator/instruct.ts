@@ -377,9 +377,8 @@ export async function runInstruction(
   // (`scheduleRouting: false`): the join of a parked instruction and an answer
   // is not a schedule question.
   if (options.calendar !== undefined && options.scheduleRouting !== false) {
-    const schedule = await answerScheduleQuery({
+    const schedule = await answerScheduleQuery(db, {
       text: input.text,
-      businessId,
       timeZone: active.charter.identity.timezone,
       operations: active.charter.operations,
       runtime: options.calendar.runtime,
@@ -472,7 +471,7 @@ export async function runInstruction(
   let contacts: Contact[] = [];
   let resolution: Resolution = { subjects: [], ambiguities: [] };
   try {
-    contacts = await listContacts({ businessId });
+    contacts = await listContacts(db);
     resolution = resolveContacts(input.text, contacts);
   } catch {
     // A failed contact read degrades to no memory, never to a failed
@@ -681,7 +680,7 @@ async function planAndCheck(
   // this one has a safe fallback and takes it instead.
   let memoryBlock = '';
   try {
-    memoryBlock = await recallForPlanning(subjects, { businessId: door.db.businessId });
+    memoryBlock = await recallForPlanning(door.db, subjects);
   } catch {
     memoryBlock = '';
   }
@@ -690,7 +689,7 @@ async function planAndCheck(
   // having it, but not planning because a read failed is worse still.
   let ledgerBlock = '';
   try {
-    const items = await listLedgerItems({ businessId: door.db.businessId, statuses: ['open', 'stuck'] });
+    const items = await listLedgerItems(door.db, { statuses: ['open', 'stuck'] });
     ledgerBlock = renderLedgerBlock({ now: new Date(), timeZone: door.timeZone, items });
   } catch {
     ledgerBlock = '';
@@ -837,7 +836,7 @@ async function ledgerStepProblem(
   if (step.toolName === 'ledger.update') {
     const parsed = LedgerUpdateInput.safeParse(step.input);
     if (!parsed.success) return invalid(parsed.error.issues[0]?.message ?? 'schema');
-    const item = await loadLedgerItem(parsed.data.itemId, { businessId: door.db.businessId });
+    const item = await loadLedgerItem(door.db, parsed.data.itemId);
     if (item === null) {
       return {
         reason: 'התוכנית מעדכנת שורה בפנקס שאינה קיימת, ולכן לא רצה.',
@@ -864,7 +863,7 @@ async function sourceQuestionFor(door: DoorContext, plan: Plan): Promise<string 
     if (!parsed.success || (parsed.data.sourceHints ?? []).length === 0) continue;
     let resolution: SourceResolution;
     try {
-      resolution = await resolveSourceDocuments(door.db.businessId, parsed.data.sourceHints ?? [], [], door.db, {
+      resolution = await resolveSourceDocuments(door.db, parsed.data.sourceHints ?? [], [], {
         timeZone: door.timeZone,
       });
     } catch {
@@ -894,8 +893,7 @@ export function renderSourceQuestion(
 
 /** What a plan's ledger steps will record, as the owner reads it (future tense, F-I4). */
 function ledgerEchoOf(door: DoorContext, plan: Plan): Promise<string | null> {
-  return ledgerEchoForSteps(plan.steps, {
-    businessId: door.db.businessId,
+  return ledgerEchoForSteps(door.db, plan.steps, {
     timeZone: door.timeZone,
     currency: door.bundle.ceilings.currency,
     instructionText: door.instruction.text,

@@ -4,8 +4,8 @@ import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { closePool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import { buildPdf } from './fixtures/build-pdf.js';
 import { guardZipArchive, ingestDocument } from './ingest.js';
 import { documentsAwaitingRead, loadArtifacts, loadDocument } from './store.js';
@@ -18,12 +18,12 @@ const stubChild = (name: string) =>
 const BUSINESS = 'test-business';
 
 let ROOT: string;
-let OPTS: { businessId: string; documentRoot: string };
+let OPTS: { documentRoot: string };
 
 beforeEach(async () => {
   await resetDatabase();
   ROOT = await mkdtemp(join(tmpdir(), 'ingest-root-'));
-  OPTS = { businessId: BUSINESS, documentRoot: ROOT };
+  OPTS = { documentRoot: ROOT };
 });
 
 afterEach(async () => {
@@ -38,19 +38,19 @@ describe('ingestDocument', () => {
   it('ingestDocument stores a PDF as extracted with page artifacts', async () => {
     const path = join(ROOT, 'incoming.pdf');
     await writeFile(path, buildPdf([['Invoice INV-17'], ['Total 1200 NIS']]));
-    const doc = await ingestDocument({ path, source: 'mail', originalName: 'invoice.pdf' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path, source: 'mail', originalName: 'invoice.pdf' }, OPTS));
     expect(doc.status).toBe('extracted');
     expect(doc.mediaType).toBe('application/pdf');
     expect(doc.storedPath.endsWith('/original.pdf')).toBe(true);
     expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
-    const artifacts = await loadArtifacts(doc.documentId, OPTS);
+    const artifacts = await withBusiness(BUSINESS, (db) => loadArtifacts(db, doc.documentId));
     // Two page artefacts, then the outline buildOutline appends.
     expect(artifacts.map((a) => [a.ordinal, a.kind, a.partName])).toEqual([
       [0, 'text', 'עמוד 1'],
       [1, 'text', 'עמוד 2'],
       [2, 'outline', null],
     ]);
-    expect((await loadDocument(doc.documentId, OPTS))?.status).toBe('extracted');
+    expect((await withBusiness(BUSINESS, (db) => loadDocument(db, doc.documentId)))?.status).toBe('extracted');
   });
 
   it('a malformed PDF is stored (downloadable, never read) with a Hebrew reason, not rejected', async () => {
@@ -59,15 +59,15 @@ describe('ingestDocument', () => {
       path,
       Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]),
     );
-    const doc = await ingestDocument({ path, source: 'manual', originalName: 'broken.pdf' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path, source: 'manual', originalName: 'broken.pdf' }, OPTS));
     // Ruling P7: the bytes are on disk, so the owner keeps the download.
     expect(doc.status).toBe('stored');
     expect(doc.reason).toMatch(/^הפענוח נכשל: /);
-    expect(await loadDocument(doc.documentId, OPTS)).toMatchObject({ status: 'stored', reason: doc.reason });
-    expect(await loadArtifacts(doc.documentId, OPTS)).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => loadDocument(db, doc.documentId))).toMatchObject({ status: 'stored', reason: doc.reason });
+    expect(await withBusiness(BUSINESS, (db) => loadArtifacts(db, doc.documentId))).toEqual([]);
     expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
     // A manual document is otherwise the conductor's — a stored one never is.
-    expect(await documentsAwaitingRead(10, OPTS)).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10))).toEqual([]);
   });
 
   it('a PDF the extractor refuses (as for a password) or that times out is stored with the reason', async () => {
@@ -75,19 +75,21 @@ describe('ingestDocument', () => {
     const hangPath = join(ROOT, 'slow.pdf');
     await writeFile(failPath, buildPdf([['Locked']]));
     await writeFile(hangPath, buildPdf([['Slow']]));
-    const failed = await ingestDocument(
+    const failed = await withBusiness(TEST_BUSINESS, (db) => ingestDocument(
+      db,
       { path: failPath, source: 'manual' },
       { ...OPTS, runExtractorOptions: { childPath: stubChild('fail.ts') } },
-    );
-    const timedOut = await ingestDocument(
+    ));
+    const timedOut = await withBusiness(TEST_BUSINESS, (db) => ingestDocument(
+      db,
       { path: hangPath, source: 'manual' },
       { ...OPTS, runExtractorOptions: { timeoutMs: 200, childPath: stubChild('hang.ts') } },
-    );
+    ));
     expect([failed.status, timedOut.status]).toEqual(['stored', 'stored']);
     expect(failed.reason).toContain('נכשל');
     expect(timedOut.reason?.length).toBeGreaterThan(0);
-    expect((await loadDocument(timedOut.documentId, OPTS))?.reason).toBe(timedOut.reason);
-    expect(await documentsAwaitingRead(10, OPTS)).toEqual([]);
+    expect((await withBusiness(BUSINESS, (db) => loadDocument(db, timedOut.documentId)))?.reason).toBe(timedOut.reason);
+    expect(await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10))).toEqual([]);
   }, 10_000);
 
   it('a manually ingested PDF is offered to the conductor; a mail-sourced one is not', async () => {
@@ -95,11 +97,11 @@ describe('ingestDocument', () => {
     const mailPath = join(ROOT, 'mail.pdf');
     await writeFile(manualPath, buildPdf([['Contract draft']]));
     await writeFile(mailPath, buildPdf([['Contract draft']], { trailingComment: 'mail copy' }));
-    const manual = await ingestDocument({ path: manualPath, source: 'manual' }, OPTS);
-    const mail = await ingestDocument({ path: mailPath, source: 'mail' }, OPTS);
+    const manual = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: manualPath, source: 'manual' }, OPTS));
+    const mail = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: mailPath, source: 'mail' }, OPTS));
     expect([manual.status, mail.status]).toEqual(['extracted', 'extracted']);
 
-    const offered = await documentsAwaitingRead(10, OPTS);
+    const offered = await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10));
     expect(offered.map((d) => d.documentId)).toEqual([manual.documentId]);
   });
 
@@ -108,13 +110,13 @@ describe('ingestDocument', () => {
     const textPath = join(ROOT, 'text.pdf');
     await writeFile(scanPath, buildPdf([null, null]));
     await writeFile(textPath, buildPdf([null, ['Signed copy']]));
-    const scan = await ingestDocument({ path: scanPath, source: 'manual' }, OPTS);
-    const withText = await ingestDocument({ path: textPath, source: 'manual' }, OPTS);
+    const scan = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: scanPath, source: 'manual' }, OPTS));
+    const withText = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: textPath, source: 'manual' }, OPTS));
     expect([scan.status, withText.status]).toEqual(['extracted', 'extracted']);
-    expect((await loadArtifacts(scan.documentId, OPTS))[0]?.flags).toEqual(['scanned_no_text']);
+    expect((await withBusiness(BUSINESS, (db) => loadArtifacts(db, scan.documentId)))[0]?.flags).toEqual(['scanned_no_text']);
 
     // A model call on a brief with no text would spend money to learn nothing.
-    const offered = await documentsAwaitingRead(10, OPTS);
+    const offered = await withBusiness(BUSINESS, (db) => documentsAwaitingRead(db, 10));
     expect(offered.map((d) => d.documentId)).toEqual([withText.documentId]);
   });
 
@@ -122,24 +124,24 @@ describe('ingestDocument', () => {
     const path = join(ROOT, 'bomb.pdf');
     await writeFile(path, buildPdf([['bomb']], { flateBombMib: 2048 }));
     const started = Date.now();
-    const doc = await ingestDocument({ path, source: 'mail', originalName: 'invoice.pdf' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path, source: 'mail', originalName: 'invoice.pdf' }, OPTS));
     expect(doc.status).toBe('stored');
     expect(doc.reason).toMatch(/תקרת הזיכרון/);
-    expect(await loadArtifacts(doc.documentId, OPTS)).toEqual([]);
+    expect(await withBusiness(BUSINESS, (db) => loadArtifacts(db, doc.documentId))).toEqual([]);
     expect(Date.now() - started).toBeLessThan(30_000);
   }, 60_000);
 
   it('still rejects binary that is not a PDF, whatever the name says', async () => {
     const path = join(ROOT, 'fake.pdf');
     await writeFile(path, Buffer.from([0x00, 0x01, 0xff, 0xfe, 0x80, 0x81]));
-    const doc = await ingestDocument({ path, source: 'mail', originalName: 'fake.pdf' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path, source: 'mail', originalName: 'fake.pdf' }, OPTS));
     expect(doc.status).toBe('rejected');
   });
 
   it('stores, extracts and records in one pass', async () => {
-    const doc = await ingestDocument({ path: fixture('tiny.xlsx'), source: 'manual' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('tiny.xlsx'), source: 'manual' }, OPTS));
     expect(doc.status).toBe('extracted');
-    const artifacts = await loadArtifacts(doc.documentId, OPTS);
+    const artifacts = await withBusiness(BUSINESS, (db) => loadArtifacts(db, doc.documentId));
     expect(artifacts.some((a) => a.kind === 'outline')).toBe(true);
     // The outline is real, not a placeholder — spot-check it read a real
     // sheet name out of the fixture used by outline.test.ts/xlsx.test.ts.
@@ -149,17 +151,18 @@ describe('ingestDocument', () => {
   });
 
   it('rejects an unsupported type and keeps the file anyway', async () => {
-    const doc = await ingestDocument({ path: fixture('mystery.bin'), source: 'manual' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('mystery.bin'), source: 'manual' }, OPTS));
     expect(doc.status).toBe('rejected');
     expect(doc.reason).toContain('סוג');
     expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
   });
 
   it('never lets the original name become a path', async () => {
-    const doc = await ingestDocument(
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(
+      db,
       { path: fixture('tiny.xlsx'), source: 'manual', originalName: '../../escape.xlsx' },
       OPTS,
-    );
+    ));
     expect(doc.storedPath).not.toContain('..');
     expect(doc.originalName).toBe('../../escape.xlsx');
     // Actually landed under the document root, not escaped from it.
@@ -167,8 +170,8 @@ describe('ingestDocument', () => {
   });
 
   it('returns the same document for the same bytes, without a second file', async () => {
-    const first = await ingestDocument({ path: fixture('tiny.xlsx'), source: 'manual' }, OPTS);
-    const second = await ingestDocument({ path: fixture('tiny.xlsx'), source: 'mail' }, OPTS);
+    const first = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('tiny.xlsx'), source: 'manual' }, OPTS));
+    const second = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('tiny.xlsx'), source: 'mail' }, OPTS));
     expect(second.documentId).toBe(first.documentId);
     // The first call's source wins — the second call did not overwrite it.
     expect(second.source).toBe('manual');
@@ -185,8 +188,8 @@ describe('ingestDocument', () => {
     // insertOrGetDocument's single atomic INSERT ... ON CONFLICT rather than
     // merely trusting its docblock.
     const [first, second] = await Promise.all([
-      ingestDocument({ path: fixture('tiny.xlsx'), source: 'manual' }, OPTS),
-      ingestDocument({ path: fixture('tiny.xlsx'), source: 'api' }, OPTS),
+      withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('tiny.xlsx'), source: 'manual' }, OPTS)),
+      withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('tiny.xlsx'), source: 'api' }, OPTS)),
     ]);
     expect(second.documentId).toBe(first.documentId);
 
@@ -201,10 +204,11 @@ describe('ingestDocument', () => {
     // (media-type.test.ts) already proves the byte-level rule; this proves
     // ingestDocument actually honours it end to end rather than trusting the
     // caller-supplied name anywhere in its own logic.
-    const doc = await ingestDocument(
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(
+      db,
       { path: fixture('small.txt'), source: 'manual', originalName: 'prices.xlsx' },
       OPTS,
-    );
+    ));
     // A non-zip file named .xlsx sniffs as plain text, which IS supported
     // (passthrough) — so it must extract successfully as text, not be
     // rejected, and its stored extension must reflect the real type.
@@ -216,11 +220,11 @@ describe('ingestDocument', () => {
     // bomb.xlsx (archive-guard.test.ts): a genuine ZIP with one entry that
     // inflates past the 200MB ceiling. basename(path) is 'bomb.xlsx', which
     // sniffMediaType recognises as an xlsx container.
-    const doc = await ingestDocument({ path: fixture('bomb.xlsx'), source: 'manual' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('bomb.xlsx'), source: 'manual' }, OPTS));
     expect(doc.status).toBe('rejected');
     expect(doc.reason).toMatch(/מתנפח|בייטים/);
     expect(existsSync(join(ROOT, doc.storedPath))).toBe(true);
-    const artifacts = await loadArtifacts(doc.documentId, OPTS);
+    const artifacts = await withBusiness(BUSINESS, (db) => loadArtifacts(db, doc.documentId));
     expect(artifacts).toHaveLength(0);
   });
 
@@ -229,7 +233,7 @@ describe('ingestDocument', () => {
     const bigPath = join(bigDir, 'big.txt');
     try {
       await writeFile(bigPath, Buffer.alloc(25 * 1024 * 1024 + 1, 0x61));
-      const doc = await ingestDocument({ path: bigPath, source: 'manual' }, OPTS);
+      const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: bigPath, source: 'manual' }, OPTS));
       expect(doc.status).toBe('rejected');
       expect(doc.reason).toContain('תקרת הגודל');
       // The whole point of checking the cap before the write: an oversized
@@ -248,62 +252,66 @@ describe('ingestDocument', () => {
   });
 
   it('records a killed, wedged child as rejected (extractor_timeout)', async () => {
-    const doc = await ingestDocument(
+    const doc = await withBusiness(TEST_BUSINESS, (db) => ingestDocument(
+      db,
       { path: fixture('small.txt'), source: 'manual' },
       { ...OPTS, runExtractorOptions: { timeoutMs: 200, childPath: stubChild('hang.ts') } },
-    );
+    ));
     expect(doc.status).toBe('rejected');
     expect(doc.reason?.length).toBeGreaterThan(0);
   }, 10_000);
 
   it('records a child that floods stdout as rejected (extractor_output_too_large)', async () => {
-    const doc = await ingestDocument(
+    const doc = await withBusiness(TEST_BUSINESS, (db) => ingestDocument(
+      db,
       { path: fixture('huge.txt'), source: 'manual' },
       { ...OPTS, runExtractorOptions: { maxOutputBytes: 1024 } },
-    );
+    ));
     expect(doc.status).toBe('rejected');
     expect(doc.reason?.length).toBeGreaterThan(0);
   });
 
   it('records a genuine engine-level crash as rejected (extractor_crashed)', async () => {
-    const doc = await ingestDocument(
+    const doc = await withBusiness(TEST_BUSINESS, (db) => ingestDocument(
+      db,
       { path: fixture('small.txt'), source: 'manual' },
       {
         ...OPTS,
         runExtractorOptions: { memoryMb: 32, childPath: stubChild('oom.ts'), timeoutMs: 15_000 },
       },
-    );
+    ));
     expect(doc.status).toBe('rejected');
     expect(doc.reason).toContain('קרס');
   }, 20_000);
 
   it('records a controlled child failure as rejected (extractor_failed)', async () => {
-    const doc = await ingestDocument(
+    const doc = await withBusiness(TEST_BUSINESS, (db) => ingestDocument(
+      db,
       { path: fixture('small.txt'), source: 'manual' },
       { ...OPTS, runExtractorOptions: { childPath: stubChild('fail.ts') } },
-    );
+    ));
     expect(doc.status).toBe('rejected');
     expect(doc.reason).toContain('נכשל');
   });
 
   it('extracts a real docx end to end', async () => {
-    const doc = await ingestDocument({ path: fixture('tiny.docx'), source: 'manual' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('tiny.docx'), source: 'manual' }, OPTS));
     expect(doc.status).toBe('extracted');
-    const artifacts = await loadArtifacts(doc.documentId, OPTS);
+    const artifacts = await withBusiness(BUSINESS, (db) => loadArtifacts(db, doc.documentId));
     expect(artifacts.some((a) => a.kind === 'text')).toBe(true);
     expect(artifacts.some((a) => a.kind === 'outline')).toBe(true);
   });
 
   it('extracts a real csv end to end', async () => {
-    const doc = await ingestDocument({ path: fixture('semicolons.csv'), source: 'manual' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('semicolons.csv'), source: 'manual' }, OPTS));
     expect(doc.status).toBe('extracted');
-    const artifacts = await loadArtifacts(doc.documentId, OPTS);
+    const artifacts = await withBusiness(BUSINESS, (db) => loadArtifacts(db, doc.documentId));
     expect(artifacts.some((a) => a.kind === 'table')).toBe(true);
   });
 
   it('propagates a genuine fault (bad path) rather than recording a rejection', async () => {
     await expect(
-      ingestDocument({ path: join(ROOT, 'no-such-file'), source: 'manual' }, OPTS),
+      withBusiness(BUSINESS, (db) => ingestDocument(db, { path: join(ROOT, 'no-such-file'), source: 'manual' }, OPTS)),
     ).rejects.toThrow();
   });
 });
@@ -316,7 +324,7 @@ describe('guardZipArchive', () => {
   });
 
   it('passes through a clean archive', async () => {
-    const doc = await ingestDocument({ path: fixture('tiny.xlsx'), source: 'manual' }, OPTS);
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: fixture('tiny.xlsx'), source: 'manual' }, OPTS));
     const verdict = await guardZipArchive(join(ROOT, doc.storedPath));
     expect(verdict.ok).toBe(true);
   });

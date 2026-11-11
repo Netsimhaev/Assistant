@@ -154,7 +154,7 @@ beforeEach(async () => {
   await connectCalendar();
   // Reminders open a job only when the dial lets email.initiate reach a card;
   // the default `off` hands the owner the text instead (its own test below).
-  await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
+  await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss'));
 });
 afterAll(async () => {
   await closePool();
@@ -172,7 +172,7 @@ describe('proposed meetings', () => {
     const plain = await seed({ eventId: null, step: { status: 'completed', externalId: 'new-ev' } });
     const { client } = fakeCalendar(new Map());
 
-    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client }));
 
     expect(result.activated).toBe(2);
     expect((await row(meetingId)).state).toBe('active');
@@ -185,7 +185,7 @@ describe('proposed meetings', () => {
   it('leaves a proposed meeting whose step has not run, and one whose step is unknown', async () => {
     const waiting = await seed({ step: null, phase: 'plan' });
     const unknown = await seed({ step: { status: 'unknown', externalId: null }, phase: 'followup' });
-    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client: fakeCalendar(new Map()).client });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client: fakeCalendar(new Map()).client }));
     expect(result).toMatchObject({ activated: 0, abandoned: 0 });
     expect((await row(waiting.meetingId)).state).toBe('proposed');
     expect((await row(unknown.meetingId)).state).toBe('proposed');
@@ -195,8 +195,8 @@ describe('proposed meetings', () => {
     const uncertain = await seed({ step: { status: 'unknown', externalId: null }, phase: 'failed', name: 'רונית' });
     const sent: { subject: string; body: string }[] = [];
     const client = fakeCalendar(new Map()).client;
-    const first = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
-    const second = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    const first = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
+    const second = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
 
     expect(first).toMatchObject({ abandoned: 0, uncertainAlerts: 1 });
     expect(second.uncertainAlerts).toBe(0);
@@ -211,7 +211,7 @@ describe('proposed meetings', () => {
   it('abandons a proposed meeting whose job failed', async () => {
     const failed = await seed({ phase: 'failed', step: null });
     const closed = await seed({ phase: 'closed', step: null });
-    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client: fakeCalendar(new Map()).client });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client: fakeCalendar(new Map()).client }));
     expect(result.abandoned).toBe(2);
     expect((await row(failed.meetingId)).state).toBe('abandoned');
     expect((await row(closed.meetingId)).state).toBe('abandoned');
@@ -226,7 +226,7 @@ describe('proposed meetings', () => {
     const moved = await seed({ operation: 'move', eventId: 'ev-9', response: 'accepted', step: { status: 'completed', externalId: 'ev-9' } });
     await getPool().query(`UPDATE meetings SET unanswered_notified_at = $2 WHERE meeting_id = $1`, [moved.meetingId, NOW]);
 
-    await syncMeetings({ businessId: B, runtime, now: NOW, client: fakeCalendar(new Map([['ev-9', []]])).client });
+    await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client: fakeCalendar(new Map([['ev-9', []]])).client }));
 
     expect((await row(old.meetingId)).state).toBe('done');
     const fresh = await row(moved.meetingId);
@@ -239,7 +239,7 @@ describe('proposed meetings', () => {
   it('a completed cancel goes straight to done, with the earlier rows of the event', async () => {
     const old = await seed({ state: 'active', eventId: 'ev-c' });
     const cancel = await seed({ operation: 'cancel', eventId: 'ev-c', step: { status: 'completed', externalId: 'ev-c' } });
-    await syncMeetings({ businessId: B, runtime, now: NOW, client: fakeCalendar(new Map()).client });
+    await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client: fakeCalendar(new Map()).client }));
     expect((await row(old.meetingId)).state).toBe('done');
     expect((await row(cancel.meetingId)).state).toBe('done');
   });
@@ -249,9 +249,9 @@ describe('proposed meetings', () => {
     const sent: { subject: string; body: string }[] = [];
     const { client, gets } = fakeCalendar(new Map());
     // Long past every wait.
-    await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
     const later = new Date(NOW.getTime() + 30 * HOUR);
-    const result = await syncMeetings({ businessId: B, runtime, now: later, client, sendAlert: recordingAlert(sent) });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: later, client, sendAlert: recordingAlert(sent) }));
 
     const r = await row(meetingId);
     expect(r.state).toBe('active');
@@ -274,7 +274,7 @@ describe('responses and alerts', () => {
         ['ev-o', [{ email: 'someone@else.com', response: 'accepted' }]],
       ]),
     );
-    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client }));
     expect(result.responsesChanged).toBe(1);
     const r = await row(meetingId);
     expect(r.response).toBe('accepted');
@@ -286,7 +286,7 @@ describe('responses and alerts', () => {
     await seed({ state: 'active', eventId: 'ev-p', start: new Date(NOW.getTime() - HOUR) });
     const { client, gets } = fakeCalendar(new Map([['ev-p', [{ email: 'dani@acme.co.il', response: 'declined' }]]]));
     const sent: { subject: string; body: string }[] = [];
-    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
     expect(gets).toEqual([]);
     expect(result).toMatchObject({ responsesChanged: 0, declinedAlerts: 0, unansweredAlerts: 0 });
     expect(sent).toEqual([]);
@@ -296,8 +296,8 @@ describe('responses and alerts', () => {
     const { meetingId } = await seed({ state: 'active', eventId: 'ev-d', name: 'דני‮ כהן\nשורה' });
     const { client } = fakeCalendar(new Map([['ev-d', [{ email: 'dani@acme.co.il', response: 'declined' }]]]));
     const sent: { subject: string; body: string }[] = [];
-    const first = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
-    const second = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    const first = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
+    const second = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
 
     expect(first.declinedAlerts).toBe(1);
     expect(second.declinedAlerts).toBe(0);
@@ -319,7 +319,7 @@ describe('responses and alerts', () => {
         return { ok: false, error: 'down' };
       },
     } as never;
-    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(emails), messenger });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(emails), messenger }));
     expect(result.declinedAlerts).toBe(1);
     expect(emails).toEqual([]);
     expect(texts).toHaveLength(1);
@@ -330,7 +330,7 @@ describe('responses and alerts', () => {
     const active = await seed({ state: 'active', eventId: 'ev-x' });
     const proposed = await seed({ step: { status: 'completed', externalId: 'ev-y' }, eventId: null });
     const { client, gets } = fakeCalendar(new Map([['ev-x', [{ email: 'dani@acme.co.il', response: 'accepted' }]]]));
-    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client }));
     expect(gets).toEqual([]);
     expect(result.activated).toBe(1);
     expect((await row(active.meetingId)).response).toBe('needs_action');
@@ -357,12 +357,12 @@ describe('unanswered meetings', () => {
       ]),
     );
     const sent: { subject: string; body: string }[] = [];
-    const first = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    const first = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
     expect(first.remindersOpened).toBe(0);
     expect(sent).toEqual([]);
 
     const later = new Date(NOW.getTime() + HOUR);
-    const second = await syncMeetings({ businessId: B, runtime, now: later, client, sendAlert: recordingAlert(sent) });
+    const second = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: later, client, sendAlert: recordingAlert(sent) }));
     expect(second.remindersOpened).toBe(2);
     expect(second.unansweredAlerts).toBe(2);
     expect((await row(far.meetingId)).reminder_job_id).not.toBeNull();
@@ -376,14 +376,13 @@ describe('unanswered meetings', () => {
     const { meetingId } = await seed({ state: 'active', eventId: 'ev-1', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
     const { client } = fakeCalendar(new Map([['ev-1', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
     const sent: { subject: string; body: string }[] = [];
-    const first = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
-    const second = await syncMeetings({
-      businessId: B,
+    const first = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
+    const second = await withBusiness(B, (db) => syncMeetings(db, {
       runtime,
       now: new Date(NOW.getTime() + 30 * HOUR),
       client,
       sendAlert: recordingAlert(sent),
-    });
+    }));
     expect(first.remindersOpened).toBe(1);
     expect(second.remindersOpened).toBe(0);
     expect(second.unansweredAlerts).toBe(0);
@@ -400,13 +399,13 @@ describe('unanswered meetings', () => {
     await resetDatabase();
     const { installCharter } = await import('../charter/store.js');
     const { buildCharter } = await import('../test/fixtures.js');
-    charterVersion = (await withBusiness(B, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 5)
+    charterVersion = (await withBusiness(B, (bdb) => installCharter(bdb, buildCharter()))).charterVersion;
     await connectCalendar();
-    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss'));
     const { meetingId } = await seed({ state: 'active', eventId: 'ev-1', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
     const { client } = fakeCalendar(new Map([['ev-1', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
     const sent: { subject: string; body: string }[] = [];
-    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
     expect(result.remindersOpened).toBe(0);
     expect(result.unansweredAlerts).toBe(1);
     expect(sent[0]?.body).toBe("⏳ דני כהן עדיין לא אישר את יום ג' 10:00 — אין תיבת מייל מחוברת, כדאי לעדכן אותו בעצמך.");
@@ -414,18 +413,17 @@ describe('unanswered meetings', () => {
   });
 
   it('under the default off dial opens no job and hands the owner the reminder text, once', async () => {
-    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'off', 'p_boss')); // TENANCY-TODO(task 5)
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'off', 'p_boss'));
     const { meetingId } = await seed({ state: 'active', eventId: 'ev-1', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
     const { client } = fakeCalendar(new Map([['ev-1', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
     const sent: { subject: string; body: string }[] = [];
-    const first = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
-    const second = await syncMeetings({
-      businessId: B,
+    const first = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
+    const second = await withBusiness(B, (db) => syncMeetings(db, {
       runtime,
       now: new Date(NOW.getTime() + 30 * HOUR),
       client,
       sendAlert: recordingAlert(sent),
-    });
+    }));
 
     expect(first).toMatchObject({ remindersOpened: 0, unansweredAlerts: 1 });
     expect(second.unansweredAlerts).toBe(0);
@@ -447,7 +445,7 @@ describe('unanswered meetings', () => {
     const failed = await seed({ state: 'active', eventId: 'broken-1', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
     const { client } = fakeCalendar(new Map());
     const sent: { subject: string; body: string }[] = [];
-    const result = await syncMeetings({ businessId: B, runtime, now: NOW, client, sendAlert: recordingAlert(sent) });
+    const result = await withBusiness(B, (db) => syncMeetings(db, { runtime, now: NOW, client, sendAlert: recordingAlert(sent) }));
     expect(result).toMatchObject({ remindersOpened: 0, unansweredAlerts: 0 });
     expect(result.errored).toEqual([{ meetingId: failed.meetingId, error: 'calendar down' }]);
     expect((await row(failed.meetingId)).reminder_claimed_at).toBeNull();
@@ -456,13 +454,12 @@ describe('unanswered meetings', () => {
     await getPool().query(`DELETE FROM connection_bindings WHERE business_id = $1`, [B]);
     const ok = await seed({ state: 'active', eventId: 'ev-2', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
     const reachable = fakeCalendar(new Map([['ev-2', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
-    const unavailable = await syncMeetings({
-      businessId: B,
+    const unavailable = await withBusiness(B, (db) => syncMeetings(db, {
       runtime,
       now: NOW,
       client: reachable.client,
       sendAlert: recordingAlert(sent),
-    });
+    }));
     expect(reachable.gets).toEqual([]);
     expect(unavailable).toMatchObject({ remindersOpened: 0, unansweredAlerts: 0 });
     expect((await row(ok.meetingId)).reminder_claimed_at).toBeNull();

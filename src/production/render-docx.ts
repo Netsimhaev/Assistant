@@ -34,7 +34,7 @@ import {
   type FileChild,
 } from 'docx';
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { Block, DocxSpec } from '../domain/document-spec.js';
 import { formatCell } from './format-value.js';
 import { SpecRenderError } from './render-error.js';
@@ -272,11 +272,11 @@ interface DocumentRow {
 }
 
 /** Production loader: the `documents` row of THIS business, bytes from under `documentRoot`. */
-export function createDbImageLoader(businessId: string, db: Queryable = getPool()): ImageLoader {
+export function createDbImageLoader(db: BusinessDb): ImageLoader {
   return async (documentId) => {
     const { rows } = await db.query<DocumentRow>(
       'SELECT stored_path, media_type FROM documents WHERE business_id = $1 AND document_id = $2',
-      [businessId, documentId],
+      [db.businessId, documentId],
     );
     const row = rows[0];
     if (!row) return null;

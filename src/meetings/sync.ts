@@ -38,7 +38,7 @@ import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type AttendeeResponse, type CalendarClient } from '../calendar/types.js';
-import { getPool, withTransaction, withBusiness, withBusinessTransaction } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { loadActionUpdateSettings } from '../governance/action-update-settings.js';
 import { NOTIFY_TIMEOUT_MS } from '../governance/notify.js';
 import { deliver } from '../ledger/pass.js';
@@ -116,14 +116,15 @@ interface OwnerChannels {
 
 /** Step 1 for one row. Returns what happened to it. */
 async function settleProposed(
-  businessId: string,
+  db: BusinessDb,
   row: ProposedRow,
   now: Date,
 ): Promise<'activated' | 'abandoned' | 'uncertain' | null> {
+  const businessId = db.businessId;
   if (row.step_status === 'completed') {
     const eventId = row.external_id ?? row.event_id;
     const freshResponse = row.client_email === null ? 'not_updated' : 'needs_action';
-    const moved = await withTransaction(async (tx) => {
+    const moved = await transaction(db, async (tx) => {
       const terminal = row.operation === 'cancel';
       const updated = await tx.query(
         `UPDATE meetings
@@ -148,7 +149,7 @@ async function settleProposed(
     if (!moved) return null;
     if (row.operation === 'create' && row.event_id !== null) {
       // The create carried a hold: the placeholder is now the meeting.
-      await markHoldConverted({ businessId, calendarId: row.calendar_id, eventId: row.event_id });
+      await markHoldConverted(db, { calendarId: row.calendar_id, eventId: row.event_id });
     }
     return 'activated';
   }
@@ -159,7 +160,7 @@ async function settleProposed(
     // calendar. Abandoning it would hide a meeting that exists; the row stays.
     return 'uncertain';
   }
-  const updated = await getPool().query(
+  const updated = await db.query(
     `UPDATE meetings SET state = 'abandoned', updated_at = $3
       WHERE business_id = $1 AND meeting_id = $2 AND state = 'proposed'`,
     [businessId, row.meeting_id, now],
@@ -173,9 +174,10 @@ async function settleProposed(
  * else), taken under a per-meeting advisory lock so two passes alert once.
  * Carries the meeting id and a hash only — never the client's name.
  */
-async function claimUncertainAlert(businessId: string, row: ProposedRow): Promise<boolean> {
+async function claimUncertainAlert(db: BusinessDb, row: ProposedRow): Promise<boolean> {
+  const businessId = db.businessId;
   const reason = `${UNCERTAIN_WRITE_REASON}:${row.meeting_id}`;
-  return withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 5)
+  return transaction(db, async (tx) => {
     await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${businessId}:${reason}`]);
     const { rows } = await tx.query('SELECT 1 FROM audit_log WHERE business_id = $1 AND reason = $2 LIMIT 1', [
       businessId,
@@ -267,8 +269,7 @@ export function unansweredAlertText(name: string, startMs: number, timeZone: str
   }
 }
 
-export async function syncMeetings(o: {
-  businessId: string;
+export async function syncMeetings(db: BusinessDb, o: {
   runtime: Pick<Runtime, 'credentials'>;
   now?: Date;
   sendAlert?: SendAlert;
@@ -276,9 +277,8 @@ export async function syncMeetings(o: {
   dashboardBaseUrl?: string;
   client?: CalendarClient;
 }): Promise<MeetingSyncResult> {
-  const { businessId } = o;
+  const businessId = db.businessId;
   const now = o.now ?? new Date();
-  const db = getPool();
   const result: MeetingSyncResult = {
     activated: 0,
     abandoned: 0,
@@ -321,10 +321,10 @@ export async function syncMeetings(o: {
   );
   for (const row of proposed) {
     try {
-      const outcome = await settleProposed(businessId, row, now);
+      const outcome = await settleProposed(db, row, now);
       if (outcome === 'activated') result.activated += 1;
       else if (outcome === 'abandoned') result.abandoned += 1;
-      else if (outcome === 'uncertain' && (await claimUncertainAlert(businessId, row))) {
+      else if (outcome === 'uncertain' && (await claimUncertainAlert(db, row))) {
         await alertOwner(owner, 'שינוי ביומן שלא ידוע אם נשמר', uncertainWriteText(row.client_name));
         result.uncertainAlerts += 1;
       }
@@ -336,7 +336,7 @@ export async function syncMeetings(o: {
   // Steps 2–4 need the charter's time zone; without a readable charter they wait.
   let timeZone: string | null = null;
   try {
-    timeZone = (await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)))?.charter.identity.timezone ?? null; // TENANCY-TODO(task 5)
+    timeZone = (await loadActiveCharter(db))?.charter.identity.timezone ?? null;
   } catch {
     timeZone = null;
   }
@@ -359,8 +359,7 @@ export async function syncMeetings(o: {
     if (waiting.length > 0) {
       let access: CalendarAccess | null = null;
       try {
-        const resolved = await resolveCalendarAccess({
-          businessId,
+        const resolved = await resolveCalendarAccess(db, {
           runtime: o.runtime,
           ...(o.client ? { client: o.client } : {}),
         });
@@ -420,7 +419,7 @@ export async function syncMeetings(o: {
     // 4. Unanswered after the wait: claim, prepare a reminder, tell the owner once.
     let settings;
     try {
-      settings = await loadMeetingSettings({ businessId });
+      settings = await loadMeetingSettings(db);
     } catch (err) {
       settings = null;
       fail('*', err);
@@ -451,8 +450,7 @@ export async function syncMeetings(o: {
 
           let outcome: UnansweredOutcome;
           try {
-            const opened = await openClientReminder({
-              businessId,
+            const opened = await openClientReminder(db, {
               meetingId: row.meeting_id,
               ...(locations.has(row.meeting_id) ? { location: locations.get(row.meeting_id) ?? null } : {}),
             });
@@ -488,8 +486,7 @@ export async function syncMeetings(o: {
 
   // 5. Holds whose question is over.
   try {
-    const holds = await sweepHolds({
-      businessId,
+    const holds = await sweepHolds(db, {
       runtime: o.runtime,
       ...(o.client ? { client: o.client } : {}),
     });

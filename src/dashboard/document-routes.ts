@@ -197,11 +197,11 @@ interface Loaded {
 }
 
 async function loadCard(businessId: string, cardId: string): Promise<Loaded | null> {
-  const card = await loadDocumentCard(businessId, cardId);
+  const card = await withBusiness(businessId, (db) => loadDocumentCard(db, cardId)); // TENANCY-TODO(task 10)
   if (card === null) return null;
-  const version = await loadVersion(businessId, card.versionId);
+  const version = await withBusiness(businessId, (db) => loadVersion(db, card.versionId)); // TENANCY-TODO(task 10)
   if (version === null) return null;
-  const production = await loadProduction(businessId, version.productionId);
+  const production = await withBusiness(businessId, (db) => loadProduction(db, version.productionId)); // TENANCY-TODO(task 10)
   if (production === null) return null;
   return { card, production, version };
 }
@@ -376,7 +376,7 @@ export async function handleDocumentDownload(
 ): Promise<void> {
   const loaded = await loadCard(businessId, cardId);
   if (loaded === null) return html(res, 404, renderNotFound());
-  const file = await loadVersionFile(loaded.version.versionId, businessId);
+  const file = await withBusiness(businessId, (db) => loadVersionFile(db, loaded.version.versionId)); // TENANCY-TODO(task 10)
   if (file === null) return html(res, 404, renderNotFound());
   const read = await readVersionBytes(
     file,
@@ -417,7 +417,7 @@ export async function handleDocumentApprove(
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
   // The plan hash and nothing else — see the module docblock.
   const planHash = form.get('planHash') ?? '';
-  const outcome = await approveDocumentCard(cardId, planHash, 'dashboard', { businessId });
+  const outcome = await withBusiness(businessId, (db) => approveDocumentCard(db, cardId, planHash, 'dashboard')); // TENANCY-TODO(task 10)
   if (outcome.status === 'approved') return seeOther(res, `/documents/${encodeURIComponent(cardId)}`);
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());
   const loaded = await loadCard(businessId, cardId);
@@ -436,10 +436,9 @@ export async function handleDocumentFix(
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return html(res, 403, renderForbidden());
   // The dashboard form is the owner's own keystrokes.
-  const outcome = await requestFix(cardId, form.get('text') ?? '', 'dashboard', 'typed', {
-    businessId,
+  const outcome = await withBusiness(businessId, (db) => requestFix(db, cardId, form.get('text') ?? '', 'dashboard', 'typed', { // TENANCY-TODO(task 10)
     production: options.production ?? productionToolsFromEnv(),
-  });
+  }));
   if (outcome.status === 'opened') return seeOther(res, '/documents');
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());
   const loaded = await loadCard(businessId, cardId);
@@ -468,7 +467,7 @@ export async function handleDocumentAddress(
   // The dashboard has no notification seams of its own: no re-send happens
   // here, the card's channel states are left as they were, and the WhatsApp
   // delivery stays withdrawn until a card is delivered there again.
-  const outcome = await addTypedRecipient(cardId, form.get('to') ?? '', { businessId });
+  const outcome = await withBusiness(businessId, (db) => addTypedRecipient(db, cardId, form.get('to') ?? '')); // TENANCY-TODO(task 10)
   if (outcome.status === 'added') return seeOther(res, `/documents/${encodeURIComponent(cardId)}`);
   if (outcome.status === 'not_found') return html(res, 404, renderNotFound());
   const loaded = await loadCard(businessId, cardId);

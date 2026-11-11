@@ -15,8 +15,7 @@
  * proceed.
  */
 import { ulid } from 'ulid';
-import { config } from '../config.js';
-import { getPool, withBusiness, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -94,6 +93,7 @@ const COLUMNS = `id, provider_message_id, direction, sender_number, sender_kind,
  * enforced by `whatsapp_messages_provider_idx`, not a best-effort check.
  */
 export async function recordInbound(
+  db: BusinessDb,
   input: {
     providerMessageId: string;
     senderNumber: string;
@@ -102,10 +102,8 @@ export async function recordInbound(
     mediaKind: string | null;
     providerTimestamp: string;
   },
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StoredMessage | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const id = `WA-${ulid()}`;
 
   const { rows } = await db.query<MessageRow>(
@@ -132,11 +130,10 @@ export async function recordInbound(
 
 /** The assistant's own outbound message. No dedupe: the assistant originates it. */
 export async function recordOutbound(
+  db: BusinessDb,
   input: { body: string; jobId: string | null },
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StoredMessage> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const id = `WA-${ulid()}`;
 
   const { rows } = await db.query<MessageRow>(
@@ -160,11 +157,10 @@ export async function recordOutbound(
  * which a read-then-write could not guarantee.
  */
 export async function claimMessage(
+  db: BusinessDb,
   id: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<boolean> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rowCount } = await db.query(
     `UPDATE whatsapp_messages SET state = 'claimed'
@@ -184,13 +180,12 @@ export async function claimMessage(
  * that must surface here rather than downstream as silence.
  */
 export async function settleMessage(
+  db: BusinessDb,
   id: string,
   state: 'handled' | 'failed',
   patch: { transcript?: string; jobId?: string } = {},
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rowCount } = await db.query(
     `UPDATE whatsapp_messages
@@ -236,12 +231,11 @@ export async function settleMessage(
  * race, and the caller's answer to it is to send nothing, not to fail.
  */
 export async function claimForReport(
+  db: BusinessDb,
   id: string,
   kind: 'interim' | 'terminal',
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<boolean> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rowCount } =
     kind === 'interim'
@@ -268,10 +262,10 @@ export async function claimForReport(
  * time this is read.
  */
 export async function unclaimedInbound(
-  options: { businessId?: string; limit?: number; db?: Queryable } = {},
+  db: BusinessDb,
+  options: { limit?: number } = {},
 ): Promise<StoredMessage[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const limit = options.limit ?? 50;
 
   const { rows } = await db.query<MessageRow>(
@@ -291,10 +285,10 @@ export async function unclaimedInbound(
  * rather than whichever order Postgres happens to return them in.
  */
 export async function conversation(
-  options: { businessId?: string; limit?: number; db?: Queryable } = {},
+  db: BusinessDb,
+  options: { limit?: number } = {},
 ): Promise<StoredMessage[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const limit = options.limit ?? 200;
 
   const { rows } = await db.query<MessageRow>(
@@ -328,9 +322,9 @@ export async function conversation(
  * own docblock in `src/domain/audit.ts` for why a shared kind would spend one
  * budget against the other.
  *
- * **`businessId` is a required positional parameter, not `options.businessId
- * ?? config.businessId`** — fix round 1, Critical 1. This pair's sibling read
- * (`whatsappTranscriptionsToday`, above) does default, but that default is
+ * **The business is a required parameter — `db`'s own — never a defaulted
+ * option** — fix round 1, Critical 1. This pair's sibling read
+ * (`whatsappTranscriptionsToday`, above) once defaulted, and that default was
  * safe only because nothing here writes under it; the moment a cap's
  * *count* and its *write* can silently disagree about which business they
  * mean, a caller that forgets the argument reads one business's rows while
@@ -350,11 +344,8 @@ export async function conversation(
  * `audit_log` from a module that does not own that table either) is the
  * established shape for a channel-scoped budget, not an exception to it.
  */
-export async function whatsappInstructionsToday(
-  businessId: string,
-  options: { db?: Queryable } = {},
-): Promise<number> {
-  const db = options.db ?? getPool();
+export async function whatsappInstructionsToday(db: BusinessDb): Promise<number> {
+  const businessId = db.businessId;
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM audit_log
       WHERE business_id = $1 AND kind = 'whatsapp_instruction'
@@ -373,11 +364,11 @@ export async function whatsappInstructionsToday(
  * `'whatsapp_instruction'`'s own docblock in `src/domain/audit.ts` for the
  * full reasoning.
  *
- * `businessId` is a required positional parameter, exactly like `recordAttempt`
+ * The business is a required parameter (`db`), exactly like `recordAttempt`
  * (`transcribe.ts`) and for the identical reason stated on
  * `whatsappInstructionsToday` above — fix round 1, Critical 1. The one call
  * site that existed before this fix omitted it entirely, which is exactly
- * the shape `options.businessId ?? config.businessId` makes easy to do by
+ * the shape a defaulted business option makes easy to do by
  * accident and a required positional argument makes a compile error instead.
  *
  * Every row this writes carries a fixed trust level: only a message from the
@@ -391,15 +382,15 @@ export async function whatsappInstructionsToday(
  * failed to write a moment later.
  */
 export async function recordWhatsAppInstructionAttempt(
-  businessId: string,
+  db: BusinessDb,
   counts: {
     status: 'planned' | 'needs_answer' | 'needs_confirmation' | 'refused' | 'answered';
     textLength: number;
   },
 ): Promise<void> {
   try {
-    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
-      bdb,
+    await appendAudit(
+      db,
       {
         actor: 'orchestrator',
         kind: 'whatsapp_instruction',
@@ -411,7 +402,7 @@ export async function recordWhatsAppInstructionAttempt(
         tokens: null,
         reason: `הוראת וואטסאפ · ${counts.status} · ${counts.textLength} תווים`,
       }
-    ));
+    );
   } catch {
     // Swallowed on purpose — see this function's docblock.
   }

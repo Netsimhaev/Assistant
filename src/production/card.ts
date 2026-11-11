@@ -79,7 +79,7 @@ import { ulid } from 'ulid';
 import { z } from 'zod';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, withTransaction, withBusiness, withBusinessTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { FORMAT_MEDIA_TYPE, formatAttachmentSize, type AttachmentRef } from '../domain/attachment-ref.js';
 import { DocumentCardState } from '../domain/document-spec.js';
 import { documentKindLabel } from '../domain/labels.js';
@@ -184,26 +184,24 @@ function toCard(row: CardRow): DocumentCard {
 }
 
 export async function loadDocumentCard(
-  businessId: string,
+  db: BusinessDb,
   cardId: string,
-  db: Queryable = getPool(),
 ): Promise<DocumentCard | null> {
   const { rows } = await db.query<CardRow>(
     'SELECT * FROM document_cards WHERE business_id = $1 AND card_id = $2',
-    [businessId, cardId],
+    [db.businessId, cardId],
   );
   const row = rows[0];
   return row === undefined ? null : toCard(row);
 }
 
 export async function loadCardForVersion(
-  businessId: string,
+  db: BusinessDb,
   versionId: string,
-  db: Queryable = getPool(),
 ): Promise<DocumentCard | null> {
   const { rows } = await db.query<CardRow>(
     'SELECT * FROM document_cards WHERE business_id = $1 AND version_id = $2',
-    [businessId, versionId],
+    [db.businessId, versionId],
   );
   const row = rows[0];
   return row === undefined ? null : toCard(row);
@@ -406,15 +404,15 @@ async function settle(run: () => Promise<{ ok: boolean }>): Promise<ChannelState
 
 /** Send the card on the owner's chosen channels and record each channel's state. Never throws for a send. */
 async function notifyCard(
-  card: { cardId: string; businessId: string },
+  db: BusinessDb,
+  card: { cardId: string },
   production: Production,
   version: DocumentVersion,
   text: string,
   seams: CardSeams,
-  db: Queryable,
   documentRoot: string,
 ): Promise<CardNotice> {
-  const settings = await loadDocumentSettings({ businessId: card.businessId, db });
+  const settings = await loadDocumentSettings({ businessId: db.businessId, db });
   const notice: CardNotice = { email: null, whatsapp: null };
   // A fresh id per notice (I2) — see `NOTICE_ID_LABEL`.
   text = `${text}\n${NOTICE_ID_LABEL}: ${ulid()}`;
@@ -423,7 +421,7 @@ async function notifyCard(
   let bytes: Buffer | null = null;
   const fileOnce = async (): Promise<Buffer | null> => {
     if (bytes !== null) return bytes;
-    const file = await loadVersionFile(version.versionId, card.businessId, db);
+    const file = await loadVersionFile(db, version.versionId);
     if (file === null) return null;
     const read = await readVersionBytes(file, { sha256: version.sha256, sizeBytes: version.sizeBytes }, documentRoot);
     bytes = read.ok ? read.bytes : null;
@@ -467,7 +465,7 @@ async function notifyCard(
             whatsapp_state = COALESCE($4, whatsapp_state),
             whatsapp_delivered_at = CASE WHEN $5::boolean THEN now() ELSE whatsapp_delivered_at END
       WHERE business_id = $1 AND card_id = $2`,
-    [card.businessId, card.cardId, notice.email, notice.whatsapp, whatsappAnswerable],
+    [db.businessId, card.cardId, notice.email, notice.whatsapp, whatsappAnswerable],
   );
   return notice;
 }
@@ -479,11 +477,8 @@ async function notifyCard(
  * the dashboard. Never throws for a send: it runs after the card row
  * committed.
  */
-async function recordNoticeFailure(
-  card: { cardId: string; businessId: string },
-  db: Queryable,
-): Promise<CardNotice> {
-  const settings = await loadDocumentSettings({ businessId: card.businessId, db });
+async function recordNoticeFailure(db: BusinessDb, card: { cardId: string }): Promise<CardNotice> {
+  const settings = await loadDocumentSettings({ businessId: db.businessId, db });
   const notice: CardNotice = {
     email: settings.toEmail ? 'failed' : null,
     whatsapp: settings.toWhatsApp ? 'failed' : null,
@@ -493,15 +488,15 @@ async function recordNoticeFailure(
         SET email_state = COALESCE($3, email_state),
             whatsapp_state = COALESCE($4, whatsapp_state)
       WHERE business_id = $1 AND card_id = $2`,
-    [card.businessId, card.cardId, notice.email, notice.whatsapp],
+    [db.businessId, card.cardId, notice.email, notice.whatsapp],
   );
   return notice;
 }
 
 /** The active charter's currency, or `null` when the charter is missing or unreadable. */
-async function charterCurrency(businessId: string, _db: Queryable): Promise<string | null> {
+async function charterCurrency(db: BusinessDb): Promise<string | null> {
   try {
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
+    const active = await loadActiveCharter(db);
     return active === null ? null : active.bundle.ceilings.currency;
   } catch {
     return null;
@@ -510,10 +505,7 @@ async function charterCurrency(businessId: string, _db: Queryable): Promise<stri
 
 // ---------------------------------------------------------------- creation
 
-export interface CreateCardOptions extends CardSeams {
-  businessId: string;
-  db?: Queryable;
-}
+export type CreateCardOptions = CardSeams;
 
 export type CreateCardResult =
   | { status: 'created'; cardId: string; notice: CardNotice }
@@ -524,12 +516,15 @@ export type CreateCardResult =
  * call (the loop's at-least-once `onFinished`) finds the card and does
  * nothing — only the call that inserted it notifies.
  */
-export async function createDocumentCard(versionId: string, options: CreateCardOptions): Promise<CreateCardResult> {
-  const db = options.db ?? getPool();
-  const { businessId } = options;
-  const version = await loadVersion(businessId, versionId, db);
+export async function createDocumentCard(
+  db: BusinessDb,
+  versionId: string,
+  options: CreateCardOptions = {},
+): Promise<CreateCardResult> {
+  const businessId = db.businessId;
+  const version = await loadVersion(db, versionId);
   if (version === null) throw new Error(`createDocumentCard: no version ${versionId} in ${businessId}`);
-  const production = await loadProduction(businessId, version.productionId, db);
+  const production = await loadProduction(db, version.productionId);
   if (production === null) throw new Error(`createDocumentCard: no production for ${versionId}`);
   if (production.stage !== 'ready' && production.stage !== 'failed_checks') {
     throw new Error(`createDocumentCard: production ${production.productionId} is ${production.stage}`);
@@ -546,13 +541,13 @@ export async function createDocumentCard(versionId: string, options: CreateCardO
     [cardId, businessId, versionId, JSON.stringify(optionsBuilt)],
   );
   if (inserted.rows.length === 0) {
-    const existing = await loadCardForVersion(businessId, versionId, db);
+    const existing = await loadCardForVersion(db, versionId);
     return { status: 'exists', cardId: existing?.cardId ?? cardId };
   }
 
-  const currency = await charterCurrency(businessId, db);
+  const currency = await charterCurrency(db);
   if (currency === null) {
-    return { status: 'created', cardId, notice: await recordNoticeFailure({ cardId, businessId }, db) };
+    return { status: 'created', cardId, notice: await recordNoticeFailure(db, { cardId }) };
   }
   const text = renderCardText({
     cardId,
@@ -564,12 +559,12 @@ export async function createDocumentCard(versionId: string, options: CreateCardO
     ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
   });
   const notice = await notifyCard(
-    { cardId, businessId },
+    db,
+    { cardId },
     production,
     version,
     text,
     options,
-    db,
     options.documentRoot ?? config.documentRoot,
   );
   return { status: 'created', cardId, notice };
@@ -586,12 +581,12 @@ export function productionFailedText(reason: string, productionId: string): stri
  * the owner's channel choice; the screen shows the production's state.
  */
 export async function onProductionFinished(
+  db: BusinessDb,
   finished: { productionId: string; versionId: string | null; stage: 'ready' | 'failed_checks' | 'failed'; reason: string | null },
-  options: CreateCardOptions,
+  options: CreateCardOptions = {},
 ): Promise<void> {
-  const db = options.db ?? getPool();
   if (finished.versionId !== null && finished.stage !== 'failed') {
-    await createDocumentCard(finished.versionId, options);
+    await createDocumentCard(db, finished.versionId, options);
     return;
   }
 
@@ -601,16 +596,16 @@ export async function onProductionFinished(
       WHERE business_id = $1 AND production_id = $2
         AND COALESCE((work->>'notified')::boolean, false) = false
       RETURNING production_id`,
-    [options.businessId, finished.productionId],
+    [db.businessId, finished.productionId],
   );
   if (claimed.rows.length === 0) return;
 
-  const production = await loadProduction(options.businessId, finished.productionId, db);
+  const production = await loadProduction(db, finished.productionId);
   const reason =
     finished.reason ??
     (production?.findings.map((f) => f.he).join('; ') || 'המסמך לא עבר את הבדיקות');
   const text = productionFailedText(reason, finished.productionId);
-  const settings = await loadDocumentSettings({ businessId: options.businessId, db });
+  const settings = await loadDocumentSettings({ businessId: db.businessId, db });
   if (settings.toEmail && options.sendAlert !== undefined) {
     await settle(() => options.sendAlert!('הפקת מסמך נכשלה', text));
   }
@@ -659,17 +654,17 @@ interface LockedCard {
   version: DocumentVersion;
 }
 
-async function lockCard(tx: Queryable, businessId: string, cardId: string): Promise<LockedCard | null> {
+async function lockCard(tx: BusinessDb, cardId: string): Promise<LockedCard | null> {
   const { rows } = await tx.query<CardRow>(
     'SELECT * FROM document_cards WHERE business_id = $1 AND card_id = $2 FOR UPDATE',
-    [businessId, cardId],
+    [tx.businessId, cardId],
   );
   const row = rows[0];
   if (row === undefined) return null;
   const card = toCard(row);
-  const version = await loadVersion(businessId, card.versionId, tx);
+  const version = await loadVersion(tx, card.versionId);
   if (version === null) return null;
-  const production = await loadProduction(businessId, version.productionId, tx);
+  const production = await loadProduction(tx, version.productionId);
   if (production === null) return null;
   return { card, production, version };
 }
@@ -680,11 +675,11 @@ async function lockCard(tx: Queryable, businessId: string, cardId: string): Prom
  * concurrent fix request and approval cannot both win.
  */
 export async function approveDocumentCard(
+  db: BusinessDb,
   cardId: string,
   planHash: string,
   actor: 'dashboard' | 'whatsapp',
   options: {
-    businessId: string;
     /**
      * When the WhatsApp answer was sent (provider timestamp). Required for
      * `actor: 'whatsapp'` — absent, the answer is refused: the time gate is
@@ -692,11 +687,11 @@ export async function approveDocumentCard(
      */
     whatsappInboundAt?: Date;
     windowMinutes?: number;
-  },
+  } = {},
 ): Promise<ApproveOutcome> {
-  const { businessId } = options;
-  return withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 5)
-    const locked = await lockCard(tx, businessId, cardId);
+  const businessId = db.businessId;
+  return transaction(db, async (tx) => {
+    const locked = await lockCard(tx, cardId);
     if (locked === null) return { status: 'not_found' };
     const { card, production, version } = locked;
     if (!ACTIONABLE.includes(card.state)) return { status: 'not_open', state: card.state };
@@ -728,7 +723,7 @@ export async function approveDocumentCard(
       if (settings.baseFolder === null) return { status: 'no_base_folder', reason: SAVE_NO_BASE_FOLDER_HE };
     }
 
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
+    const active = await loadActiveCharter(tx);
     if (active === null) throw new Error(`approveDocumentCard: no active charter for ${businessId}`);
 
     const job = await createJob(tx, {
@@ -845,17 +840,18 @@ export type TypedAddressOutcome =
  * lock, so it cannot race an approval or a fix.
  */
 export async function addTypedRecipient(
+  db: BusinessDb,
   cardId: string,
   typed: string,
-  options: CardSeams & { businessId: string },
+  options: CardSeams = {},
 ): Promise<TypedAddressOutcome> {
-  const { businessId } = options;
+  const businessId = db.businessId;
   const problem = typedAddressProblem(typed);
   if (problem !== null) return { status: 'refused', reason: problem };
   const address = typed.trim();
 
-  const outcome = await withTransaction<TypedAddressOutcome | { status: 'saved'; planHash: string }>(async (tx) => {
-    const locked = await lockCard(tx, businessId, cardId);
+  const outcome = await transaction<TypedAddressOutcome | { status: 'saved'; planHash: string }>(db, async (tx) => {
+    const locked = await lockCard(tx, cardId);
     if (locked === null) return { status: 'not_found' };
     const { card, production, version } = locked;
     if (!ACTIONABLE.includes(card.state)) return { status: 'not_open', state: card.state };
@@ -887,7 +883,7 @@ export async function addTypedRecipient(
     return { status: 'saved', planHash: send.planHash };
   });
   if (outcome.status !== 'saved') return outcome;
-  return { status: 'added', planHash: outcome.planHash, resend: await resendAfterTypedAddress(cardId, options) };
+  return { status: 'added', planHash: outcome.planHash, resend: await resendAfterTypedAddress(db, cardId, options) };
 }
 
 /**
@@ -900,25 +896,24 @@ export async function addTypedRecipient(
  * — amounts are never shown in a guessed currency.
  */
 async function resendAfterTypedAddress(
+  db: BusinessDb,
   cardId: string,
-  options: CardSeams & { businessId: string },
+  options: CardSeams,
 ): Promise<TypedAddressResend> {
-  const { businessId } = options;
   if (options.sendAlertWithAttachment === undefined && options.messenger?.sendFile === undefined) {
     return 'skipped_no_seams';
   }
   try {
-    const db = getPool();
     let active: Awaited<ReturnType<typeof loadActiveCharter>>;
     try {
-      active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
+      active = await loadActiveCharter(db);
     } catch {
       return 'skipped_charter_unreadable';
     }
     if (active === null) return 'skipped_charter_unreadable';
-    const card = await loadDocumentCard(businessId, cardId, db);
-    const version = card === null ? null : await loadVersion(businessId, card.versionId, db);
-    const production = version === null ? null : await loadProduction(businessId, version.productionId, db);
+    const card = await loadDocumentCard(db, cardId);
+    const version = card === null ? null : await loadVersion(db, card.versionId);
+    const production = version === null ? null : await loadProduction(db, version.productionId);
     if (card === null || version === null || production === null) return 'failed';
     const text = renderCardText({
       cardId,
@@ -929,7 +924,7 @@ async function resendAfterTypedAddress(
       currency: active.bundle.ceilings.currency,
       ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
     });
-    await notifyCard(card, production, version, text, options, db, options.documentRoot ?? config.documentRoot);
+    await notifyCard(db, card, production, version, text, options, options.documentRoot ?? config.documentRoot);
     return 'sent';
   } catch (err) {
     console.error(
@@ -953,12 +948,12 @@ export type FixOutcome =
   | { status: 'not_found' };
 
 export async function requestFix(
+  db: BusinessDb,
   cardId: string,
   text: string,
   actor: 'dashboard' | 'whatsapp',
   textOrigin: InstructionTextOrigin,
   options: {
-    businessId: string;
     /**
      * `runtime.production` — required, though it may be `undefined`: a fix is
      * a new production, and a server that cannot produce refuses it up front
@@ -969,7 +964,7 @@ export async function requestFix(
     now?: Date;
   },
 ): Promise<FixOutcome> {
-  const { businessId } = options;
+  const businessId = db.businessId;
   const fix = text.trim();
   if (fix === '') return { status: 'refused', reason: FIX_EMPTY_HE };
   const tools = options.production;
@@ -977,8 +972,8 @@ export async function requestFix(
     return { status: 'refused', reason: PRODUCTION_TOOLS_MISSING_REASON };
   }
 
-  return withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 5)
-    const locked = await lockCard(tx, businessId, cardId);
+  return transaction(db, async (tx) => {
+    const locked = await lockCard(tx, cardId);
     if (locked === null) return { status: 'not_found' };
     const { card, production, version } = locked;
     if (!ACTIONABLE.includes(card.state)) return { status: 'not_open', state: card.state };
@@ -989,10 +984,10 @@ export async function requestFix(
     const origin: InstructionTextOrigin =
       production.textOrigin === 'typed' && textOrigin === 'typed' ? 'typed' : 'transcribed';
 
-    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
+    const active = await loadActiveCharter(tx);
     if (active === null) throw new Error(`requestFix: no active charter for ${businessId}`);
     const perDay = options.perDay ?? config.documentsPerDay;
-    if ((await productionsToday(businessId, active.charter.identity.timezone, tx, options.now)) >= perDay) {
+    if ((await productionsToday(tx, active.charter.identity.timezone, options.now)) >= perDay) {
       return { status: 'refused', reason: productionCapReason(perDay) };
     }
 
@@ -1023,8 +1018,8 @@ export async function requestFix(
       await transition(tx, job.jobId, { to, actor: 'human', reason: `document card ${cardId}: fix (${actor})` });
     }
     const productionId = await createProduction(
+      tx,
       {
-        businessId,
         originJobId: job.jobId,
         instructionText: instruction,
         textOrigin: origin,
@@ -1037,7 +1032,6 @@ export async function requestFix(
         // The fix is the same request: the owner's own sources stay his.
         ownerSourceIds: production.work.ownerSourceIds,
       },
-      tx,
     );
     // Parked like `doc.produce` parks: the production loop closes it.
     await transition(tx, job.jobId, {
@@ -1070,9 +1064,8 @@ export interface ReraiseResult {
  * failure. The claim is the conditional move `approved|saved → failed_send`
  * on that very job; only the call that made it sends.
  */
-export async function reraiseFailedDeliveries(options: CardSeams & { businessId: string; db?: Queryable }): Promise<ReraiseResult> {
-  const db = options.db ?? getPool();
-  const { businessId } = options;
+export async function reraiseFailedDeliveries(db: BusinessDb, options: CardSeams = {}): Promise<ReraiseResult> {
+  const businessId = db.businessId;
   const result: ReraiseResult = { reraised: [], errored: [] };
   const { rows } = await db.query<{ card_id: string; delivery_job_id: string; state: string; may_have_sent: boolean }>(
     `SELECT c.card_id, c.delivery_job_id, c.state,
@@ -1094,16 +1087,16 @@ export async function reraiseFailedDeliveries(options: CardSeams & { businessId:
         [businessId, row.card_id, row.delivery_job_id],
       );
       if (claimed.rows.length === 0) continue;
-      const card = await loadDocumentCard(businessId, row.card_id, db);
+      const card = await loadDocumentCard(db, row.card_id);
       if (card === null) continue;
-      const version = await loadVersion(businessId, card.versionId, db);
-      const production = version === null ? null : await loadProduction(businessId, version.productionId, db);
+      const version = await loadVersion(db, card.versionId);
+      const production = version === null ? null : await loadProduction(db, version.productionId);
       if (version === null || production === null) continue;
-      const currency = await charterCurrency(businessId, db);
+      const currency = await charterCurrency(db);
       if (currency === null) {
         // The claim already moved the card to `failed_send`: it stays on the
         // dashboard, and the owner's channels record the notice as failed.
-        await recordNoticeFailure(card, db);
+        await recordNoticeFailure(db, card);
         result.errored.push({ cardId: card.cardId, error: 'charter_unreadable' });
         continue;
       }
@@ -1125,7 +1118,7 @@ export async function reraiseFailedDeliveries(options: CardSeams & { businessId:
         prefix,
         ...(options.dashboardBaseUrl !== undefined ? { dashboardBaseUrl: options.dashboardBaseUrl } : {}),
       });
-      await notifyCard(card, production, version, text, options, db, options.documentRoot ?? config.documentRoot);
+      await notifyCard(db, card, production, version, text, options, options.documentRoot ?? config.documentRoot);
       result.reraised.push({ cardId: card.cardId, jobId: row.delivery_job_id, mayHaveSent: row.may_have_sent });
     } catch (err) {
       result.errored.push({ cardId: row.card_id, error: err instanceof Error ? err.message : String(err) });

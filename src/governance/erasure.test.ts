@@ -32,10 +32,10 @@ async function seed(): Promise<{ jobId: string }> {
      VALUES ($1, $2, 'email.reply', ARRAY[$3])`,
     [BUSINESS, job.jobId, RONIT],
   );
-  await writeMemory(
+  await withBusiness(BUSINESS, (db) => writeMemory(
+    db,
     { jobId: job.jobId, kind: 'entity', subjectKey: RONIT, body: { name: 'רונית' } },
-    { businessId: BUSINESS },
-  );
+  ));
   return { jobId: job.jobId };
 }
 
@@ -299,10 +299,10 @@ describe('executeErasure', () => {
    */
   it('rolls back the whole transaction when one statement fails partway through', async () => {
     const jobId = await bareJob('rollback-target');
-    const memory = await writeMemory(
+    const memory = await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'entity', subjectKey: 'rollback-subject', body: {} },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const documentId = `DOC-${ulid()}`;
     await insertDocument(documentId, `nowhere/${documentId}.txt`);
@@ -478,10 +478,10 @@ describe('executeErasure', () => {
        VALUES ($1, $2, 'h1', 's1', 'ext-123')`,
       [BUSINESS, jobId],
     );
-    const memory = await writeMemory(
+    const memory = await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'entity', subjectKey: 'i2-subject', body: {} },
-      { businessId: BUSINESS },
-    );
+    ));
     const digestId = `DG-${ulid()}`;
     await getPool().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)

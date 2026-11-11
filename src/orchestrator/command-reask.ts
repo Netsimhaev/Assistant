@@ -325,8 +325,7 @@ async function reaskOne(
   if (active === null) throw new Error(`command re-ask: no active charter for business ${businessId}`);
   // T6: the ledger steps still left are read-only, so `renderStepEcho` hides
   // them; the owner sees what they will record, as in the first question.
-  const ledgerEcho = await ledgerEchoForSteps(residual.steps, {
-    businessId,
+  const ledgerEcho = await ledgerEchoForSteps(db, residual.steps, {
     timeZone: active.charter.identity.timezone,
     currency: active.bundle.ceilings.currency,
     instructionText: instruction.text,

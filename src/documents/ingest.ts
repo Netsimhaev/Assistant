@@ -81,6 +81,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
+import type { BusinessDb } from '../db/pool.js';
 import { inspectArchive } from './archive-guard.js';
 import type { ArchiveVerdict } from './archive-guard.js';
 import {
@@ -158,7 +159,6 @@ export interface IngestInput {
 }
 
 export interface IngestOptions {
-  businessId?: string;
   documentRoot?: string;
   /**
    * Test-only escape hatch, threaded straight through to `runExtractor`.
@@ -216,10 +216,11 @@ function reasonForExtractFailure(outcome: Extract<ExtractOutcome, { ok: false }>
 }
 
 export async function ingestDocument(
+  db: BusinessDb,
   input: IngestInput,
   options: IngestOptions = {},
 ): Promise<DocumentRecord> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const documentRoot = options.documentRoot ?? config.documentRoot;
 
   // Read once. Every later step — the hash, the dedupe key, the sniff, the
@@ -249,6 +250,7 @@ export async function ingestDocument(
   const storedPath = `${businessId}/${documentId}/original.${extension}`;
 
   const { document, created } = await insertOrGetDocument(
+    db,
     {
       documentId,
       source: input.source,
@@ -258,7 +260,6 @@ export async function ingestDocument(
       byteSize: bytes.length,
       storedPath,
     },
-    { businessId },
   );
 
   // §8: the same sha256 already exists for this business → the existing
@@ -267,7 +268,7 @@ export async function ingestDocument(
   if (!created) return document;
 
   const reject = async (reason: string): Promise<DocumentRecord> => {
-    await markRejected(documentId, reason, { businessId });
+    await markRejected(db, documentId, reason);
     return { ...document, status: 'rejected', reason };
   };
 
@@ -314,7 +315,7 @@ export async function ingestDocument(
   // refused, and `extracted` would offer it to a reader with no artefacts
   // to read.
   if (STORE_ONLY_TYPES.has(sniffed)) {
-    await markStored(documentId, { businessId });
+    await markStored(db, documentId);
     return { ...document, status: 'stored' };
   }
 
@@ -341,13 +342,13 @@ export async function ingestDocument(
     // attachment away (spec §9, "attached for download"). It is never read:
     // the conductor takes `extracted` only. Every other type keeps `rejected`.
     if (sniffed === PDF) {
-      await markStored(documentId, { businessId, reason });
+      await markStored(db, documentId, { reason });
       return { ...document, status: 'stored', reason };
     }
     return reject(reason);
   }
 
   const outline = buildOutline(outcome.artifacts);
-  await markExtracted(documentId, [...outcome.artifacts, outline], { businessId });
+  await markExtracted(db, documentId, [...outcome.artifacts, outline]);
   return { ...document, status: 'extracted' };
 }

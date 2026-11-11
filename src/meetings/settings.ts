@@ -10,7 +10,7 @@
  * without it is refused. No setting here widens authority — they only shape
  * which slots the assistant proposes and when it reminds.
  */
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export type LocationKind = 'travel' | 'fixed' | 'mixed';
 
@@ -86,14 +86,13 @@ function defaults(): MeetingSettings {
   return { ...MEETING_DEFAULTS, readCalendarIds: [] };
 }
 
-export async function loadMeetingSettings(o: { businessId: string; db?: Queryable }): Promise<MeetingSettings> {
-  const db = o.db ?? getPool();
+export async function loadMeetingSettings(db: BusinessDb): Promise<MeetingSettings> {
   const { rows } = await db.query<MeetingSettingsRow>(
     `SELECT location_kind, fixed_address, gap_minutes, default_duration_minutes,
             work_start::text AS work_start, work_end::text AS work_end,
             read_calendar_ids, write_calendar_id, reminder_hours, reminder_hours_soon
        FROM meeting_settings WHERE business_id = $1`,
-    [o.businessId],
+    [db.businessId],
   );
   const row = rows[0];
   return row === undefined ? defaults() : toMeetingSettings(row);
@@ -156,14 +155,14 @@ export function meetingSettingsProblem(s: MeetingSettings): string | null {
 }
 
 export async function saveMeetingSettings(
+  db: BusinessDb,
   s: MeetingSettings,
-  o: { businessId: string },
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const reason = meetingSettingsProblem(s);
   if (reason !== null) return { ok: false, reason };
 
   const address = s.fixedAddress === null || s.fixedAddress.trim() === '' ? null : s.fixedAddress.trim();
-  await getPool().query(
+  await db.query(
     `INSERT INTO meeting_settings (business_id, location_kind, fixed_address, gap_minutes, default_duration_minutes,
         work_start, work_end, read_calendar_ids, write_calendar_id, reminder_hours, reminder_hours_soon)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -180,7 +179,7 @@ export async function saveMeetingSettings(
            reminder_hours_soon = EXCLUDED.reminder_hours_soon,
            updated_at = now()`,
     [
-      o.businessId,
+      db.businessId,
       s.locationKind,
       address,
       s.gapMinutes,

@@ -131,7 +131,7 @@ export async function openDocumentCards(
     if (Number.isNaN(deliveredMs) || nowMs - deliveredMs > windowMinutes * 60_000) continue;
     // Strictly after, with no tolerance in the permissive direction.
     if (!(inboundMs > deliveredMs)) continue;
-    const card = await loadDocumentCard(businessId, row.card_id, db);
+    const card = await loadDocumentCard(db, row.card_id);
     if (card !== null) open.push(card);
   }
   return open;
@@ -146,28 +146,27 @@ export type DocumentCardOutcome = 'decided' | 'fix' | 'refused' | 'skipped' | 'p
  * delivered on WhatsApp (`openOnWhatsApp`, the definition every reader
  * shares) — counted together with `cards` (C9).
  */
-export async function handleDocumentCardMessage(input: {
+export async function handleDocumentCardMessage(db: BusinessDb, input: {
   msg: NormalizedInboundMessage;
   storedId: string;
   cards: readonly DocumentCard[];
   othersOpen: number;
   messenger: BossMessenger;
-  businessId: string;
   production: Runtime['production'] | undefined;
   /** Test seam, the door's `questionWindowMinutes`. */
   windowMinutes?: number;
 }): Promise<DocumentCardOutcome> {
-  const { msg, storedId, cards, messenger, businessId } = input;
+  const { msg, storedId, cards, messenger } = input;
   if (msg.mediaKind !== null || msg.body === null) return 'passthrough';
   const text = msg.body;
   if (!isDocumentCardAction(text) || cards.length === 0) return 'passthrough';
 
-  const claimed = await claimMessage(storedId, { businessId });
+  const claimed = await claimMessage(db, storedId);
   if (!claimed) return 'skipped';
 
   const reply = async (replyText: string, state: 'handled' | 'failed', jobId: string | null = null): Promise<void> => {
     await messenger.send({ text: replyText, jobId });
-    await settleMessage(storedId, state, jobId !== null ? { jobId } : {}, { businessId });
+    await settleMessage(db, storedId, state, jobId !== null ? { jobId } : {});
   };
   const refuse = async (replyText: string): Promise<'refused'> => {
     await reply(replyText, 'failed');
@@ -179,8 +178,7 @@ export async function handleDocumentCardMessage(input: {
 
   const fix = fixRequestText(text);
   if (fix !== null) {
-    const outcome = await requestFix(only.cardId, fix, 'whatsapp', 'typed', {
-      businessId,
+    const outcome = await requestFix(db, only.cardId, fix, 'whatsapp', 'typed', {
       production: input.production,
     });
     if (outcome.status === 'opened') {
@@ -196,13 +194,12 @@ export async function handleDocumentCardMessage(input: {
   const ofKind = only.deliveryPlans.filter((o) => o.option === kind);
   if (ofKind.length !== 1) return refuse(DOCUMENT_CARD_SEVERAL_OPTIONS);
   const option = ofKind[0]!;
-  const version = await loadVersion(businessId, only.versionId);
-  const production = version === null ? null : await loadProduction(businessId, version.productionId);
+  const version = await loadVersion(db, only.versionId);
+  const production = version === null ? null : await loadProduction(db, version.productionId);
   if (production === null) return refuse(DOCUMENT_CARD_GONE);
 
   // The time gate again, inside the approval, under the card's lock.
-  const outcome = await approveDocumentCard(only.cardId, option.planHash, 'whatsapp', {
-    businessId,
+  const outcome = await approveDocumentCard(db, only.cardId, option.planHash, 'whatsapp', {
     whatsappInboundAt: new Date(msg.providerTimestamp),
     ...(input.windowMinutes !== undefined ? { windowMinutes: input.windowMinutes } : {}),
   });

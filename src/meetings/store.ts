@@ -9,16 +9,14 @@
  * (`ON CONFLICT DO NOTHING`), so a retried door does not duplicate rows.
  */
 import { ulid } from 'ulid';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
 import type { PlannedChange } from './plan.js';
 
-export async function recordProposedMeetings(o: {
-  businessId: string;
+export async function recordProposedMeetings(db: BusinessDb, o: {
   jobId: string;
   plan: Plan;
   changes: PlannedChange[];
-  db?: Queryable;
 }): Promise<void> {
   if (o.changes.length !== o.plan.steps.length) {
     throw new Error('recordProposedMeetings: one change per plan step is required');
@@ -65,7 +63,7 @@ export async function recordProposedMeetings(o: {
     const base = values.length;
     values.push(
       `M-${ulid()}`,
-      o.businessId,
+      db.businessId,
       o.jobId,
       step.id,
       calendarId,
@@ -83,7 +81,7 @@ export async function recordProposedMeetings(o: {
     rows.push(`(${Array.from({ length: 15 }, (_, k) => `$${base + k + 1}`).join(', ')}, 'proposed')`);
   }
 
-  await (o.db ?? getPool()).query(
+  await db.query(
     `INSERT INTO meetings (meeting_id, business_id, job_id, step_id, calendar_id, event_id, operation,
         client_name, client_email, client_email_verified, client_phone, internal_note, start_at, end_at,
         response, state)

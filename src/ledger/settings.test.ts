@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   LEDGER_DEFAULTS,
@@ -23,11 +23,11 @@ afterAll(async () => {
   await closePool();
 });
 
-const save = (s: LedgerSettings) => saveLedgerSettings(s, { businessId: B, updatedBy: 'owner' });
+const save = (s: LedgerSettings) => withBusiness(B, (db) => saveLedgerSettings(db, s, { updatedBy: 'owner' }));
 
 describe('ledger settings', () => {
   it('returns defaults when the row is absent and writes nothing', async () => {
-    const s = await loadLedgerSettings({ businessId: B });
+    const s = await withBusiness(B, (db) => loadLedgerSettings(db));
     expect(s).toEqual(LEDGER_DEFAULTS);
     expect(s.toEmail).toBe(true);
     expect(s.toWhatsApp).toBe(false);
@@ -71,7 +71,7 @@ describe('ledger settings', () => {
       dailyHour: 7,
     };
     await save(s);
-    expect(await loadLedgerSettings({ businessId: B })).toEqual(s);
+    expect(await withBusiness(B, (db) => loadLedgerSettings(db))).toEqual(s);
     const { rows } = await getPool().query('SELECT modes FROM ledger_settings');
     expect(Object.keys(rows[0].modes).sort()).toEqual([
       'awaiting_reply',
@@ -91,7 +91,7 @@ describe('ledger settings', () => {
        VALUES ($1, '{"meetings":"act","bogus":"act"}', false, true, true, 60, '{1440,60}', 3, 3, 2, 1, 8, 'x')`,
       [B],
     );
-    const s = await loadLedgerSettings({ businessId: B });
+    const s = await withBusiness(B, (db) => loadLedgerSettings(db));
     expect(s.modes.money_out).toBe('remind');
     // M3: a stored act on meetings is coerced to remind (no counterparty nudge exists).
     expect(s.modes.meetings).toBe('remind');
@@ -106,7 +106,7 @@ describe('ledger settings', () => {
     expect(rows).toHaveLength(0);
     // The saver did run: act on a family that has a nudge is accepted.
     await save({ ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes, awaiting_reply: 'act' } });
-    expect((await loadLedgerSettings({ businessId: B })).modes.awaiting_reply).toBe('act');
+    expect((await withBusiness(B, (db) => loadLedgerSettings(db))).modes.awaiting_reply).toBe('act');
   });
 
   it('M3: a stored act on projects loads as remind; act on warm_leads is kept', async () => {
@@ -117,7 +117,7 @@ describe('ledger settings', () => {
        VALUES ($1, '{"projects":"act","warm_leads":"act","money_out":"remind"}', false, true, true, 60, '{1440,60}', 3, 3, 2, 1, 8, 'x')`,
       [B],
     );
-    const s = await loadLedgerSettings({ businessId: B });
+    const s = await withBusiness(B, (db) => loadLedgerSettings(db));
     expect(s.modes.projects).toBe('remind');
     expect(s.modes.warm_leads).toBe('act');
   });
@@ -125,25 +125,25 @@ describe('ledger settings', () => {
 
 describe('critical rules', () => {
   it('adds, lists (scoped by business) and removes', async () => {
-    const r = await addCriticalRule({ kind: 'counterparty', match: 'DANA@X.co' }, { businessId: B, by: 'owner' });
+    const r = await withBusiness(B, (db) => addCriticalRule(db, { kind: 'counterparty', match: 'DANA@X.co' }, { by: 'owner' }));
     expect(r.ruleId).toMatch(/^LC-/);
     expect(r).toMatchObject({ kind: 'counterparty', match: 'dana@x.co' });
-    await addCriticalRule({ kind: 'family', family: 'money_in' }, { businessId: B, by: 'owner' });
-    await addCriticalRule({ kind: 'amount_over', amountMinor: 500000 }, { businessId: 'other', by: 'owner' });
-    expect(await listCriticalRules({ businessId: B })).toHaveLength(2);
-    await removeCriticalRule(r.ruleId, { businessId: 'other' });
-    expect(await listCriticalRules({ businessId: B })).toHaveLength(2);
-    await removeCriticalRule(r.ruleId, { businessId: B });
-    expect(await listCriticalRules({ businessId: B })).toHaveLength(1);
+    await withBusiness(B, (db) => addCriticalRule(db, { kind: 'family', family: 'money_in' }, { by: 'owner' }));
+    await withBusiness('other', (db) => addCriticalRule(db, { kind: 'amount_over', amountMinor: 500000 }, { by: 'owner' }));
+    expect(await withBusiness(B, (db) => listCriticalRules(db))).toHaveLength(2);
+    await withBusiness('other', (db) => removeCriticalRule(db, r.ruleId));
+    expect(await withBusiness(B, (db) => listCriticalRules(db))).toHaveLength(2);
+    await withBusiness(B, (db) => removeCriticalRule(db, r.ruleId));
+    expect(await withBusiness(B, (db) => listCriticalRules(db))).toHaveLength(1);
   });
 
   it('refuses an empty counterparty match and a non-positive-integer amount, in Hebrew', async () => {
     const o = { businessId: B, by: 'owner' };
-    await expect(addCriticalRule({ kind: 'counterparty', match: '   ' }, o)).rejects.toThrow(/[א-ת]/);
-    await expect(addCriticalRule({ kind: 'amount_over', amountMinor: 0 }, o)).rejects.toThrow(/[א-ת]/);
-    await expect(addCriticalRule({ kind: 'amount_over', amountMinor: 1.5 }, o)).rejects.toThrow(/[א-ת]/);
-    await expect(addCriticalRule({ kind: 'amount_over', amountMinor: -5 }, o)).rejects.toThrow(/[א-ת]/);
-    expect(await listCriticalRules({ businessId: B })).toHaveLength(0);
+    await expect(withBusiness(B, (db) => addCriticalRule(db, { kind: 'counterparty', match: '   ' }, o))).rejects.toThrow(/[א-ת]/);
+    await expect(withBusiness(B, (db) => addCriticalRule(db, { kind: 'amount_over', amountMinor: 0 }, o))).rejects.toThrow(/[א-ת]/);
+    await expect(withBusiness(B, (db) => addCriticalRule(db, { kind: 'amount_over', amountMinor: 1.5 }, o))).rejects.toThrow(/[א-ת]/);
+    await expect(withBusiness(B, (db) => addCriticalRule(db, { kind: 'amount_over', amountMinor: -5 }, o))).rejects.toThrow(/[א-ת]/);
+    expect(await withBusiness(B, (db) => listCriticalRules(db))).toHaveLength(0);
   });
 });
 

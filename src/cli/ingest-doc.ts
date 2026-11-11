@@ -14,7 +14,8 @@
  */
 import { stat } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { closePool } from '../db/pool.js';
+import { config } from '../config.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { loadArtifacts } from '../documents/store.js';
 import type { DocumentSource } from '../documents/types.js';
@@ -88,14 +89,15 @@ export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise
   }
 
   const options = {
-    ...(deps.businessId !== undefined ? { businessId: deps.businessId } : {}),
     ...(deps.documentRoot !== undefined ? { documentRoot: deps.documentRoot } : {}),
   };
+  const businessId = deps.businessId ?? config.businessId;
 
-  const doc = await ingestDocument(
+  const doc = await withBusiness(businessId, (db) => ingestDocument( // TENANCY-TODO(task 7)
+    db,
     { path, source, originalName: basename(path) },
     options,
-  );
+  ));
 
   log(`מסמך ${doc.documentId}`);
   log(`מקור: ${documentSourceLabel[doc.source]}`);
@@ -114,7 +116,7 @@ export async function runIngestCli(argv: string[], deps: IngestCliDeps): Promise
   }
 
   if (doc.status === 'extracted') {
-    const artifacts = await loadArtifacts(doc.documentId, options);
+    const artifacts = await withBusiness(businessId, (db) => loadArtifacts(db, doc.documentId)); // TENANCY-TODO(task 7)
     for (const artifact of artifacts) {
       log(`רכיב: ${artifact.kind} — ${artifact.partName ?? '(ללא שם)'}`);
     }

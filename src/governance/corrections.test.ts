@@ -119,7 +119,7 @@ describe('recordCorrection', () => {
       }
     ));
 
-    const rows = await recallMemories({ subjectKey: 'dana@example.com' }, { businessId: BUSINESS });
+    const rows = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'dana@example.com' }));
     expect(rows).toHaveLength(1);
     expect(rows[0]?.provenance).toBe('boss');
   });
@@ -183,7 +183,7 @@ describe('recordCorrection', () => {
       { jobId: secondJob, stepId: 's1', actionClass: 'email.reply', note: 'השני', by: 'owner@example.com' }
     ));
 
-    const live = await recallMemories({ subjectKey: 'dana@example.com' }, { businessId: BUSINESS });
+    const live = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'dana@example.com' }));
     expect(live).toHaveLength(1);
     expect(JSON.stringify(live[0]?.body)).toContain('השני');
   });
@@ -224,7 +224,7 @@ describe('recordCorrection', () => {
       }
     ));
 
-    const live = await recallMemories({ subjectKey: 'dana@example.com' }, { businessId: BUSINESS });
+    const live = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'dana@example.com' }));
     expect(live).toHaveLength(2);
     expect(live.map((row) => row.attribute).sort()).toEqual(
       ['תיקון — calendar.create', 'תיקון — email.reply'].sort(),

@@ -10,7 +10,7 @@ import { documentKindLabel } from '../domain/labels.js';
 import { saveDocumentSettings } from '../governance/document-settings.js';
 import { runLocalTool } from '../orchestrator/local-tools.js';
 import { StepChannelError } from '../orchestrator/step-error.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import { resolveSaveTarget, saveVersionToFolder, SAVE_FAILURE_HE } from './save.js';
 import { createProduction, saveVersion } from './store.js';
 
@@ -235,8 +235,7 @@ describe('doc.save handler', () => {
   const bytes = Buffer.from('PK\x03\x04 the approved xlsx');
 
   async function produced(businessId = B): Promise<string> {
-    const productionId = await createProduction({
-      businessId,
+    const productionId = await withBusiness(businessId, (db) => createProduction(db, {
       originJobId: 'J-origin',
       instructionText: 'תכיני טבלה',
       textOrigin: 'typed',
@@ -245,11 +244,11 @@ describe('doc.save handler', () => {
       kind: 'profit_table',
       destination: { mode: 'save', folder: null },
       sourceDocumentIds: [],
-    });
+    }));
     const storedPath = `${DIR}/${productionId}.xlsx`;
     await mkdir(join(config.documentRoot, DIR), { recursive: true });
     await writeFile(join(config.documentRoot, storedPath), bytes);
-    return saveVersion({ productionId, versionNo: 1, spec, storedPath, sha256: sha(bytes), sizeBytes: bytes.length });
+    return withBusiness(TEST_BUSINESS, (db) => saveVersion(db, { productionId, versionNo: 1, spec, storedPath, sha256: sha(bytes), sizeBytes: bytes.length }));
   }
 
   async function deliveryCard(versionId: string, businessId = B): Promise<void> {

@@ -20,7 +20,7 @@ import type { DocumentSpec, DocxSpec, PdfSpec } from '../domain/document-spec.js
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import type { DraftRequest, Drafter } from '../sdk/doc-drafter.js';
 import type { DocJudge } from '../sdk/doc-judge.js';
-import { resetDatabase } from '../test/db.js';
+import { resetDatabase, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { runCheck1, type Check1Input } from './check1.js';
 import {
@@ -104,10 +104,9 @@ async function originJob(): Promise<string> {
   return job.jobId;
 }
 
-async function produce(over: Partial<Parameters<typeof createProduction>[0]> = {}): Promise<{ id: string; jobId: string }> {
+async function produce(over: Partial<Parameters<typeof createProduction>[1]> = {}): Promise<{ id: string; jobId: string }> {
   const jobId = await originJob();
-  const id = await createProduction({
-    businessId: B,
+  const id = await withBusiness(B, (db) => createProduction(db, {
     originJobId: jobId,
     instructionText: 'תכיני מכתב תודה ללקוח',
     textOrigin: 'typed',
@@ -117,15 +116,14 @@ async function produce(over: Partial<Parameters<typeof createProduction>[0]> = {
     destination: { mode: 'save', folder: null },
     sourceDocumentIds: [],
     ...over,
-  });
+  }));
   return { id, jobId };
 }
 
 function run(over: Partial<RunProductionsOptions> & { drafter: Drafter }) {
   const finished: ProductionFinished[] = [];
   const renderer = rendererOf();
-  const promise = runDocumentProductions({
-    businessId: B,
+  const promise = withBusiness(B, (db) => runDocumentProductions(db, {
     now: NOW,
     documentRoot: root,
     judge: passingJudge,
@@ -138,13 +136,13 @@ function run(over: Partial<RunProductionsOptions> & { drafter: Drafter }) {
       finished.push(f);
     },
     ...over,
-  });
+  }));
   return { promise, finished, renderer };
 }
 
 beforeEach(async () => {
   await resetDatabase();
-  charterVersion = (await withBusiness(B, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 5)
+  charterVersion = (await withBusiness(B, (bdb) => installCharter(bdb, buildCharter()))).charterVersion;
   root = await mkdtemp(join(tmpdir(), 'produced-'));
 });
 afterEach(async () => {
@@ -164,14 +162,14 @@ describe('runDocumentProductions', () => {
     expect(result).toMatchObject({ ready: 1, failedChecks: 0, failed: 0, skipped: 0, errored: [] });
     expect(drafter.calls).toHaveLength(1);
     expect(drafter.calls[0]!.today).toBe('2026-11-04');
-    const p = await loadProduction(B, id);
+    const p = await withBusiness(B, (db) => loadProduction(db, id));
     expect(p?.stage).toBe('ready');
     expect(p?.attempt).toBe(0);
     expect(p?.work.finished).toBe(true);
 
     const { rows } = await getPool().query('SELECT * FROM document_versions WHERE production_id = $1', [id]);
     expect(rows).toHaveLength(1);
-    const version = await latestVersion(id);
+    const version = await withBusiness(TEST_BUSINESS, (db) => latestVersion(db, id));
     const bytes = await readFile(join(root, version!.storedPath));
     expect(createHash('sha256').update(bytes).digest('hex')).toBe(version!.sha256);
     expect(version!.storedPath).toBe(join('produced', B, id, `${version!.versionId}.docx`));
@@ -199,7 +197,7 @@ describe('runDocumentProductions', () => {
     const result = await r.promise;
 
     expect(result).toMatchObject({ ready: 1, errored: [] });
-    const p = await loadProduction(B, id);
+    const p = await withBusiness(B, (db) => loadProduction(db, id));
     expect(p?.stage).toBe('ready');
     expect(p?.attempt).toBe(2);
     expect(drafter.calls).toHaveLength(3);
@@ -223,13 +221,13 @@ describe('runDocumentProductions', () => {
 
     expect(result).toMatchObject({ failedChecks: 1, ready: 0, errored: [] });
     expect(drafter.calls).toHaveLength(3);
-    const p = await loadProduction(B, id);
+    const p = await withBusiness(B, (db) => loadProduction(db, id));
     expect(p?.stage).toBe('failed_checks');
     expect(p?.attempt).toBe(2);
     expect(p?.findings).toContainEqual(
       expect.objectContaining({ check: 'check1', code: 'cap_exceeded', he: 'המסמך ארוך מהמותר' }),
     );
-    const version = await latestVersion(id);
+    const version = await withBusiness(TEST_BUSINESS, (db) => latestVersion(db, id));
     expect(version?.versionNo).toBe(3);
     expect(r.finished).toEqual([{ productionId: id, versionId: version!.versionId, stage: 'failed_checks', reason: null }]);
     expect((await withBusiness(B, (db) => loadJob(db, jobId)))?.phase).toBe('closed');
@@ -250,8 +248,8 @@ describe('runDocumentProductions', () => {
     });
     const crashed = await first.promise;
     expect(crashed?.errored).toEqual([{ productionId: id, error: 'simulated crash' }]);
-    expect((await loadProduction(B, id))?.stage).toBe('building');
-    expect((await latestVersion(id))?.versionNo).toBe(1);
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.stage).toBe('building');
+    expect((await withBusiness(TEST_BUSINESS, (db) => latestVersion(db, id)))?.versionNo).toBe(1);
     expect(first.renderer.calls).toHaveLength(0);
 
     const second = run({ drafter: drafter.fn });
@@ -299,7 +297,7 @@ describe('runDocumentProductions', () => {
     expect(resumed).toMatchObject({ ready: 1, errored: [] });
     expect(printed).toHaveLength(1);
     expect(seen).toEqual([printed[0]]);
-    expect((await loadProduction(B, id))?.stage).toBe('ready');
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.stage).toBe('ready');
   });
 
   it('the 21st production of the local day is refused with the Hebrew cap reason and the drafter never runs', async () => {
@@ -318,7 +316,7 @@ describe('runDocumentProductions', () => {
 
     expect(drafter.calls).toHaveLength(0);
     expect(result).toMatchObject({ failed: 1, errored: [] });
-    const p = await loadProduction(B, id);
+    const p = await withBusiness(B, (db) => loadProduction(db, id));
     expect(p?.stage).toBe('failed');
     expect(p?.work.reason).toBe(productionCapReason(20));
     expect(p?.work.drafted).toBe(false);
@@ -353,10 +351,10 @@ describe('runDocumentProductions', () => {
 
     expect(drafter.calls).toHaveLength(1);
     expect(result).toMatchObject({ ready: 0, errored: [] });
-    expect((await loadProduction(B, a.id))?.stage).toBe('building');
-    expect((await loadProduction(B, b.id))?.stage).toBe('queued');
+    expect((await withBusiness(B, (db) => loadProduction(db, a.id)))?.stage).toBe('building');
+    expect((await withBusiness(B, (db) => loadProduction(db, b.id)))?.stage).toBe('queued');
     // The lease was released: the next pass picks up where this one stopped.
-    expect((await loadProduction(B, a.id))?.leasedBy).toBeNull();
+    expect((await withBusiness(B, (db) => loadProduction(db, a.id)))?.leasedBy).toBeNull();
     t = 0;
     const next = await run({ drafter: drafter.fn, clock: () => 0 }).promise;
     expect(next).toMatchObject({ ready: 2 });
@@ -370,7 +368,7 @@ describe('runDocumentProductions', () => {
 
     expect(drafter.calls).toHaveLength(1);
     expect(result).toMatchObject({ failed: 1, errored: [] });
-    const p = await loadProduction(B, id);
+    const p = await withBusiness(B, (db) => loadProduction(db, id));
     expect(p?.stage).toBe('failed');
     expect(p?.work.reason).toBe('ניסוח המסמך לא הסתיים בזמן');
     expect(r.finished[0]).toMatchObject({ stage: 'failed', reason: 'ניסוח המסמך לא הסתיים בזמן', versionId: null });
@@ -380,7 +378,7 @@ describe('runDocumentProductions', () => {
   it('an undrafted outcome → failed; a render error → failed with its Hebrew reason', async () => {
     const one = await produce();
     await run({ drafter: drafterOf(['undrafted']).fn }).promise;
-    expect((await loadProduction(B, one.id))?.work.reason).toBe('לא הצלחתי לנסח את המסמך מהבקשה ומהמקורות');
+    expect((await withBusiness(B, (db) => loadProduction(db, one.id)))?.work.reason).toBe('לא הצלחתי לנסח את המסמך מהבקשה ומהמקורות');
 
     const { id } = await produce({ format: 'pdf' });
     const pdfSpec: PdfSpec = { ...letter(), format: 'pdf' };
@@ -392,7 +390,7 @@ describe('runDocumentProductions', () => {
       },
     }).promise;
     expect(r).toMatchObject({ failed: 1 });
-    expect((await loadProduction(B, id))?.work.reason).toBe('בניית ה-PDF חרגה ממגבלת הזיכרון של השרת');
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.work.reason).toBe('בניית ה-PDF חרגה ממגבלת הזיכרון של השרת');
   });
 
   it('an unjudged check 2 fails closed into a fix round', async () => {
@@ -402,7 +400,7 @@ describe('runDocumentProductions', () => {
     const result = await run({ drafter: drafter.fn, judge: unjudged }).promise;
     expect(result).toMatchObject({ failedChecks: 1 });
     expect(drafter.calls).toHaveLength(3);
-    expect((await loadProduction(B, id))?.findings).toEqual([
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.findings).toEqual([
       { check: 'check2', code: 'unjudged', where: 'document', he: CHECK2_UNJUDGED_HE },
     ]);
   });
@@ -429,12 +427,11 @@ describe('runDocumentProductions', () => {
 
   it('returns null when production tools are unavailable and nothing is injected', async () => {
     await produce();
-    expect(await runDocumentProductions({ businessId: B })).toBeNull();
+    expect(await withBusiness(B, (db) => runDocumentProductions(db))).toBeNull();
     expect(
-      await runDocumentProductions({
-        businessId: B,
+      await withBusiness(B, (db) => runDocumentProductions(db, {
         production: { available: false, sofficePath: null, chromiumPath: null },
-      }),
+      })),
     ).toBeNull();
   });
 
@@ -472,16 +469,15 @@ describe('fix round 1', () => {
   it('missing tools: the pass is null, but queued rows end failed with the tools reason and the origin job fails', async () => {
     const { id, jobId } = await produce();
     const finished: ProductionFinished[] = [];
-    const result = await runDocumentProductions({
-      businessId: B,
+    const result = await withBusiness(B, (db) => runDocumentProductions(db, {
       now: NOW,
       production: { available: false, sofficePath: null, chromiumPath: null },
       onFinished: async (f) => {
         finished.push(f);
       },
-    });
+    }));
     expect(result).toBeNull();
-    const p = await loadProduction(B, id);
+    const p = await withBusiness(B, (db) => loadProduction(db, id));
     expect(p?.stage).toBe('failed');
     expect(p?.work.reason).toBe(PRODUCTION_TOOLS_MISSING_REASON);
     expect(p?.work.finished).toBe(true);
@@ -495,7 +491,7 @@ describe('fix round 1', () => {
     const r = run({ drafter: drafter.fn });
     expect(await r.promise).toMatchObject({ failedChecks: 1 });
     expect(drafter.calls).toHaveLength(3);
-    expect((await loadProduction(B, id))?.findings[0]).toMatchObject({ check: 'spec', code: 'ungrounded_number' });
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.findings[0]).toMatchObject({ check: 'spec', code: 'ungrounded_number' });
     expect(r.finished).toEqual([{ productionId: id, versionId: null, stage: 'failed_checks', reason: null }]);
   });
 
@@ -503,7 +499,7 @@ describe('fix round 1', () => {
     const { id } = await produce();
     const r = run({ drafter: drafterOf([letter(BAD_TITLE), letter(BAD_TITLE), ungrounded()]).fn });
     expect(await r.promise).toMatchObject({ failedChecks: 1 });
-    expect((await latestVersion(id))?.versionNo).toBe(2);
+    expect((await withBusiness(TEST_BUSINESS, (db) => latestVersion(db, id)))?.versionNo).toBe(2);
     expect(r.finished[0]).toMatchObject({ stage: 'failed_checks', versionId: null });
   });
 
@@ -514,7 +510,7 @@ describe('fix round 1', () => {
     };
     const r = run({ drafter: drafterOf([letter()]).fn, judge });
     expect(await r.promise).toMatchObject({ failed: 1 });
-    expect((await latestVersion(id))?.versionNo).toBe(1);
+    expect((await withBusiness(TEST_BUSINESS, (db) => latestVersion(db, id)))?.versionNo).toBe(1);
     expect(r.finished[0]).toMatchObject({ stage: 'failed', versionId: null, reason: 'הבדיקה השנייה של המסמך נכשלה' });
   });
 
@@ -522,11 +518,11 @@ describe('fix round 1', () => {
     const { id } = await produce();
     const drafter = drafterOf([letter()]);
     await run({ drafter: drafter.fn, checkpoint: crashAt('version_saved') }).promise;
-    const v = await latestVersion(id);
+    const v = await withBusiness(TEST_BUSINESS, (db) => latestVersion(db, id));
     await rm(join(root, v!.storedPath));
     const result = await run({ drafter: drafter.fn }).promise;
     expect(result).toMatchObject({ failed: 1, errored: [] });
-    expect((await loadProduction(B, id))?.work.reason).toBe(FILE_CHANGED_REASON);
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.work.reason).toBe(FILE_CHANGED_REASON);
   });
 
   it('invariant breaks end failed with render_failed, never an endless errored', async () => {
@@ -543,7 +539,7 @@ describe('fix round 1', () => {
     const result = await run({ drafter: drafterOf([letter()]).fn }).promise;
     expect(result).toMatchObject({ failed: 2, errored: [] });
     for (const id of [noDraft.id, noVersion.id]) {
-      const p = await loadProduction(B, id);
+      const p = await withBusiness(B, (db) => loadProduction(db, id));
       expect(p?.stage).toBe('failed');
       expect(p?.work.reason).toBe(RENDER_ERROR_HE.render_failed);
     }
@@ -553,7 +549,7 @@ describe('fix round 1', () => {
     const { id } = await produce({ originJobId: 'J-gone' });
     const r = run({ drafter: drafterOf([letter()]).fn });
     expect(await r.promise).toMatchObject({ ready: 1, errored: [], originJobMissing: [id] });
-    expect((await loadProduction(B, id))?.work.finished).toBe(true);
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.work.finished).toBe(true);
     expect(r.finished).toHaveLength(1);
     // Next pass: nothing left to finish.
     expect(await run({ drafter: drafterOf([letter()]).fn }).promise).toMatchObject({
@@ -595,7 +591,7 @@ describe('fix round 1', () => {
     };
     const r = run({ drafter: slow, clock: () => t, budgetMs: 120_000 });
     await r.promise;
-    expect((await loadProduction(B, id))?.stage).toBe('check1');
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.stage).toBe('check1');
     expect(r.renderer.calls).toHaveLength(0);
   });
 
@@ -607,7 +603,7 @@ describe('fix round 1', () => {
       return runCheck1(input);
     };
     await run({ drafter: drafterOf([letter()]).fn, check1, checkpoint: crashAt('check1_saved') }).promise;
-    expect((await loadProduction(B, id))?.stage).toBe('check1');
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.stage).toBe('check1');
     const second = run({ drafter: drafterOf([letter()]).fn, check1 });
     expect(await second.promise).toMatchObject({ ready: 1 });
     expect(checks).toBe(1);
@@ -622,7 +618,7 @@ describe('fix round 1', () => {
       return passingJudge(request);
     };
     await run({ drafter: drafterOf([letter()]).fn, judge, checkpoint: crashAt('check2_saved') }).promise;
-    expect((await loadProduction(B, id))?.stage).toBe('check2');
+    expect((await withBusiness(B, (db) => loadProduction(db, id)))?.stage).toBe('check2');
     const second = run({ drafter: drafterOf([letter()]).fn, judge });
     expect(await second.promise).toMatchObject({ ready: 1 });
     expect(judged).toBe(1);

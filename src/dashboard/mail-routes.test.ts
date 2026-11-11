@@ -135,7 +135,7 @@ describe('GET /mail', () => {
 
   it('shows the over-cap banner on the row', async () => {
     const mail = await storedMail(BUSINESS, { providerMessageId: 'PM-C' });
-    await markOverCap(mail.mailId, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => markOverCap(db, mail.mailId));
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const html = await (await get(baseUrl, cookie, '/mail')).text();
@@ -151,9 +151,9 @@ describe('GET /mail', () => {
 
   it('shows the reconnect-gap banner and Hebrew notes for error codes', async () => {
     const mail = await storedMail(BUSINESS, { providerMessageId: 'PM-G' });
-    await settleMail(mail.mailId, { state: 'triaged', categories: ['other'] }, { businessId: BUSINESS });
-    await noteMailError(mail.mailId, 'notify_failed', { businessId: BUSINESS });
-    await setCursor({ provider: 'google', cursor: 'c', lastError: null }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => settleMail(db, mail.mailId, { state: 'triaged', categories: ['other'] }));
+    await withBusiness(BUSINESS, (db) => noteMailError(db, mail.mailId, 'notify_failed'));
+    await withBusiness(BUSINESS, (db) => setCursor(db, { provider: 'google', cursor: 'c', lastError: null }));
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const html = await (await get(baseUrl, cookie, '/mail')).text();
@@ -172,7 +172,7 @@ describe('GET /mail', () => {
 
   it('filters by category and by sender', async () => {
     const a = await storedMail(BUSINESS, { providerMessageId: 'PM-1', subject: 'חשבונית מאי', fromAddress: 'a@x.example' });
-    await settleMail(a.mailId, { state: 'triaged', categories: ['invoice'] }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => settleMail(db, a.mailId, { state: 'triaged', categories: ['invoice'] }));
     await storedMail(BUSINESS, { providerMessageId: 'PM-2', subject: 'הצעת מחיר', fromAddress: 'b@y.example' });
     const baseUrl = await start();
     const cookie = await login(baseUrl);
@@ -191,21 +191,21 @@ describe('GET /mail/invoices', () => {
     const m2 = await storedMail(BUSINESS, { providerMessageId: 'I-2' });
     const m3 = await storedMail(BUSINESS, { providerMessageId: 'I-3' });
     await addDocument(BUSINESS, 'doc1');
-    await insertInvoice(
+    await withBusiness(BUSINESS, (db) => insertInvoice(
+      db,
       { mailId: m1.mailId, supplierAddress: 'acc@sup1.example', supplierName: 'ספק ראשון', invoiceNumber: 'INV-100',
         amountText: '1,200 ש"ח', documentId: 'doc1', fileName: 'a.pdf', receivedAt: '2026-10-01T10:00:00.000Z' },
-      { businessId: BUSINESS },
-    );
-    await insertInvoice(
+    ));
+    await withBusiness(BUSINESS, (db) => insertInvoice(
+      db,
       { mailId: m2.mailId, supplierAddress: 'acc@sup1.example', supplierName: 'ספק ראשון', invoiceNumber: 'INV-200',
         amountText: null, documentId: null, fileName: null, receivedAt: '2026-10-05T10:00:00.000Z' },
-      { businessId: BUSINESS },
-    );
-    await insertInvoice(
+    ));
+    await withBusiness(BUSINESS, (db) => insertInvoice(
+      db,
       { mailId: m3.mailId, supplierAddress: 'x@sup2.example', supplierName: 'ספק שני', invoiceNumber: 'ZZ-1',
         amountText: '50', documentId: null, fileName: null, receivedAt: '2026-10-03T10:00:00.000Z' },
-      { businessId: BUSINESS },
-    );
+    ));
   }
 
   it('groups by supplier, newest first, marks unverified, links original mail and download', async () => {
@@ -315,8 +315,8 @@ describe('fix round 1', () => {
   it('links an attachment document, business-scoped, leaving the others untouched', async () => {
     const mail = await storedMail(BUSINESS, { providerMessageId: 'L-1', attachments: [pdf('a1', 'one.pdf'), pdf('a2', 'two.pdf')] });
     const other = await storedMail(OTHER, { providerMessageId: 'L-2', attachments: [pdf('a1', 'one.pdf')] });
-    await linkAttachmentDocument(mail.mailId, 'a2', 'docZ', { businessId: OTHER });
-    await linkAttachmentDocument(mail.mailId, 'a2', 'docZ', { businessId: BUSINESS });
+    await withBusiness(OTHER, (db) => linkAttachmentDocument(db, mail.mailId, 'a2', 'docZ'));
+    await withBusiness(BUSINESS, (db) => linkAttachmentDocument(db, mail.mailId, 'a2', 'docZ'));
     const { rows } = await getPool().query('SELECT mail_id, attachments FROM mail_messages');
     const byId = new Map(rows.map((r) => [r.mail_id, r.attachments]));
     expect(byId.get(mail.mailId)).toEqual([pdf('a1', 'one.pdf'), { ...pdf('a2', 'two.pdf'), documentId: 'docZ' }]);
@@ -325,12 +325,12 @@ describe('fix round 1', () => {
 
   it('a document-category mail with PDFs shows working downloads for every linked attachment', async () => {
     const m = await storedMail(BUSINESS, { providerMessageId: 'D-1', attachments: [pdf('a1', 'offer.pdf'), pdf('a2', 'terms.pdf')] });
-    await settleMail(m.mailId, { state: 'triaged', categories: ['document'] }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => settleMail(db, m.mailId, { state: 'triaged', categories: ['document'] }));
     await addDocument(BUSINESS, 'docP1');
     await addDocument(BUSINESS, 'docP2');
     await writeFor(BUSINESS, 'docP1');
-    await linkAttachmentDocument(m.mailId, 'a1', 'docP1', { businessId: BUSINESS });
-    await linkAttachmentDocument(m.mailId, 'a2', 'docP2', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => linkAttachmentDocument(db, m.mailId, 'a1', 'docP1'));
+    await withBusiness(BUSINESS, (db) => linkAttachmentDocument(db, m.mailId, 'a2', 'docP2'));
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const detail = await (await get(baseUrl, cookie, `/mail/${m.mailId}`)).text();
@@ -348,10 +348,10 @@ describe('fix round 1', () => {
     const src = join(root, 'incoming-broken');
     const bytes = Buffer.concat([Buffer.from('%PDF-1.4\n%'), Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]), Buffer.from('\n1 0 obj\n')]);
     await writeFile(src, bytes);
-    const doc = await ingestDocument({ path: src, source: 'mail', originalName: 'broken.pdf' }, { businessId: BUSINESS, documentRoot: root });
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(db, { path: src, source: 'mail', originalName: 'broken.pdf' }, { documentRoot: root }));
     expect(doc.status).toBe('stored');
     expect(doc.reason).toMatch(/^הפענוח נכשל: /);
-    await linkAttachmentDocument(m.mailId, 'a1', doc.documentId, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => linkAttachmentDocument(db, m.mailId, 'a1', doc.documentId));
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const detail = await (await get(baseUrl, cookie, `/mail/${m.mailId}`)).text();
@@ -367,7 +367,7 @@ describe('fix round 1', () => {
   it('does not offer a download for a linked document that was rejected', async () => {
     const m = await storedMail(BUSINESS, { providerMessageId: 'D-2', attachments: [pdf('a1', 'bad.pdf')] });
     await addDocument(BUSINESS, 'docBad', { status: 'rejected' });
-    await linkAttachmentDocument(m.mailId, 'a1', 'docBad', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => linkAttachmentDocument(db, m.mailId, 'a1', 'docBad'));
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const detail = await (await get(baseUrl, cookie, `/mail/${m.mailId}`)).text();
@@ -393,7 +393,7 @@ describe('fix round 1', () => {
   }
 
   it('shows the gap banner from the durable audit row even after the cursor error was cleared', async () => {
-    await setCursor({ provider: 'google', cursor: 'c', lastError: null }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setCursor(db, { provider: 'google', cursor: 'c', lastError: null }));
     await auditGap(0);
     const baseUrl = await start();
     const cookie = await login(baseUrl);
@@ -410,7 +410,7 @@ describe('fix round 1', () => {
   });
 
   it('shows a generic banner for other cursor errors', async () => {
-    await setCursor({ provider: 'google', cursor: 'c', lastError: 'list_transient' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setCursor(db, { provider: 'google', cursor: 'c', lastError: 'list_transient' }));
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const html = await (await get(baseUrl, cookie, '/mail')).text();
@@ -420,11 +420,11 @@ describe('fix round 1', () => {
 
   it('strips bidi controls from invoice number and amount, snippet and body', async () => {
     const m = await storedMail(BUSINESS, { providerMessageId: 'B-1', bodyText: 'abc\u202Edef משלוח⁧ x' });
-    await insertInvoice(
+    await withBusiness(BUSINESS, (db) => insertInvoice(
+      db,
       { mailId: m.mailId, supplierAddress: 's@x.example', supplierName: null, invoiceNumber: 'N\u202E1',
         amountText: '9\u202E00', documentId: null, fileName: null, receivedAt: '2026-10-01T10:00:00.000Z' },
-      { businessId: BUSINESS },
-    );
+    ));
     const baseUrl = await start();
     const cookie = await login(baseUrl);
     const inv = await (await get(baseUrl, cookie, '/mail/invoices')).text();
@@ -469,16 +469,17 @@ describe('PDF summaries and the documents screen', () => {
     });
     for (const a of given) {
       const id = a['attachmentId'] as string;
-      await annotateAttachment(
-        m.mailId, id,
+      await withBusiness(businessId, (db) => annotateAttachment(
+        db,
+        m.mailId,
+        id,
         {
           ...(a['docType'] !== undefined ? { docType: a['docType'] as never } : {}),
           ...(a['summary'] !== undefined ? { summary: a['summary'] as string } : {}),
           ...(a['scanned'] !== undefined ? { scanned: a['scanned'] as boolean } : {}),
         },
-        { businessId },
-      );
-      if (a['documentId'] !== undefined) await linkAttachmentDocument(m.mailId, id, a['documentId'] as string, { businessId });
+      ));
+      if (a['documentId'] !== undefined) await withBusiness(businessId, (db) => linkAttachmentDocument(db, m.mailId, id, a['documentId'] as string));
     }
     return m;
   }

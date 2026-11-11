@@ -119,10 +119,7 @@ export async function proposeForReading(
     throw new Error(`proposeForReading: no job ${input.jobId} for business ${businessId}`);
   }
 
-  const reading = await loadLatestReading(input.documentId, job.provenance, {
-    businessId,
-    db,
-  });
+  const reading = await loadLatestReading(db, input.documentId, job.provenance);
   if (reading === null || reading.content === null) {
     return { status: 'no_reading' };
   }

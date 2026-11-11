@@ -67,10 +67,11 @@ async function aDocument(text: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'cd-'));
   const path = join(dir, `${text.slice(0, 6)}.txt`);
   await writeFile(path, text, 'utf8');
-  const doc = await ingestDocument(
+  const doc = await withBusiness(BUSINESS, (db) => ingestDocument(
+    db,
     { path, source: 'manual' },
-    { businessId: BUSINESS, documentRoot: dir },
-  );
+    { documentRoot: dir },
+  ));
   return doc.documentId;
 }
 
@@ -741,10 +742,11 @@ describe('conductPendingDocuments and mail-sourced documents', () => {
     const dir = await mkdtemp(join(tmpdir(), 'cd-mail-'));
     const path = join(dir, 'from-mail.txt');
     await writeFile(path, 'מסמך שהגיע במייל', 'utf8');
-    const doc = await ingestDocument(
+    const doc = await withBusiness(BUSINESS, (db) => ingestDocument(
+      db,
       { path, source: 'mail' },
-      { businessId: BUSINESS, documentRoot: dir },
-    );
+      { documentRoot: dir },
+    ));
     expect(doc.status).toBe('extracted');
     const d = deps();
 

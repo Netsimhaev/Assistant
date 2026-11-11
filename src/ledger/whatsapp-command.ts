@@ -38,7 +38,7 @@
  * Cost: on a one-item batch the owner types "1 בטלי", not "בטלי".
  */
 import { monotonicFactory } from 'ulid';
-import { getPool, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { ledgerStatusLabel } from '../domain/labels.js';
 import type { LedgerItem, LedgerStatus } from '../domain/ledger.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
@@ -46,7 +46,7 @@ import { localParts, localToInstant } from '../util/local-time.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
 import { claimMessage, settleMessage } from '../whatsapp/store.js';
 import { loadLedgerSettings } from './settings.js';
-import { atomically, loadLedgerItem, moveLedgerStatus } from './store.js';
+import { loadLedgerItem, moveLedgerStatus } from './store.js';
 
 const ulid = monotonicFactory();
 
@@ -162,16 +162,18 @@ export function readLedgerCommand(text: string, o: { now: Date; timeZone: string
 
 export type LedgerApplyOutcome = 'applied' | 'not_applicable' | 'lost_race';
 
-interface ApplyOpts {
-  businessId: string;
+export interface ApplyLedgerOptions {
   by: string;
   now: Date;
   timeZone: string;
-  db?: Queryable;
+}
+
+interface ApplyOpts extends ApplyLedgerOptions {
+  db: BusinessDb;
 }
 
 async function insertEvent(
-  tx: Queryable,
+  tx: BusinessDb,
   businessId: string,
   itemId: string,
   kind: string,
@@ -205,10 +207,7 @@ async function move(
   o: ApplyOpts,
 ): Promise<LedgerApplyOutcome> {
   if (!from.includes(item.status)) return 'not_applicable';
-  const moved = await moveLedgerStatus(item.itemId, from, to, { kind, by: o.by }, {
-    businessId: o.businessId,
-    ...(o.db !== undefined ? { db: o.db } : {}),
-  });
+  const moved = await moveLedgerStatus(o.db, item.itemId, from, to, { kind, by: o.by });
   return moved ? 'applied' : 'lost_race';
 }
 
@@ -218,7 +217,6 @@ async function snooze(
   o: ApplyOpts,
 ): Promise<LedgerApplyOutcome> {
   if (!SNOOZE_FROM.includes(item.status)) return 'not_applicable';
-  const db = o.db ?? getPool();
   const today = localParts(o.now, o.timeZone).date;
   const date = to === 'tomorrow' ? addDays(today, 1) : to.date;
   // A timed item keeps its hour; a date-only one lands on the daily hour —
@@ -226,24 +224,24 @@ async function snooze(
   const keptTime = item.dueAt !== null && !item.dueIsDateOnly ? localParts(item.dueAt, o.timeZone).time : null;
   let time = keptTime;
   if (time === null) {
-    const settings = await loadLedgerSettings({ businessId: o.businessId, db });
+    const settings = await loadLedgerSettings(o.db);
     time = `${String(settings.dailyHour).padStart(2, '0')}:00`;
   }
   const dueAt = localToInstant(date, time, o.timeZone);
   const reopening = item.status !== 'open';
 
-  return atomically(o.db, async (tx) => {
+  return transaction(o.db, async (tx) => {
     const res = await tx.query(
       `UPDATE ledger_items
           SET due_at = $3, due_is_date_only = $4, nudge_count = 0,
               status = 'open', closed_at = NULL, updated_at = now()
               ${reopening ? ', evidence_after = now()' : ''}
         WHERE business_id = $1 AND item_id = $2 AND status = ANY($5)`,
-      [o.businessId, item.itemId, dueAt, keptTime === null, [item.status]],
+      [tx.businessId, item.itemId, dueAt, keptTime === null, [item.status]],
     );
     if ((res.rowCount ?? 0) === 0) return 'lost_race';
-    await insertEvent(tx, o.businessId, item.itemId, 'snoozed', o.by, date);
-    if (reopening) await insertEvent(tx, o.businessId, item.itemId, 'reopened', o.by);
+    await insertEvent(tx, tx.businessId, item.itemId, 'snoozed', o.by, date);
+    if (reopening) await insertEvent(tx, tx.businessId, item.itemId, 'reopened', o.by);
     return 'applied';
   });
 }
@@ -255,14 +253,14 @@ async function conditional(
   kind: string,
   o: ApplyOpts,
 ): Promise<LedgerApplyOutcome> {
-  return atomically(o.db, async (tx) => {
+  return transaction(o.db, async (tx) => {
     const res = await tx.query(
       `UPDATE ledger_items SET ${setAndWhere.set}, updated_at = now()
         WHERE business_id = $1 AND item_id = $2 AND ${setAndWhere.where}`,
-      [o.businessId, item.itemId],
+      [tx.businessId, item.itemId],
     );
     if ((res.rowCount ?? 0) === 0) return 'lost_race';
-    await insertEvent(tx, o.businessId, item.itemId, kind, o.by);
+    await insertEvent(tx, tx.businessId, item.itemId, kind, o.by);
     return 'applied';
   });
 }
@@ -275,11 +273,13 @@ async function conditional(
  * `'lost_race'` and nothing is written.
  */
 export async function applyLedgerCommand(
+  db: BusinessDb,
   itemId: string,
   cmd: LedgerCommand,
-  o: ApplyOpts,
+  options: ApplyLedgerOptions,
 ): Promise<LedgerApplyOutcome> {
-  const item = await loadLedgerItem(itemId, { businessId: o.businessId, ...(o.db !== undefined ? { db: o.db } : {}) });
+  const o: ApplyOpts = { ...options, db };
+  const item = await loadLedgerItem(db, itemId);
   if (item === null) return 'not_applicable';
 
   switch (cmd.kind) {
@@ -346,35 +346,32 @@ function itemLine(item: LedgerItem): string {
  * an earlier delivery already has it), resolved against the latest batch
  * delivered before it, applied, and answered in Hebrew.
  */
-export async function handleLedgerWhatsApp(input: {
+export async function handleLedgerWhatsApp(db: BusinessDb, input: {
   text: string;
   messageId: string;
   inboundAt: Date;
-  businessId: string;
   by: string;
   now: Date;
   timeZone: string;
   messenger: BossMessenger;
   accept?: 'numbered' | 'bare' | 'any';
-  db?: Queryable;
 }): Promise<'passthrough' | 'applied' | 'refused' | 'skipped'> {
   const cmd = readLedgerCommand(input.text, { now: input.now, timeZone: input.timeZone });
   if (cmd === null) return 'passthrough';
   const accept = input.accept ?? 'any';
   if (accept === 'numbered' && cmd.n === null) return 'passthrough';
   if (accept === 'bare' && cmd.n !== null) return 'passthrough';
-  const db = input.db ?? getPool();
-  const scope = { businessId: input.businessId, ...(input.db !== undefined ? { db: input.db } : {}) };
+  const businessId = db.businessId;
 
   if (cmd.n === null) {
     const { rows } = await db.query(
       `SELECT 1 FROM ledger_whatsapp_batches WHERE business_id = $1 AND sent_at IS NOT NULL LIMIT 1`,
-      [input.businessId],
+      [businessId],
     );
     if (rows.length === 0) return 'passthrough';
   }
 
-  const claimed = await claimMessage(input.messageId, scope);
+  const claimed = await claimMessage(db, input.messageId);
   if (!claimed) return 'skipped';
 
   // The message is claimed, so it MUST be settled even when the reply cannot
@@ -386,7 +383,7 @@ export async function handleLedgerWhatsApp(input: {
     } catch {
       // the reply is lost; the settlement below still records the outcome
     }
-    await settleMessage(input.messageId, state, {}, scope);
+    await settleMessage(db, input.messageId, state, {});
   };
 
   let items: string[] | null = null;
@@ -396,7 +393,7 @@ export async function handleLedgerWhatsApp(input: {
         WHERE business_id = $1 AND sent_at IS NOT NULL AND sent_at < $2
         ORDER BY sent_at DESC, batch_id DESC
         LIMIT 1`,
-      [input.businessId, input.inboundAt],
+      [businessId, input.inboundAt],
     );
     items = rows[0]?.items ?? null;
   }
@@ -424,14 +421,12 @@ export async function handleLedgerWhatsApp(input: {
     return 'refused';
   }
 
-  const outcome = await applyLedgerCommand(itemId, cmd, {
-    businessId: input.businessId,
+  const outcome = await applyLedgerCommand(db, itemId, cmd, {
     by: input.by,
     now: input.now,
     timeZone: input.timeZone,
-    ...(input.db !== undefined ? { db: input.db } : {}),
   });
-  const after = await loadLedgerItem(itemId, scope);
+  const after = await loadLedgerItem(db, itemId);
   if (outcome === 'lost_race') {
     await answer(LEDGER_LOST_RACE, 'failed');
     return 'refused';

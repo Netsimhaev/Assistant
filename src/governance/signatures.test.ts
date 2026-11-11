@@ -9,11 +9,11 @@ const BUSINESS = 'test-business';
 
 async function aDocument(): Promise<string> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument({
+  await withBusiness(BUSINESS, (db) => insertOrGetDocument(db, {
     documentId, source: 'manual', originalName: 'חוזה.docx', mediaType: 'text/plain',
     sha256: 'a'.repeat(64), byteSize: 10,
     storedPath: `${BUSINESS}/${documentId}/original.txt`,
-  }, { businessId: BUSINESS });
+  }));
   return documentId;
 }
 
@@ -106,7 +106,7 @@ describe('the signatures table as evidence', () => {
 describe('loadDocument', () => {
   it('returns the document, and null across the business boundary', async () => {
     const documentId = await aDocument();
-    expect((await loadDocument(documentId, { businessId: BUSINESS }))?.documentId).toBe(documentId);
-    expect(await loadDocument(documentId, { businessId: 'other' })).toBeNull();
+    expect((await withBusiness(BUSINESS, (db) => loadDocument(db, documentId)))?.documentId).toBe(documentId);
+    expect(await withBusiness('other', (db) => loadDocument(db, documentId))).toBeNull();
   });
 });

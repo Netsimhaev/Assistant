@@ -481,7 +481,7 @@ describe('the mail field on SchedulerPassResult', () => {
 
   it('polls the connected mailbox and raises the reply card in the same pass', async () => {
     await installMailboxCharter(BUSINESS);
-    await setCursor({ provider: 'google', cursor: 'C-0' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => setCursor(db, { provider: 'google', cursor: 'C-0' }));
     const client = {
       initialCursor: async () => 'C-0',
       listSince: async () => ({ messages: [incomingMail({ providerMessageId: 'PM-S' })], nextCursor: 'C-1' }),
@@ -504,7 +504,7 @@ describe('the mail field on SchedulerPassResult', () => {
 
     expect(pass.mailError).toBeNull();
     expect(pass.mail).toMatchObject({ status: 'ok', recorded: 1, triaged: 1, drafts: 1 });
-    expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-1');
+    expect((await withBusiness(BUSINESS, (db) => getCursor(db)))?.cursor).toBe('C-1');
     const pending = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb));
     expect(pending).toHaveLength(1);
   });
@@ -524,8 +524,7 @@ describe('the document production loop runs in the pass, right after the plans',
       await withBusiness(BUSINESS, (db) => transition(db, job.jobId, { to, actor: 'orchestrator', reason: 'setup' }));
     }
     const { createProduction } = await import('../production/store.js');
-    return createProduction({
-      businessId: BUSINESS,
+    return withBusiness(BUSINESS, (db) => createProduction(db, {
       originJobId: job.jobId,
       instructionText: 'תכיני מכתב תודה ללקוח',
       textOrigin: 'typed',
@@ -534,7 +533,7 @@ describe('the document production loop runs in the pass, right after the plans',
       kind: 'letter',
       destination: { mode: 'save', folder: null },
       sourceDocumentIds: [],
-    });
+    }));
   }
 
   it('does not run (null, not zeros) without production tools, and the request ends failed instead of waiting', async () => {
@@ -550,7 +549,7 @@ describe('the document production loop runs in the pass, right after the plans',
     const absent = await schedulerPass({ businessId: BUSINESS, now: NOON, runtime: inert() });
     expect(absent.documentProductions).toBeNull();
     const { loadProduction } = await import('../production/store.js');
-    const p = await loadProduction(BUSINESS, id);
+    const p = await withBusiness(BUSINESS, (db) => loadProduction(db, id));
     expect(p?.stage).toBe('failed');
     expect(p?.work.reason).toBe('כלי ההפקה אינו מותקן בשרת');
   });
@@ -600,10 +599,10 @@ describe('the document production loop runs in the pass, right after the plans',
       expect(first.documentProductionsError).toBeNull();
       expect(first.documentProductions).toMatchObject({ ready: 0, errored: [] });
       const { loadProduction } = await import('../production/store.js');
-      expect((await loadProduction(BUSINESS, id))?.stage).toBe('check2');
+      expect((await withBusiness(BUSINESS, (db) => loadProduction(db, id)))?.stage).toBe('check2');
       const result = await schedulerPass({ businessId: BUSINESS, now: NOON, runtime: inert(), production });
       expect(result.documentProductions).toMatchObject({ ready: 1, errored: [] });
-      expect((await loadProduction(BUSINESS, id))?.stage).toBe('ready');
+      expect((await withBusiness(BUSINESS, (db) => loadProduction(db, id)))?.stage).toBe('ready');
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -578,7 +578,7 @@ async function performStep(
   // attachments do not resolve to the exact approved bytes fails here, final,
   // and no adapter is ever called (spec §8.2, ruling C16).
   const documentRoot = request.documentRoot ?? config.documentRoot;
-  const attachments = await stepAttachments(step.toolName, effectiveInput, request.job, documentRoot);
+  const attachments = await stepAttachments(db, step.toolName, effectiveInput, request.job, documentRoot);
 
   if (!needsChannel(step.toolName)) {
     // A local step never carries attachments: `stepAttachments` above already
@@ -824,6 +824,7 @@ const ATTACHMENT_INVALID_HE = 'פרטי הקובץ המצורף אינם תקי�
  * before a file is read.
  */
 async function stepAttachments(
+  db: BusinessDb,
   toolName: string,
   effectiveInput: Record<string, unknown>,
   job: Job,
@@ -838,11 +839,11 @@ async function stepAttachments(
   if (refs.data.length === 0) return [];
   // Not merely "a delivery job": every ref must name the very version the
   // owner approved on the card that created this job (Task 14, carry (b)).
-  const approved = await deliveryVersionOf(job.businessId, job.jobId);
+  const approved = await deliveryVersionOf(db, job.jobId);
   if (approved === null || refs.data.some((ref) => ref.producedVersionId !== approved)) {
     throw new StepChannelError('attachments_not_supported', ATTACHMENTS_NOT_SUPPORTED_HE, false);
   }
-  const resolved = await resolveAttachments(refs.data, job.businessId, documentRoot);
+  const resolved = await resolveAttachments(db, refs.data, documentRoot);
   if (!resolved.ok) throw new StepChannelError(resolved.code, resolved.he, false);
   return resolved.files;
 }

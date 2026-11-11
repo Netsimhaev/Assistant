@@ -59,7 +59,7 @@ describe('the local tool executor', () => {
     expect(out['recorded']).toBe(true);
     expect(out['subject']).toBe('c_812');
 
-    const found = await recallMemories({ subjectKey: 'c_812' }, { businessId: BUSINESS });
+    const found = await withBusiness(BUSINESS, (db) => recallMemories(db, { subjectKey: 'c_812' }));
     expect(found[0]?.body).toEqual({ name: 'אלפא', phone: '03-5551234' });
   });
 
@@ -71,10 +71,10 @@ describe('the local tool executor', () => {
     await write('בוקר');
     await write('אחר הצהריים');
 
-    const found = await recallMemories(
+    const found = await withBusiness(BUSINESS, (db) => recallMemories(
+      db,
       { subjectKey: 'c_812', kind: 'preference' },
-      { businessId: BUSINESS },
-    );
+    ));
     expect(found).toHaveLength(1);
     expect(found[0]?.body).toEqual({ value: 'אחר הצהריים' });
   });
@@ -254,10 +254,10 @@ describe('the local tool executor', () => {
     if (result.status !== 'done') throw new Error('expected done');
 
     // The write really happened — read from the store, not from the result.
-    const stored = await recallMemories(
+    const stored = await withBusiness(BUSINESS, (db) => recallMemories(
+      db,
       { subjectKey: 'c_812', kind: 'preference' },
-      { businessId: BUSINESS },
-    );
+    ));
     expect(stored).toHaveLength(1);
     expect(stored[0]?.body).toEqual({ value: 'בוקר' });
     expect(stored[0]?.provenance).toBe('boss');
@@ -333,7 +333,8 @@ describe('the local tool executor', () => {
   describe('doc.fetch', () => {
     async function anExtractedDocument(text: string): Promise<string> {
       const documentId = `DOC-${ulid()}`;
-      await insertOrGetDocument(
+      await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+        db,
         {
           documentId,
           source: 'manual',
@@ -343,13 +344,12 @@ describe('the local tool executor', () => {
           byteSize: text.length,
           storedPath: `${BUSINESS}/${documentId}/original.txt`,
         },
-        { businessId: BUSINESS },
-      );
-      await markExtracted(
+      ));
+      await withBusiness(BUSINESS, (db) => markExtracted(
+        db,
         documentId,
         [{ ordinal: 0, kind: 'text', partName: 'גוף', content: { blocks: [{ kind: 'paragraph', text }] }, flags: [] }],
-        { businessId: BUSINESS },
-      );
+      ));
       return documentId;
     }
 
@@ -394,7 +394,8 @@ describe('the local tool executor', () => {
     it('reports no_artifacts without calling the reader, for a document with nothing extracted', async () => {
       const jobId = await aJob('unknown_external', 'docfetch2');
       const documentId = `DOC-${ulid()}`;
-      await insertOrGetDocument(
+      await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+        db,
         {
           documentId,
           source: 'manual',
@@ -404,8 +405,7 @@ describe('the local tool executor', () => {
           byteSize: 0,
           storedPath: `${BUSINESS}/${documentId}/original.txt`,
         },
-        { businessId: BUSINESS },
-      );
+      ));
       const bundle = compileCharter(buildCharter({ version: 'docfetch-v2' }));
       let called = false;
       const reader = async (): Promise<ReadOutcome> => {
@@ -927,7 +927,8 @@ describe('the local tool executor', () => {
       }));
 
       const documentId = `DOC-${ulid()}`;
-      await insertOrGetDocument(
+      await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+        db,
         {
           documentId,
           source: 'manual',
@@ -937,9 +938,9 @@ describe('the local tool executor', () => {
           byteSize: 64,
           storedPath: `${BUSINESS}/${documentId}/original.txt`,
         },
-        { businessId: BUSINESS },
-      );
-      await markExtracted(
+      ));
+      await withBusiness(BUSINESS, (db) => markExtracted(
+        db,
         documentId,
         [
           {
@@ -950,9 +951,9 @@ describe('the local tool executor', () => {
             flags: [],
           },
         ],
-        { businessId: BUSINESS },
-      );
-      await saveReading(
+      ));
+      await withBusiness(BUSINESS, (db) => saveReading(
+        db,
         {
           readingId: `RD-${ulid()}`,
           documentId,
@@ -976,8 +977,7 @@ describe('the local tool executor', () => {
           promptVersion: 'v1',
           briefHash: `BH-${ulid()}`,
         },
-        { businessId: BUSINESS },
-      );
+      ));
 
       const constraints = {
         charterVersion: bundle.charterVersion,
@@ -1154,7 +1154,8 @@ describe('the local tool executor', () => {
         await seedAnsweredDelegation('succeeded');
       // Newer than the readable row seeded above, so `loadLatestReading` — which
       // orders by `created_at DESC` — returns this one.
-      await saveReading(
+      await withBusiness(BUSINESS, (db) => saveReading(
+        db,
         {
           readingId: `RD-${ulid()}`,
           documentId,
@@ -1166,8 +1167,7 @@ describe('the local tool executor', () => {
           promptVersion: 'v1',
           briefHash: `BH-${ulid()}`,
         },
-        { businessId: BUSINESS },
-      );
+      ));
       let judgeCalls = 0;
       const counting = async (input: VerifyDraftInput) => {
         judgeCalls += 1;

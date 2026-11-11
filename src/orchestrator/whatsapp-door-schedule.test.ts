@@ -85,10 +85,10 @@ function recordingMessenger(): { messenger: BossMessenger; jobIds: (string | nul
 async function expectedSchedule(text: string): Promise<string> {
   const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
   if (active === null) throw new Error('no charter');
-  const r = await answerScheduleQuery({
-    text, businessId: BUSINESS, timeZone: active.charter.identity.timezone, operations: active.charter.operations,
+  const r = await withBusiness(BUSINESS, (db) => answerScheduleQuery(db, {
+    text, timeZone: active.charter.identity.timezone, operations: active.charter.operations,
     runtime: CALENDAR.runtime, client: CLIENT,
-  });
+  }));
   if (r === null) throw new Error('not a schedule question');
   return r.answered;
 }

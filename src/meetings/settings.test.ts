@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { MEETING_DEFAULTS, loadMeetingSettings, saveMeetingSettings, type MeetingSettings } from './settings.js';
 
@@ -17,20 +17,21 @@ function valid(over: Partial<MeetingSettings> = {}): MeetingSettings {
 }
 
 async function refused(over: Partial<MeetingSettings>): Promise<string> {
-  const r = await saveMeetingSettings(valid(over), { businessId: BUSINESS });
+  const r = await withBusiness(BUSINESS, (db) => saveMeetingSettings(db, valid(over)));
   expect(r.ok).toBe(false);
   return r.ok ? '' : r.reason;
 }
 
 describe('meeting settings', () => {
   it('loads defaults for a business without a row', async () => {
-    const s = await loadMeetingSettings({ businessId: BUSINESS });
+    const s = await withBusiness(BUSINESS, (db) => loadMeetingSettings(db));
     expect(s).toEqual({ ...MEETING_DEFAULTS, readCalendarIds: [] });
     expect(s.locationKind).toBeNull();
   });
 
   it('saves and reloads, trimming the time to HH:MM', async () => {
-    const r = await saveMeetingSettings(
+    const r = await withBusiness(BUSINESS, (db) => saveMeetingSettings(
+      db,
       valid({
         locationKind: 'mixed',
         gapMinutes: 15,
@@ -39,10 +40,9 @@ describe('meeting settings', () => {
         readCalendarIds: ['a', 'b'],
         writeCalendarId: 'b',
       }),
-      { businessId: BUSINESS },
-    );
+    ));
     expect(r).toEqual({ ok: true });
-    const s = await loadMeetingSettings({ businessId: BUSINESS });
+    const s = await withBusiness(BUSINESS, (db) => loadMeetingSettings(db));
     expect(s).toMatchObject({
       locationKind: 'mixed',
       gapMinutes: 15,
@@ -80,6 +80,6 @@ describe('meeting settings', () => {
 
   it('writes nothing when it refuses', async () => {
     await refused({ gapMinutes: 999 });
-    expect((await loadMeetingSettings({ businessId: BUSINESS })).locationKind).toBeNull();
+    expect((await withBusiness(BUSINESS, (db) => loadMeetingSettings(db))).locationKind).toBeNull();
   });
 });

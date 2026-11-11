@@ -726,7 +726,8 @@ export async function buildRuntime(
       createMailboxSendAdapter({
         system: binding.system,
         provider,
-        replyTargets: replyTargetFor,
+        replyTargets: (businessId, internetMessageId, providerMessageId) => // TENANCY-TODO(task 8)
+          withBusiness(businessId, (db) => replyTargetFor(db, internetMessageId, providerMessageId)),
         ...(overrides.mailboxClient !== undefined ? { client: overrides.mailboxClient(provider) } : {}),
       }),
     );

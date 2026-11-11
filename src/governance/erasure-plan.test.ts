@@ -49,7 +49,8 @@ async function jobAbout(identifier: string, title: string): Promise<string> {
 
 async function aDocument(): Promise<string> {
   const documentId = `DOC-${ulid()}`;
-  await insertOrGetDocument(
+  await withBusiness(BUSINESS, (db) => insertOrGetDocument(
+    db,
     {
       documentId,
       source: 'manual',
@@ -59,8 +60,7 @@ async function aDocument(): Promise<string> {
       byteSize: 10,
       storedPath: `${BUSINESS}/${documentId}/original.txt`,
     },
-    { businessId: BUSINESS },
-  );
+  ));
   return documentId;
 }
 
@@ -460,10 +460,10 @@ describe('buildErasurePlan', () => {
 
   it('classifies items as delete or scrub correctly', async () => {
     const jobId = await jobAbout(RONIT, 'action-classification');
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId, kind: 'entity', subjectKey: RONIT, body: { name: 'רונית' } },
-      { businessId: BUSINESS },
-    );
+    ));
     await getPool().query(
       `INSERT INTO agent_envelopes
          (business_id, envelope_id, correlation_id, causal_chain, from_agent, to_agent,
@@ -518,11 +518,11 @@ describe('buildErasurePlan', () => {
   it('leaves a second contact completely untouched', async () => {
     const mine = await jobAbout(RONIT, 'ronit');
     const theirs = await jobAbout('avi@gamma-lift.example', 'avi');
-    await writeMemory({ jobId: mine, kind: 'entity', subjectKey: RONIT, body: {} }, { businessId: BUSINESS });
-    await writeMemory(
+    await withBusiness(BUSINESS, (db) => writeMemory(db, { jobId: mine, kind: 'entity', subjectKey: RONIT, body: {} }));
+    await withBusiness(BUSINESS, (db) => writeMemory(
+      db,
       { jobId: theirs, kind: 'entity', subjectKey: 'avi@gamma-lift.example', body: {} },
-      { businessId: BUSINESS },
-    );
+    ));
 
     const plan = await buildErasurePlan(
       { kind: 'contact', identifier: RONIT },
@@ -655,7 +655,7 @@ describe('buildErasurePlan', () => {
 
   it('treats a wildcard character in the anchor as a literal', async () => {
     const jobId = await jobAbout(RONIT, 'ronit');
-    await writeMemory({ jobId, kind: 'chunk', subjectKey: 'c_1', body: { t: 'x' } }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (db) => writeMemory(db, { jobId, kind: 'chunk', subjectKey: 'c_1', body: { t: 'x' } }));
 
     // `%` would match every row if it reached LIKE unescaped.
     const plan = await buildErasurePlan({ kind: 'contact', identifier: '%' }, { businessId: BUSINESS });
@@ -666,10 +666,10 @@ describe('buildErasurePlan', () => {
   describe('kept items are excluded and explained, never skipped silently', () => {
     it('excludes a kept memory and says why', async () => {
       const jobId = await jobAbout(RONIT, 'ronit');
-      const memory = await writeMemory(
+      const memory = await withBusiness(BUSINESS, (db) => writeMemory(
+        db,
         { jobId, kind: 'entity', subjectKey: RONIT, body: {} },
-        { businessId: BUSINESS },
-      );
+      ));
       await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'memory', itemId: memory.memoryId, note: 'חשוב' })); // TENANCY-TODO(task 6)
 
       const plan = await buildErasurePlan(

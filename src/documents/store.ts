@@ -1,6 +1,4 @@
-import type pg from 'pg';
-import { config } from '../config.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import type {
   ArtifactKind,
   DocumentArtifact,
@@ -121,11 +119,10 @@ export interface NewDocumentWithId extends NewDocument {
  * `created: true` result, so a lost race leaves no orphaned file.
  */
 export async function insertOrGetDocument(
+  db: BusinessDb,
   input: NewDocumentWithId,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<{ document: DocumentRecord; created: boolean }> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const documentId = input.documentId;
 
   const inserted = await db.query<DocumentRow>(
@@ -188,13 +185,13 @@ export async function insertOrGetDocument(
  * worth calling" stays true rather than merely stated.
  */
 export async function markExtracted(
+  db: BusinessDb,
   documentId: string,
   artifacts: DocumentArtifact[],
-  options: { businessId?: string } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
-  await withTransaction(async (tx: pg.PoolClient) => {
+  await transaction(db, async (tx) => {
     for (const artifact of artifacts) {
       await tx.query(
         `INSERT INTO document_artifacts
@@ -237,31 +234,30 @@ export async function markExtracted(
  * PDFs were extracted at all (a store-only type).
  */
 export async function markStored(
+  db: BusinessDb,
   documentId: string,
-  options: { businessId?: string; db?: Queryable; reason?: string } = {},
+  options: { reason?: string } = {},
 ): Promise<void> {
-  const db = options.db ?? getPool();
   const { rowCount } = await db.query(
     `UPDATE documents SET status = 'stored', reason = $3
       WHERE business_id = $1 AND document_id = $2`,
-    [options.businessId ?? config.businessId, documentId, options.reason ?? null],
+    [db.businessId, documentId, options.reason ?? null],
   );
   if (rowCount !== 1) {
-    throw new Error(`markStored: no document ${documentId} for business ${options.businessId ?? config.businessId}`);
+    throw new Error(`markStored: no document ${documentId} for business ${db.businessId}`);
   }
 }
 
 /** Mark a document `rejected` with a human-readable reason (§8). The original bytes stay on disk. */
 export async function markRejected(
+  db: BusinessDb,
   documentId: string,
   reason: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const db = options.db ?? getPool();
   const { rowCount } = await db.query(
     `UPDATE documents SET status = 'rejected', reason = $3
       WHERE business_id = $1 AND document_id = $2`,
-    [options.businessId ?? config.businessId, documentId, reason],
+    [db.businessId, documentId, reason],
   );
 
   // Same reasoning as markExtracted: a zero-row match here means this
@@ -269,22 +265,21 @@ export async function markRejected(
   // like success.
   if ((rowCount ?? 0) === 0) {
     throw new Error(
-      `markRejected: no document ${documentId} for business ${options.businessId ?? config.businessId}`,
+      `markRejected: no document ${documentId} for business ${db.businessId}`,
     );
   }
 }
 
 /** One document by id, scoped to its business. `null` when this business does not own it. */
 export async function loadDocument(
+  db: BusinessDb,
   documentId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<DocumentRecord | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<DocumentRow>(
     `SELECT document_id, business_id, source, original_name, media_type, sha256,
             byte_size, stored_path, status, reason, read_attempts, read_error
        FROM documents WHERE business_id = $1 AND document_id = $2`,
-    [options.businessId ?? config.businessId, documentId],
+    [db.businessId, documentId],
   );
   const row = rows[0];
   return row === undefined ? null : toDocument(row);
@@ -292,15 +287,14 @@ export async function loadDocument(
 
 /** A document's extracted parts, ordered the way they were written. */
 export async function loadArtifacts(
+  db: BusinessDb,
   documentId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<DocumentArtifact[]> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<ArtifactRow>(
     `SELECT ordinal, kind, part_name, content, flags FROM document_artifacts
       WHERE business_id = $1 AND document_id = $2
       ORDER BY ordinal`,
-    [options.businessId ?? config.businessId, documentId],
+    [db.businessId, documentId],
   );
   return rows.map(toArtifact);
 }
@@ -375,11 +369,10 @@ export const MAX_READ_ATTEMPTS = 3;
  * extractor wrote — not an inference from empty artefacts.
  */
 export async function documentsAwaitingRead(
+  db: BusinessDb,
   limit: number,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<DocumentRecord[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rows } = await db.query<DocumentRow>(
     `SELECT d.* FROM documents d
@@ -425,12 +418,11 @@ export async function documentsAwaitingRead(
  * failure to record a failure must not become a second, louder failure.
  */
 export async function recordReadFailure(
+  db: BusinessDb,
   documentId: string,
   message: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   await db.query(
     `UPDATE documents
@@ -450,10 +442,9 @@ export async function recordReadFailure(
  * ceiling is meant to bound.
  */
 export async function readingsToday(
-  options: { businessId?: string; db?: Queryable } = {},
+  db: BusinessDb,
 ): Promise<number> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM document_readings
