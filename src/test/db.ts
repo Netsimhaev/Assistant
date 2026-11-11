@@ -2,12 +2,7 @@ import type pg from 'pg';
 import { getMigratorPool } from '../db/pool.js';
 import { migrate } from '../db/migrate.js';
 import { ensureRoles } from '../db/roles.js';
-import {
-  TEST_APP_PASSWORD,
-  TEST_APP_USER,
-  TEST_PLATFORM_PASSWORD,
-  TEST_PLATFORM_USER,
-} from '../config.js';
+import { config } from '../config.js';
 
 let migrated = false;
 
@@ -20,10 +15,8 @@ export async function ensureSchema(): Promise<void> {
   if (migrated) return;
   const admin = await getMigratorPool().connect();
   try {
-    await ensureRoles(admin, {
-      app: { user: TEST_APP_USER, password: TEST_APP_PASSWORD },
-      platform: { user: TEST_PLATFORM_USER, password: TEST_PLATFORM_PASSWORD },
-    });
+    if (config.testLogins === null) throw new Error('ensureSchema runs only under NODE_ENV=test');
+    await ensureRoles(admin, config.testLogins);
   } finally {
     admin.release();
   }

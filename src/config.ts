@@ -1,5 +1,6 @@
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHmac } from 'node:crypto';
 import { config as loadDotenv } from 'dotenv';
 
 loadDotenv();
@@ -50,30 +51,54 @@ const isTest =
   process.env['NODE_ENV'] === 'test' || process.argv.includes('--test-db');
 
 /**
- * The test-only logins. Fixed, public, and used ONLY when `isTest` — they
- * exist so the suite runs as the real application role (a member of
- * `assistant_app`, NOBYPASSRLS, owning nothing) instead of as the superuser
- * in `TEST_DATABASE_URL`. Postgres roles are cluster-wide, so these names are
- * deliberately distinct from any dev or production login: creating them never
- * changes a password anyone else depends on.
+ * The test-only logins, used ONLY when `isTest`. They exist so the suite runs
+ * as the real application role (a member of `assistant_app`, NOBYPASSRLS,
+ * owning nothing) instead of as the superuser in `TEST_DATABASE_URL`.
+ *
+ * Postgres roles are cluster-wide, and `assistant_app` holds DML on every
+ * database of the cluster where migration 062 ran — the dev database
+ * included. So the passwords are NOT constants in git: each is
+ * HMAC-SHA256(key = the password in TEST_DATABASE_URL, message = a fixed
+ * label), hex. As secret as the superuser's own password, and every process
+ * derives the same value. Never printed.
  */
 export const TEST_APP_USER = 'assistant_app_test';
-export const TEST_APP_PASSWORD = 'assistant-app-test-only';
 export const TEST_PLATFORM_USER = 'assistant_platform_test';
-export const TEST_PLATFORM_PASSWORD = 'assistant-platform-test-only';
+
+export interface TestLogins {
+  app: { user: string; password: string };
+  platform: { user: string; password: string };
+}
+
+function deriveTestLogins(url: string): TestLogins {
+  const key = decodeURIComponent(new URL(url).password);
+  if (key === '') {
+    throw new Error(
+      'TEST_DATABASE_URL carries no password — the test logins derive theirs from it, and an empty key would make them guessable',
+    );
+  }
+  const derive = (label: string): string => createHmac('sha256', key).update(label).digest('hex');
+  return {
+    app: { user: TEST_APP_USER, password: derive('assistant-app-test') },
+    platform: { user: TEST_PLATFORM_USER, password: derive('assistant-platform-test') },
+  };
+}
 
 /** `TEST_DATABASE_URL` with another login, keeping host, port, database and params. */
-function withLogin(url: string, user: string, password: string): string {
+function withLogin(url: string, login: { user: string; password: string }): string {
   const parsed = new URL(url);
-  parsed.username = user;
-  parsed.password = password;
+  parsed.username = login.user;
+  parsed.password = login.password;
   return parsed.toString();
 }
 
 const testDatabaseUrl = isTest ? required('TEST_DATABASE_URL') : null;
+const testLogins = testDatabaseUrl !== null ? deriveTestLogins(testDatabaseUrl) : null;
 
 export const config = {
   isTest,
+  /** The derived test logins (see `deriveTestLogins`); `null` outside tests. */
+  testLogins,
   /**
    * The APPLICATION login — a member of `assistant_app`, never the table
    * owner, never BYPASSRLS. Tests run against a separate database because
@@ -83,8 +108,8 @@ export const config = {
    * one variable moves all three pools together.
    */
   databaseUrl:
-    testDatabaseUrl !== null
-      ? withLogin(testDatabaseUrl, TEST_APP_USER, TEST_APP_PASSWORD)
+    testDatabaseUrl !== null && testLogins !== null
+      ? withLogin(testDatabaseUrl, testLogins.app)
       : required('DATABASE_URL'),
   /**
    * The BYPASSRLS login, for the named cross-business operations only
@@ -92,8 +117,8 @@ export const config = {
    * it must not quietly reuse the app login for cross-business work.
    */
   databasePlatformUrl:
-    testDatabaseUrl !== null
-      ? withLogin(testDatabaseUrl, TEST_PLATFORM_USER, TEST_PLATFORM_PASSWORD)
+    testDatabaseUrl !== null && testLogins !== null
+      ? withLogin(testDatabaseUrl, testLogins.platform)
       : required('DATABASE_PLATFORM_URL'),
   /**
    * The migrator — owns every table, runs migrations and `db:roles`. Never

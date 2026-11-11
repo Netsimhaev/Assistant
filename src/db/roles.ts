@@ -53,16 +53,23 @@ async function currentDatabase(admin: Queryable): Promise<string> {
   return db;
 }
 
+/** Every login is denied these, on CREATE and on ALTER alike. */
+const LOGIN_LIMITS = 'NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION';
+
 async function ensureLogin(
   admin: Queryable,
   login: RoleLogin,
   bypass: 'BYPASSRLS' | 'NOBYPASSRLS',
+  mustNotBeMemberOf: readonly string[],
 ): Promise<void> {
   // Refuse to touch the admin's own role or any superuser. Today's .env puts
   // `postgres` in DATABASE_URL; running `db:roles` before changing it must not
   // demote the cluster's superuser and rewrite its password.
-  const { rows } = await admin.query<{ rolsuper: boolean; is_self: boolean }>(
-    'SELECT rolsuper, rolname = current_user AS is_self FROM pg_roles WHERE rolname = $1',
+  const { rows } = await admin.query<{ rolsuper: boolean; is_self: boolean; admin_member: boolean }>(
+    `SELECT rolsuper,
+            rolname = current_user AS is_self,
+            pg_has_role(rolname, current_user, 'MEMBER') AS admin_member
+       FROM pg_roles WHERE rolname = $1`,
     [login.user],
   );
   const existing = rows[0];
@@ -71,8 +78,27 @@ async function ensureLogin(
       `refusing to turn ${login.user} into an application login: it is a superuser or the admin role itself — set DATABASE_URL / DATABASE_PLATFORM_URL to dedicated logins`,
     );
   }
+  // A login that inherits the admin role inherits ownership of every table —
+  // the exact privilege the app role must never hold.
+  if (existing?.admin_member === true) {
+    throw new Error(
+      `refusing ${login.user} as an application login: it is a member of the admin role — revoke that membership or use a dedicated login`,
+    );
+  }
   if (existing !== undefined) {
-    await execFormatted(admin, `ALTER ROLE %I LOGIN PASSWORD %L ${bypass} NOSUPERUSER`, [
+    for (const other of mustNotBeMemberOf) {
+      if (!(await roleExists(admin, other))) continue;
+      const { rows: member } = await admin.query<{ m: boolean }>(
+        "SELECT pg_has_role($1, $2, 'MEMBER') AS m",
+        [login.user, other],
+      );
+      if (member[0]?.m === true) {
+        throw new Error(
+          `refusing ${login.user} as the app login: it is a member of ${other}, the BYPASSRLS platform login — revoke that membership`,
+        );
+      }
+    }
+    await execFormatted(admin, `ALTER ROLE %I LOGIN PASSWORD %L ${bypass} ${LOGIN_LIMITS}`, [
       login.user,
       login.password,
     ]);
@@ -80,7 +106,7 @@ async function ensureLogin(
   } else {
     await execFormatted(
       admin,
-      `CREATE ROLE %I LOGIN PASSWORD %L ${bypass} NOSUPERUSER IN ROLE ${APP_GROUP_ROLE}`,
+      `CREATE ROLE %I LOGIN PASSWORD %L ${bypass} ${LOGIN_LIMITS} IN ROLE ${APP_GROUP_ROLE}`,
       [login.user, login.password],
     );
   }
@@ -97,15 +123,15 @@ async function ensureRolesOnce(admin: Queryable, logins: RoleLogins): Promise<vo
     if (!(await roleExists(admin, APP_GROUP_ROLE))) {
       await admin.query(`CREATE ROLE ${APP_GROUP_ROLE} NOLOGIN NOBYPASSRLS`);
     }
-    await admin.query(`ALTER ROLE ${APP_GROUP_ROLE} NOLOGIN NOBYPASSRLS NOSUPERUSER`);
+    await admin.query(`ALTER ROLE ${APP_GROUP_ROLE} NOLOGIN NOBYPASSRLS ${LOGIN_LIMITS}`);
 
     // The app login: NOBYPASSRLS, a member of the group — table grants come
     // through the group (migration 062).
-    await ensureLogin(admin, logins.app, 'NOBYPASSRLS');
+    await ensureLogin(admin, logins.app, 'NOBYPASSRLS', [logins.platform.user]);
     // The platform login: BYPASSRLS on the login itself, since BYPASSRLS is
     // not inherited. Also a member of the group, so it holds the same table
     // privileges: BYPASSRLS skips policies, not GRANTs.
-    await ensureLogin(admin, logins.platform, 'BYPASSRLS');
+    await ensureLogin(admin, logins.platform, 'BYPASSRLS', []);
 
     const database = await currentDatabase(admin);
     for (const role of [APP_GROUP_ROLE, logins.app.user, logins.platform.user]) {

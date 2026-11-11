@@ -10,6 +10,35 @@ import {
 import { closePlatformPool, withPlatform } from './platform-pool.js';
 import { ensureSchema, testDb } from '../test/db.js';
 import { ensureRoles } from './roles.js';
+import { config } from '../config.js';
+
+function testLogins(): NonNullable<typeof config.testLogins> {
+  if (config.testLogins === null) throw new Error('test logins are derived only under NODE_ENV=test');
+  return config.testLogins;
+}
+
+/** The backend `pid` is gone from the server — the connection was destroyed, not pooled. */
+async function expectBackendGone(pid: number | undefined): Promise<void> {
+  expect(pid).toBeTypeOf('number');
+  for (let i = 0; i < 50; i += 1) {
+    const { rows } = await testDb().query('SELECT 1 FROM pg_stat_activity WHERE pid = $1', [pid]);
+    if (rows.length === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`backend ${String(pid)} is still connected`);
+}
+
+/** With `max: 1`, the next checkout is either the same client or a fresh one. */
+async function nextAppPid(): Promise<number | undefined> {
+  const client = await getPool().connect();
+  try {
+    const { rows } = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+    await expect(client.query('SELECT app_business_id()')).rejects.toThrow(/no business context/);
+    return rows[0]?.pid;
+  } finally {
+    client.release();
+  }
+}
 
 beforeAll(async () => {
   await ensureSchema();
@@ -58,6 +87,56 @@ describe('withBusiness', () => {
     } finally {
       client.release();
     }
+  });
+
+  it('a connection left in an open transaction is destroyed, not reused', async () => {
+    await __setAppPoolMaxForTest(1);
+    let pidInside: number | undefined;
+    await withBusiness('biz-a', async (db) => {
+      const { rows } = await db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      pidInside = rows[0]?.pid;
+      // A raw BEGIN that is never closed: RESET would run inside it, and a
+      // later ROLLBACK would bring biz-a back.
+      await db.query('BEGIN');
+    });
+    await expectBackendGone(pidInside);
+    expect(await nextAppPid()).not.toBe(pidInside);
+  });
+
+  it('a connection left in an aborted transaction is destroyed', async () => {
+    await __setAppPoolMaxForTest(1);
+    let pidInside: number | undefined;
+    await expect(
+      withBusiness('biz-a', async (db) => {
+        const { rows } = await db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        pidInside = rows[0]?.pid;
+        await db.query('BEGIN');
+        // Aborts the transaction; the RESET in `finally` then fails too.
+        await db.query('SELECT 1 / 0');
+      }),
+    ).rejects.toThrow(/division by zero/);
+    await expectBackendGone(pidInside);
+    expect(await nextAppPid()).not.toBe(pidInside);
+  });
+
+  it('a platform connection left in a transaction is destroyed', async () => {
+    let pidInside: number | undefined;
+    await withPlatform(async (db) => {
+      const { rows } = await db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      pidInside = rows[0]?.pid;
+      await db.query('BEGIN');
+    });
+    await expectBackendGone(pidInside);
+    let abortedPid: number | undefined;
+    await expect(
+      withPlatform(async (db) => {
+        const { rows } = await db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        abortedPid = rows[0]?.pid;
+        await db.query('BEGIN');
+        await db.query('SELECT 1 / 0');
+      }),
+    ).rejects.toThrow(/division by zero/);
+    await expectBackendGone(abortedPid);
   });
 
   it('refuses a malformed business id before touching the pool', async () => {
@@ -133,7 +212,7 @@ describe('ensureRoles', () => {
       await expect(
         ensureRoles(admin, {
           app: { user: self, password: 'x' },
-          platform: { user: 'assistant_platform_test', password: 'assistant-platform-test-only' },
+          platform: testLogins().platform,
         }),
       ).rejects.toThrow(/refusing to turn/);
       const { rows: after } = await admin.query<{ rolsuper: boolean }>(
@@ -141,6 +220,68 @@ describe('ensureRoles', () => {
       );
       expect(after[0]?.rolsuper).toBe(true);
     } finally {
+      admin.release();
+    }
+  });
+
+  it('derives the test passwords from TEST_DATABASE_URL, one per login', () => {
+    const { app, platform } = testLogins();
+    expect(app.password).toMatch(/^[0-9a-f]{64}$/);
+    expect(platform.password).toMatch(/^[0-9a-f]{64}$/);
+    expect(app.password).not.toBe(platform.password);
+  });
+
+  it('gives the app login no CREATEROLE, CREATEDB or REPLICATION', async () => {
+    const { rows } = await testDb().query<{
+      rolcreaterole: boolean;
+      rolcreatedb: boolean;
+      rolreplication: boolean;
+      rolsuper: boolean;
+      rolbypassrls: boolean;
+    }>(
+      'SELECT rolcreaterole, rolcreatedb, rolreplication, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1',
+      [testLogins().app.user],
+    );
+    expect(rows[0]).toEqual({
+      rolcreaterole: false,
+      rolcreatedb: false,
+      rolreplication: false,
+      rolsuper: false,
+      rolbypassrls: false,
+    });
+  });
+
+  it('refuses an app login that is a member of the admin role or of the platform login', async () => {
+    const probe = 'assistant_role_probe_test';
+    const admin = await testDb().connect();
+    try {
+      await admin.query(`CREATE ROLE ${probe} NOLOGIN`);
+      const logins = (): Parameters<typeof ensureRoles>[1] => ({
+        app: { user: probe, password: 'probe-only' },
+        platform: testLogins().platform,
+      });
+
+      await admin.query(`GRANT ${testLogins().platform.user} TO ${probe}`);
+      await expect(ensureRoles(admin, logins())).rejects.toThrow(/member of assistant_platform_test/);
+      await admin.query(`REVOKE ${testLogins().platform.user} FROM ${probe}`);
+
+      const { rows: me } = await admin.query<{ q: string }>('SELECT quote_ident(current_user) AS q');
+      await admin.query(`GRANT ${me[0]?.q ?? 'postgres'} TO ${probe}`);
+      await expect(ensureRoles(admin, logins())).rejects.toThrow(/member of the admin role/);
+
+      // Refused, so nothing about the probe changed.
+      const { rows } = await admin.query<{ rolcanlogin: boolean }>(
+        'SELECT rolcanlogin FROM pg_roles WHERE rolname = $1',
+        [probe],
+      );
+      expect(rows[0]?.rolcanlogin).toBe(false);
+    } finally {
+      // Had a refusal regressed, ensureRoles would have granted the probe
+      // CONNECT on this database; DROP OWNED clears that before DROP ROLE.
+      await admin.query(
+        `DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${probe}') THEN DROP OWNED BY ${probe}; END IF; END $$`,
+      );
+      await admin.query(`DROP ROLE IF EXISTS ${probe}`);
       admin.release();
     }
   });

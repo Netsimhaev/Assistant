@@ -1,6 +1,6 @@
 import pg from 'pg';
 import { config } from '../config.js';
-import type { Queryable } from './pool.js';
+import { isIdleOutsideTransaction, type Queryable } from './pool.js';
 
 /**
  * The PLATFORM pool — logs in as the BYPASSRLS login, for the named
@@ -25,7 +25,9 @@ export async function withPlatform<T>(fn: (db: Queryable) => Promise<T>): Promis
   try {
     return await fn(client);
   } finally {
-    client.release();
+    // A BYPASSRLS session left in an open or aborted transaction must not be
+    // handed to the next cross-business operation.
+    client.release(!isIdleOutsideTransaction(client));
   }
 }
 

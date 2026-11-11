@@ -108,12 +108,22 @@ function businessDb(client: pg.PoolClient, businessId: string, inTransaction: bo
 }
 
 /**
+ * True only when the server's last ReadyForQuery said "idle" ('I'): not in a
+ * transaction ('T'), not in an aborted one ('E'), and not unknown (null).
+ * A connection that is anything else must be destroyed, never pooled.
+ */
+export function isIdleOutsideTransaction(client: pg.PoolClient): boolean {
+  return client.getTransactionStatus() === 'I';
+}
+
+/**
  * Run `fn` on one app-pool connection whose SESSION carries `businessId`.
  *
  * Session-level, never transaction-level (`set_config(..., false)`): code that
  * holds a session advisory lock and queries outside a transaction must be
  * covered too. In `finally` the setting is RESET before the connection goes
- * back; a connection whose RESET fails is destroyed (`release(true)`), never
+ * back; a connection whose RESET fails, or that is still inside a
+ * transaction (open or aborted), is destroyed (`release(true)`), never
  * returned — a pooled connection carrying business A that reaches a request
  * for business B is exactly the leak the wall exists to prevent.
  *
@@ -144,6 +154,10 @@ export async function withBusiness<T>(
         destroy = true;
       }
     }
+    // A RESET that ran inside a transaction `fn` left open does not last: a
+    // later ROLLBACK restores the old business. Only a connection that is
+    // idle — no open, no aborted transaction — goes back to the pool.
+    if (!isIdleOutsideTransaction(client)) destroy = true;
     client.release(destroy);
   }
 }
