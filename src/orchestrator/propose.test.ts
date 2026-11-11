@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { compileCharter } from '../charter/compile.js';
 import { installCharter } from '../charter/store.js';
@@ -101,7 +101,7 @@ async function aJob(provenance: TrustLevel, title: string) {
 
 beforeEach(async () => {
   await resetDatabase();
-  await installCharter(buildCharter(), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
 });
 afterAll(async () => {
   await closePool();

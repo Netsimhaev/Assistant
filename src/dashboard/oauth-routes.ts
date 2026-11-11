@@ -35,7 +35,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { withTransaction } from '../db/pool.js';
+import { withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { canonicalHash } from '../util/canonical.js';
 import { storedCredentials } from '../governance/credential-store.js';
 import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
@@ -425,7 +425,7 @@ export async function handleOAuthStart(
 
   let active: Awaited<ReturnType<typeof loadActiveCharter>>;
   try {
-    active = await loadActiveCharter(businessId);
+    active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
   } catch {
     // An unreadable charter is refused exactly like no matching connection
     // below -- this ceremony is not the place to diagnose WHY the charter
@@ -510,13 +510,7 @@ export async function handleOAuthStart(
   const clientId = client.clientId;
 
   const codeVerifier = createCodeVerifier();
-  const state = await createState({
-    businessId,
-    system,
-    sessionId: session.sessionId,
-    codeVerifier,
-    ...(system === MAILBOX_SYSTEM || system === CALENDAR_SYSTEM ? { provider } : {}),
-  });
+  const state = await withBusiness(businessId, (bdb) => createState(bdb, { system, sessionId: session.sessionId, codeVerifier, ...(system === MAILBOX_SYSTEM || system === CALENDAR_SYSTEM ? { provider } : {}) })); // TENANCY-TODO(task 10)
   const consentUrl = buildConsentUrl({
     provider,
     authorizeUrl: profile.authorizeUrl,
@@ -556,7 +550,7 @@ export async function handleOAuthCallback(
     return sendHtml(res, 400, page('בקשה לא תקינה', errorBlock('לבקשה חסר פרמטר state.')));
   }
 
-  const consumed = await consumeState(stateParam, businessId);
+  const consumed = await withBusiness(businessId, (bdb) => consumeState(bdb, stateParam)); // TENANCY-TODO(task 10)
   if (consumed === null || consumed.sessionId !== session.sessionId) {
     return sendHtml(res, 400, page('הבקשה אינה תקפה', errorBlock(INVALID_STATE_MESSAGE)));
   }
@@ -591,7 +585,7 @@ export async function handleOAuthCallback(
   if (system === MAILBOX_SYSTEM) {
     let mailbox: CharterConnection | undefined;
     try {
-      mailbox = (await loadActiveCharter(businessId))?.charter.connections.find((c) => c.system === MAILBOX_SYSTEM);
+      mailbox = (await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)))?.charter.connections.find((c) => c.system === MAILBOX_SYSTEM); // TENANCY-TODO(task 10)
     } catch {
       mailbox = undefined;
     }
@@ -614,7 +608,7 @@ export async function handleOAuthCallback(
   if (system === CALENDAR_SYSTEM) {
     let calendar: CharterConnection | undefined;
     try {
-      calendar = (await loadActiveCharter(businessId))?.charter.connections.find((c) => c.system === CALENDAR_SYSTEM);
+      calendar = (await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)))?.charter.connections.find((c) => c.system === CALENDAR_SYSTEM); // TENANCY-TODO(task 10)
     } catch {
       calendar = undefined;
     }
@@ -744,7 +738,7 @@ export async function handleOAuthCallback(
   // simply restarts the ceremony -- the same trade `decideAndSign` makes for
   // a failed sign-and-approve. The success page below is rendered only after
   // this commits.
-  await withTransaction(async (tx) => {
+  await withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 10)
     await writeGrant(
       {
         businessId,
@@ -761,6 +755,7 @@ export async function handleOAuthCallback(
     );
 
     await appendAudit(
+      tx,
       {
         actor: 'human',
         onBehalfOf: session.username,
@@ -775,7 +770,6 @@ export async function handleOAuthCallback(
           `oauth consent granted for system "${system}" (provider: ${provider}) by ${session.username}; ` +
           `scopes: ${exchange.grantedScopes.length > 0 ? exchange.grantedScopes.join(', ') : '(none reported)'}`,
       },
-      { businessId, tx },
     );
 
     // Task 4's fix: the callback must also write the binding's `provider`,
@@ -921,7 +915,8 @@ export async function handleOAuthRevoke(
       'could not attempt provider revocation — the master key would not open, so whether access remains at the provider is unknown',
   };
 
-  await appendAudit(
+  await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 10)
+    bdb,
     {
       actor: 'human',
       onBehalfOf: session.username,
@@ -930,9 +925,8 @@ export async function handleOAuthRevoke(
       provenance: 'boss',
       inputHash: canonicalHash({ businessId, system, action: 'revoke' }),
       reason: `oauth revoke for system "${system}" by ${session.username}: ${localNote}; ${providerNote[providerOutcome]}`,
-    },
-    { businessId },
-  );
+    }
+  ));
 
   // No `/connections` screen exists yet in this subproject (Task 6 builds
   // it) -- redirecting there is forward-compatible with that screen once it

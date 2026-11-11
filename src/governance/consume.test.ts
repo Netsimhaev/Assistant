@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { assessRisk } from '../policy/risk.js';
@@ -15,7 +15,7 @@ afterAll(async () => { await closePool(); });
 
 describe('the consumption columns', () => {
   it('start null, so an existing approval reads as unspent', async () => {
-    const { rows } = await getPool().query<{ column_name: string; column_default: string | null }>(
+    const { rows } = await testDb().query<{ column_name: string; column_default: string | null }>(
       `SELECT column_name, column_default FROM information_schema.columns
         WHERE table_name = 'approval_requests'
           AND column_name IN ('consumed_at', 'consumed_by_step')
@@ -26,7 +26,7 @@ describe('the consumption columns', () => {
   });
 
   it('reject approval_requests with consumed_at set but consumed_by_step null', async () => {
-    const pool = getPool();
+    const pool = testDb();
 
     // Insert a valid approval_request first
     await pool.query(
@@ -58,7 +58,7 @@ describe('the consumption columns', () => {
   });
 
   it('reject dashboard_sessions for a username with no matching dashboard_users row', async () => {
-    const pool = getPool();
+    const pool = testDb();
 
     // Try to insert a session for a non-existent user
     await expect(
@@ -76,7 +76,7 @@ const INPUT = { to: 'dana@example.com', body: 'שלום' };
 
 async function install(): Promise<PolicyBundle> {
   const charter = buildCharter();
-  return installCharter(charter, { businessId: BUSINESS });
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, charter));
 }
 
 /**
@@ -119,23 +119,22 @@ async function riskFor(input: unknown, bundle: PolicyBundle) {
 }
 
 async function pendingApproval(jobId: string, bundle: PolicyBundle, input: unknown = INPUT) {
-  const approvalId = await enqueueApproval(
+  const approvalId = await withBusiness(BUSINESS, async (bdb) => enqueueApproval(
+    bdb,
     {
       jobId,
       facts: factsFor(input),
       risk: await riskFor(input, bundle),
       proposedInput: input,
       summary: 'שליחת מייל',
-    },
-    { businessId: BUSINESS },
-  );
+    }
+  ));
   return approvalId;
 }
 
 async function approvedApproval(jobId: string, bundle: PolicyBundle, input: unknown = INPUT) {
   const approvalId = await pendingApproval(jobId, bundle, input);
-  await decide(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' },
-    { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
   return approvalId;
 }
 
@@ -148,10 +147,7 @@ describe('an approval is spent exactly once', () => {
 
   it('lets the step through when all four conditions hold', async () => {
     const approvalId = await approvedApproval('J-1', bundle);
-    const out = await consumeApproval({
-      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
-      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
-    });
+    const out = await withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, { approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send', liveInputHash: canonicalHash(INPUT) }));
     expect(out).toEqual({ ok: true });
   });
 
@@ -159,47 +155,34 @@ describe('an approval is spent exactly once', () => {
     const approvalId = await approvedApproval('J-1', bundle);
     const args = {
       approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
-      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
+      liveInputHash: canonicalHash(INPUT),
     };
-    expect(await consumeApproval(args)).toEqual({ ok: true });
-    expect(await consumeApproval({ ...args, stepId: 's2' })).toEqual({
+    expect(await withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, args))).toEqual({ ok: true });
+    expect(await withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, { ...args, stepId: 's2' }))).toEqual({
       ok: false, code: 'already_consumed',
     });
   });
 
   it('refuses when the input changed after the approval', async () => {
     const approvalId = await approvedApproval('J-1', bundle);
-    const out = await consumeApproval({
-      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
-      liveInputHash: canonicalHash({ ...INPUT, body: 'משהו אחר' }),
-      businessId: BUSINESS,
-    });
+    const out = await withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, { approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send', liveInputHash: canonicalHash({ ...INPUT, body: 'משהו אחר' }) }));
     expect(out).toEqual({ ok: false, code: 'input_changed' });
   });
 
   it('refuses an approval that belongs to another job', async () => {
     const approvalId = await approvedApproval('J-1', bundle);
-    const out = await consumeApproval({
-      approvalId, jobId: 'J-2', stepId: 's1', toolName: 'mail.send',
-      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
-    });
+    const out = await withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, { approvalId, jobId: 'J-2', stepId: 's1', toolName: 'mail.send', liveInputHash: canonicalHash(INPUT) }));
     expect(out).toEqual({ ok: false, code: 'wrong_job' });
   });
 
   it('refuses an approval nobody decided yet', async () => {
     const approvalId = await pendingApproval('J-1', bundle);
-    const out = await consumeApproval({
-      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
-      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
-    });
+    const out = await withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, { approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send', liveInputHash: canonicalHash(INPUT) }));
     expect(out).toEqual({ ok: false, code: 'not_approved' });
   });
 
   it('refuses an approval id that does not exist', async () => {
-    const out = await consumeApproval({
-      approvalId: 'A-nope', jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
-      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
-    });
+    const out = await withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, { approvalId: 'A-nope', jobId: 'J-1', stepId: 's1', toolName: 'mail.send', liveInputHash: canonicalHash(INPUT) }));
     expect(out).toEqual({ ok: false, code: 'unknown_approval' });
   });
 
@@ -208,10 +191,7 @@ describe('an approval is spent exactly once', () => {
     // Same job, same input, same everything the old claim compared — and a
     // different tool. `proposed_tool` was stored on every approval from the
     // start and matched against nothing.
-    const out = await consumeApproval({
-      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'whatsapp.send',
-      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
-    });
+    const out = await withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, { approvalId, jobId: 'J-1', stepId: 's1', toolName: 'whatsapp.send', liveInputHash: canonicalHash(INPUT) }));
     expect(out).toEqual({ ok: false, code: 'wrong_tool' });
   });
 
@@ -221,20 +201,17 @@ describe('an approval is spent exactly once', () => {
     // DECIDED row out of `approved` when its expiry passes. Backdating the
     // column is exactly the state a job that halted for four hours leaves
     // behind.
-    await getPool().query(
+    await testDb().query(
       `UPDATE approval_requests SET expires_at = now() - interval '1 hour'
         WHERE approval_id = $1`,
       [approvalId],
     );
 
-    const out = await consumeApproval({
-      approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
-      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
-    });
+    const out = await withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, { approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send', liveInputHash: canonicalHash(INPUT) }));
     expect(out).toEqual({ ok: false, code: 'expired' });
 
     // Still unspent: a refused claim must not mark the row as consumed.
-    const { rows } = await getPool().query<{ consumed_at: Date | null }>(
+    const { rows } = await testDb().query<{ consumed_at: Date | null }>(
       `SELECT consumed_at FROM approval_requests WHERE approval_id = $1`,
       [approvalId],
     );
@@ -244,10 +221,10 @@ describe('an approval is spent exactly once', () => {
   it('does not offer an expired approval to a step at all', async () => {
     const approvalId = await approvedApproval('J-1', bundle);
     expect(
-      await unspentApprovalFor({ jobId: 'J-1', inputHash: canonicalHash(INPUT), businessId: BUSINESS }),
+      await withBusiness(BUSINESS, (bdb) => unspentApprovalFor(bdb, { jobId: 'J-1', inputHash: canonicalHash(INPUT) })),
     ).toBe(approvalId);
 
-    await getPool().query(
+    await testDb().query(
       `UPDATE approval_requests SET expires_at = now() - interval '1 hour'
         WHERE approval_id = $1`,
       [approvalId],
@@ -256,7 +233,7 @@ describe('an approval is spent exactly once', () => {
     // Nothing to resume under, so the step queues a fresh request instead of
     // spending a decision nobody remembers making.
     expect(
-      await unspentApprovalFor({ jobId: 'J-1', inputHash: canonicalHash(INPUT), businessId: BUSINESS }),
+      await withBusiness(BUSINESS, (bdb) => unspentApprovalFor(bdb, { jobId: 'J-1', inputHash: canonicalHash(INPUT) })),
     ).toBeNull();
   });
 
@@ -264,11 +241,11 @@ describe('an approval is spent exactly once', () => {
     const approvalId = await approvedApproval('J-1', bundle);
     const args = {
       approvalId, jobId: 'J-1', stepId: 's1', toolName: 'mail.send',
-      liveInputHash: canonicalHash(INPUT), businessId: BUSINESS,
+      liveInputHash: canonicalHash(INPUT),
     };
     const [a, b] = await Promise.all([
-      consumeApproval(args),
-      consumeApproval({ ...args, stepId: 's2' }),
+      withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, args)),
+      withBusiness(BUSINESS, (bdb) => consumeApproval(bdb, { ...args, stepId: 's2' })),
     ]);
     expect([a.ok, b.ok].filter(Boolean)).toHaveLength(1);
   });

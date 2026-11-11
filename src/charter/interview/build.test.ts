@@ -1,8 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../../db/pool.js';
+import { closePool, withBusiness } from '../../db/pool.js';
 import { BusinessCharter } from '../../domain/charter.js';
 import type { CharterConnection } from '../../domain/connection.js';
-import { evaluateToolCall, type GateContext } from '../../policy/engine.js';
+import { evaluateFor, type TestGateContext } from '../../test/gate.js';
 import type { PolicyBundle } from '../../domain/policy.js';
 import { resetDatabase } from '../../test/db.js';
 import { buildCharter } from '../../test/fixtures.js';
@@ -40,7 +40,7 @@ function completed(draft: ReturnType<typeof prefillFromCharter>): InterviewAnswe
   } as InterviewAnswers;
 }
 
-function ctx(bundle: PolicyBundle, over: Partial<GateContext> = {}): GateContext {
+function ctx(bundle: PolicyBundle, over: Partial<TestGateContext> = {}): TestGateContext {
   return {
     agent: 'comms.email',
     bundle,
@@ -52,7 +52,7 @@ function ctx(bundle: PolicyBundle, over: Partial<GateContext> = {}): GateContext
     rampLevel: 'auto',
     now: NOON,
     ...over,
-  } as GateContext;
+  } as TestGateContext;
 }
 
 beforeEach(async () => {
@@ -86,9 +86,9 @@ describe('buildCharterFromInterview', () => {
     a.actions['quote.issue'] = 'never';
     const charter = sign(build(a));
     expect(charter.autonomy.base['quote.issue']).toBe('draft_only');
-    const bundle = await installCharter(charter, { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, charter));
 
-    const decision = await evaluateToolCall('quote.issue', { amountMinor: 100 }, ctx(bundle));
+    const decision = await evaluateFor('quote.issue', { amountMinor: 100 }, ctx(bundle));
 
     expect(decision.outcome).toBe('deny');
     if (decision.outcome !== 'deny') throw new Error('unreachable');

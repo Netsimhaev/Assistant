@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import { recordInbound, recordOutbound } from '../whatsapp/store.js';
@@ -70,7 +70,7 @@ afterAll(async () => {
  * own version, so a test that installs `buildCharter()` itself still can.
  */
 async function installGateCharter(businessId: string): Promise<void> {
-  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId });
+  await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
 }
 
 let server: Server | null = null;
@@ -143,20 +143,20 @@ async function makeApproval(options: {
   summary?: string;
 }): Promise<string> {
   const proposedInput = options.proposedInput ?? { to: 'client@example.com', body: 'שלום' };
-  return enqueueApproval(
+  return withBusiness(options.businessId, (bdb) => enqueueApproval( // TENANCY-TODO(task 10)
+    bdb,
     {
       jobId: options.jobId ?? null,
       facts: factsFixture(proposedInput),
       risk: riskFixture(),
       proposedInput,
       summary: options.summary ?? 'שליחת מייל ללקוח',
-    },
-    { businessId: options.businessId },
-  );
+    }
+  ));
 }
 
 async function jobAwaitingApproval(businessId: string) {
-  const bundle = await installCharter(buildCharter(), { businessId });
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
   const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
   for (const to of ['understand', 'plan', 'await_approval'] as const) {
     await transition(job.jobId, { to, actor: 'orchestrator', reason: 'setup', businessId });
@@ -177,7 +177,7 @@ async function seedAutonomousAction(
   businessId: string,
   input: Record<string, unknown> = { to: 'dana@example.com', inReplyTo: 'thread-1', subject: 'תשובה', body: 'גוף' },
 ): Promise<{ jobId: string; stepId: string }> {
-  const bundle = await installCharter(buildCharter({ version: `autonomy-actions-${ulid()}` }), { businessId });
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: `autonomy-actions-${ulid()}` }))); // TENANCY-TODO(task 10)
   const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
   const plan = Plan.parse({
     goal: 'reply to a known customer',
@@ -352,7 +352,7 @@ async function anApprovalForReading(
 async function aConductorRaisedApproval(
   businessId: string,
 ): Promise<{ approvalId: string; jobId: string }> {
-  const bundle = await installCharter(buildCharter(), { businessId });
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
   const documentId = `DOC-${ulid()}`;
   await insertOrGetDocument(
     {
@@ -377,7 +377,7 @@ async function aSignableApproval(
   bytes: Buffer,
   proposal: Proposal = FILING_PROPOSAL,
 ): Promise<{ approvalId: string; jobId: string; documentId: string; sha256: string }> {
-  const bundle = await installCharter(buildCharter(), { businessId });
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
   const { documentId, sha256 } = await aDocument(businessId, docRoot, bytes);
   const readingId = await aReadingOf(documentId, businessId);
   const { approvalId, jobId } = await anApprovalForReading(businessId, bundle, readingId, proposal);
@@ -618,7 +618,7 @@ describe('GET /readings', () => {
   // sign form is tested for.
   it('renders the stance label, headline, a reason and a bidi-safe filename from a real reading', async () => {
     const baseUrl = await startServer(BUSINESS);
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     // `NewProposal.jobId` is required, not nullable — every proposal is made
     // in service of a real job (`proposeForReading` always loads or creates
     // one first). The job never reaches `await_approval`: an `advise_against`
@@ -775,7 +775,7 @@ describe('GET /instruct, POST /instruct', () => {
   // has to fire first for this to pass.
   it('shows the refusal when the instruction is too long, and opens no job', async () => {
     const baseUrl = await startServer(BUSINESS);
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     const boxPage = await fetch(`${baseUrl}/instruct`, { headers: { cookie } });
     const csrf = extractCsrf(await boxPage.text());
@@ -813,7 +813,7 @@ describe('GET /instruct, POST /instruct', () => {
    */
   it('shows a parked question and its answer form on a fresh GET', async () => {
     const baseUrl = await startServer(BUSINESS);
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -843,7 +843,7 @@ describe('GET /instruct, POST /instruct', () => {
 
   it('does not list a question that has already been answered', async () => {
     const baseUrl = await startServer(BUSINESS);
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
 
     const answeredJob = await createJob({
       charterVersion: bundle.charterVersion,
@@ -1161,7 +1161,7 @@ describe('POST /instruct/:jobId/answer', () => {
    * N2's phase guard tests) transitions it further after calling this.
    */
   async function anInstructionJob(businessId: string, text: string): Promise<string> {
-    const bundle = await installCharter(buildCharter(), { businessId });
+    const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId });
     await saveInstruction({ textOrigin: 'typed', jobId: job.jobId, text }, { businessId });
     await transition(job.jobId, { to: 'understand', actor: 'orchestrator', reason: 'test setup', businessId });
@@ -1611,7 +1611,7 @@ describe('CSRF', () => {
     });
     expect(res.status).toBe(403);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
   });
 });
@@ -1634,7 +1634,7 @@ describe('deciding an approval', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('approved');
     const updatedJob = await loadJob(job.jobId, { businessId: BUSINESS });
     expect(updatedJob?.phase).toBe('execute');
@@ -1657,7 +1657,7 @@ describe('deciding an approval', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('denied');
     const updatedJob = await loadJob(job.jobId, { businessId: BUSINESS });
     expect(updatedJob?.phase).toBe('closed');
@@ -1679,7 +1679,8 @@ describe('the gov.verify verdict on a card', () => {
     const baseUrl = await startServer(BUSINESS);
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
-    await saveVerdict(
+    await withBusiness(BUSINESS, (bdb) => saveVerdict( // TENANCY-TODO(task 10)
+      bdb,
       job.jobId,
       {
         criteria: [
@@ -1695,9 +1696,8 @@ describe('the gov.verify verdict on a card', () => {
         answerTruncated: false,
         draftTruncated: false,
         fenceForgeryDetected: false,
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
@@ -1736,7 +1736,8 @@ describe('the gov.verify verdict on a card', () => {
     const baseUrl = await startServer(BUSINESS);
     const job = await jobAwaitingApproval(BUSINESS);
     const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
-    await saveVerdict(
+    await withBusiness(BUSINESS, (bdb) => saveVerdict( // TENANCY-TODO(task 10)
+      bdb,
       job.jobId,
       {
         criteria: [
@@ -1758,9 +1759,8 @@ describe('the gov.verify verdict on a card', () => {
         ungroundedNumbers: ['<b>1</b>‮2'],
         answerTruncated: false,
         draftTruncated: false,
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
     const body = await (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
@@ -1782,7 +1782,8 @@ describe('the gov.verify verdict on a card', () => {
       const baseUrl = await startServer(businessId);
       const job = await jobAwaitingApproval(businessId);
       const approvalId = await makeApproval({ businessId, jobId: job.jobId });
-      await saveVerdict(
+      await withBusiness(businessId, (bdb) => saveVerdict( // TENANCY-TODO(task 10)
+        bdb,
         job.jobId,
         {
           criteria: [{ id: 'x', statement: 'y', severity: 'must', passed: true, detail: 'z' }],
@@ -1790,9 +1791,8 @@ describe('the gov.verify verdict on a card', () => {
           answerTruncated: false,
           draftTruncated: false,
           ...overrides,
-        },
-        { businessId },
-      );
+        }
+      ));
       return { baseUrl, approvalId };
     }
 
@@ -1896,7 +1896,7 @@ describe('the gov.verify verdict on a card', () => {
   describe('and says nothing at all on a card verification never reaches', () => {
     it('an orphan card — approval_requests.job_id IS NULL, the SDK path', async () => {
       const baseUrl = await startServer(BUSINESS);
-      await installCharter(buildCharter(), { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
       const approvalId = await makeApproval({ businessId: BUSINESS, jobId: null });
       const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -1927,7 +1927,7 @@ describe('the gov.verify verdict on a card', () => {
       const baseUrl = await startServer(BUSINESS);
       const job = await jobAwaitingApproval(BUSINESS);
       const approvalId = await makeApproval({ businessId: BUSINESS, jobId: job.jobId });
-      await saveNotJudged(job.jobId, reason, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => saveNotJudged(bdb, job.jobId, reason)); // TENANCY-TODO(task 10)
       const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
       return (await fetch(`${baseUrl}/a/${approvalId}`, { headers: { cookie } })).text();
     }
@@ -1998,10 +1998,10 @@ describe('signing an approval', () => {
     });
     expect(signRes.status).toBe(302);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('approved');
 
-    const signature = await loadSignature(documentId, { businessId: BUSINESS });
+    const signature = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId)); // TENANCY-TODO(task 10)
     expect(signature).not.toBeNull();
     expect(signature?.signedBy).toBe(USERNAME);
     expect(signature?.approvalId).toBe(approvalId);
@@ -2009,7 +2009,7 @@ describe('signing an approval', () => {
     // just that *some* signature exists.
     expect(signature?.signedSha256).toBe(sha256);
 
-    const audit = await queryAudit({ businessId: BUSINESS, kind: 'signature' });
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'signature' })); // TENANCY-TODO(task 10)
     expect(audit.length).toBe(1);
     expect(audit[0]?.jobId).toBe(jobId);
     expect(audit[0]?.reason).toContain(`signature:${documentId}`);
@@ -2039,7 +2039,7 @@ describe('signing an approval', () => {
       redirect: 'manual',
     });
     expect(denyRes.status).toBe(302);
-    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('denied');
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('denied'); // TENANCY-TODO(task 10)
 
     // Tab 2, stale: sign the same, now-denied approval. `documentId` matches
     // the real document — this must be refused on the approval's state
@@ -2057,9 +2057,9 @@ describe('signing an approval', () => {
     // button simply gone, no explanation.
     expect(await signRes.text()).toContain('הבקשה כבר הוכרעה');
 
-    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
-    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('denied');
-    expect(await queryAudit({ businessId: BUSINESS, kind: 'signature' })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull(); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('denied'); // TENANCY-TODO(task 10)
+    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'signature' }))).toEqual([]); // TENANCY-TODO(task 10)
   });
 
   it('refuses to sign a document that changed on disk, and leaves the approval pending', async () => {
@@ -2085,9 +2085,9 @@ describe('signing an approval', () => {
     });
     expect(signRes.status).toBe(400);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
-    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull(); // TENANCY-TODO(task 10)
   });
 
   it('refuses to sign when the stored file is unreadable, with text distinct from "missing"', async () => {
@@ -2096,7 +2096,7 @@ describe('signing an approval', () => {
     // One charter install, reused for both documents below — installCharter
     // writes a fixed, deterministic charter_version id (buildCharter's own),
     // and a second install under the same business would collide on it.
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
 
     const unreadableDoc = await aDocument(BUSINESS, docRoot, bytes);
     const unreadableReading = await aReadingOf(unreadableDoc.documentId, BUSINESS);
@@ -2122,7 +2122,7 @@ describe('signing an approval', () => {
     expect(signRes.status).toBe(400);
     const unreadableBody = await signRes.text();
 
-    const approval = await getApproval(unreadable.approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, unreadable.approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
 
     // Now check the "missing" refusal reads differently, on a fresh document.
@@ -2181,14 +2181,14 @@ describe('signing an approval', () => {
     // got no message instead of a misplaced one.
     expect(await signRes.text()).toContain('לא נמצא מסמך המשויך לבקשה זו');
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
   });
 
   it('refuses a second signature on the same document, leaving the first intact', async () => {
     const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
     const bytes = Buffer.from('הסכם שיווק — נחתם פעם אחת בלבד', 'utf8');
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const { documentId } = await aDocument(BUSINESS, docRoot, bytes);
     const readingId1 = await aReadingOf(documentId, BUSINESS);
     const first = await anApprovalForReading(BUSINESS, bundle, readingId1);
@@ -2206,7 +2206,7 @@ describe('signing an approval', () => {
       redirect: 'manual',
     });
     expect(firstSignRes.status).toBe(302);
-    const firstSignature = await loadSignature(documentId, { businessId: BUSINESS });
+    const firstSignature = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId)); // TENANCY-TODO(task 10)
     expect(firstSignature).not.toBeNull();
 
     const secondCardRes = await fetch(`${baseUrl}/a/${second.approvalId}`, { headers: { cookie } });
@@ -2224,10 +2224,10 @@ describe('signing an approval', () => {
     expect(secondBody).toContain(USERNAME);
     expect(secondBody).toContain(String(new Date().getUTCFullYear()));
 
-    const secondApproval = await getApproval(second.approvalId, { businessId: BUSINESS });
+    const secondApproval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, second.approvalId)); // TENANCY-TODO(task 10)
     expect(secondApproval?.state).toBe('pending');
 
-    const stillFirst = await loadSignature(documentId, { businessId: BUSINESS });
+    const stillFirst = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId)); // TENANCY-TODO(task 10)
     expect(stillFirst?.signatureId).toBe(firstSignature?.signatureId);
   });
 
@@ -2244,7 +2244,7 @@ describe('signing an approval', () => {
     });
     expect(res.status).toBe(403);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
   });
 
@@ -2287,8 +2287,8 @@ describe('signing an approval', () => {
     });
     expect(signRes.status).toBe(400);
 
-    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
-    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull(); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 10)
   });
 
   // F2: the filename is chosen by whoever sent the document. It is the only
@@ -2299,7 +2299,7 @@ describe('signing an approval', () => {
   it('shows a hash prefix beside the name and strips bidi controls from it', async () => {
     const baseUrl = await startServer(BUSINESS, { documentRoot: docRoot });
     const bytes = Buffer.from('הסכם שיווק — שם עוין', 'utf8');
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     // U+202E RIGHT-TO-LEFT OVERRIDE, then a name that renders reversed.
     const { documentId, sha256 } = await aDocument(
       BUSINESS,
@@ -2389,8 +2389,8 @@ describe('signing an approval', () => {
     });
     expect(signRes.status).toBe(400);
 
-    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
-    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull(); // TENANCY-TODO(task 10)
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 10)
   });
 
   // F6, spec §8 and §9: no document behind the approval, no sign control at
@@ -2440,7 +2440,7 @@ describe('tenant isolation', () => {
     });
     expect(res.status).toBe(404);
 
-    const approval = await getApproval(approvalId, { businessId: OTHER_BUSINESS });
+    const approval = await withBusiness(OTHER_BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
   });
 });
@@ -2516,7 +2516,7 @@ describe('recovery-code login', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/password');
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
   });
 
@@ -2752,7 +2752,7 @@ describe('HTML escaping', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('approved');
     expect(approval?.editedInput).toBeNull();
   });
@@ -2778,7 +2778,7 @@ describe('editing before approval', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('approved_with_edit');
     expect(approval?.editedInput).toEqual(edited);
     const updatedJob = await loadJob(job.jobId, { businessId: BUSINESS });
@@ -2805,7 +2805,7 @@ describe('editing before approval', () => {
     });
     expect(decideRes.status).toBe(302);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('approved');
     expect(approval?.editedInput).toBeNull();
   });
@@ -2831,7 +2831,7 @@ describe('editing before approval', () => {
     // in-progress edit on a typo would be its own kind of data loss.
     expect(body).toContain('{not valid json');
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
   });
 
@@ -2884,7 +2884,7 @@ describe('editing before approval', () => {
       // handed to the job. `null` in particular used to sail through into
       // `approved_with_edit` and then get silently ignored by the executor,
       // which is the failure mode this test exists to close off.
-      const approval = await getApproval(approvalId, { businessId: BUSINESS });
+      const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
       expect(approval?.state).toBe('pending');
       expect(approval?.editedInput).toBeNull();
       const jobAfter = await loadJob(job.jobId, { businessId: BUSINESS });
@@ -2911,7 +2911,7 @@ describe('editing before approval', () => {
     const body = await decideRes.text();
     expect(body).toContain('גדול מדי');
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
   });
 
@@ -2928,7 +2928,7 @@ describe('editing before approval', () => {
     });
     expect(res.status).toBe(403);
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
   });
 
@@ -2944,7 +2944,7 @@ describe('editing before approval', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
 
-    const approval = await getApproval(approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     expect(approval?.state).toBe('pending');
   });
 });
@@ -2988,7 +2988,7 @@ describe('GET /autonomy — the owner’s dial', () => {
     expect(postRes.status).toBe(302);
     expect(postRes.headers.get('location')).toBe('/autonomy');
 
-    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('learn');
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('learn'); // TENANCY-TODO(task 10)
   });
 
   it('refuses a mode change without a CSRF token', async () => {
@@ -3002,13 +3002,13 @@ describe('GET /autonomy — the owner’s dial', () => {
       redirect: 'manual',
     });
     expect(res.status).toBe(403);
-    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off'); // TENANCY-TODO(task 10)
   });
 });
 
 describe('GET /autonomy — the learning level and the update channels', () => {
   it('shows the learning level in Hebrew, with no raw class id', async () => {
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const baseUrl = await startServer(BUSINESS);
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
 
@@ -3296,7 +3296,7 @@ describe('digest screen', () => {
    * `runDigests` (`digest-run.ts`). */
   async function digestSession(businessId: string): Promise<{ baseUrl: string; cookie: string }> {
     const baseUrl = await startServer(businessId);
-    await installCharter(buildCharter(), { businessId });
+    await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const cookie = await loginWithPassword(baseUrl, USERNAME, PASSWORD);
     return { baseUrl, cookie };
   }
@@ -3451,7 +3451,7 @@ describe('digest screen', () => {
    */
   it('renders 200 with a message distinct from "none yet" when the signed charter cannot be read', async () => {
     const baseUrl = await startServer(BUSINESS);
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     await getPool().query(
       `UPDATE charter_versions
           SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb($2::text))
@@ -3608,10 +3608,10 @@ describe('boss-command confirmation on the dashboard', () => {
     businessId: string = BUSINESS,
   ): Promise<string> {
     // One charter per business: installing the same one twice collides.
-    const active = await loadActiveCharter(businessId);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
     const charterVersion =
       active?.charter.charterVersion ??
-      (await installCharter(buildCharter(), { businessId })).charterVersion;
+      (await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 10)
     const job = await createJob({ charterVersion, provenance: 'boss', businessId });
     await saveInstruction(
       { textOrigin: 'typed', jobId: job.jobId, text: 'תשלחי לדנה תזכורת' },

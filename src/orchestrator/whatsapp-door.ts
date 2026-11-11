@@ -182,6 +182,7 @@ import {
   STILL_NEEDS_ANSWER_HINT,
   type WhatsAppRoute,
 } from './whatsapp-routing.js';
+import { withBusiness } from '../db/pool.js';
 
 export interface DoorResult {
   /** However many messages `pollOnce` delivered to this pass, redeliveries included. */
@@ -1311,7 +1312,7 @@ export async function runWhatsAppDoor(options: {
   if (options.charter !== undefined) {
     charter = options.charter;
   } else {
-    const active = await loadActiveCharter(businessId);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) {
       throw new Error(
         `runWhatsAppDoor: no active charter for business ${businessId} — refusing to guess who the owner is`,

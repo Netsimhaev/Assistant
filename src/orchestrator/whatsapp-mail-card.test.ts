@@ -8,7 +8,7 @@
  * wrong reason.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   NOON,
@@ -186,7 +186,7 @@ describe('approve-by-WhatsApp', () => {
   it('replacement text creates a new pending approval with the edited body and does not send', async () => {
     const h = await harness();
     const raised = await raiseAndPresent(h);
-    const original = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    const original = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId)); // TENANCY-TODO(task 4)
 
     h.gateway.enqueue(textMsg(PRINCIPAL, '‏נוסח: שלום דנה, ההצעה תגיע ביום ראשון.'));
     const result = await door(h);

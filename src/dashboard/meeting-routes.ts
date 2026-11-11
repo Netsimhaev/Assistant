@@ -20,7 +20,7 @@ import { appendAudit } from '../audit/log.js';
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type CalendarClient, type CalendarInfo } from '../calendar/types.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { getPool, withTransaction } from '../db/pool.js';
+import { getPool, withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { MAX_INSTRUCTION_CHARS } from '../governance/instructions.js';
 import { MasterKeyError, loadMasterKey, verifyKeyState } from '../governance/master-key.js';
 import { storedCredentials } from '../governance/credential-store.js';
@@ -528,7 +528,7 @@ function addDaysIso(date: string, n: number): string {
 
 async function charterZone(businessId: string): Promise<{ timeZone: string; charterVersion: string }> {
   try {
-    const active = await loadActiveCharter(businessId);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
     if (active !== null) return { timeZone: active.charter.identity.timezone, charterVersion: active.charter.charterVersion };
   } catch {
     // an unreadable charter costs the zone, not the page
@@ -869,7 +869,7 @@ export async function handleMeetingMarkPost(
     return sendMeetingsPage(res, 400, businessId, session, options, { error: 'התשובה שנבחרה אינה מוכרת.' });
   }
   const { charterVersion } = await charterZone(businessId);
-  const marked = await withTransaction(async (tx) => {
+  const marked = await withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 10)
     const { rows } = await tx.query<{ meeting_id: string }>(
       `UPDATE meetings SET response = $3, response_at = now(), updated_at = now()
         WHERE business_id = $1 AND meeting_id = $2 AND state = 'active'
@@ -878,6 +878,7 @@ export async function handleMeetingMarkPost(
     );
     if (rows.length === 0) return false;
     await appendAudit(
+      tx,
       {
         jobId: null,
         actor: 'human',
@@ -895,7 +896,6 @@ export async function handleMeetingMarkPost(
         costMinor: null,
         tokens: null,
       },
-      { businessId, tx },
     );
     return true;
   });

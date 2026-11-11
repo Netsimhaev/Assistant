@@ -1,4 +1,3 @@
-import { config } from '../config.js';
 import { domainMatches, extractDomain } from '../util/address.js';
 import { AMOUNT_REQUIRED_CLASSES, NEVER_FULLY_AUTONOMOUS } from '../domain/action.js';
 import { coveredByAuthorization, loadAuthorization } from '../governance/authorization.js';
@@ -20,7 +19,7 @@ import { enqueueApproval, getApproval } from '../governance/approvals.js';
 import { consumeApproval } from '../governance/consume.js';
 import { checkKillSwitch } from '../governance/killswitch.js';
 import type { ApprovalNotifier } from '../governance/notify.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { checkBudget } from './budget.js';
 import { buildFacts, type FactsContext } from './facts.js';
 import { isOutbound, isKnownTool } from './classify.js';
@@ -41,8 +40,12 @@ export interface GateContext extends FactsContext {
   autonomyCeiling?: AutonomyLevel;
   /** Earned autonomy for this action class, from the ramp. */
   rampLevel?: AutonomyLevel;
-  businessId?: string;
-  db?: Queryable;
+  /**
+   * The business this call runs for, and the connection every read and write
+   * of the gate goes through. Audit and approval rows join `db`'s
+   * transaction when it is in one.
+   */
+  db: BusinessDb;
   norms?: NormsLookup;
   /** Injectable clock. The quiet-hours check is the only time-dependent step. */
   now?: Date;
@@ -79,9 +82,9 @@ export interface GateContext extends FactsContext {
    * documented against, not structurally impossible — a real risk once a
    * model-produced proposal is what shapes `GateContext`.
    *
-   * The gate now loads the row itself with `loadAuthorization(ctx.jobId, {
-   * businessId, db })` — the same `businessId` and `db` every other step in
-   * this call already trusts — so a caller can only ask "does one apply",
+   * The gate now loads the row itself with `loadAuthorization(ctx.db,
+   * ctx.jobId)` — the same `db` every other step in this call already
+   * trusts — so a caller can only ask "does one apply",
    * never assert what it says. When it covers the call, `needsApproval` is
    * satisfied by it instead of by a fresh question (spec §6). It cannot
    * reach `NEVER_FULLY_AUTONOMOUS` or the charter's own `approve_required`
@@ -142,12 +145,11 @@ export async function evaluateToolCall(
   toolInput: unknown,
   ctx: GateContext,
 ): Promise<PolicyDecision> {
-  const businessId = ctx.businessId ?? config.businessId;
-  const db = ctx.db ?? getPool();
+  const db = ctx.db;
   const outbound = isOutbound(toolName);
 
   // 1. Kill switch ---------------------------------------------------------
-  const kill = await checkKillSwitch(ctx.agent, outbound, { businessId, db });
+  const kill = await checkKillSwitch(db, ctx.agent, outbound);
   if (kill.blocked) {
     return deny(
       DENY_CODES.killSwitch,
@@ -156,7 +158,7 @@ export async function evaluateToolCall(
   }
 
   // 2. Stale policy --------------------------------------------------------
-  const currentVersion = await activeCharterVersion(businessId, db);
+  const currentVersion = await activeCharterVersion(db);
   if (currentVersion === null) {
     return deny(
       DENY_CODES.stalePolicy,
@@ -251,7 +253,7 @@ export async function evaluateToolCall(
   // call carrying `ctx.approval`, so the approval path is never mixed in.
   const confirmed = await confirmedCommandCovers(facts, ctx);
   if (confirmed !== null) {
-    return confirmedCommand(confirmed, facts, toolInput, outbound, ctx, currentVersion, businessId, db);
+    return confirmedCommand(confirmed, facts, toolInput, outbound, ctx, currentVersion);
   }
 
   // 5. Hard prohibitions ---------------------------------------------------
@@ -263,7 +265,7 @@ export async function evaluateToolCall(
         facts.counterpartyTags.includes(rule.whenCounterpartyTag)),
   );
   if (forbidden) {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
+    await recordIntent(facts, ctx, currentVersion, {
       kind: 'policy_denial',
       reason: `${forbidden.id} — ${forbidden.description}`,
     });
@@ -277,7 +279,7 @@ export async function evaluateToolCall(
   // 6. Do-not-contact ------------------------------------------------------
   const blocked = matchDoNotContact(facts, ctx.bundle.doNotContact);
   if (blocked !== null) {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
+    await recordIntent(facts, ctx, currentVersion, {
       kind: 'policy_denial',
       reason: `${DENY_CODES.doNotContact}: ${blocked}`,
     });
@@ -290,7 +292,7 @@ export async function evaluateToolCall(
   // promised would not happen.
   const quiet = ctx.bundle.quietHours;
   if (outbound && quiet !== null && inQuietHours(quiet, ctx.now ?? new Date())) {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
+    await recordIntent(facts, ctx, currentVersion, {
       kind: 'policy_denial',
       reason: `${DENY_CODES.quietHours}: ${quiet.from}-${quiet.to} ${quiet.timezone}`,
     });
@@ -322,7 +324,7 @@ export async function evaluateToolCall(
     skipProvenanceOnly: learnedReply,
   });
 
-  const stage8Denial = await autonomyDenial(effective, facts, ctx, currentVersion, businessId);
+  const stage8Denial = await autonomyDenial(effective, facts, ctx, currentVersion);
   if (stage8Denial !== null) return stage8Denial;
 
   // 9. Budget --------------------------------------------------------------
@@ -330,7 +332,7 @@ export async function evaluateToolCall(
   // purchase whose total arrived as `total` or `order.amountMinor` skipped
   // every ceiling and scored zero on the money dimension.
   if (AMOUNT_REQUIRED_CLASSES.has(facts.actionClass) && !facts.amountDeclared) {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
+    await recordIntent(facts, ctx, currentVersion, {
       kind: 'policy_denial',
       reason: `${DENY_CODES.amountUnreadable}: ${facts.actionClass}`,
     });
@@ -340,9 +342,9 @@ export async function evaluateToolCall(
     );
   }
 
-  const budget = await checkBudget(facts, ctx.bundle.ceilings, { businessId, db });
+  const budget = await checkBudget(db, facts, ctx.bundle.ceilings);
   if (!budget.permitted) {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
+    await recordIntent(facts, ctx, currentVersion, {
       kind: 'policy_denial',
       reason: `${budget.code} — ${budget.reason}`,
     });
@@ -357,7 +359,7 @@ export async function evaluateToolCall(
   // A send the learned-reply exemption carried has no `approval_consumed`
   // row to mark, so the fixed token rides on the intent row instead — a
   // reader can find every reply that went out on what she learned alone.
-  const intent = await recordIntent(facts, ctx, currentVersion, businessId, {
+  const intent = await recordIntent(facts, ctx, currentVersion, {
     kind: 'intent_to_act',
     reason: risk.explanation + (learnedReply ? ` ${LEARNED_REPLY_EXEMPTION_MARKER}` : ''),
     risk,
@@ -382,7 +384,7 @@ export async function evaluateToolCall(
   // is permission to do something questionable, never permission to do
   // something the charter forbids outright.
   if (ctx.approval !== undefined) {
-    const spent = await consumeApproval({
+    const spent = await consumeApproval(db, {
       approvalId: ctx.approval.approvalId,
       // An approval always belongs to a job. A context carrying an approval
       // id and no job id cannot match any row, so it falls through and queues
@@ -394,12 +396,11 @@ export async function evaluateToolCall(
       // half of what makes it specific.
       toolName: facts.toolName,
       liveInputHash: facts.inputHash,
-      businessId,
-      ...(ctx.db ? { db: ctx.db } : {}),
     });
 
     if (spent.ok) {
       await appendAudit(
+        ctx.db,
         {
           actor: ctx.agent,
           kind: 'approval',
@@ -418,7 +419,6 @@ export async function evaluateToolCall(
             `approval_consumed:${ctx.approval.approvalId} (intent seq ${intent.seq})` +
             (approvedReply ? ` ${APPROVED_REPLY_EXEMPTION_MARKER}` : ''),
         },
-        { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
       );
 
       return {
@@ -440,7 +440,7 @@ export async function evaluateToolCall(
     // exemption had never applied.
     if (approvedReply) {
       effective = effectiveAutonomy(facts, ctx);
-      const lostClaim = await autonomyDenial(effective, facts, ctx, currentVersion, businessId);
+      const lostClaim = await autonomyDenial(effective, facts, ctx, currentVersion);
       if (lostClaim !== null) return lostClaim;
     }
   }
@@ -457,14 +457,14 @@ export async function evaluateToolCall(
   // a future caller of `coveredByAuthorization` elsewhere might).
   const standingAuth =
     ctx.useStandingAuthorization === true && ctx.jobId != null
-      ? await loadAuthorization(ctx.jobId, { businessId, db })
+      ? await loadAuthorization(db, ctx.jobId)
       : null;
 
   const standing =
     ctx.jobId != null &&
     coveredByAuthorization(standingAuth, {
       jobId: ctx.jobId,
-      businessId,
+      businessId: db.businessId,
       actionClass: facts.actionClass,
       input: isRecord(toolInput) ? toolInput : {},
       amountDeclared: facts.amountDeclared,
@@ -487,6 +487,7 @@ export async function evaluateToolCall(
 
   if (needsApproval) {
     const approvalId = await enqueueApproval(
+      db,
       {
         jobId: ctx.jobId ?? null,
         envelopeId: ctx.envelopeId ?? null,
@@ -496,10 +497,10 @@ export async function evaluateToolCall(
         summary: proposalHeadline(ctx.proposalText) ?? risk.explanation,
         detail: proposalDetail(ctx.proposalText) ?? defaultApprovalDetail(facts, risk),
       },
-      { businessId, db },
     );
 
     await appendAudit(
+      ctx.db,
       {
         actor: ctx.agent,
         kind: 'decision',
@@ -512,7 +513,6 @@ export async function evaluateToolCall(
         risk,
         reason: `queued_for_approval:${approvalId} (intent seq ${intent.seq})`,
       },
-      { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
     );
 
     if (ctx.notify) {
@@ -523,7 +523,7 @@ export async function evaluateToolCall(
       // approval that vanished because an SMTP server was down would be far worse
       // than one nobody was emailed about.
       try {
-        const request = await getApproval(approvalId, { businessId, db });
+        const request = await getApproval(db, approvalId);
         if (request === null) {
           throw new Error('approval vanished immediately after being queued');
         }
@@ -531,6 +531,7 @@ export async function evaluateToolCall(
         if (!delivered.ok) throw new Error(delivered.error ?? 'notify returned not-ok');
       } catch (error) {
         await appendAudit(
+          ctx.db,
           {
             actor: 'system',
             kind: 'incident',
@@ -543,7 +544,6 @@ export async function evaluateToolCall(
               `approval_notify_failed:${approvalId} via ${notifier.channel} — ` +
               `${error instanceof Error ? error.message : String(error)}`,
           },
-          { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
         );
       }
     }
@@ -572,6 +572,7 @@ export async function evaluateToolCall(
   // consulted, not only what tipped it.
   if (standing) {
     await appendAudit(
+      ctx.db,
       {
         actor: ctx.agent,
         kind: 'decision',
@@ -584,7 +585,6 @@ export async function evaluateToolCall(
         risk,
         reason: `standing_authorization:${ctx.jobId} (intent seq ${intent.seq})`,
       },
-      { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
     );
   }
 
@@ -641,10 +641,9 @@ async function autonomyDenial(
   facts: ActionFacts,
   ctx: GateContext,
   currentVersion: string,
-  businessId: string,
 ): Promise<PolicyDecision | null> {
   if (effective === 'forbidden') {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
+    await recordIntent(facts, ctx, currentVersion, {
       kind: 'policy_denial',
       reason: `${DENY_CODES.autonomyForbidden}: ${facts.actionClass}`,
     });
@@ -655,7 +654,7 @@ async function autonomyDenial(
   }
 
   if (effective === 'draft_only') {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
+    await recordIntent(facts, ctx, currentVersion, {
       kind: 'policy_denial',
       reason: `${DENY_CODES.draftOnly}: ${facts.actionClass}`,
     });
@@ -707,12 +706,10 @@ async function confirmedCommand(
   outbound: boolean,
   ctx: GateContext,
   currentVersion: string,
-  businessId: string,
-  db: Queryable,
 ): Promise<PolicyDecision> {
   const actionClass = facts.actionClass;
   if (actionClass !== null && AMOUNT_REQUIRED_CLASSES.has(actionClass) && !facts.amountDeclared) {
-    await recordIntent(facts, ctx, currentVersion, businessId, {
+    await recordIntent(facts, ctx, currentVersion, {
       kind: 'policy_denial',
       reason: `${DENY_CODES.amountUnreadable}: ${actionClass}`,
     });
@@ -723,7 +720,7 @@ async function confirmedCommand(
   }
 
   const risk = await assessRisk(facts, ctx.bundle, ctx.norms ? { norms: ctx.norms } : {});
-  const intent = await recordIntent(facts, ctx, currentVersion, businessId, {
+  const intent = await recordIntent(facts, ctx, currentVersion, {
     kind: 'intent_to_act',
     reason: `${risk.explanation} ${CONFIRMED_COMMAND_EXEMPTION_MARKER}`,
     risk,
@@ -731,14 +728,14 @@ async function confirmedCommand(
 
   const claimed = await claimConfirmedStep(
     { jobId: ctx.jobId ?? '', stepId: confirmed.stepId, planHash: confirmed.planHash },
-    { businessId, db },
+    { businessId: ctx.db.businessId, db: ctx.db },
   );
   if (!claimed) {
     // The marker row above is already written, and on its own it would read as
     // one more execution on the owner's confirmation. This row, citing it by
     // seq, says the attempt was refused — so counting executions is counting
     // marker rows that no `confirmed_step_already_claimed` denial cites.
-    await recordIntent(facts, ctx, currentVersion, businessId, {
+    await recordIntent(facts, ctx, currentVersion, {
       kind: 'policy_denial',
       reason: `${DENY_CODES.confirmedStepAlreadyClaimed} (intent seq ${intent.seq})`,
     });
@@ -826,24 +823,20 @@ async function recordIntent(
   facts: ActionFacts,
   ctx: GateContext,
   charterVersion: string,
-  businessId: string,
   entry: {
     kind: 'intent_to_act' | 'policy_denial';
     reason: string;
     risk?: RiskAssessment;
   },
 ) {
-  // Join the caller's transaction when there is one. `checkBudget` and
-  // `enqueueApproval` already used `ctx.db`; the audit writes did not, so a
-  // caller-supplied transaction produced an approval row and an audit entry
-  // citing it on two different connections — the approval could commit while
-  // its own justification rolled back.
-  //
-  // Passed only when the caller actually supplied a handle. The audit chain
-  // serialises on `pg_advisory_xact_lock`, which is transaction-scoped: handing
-  // it the bare pool would take and drop the lock inside one statement and
-  // silently remove the serialisation that keeps the chain from forking.
+  // On `ctx.db`, joining its transaction when it is in one. `checkBudget` and
+  // `enqueueApproval` use `ctx.db` too; an approval row and the audit entry
+  // citing it on two different connections would let the approval commit
+  // while its own justification rolled back. The audit chain serialises on
+  // `pg_advisory_xact_lock`, which `appendAudit` takes on this same
+  // connection inside the transaction it joins or opens.
   return appendAudit(
+    ctx.db,
     {
       actor: ctx.agent,
       kind: entry.kind,
@@ -856,7 +849,6 @@ async function recordIntent(
       risk: entry.risk ?? null,
       reason: entry.reason,
     },
-    { businessId, ...(ctx.db ? { tx: ctx.db } : {}) },
   );
 }
 

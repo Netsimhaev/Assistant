@@ -1,9 +1,8 @@
 import { ulid } from 'ulid';
-import { config } from '../config.js';
 import type { ActionClass } from '../domain/action.js';
 import type { ActionFacts } from '../domain/policy.js';
 import type { RiskAssessment } from '../domain/risk.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { canonicalHash } from '../util/canonical.js';
 
 export type ApprovalState =
@@ -55,11 +54,10 @@ export interface EnqueueInput {
  * disaster, so approval is never a blocking wait (docs/00-overview.md, #4).
  */
 export async function enqueueApproval(
+  db: BusinessDb,
   input: EnqueueInput,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<string> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   if (input.facts.actionClass === null) {
     throw new Error('cannot queue an approval for a read-only action');
@@ -141,13 +139,12 @@ function toRequest(row: ApprovalRow): ApprovalRequest {
 }
 
 export async function getApproval(
+  db: BusinessDb,
   approvalId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ApprovalRequest | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<ApprovalRow>(
     'SELECT * FROM approval_requests WHERE approval_id = $1 AND business_id = $2',
-    [approvalId, options.businessId ?? config.businessId],
+    [approvalId, db.businessId],
   );
   const row = rows[0];
   return row ? toRequest(row) : null;
@@ -187,9 +184,9 @@ export async function getApproval(
  * this answer can go stale between the two statements.
  */
 export async function unspentApprovalFor(
-  query: { jobId: string; inputHash: string; businessId?: string; db?: Queryable },
+  db: BusinessDb,
+  query: { jobId: string; inputHash: string },
 ): Promise<string | null> {
-  const db = query.db ?? getPool();
   const { rows } = await db.query<{ approval_id: string }>(
     `SELECT approval_id FROM approval_requests
       WHERE business_id = $1 AND job_id = $2 AND input_hash = $3
@@ -198,20 +195,19 @@ export async function unspentApprovalFor(
         AND expires_at > now()
       ORDER BY created_at ASC
       LIMIT 1`,
-    [query.businessId ?? config.businessId, query.jobId, query.inputHash],
+    [db.businessId, query.jobId, query.inputHash],
   );
   return rows[0]?.approval_id ?? null;
 }
 
 export async function pendingApprovals(
-  options: { businessId?: string; db?: Queryable } = {},
+  db: BusinessDb,
 ): Promise<ApprovalRequest[]> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<ApprovalRow>(
     `SELECT * FROM approval_requests
       WHERE business_id = $1 AND state = 'pending'
       ORDER BY created_at ASC`,
-    [options.businessId ?? config.businessId],
+    [db.businessId],
   );
   return rows.map(toRequest);
 }
@@ -244,17 +240,16 @@ export async function pendingApprovals(
  * surfaces it.
  */
 export async function pendingApprovalForJob(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<string | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<{ approval_id: string }>(
     `SELECT approval_id FROM approval_requests
       WHERE business_id = $1 AND job_id = $2 AND state = 'pending'
         AND expires_at > now()
       ORDER BY created_at DESC
       LIMIT 1`,
-    [options.businessId ?? config.businessId, jobId],
+    [db.businessId, jobId],
   );
   return rows[0]?.approval_id ?? null;
 }
@@ -295,15 +290,14 @@ export interface Decision {
  * approval the boss never actually gave for *this* input.
  */
 export async function decide(
+  db: BusinessDb,
   approvalId: string,
   outcome: 'approved' | 'denied',
   decision: Decision,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<ApprovalRequest> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
-  const existing = await getApproval(approvalId, { businessId, db });
+  const existing = await getApproval(db, approvalId);
   if (!existing) throw new Error(`unknown approval ${approvalId}`);
   if (existing.state !== 'pending') {
     throw new ApprovalNotDecidableError(
@@ -406,14 +400,13 @@ export async function decide(
  * no person decided this. Returns whether a row moved.
  */
 export async function cancelPendingApproval(
+  db: BusinessDb,
   approvalId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<boolean> {
-  const db = options.db ?? getPool();
   const res = await db.query(
     `UPDATE approval_requests SET state = 'cancelled'
       WHERE approval_id = $1 AND business_id = $2 AND state = 'pending'`,
-    [approvalId, options.businessId ?? config.businessId],
+    [approvalId, db.businessId],
   );
   return (res.rowCount ?? 0) === 1;
 }
@@ -434,15 +427,14 @@ export async function cancelPendingApproval(
  * Returns whether a row moved.
  */
 export async function stagePendingEdit(
+  db: BusinessDb,
   approvalId: string,
   editedInput: unknown,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<boolean> {
-  const db = options.db ?? getPool();
   const res = await db.query(
     `UPDATE approval_requests SET edited_input = $3
       WHERE approval_id = $1 AND business_id = $2 AND state = 'pending'`,
-    [approvalId, options.businessId ?? config.businessId, JSON.stringify(editedInput)],
+    [approvalId, db.businessId, JSON.stringify(editedInput)],
   );
   return (res.rowCount ?? 0) === 1;
 }
@@ -452,15 +444,14 @@ export async function stagePendingEdit(
  * Returns the ones that expired so the caller can escalate where configured.
  */
 export async function expireOverdue(
-  options: { businessId?: string; db?: Queryable } = {},
+  db: BusinessDb,
 ): Promise<ApprovalRequest[]> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<ApprovalRow>(
     `UPDATE approval_requests
         SET state = 'expired'
       WHERE business_id = $1 AND state = 'pending' AND expires_at <= now()
       RETURNING *`,
-    [options.businessId ?? config.businessId],
+    [db.businessId],
   );
   return rows.map(toRequest);
 }

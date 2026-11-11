@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import mammoth from 'mammoth';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { DocumentSpec, DocxSpec, PdfSpec } from '../domain/document-spec.js';
 import { createJob, loadJob, transition } from '../orchestrator/jobs.js';
 import type { DraftRequest, Drafter } from '../sdk/doc-drafter.js';
@@ -144,7 +144,7 @@ function run(over: Partial<RunProductionsOptions> & { drafter: Drafter }) {
 
 beforeEach(async () => {
   await resetDatabase();
-  charterVersion = (await installCharter(buildCharter(), { businessId: B })).charterVersion;
+  charterVersion = (await withBusiness(B, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 5)
   root = await mkdtemp(join(tmpdir(), 'produced-'));
 });
 afterEach(async () => {

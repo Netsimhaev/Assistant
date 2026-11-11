@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -34,7 +34,7 @@ function collector(): { log: (line: string) => void; lines: string[] } {
 describe('runSetRampCli', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
   });
 
   afterAll(async () => {
@@ -115,7 +115,7 @@ describe('runSetRampCli', () => {
 
   /** The same raise, with the dial opened, is now genuinely felt. */
   it('reports a raise as felt once the dial is opened to learn', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 7)
     const { log, lines } = collector();
 
     await runSetRampCli(['email.reply', 'auto_notify'], { log, businessId: BUSINESS });

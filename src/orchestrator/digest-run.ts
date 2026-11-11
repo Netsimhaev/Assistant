@@ -47,6 +47,7 @@ import { renderDigest } from './digest-render.js';
 import { lastWindowEnd, recordChannel, storeDigest } from './digest-store.js';
 import { dueWindow } from './digest-window.js';
 import type { DigestKind } from './digest-window.js';
+import { withBusiness } from '../db/pool.js';
 
 export interface DigestRunResult {
   /**
@@ -120,7 +121,7 @@ export async function runDigests(options: {
   // throw in `scheduler.ts`.
   let active;
   try {
-    active = await loadActiveCharter(businessId);
+    active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
   } catch (err) {
     return { produced: [], screenOnly: 0, errored: err instanceof Error ? err.message : String(err) };
   }

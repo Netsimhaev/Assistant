@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -80,7 +80,8 @@ describe('schedulerPass', () => {
   });
 
   it('wakes a sleeping job and runs its plan in the same pass', async () => {
-    const bundle = await installCharter(
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [MAIL_CONNECTION],
         // The recipient must resolve by DOMAIN: since the first-contact exempt
@@ -89,9 +90,8 @@ describe('schedulerPass', () => {
         // which is not what this file is about.
         knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'auto' },
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -117,7 +117,7 @@ describe('schedulerPass', () => {
     // The owner's dial (Task 2) defaults to `off`, which clamps
     // `loadRampLevel` to `draft_only` regardless of what is stored — open it
     // first so the promotion below is actually honoured.
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     // Park it asleep, due as of NOON — the same fixed clock passed to
@@ -145,7 +145,8 @@ describe('schedulerPass', () => {
     // production read `verify`, so every job the engine completed stayed there
     // for good. Ordering the close after the run — rather than before it — is
     // what lets one pass take a job from `execute` to `closed`.
-    const bundle = await installCharter(
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [MAIL_CONNECTION],
         // The recipient must resolve by DOMAIN: since the first-contact exempt
@@ -154,9 +155,8 @@ describe('schedulerPass', () => {
         // which is not what this file is about.
         knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'auto' },
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -182,7 +182,7 @@ describe('schedulerPass', () => {
     // The owner's dial (Task 2) defaults to `off`, which clamps
     // `loadRampLevel` to `draft_only` regardless of what is stored — open it
     // first so the promotion below is actually honoured.
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     const sent: MailMessage[] = [];
@@ -217,14 +217,14 @@ describe('schedulerPass', () => {
    * empty and the stored row stays `auto_notify`.
    */
   it('demotes a class on a job that failed in this same pass', async () => {
-    const bundle = await installCharter(
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [MAIL_CONNECTION],
         knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'auto' },
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -250,7 +250,7 @@ describe('schedulerPass', () => {
       { businessId: BUSINESS, by: 'test' },
     );
     await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     // The rung a class can actually fall from. `auto` would be clamped to
     // `auto_notify` on read anyway; writing the level the demotion expects
     // makes what is being tested explicit.
@@ -302,13 +302,13 @@ describe('schedulerPass', () => {
    * does not, purely as a function of which runs first within THIS pass.
    */
   it('counts an approval this very pass just raised', async () => {
-    const bundle = await installCharter(
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [MAIL_CONNECTION],
         knownCounterpartyEmailDomain: 'example.com',
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -333,7 +333,7 @@ describe('schedulerPass', () => {
     await bindPlanToJob(job.jobId, PLAN, { businessId: BUSINESS });
     // `ask` clamps floor AND ceiling to `approve_required` for every class —
     // the plan step must queue an approval rather than send or sit in draft.
-    await setAutonomyMode('ask', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setDigestSettings(
       { schedule: 'daily', dailyHour: 8, weeklyDay: 0, weeklyHour: 8, toEmail: false, toWhatsApp: false },
       'owner',

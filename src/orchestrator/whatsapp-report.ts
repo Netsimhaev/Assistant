@@ -93,7 +93,7 @@
  * `closeVerifiedJobs` already give each job they touch.
  */
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import { JobPhase } from '../domain/job.js';
 import { pendingApprovalForJob } from '../governance/approvals.js';
 import type { BossMessenger } from '../whatsapp/messenger.js';
@@ -575,7 +575,7 @@ export async function classifyJob(
   businessId: string,
 ): Promise<JobVerdict> {
   if (phase === 'await_approval') {
-    const approvalId = await pendingApprovalForJob(jobId, { businessId });
+    const approvalId = await withBusiness(businessId, (bdb) => pendingApprovalForJob(bdb, jobId)); // TENANCY-TODO(task 4)
     if (approvalId !== null) {
       return { status: 'report', outcome: 'awaiting_approval', failReason: null, approvalId };
     }

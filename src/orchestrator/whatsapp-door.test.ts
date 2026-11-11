@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -69,7 +69,7 @@ const JOINED_ANSWER = ['תשלחי לרונית', 'רונית כהן'].join('\n\
 const STRANGER_NUMBER = '+972549999999';
 
 async function withCharter(): Promise<void> {
-  await installCharter(buildCharter(), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
 }
 
 let nextId = 0;
@@ -217,7 +217,8 @@ async function jobWhatsAppMessageId(jobId: string): Promise<string | null> {
 }
 
 async function seedInstructionAttempt(businessId: string): Promise<void> {
-  await appendAudit(
+  await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
+    bdb,
     {
       actor: 'orchestrator',
       kind: 'whatsapp_instruction',
@@ -228,9 +229,8 @@ async function seedInstructionAttempt(businessId: string): Promise<void> {
       costMinor: null,
       tokens: null,
       reason: 'seed row for test',
-    },
-    { businessId },
-  );
+    }
+  ));
 }
 
 describe('runWhatsAppDoor', () => {
@@ -458,7 +458,7 @@ describe('runWhatsAppDoor', () => {
    * ambiguous) is what bounds the loop.
    */
   it('suppresses the identity question on the answer pass, so the same name is not asked about forever', async () => {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -1607,7 +1607,7 @@ describe('a side-effecting instruction over WhatsApp', () => {
   });
 
   it('counts one instruction once against the daily cap, however many candidates were planned', async () => {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -1972,7 +1972,7 @@ describe('confirming a held command over WhatsApp', () => {
     const result = await pass();
 
     expect(result.mailCardReplies).toBe(1);
-    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('approved');
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('approved'); // TENANCY-TODO(task 4)
     expect(await confirmationState(jobId)).toBe('pending');
   });
 
@@ -1988,7 +1988,7 @@ describe('confirming a held command over WhatsApp', () => {
       expect(lastSent()).toBe(SEVERAL_OPEN_REFUSAL);
       expect(await phase(jobId)).toBe('plan');
       expect(await confirmationState(jobId)).toBe('pending');
-      expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+      expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 4)
       expect((await messageRow(msg.providerMessageId))?.state).toBe('failed');
     });
   }
@@ -2314,7 +2314,7 @@ describe('confirming a held command over WhatsApp', () => {
       expect(result.documentCardReplies).toBe(0);
       expect(result.mailCardReplies).toBe(0);
       expect(await cardState(cardId)).toBe('open');
-      expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+      expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 4)
     });
 
     it('"שמרי" with no base folder set is refused with the reason, and nothing is approved', async () => {
@@ -2463,7 +2463,7 @@ describe('confirming a held command over WhatsApp', () => {
       gateway.enqueue(reply('שלח'));
       const result = await pass();
       expect(result.mailCardReplies).toBe(1);
-      expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).not.toBe('pending');
+      expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).not.toBe('pending'); // TENANCY-TODO(task 4)
     });
   });
 });

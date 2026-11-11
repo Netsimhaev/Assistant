@@ -16,7 +16,7 @@
  */
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -398,7 +398,8 @@ export async function recordWhatsAppInstructionAttempt(
   },
 ): Promise<void> {
   try {
-    await appendAudit(
+    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+      bdb,
       {
         actor: 'orchestrator',
         kind: 'whatsapp_instruction',
@@ -409,9 +410,8 @@ export async function recordWhatsAppInstructionAttempt(
         costMinor: null,
         tokens: null,
         reason: `הוראת וואטסאפ · ${counts.status} · ${counts.textLength} תווים`,
-      },
-      { businessId },
-    );
+      }
+    ));
   } catch {
     // Swallowed on purpose — see this function's docblock.
   }

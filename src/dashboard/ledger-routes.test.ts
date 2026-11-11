@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
@@ -26,7 +26,7 @@ let server: Server | null = null;
 beforeEach(async () => {
   await resetDatabase();
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
-  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
 });
 afterEach(async () => {
   if (server) {

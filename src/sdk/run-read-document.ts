@@ -10,7 +10,7 @@
 import { config } from '../config.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { readDocument } from '../documents/read.js';
 
 const documentId = process.argv[2];
@@ -33,8 +33,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const active = await loadActiveCharter(config.businessId);
-  const bundle = active?.bundle ?? (await installCharter(buildCharter()));
+  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const bundle = active?.bundle ?? (await withBusiness(config.businessId, (bdb) => installCharter(bdb, buildCharter()))); // TENANCY-TODO(task 7)
 
   const result = await readDocument({
     documentId,

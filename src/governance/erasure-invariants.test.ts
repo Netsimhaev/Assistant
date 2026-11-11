@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -145,7 +145,7 @@ describe('what an erasure leaves behind', () => {
    * project's own documentation fell into.
    */
   it('leaves the probe in no text or JSON column of any table, anywhere', async () => {
-    const bundle = await installCharter(buildCharter({ version: 'probe' }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'probe' }))); // TENANCY-TODO(task 6)
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -762,7 +762,7 @@ describe('what an erasure leaves behind', () => {
     // A real `"` inside the name and a real newline right after it: both are
     // escaped in the plan's JSONB text form.
     const BODY = `לכבוד ${NAME}\nשלום, שלחתי את ההצעה`;
-    const bundle = await installCharter(buildCharter({ version: 'update-only' }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'update-only' }))); // TENANCY-TODO(task 6)
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -812,7 +812,7 @@ describe('what an erasure leaves behind', () => {
    */
   it('reaches a confirmation whose name appears only in the question or only JSON-escaped in an option', async () => {
     const NAME = 'אלפא בע"מ';
-    const bundle = await installCharter(buildCharter({ version: 'confirmation-only' }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'confirmation-only' }))); // TENANCY-TODO(task 6)
     const db = getPool();
     const textJob = await createJob({
       charterVersion: bundle.charterVersion,
@@ -899,7 +899,7 @@ describe('what an erasure leaves behind', () => {
    * erasure of that very contact permanently.
    */
   it('reaches a correction note that names a counterparty the job otherwise never mentions', async () => {
-    const bundle = await installCharter(buildCharter({ version: 'note-only' }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'note-only' }))); // TENANCY-TODO(task 6)
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -945,7 +945,7 @@ describe('what an erasure leaves behind', () => {
    * point: the subject job's own plan row going away says nothing here.
    */
   it('reaches a gov.verify job whose bound plan names the document, on a document anchor', async () => {
-    const bundle = await installCharter(buildCharter({ version: 'doc-anchor' }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'doc-anchor' }))); // TENANCY-TODO(task 6)
     const db = getPool();
     const documentId = `DOC-anchor-${Date.now()}`;
 
@@ -1057,7 +1057,7 @@ describe('what an erasure leaves behind', () => {
    * found is explicitly kept, is the next test below (Critical 1).
    */
   it('leaves a second contact entirely intact', async () => {
-    const bundle = await installCharter(buildCharter({ version: 'two' }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'two' }))); // TENANCY-TODO(task 6)
     const mk = async (identifier: string, title: string): Promise<string> => {
       const job = await createJob({
         charterVersion: bundle.charterVersion,
@@ -1117,7 +1117,7 @@ describe('what an erasure leaves behind', () => {
    * job's opening message while the preview reports it as kept.
    */
   it('leaves a kept job’s own WhatsApp message alone', async () => {
-    const bundle = await installCharter(buildCharter({ version: 'wa-kept' }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-kept' }))); // TENANCY-TODO(task 6)
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -1136,7 +1136,7 @@ describe('what an erasure leaves behind', () => {
        VALUES ('WA-kept-job', $1, 'wamid-kept-job', 'inbound', $2, 'principal', $3, now(), 'handled', $4)`,
       [BUSINESS, PROBE, `הודעה מ-${PROBE}`, job.jobId],
     );
-    await keepItem({ kind: 'job', itemId: job.jobId, note: 'לשימור' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: job.jobId, note: 'לשימור' })); // TENANCY-TODO(task 6)
 
     const plan = await buildErasurePlan({ kind: 'contact', identifier: PROBE }, { businessId: BUSINESS });
     expect(plan.jobIds).not.toContain(job.jobId);
@@ -1169,7 +1169,7 @@ describe('what an erasure leaves behind', () => {
    * the message rides along for the wrong reason.
    */
   it('reaches a job whose only trace of the contact is its own WhatsApp message', async () => {
-    const bundle = await installCharter(buildCharter({ version: 'wa-discovery' }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-discovery' }))); // TENANCY-TODO(task 6)
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -1218,7 +1218,7 @@ describe('what an erasure leaves behind', () => {
    * same identifier, survives untouched. Fix round 1, Important 2.
    */
   it('reaches an orphan whatsapp message by window, and leaves one outside the window alone', async () => {
-    await installCharter(buildCharter({ version: 'wa-window' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'wa-window' }))); // TENANCY-TODO(task 6)
 
     // The window arm matches `created_at` (when the row was WRITTEN), not
     // `provider_timestamp` (what GREEN-API says about when the message was
@@ -1267,7 +1267,7 @@ describe('what an erasure leaves behind', () => {
    * mail went.
    */
   it('contact erasure deletes the mail and its reply job', async () => {
-    const bundle = await installCharter(buildCharter({ version: 'mail' }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail' }))); // TENANCY-TODO(task 6)
     const db = getPool();
     const NAME = 'רונית_כהן';
     const SENDER = 'ronit@client.example';
@@ -1373,7 +1373,7 @@ describe('what an erasure leaves behind', () => {
 
   /** The window arm: `received_at`, inside the window gone, outside kept. */
   it('reaches mail by received_at on a window anchor', async () => {
-    await installCharter(buildCharter({ version: 'mail-window' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail-window' }))); // TENANCY-TODO(task 6)
     for (const [mailId, at] of [
       ['M-in', '2026-01-01T12:00:00.000Z'],
       ['M-out', '2026-03-01T12:00:00.000Z'],
@@ -1410,7 +1410,7 @@ describe('what an erasure leaves behind', () => {
    * the mail that delivered it is not the document and stays.
    */
   it('removes the invoice of an erased document and keeps the mail', async () => {
-    await installCharter(buildCharter({ version: 'mail-doc' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'mail-doc' }))); // TENANCY-TODO(task 6)
     const db = getPool();
     const documentId = `DOC-inv-${Date.now()}`;
     await db.query(

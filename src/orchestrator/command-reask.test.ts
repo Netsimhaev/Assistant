@@ -8,7 +8,7 @@
  * `runDueJobs`.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withTransaction } from '../db/pool.js';
+import { closePool, getPool, withTransaction, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -159,10 +159,10 @@ async function seedCommand(o: {
   const plan = o.plan ?? PLAN;
   const planHash = planHashOf(plan);
   charterCounter += 1;
-  const bundle = await installCharter(
-    buildCharter({ version: `2026-08-15.reask-${charterCounter}`, connections: [MAIL_CONNECTION] }),
-    { businessId },
-  );
+  const bundle = await withBusiness(businessId, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    bdb,
+    buildCharter({ version: `2026-08-15.reask-${charterCounter}`, connections: [MAIL_CONNECTION] })
+  ));
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',

@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { AgentEnvelope } from '../domain/envelope.js';
 import type { EnvelopeConstraints } from '../domain/envelope.js';
 import {
@@ -55,13 +55,10 @@ afterAll(async () => {
 describe('writeEnvelope / loadEnvelope', () => {
   it('round-trips an envelope through the database unchanged', async () => {
     const envelope = anEnvelope();
-    const written = await writeEnvelope(envelope, {
-      parentJobId: 'JOB-root',
-      businessId: BUSINESS,
-    });
+    const written = await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: 'JOB-root' }));
     expect(written.status).toBe('stored');
 
-    const loaded = await loadEnvelope(envelope.id, { businessId: BUSINESS });
+    const loaded = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, envelope.id));
     const parsed = AgentEnvelope.parse(loaded);
     expect(parsed).toEqual(envelope);
     expect(Array.isArray(parsed.causalChain)).toBe(true);
@@ -70,19 +67,13 @@ describe('writeEnvelope / loadEnvelope', () => {
 
   it('returns duplicate and stores nothing on a repeated idempotency key', async () => {
     const envelope = anEnvelope();
-    const first = await writeEnvelope(envelope, {
-      parentJobId: 'JOB-root',
-      businessId: BUSINESS,
-    });
+    const first = await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: 'JOB-root' }));
     expect(first.status).toBe('stored');
 
-    const second = await writeEnvelope(envelope, {
-      parentJobId: 'JOB-root',
-      businessId: BUSINESS,
-    });
+    const second = await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: 'JOB-root' }));
     expect(second.status).toBe('duplicate');
 
-    const { rows } = await getPool().query<{ n: string }>(
+    const { rows } = await testDb().query<{ n: string }>(
       `SELECT count(*)::text AS n FROM agent_envelopes WHERE business_id = $1`,
       [BUSINESS],
     );
@@ -100,10 +91,10 @@ describe('priorQuadruples', () => {
     };
     const inFirst = anEnvelope({ correlationId: 'JOB-a', ...shared });
     const inSecond = anEnvelope({ correlationId: 'JOB-b', ...shared });
-    await writeEnvelope(inFirst, { parentJobId: 'JOB-a', businessId: BUSINESS });
-    await writeEnvelope(inSecond, { parentJobId: 'JOB-b', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, inFirst, { parentJobId: 'JOB-a' }));
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, inSecond, { parentJobId: 'JOB-b' }));
 
-    const quadruples = await priorQuadruples('JOB-a', { businessId: BUSINESS });
+    const quadruples = await withBusiness(BUSINESS, (bdb) => priorQuadruples(bdb, 'JOB-a'));
     expect(quadruples).toHaveLength(1);
     expect(quadruples[0]).toMatchObject({
       from: 'comms.email',
@@ -128,7 +119,7 @@ describe('priorQuadruples', () => {
       to: 'know.reader',
       intent: 'summarise_document',
     });
-    await writeEnvelope(request, { parentJobId: correlationId, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, request, { parentJobId: correlationId }));
     const answer = anEnvelope({
       correlationId,
       kind: 'result',
@@ -136,9 +127,9 @@ describe('priorQuadruples', () => {
       to: 'comms.email',
       intent: 'summarise_document',
     });
-    await writeEnvelope(answer, { parentJobId: correlationId, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, answer, { parentJobId: correlationId }));
 
-    const quadruples = await priorQuadruples(correlationId, { businessId: BUSINESS });
+    const quadruples = await withBusiness(BUSINESS, (bdb) => priorQuadruples(bdb, correlationId));
     expect(quadruples).toHaveLength(1);
     expect(quadruples[0]).toMatchObject({ from: 'comms.email', to: 'know.reader' });
   });
@@ -159,18 +150,18 @@ describe('countPairExchanges', () => {
       to: 'know.reader',
       intent: 'summarise_document',
     });
-    await writeEnvelope(first, { parentJobId: correlationId, businessId: BUSINESS });
-    await writeEnvelope(second, { parentJobId: correlationId, businessId: BUSINESS });
-    await writeEnvelope(otherIntent, { parentJobId: correlationId, businessId: BUSINESS });
-    await writeEnvelope(otherCorrelation, { parentJobId: 'JOB-unrelated', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, first, { parentJobId: correlationId }));
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, second, { parentJobId: correlationId }));
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, otherIntent, { parentJobId: correlationId }));
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, otherCorrelation, { parentJobId: 'JOB-unrelated' }));
 
-    const count = await countPairExchanges(
+    const count = await withBusiness(BUSINESS, (bdb) => countPairExchanges(
+      bdb,
       correlationId,
       'comms.email',
       'know.reader',
-      'summarise_document',
-      { businessId: BUSINESS },
-    );
+      'summarise_document'
+    ));
     expect(count).toBe(2);
   });
 
@@ -189,15 +180,15 @@ describe('countPairExchanges', () => {
       to: 'comms.email',
       intent: 'summarise_document',
     });
-    await writeEnvelope(answer, { parentJobId: correlationId, businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, answer, { parentJobId: correlationId }));
 
-    const count = await countPairExchanges(
+    const count = await withBusiness(BUSINESS, (bdb) => countPairExchanges(
+      bdb,
       correlationId,
       'know.reader',
       'comms.email',
-      'summarise_document',
-      { businessId: BUSINESS },
-    );
+      'summarise_document'
+    ));
     expect(count).toBe(0);
   });
 });
@@ -206,30 +197,30 @@ describe('delegationsToday', () => {
   it('delegationsToday counts audit rows and not envelope rows', async () => {
     // No `AuditKind` member for `'delegation'` exists yet (a later task adds
     // one) — inserted directly so this test is not blocked on that task.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO audit_log (
          business_id, actor, kind, charter_version, provenance, input_hash, reason, prev_hash, hash
        ) VALUES ($1, 'orchestrator', 'delegation', 'v1', 'boss', 'h', 'האצלה לדוגמה', $2, $3)`,
       [BUSINESS, '0'.repeat(64), '1'.repeat(64)],
     );
 
-    expect(await delegationsToday({ businessId: BUSINESS })).toBe(1);
+    expect(await withBusiness(BUSINESS, (bdb) => delegationsToday(bdb))).toBe(1);
 
     // An envelope with no matching audit row must not move the count.
     const envelope = anEnvelope();
-    await writeEnvelope(envelope, { parentJobId: 'JOB-root', businessId: BUSINESS });
-    expect(await delegationsToday({ businessId: BUSINESS })).toBe(1);
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: 'JOB-root' }));
+    expect(await withBusiness(BUSINESS, (bdb) => delegationsToday(bdb))).toBe(1);
   });
 });
 
 describe('attachChildJob', () => {
   it('attachChildJob fills the column the resumer reads', async () => {
     const envelope = anEnvelope();
-    await writeEnvelope(envelope, { parentJobId: 'JOB-root', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: 'JOB-root' }));
 
-    await attachChildJob(envelope.id, 'JOB-child', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, envelope.id, 'JOB-child'));
 
-    const { rows } = await getPool().query<{ child_job_id: string | null }>(
+    const { rows } = await testDb().query<{ child_job_id: string | null }>(
       `SELECT child_job_id FROM agent_envelopes WHERE business_id = $1 AND envelope_id = $2`,
       [BUSINESS, envelope.id],
     );

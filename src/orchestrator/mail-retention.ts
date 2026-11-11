@@ -28,7 +28,7 @@
  * (`scheduler.ts`) and `executeErasure` already give for those values.
  */
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, type BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -54,7 +54,11 @@ export async function scrubOldMailBodies(
     );
     const scrubbed = rowCount ?? 0;
     if (scrubbed > 0) {
+      // The raw client is inside the BEGIN above; viewed as a BusinessDb in a
+      // transaction so the audit row joins it.
+      const tx: BusinessDb = { businessId, inTransaction: true, query: client.query.bind(client) }; // TENANCY-TODO(task 4)
       await appendAudit(
+        tx,
         {
           actor: 'system',
           kind: 'erasure',
@@ -63,7 +67,6 @@ export async function scrubOldMailBodies(
           inputHash: canonicalHash({ event: 'mail_retention', scrubbed }),
           reason: `mail_retention:${scrubbed}`,
         },
-        { businessId, tx: client },
       );
     }
     await client.query('COMMIT');

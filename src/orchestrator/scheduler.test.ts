@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -40,7 +40,7 @@ const NIGHT = new Date('2026-08-18T00:00:00.000Z');
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 async function install(overrides = {}): Promise<PolicyBundle> {
-  return installCharter(buildCharter(overrides), { businessId: BUSINESS });
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(overrides))); // TENANCY-TODO(task 4)
 }
 
 async function jobInExecute(bundle: PolicyBundle) {
@@ -170,12 +170,12 @@ describe('the scheduler closes the loop the orchestrator opens', () => {
     const result = await tick({ businessId: BUSINESS, now: NOON });
 
     expect(result.expiredApprovals).toEqual([queued.approvalId]);
-    expect((await getApproval(queued.approvalId, { businessId: BUSINESS }))?.state).toBe(
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, queued.approvalId)))?.state).toBe( // TENANCY-TODO(task 4)
       'expired',
     );
     // The job is freed rather than failed: nobody answering is not a rejection.
     expect((await loadJob(job.jobId, { businessId: BUSINESS }))?.phase).toBe('followup');
-    expect(await pendingApprovals({ businessId: BUSINESS })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb))).toEqual([]); // TENANCY-TODO(task 4)
   });
 
   it('leaves an approval that is still within its fuse alone', async () => {
@@ -384,7 +384,7 @@ describe('a delegation resumes in the same pass it is freed', () => {
     expect(parkedParent?.phase).toBe('followup');
     if (parkedParent?.awaitingEnvelopeId == null) throw new Error('expected an awaiting envelope id');
 
-    const stored = await loadEnvelopeWithChild(parkedParent.awaitingEnvelopeId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadEnvelopeWithChild(bdb, parkedParent.awaitingEnvelopeId as string)); // TENANCY-TODO(task 4)
     if (stored?.childJobId == null) throw new Error('expected an attached child job');
     const childJobId = stored.childJobId;
 
@@ -517,7 +517,7 @@ describe('the mail field on SchedulerPassResult', () => {
     expect(pass.mailError).toBeNull();
     expect(pass.mail).toMatchObject({ status: 'ok', recorded: 1, triaged: 1, drafts: 1 });
     expect((await getCursor({ businessId: BUSINESS }))?.cursor).toBe('C-1');
-    const pending = await pendingApprovals({ businessId: BUSINESS });
+    const pending = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 4)
     expect(pending).toHaveLength(1);
   });
 });

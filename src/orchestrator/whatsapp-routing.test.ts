@@ -16,7 +16,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
 import { pendingQuestions, type InstructionRecord } from '../governance/instructions.js';
 import type { PlanOutcome } from '../sdk/planner.js';
@@ -101,7 +101,7 @@ async function openQuestions(): Promise<InstructionRecord[]> {
 describe('decideWhatsAppRoute', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   });
 
   afterAll(async () => {
@@ -288,7 +288,7 @@ describe('decideWhatsAppRoute', () => {
 describe('claimAsAnswer', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   });
 
   /**
@@ -320,7 +320,7 @@ describe('claimAsAnswer', () => {
 describe('retireOpenInstruction', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   });
 
   /**

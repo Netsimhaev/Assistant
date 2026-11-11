@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -38,7 +38,7 @@ const ACTING_PROPOSAL: Proposal = {
 };
 
 async function install(businessId: string): Promise<PolicyBundle> {
-  return installCharter(buildCharter(), { businessId });
+  return withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
 }
 
 /** Real `ActionFacts`, matching the shape `governance/consume.test.ts` builds. */
@@ -161,16 +161,16 @@ async function anApproval(
   bundle: PolicyBundle,
   input: unknown = MAIL_INPUT,
 ): Promise<string> {
-  return enqueueApproval(
+  return withBusiness(businessId, async (bdb) => enqueueApproval( // TENANCY-TODO(task 10)
+    bdb,
     {
       jobId,
       facts: factsFor(input),
       risk: await riskFor(input, bundle),
       proposedInput: input,
       summary: 'שליחת מייל',
-    },
-    { businessId },
-  );
+    }
+  ));
 }
 
 beforeEach(async () => {

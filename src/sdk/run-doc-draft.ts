@@ -18,7 +18,7 @@ import { z } from 'zod';
 import { compileCharter } from '../charter/compile.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { DocumentFormat, DocumentKind, DocumentLanguage } from '../domain/document-spec.js';
 import { TrustLevel } from '../domain/trust.js';
 import { validateSpec } from '../production/validate-spec.js';
@@ -56,7 +56,7 @@ async function main(): Promise<void> {
     return;
   }
   const fixture = Fixture.parse(JSON.parse(readFileSync(path, 'utf8')));
-  const active = await loadActiveCharter(config.businessId);
+  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
   const charter = active?.charter ?? buildCharter();
   const bundle = active?.bundle ?? compileCharter(charter);
   const today = localParts(new Date(), charter.identity.timezone).date;

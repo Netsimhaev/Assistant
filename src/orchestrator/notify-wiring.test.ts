@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -114,10 +114,10 @@ describe('approval notification wiring', () => {
   });
 
   it('notifies the owner when the gate queues an approval', async () => {
-    const bundle = await installCharter(
-      buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
+      buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } })
+    ));
     const job = await jobInExecute(bundle);
 
     const { calls, notifier } = recordingNotifier();
@@ -141,10 +141,10 @@ describe('approval notification wiring', () => {
   });
 
   it('runs unchanged when no notifier is supplied', async () => {
-    const bundle = await installCharter(
-      buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
+      buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } })
+    ));
     const job = await jobInExecute(bundle);
 
     const result = await runPlan({
@@ -194,10 +194,10 @@ describe('approval notification wiring', () => {
    * vacuously.
    */
   it('carries a real secret from the store to the transport, for a plan-driven send', async () => {
-    const bundle = await installCharter(
-      buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
+      buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' })
+    ));
     const job = await jobInExecute(bundle);
 
     // The store is the source: nothing in this test sets SMTP_PASS, and the
@@ -289,10 +289,10 @@ describe('approval notification wiring', () => {
    */
   it('keeps the resolved secret out of the audit row a failed notification writes', async () => {
     const secret = 'סוד-התראה-שאסור-להופיע';
-    const bundle = await installCharter(
-      buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
+      buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'approve_required' } })
+    ));
     const job = await jobInExecute(bundle);
 
     const key = randomBytes(32);

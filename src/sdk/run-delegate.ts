@@ -84,7 +84,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { queryAudit } from '../audit/log.js';
@@ -149,8 +149,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const active = await loadActiveCharter(BUSINESS);
-  const bundle = active?.bundle ?? (await installCharter(buildCharter()));
+  const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const bundle = active?.bundle ?? (await withBusiness(config.businessId, (bdb) => installCharter(bdb, buildCharter()))); // TENANCY-TODO(task 7)
   console.log(`עסק: ${BUSINESS} · תקנון: ${bundle.charterVersion} · עוגן: ${PROBE}`);
 
   // ------------------------------------------------------- SEED A DOCUMENT
@@ -240,7 +240,7 @@ async function main(): Promise<void> {
     console.log('עוצר כאן — בלי ילד אין מה להריץ ולסגור.');
     return;
   }
-  const stored = await loadEnvelopeWithChild(opened.envelopeId, { businessId: BUSINESS });
+  const stored = await withBusiness(BUSINESS, (bdb) => loadEnvelopeWithChild(bdb, opened.envelopeId)); // TENANCY-TODO(task 7)
   check('המעטפת קיימת בבסיס הנתונים', stored !== null);
   if (stored === null) return;
   const envelope = stored.envelope;
@@ -336,7 +336,7 @@ async function main(): Promise<void> {
   // again here would be a tautology proven by the query's WHERE clause, not
   // by anything this run did. The one fact worth checking is the payload's
   // content, which the query does not constrain.
-  const resultEnvelope = await loadResultForChildJob(childJobId, parent.jobId, { businessId: BUSINESS });
+  const resultEnvelope = await withBusiness(BUSINESS, (bdb) => loadResultForChildJob(bdb, childJobId, parent.jobId)); // TENANCY-TODO(task 7)
   check('שורת result נמצאה (resumeDelegatedJobs כתב אותה בפועל)', resultEnvelope !== null);
   if (resultEnvelope !== null) {
     const payload = resultEnvelope.payload as { outcome?: unknown; note?: unknown };
@@ -345,7 +345,7 @@ async function main(): Promise<void> {
   }
 
   banner('אימות 3: audit_log מסוג delegation, עם envelope_id שאינו null');
-  const auditRows = await queryAudit({ businessId: BUSINESS, jobId: parent.jobId, kind: 'delegation' });
+  const auditRows = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { jobId: parent.jobId, kind: 'delegation' })); // TENANCY-TODO(task 7)
   for (const row of auditRows) {
     console.log(`  ${row.at} · envelopeId=${row.envelopeId ?? '(null)'} · ${row.reason}`);
   }

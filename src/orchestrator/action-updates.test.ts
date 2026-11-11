@@ -8,7 +8,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { saveActionUpdateSettings } from '../governance/action-update-settings.js';
@@ -96,7 +96,7 @@ async function rows(): Promise<
 
 beforeEach(async () => {
   await resetDatabase();
-  bundle = await installCharter(buildCharter({}), { businessId: BUSINESS });
+  bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 4)
 });
 
 afterAll(async () => {

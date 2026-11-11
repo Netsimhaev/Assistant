@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withTransaction } from '../db/pool.js';
+import { closePool, getPool, withTransaction, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -35,10 +35,10 @@ async function jobInVerify(
 ): Promise<{ jobId: string; planHash: string }> {
   const businessId = options.businessId ?? BUSINESS;
   charterCounter += 1;
-  const bundle = await installCharter(
-    buildCharter({ version: `2026-08-25.${charterCounter}` }),
-    { businessId },
-  );
+  const bundle = await withBusiness(businessId, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    bdb,
+    buildCharter({ version: `2026-08-25.${charterCounter}` })
+  ));
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',

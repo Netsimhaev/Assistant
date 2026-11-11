@@ -11,7 +11,7 @@
  * behaviour the system actually produces rather than a shape a test invented.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -96,15 +96,15 @@ function runtimeWith(sent: MailMessage[]): Runtime {
  * one signed charter, exactly as they would on one real install.
  */
 async function installFixture(): Promise<PolicyBundle> {
-  const bundle = await installCharter(
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+    bdb,
     buildCharter({
       version: '2026-08-15.autonomous-actions',
       connections: [MAIL_CONNECTION],
       knownCounterpartyEmailDomain: 'example.com',
-    }),
-    { businessId: BUSINESS },
-  );
-  await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    })
+  ));
+  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 10)
   await upsertBinding(
     {
       system: 'office-mail',
@@ -228,7 +228,7 @@ describe('listAutonomousActions', () => {
 
     // The owner approves the card — exactly what `applyDecision` runs under
     // the dashboard's `/a/:id/approve` route.
-    const [pending] = await pendingApprovals({ businessId: BUSINESS });
+    const [pending] = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 10)
     if (pending === undefined) throw new Error('expected one pending approval');
     expect(pending.jobId).toBe(cardJobId);
     await applyDecision(
@@ -299,7 +299,7 @@ describe('listAutonomousActions', () => {
     const beforeApproval = await listAutonomousActions({ businessId: BUSINESS });
     expect(beforeApproval.map((a) => a.stepId)).toEqual(['s1']);
 
-    const [pending] = await pendingApprovals({ businessId: BUSINESS });
+    const [pending] = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 10)
     if (pending === undefined) throw new Error('expected one pending approval for s2');
     await applyDecision(
       pending.approvalId,
@@ -327,7 +327,7 @@ describe('listAutonomousActions', () => {
    * or could mark. Only `performed = true` is listed.
    */
   it('lists only steps that performed, leaving out performed = false and performed IS NULL', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 10)
     const performedJob = await seedCompletedStep(bundle, true);
     await seedCompletedStep(bundle, false);
     await seedCompletedStep(bundle, null);
@@ -337,7 +337,7 @@ describe('listAutonomousActions', () => {
   });
 
   it('marks a step fromInstruction only when ITS business holds a boss_instructions row for the job', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 10)
     const instructedJob = await seedCompletedStep(bundle, true);
     const plainJob = await seedCompletedStep(bundle, true);
     const foreignInstructionJob = await seedCompletedStep(bundle, true);
@@ -365,7 +365,7 @@ describe('listAutonomousActions', () => {
   });
 
   it('returns an empty list for a business with no completed steps', async () => {
-    await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 10)
     expect(await listAutonomousActions({ businessId: BUSINESS })).toEqual([]);
   });
 });

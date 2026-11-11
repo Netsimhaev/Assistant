@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../../config.js';
 import { installCharter } from '../../charter/store.js';
-import { closePool } from '../../db/pool.js';
+import { closePool, withBusiness } from '../../db/pool.js';
 import type { CharterConnection } from '../../domain/connection.js';
 import { KEY_BYTES, writeKeyState } from '../../governance/master-key.js';
 import { writeGrant } from '../../governance/oauth-grants.js';
@@ -229,7 +229,7 @@ describe('createGoogleCalendarAdapter', () => {
     // declared" — the charter -> registry link itself (does a declared
     // `serves: ['calendar.read']` connection actually cause registration)
     // is proven separately, by `runtime.test.ts`'s two registration tests.
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 4)
     await writeKeyState(KEY, 'KEY-e2e', { businessId: BUSINESS });
     await upsertBinding(
       {

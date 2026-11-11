@@ -1,9 +1,9 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
-import { evaluateToolCall } from '../policy/engine.js';
+import { evaluateFor } from '../test/gate.js';
 import { inQuietHours, redactPayload } from '../policy/redact.js';
 import { canTransition } from '../domain/job.js';
 import type { PolicyBundle } from '../domain/policy.js';
@@ -28,7 +28,7 @@ const NIGHT = new Date('2026-08-18T00:00:00.000Z');
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 async function install(overrides = {}): Promise<PolicyBundle> {
-  return installCharter(buildCharter(overrides), { businessId: BUSINESS });
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(overrides))); // TENANCY-TODO(task 4)
 }
 
 async function jobInExecute(bundle: PolicyBundle) {
@@ -149,7 +149,7 @@ describe('quiet hours', () => {
   it('stops an outbound send at night — the promise the owner signed', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812' },
       {
@@ -174,7 +174,7 @@ describe('quiet hours', () => {
 
     // Reading and writing our own records at 03:00 is fine. The promise is
     // about a message arriving on someone's phone.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'crm.read',
       { entityId: 'c_812' },
       {
@@ -232,7 +232,7 @@ describe('redaction', () => {
     const bundle = await install({ knownCounterpartyEmailDomain: 'b.com' });
 
     // The fixture redacts a bare 9-digit number — an Israeli ID.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       {
         to: 'a@b.com',

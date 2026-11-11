@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -42,10 +42,10 @@ let bundle: PolicyBundle;
 
 beforeEach(async () => {
   await resetDatabase();
-  bundle = await installCharter(
-    buildCharter({ knownCounterpartyEmailDomain: 'acme.co.il' }),
-    { businessId: BUSINESS },
-  );
+  bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+    bdb,
+    buildCharter({ knownCounterpartyEmailDomain: 'acme.co.il' })
+  ));
 });
 
 afterAll(async () => {

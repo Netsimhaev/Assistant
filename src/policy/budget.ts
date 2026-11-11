@@ -1,6 +1,5 @@
-import { config } from '../config.js';
 import type { ActionFacts, CompiledCeilings } from '../domain/policy.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { formatMinor } from '../util/money.js';
 
 export type BudgetVerdict =
@@ -19,17 +18,14 @@ interface SpendWindow {
  * counter that a crash leaves stale is a ceiling that silently stops holding.
  * The ledger is the source of truth and the sum is always recomputable.
  */
-async function spentInWindows(
-  businessId: string,
-  db: Queryable,
-): Promise<SpendWindow> {
+async function spentInWindows(db: BusinessDb): Promise<SpendWindow> {
   const { rows } = await db.query<{ daily: string | null; monthly: string | null }>(
     `SELECT
        COALESCE(SUM(amount_minor) FILTER (WHERE at >= now() - interval '1 day'), 0)   AS daily,
        COALESCE(SUM(amount_minor) FILTER (WHERE at >= now() - interval '30 days'), 0) AS monthly
      FROM spend_ledger
      WHERE business_id = $1`,
-    [businessId],
+    [db.businessId],
   );
 
   const row = rows[0];
@@ -51,9 +47,9 @@ async function spentInWindows(
  * an in-the-moment approval should quietly raise.
  */
 export async function checkBudget(
+  db: BusinessDb,
   facts: ActionFacts,
   ceilings: CompiledCeilings,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<BudgetVerdict> {
   if (facts.actionClass === null) {
     return { permitted: true };
@@ -78,9 +74,6 @@ export async function checkBudget(
   if (facts.amountMinor === 0) {
     return { permitted: true };
   }
-
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
 
   const perClass = ceilings.perActionClassMinor[facts.actionClass];
 
@@ -134,7 +127,7 @@ export async function checkBudget(
     }
   }
 
-  const spent = await spentInWindows(businessId, db);
+  const spent = await spentInWindows(db);
 
   if (spent.daily + facts.amountMinor > ceilings.dailyMinor) {
     return {
@@ -169,6 +162,7 @@ export async function checkBudget(
  * does the enforcing; this returns false when the row already existed.
  */
 export async function recordSpend(
+  db: BusinessDb,
   entry: {
     jobId: string | null;
     actionClass: string;
@@ -177,10 +171,8 @@ export async function recordSpend(
     idempotencyKey: string;
     auditSeq?: bigint;
   },
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<boolean> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const { rowCount } = await db.query(
     `INSERT INTO spend_ledger

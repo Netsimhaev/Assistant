@@ -15,7 +15,7 @@
  * test.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -66,12 +66,12 @@ afterAll(async () => {
 
 describe('the executor consults the standing authorisation the instruction door wrote', () => {
   it('runs a covered step without asking again', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const job = await bossJobInExecute(bundle);
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization( // TENANCY-TODO(task 4)
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] }
+    ));
 
     let performed = 0;
     const outcome = await executeStep({
@@ -103,7 +103,7 @@ describe('the executor consults the standing authorisation the instruction door 
   });
 
   it('still asks when no authorisation was granted for the job', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const job = await bossJobInExecute(bundle);
     // No grantAuthorization call — the single difference from the test above.
 

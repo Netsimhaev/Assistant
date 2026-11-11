@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -17,9 +17,7 @@ async function seedJob(provenance: 'boss' | 'unknown_external', toolName = 'mail
   // A fresh version per call: `charter_versions`' primary key is
   // (business_id, charter_version), and several tests here call `seedJob`
   // more than once against the same BUSINESS.
-  const bundle = await installCharter(buildCharter({ version: `curation-${randomUUID()}` }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `curation-${randomUUID()}` }))); // TENANCY-TODO(task 5)
   // `createJob` takes ONE argument and requires `charterVersion`. There is no
   // `counterpartyTags` on it — preflight for Task 2 caught this shape.
   const job = await createJob({

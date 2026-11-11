@@ -36,7 +36,7 @@
  * command whose answer is the live state, and "nothing is stopped" is an
  * answer, not an empty result.
  */
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { config } from '../config.js';
 import {
   AGENT_DEPARTMENT,
@@ -92,7 +92,7 @@ export async function runKillCli(argv: string[], deps: KillCliDeps): Promise<voi
 
   if (action === 'status') {
     if (argv.length > 1) throw new Error(`ל-status אין ארגומנטים.\n${USAGE}`);
-    const active = await activeScopes(businessId);
+    const active = await withBusiness(businessId, (bdb) => activeScopes(bdb)); // TENANCY-TODO(task 7)
     if (active.length === 0) {
       log(`אין שום עצירה פעילה עבור ${businessId} — כל ההיקפים פתוחים.`);
       return;
@@ -130,7 +130,7 @@ export async function runKillCli(argv: string[], deps: KillCliDeps): Promise<voi
   const scope: KillScope = rawScope;
 
   if (action === 'stop') {
-    await trip(scope, by, reason, { businessId });
+    await withBusiness(businessId, (bdb) => trip(bdb, scope, by, reason)); // TENANCY-TODO(task 7)
     log(`העצירה בהיקף "${scope}" פעילה מעכשיו עבור ${businessId}.`);
     log('');
     explainScope(scope, log);
@@ -143,9 +143,9 @@ export async function runKillCli(argv: string[], deps: KillCliDeps): Promise<voi
     return;
   }
 
-  await release(scope, by, reason, { businessId });
+  await withBusiness(businessId, (bdb) => release(bdb, scope, by, reason)); // TENANCY-TODO(task 7)
   log(`העצירה בהיקף "${scope}" שוחררה עבור ${businessId}.`);
-  const stillActive = await activeScopes(businessId);
+  const stillActive = await withBusiness(businessId, (bdb) => activeScopes(bdb)); // TENANCY-TODO(task 7)
   if (stillActive.length > 0) {
     log('');
     log('היקפים שעדיין עצורים:');

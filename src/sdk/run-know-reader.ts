@@ -11,7 +11,7 @@ import { mkdir } from 'node:fs/promises';
 import { config } from '../config.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { runKnowReader } from './know-reader.js';
 
 const task = process.argv.slice(2).join(' ') || 'סכם בשתי שורות את הקובץ README.md.';
@@ -28,8 +28,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const active = await loadActiveCharter(config.businessId);
-  const bundle = active?.bundle ?? (await installCharter(buildCharter()));
+  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const bundle = active?.bundle ?? (await withBusiness(config.businessId, (bdb) => installCharter(bdb, buildCharter()))); // TENANCY-TODO(task 7)
 
   // DOCUMENT_ROOT is required config now (src/config.ts) — the same
   // directory ingestDocument (src/documents/ingest.ts) stores under.

@@ -5,9 +5,7 @@
  * the five guards pure and takes the rows they need as arguments rather than
  * querying for them, so every write and read against those rows lives here.
  */
-import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
-import type { Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { AgentEnvelope } from '../domain/envelope.js';
 import type { EnvelopeConstraints, EnvelopeKind } from '../domain/envelope.js';
 import { contextRefsHash } from './delegation.js';
@@ -91,11 +89,11 @@ export type WriteEnvelopeResult =
  * time `ON CONFLICT` fires, the winning row is already committed.
  */
 export async function writeEnvelope(
+  db: BusinessDb,
   envelope: AgentEnvelope,
-  options: { parentJobId: string; childJobId?: string | null; businessId?: string; db?: Queryable },
+  options: { parentJobId: string; childJobId?: string | null },
 ): Promise<WriteEnvelopeResult> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const childJobId = options.childJobId ?? null;
 
   const inserted = await db.query<EnvelopeRow>(
@@ -182,11 +180,10 @@ export interface StoredEnvelope {
  * `GateContext.standing` for a claimed authorisation.
  */
 export async function loadEnvelopeWithChild(
+  db: BusinessDb,
   envelopeId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StoredEnvelope | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<EnvelopeRow>(
     `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
             intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
@@ -232,11 +229,10 @@ export async function loadEnvelopeWithChild(
  * this tree already asked this".
  */
 export async function loadEnvelopeByIdempotencyKey(
+  db: BusinessDb,
   idempotencyKey: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StoredEnvelope | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<EnvelopeRow>(
     `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
             intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
@@ -251,10 +247,10 @@ export async function loadEnvelopeByIdempotencyKey(
 
 /** One envelope by id, or null if this business has never stored one under it. */
 export async function loadEnvelope(
+  db: BusinessDb,
   envelopeId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<AgentEnvelope | null> {
-  const stored = await loadEnvelopeWithChild(envelopeId, options);
+  const stored = await loadEnvelopeWithChild(db, envelopeId);
   return stored ? stored.envelope : null;
 }
 
@@ -282,11 +278,10 @@ interface QuadrupleRow {
  * job's tree.
  */
 export async function priorQuadruples(
+  db: BusinessDb,
   correlationId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<EnvelopeQuadruple[]> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<QuadrupleRow>(
     // `kind = 'help_request'` — `resumeDelegatedJobs` (Task 7) is now a
     // writer of `result` rows in the OPPOSITE direction (`from`/`to`
@@ -312,14 +307,13 @@ export async function priorQuadruples(
  * to decide guard 5.
  */
 export async function countPairExchanges(
+  db: BusinessDb,
   correlationId: string,
   from: string,
   to: string,
   intent: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<number> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<{ n: string }>(
     // `kind = 'help_request'`, for the same reason `priorQuadruples` filters
     // it above: a `result` envelope going the other way must not inflate the
@@ -349,10 +343,9 @@ export async function countPairExchanges(
  * `'curation'`.
  */
 export async function delegationsToday(
-  options: { businessId?: string; db?: Queryable } = {},
+  db: BusinessDb,
 ): Promise<number> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<{ n: string }>(
     `SELECT count(*)::text AS n
        FROM audit_log
@@ -381,11 +374,10 @@ export async function delegationsToday(
  * primary key instead.
  */
 export async function loadEnvelopeForChildJob(
+  db: BusinessDb,
   childJobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<AgentEnvelope | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<EnvelopeRow>(
     `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
             intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
@@ -429,11 +421,10 @@ export async function loadEnvelopeForChildJob(
  * table with one row per delegation.
  */
 export async function loadHelpRequestFromParentJob(
+  db: BusinessDb,
   parentJobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StoredEnvelope | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<EnvelopeRow>(
     `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
             intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
@@ -481,12 +472,11 @@ export async function loadHelpRequestFromParentJob(
  * exists.
  */
 export async function loadResultForChildJob(
+  db: BusinessDb,
   childJobId: string,
   correlationId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<AgentEnvelope | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<EnvelopeRow>(
     `SELECT envelope_id, correlation_id, causal_chain, from_agent, to_agent, kind,
             intent, payload, context_refs, constraints, hops, idempotency_key, created_at,
@@ -522,12 +512,11 @@ export async function loadResultForChildJob(
  * exist to avoid.
  */
 export async function attachChildJob(
+  db: BusinessDb,
   envelopeId: string,
   childJobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   await db.query(
     `UPDATE agent_envelopes SET child_job_id = $3 WHERE business_id = $1 AND envelope_id = $2`,
     [businessId, envelopeId, childJobId],

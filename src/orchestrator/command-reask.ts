@@ -83,7 +83,7 @@
  */
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, withTransaction } from '../db/pool.js';
+import { getPool, withTransaction, withBusiness } from '../db/pool.js';
 import { JobPhase } from '../domain/job.js';
 import { Plan, planProblems } from '../domain/plan.js';
 import { loadInstructionForJob, saveInstruction } from '../governance/instructions.js';
@@ -341,7 +341,7 @@ async function reaskOne(
   }
   const option: ConfirmationOption = { ...chosen, plan: residual, planHash: planHashOf(residual) };
 
-  const active = await loadActiveCharter(businessId);
+  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
   if (active === null) throw new Error(`command re-ask: no active charter for business ${businessId}`);
   // T6: the ledger steps still left are read-only, so `renderStepEcho` hides
   // them; the owner sees what they will record, as in the first question.

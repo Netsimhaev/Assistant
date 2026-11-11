@@ -6,7 +6,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { installCharter } from '../charter/store.js';
 import { ActionClass } from '../domain/action.js';
 import type { Plan } from '../domain/plan.js';
@@ -266,7 +266,7 @@ describe('the planner never receives an instruction the owner did not write', ()
   }
 
   it('passes the stored text unchanged to every candidate planning pass', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const seed = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',

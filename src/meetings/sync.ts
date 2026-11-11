@@ -38,7 +38,7 @@ import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type AttendeeResponse, type CalendarClient } from '../calendar/types.js';
-import { getPool, withTransaction } from '../db/pool.js';
+import { getPool, withTransaction, withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { loadActionUpdateSettings } from '../governance/action-update-settings.js';
 import { NOTIFY_TIMEOUT_MS } from '../governance/notify.js';
 import { deliver } from '../ledger/pass.js';
@@ -175,7 +175,7 @@ async function settleProposed(
  */
 async function claimUncertainAlert(businessId: string, row: ProposedRow): Promise<boolean> {
   const reason = `${UNCERTAIN_WRITE_REASON}:${row.meeting_id}`;
-  return withTransaction(async (tx) => {
+  return withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 5)
     await tx.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${businessId}:${reason}`]);
     const { rows } = await tx.query('SELECT 1 FROM audit_log WHERE business_id = $1 AND reason = $2 LIMIT 1', [
       businessId,
@@ -183,6 +183,7 @@ async function claimUncertainAlert(businessId: string, row: ProposedRow): Promis
     ]);
     if (rows.length > 0) return false;
     await appendAudit(
+      tx,
       {
         jobId: row.job_id,
         actor: 'sched.meetings',
@@ -200,7 +201,6 @@ async function claimUncertainAlert(businessId: string, row: ProposedRow): Promis
         costMinor: null,
         tokens: null,
       },
-      { businessId, tx },
     );
     return true;
   });
@@ -336,7 +336,7 @@ export async function syncMeetings(o: {
   // Steps 2–4 need the charter's time zone; without a readable charter they wait.
   let timeZone: string | null = null;
   try {
-    timeZone = (await loadActiveCharter(businessId))?.charter.identity.timezone ?? null;
+    timeZone = (await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)))?.charter.identity.timezone ?? null; // TENANCY-TODO(task 5)
   } catch {
     timeZone = null;
   }

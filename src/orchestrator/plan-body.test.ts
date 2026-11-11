@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -31,7 +31,7 @@ const PLAN: Plan = Plan.parse({
 });
 
 async function seedJob(): Promise<string> {
-  const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -156,17 +156,17 @@ describe('runPlan and delegationProblems', () => {
   });
 
   it('rejects the whole plan when a delegation step names a pair outside the graph', async () => {
-    const bundle = await installCharter(
-      buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'auto' } }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
+      buildCharter({ connections: [MAIL_CONNECTION], autonomyBase: { 'email.initiate': 'auto' } })
+    ));
     const job = await bossJobInExecute(bundle.charterVersion);
     // A standing authorisation, so the first step is genuinely executable —
     // the assertion that it never ran only means something if it could have.
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.initiate', recipients: ['dana@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization( // TENANCY-TODO(task 4)
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.initiate', recipients: ['dana@example.com'] }
+    ));
 
     const plan: Plan = Plan.parse({
       goal: 'send, then ask an agent gov.verify may not delegate to',

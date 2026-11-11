@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { queryAudit } from '../audit/log.js';
 import { resetDatabase } from '../test/db.js';
 import { loadBindings, upsertBinding } from './bindings.js';
@@ -161,7 +161,7 @@ describe('connection bindings', () => {
       { businessId: BUSINESS, by: BY },
     );
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'connection_binding' });
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'connection_binding' })); // TENANCY-TODO(task 4)
     expect(entries).toHaveLength(1);
     expect(entries[0]?.reason).toContain('office-mail');
     expect(entries[0]?.onBehalfOf).toBe(BY);
@@ -193,7 +193,7 @@ describe('connection bindings', () => {
       { businessId: BUSINESS, by: BY },
     );
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'connection_binding' });
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'connection_binding' })); // TENANCY-TODO(task 4)
     expect(entries).toHaveLength(1);
     // Positive half: `status` is still named (unchanged behaviour) ...
     expect(entries[0]?.reason).toContain('status "live"');
@@ -236,7 +236,7 @@ describe('connection bindings', () => {
           lastOkAt: null,
           lastError: null,
         },
-        { businessId: BUSINESS, by: BY, db: client },
+        { businessId: BUSINESS, by: BY, db: { businessId: BUSINESS, inTransaction: true, query: client.query.bind(client) } }, // TENANCY-TODO(task 4)
       );
 
       // Force this transaction to abort *after* the write and the audit
@@ -253,7 +253,7 @@ describe('connection bindings', () => {
     }
 
     expect(await loadBindings({ businessId: BUSINESS })).toEqual([]);
-    expect(await queryAudit({ businessId: BUSINESS, kind: 'connection_binding' })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'connection_binding' }))).toEqual([]); // TENANCY-TODO(task 4)
   });
 
   it('preserves endpoint and credentialRef across a read-modify-write status change', async () => {

@@ -1,5 +1,3 @@
-import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
 import type { ActionFacts } from '../domain/policy.js';
 import { Plan } from '../domain/plan.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -72,8 +70,8 @@ export async function confirmedCommandCovers(
   if (typeof ctx.jobId !== 'string') return null;
   if (typeof ctx.stepId !== 'string') return null;
 
-  const businessId = ctx.businessId ?? config.businessId;
-  const db = ctx.db ?? getPool();
+  const db = ctx.db;
+  const businessId = db.businessId;
   const { rows } = await db.query<{ plan_hash: string; plan: unknown }>(
     `SELECT p.plan_hash, p.plan
        FROM jobs j

@@ -45,7 +45,7 @@
  */
 import { monotonicFactory } from 'ulid';
 import { loadActiveCharter, type ActiveCharter } from '../charter/store.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import type { LedgerItem } from '../domain/ledger.js';
 import { NOTIFY_TIMEOUT_MS, withDeadline } from '../governance/notify.js';
 import type { NudgeDrafter } from '../sdk/nudge-drafter.js';
@@ -258,7 +258,7 @@ export async function runLedgerPass(options: LedgerPassOptions): Promise<LedgerP
   const timeoutMs = options.timeoutMs ?? NOTIFY_TIMEOUT_MS;
   const result = emptyResult();
 
-  const active = await loadActiveCharter(businessId, db);
+  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
   if (active === null) return result;
   const timeZone = active.charter.identity.timezone;
   const workweek = active.charter.operations.workweek;

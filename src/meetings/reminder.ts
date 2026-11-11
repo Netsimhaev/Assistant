@@ -32,7 +32,7 @@
  */
 import type { ActiveCharter } from '../charter/store.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { loadRampLevel } from '../orchestrator/ramp.js';
@@ -119,7 +119,7 @@ export async function openClientReminder(o: {
   const to = row.client_email === null ? '' : row.client_email.trim();
   if (to === '' || row.start_at === null) return { skipped: 'no_email' };
 
-  const active = await loadActiveCharter(businessId, db);
+  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
   if (active === null) return { skipped: 'no_mailbox' };
   const timeZone = active.charter.identity.timezone;
   const startMs = row.start_at.getTime();

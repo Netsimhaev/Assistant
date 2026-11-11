@@ -1,13 +1,13 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { compileCharter } from '../charter/compile.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { grantAuthorization } from '../governance/authorization.js';
 import { queryAudit } from '../audit/log.js';
-import { evaluateToolCall } from './engine.js';
+import { evaluateFor } from '../test/gate.js';
 
 const BUSINESS = 'test-business';
 const bundle = compileCharter(buildCharter());
@@ -27,19 +27,19 @@ const REPLY = { to: 'dana@example.com', inReplyTo: 'msg-1', subject: 'תיאום
 
 beforeEach(async () => {
   await resetDatabase();
-  await installCharter(buildCharter(), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 });
 afterAll(async () => { await closePool(); });
 
 describe('standing authorisation at the gate', () => {
   it('lets an authorised reply through without queueing an approval', async () => {
     const job = await bossJob('להשיב לדנה');
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] }
+    ));
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       agent: 'comms.email',
       bundle,
       provenance: 'boss',
@@ -59,7 +59,7 @@ describe('standing authorisation at the gate', () => {
     // The positive half matters. Without it this test would pass if the call
     // were denied for any reason at all.
     expect(decision.outcome).toBe('allow');
-    const { rows } = await getPool().query('SELECT 1 FROM approval_requests WHERE job_id = $1', [job.jobId]);
+    const { rows } = await testDb().query('SELECT 1 FROM approval_requests WHERE job_id = $1', [job.jobId]);
     expect(rows).toHaveLength(0);
   });
 
@@ -68,12 +68,12 @@ describe('standing authorisation at the gate', () => {
     // — or one that should not have it — gets a fresh question, not a silent
     // grant, even though the exact same authorisation would have covered it.
     const job = await bossJob('להשיב לדנה');
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] }
+    ));
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       agent: 'comms.email', bundle, provenance: 'boss', chainDepth: 0, counterpartyTags: [],
       rampLevel: 'auto', businessId: BUSINESS, jobId: job.jobId, now: NOON,
       // useStandingAuthorization omitted.
@@ -84,12 +84,12 @@ describe('standing authorisation at the gate', () => {
 
   it('still asks when the recipient is not the one authorised', async () => {
     const job = await bossJob('להשיב לדנה');
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] }
+    ));
 
-    const decision = await evaluateToolCall('mail.send', { ...REPLY, to: 'stranger@x.com' }, {
+    const decision = await evaluateFor('mail.send', { ...REPLY, to: 'stranger@x.com' }, {
       agent: 'comms.email', bundle, provenance: 'boss',
       chainDepth: 0, counterpartyTags: [],
       rampLevel: 'auto', businessId: BUSINESS, jobId: job.jobId,
@@ -101,7 +101,7 @@ describe('standing authorisation at the gate', () => {
 
   it('still asks when there is no authorisation at all', async () => {
     const job = await bossJob('משימה בלי הרשאה');
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       agent: 'comms.email', bundle, provenance: 'boss',
       chainDepth: 0, counterpartyTags: [],
       rampLevel: 'auto', businessId: BUSINESS, jobId: job.jobId,
@@ -117,12 +117,12 @@ describe('standing authorisation at the gate', () => {
   // naming the exact class and recipient must not buy its way past that.
   it('does not let a standing authorisation override a signed approve_required ceiling', async () => {
     const job = await bossJob('פנייה חדשה לדנה');
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.initiate', recipients: ['dana@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.initiate', recipients: ['dana@example.com'] }
+    ));
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'dana@example.com', subject: 'תיאום', body: 'שלום' }, // no inReplyTo -> email.initiate
       {
@@ -166,18 +166,18 @@ describe('standing authorisation at the gate', () => {
       autonomyBase: { 'data.export': 'auto' },
     });
     const dataExportBundle = compileCharter(dataExportCharter);
-    await installCharter(dataExportCharter, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, dataExportCharter));
 
     const job = await createJob({
       charterVersion: dataExportBundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
       title: 'ייצוא נתונים',
     });
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'data.export', recipients: ['dana@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
+      bdb,
+      { jobId: job.jobId, actionClass: 'data.export', recipients: ['dana@example.com'] }
+    ));
 
-    const decision = await evaluateToolCall('data.export', { to: 'dana@example.com' }, {
+    const decision = await evaluateFor('data.export', { to: 'dana@example.com' }, {
       agent: 'ops.systems', bundle: dataExportBundle, provenance: 'boss', chainDepth: 0,
       counterpartyTags: [], rampLevel: 'auto', businessId: BUSINESS, jobId: job.jobId,
       useStandingAuthorization: true, now: NOON,
@@ -188,7 +188,7 @@ describe('standing authorisation at the gate', () => {
 
   it('puts the proposal\'s words on the approval instead of the risk sentence', async () => {
     const job = await bossJob('הצעה');
-    const decision = await evaluateToolCall('mail.send', { ...REPLY, to: 'stranger@x.com' }, {
+    const decision = await evaluateFor('mail.send', { ...REPLY, to: 'stranger@x.com' }, {
       agent: 'comms.email', bundle, provenance: 'boss',
       chainDepth: 0, counterpartyTags: [],
       rampLevel: 'auto', businessId: BUSINESS, jobId: job.jobId,
@@ -197,7 +197,7 @@ describe('standing authorisation at the gate', () => {
     });
 
     expect(decision.outcome).toBe('queue_approval');
-    const { rows } = await getPool().query<{ summary: string; detail: string }>(
+    const { rows } = await testDb().query<{ summary: string; detail: string }>(
       'SELECT summary, detail FROM approval_requests WHERE job_id = $1', [job.jobId],
     );
     expect(rows[0]?.summary).toBe('אשלח מייל לדנה');
@@ -206,7 +206,7 @@ describe('standing authorisation at the gate', () => {
 
   it('falls back to the risk sentence when no proposal text is supplied', async () => {
     const job = await bossJob('בלי הצעה');
-    const decision = await evaluateToolCall('mail.send', { ...REPLY, to: 'stranger@x.com' }, {
+    const decision = await evaluateFor('mail.send', { ...REPLY, to: 'stranger@x.com' }, {
       agent: 'comms.email', bundle, provenance: 'boss',
       chainDepth: 0, counterpartyTags: [],
       rampLevel: 'auto', businessId: BUSINESS, jobId: job.jobId,
@@ -214,7 +214,7 @@ describe('standing authorisation at the gate', () => {
     });
     if (decision.outcome !== 'queue_approval') throw new Error('expected a queued approval');
 
-    const { rows } = await getPool().query<{ summary: string; detail: string }>(
+    const { rows } = await testDb().query<{ summary: string; detail: string }>(
       'SELECT summary, detail FROM approval_requests WHERE job_id = $1', [job.jobId],
     );
     // Pinned to the actual risk explanation, not merely "non-empty" — a
@@ -230,7 +230,7 @@ describe('standing authorisation at the gate', () => {
   // headline and an empty detail through and rendered a blank card title.
   it('treats a whitespace-only headline and an empty detail as absent, and falls back', async () => {
     const job = await bossJob('הצעה ריקה');
-    const decision = await evaluateToolCall('mail.send', { ...REPLY, to: 'stranger@x.com' }, {
+    const decision = await evaluateFor('mail.send', { ...REPLY, to: 'stranger@x.com' }, {
       agent: 'comms.email', bundle, provenance: 'boss',
       chainDepth: 0, counterpartyTags: [],
       rampLevel: 'auto', businessId: BUSINESS, jobId: job.jobId,
@@ -239,7 +239,7 @@ describe('standing authorisation at the gate', () => {
     });
     if (decision.outcome !== 'queue_approval') throw new Error('expected a queued approval');
 
-    const { rows } = await getPool().query<{ summary: string; detail: string }>(
+    const { rows } = await testDb().query<{ summary: string; detail: string }>(
       'SELECT summary, detail FROM approval_requests WHERE job_id = $1', [job.jobId],
     );
     expect(rows[0]?.summary).toBe(decision.reason);
@@ -250,22 +250,22 @@ describe('standing authorisation at the gate', () => {
   // must not be indistinguishable from an ordinary routine allow.
   it('leaves an audit trail naming the standing authorisation as the reason it ran unattended', async () => {
     const job = await bossJob('להשיב לדנה');
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] }
+    ));
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       agent: 'comms.email', bundle, provenance: 'boss', chainDepth: 0, counterpartyTags: [],
       rampLevel: 'auto', businessId: BUSINESS, jobId: job.jobId,
       useStandingAuthorization: true, now: NOON,
     });
     expect(decision.outcome).toBe('allow');
 
-    const entries = await queryAudit(
-      { businessId: BUSINESS, jobId: job.jobId, kind: 'decision' },
-      getPool(),
-    );
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(
+      bdb,
+      { jobId: job.jobId, kind: 'decision' }
+    ));
     const standingEntry = entries.find((e) => e.reason.startsWith(`standing_authorization:${job.jobId}`));
     expect(standingEntry).toBeDefined();
   });

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { assessRisk } from '../policy/risk.js';
@@ -55,7 +55,7 @@ interface CardOptions {
 async function card(opts: CardOptions = {}): Promise<string> {
   sequence += 1;
   const jobId = opts.jobId ?? `J-${sequence}`;
-  const db = getPool();
+  const db = testDb();
 
   if (opts.linked !== false) {
     await db.query(
@@ -71,7 +71,8 @@ async function card(opts: CardOptions = {}): Promise<string> {
   const input = { to: ['dana@example.com'], subject: 'Re: s', body: 'תודה רבה על הפנייה שלך', ref: sequence };
   const facts = factsFor(input);
   const risk = await assessRisk(facts, bundle);
-  const approvalId = await enqueueApproval(
+  const approvalId = await withBusiness(BUSINESS, (bdb) => enqueueApproval(
+    bdb,
     {
       facts,
       risk,
@@ -79,9 +80,8 @@ async function card(opts: CardOptions = {}): Promise<string> {
       summary: 'שליחת מייל',
       jobId,
       ...(opts.detail !== undefined ? { detail: opts.detail } : {}),
-    },
-    { businessId: BUSINESS },
-  );
+    }
+  ));
 
   const outcome = opts.outcome ?? 'approved';
   const decidedAt = new Date(Date.now() - (opts.decidedDaysAgo ?? 0) * DAY_MS - 1_000);
@@ -92,7 +92,8 @@ async function card(opts: CardOptions = {}): Promise<string> {
       decidedAt.toISOString(),
     ]);
   } else {
-    await decide(
+    await withBusiness(BUSINESS, (bdb) => decide(
+      bdb,
       approvalId,
       outcome === 'denied' ? 'denied' : 'approved',
       {
@@ -101,9 +102,8 @@ async function card(opts: CardOptions = {}): Promise<string> {
         ...(outcome === 'approved_with_edit'
           ? { editedInput: { ...input, body: opts.editedBody ?? 'נוסח אחר לגמרי של התשובה הזו' } }
           : {}),
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
     await db.query(`UPDATE approval_requests SET decided_at = $2 WHERE approval_id = $1`, [
       approvalId,
       decidedAt.toISOString(),
@@ -119,13 +119,13 @@ async function card(opts: CardOptions = {}): Promise<string> {
 }
 
 const agreement = (since: Date | null = null): Promise<Agreement> =>
-  agreementFor('email.reply', { businessId: BUSINESS, since });
+  withBusiness(BUSINESS, (bdb) => agreementFor(bdb, 'email.reply', { since }));
 
 describe('the windowed agreement rate', () => {
   beforeEach(async () => {
     await resetDatabase();
     sequence = 0;
-    bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
   afterAll(async () => {
     await closePool();
@@ -142,7 +142,7 @@ describe('the windowed agreement rate', () => {
     expect(isLearned(five)).toBe(true);
 
     await resetDatabase();
-    bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     for (let i = 0; i < 4; i += 1) await card();
     await card({ outcome: 'denied' });
     const mixed = await agreement();
@@ -173,13 +173,13 @@ describe('the windowed agreement rate', () => {
   it('does not count a linked job of another business', async () => {
     await card();
     expect(
-      await agreementFor('email.reply', { businessId: 'other-business', since: null }),
+      await withBusiness('other-business', (bdb) => agreementFor(bdb, 'email.reply', { since: null })),
     ).toEqual({ right: 0, counted: 0, topWrongReason: null });
   });
 
   it('does not count a job whose only mail link belongs to another business', async () => {
     await card({ jobId: 'J-shared', linked: false });
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO mail_messages
          (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
           received_at, body_text, state, reply_job_id)
@@ -196,7 +196,7 @@ describe('the windowed agreement rate', () => {
     expect(await agreement()).toEqual({ right: 0, counted: 1, topWrongReason: 'denied' });
 
     await resetDatabase();
-    bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     await card({ jobId: 'J-dup', outcome: 'approved', createdOffsetSeconds: 10 });
     await card({ jobId: 'J-dup', outcome: 'denied', createdOffsetSeconds: 20, linked: false });
     expect(await agreement()).toEqual({ right: 1, counted: 1, topWrongReason: null });
@@ -268,7 +268,7 @@ describe('the windowed agreement rate', () => {
     expect((await agreement()).topWrongReason).toBe('denied');
 
     await resetDatabase();
-    bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     await card({ outcome: 'denied' });
     await card({ outcome: 'approved_with_edit' });
     expect((await agreement()).topWrongReason).toBe('too_many_words');
@@ -277,7 +277,7 @@ describe('the windowed agreement rate', () => {
   it('counts each action class on its own', async () => {
     await card();
     expect(
-      await agreementFor('calendar.create', { businessId: BUSINESS, since: null }),
+      await withBusiness(BUSINESS, (bdb) => agreementFor(bdb, 'calendar.create', { since: null })),
     ).toEqual({ right: 0, counted: 0, topWrongReason: null });
   });
 });

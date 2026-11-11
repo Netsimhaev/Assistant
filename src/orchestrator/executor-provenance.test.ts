@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -17,9 +17,7 @@ async function jobInExecute() {
   // is a first contact — correctly, because nothing ties that id to that
   // mailbox. These tests are about the provenance flag, not about escalation,
   // so the charter is given the domain and the recipient is genuinely known.
-  const bundle = await installCharter(buildCharter({ knownCounterpartyEmailDomain: 'example.com' }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ knownCounterpartyEmailDomain: 'example.com' }))); // TENANCY-TODO(task 4)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',

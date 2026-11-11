@@ -6,7 +6,7 @@
  * attached document stays `unknown_external`.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
@@ -74,7 +74,7 @@ async function ownerJob(text: string, attached: string[]): Promise<Job> {
 
 beforeEach(async () => {
   await resetDatabase();
-  await installCharter(buildCharter({ version: 'v-owner' }), { businessId: B });
+  await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'v-owner' }))); // TENANCY-TODO(task 5)
 });
 afterAll(async () => {
   await closePool();
@@ -107,7 +107,7 @@ describe('owner-attached sources', () => {
   it('the planner prompt lists the attached files in a fence, after the instruction', async () => {
     const prompt = buildPlannerPrompt(
       {
-        bundle: (await loadActiveCharter(B))!.bundle,
+        bundle: (await withBusiness(B, (bdb) => loadActiveCharter(bdb)))!.bundle, // TENANCY-TODO(task 5)
         intents: [],
         instruction: 'הוראה',
         attachedDocuments: [{ documentId: 'DOC-1', name: 'a\nb.xlsx' }],

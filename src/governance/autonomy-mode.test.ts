@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { loadAutonomyMode, rampBoundsForMode, setAutonomyMode } from './autonomy-mode.js';
 
@@ -14,7 +14,7 @@ describe('the owner dial', () => {
   });
 
   it('is off when nobody has set it', async () => {
-    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
   });
 
   /**
@@ -37,13 +37,13 @@ describe('the owner dial', () => {
   });
 
   it('stores what the owner chose and reads it back', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
-    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('learn');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('learn');
   });
 
   it('records the change in the audit trail, naming both levels and who', async () => {
-    await setAutonomyMode('ask', 'owner@example.com', { businessId: BUSINESS });
-    const { rows } = await getPool().query<{ reason: string; on_behalf_of: string }>(
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com'));
+    const { rows } = await testDb().query<{ reason: string; on_behalf_of: string }>(
       `SELECT reason, on_behalf_of FROM audit_log
         WHERE business_id = $1 AND kind = 'autonomy_change' ORDER BY seq DESC LIMIT 1`,
       [BUSINESS],
@@ -84,11 +84,11 @@ describe('the owner dial', () => {
       `);
 
       await expect(
-        setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS }),
+        withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')),
       ).rejects.toThrow(/audit refused by test/);
 
       // Nothing half-happened: the dial is still at its default.
-      expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+      expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
     } finally {
       await testDb().query(
         'DROP TRIGGER IF EXISTS refuse_autonomy_mode_audit_trigger ON audit_log',
@@ -97,8 +97,8 @@ describe('the owner dial', () => {
     }
 
     // Positive control: with the obstacle gone, the identical call moves it.
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
-    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('learn');
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com'));
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('learn');
   });
 
   /**
@@ -109,17 +109,17 @@ describe('the owner dial', () => {
   it('falls to off on a mode string this build does not know', async () => {
     await testDb().query('ALTER TABLE autonomy_mode DROP CONSTRAINT autonomy_mode_known');
     try {
-      await getPool().query(
+      await testDb().query(
         `INSERT INTO autonomy_mode (business_id, mode, updated_by) VALUES ($1, 'wide_open', 'x')`,
         [BUSINESS],
       );
-      expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+      expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
     } finally {
       // The row inserted above still holds 'wide_open', and ADD CONSTRAINT
       // validates every existing row — it would fail on the very row this
       // test put there on purpose. Clean it up before restoring the
       // constraint, or the constraint can never come back.
-      await getPool().query('DELETE FROM autonomy_mode WHERE business_id = $1', [BUSINESS]);
+      await testDb().query('DELETE FROM autonomy_mode WHERE business_id = $1', [BUSINESS]);
       await testDb().query(
         `ALTER TABLE autonomy_mode ADD CONSTRAINT autonomy_mode_known
            CHECK (mode IN ('off', 'ask', 'learn'))`,

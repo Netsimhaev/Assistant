@@ -26,7 +26,7 @@
  * the same function `loadRampLevel` clamps through, so the two can never
  * disagree about what "effective" means.
  */
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { ActionClass } from '../domain/action.js';
@@ -82,7 +82,7 @@ export async function runSetRampCli(argv: string[], deps: SetRampCliDeps): Promi
   // Read the charter before writing. Without it the ceilings cannot be
   // reported, and a raise reported without its ceilings is the exact
   // half-truth this command exists to prevent.
-  const active = await loadActiveCharter(businessId);
+  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
   if (active === null) {
     throw new Error(
       `אין תקנון פעיל ל-${businessId}. הרמפה נאכפת יחד עם תקרות התקנון, ובלעדיו אי אפשר לומר מה הרמה תשנה בפועל.`,
@@ -94,7 +94,7 @@ export async function runSetRampCli(argv: string[], deps: SetRampCliDeps): Promi
   // The dial that clamps everything `loadRampLevel` returns to the gate.
   // Read AFTER the write, same as the charter above, so what gets printed
   // matches what a gate decision made right now would actually see.
-  const mode = await loadAutonomyMode({ businessId });
+  const mode = await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb)); // TENANCY-TODO(task 7)
   const dialBounds = rampBoundsForMode(mode);
   const dialClamped = clampToDial(level, dialBounds);
 

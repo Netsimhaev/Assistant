@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { compileCharter } from '../charter/compile.js';
 import { installCharter } from '../charter/store.js';
@@ -64,7 +64,7 @@ function newProposal(readingId: string, overrides: Partial<NewProposal> = {}): N
 
 beforeEach(async () => {
   await resetDatabase();
-  await installCharter(buildCharter(), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   DEFAULT_JOB_ID = (await aJob()).jobId;
 });
 afterAll(async () => { await closePool(); });

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -20,7 +20,7 @@ const SOURCE = { ordinal: 0, locator: null };
 type StepSpec = Pick<PlanStep, 'id' | 'agent' | 'toolName' | 'input'> & { intent?: string };
 
 async function seedJob(title: string): Promise<string> {
-  const bundle = await installCharter(buildCharter({ version: 'curation' }), { businessId: BUSINESS });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'curation' }))); // TENANCY-TODO(task 5)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',

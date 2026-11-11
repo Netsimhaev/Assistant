@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { insertOrGetDocument, loadDocument } from '../documents/store.js';
 import { DocumentAlreadySignedError, loadSignature, recordSignature } from './signatures.js';
 
@@ -30,7 +30,7 @@ afterAll(async () => { await closePool(); });
 describe('recordSignature', () => {
   it('stores a signature and hands it back', async () => {
     const documentId = await aDocument();
-    const record = await recordSignature(newSignature(documentId), { businessId: BUSINESS });
+    const record = await withBusiness(BUSINESS, (bdb) => recordSignature(bdb, newSignature(documentId)));
     expect(record.documentId).toBe(documentId);
     expect(record.signedBy).toBe('owner');
     expect(record.signedSha256).toBe('b'.repeat(64));
@@ -38,19 +38,19 @@ describe('recordSignature', () => {
 
   it('refuses a second signature on the same document', async () => {
     const documentId = await aDocument();
-    await recordSignature(newSignature(documentId), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => recordSignature(bdb, newSignature(documentId)));
     await expect(
-      recordSignature(newSignature(documentId), { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => recordSignature(bdb, newSignature(documentId))),
     ).rejects.toThrow(DocumentAlreadySignedError);
   });
 
   it('leaves the first signature untouched when a second is refused', async () => {
     const documentId = await aDocument();
-    const first = await recordSignature(newSignature(documentId), { businessId: BUSINESS });
+    const first = await withBusiness(BUSINESS, (bdb) => recordSignature(bdb, newSignature(documentId)));
     await expect(
-      recordSignature(newSignature(documentId), { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => recordSignature(bdb, newSignature(documentId))),
     ).rejects.toThrow(DocumentAlreadySignedError);
-    const loaded = await loadSignature(documentId, { businessId: BUSINESS });
+    const loaded = await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId));
     expect(loaded?.signatureId).toBe(first.signatureId);
   });
 });
@@ -58,13 +58,13 @@ describe('recordSignature', () => {
 describe('loadSignature', () => {
   it('returns null for an unsigned document', async () => {
     const documentId = await aDocument();
-    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull();
   });
 
   it('does not cross the business boundary', async () => {
     const documentId = await aDocument();
-    await recordSignature(newSignature(documentId), { businessId: BUSINESS });
-    expect(await loadSignature(documentId, { businessId: 'other' })).toBeNull();
+    await withBusiness(BUSINESS, (bdb) => recordSignature(bdb, newSignature(documentId)));
+    expect(await withBusiness('other', (bdb) => loadSignature(bdb, documentId))).toBeNull();
   });
 });
 
@@ -77,23 +77,23 @@ describe('loadSignature', () => {
 describe('the signatures table as evidence', () => {
   it('refuses to delete a document that carries a signature, and keeps the signature', async () => {
     const documentId = await aDocument();
-    await recordSignature(newSignature(documentId), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => recordSignature(bdb, newSignature(documentId)));
 
     await expect(
-      getPool().query('DELETE FROM documents WHERE document_id = $1 AND business_id = $2', [
+      testDb().query('DELETE FROM documents WHERE document_id = $1 AND business_id = $2', [
         documentId,
         BUSINESS,
       ]),
     ).rejects.toThrow(/signatures/);
 
-    expect(await loadSignature(documentId, { businessId: BUSINESS })).not.toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).not.toBeNull();
   });
 
   it('refuses a signed_sha256 that is not 64 lowercase hex characters', async () => {
     const documentId = await aDocument();
     for (const bad of ['', 'not-a-hash', 'B'.repeat(64), 'b'.repeat(63)]) {
       await expect(
-        getPool().query(
+        testDb().query(
           `INSERT INTO signatures (signature_id, business_id, document_id, signed_sha256, approval_id, signed_by)
            VALUES ($1, $2, $3, $4, $5, $6)`,
           [`SIG-${ulid()}`, BUSINESS, documentId, bad, `AP-${ulid()}`, 'owner'],

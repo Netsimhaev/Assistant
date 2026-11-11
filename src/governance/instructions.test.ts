@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -15,7 +15,7 @@ const BUSINESS = 'test-business';
 
 async function aBossJob(): Promise<string> {
   const charter = buildCharter();
-  await installCharter(charter, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, charter)); // TENANCY-TODO(task 6)
   const job = await createJob({
     charterVersion: charter.charterVersion,
     provenance: 'boss',

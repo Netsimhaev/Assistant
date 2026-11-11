@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { resetDatabase } from '../test/db.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
 import { FAILED_GENERIC_TEXT, NOT_PERMITTED_TEXT } from './whatsapp-report.js';
@@ -27,7 +27,7 @@ describe('collectDigestFacts', () => {
     // INSERT INTO jobs without one fails the constraint, and a job for
     // ANOTHER business cannot reference this row (see the cross-business
     // test below, which installs its own).
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     charterVersion = bundle.charterVersion;
   });
 
@@ -216,7 +216,7 @@ describe('collectDigestFacts', () => {
     // `jobs`'s FK on `charter_version` is actually composite
     // `(business_id, charter_version)` (migration 002) — a job for
     // `other-business` needs its OWN charter row, not `BUSINESS`'s.
-    const otherBundle = await installCharter(buildCharter(), { businessId: 'other-business' });
+    const otherBundle = await withBusiness('other-business', (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     await getPool().query(
       `INSERT INTO jobs (job_id, business_id, title, phase, charter_version, provenance, content_ingested, closed_at)
        VALUES ('J-other', 'other-business', 'לא שלנו', 'closed', $2, 'boss', false, $1)`,

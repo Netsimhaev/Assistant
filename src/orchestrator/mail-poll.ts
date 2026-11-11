@@ -74,7 +74,7 @@ import { join } from 'node:path';
 import { appendAudit } from '../audit/log.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { ingestDocument } from '../documents/ingest.js';
 import { CSV, DOCX, JSON as JSON_TYPE, MARKDOWN, PDF, TEXT, XLSX } from '../documents/media-type.js';
 import type { DocumentRecord } from '../documents/types.js';
@@ -240,7 +240,7 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
   const now = options.now ?? new Date();
 
   // --- The switch -----------------------------------------------------------
-  const active = await loadActiveCharter(businessId);
+  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
   if (active === null) return null;
   if (!active.bundle.connections.some((c) => c.system === MAILBOX_SYSTEM)) return null;
   const binding = (await loadBindings({ businessId })).find((b) => b.system === MAILBOX_SYSTEM);
@@ -327,7 +327,8 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
       // `last_error` is overwritten by the next clean pass; the audit row is
       // the durable record that mail between the two cursors was never read.
       // Codes only — no cursor value, no address.
-      await appendAudit(
+      await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
+        bdb,
         {
           jobId: null,
           actor: 'orchestrator',
@@ -344,9 +345,8 @@ export async function pollMailbox(options: PollMailboxOptions): Promise<MailPoll
           artifacts: [],
           costMinor: null,
           tokens: null,
-        },
-        { businessId },
-      );
+        }
+      ));
     } else {
       // transient or rejected: the cursor stays where it was.
       await writeCursor({ lastError: `list_${listed.failure}` });
@@ -821,7 +821,8 @@ async function applyLabels(
     await recordMailProgress(mail.mailId, { labelsApplied: applied }, { businessId });
     pass.result.labelled += 1;
     // Numbers and hashes only: never the subject, never an address.
-    await appendAudit(
+    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
+      bdb,
       {
         jobId,
         actor: 'intake.triage',
@@ -838,9 +839,8 @@ async function applyLabels(
         artifacts: [],
         costMinor: null,
         tokens: null,
-      },
-      { businessId },
-    );
+      }
+    ));
   }
   return applied;
 }

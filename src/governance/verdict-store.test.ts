@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { loadVerdict, loadVerificationOutcome, saveNotJudged, saveVerdict } from './verdict-store.js';
 import type { Verdict } from './verdict-store.js';
 
@@ -35,17 +35,17 @@ afterAll(async () => {
 
 describe('verdict-store', () => {
   it('loads null for a job that has no saved verdict', async () => {
-    expect(await loadVerdict('job-none', { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, 'job-none'))).toBeNull();
   });
 
   it('round-trips a saved verdict', async () => {
     const verdict = aVerdict();
-    await saveVerdict('job-1', verdict, { businessId: BUSINESS });
-    expect(await loadVerdict('job-1', { businessId: BUSINESS })).toEqual(verdict);
+    await withBusiness(BUSINESS, (bdb) => saveVerdict(bdb, 'job-1', verdict));
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, 'job-1'))).toEqual(verdict);
   });
 
   it('replaces the earlier verdict on a second save for the same job', async () => {
-    await saveVerdict('job-2', aVerdict({ ungroundedNumbers: ['12500'] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => saveVerdict(bdb, 'job-2', aVerdict({ ungroundedNumbers: ['12500'] })));
     const second = aVerdict({
       criteria: [
         {
@@ -58,14 +58,14 @@ describe('verdict-store', () => {
       ],
       ungroundedNumbers: [],
     });
-    await saveVerdict('job-2', second, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => saveVerdict(bdb, 'job-2', second));
 
-    expect(await loadVerdict('job-2', { businessId: BUSINESS })).toEqual(second);
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, 'job-2'))).toEqual(second);
   });
 
   it('scopes verdicts to the business', async () => {
-    await saveVerdict('job-3', aVerdict(), { businessId: BUSINESS });
-    expect(await loadVerdict('job-3', { businessId: 'other-business' })).toBeNull();
+    await withBusiness(BUSINESS, (bdb) => saveVerdict(bdb, 'job-3', aVerdict()));
+    expect(await withBusiness('other-business', (bdb) => loadVerdict(bdb, 'job-3'))).toBeNull();
   });
 
   /**
@@ -90,12 +90,12 @@ describe('verdict-store', () => {
       ],
       ungroundedNumbers: [],
     };
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO verification_verdicts (business_id, job_id, verdict) VALUES ($1, $2, $3)`,
       [BUSINESS, 'job-old-shape', JSON.stringify(oldShapeVerdict)],
     );
 
-    const loaded = await loadVerdict('job-old-shape', { businessId: BUSINESS });
+    const loaded = await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, 'job-old-shape'));
     expect(loaded).not.toBeNull();
     expect(loaded?.answerTruncated).toBe(false);
     expect(loaded?.draftTruncated).toBe(false);
@@ -103,28 +103,28 @@ describe('verdict-store', () => {
   });
 
   it('records a verification that was attempted and did not complete', async () => {
-    await saveNotJudged('JOB-1', 'timeout', { businessId: BUSINESS });
-    const outcome = await loadVerificationOutcome('JOB-1', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => saveNotJudged(bdb, 'JOB-1', 'timeout'));
+    const outcome = await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, 'JOB-1'));
     expect(outcome).toEqual({ status: 'not_judged', reason: 'timeout' });
   });
 
   it('reports no row at all as null — the state that means "still running"', async () => {
-    expect(await loadVerificationOutcome('JOB-NONE', { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, 'JOB-NONE'))).toBeNull();
   });
 
   it('a real verdict written over a not-judged row clears the reason, and vice versa', async () => {
     // Both writers upsert the same primary key. Without each clearing the
     // other's column the CHECK rejects the second write, which would surface
     // as a raw Postgres error on a path that should simply overwrite.
-    await saveNotJudged('JOB-2', 'failed', { businessId: BUSINESS });
-    await saveVerdict('JOB-2', aVerdict(), { businessId: BUSINESS });
-    expect(await loadVerificationOutcome('JOB-2', { businessId: BUSINESS })).toEqual({
+    await withBusiness(BUSINESS, (bdb) => saveNotJudged(bdb, 'JOB-2', 'failed'));
+    await withBusiness(BUSINESS, (bdb) => saveVerdict(bdb, 'JOB-2', aVerdict()));
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, 'JOB-2'))).toEqual({
       status: 'judged',
       verdict: expect.objectContaining({ criteria: expect.any(Array) }),
     });
 
-    await saveNotJudged('JOB-2', 'timeout', { businessId: BUSINESS });
-    expect(await loadVerificationOutcome('JOB-2', { businessId: BUSINESS })).toEqual({
+    await withBusiness(BUSINESS, (bdb) => saveNotJudged(bdb, 'JOB-2', 'timeout'));
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, 'JOB-2'))).toEqual({
       status: 'not_judged',
       reason: 'timeout',
     });
@@ -136,13 +136,13 @@ describe('verdict-store', () => {
     // `null` and throw — and the dashboard route wraps `loadVerdict` in a
     // try/catch that renders "a verdict exists but could not be read", which
     // would be a lie about a row that says the judge never ran.
-    await saveNotJudged('JOB-3', 'failed', { businessId: BUSINESS });
-    expect(await loadVerdict('JOB-3', { businessId: BUSINESS })).toBeNull();
+    await withBusiness(BUSINESS, (bdb) => saveNotJudged(bdb, 'JOB-3', 'failed'));
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, 'JOB-3'))).toBeNull();
   });
 
   it('refuses a reason outside the enum at the database, not only in zod', async () => {
     await expect(
-      getPool().query(
+      testDb().query(
         `INSERT INTO verification_verdicts (business_id, job_id, verdict, not_judged_reason)
          VALUES ($1, $2, NULL, 'whatever')`,
         [BUSINESS, 'JOB-4'],

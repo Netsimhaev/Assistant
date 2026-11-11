@@ -1,6 +1,8 @@
+import { config } from '../config.js';
 import { decide, getApproval, type ApprovalRequest, type Decision } from '../governance/approvals.js';
 import { loadJob, transition } from './jobs.js';
 import type { Job } from './jobs.js';
+import { withBusiness } from '../db/pool.js';
 
 export interface ResumeResult {
   approvalId: string;
@@ -26,7 +28,7 @@ export async function applyDecision(
   decision: Decision,
   options: { businessId?: string } = {},
 ): Promise<ResumeResult> {
-  const approval = await decide(approvalId, outcome, decision, options);
+  const approval = await withBusiness(options.businessId ?? config.businessId, (bdb) => decide(bdb, approvalId, outcome, decision)); // TENANCY-TODO(task 4)
   return resumeAfterDecision(approval, decision.by, options);
 }
 
@@ -76,5 +78,5 @@ export async function blockingApproval(
   approvalId: string,
   options: { businessId?: string } = {},
 ) {
-  return getApproval(approvalId, options);
+  return withBusiness(options.businessId ?? config.businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
 }

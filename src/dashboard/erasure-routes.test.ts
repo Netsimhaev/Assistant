@@ -20,7 +20,7 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -46,7 +46,7 @@ const RONIT = 'ronit@beta-log.example';
  * own version, so a test that installs `buildCharter()` itself still can.
  */
 async function installGateCharter(businessId: string): Promise<void> {
-  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId });
+  await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
 }
 
 let server: Server | null = null;
@@ -107,7 +107,7 @@ function extractPlanHash(html: string): string {
 
 /** A job whose title names Ronit, plus one memory about her. */
 async function seedRonit(): Promise<{ jobId: string }> {
-  const bundle = await installCharter(buildCharter({ version: 'screen' }), { businessId: BUSINESS });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'screen' }))); // TENANCY-TODO(task 10)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -245,7 +245,7 @@ describe('the erasure routes', () => {
    */
   it('renders the erasure screen inline, with the identity in no URL', async () => {
     const baseUrl = await startServer();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     await seedRonit();
     const cookie = await signIn(baseUrl);
     const csrf = extractCsrf(await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text());
@@ -308,7 +308,7 @@ describe('the erasure routes', () => {
    */
   it('renders the entry form inline for a date-only forget command', async () => {
     const baseUrl = await startServer();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const cookie = await signIn(baseUrl);
     const csrf = extractCsrf(await (await fetch(`${baseUrl}/instruct`, { headers: { cookie } })).text());
 
@@ -370,10 +370,10 @@ describe('the erasure routes', () => {
   it('shows what is kept on the entry screen, where there is no plan at all', async () => {
     const baseUrl = await startServer();
     const cookie = await signIn(baseUrl);
-    await keepItem(
-      { kind: 'memory', itemId: 'MEM-unreachable-by-any-anchor', note: 'הסיכום מהישיבה' },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => keepItem( // TENANCY-TODO(task 10)
+      bdb,
+      { kind: 'memory', itemId: 'MEM-unreachable-by-any-anchor', note: 'הסיכום מהישיבה' }
+    ));
 
     const res = await fetch(`${baseUrl}/erase`, { headers: { cookie } });
     const html = await res.text();
@@ -436,7 +436,7 @@ describe('the erasure routes', () => {
   it('returns a kept item to the plan when the keep is revoked', async () => {
     const baseUrl = await startServer();
     const { jobId } = await seedRonit();
-    await keepItem({ kind: 'job', itemId: jobId, note: 'החוזה' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: jobId, note: 'החוזה' })); // TENANCY-TODO(task 10)
     const cookie = await signIn(baseUrl);
 
     const kept = await fetch(`${baseUrl}/erase?identifier=${encodeURIComponent(RONIT)}`, {

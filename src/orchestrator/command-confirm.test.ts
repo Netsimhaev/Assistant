@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -93,7 +93,7 @@ const versions = new Map<string, string>();
 async function charterVersion(businessId: string): Promise<string> {
   const known = versions.get(businessId);
   if (known !== undefined) return known;
-  const bundle = await installCharter(buildCharter(), { businessId });
+  const bundle = await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   versions.set(businessId, bundle.charterVersion);
   return bundle.charterVersion;
 }

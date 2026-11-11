@@ -34,7 +34,7 @@
  * failed DRAFT records nothing: it returns `null` and the poller decides.
  */
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { MailTriage } from '../domain/mail-triage.js';
 import { Plan } from '../domain/plan.js';
@@ -257,7 +257,7 @@ async function raiseReplyCard(
     // send itself produces an action update (`action-updates.ts`).
     if (
       input.retry === undefined &&
-      (await loadAutonomyMode({ businessId })) === 'learn' &&
+      (await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb))) === 'learn' && // TENANCY-TODO(task 4)
       (await loadRampLevel('email.reply', { businessId })) === 'auto_notify' &&
       risk.band === 'routine'
     ) {
@@ -272,7 +272,8 @@ async function raiseReplyCard(
     }
 
     const who = displayLine(input.displayName ?? '') || recipient;
-    approvalId = await enqueueApproval(
+    approvalId = await withBusiness(businessId, (bdb) => enqueueApproval( // TENANCY-TODO(task 4)
+      bdb,
       {
         jobId: job.jobId,
         facts,
@@ -286,9 +287,8 @@ async function raiseReplyCard(
           body,
           ...(input.retry !== undefined ? { retry: input.retry } : {}),
         }),
-      },
-      { businessId },
-    );
+      }
+    ));
 
     if (options.notify !== undefined) {
       await notifyOwner(approvalId, options.notify, {
@@ -314,8 +314,9 @@ async function raiseReplyCard(
     // A card already queued would otherwise sit pending on a failed job: the
     // owner could approve it, and nothing would ever run. Withdraw it first.
     if (approvalId !== null) {
+      const raised = approvalId;
       try {
-        await cancelPendingApproval(approvalId, { businessId });
+        await withBusiness(businessId, (bdb) => cancelPendingApproval(bdb, raised)); // TENANCY-TODO(task 4)
       } catch {
         // Best effort; `expireOverdue` retires it on schedule regardless.
       }

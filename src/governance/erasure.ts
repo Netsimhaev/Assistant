@@ -28,7 +28,7 @@
  */
 import { unlink } from 'node:fs/promises';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { ErasureItem, ErasurePlan, ErasureRefusal } from './erasure-plan.js';
@@ -654,7 +654,8 @@ export async function executeErasure(
     .reduce((sum, item) => sum + item.count, 0);
 
   try {
-    await appendAudit(
+    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 6)
+      bdb,
       {
         actor: 'human',
         kind: 'erasure',
@@ -675,9 +676,8 @@ export async function executeErasure(
             ? ` · ${filesAlreadyGone.length} קבצים כבר לא היו על הדיסק`
             : '') +
           (filesFailed.length > 0 ? ` · ${filesFailed.length} קבצים לא נמחקו מהדיסק` : ''),
-      },
-      { businessId },
-    );
+      }
+    ));
   } catch (err) {
     throw new ErasureAuditUnrecordedError(outcome, err);
   }

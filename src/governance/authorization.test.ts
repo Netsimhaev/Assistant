@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { compileCharter } from '../charter/compile.js';
 import { installCharter } from '../charter/store.js';
@@ -30,7 +30,7 @@ const OWN_JOB = { jobId: AUTH.jobId, businessId: AUTH.businessId };
 
 beforeEach(async () => {
   await resetDatabase();
-  await installCharter(buildCharter(), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 });
 afterAll(async () => { await closePool(); });
 
@@ -240,11 +240,11 @@ describe('grantAuthorization', () => {
       charterVersion: bundle.charterVersion, provenance: 'boss',
       businessId: BUSINESS, title: 'להשיב לדנה',
     });
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['Dana@Example.com'] },
-      { businessId: BUSINESS },
-    );
-    const loaded = await loadAuthorization(job.jobId, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['Dana@Example.com'] }
+    ));
+    const loaded = await withBusiness(BUSINESS, (bdb) => loadAuthorization(bdb, job.jobId));
     expect(loaded?.actionClass).toBe('email.reply');
     // Lower-cased on the way in, so a match cannot be defeated by casing.
     expect(loaded?.recipients).toEqual(['dana@example.com']);
@@ -256,20 +256,20 @@ describe('grantAuthorization', () => {
       businessId: BUSINESS, title: 'מסמך שהגיע',
     });
     await expect(
-      grantAuthorization(
-        { jobId: job.jobId, actionClass: 'email.reply', recipients: ['x@y.com'] },
-        { businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (bdb) => grantAuthorization(
+        bdb,
+        { jobId: job.jobId, actionClass: 'email.reply', recipients: ['x@y.com'] }
+      )),
     ).rejects.toThrow(/provenance unknown_external/);
-    expect(await loadAuthorization(job.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadAuthorization(bdb, job.jobId))).toBeNull();
   });
 
   it('refuses to authorise a job that does not exist', async () => {
     await expect(
-      grantAuthorization(
-        { jobId: 'J-does-not-exist', actionClass: 'email.reply', recipients: ['x@y.com'] },
-        { businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (bdb) => grantAuthorization(
+        bdb,
+        { jobId: 'J-does-not-exist', actionClass: 'email.reply', recipients: ['x@y.com'] }
+      )),
     ).rejects.toThrow(/no job J-does-not-exist/);
   });
 
@@ -283,30 +283,30 @@ describe('grantAuthorization', () => {
       charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
     });
     await expect(
-      grantAuthorization(
-        { jobId: job.jobId, actionClass: 'email.reply', recipients: ['x@y.com'] },
-        { businessId: 'other-business' },
-      ),
+      withBusiness('other-business', (bdb) => grantAuthorization(
+        bdb,
+        { jobId: job.jobId, actionClass: 'email.reply', recipients: ['x@y.com'] }
+      )),
     ).rejects.toThrow(/no job/);
-    expect(await loadAuthorization(job.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadAuthorization(bdb, job.jobId))).toBeNull();
   });
 
   it('refuses a second authorisation for the same job, and leaves the first row unchanged', async () => {
     const job = await createJob({
       charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
     });
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['dana@example.com'] }
+    ));
     await expect(
-      grantAuthorization(
-        { jobId: job.jobId, actionClass: 'crm.write', recipients: [] },
-        { businessId: BUSINESS },
-      ),
+      withBusiness(BUSINESS, (bdb) => grantAuthorization(
+        bdb,
+        { jobId: job.jobId, actionClass: 'crm.write', recipients: [] }
+      )),
     ).rejects.toThrow(AuthorizationAlreadyGrantedError);
 
-    const loaded = await loadAuthorization(job.jobId, { businessId: BUSINESS });
+    const loaded = await withBusiness(BUSINESS, (bdb) => loadAuthorization(bdb, job.jobId));
     expect(loaded?.actionClass).toBe('email.reply');
     expect(loaded?.recipients).toEqual(['dana@example.com']);
   });
@@ -315,17 +315,17 @@ describe('grantAuthorization', () => {
     const job = await createJob({
       charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
     });
-    expect(await loadAuthorization(job.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadAuthorization(bdb, job.jobId))).toBeNull();
   });
 
   it('does not cross the business boundary', async () => {
     const job = await createJob({
       charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS,
     });
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['x@y.com'] },
-      { businessId: BUSINESS },
-    );
-    expect(await loadAuthorization(job.jobId, { businessId: 'other-business' })).toBeNull();
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization(
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.reply', recipients: ['x@y.com'] }
+    ));
+    expect(await withBusiness('other-business', (bdb) => loadAuthorization(bdb, job.jobId))).toBeNull();
   });
 });

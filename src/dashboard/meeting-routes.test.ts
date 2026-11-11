@@ -10,7 +10,7 @@ import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent, CalendarInfo } from '../calendar/types.js';
 import { calendarConnection } from '../charter/amend-calendar.js';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
@@ -46,7 +46,7 @@ function clientListing(result: CalendarInfo[] | { failure: 'transient'; status: 
 beforeEach(async () => {
   await resetDatabase();
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: BUSINESS });
-  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
 });
 afterEach(async () => {
   if (server) {
@@ -342,9 +342,7 @@ function recordingCalendar(initial: CalendarEvent[] = []) {
 }
 
 async function setupMeetings(): Promise<void> {
-  await installCharter(buildCharter({ version: 'meetings-screen', connections: [calendarConnection('google')] }), {
-    businessId: BUSINESS,
-  });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'meetings-screen', connections: [calendarConnection('google')] }))); // TENANCY-TODO(task 10)
   await bindCalendar();
   await saveMeetingSettings(
     { ...MEETING_DEFAULTS, locationKind: 'travel', workStart: '09:00', workEnd: '18:00', gapMinutes: 30 },

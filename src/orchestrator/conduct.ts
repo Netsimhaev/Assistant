@@ -13,7 +13,7 @@
  */
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { renderArtifactFull } from '../documents/brief.js';
 import { readDocument, type ReadDocumentOptions } from '../documents/read.js';
 import {
@@ -421,7 +421,7 @@ export async function conductPendingDocuments(
     // No charter, no reasoning: the bundle is what the proposer's catalogue
     // and the risk engine's ceilings are both derived from. `evaluateToolCall`
     // treats an absent charter as fatal for the same reason.
-    const active = await loadActiveCharter(businessId);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) return result;
 
     const alreadyToday = await readingsToday({ businessId });

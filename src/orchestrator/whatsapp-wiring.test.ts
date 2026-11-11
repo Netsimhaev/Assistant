@@ -11,7 +11,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { queryAudit } from '../audit/log.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -220,7 +220,7 @@ function controllableNotifier(): {
 
 /** Every `whatsapp_health_notify_failed` incident row for this business, oldest first (`queryAudit`'s own order is newest-first). */
 async function whatsappHealthIncidents(businessId: string): Promise<string[]> {
-  const rows = await queryAudit({ businessId, kind: 'incident' });
+  const rows = await withBusiness(businessId, (bdb) => queryAudit(bdb, { kind: 'incident' })); // TENANCY-TODO(task 4)
   return rows
     .filter((row) => row.reason.startsWith('whatsapp_health_notify_failed'))
     .map((row) => row.reason)
@@ -237,7 +237,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
   });
 
   it('runs neither loop and returns nulls when WhatsApp is not configured', async () => {
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const pass = await schedulerPass({
       businessId: BUSINESS,
       now: NOON,
@@ -268,14 +268,14 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * verification in the task report for both orderings pinned this way.
    */
   it('instructs, executes, closes and reports — all in one pass', async () => {
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [MAIL_CONNECTION],
         knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'auto' },
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     await upsertBinding(
       {
         system: 'office-mail',
@@ -288,7 +288,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
       },
       { businessId: BUSINESS, by: 'test' },
     );
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     const gateway = createFakeGateway();
@@ -351,7 +351,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * exactly ONCE per transition.
    */
   it('emails the owner once when a previously connected gateway is no longer connected', async () => {
-    await installCharter(buildCharter(), { businessId: HEALTH_BUSINESS });
+    await withBusiness(HEALTH_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     const { calls, notify } = recordingNotifier();
     const baseRuntime: Runtime = {
@@ -391,7 +391,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * tries again rather than treating the outage as already reported.
    */
   it('records a failed health-alert send as an incident, and retries the next pass', async () => {
-    await installCharter(buildCharter(), { businessId: HEALTH_FAIL_BUSINESS });
+    await withBusiness(HEALTH_FAIL_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     const { calls, notify, failNext } = controllableNotifier();
     const baseRuntime: Runtime = {
@@ -411,7 +411,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
     await schedulerPass({ businessId: HEALTH_FAIL_BUSINESS, now: NOON, inbox: null, runtime: baseRuntime });
     expect(calls).toHaveLength(1); // the attempt was made
 
-    const incidents = (await queryAudit({ businessId: HEALTH_FAIL_BUSINESS, kind: 'incident' })).filter((row) =>
+    const incidents = (await withBusiness(HEALTH_FAIL_BUSINESS, (bdb) => queryAudit(bdb, { kind: 'incident' }))).filter((row) => // TENANCY-TODO(task 4)
       row.reason.startsWith('whatsapp_health_notify_failed'),
     );
     expect(incidents).toHaveLength(1);
@@ -425,7 +425,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
 
   /** Fix round 1, F6 — a flaky health PROBE must not refuse the owner's own instruction. */
   it('runs the door even when gateway.health() itself throws', async () => {
-    await installCharter(buildCharter(), { businessId: DOOR_THROWS_BUSINESS });
+    await withBusiness(DOOR_THROWS_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     gateway.health = (): Promise<never> => {
       throw new Error('health probe timed out');
@@ -460,7 +460,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * messenger as proof the door succeeded.
    */
   it('skips the report too when runWhatsAppDoor itself throws after the messenger was built', async () => {
-    await installCharter(buildCharter(), { businessId: HEALTH_READ_FAIL_BUSINESS });
+    await withBusiness(HEALTH_READ_FAIL_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const throwingGateway: WhatsAppGateway = {
       async canSendFreeform() {
         return true;
@@ -512,7 +512,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * through one, which is why this one does not.
    */
   it('writes one incident per outage — not one per retry — and a second outage gets its own row even with the same state word and no observed reconnect in between', async () => {
-    await installCharter(buildCharter(), { businessId: ONCE_PER_OUTAGE_BUSINESS });
+    await withBusiness(ONCE_PER_OUTAGE_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     const { calls, notify, failNext } = controllableNotifier();
     const baseRuntime: Runtime = {
@@ -564,7 +564,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * outage must still get told about the outage that was already underway.
    */
   it('does not consume the transition when no sendAlert is configured, and sends once one becomes available', async () => {
-    await installCharter(buildCharter(), { businessId: NO_SENDALERT_BUSINESS });
+    await withBusiness(NO_SENDALERT_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     const calls: { subject: string; body: string }[] = [];
     const notifier: ApprovalNotifier = {
@@ -624,7 +624,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * new one and write a second row. This test drives exactly that sequence.
    */
   it('leaves the health record untouched when the probe throws mid-outage, so a later retry is not mistaken for a new outage', async () => {
-    await installCharter(buildCharter(), { businessId: PROBE_THROW_MID_OUTAGE_BUSINESS });
+    await withBusiness(PROBE_THROW_MID_OUTAGE_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     const { calls, notify, failNext } = controllableNotifier();
     const baseRuntime: Runtime = {
@@ -674,7 +674,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * for a business must alert if it is not `'connected'`.
    */
   it('alerts on the very first observation ever made, when the bridge is already down', async () => {
-    await installCharter(buildCharter(), { businessId: DOWN_AT_BOOT_BUSINESS });
+    await withBusiness(DOWN_AT_BOOT_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     gateway.setHealth({ state: 'reconnecting', since: NOON.toISOString() });
     const { calls, notify } = recordingNotifier();
@@ -704,7 +704,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * as a new episode in its own right.
    */
   it('escalates to a new alert when the state word worsens under an unchanged since, even with no reconnect observed', async () => {
-    await installCharter(buildCharter(), { businessId: WORSENING_WORD_BUSINESS });
+    await withBusiness(WORSENING_WORD_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     const { calls, notify } = recordingNotifier();
     const baseRuntime: Runtime = {
@@ -747,7 +747,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * function's constant, and none is needed at 5s.
    */
   it('does not hang the whole scheduler pass when gateway.health() never settles', async () => {
-    await installCharter(buildCharter(), { businessId: HEALTH_HANG_BUSINESS });
+    await withBusiness(HEALTH_HANG_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     gateway.health = (): Promise<GatewayHealth> => new Promise<never>(() => {
       /* deliberately never settles */
@@ -791,7 +791,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * this asserts on the BODY TEXT a real transport would hash instead.
    */
   it('gives two outages sharing a state word different alert bodies, and the same outage retried an identical one', async () => {
-    await installCharter(buildCharter(), { businessId: DISTINCT_BODY_BUSINESS });
+    await withBusiness(DISTINCT_BODY_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     const { calls, notify, failNext } = controllableNotifier();
     const baseRuntime: Runtime = {
@@ -855,7 +855,7 @@ describe('schedulerPass — WhatsApp wiring', () => {
    * at all — not a second call with a colliding body.
    */
   it('reads two ISO spellings of the identical instant as the same episode, not a new one with a colliding body', async () => {
-    await installCharter(buildCharter(), { businessId: SAME_INSTANT_BUSINESS });
+    await withBusiness(SAME_INSTANT_BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const gateway = createFakeGateway();
     const { calls, notify } = recordingNotifier();
     const baseRuntime: Runtime = {

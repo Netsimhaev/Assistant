@@ -47,7 +47,7 @@
  */
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { AgentId } from '../domain/audit.js';
 import type { AgentEnvelope, DelegationOutcome } from '../domain/envelope.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -137,7 +137,8 @@ export async function resumeDelegatedJobs(
           continue;
         }
 
-        const stored = await loadEnvelopeWithChild(parent.awaitingEnvelopeId, { businessId });
+        const awaitingEnvelopeId = parent.awaitingEnvelopeId;
+        const stored = await withBusiness(businessId, (bdb) => loadEnvelopeWithChild(bdb, awaitingEnvelopeId)); // TENANCY-TODO(task 4)
         if (stored === null) {
           const error = `job ${jobId} awaits envelope ${parent.awaitingEnvelopeId}, which does not exist`;
           await failCorruptedParent(jobId, businessId, error);
@@ -318,10 +319,7 @@ async function writeResultAndWake(
     createdAt: ctx.now.toISOString(),
   };
 
-  const written = await writeEnvelope(resultEnvelope, {
-    parentJobId: helperJobId,
-    businessId: ctx.businessId,
-  });
+  const written = await withBusiness(ctx.businessId, (bdb) => writeEnvelope(bdb, resultEnvelope, { parentJobId: helperJobId })); // TENANCY-TODO(task 4)
 
   await transition(parentJobId, {
     to: 'execute',

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -54,9 +54,7 @@ function isAwaitingDelegation(result: VerifyDraftResult): result is AwaitingDele
 }
 
 async function openVerifyJob(): Promise<{ job: Job; bundle: PolicyBundle }> {
-  const bundle = await installCharter(buildCharter({ version: `verify-${ulid()}` }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `verify-${ulid()}` }))); // TENANCY-TODO(task 7)
   const created = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'unknown_external',
@@ -164,7 +162,7 @@ describe('verifyDraft — the cheap check runs alone', () => {
     if (!isAwaitingDelegation(result)) throw new Error('expected awaiting_delegation');
     expect(result.childJobId).not.toBeNull();
 
-    const stored = await loadEnvelopeWithChild(result.envelopeId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => loadEnvelopeWithChild(bdb, result.envelopeId)); // TENANCY-TODO(task 7)
     expect(stored).not.toBeNull();
     expect(stored?.envelope.from).toBe('gov.verify');
     expect(stored?.envelope.to).toBe('know.reader');
@@ -183,7 +181,7 @@ describe('verifyDraft — the cheap check runs alone', () => {
     // The state a waiting-then-judging implementation could not produce:
     // nothing ran the child's one step, and nothing was ever judged or saved.
     expect(await stepResultCount(childJobId)).toBe(0);
-    expect(await loadVerdict(job.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, job.jobId))).toBeNull(); // TENANCY-TODO(task 7)
   });
 
   it('runs the judge once an answer is available, saves the verdict, and reads it back', async () => {
@@ -230,7 +228,7 @@ describe('verifyDraft — the cheap check runs alone', () => {
 
     // Round-trip through the store: the persistence contract this module has
     // with Task 9, not merely "saveVerdict was awaited and did not throw".
-    const reloaded = await loadVerdict(job.jobId, { businessId: BUSINESS });
+    const reloaded = await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, job.jobId)); // TENANCY-TODO(task 7)
     expect(reloaded).toEqual(result);
   });
 
@@ -272,8 +270,8 @@ describe('verifyDraft — the cheap check runs alone', () => {
     );
     if (!('criteria' in result)) throw new Error('expected a Verdict');
 
-    expect(await loadVerdict(subjectJob.jobId, { businessId: BUSINESS })).toEqual(result);
-    expect(await loadVerdict(delegatingJob.jobId, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, subjectJob.jobId))).toEqual(result); // TENANCY-TODO(task 7)
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, delegatingJob.jobId))).toBeNull(); // TENANCY-TODO(task 7)
   });
 
   /**
@@ -303,7 +301,7 @@ describe('verifyDraft — the cheap check runs alone', () => {
     if (!('criteria' in result)) throw new Error('expected a Verdict');
     expect(result.answerTruncated).toBe(true);
 
-    const reloaded = await loadVerdict(job.jobId, { businessId: BUSINESS });
+    const reloaded = await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, job.jobId)); // TENANCY-TODO(task 7)
     expect(reloaded?.answerTruncated).toBe(true);
   });
 
@@ -335,7 +333,7 @@ describe('verifyDraft — the cheap check runs alone', () => {
     if (!('criteria' in result)) throw new Error('expected a Verdict');
     expect(result.draftTruncated).toBe(true);
 
-    const reloaded = await loadVerdict(job.jobId, { businessId: BUSINESS });
+    const reloaded = await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, job.jobId)); // TENANCY-TODO(task 7)
     expect(reloaded?.draftTruncated).toBe(true);
   });
 
@@ -368,7 +366,7 @@ describe('verifyDraft — the cheap check runs alone', () => {
     if (!('criteria' in result)) throw new Error('expected a Verdict');
     expect(result.fenceForgeryDetected).toBe(true);
 
-    const reloaded = await loadVerdict(job.jobId, { businessId: BUSINESS });
+    const reloaded = await withBusiness(BUSINESS, (bdb) => loadVerdict(bdb, job.jobId)); // TENANCY-TODO(task 7)
     expect(reloaded?.fenceForgeryDetected).toBe(true);
   });
 
@@ -439,9 +437,7 @@ describe('verifyDraft — the cheap check runs alone', () => {
    * than silently succeeding.
    */
   it('throws when the delegation itself is refused', async () => {
-    const bundle = await installCharter(buildCharter({ version: `verify-refused-${ulid()}` }), {
-      businessId: BUSINESS,
-    });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `verify-refused-${ulid()}` }))); // TENANCY-TODO(task 7)
     const created = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'unknown_external',

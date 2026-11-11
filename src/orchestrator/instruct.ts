@@ -76,7 +76,7 @@
  * otherwise.
  */
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
 import type { ActionClass } from '../domain/action.js';
 import { planProblems, type Plan } from '../domain/plan.js';
@@ -368,7 +368,7 @@ export async function runInstruction(
     };
   }
 
-  const active = await loadActiveCharter(businessId);
+  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
   if (active === null) {
     return { status: 'refused', reason: 'אין תקנון פעיל — המתכנן נשען על הקטלוג והתקרות שבו.' };
   }
@@ -1423,7 +1423,7 @@ async function grantForPlan(
   const granted: GrantedAuthorization[] = [];
   for (const [actionClass, addresses] of byClass) {
     const recipients = [...addresses].sort();
-    await grantAuthorization({ jobId, actionClass, recipients }, { businessId, db: getPool() });
+    await withBusiness(businessId, (bdb) => grantAuthorization(bdb, { jobId, actionClass, recipients })); // TENANCY-TODO(task 4)
     granted.push({ actionClass, recipients });
   }
   return { granted, grantNote: null, recordingNote };

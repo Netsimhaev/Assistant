@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
 import type { Plan } from '../domain/plan.js';
 import { AutonomyLevel, mostRestrictiveAutonomy, permits } from '../domain/trust.js';
@@ -104,7 +104,9 @@ export async function loadRampLevel(
   // `email.reply` — i.e. only when the dial is `learn` and the class was
   // promoted. Neither drops the charter's cap, which is why that one is the
   // invariant this relaxation leans on.
-  const bounds = rampBoundsForMode(await loadAutonomyMode({ ...options, db }));
+  const bounds = rampBoundsForMode(
+    await withBusiness(options.businessId ?? config.businessId, (bdb) => loadAutonomyMode(bdb)), // TENANCY-TODO(task 4)
+  );
   return clampToDial(stored, bounds);
 }
 

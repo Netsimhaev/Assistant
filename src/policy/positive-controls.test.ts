@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { readFile } from 'node:fs/promises';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -17,7 +17,7 @@ import {
   refineActionClass,
   READ_ONLY_TOOLS,
 } from './classify.js';
-import { evaluateToolCall, type GateContext } from './engine.js';
+import { evaluateFor, type TestGateContext } from '../test/gate.js';
 import { assessRisk } from './risk.js';
 import type { ActionFacts, PolicyBundle } from '../domain/policy.js';
 import { TrustLevel } from '../domain/trust.js';
@@ -26,7 +26,7 @@ const BUSINESS = 'test-business';
 /** 12:00 Asia/Jerusalem — outside the fixture's 22:00–07:00 quiet window. */
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
-function ctx(bundle: PolicyBundle, over: Partial<GateContext> = {}): GateContext {
+function ctx(bundle: PolicyBundle, over: Partial<TestGateContext> = {}): TestGateContext {
   return {
     agent: 'comms.email',
     bundle,
@@ -38,7 +38,7 @@ function ctx(bundle: PolicyBundle, over: Partial<GateContext> = {}): GateContext
     jobId: 'J-POS',
     now: NOON,
     ...over,
-  } as GateContext;
+  } as TestGateContext;
 }
 
 beforeEach(async () => {
@@ -57,14 +57,14 @@ afterAll(async () => {
  */
 describe('controls that identify by one key must check every key', () => {
   it('honours a do-not-contact rule when the payload lists several recipients', async () => {
-    const bundle = await installCharter(
-      buildCharter({ doNotContactEmailDomain: 'rival-legal.co.il' }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ doNotContactEmailDomain: 'rival-legal.co.il' })
+    ));
 
     // An array `to` produced no address at all under the single-value reader,
     // so the block simply did not run.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: ['fine@example.com', 'adv@rival-legal.co.il'], inReplyTo: 'm1' },
       ctx(bundle),
@@ -76,12 +76,12 @@ describe('controls that identify by one key must check every key', () => {
   });
 
   it('honours it when the recipients arrive joined into one string', async () => {
-    const bundle = await installCharter(
-      buildCharter({ doNotContactEmailDomain: 'rival-legal.co.il' }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ doNotContactEmailDomain: 'rival-legal.co.il' })
+    ));
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'fine@example.com, Adv@Rival-Legal.co.il', inReplyTo: 'm1' },
       ctx(bundle),
@@ -104,7 +104,7 @@ describe('controls that identify by one key must check every key', () => {
   });
 
   it('does not let an invented id match a tag and pose as a known counterparty', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     expect(bundle.knownCounterparties.entityIds).not.toEqual(
       bundle.knownCounterparties.tags,
     );
@@ -116,7 +116,7 @@ describe('controls that identify by one key must check every key', () => {
     // contact is exempt from this escalation on purpose (naming the
     // counterparty WAS the approval), so it would not tell resolved from
     // unresolved apart here. Staff stays inside the escalation.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'x@example.com', entityId: 'לקוח ותיק', inReplyTo: 'm1' },
       ctx(bundle, { provenance: 'staff' }),
@@ -128,11 +128,11 @@ describe('controls that identify by one key must check every key', () => {
 
 describe('an unreadable value is not a permissive value', () => {
   it('refuses a purchase whose amount it could not read', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 
     // `total` rather than `amountMinor`: previously read as zero, which skipped
     // every ceiling and scored zero on the money dimension.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       { supplierId: 'supplier_a', total: 500_000 },
       ctx(bundle, { agent: 'ops.web' }),
@@ -144,11 +144,11 @@ describe('an unreadable value is not a permissive value', () => {
   });
 
   it('still allows a discount, which is a percentage and carries no amount', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 
     // The amount requirement must not undo the fix that made the discount
     // ceiling reachable at all.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'discount.grant',
       { counterpartyId: 'c_812', discountPercent: 90 },
       ctx(bundle),
@@ -160,10 +160,10 @@ describe('an unreadable value is not a permissive value', () => {
   });
 
   it('scores an unrecognised data class as the worst one, not as nothing', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 
     // 'medical' is a plausible near-miss for 'health'. Dropping it scored zero.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       {
         to: 'x@example.com',
@@ -196,8 +196,8 @@ describe('read-only must mean no side effect, not merely no action class', () =>
     // writes no audit row — unrecorded filesystem write.
     expect(READ_ONLY_TOOLS.has('file.write')).toBe(false);
 
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
-    const decision = await evaluateToolCall(
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const decision = await evaluateFor(
       'file.write',
       { path: 'out.docx' },
       ctx(bundle, { agent: 'prod.docs' }),
@@ -206,12 +206,12 @@ describe('read-only must mean no side effect, not merely no action class', () =>
   });
 
   it('redacts a read-only tool that nonetheless leaves the instance', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 
     // browser.navigate is in READ_ONLY_TOOLS *and* OUTBOUND_TOOLS. It carries
     // no action class, so it short-circuited past redaction — making a URL an
     // unredacted egress channel.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.navigate',
       { url: 'https://supplier.example/?ref=123456789' },
       ctx(bundle, { agent: 'ops.web' }),
@@ -223,8 +223,8 @@ describe('read-only must mean no side effect, not merely no action class', () =>
   });
 
   it('holds quiet hours over an outbound read-only tool too', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
-    const decision = await evaluateToolCall(
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const decision = await evaluateFor(
       'browser.navigate',
       { url: 'https://supplier.example/' },
       ctx(bundle, { agent: 'ops.web', now: new Date('2026-08-18T00:00:00.000Z') }),
@@ -399,10 +399,10 @@ describe('constants that must fail closed as the system grows', () => {
  */
 describe('broad domain matching widens what gets blocked, never what gets trusted', () => {
   it('does not let a subdomain of a known counterparty skip the first-contact escalation', async () => {
-    const bundle = await installCharter(
-      buildCharter({ knownCounterpartyEmailDomain: 'acme.co.il' }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ knownCounterpartyEmailDomain: 'acme.co.il' })
+    ));
 
     // A valid reply (auto_notify baseline) so risk alone -- not the action
     // class -- decides allow vs. queue_approval. 'promo.mail.acme.co.il' is
@@ -413,7 +413,7 @@ describe('broad domain matching widens what gets blocked, never what gets truste
     // contact is exempt from this escalation on purpose, so it would not
     // distinguish the subdomain bypass this test guards against. Staff
     // stays inside the escalation.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'dana@promo.mail.acme.co.il', inReplyTo: 't-1', body: 'שלום' },
       ctx(bundle, { provenance: 'staff' }),
@@ -423,15 +423,15 @@ describe('broad domain matching widens what gets blocked, never what gets truste
   });
 
   it('still denies a subdomain of a do-not-contact domain', async () => {
-    const bundle = await installCharter(
-      buildCharter({ doNotContactEmailDomain: 'rival-legal.co.il' }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ doNotContactEmailDomain: 'rival-legal.co.il' })
+    ));
 
     // The mirror image of the case above: matchDoNotContact widens to a
     // subdomain on purpose, because blocking more is always the safe
     // direction.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'dana@mail.rival-legal.co.il', inReplyTo: 't-1', body: 'שלום' },
       ctx(bundle),
@@ -468,13 +468,11 @@ describe('outbound is a positive list, and it is complete', () => {
   });
 
   it('redacts the payload of a calendar invitation', async () => {
-    const bundle = await installCharter(buildCharter({ autonomyBase: { 'calendar.create': 'auto' } }), {
-      businessId: BUSINESS,
-    });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ autonomyBase: { 'calendar.create': 'auto' } })));
 
     // The fixture charter redacts a bare nine-digit number. An invitation is
     // delivered to attendees, so the description must not carry one out.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'calendar.write',
       { entityId: 'c_812', title: 'פגישה', description: 'ת.ז. 123456789' },
       ctx(bundle, { agent: 'sched.meetings' }),
@@ -567,7 +565,7 @@ function firstContactFacts(provenance: TrustLevel, chainDerived: boolean): Actio
 
 describe('the first-contact exemption is empty: no TrustLevel escapes the escalation', () => {
   it('scores EVERY TrustLevel as sensitive, boss included', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 
     // A widening of FIRST_CONTACT_EXEMPT in risk.ts is precisely how a
     // security control loosens into a prompt-injection hole: add a level
@@ -598,7 +596,7 @@ describe('the first-contact exemption is empty: no TrustLevel escapes the escala
   });
 
   it('scores EVERY TrustLevel as sensitive when nobody derived the provenance', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 
     // The other half of the same invariant, and the half that holds the
     // safety argument up if the set is ever re-populated. Membership of

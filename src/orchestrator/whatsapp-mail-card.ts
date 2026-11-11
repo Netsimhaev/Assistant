@@ -55,7 +55,7 @@
  * the ordinary instruction door. The dashboard is always the other exit.
  */
 import { config } from '../config.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, withBusinessTransaction, type Queryable } from '../db/pool.js';
 import {
   ApprovalNotDecidableError,
   cancelPendingApproval,
@@ -147,7 +147,7 @@ export async function presentMailCard(
   options: { businessId?: string; lead?: string } = {},
 ): Promise<boolean> {
   const businessId = options.businessId ?? config.businessId;
-  const approval = await getApproval(approvalId, { businessId });
+  const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
   if (approval === null || approval.jobId === null || approval.state !== 'pending') return false;
   if (mailboxReplyRecipient(approval.proposedInput) === null) return false;
   const payload = approval.editedInput ?? approval.proposedInput;
@@ -251,7 +251,7 @@ export async function openMailCards(input: {
     // answer to it — it goes to the ordinary door instead.
     if (!(inboundMs > presentedMs)) continue;
     if (row.later_texts.some((text) => isClosureCommand(text))) continue;
-    const approval = await getApproval(row.approval_id, { businessId });
+    const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, row.approval_id)); // TENANCY-TODO(task 4)
     if (approval === null || mailboxReplyRecipient(approval.proposedInput) === null) continue;
     open.push({ approval, presentedAt: row.presented_at });
   }
@@ -356,12 +356,12 @@ async function approveCard(
 
   let decided: ApprovalRequest;
   try {
-    decided = await decide(
+    decided = await withBusiness(ctx.businessId, (bdb) => decide( // TENANCY-TODO(task 4)
+      bdb,
       card.approvalId,
       'approved',
-      { by: ctx.by, channel: 'whatsapp', ...(staged !== undefined ? { editedInput: staged } : {}) },
-      { businessId: ctx.businessId },
-    );
+      { by: ctx.by, channel: 'whatsapp', ...(staged !== undefined ? { editedInput: staged } : {}) }
+    ));
   } catch (error) {
     if (error instanceof ApprovalNotDecidableError) return ctx.refuse(MAIL_CARD_GONE);
     throw error;
@@ -420,8 +420,8 @@ async function replaceBody(
   const edited: Record<string, unknown> = { ...proposed, body: newBody };
   if (!mailReplyEditAllowed(proposed, edited)) return ctx.refuse(MAIL_CARD_GONE);
 
-  const freshId = await withTransaction(async (tx) => {
-    if (!(await cancelPendingApproval(card.approvalId, { businessId: ctx.businessId, db: tx }))) {
+  const freshId = await withBusinessTransaction(ctx.businessId, async (tx) => { // TENANCY-TODO(task 4)
+    if (!(await cancelPendingApproval(tx, card.approvalId))) {
       return null;
     }
     const facts = buildFacts('mail.send', proposed, {
@@ -435,18 +435,15 @@ async function replaceBody(
       throw new Error(`whatsapp mail card: proposal of ${card.approvalId} no longer reads as the bound reply`);
     }
     const { header } = splitReplyDetail(card.detail);
-    const id = await enqueueApproval(
-      {
-        jobId,
-        facts,
-        risk: card.risk,
-        proposedInput: proposed,
-        summary: card.summary,
-        detail: `${header.join('\n')}\n\n${newBody}`,
-      },
-      { businessId: ctx.businessId, db: tx },
-    );
-    if (!(await stagePendingEdit(id, edited, { businessId: ctx.businessId, db: tx }))) {
+    const id = await enqueueApproval(tx, {
+      jobId,
+      facts,
+      risk: card.risk,
+      proposedInput: proposed,
+      summary: card.summary,
+      detail: `${header.join('\n')}\n\n${newBody}`,
+    });
+    if (!(await stagePendingEdit(tx, id, edited))) {
       throw new Error(`whatsapp mail card: could not stage the edit on ${id}`);
     }
     return id;

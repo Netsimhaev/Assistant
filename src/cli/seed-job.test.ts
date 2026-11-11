@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -41,9 +41,7 @@ describe('seedMailJob', () => {
     await resetDatabase();
     // `installCharter` returns the compiled PolicyBundle directly and takes
     // no `actor` option — see src/orchestrator/run-due.test.ts.
-    await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
-      businessId: BUSINESS,
-    });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 7)
   });
 
   afterAll(async () => {

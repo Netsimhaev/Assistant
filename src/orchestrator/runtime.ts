@@ -34,6 +34,7 @@ import type { CredentialHandle } from './adapters/types.js';
 import type { WhatsAppGateway } from '../whatsapp/gateway.js';
 import { canonicalHash } from '../util/canonical.js';
 import { PRODUCTION_TOOLS_MISSING_REASON } from '../production/render-error.js';
+import { withBusiness } from '../db/pool.js';
 
 /** Which vendor's code serves a binding's system. Matches `ConnectionBinding.provider`. */
 const GOOGLE_PROVIDER = 'google';
@@ -654,7 +655,7 @@ export async function buildRuntime(
   // every pass would mean re-reading the charter and the master key every
   // 30 seconds, which is an architecture decision for a later task, not a
   // line in this fix round. See `docs/live-thread-runbook.md`.
-  const charter = await loadActiveCharter();
+  const charter = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 8)
   const bindings = await loadBindings();
   const connectionBySystem = new Map(
     (charter?.charter.connections ?? []).map((connection) => [connection.system, connection] as const),
@@ -761,7 +762,7 @@ export async function buildRuntime(
         system: binding.system,
         provider,
         timeZone: async () => {
-          const active = await loadActiveCharter();
+          const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 8)
           if (active === null) throw new Error('no active charter: the business time zone is unknown');
           return active.charter.identity.timezone;
         },

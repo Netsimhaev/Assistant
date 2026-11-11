@@ -22,8 +22,8 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter, loadActiveCharter, probeActiveCharter } from './store.js';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 
 const BUSINESS = 'test-business';
@@ -39,7 +39,7 @@ const BUSINESS = 'test-business';
  * correctly months ago, under a schema this code has since moved past.
  */
 async function ageStoredCharter(businessId: string, to: string): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `UPDATE charter_versions
         SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb($2::text))
       WHERE business_id = $1`,
@@ -50,7 +50,7 @@ async function ageStoredCharter(businessId: string, to: string): Promise<void> {
 describe('a charter signed under an older schema', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   });
 
   afterAll(async () => {
@@ -60,24 +60,24 @@ describe('a charter signed under an older schema', () => {
   it('stops every production reader, and says which way to move', async () => {
     await ageStoredCharter(BUSINESS, '1.1');
 
-    await expect(loadActiveCharter(BUSINESS)).rejects.toThrow(/re-signed/);
+    await expect(withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb))).rejects.toThrow(/re-signed/);
     // The direction matters as much as the refusal: an operator told to
     // re-sign when the real problem is a rolled-back deployment is being sent
     // the wrong way. Pin that the message names the older-schema case.
-    await expect(loadActiveCharter(BUSINESS)).rejects.toThrow(/older schema/);
+    await expect(withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb))).rejects.toThrow(/older schema/);
   });
 
   it('points the other way for a charter NEWER than this code', async () => {
     await ageStoredCharter(BUSINESS, '9.9');
 
-    await expect(loadActiveCharter(BUSINESS)).rejects.toThrow(/roll the code forward/);
-    await expect(loadActiveCharter(BUSINESS)).rejects.toThrow(/do not re-sign/);
+    await expect(withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb))).rejects.toThrow(/roll the code forward/);
+    await expect(withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb))).rejects.toThrow(/do not re-sign/);
   });
 
   it('still lets the install path ask, and hands it the reason', async () => {
     await ageStoredCharter(BUSINESS, '1.1');
 
-    const probe = await probeActiveCharter(BUSINESS);
+    const probe = await withBusiness(BUSINESS, (bdb) => probeActiveCharter(bdb));
 
     // The positive half first: the probe RESOLVED rather than rejecting. An
     // assertion only on `ok === false` would pass just as well if this call
@@ -92,13 +92,13 @@ describe('a charter signed under an older schema', () => {
 
     // The whole point: the door out is open. This is what `seed-charter.ts`
     // does after a failed probe.
-    const bundle = await installCharter(
-      buildCharter({ version: 'after-the-bump' }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ version: 'after-the-bump' })
+    ));
     expect(bundle.charterVersion).toBe('after-the-bump');
 
-    const recovered = await loadActiveCharter(BUSINESS);
+    const recovered = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     expect(recovered?.charter.charterVersion).toBe('after-the-bump');
   });
 });
@@ -113,9 +113,9 @@ describe('a charter this code can read', () => {
   });
 
   it('probes as readable, carrying the charter itself', async () => {
-    await installCharter(buildCharter({ version: 'current' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'current' })));
 
-    const probe = await probeActiveCharter(BUSINESS);
+    const probe = await withBusiness(BUSINESS, (bdb) => probeActiveCharter(bdb));
 
     expect(probe.ok).toBe(true);
     if (!probe.ok) throw new Error(`unreachable: ${probe.reason}`);
@@ -127,7 +127,7 @@ describe('a charter this code can read', () => {
     // the installer treats them the same way while the readiness report must
     // not: "none — run seed-charter" and "stored but unreadable" send an
     // operator to different places.
-    const probe = await probeActiveCharter(BUSINESS);
+    const probe = await withBusiness(BUSINESS, (bdb) => probeActiveCharter(bdb));
 
     expect(probe.ok).toBe(true);
     if (!probe.ok) throw new Error(`unreachable: ${probe.reason}`);

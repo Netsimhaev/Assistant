@@ -25,7 +25,7 @@ vi.mock('./plan-store.js', async (importOriginal) => {
   };
 });
 
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -89,7 +89,7 @@ const versions = new Map<string, string>();
 async function parkedJob(options: ConfirmationOption[], businessId = BUSINESS): Promise<string> {
   let version = versions.get(businessId);
   if (version === undefined) {
-    version = (await installCharter(buildCharter(), { businessId })).charterVersion;
+    version = (await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 4)
     versions.set(businessId, version);
   }
   const job = await createJob({ charterVersion: version, provenance: 'boss', businessId });

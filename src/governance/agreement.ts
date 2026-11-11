@@ -27,7 +27,7 @@
  * its link and the re-raised card is skipped by its prefix. That undercounts,
  * which is the safe direction.
  */
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
 import { EXPIRED_PREFIX, RETRY_PREFIX, splitReplyDetail } from '../mail/reply-card.js';
 import { agreementVerdict, type WrongReason } from './agreement-verdict.js';
@@ -78,10 +78,10 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 export async function agreementFor(
+  db: BusinessDb,
   actionClass: ActionClass,
-  options: { businessId: string; since: Date | null; now?: Date; db?: Queryable },
+  options: { since: Date | null; now?: Date },
 ): Promise<Agreement> {
-  const db = options.db ?? getPool();
   const now = options.now ?? new Date();
   const { rows } = await db.query<CardRow>(
     `SELECT state, detail, proposed_input, edited_input
@@ -99,7 +99,7 @@ export async function agreementFor(
               $4::timestamptz - make_interval(days => $5),
               COALESCE($6::timestamptz, '-infinity'::timestamptz))`,
     [
-      options.businessId,
+      db.businessId,
       actionClass,
       [...DECIDED_STATES],
       now.toISOString(),

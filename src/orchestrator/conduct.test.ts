@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -108,7 +108,7 @@ function deps(proposal: Proposal = ACTING) {
 describe('conductPendingDocuments', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   });
 
   // I3: the conductor writes `approval_requests` without passing through the
@@ -691,7 +691,7 @@ describe('conductPendingDocuments', () => {
     );
     const subjectJobId = jobs.rows[0]?.job_id;
     expect(subjectJobId).toBeTruthy();
-    expect(await loadVerificationOutcome(subjectJobId as string, { businessId: BUSINESS })).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId as string))).toBeNull(); // TENANCY-TODO(task 4)
   });
 
   /**
@@ -748,7 +748,7 @@ describe('conductPendingDocuments', () => {
 describe('conductPendingDocuments and mail-sourced documents', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   });
 
   // `intake.triage` already read the mail an attachment came with (spec

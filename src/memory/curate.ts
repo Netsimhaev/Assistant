@@ -19,8 +19,7 @@
  * when the model never answered, and `CurationOutcome.failed` says plainly
  * that something went wrong rather than reading like a quiet no-op.
  */
-import type { Queryable } from '../db/pool.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -161,7 +160,8 @@ export async function curateJob(
       written += 1;
     }
 
-    await appendAudit(
+    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+      bdb,
       {
         actor: 'orchestrator',
         kind: 'curation',
@@ -174,9 +174,8 @@ export async function curateJob(
         costMinor: null,
         tokens: null,
         reason: `${prefix}אצירה · ${written} עובדות נשמרו · ${rejected} נדחו`,
-      },
-      { businessId },
-    );
+      }
+    ));
 
     return { ran: true, skipped: null, written, rejected, failed: false };
   } catch (err) {
@@ -214,7 +213,8 @@ async function recordCurationFailure(
 ): Promise<void> {
   const errorKind = err instanceof Error ? err.constructor.name : 'unknown';
   try {
-    await appendAudit(
+    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+      bdb,
       {
         actor: 'orchestrator',
         kind: 'curation',
@@ -225,9 +225,8 @@ async function recordCurationFailure(
         costMinor: null,
         tokens: null,
         reason: `${prefix}אצירה נכשלה · ${written} עובדות נשמרו לפני הכשל · ${rejected} נדחו · שגיאה: ${errorKind}`,
-      },
-      { businessId },
-    );
+      }
+    ));
   } catch {
     // Swallowed on purpose — see the docblock above.
   }

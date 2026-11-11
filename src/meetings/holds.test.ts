@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { resetDatabase } from '../test/db.js';
@@ -115,7 +115,7 @@ const runtime = { credentials: { resolve: async () => ({ value: 'tok' }) } } as 
 
 beforeEach(async () => {
   await resetDatabase();
-  charterVersion = (await installCharter(buildCharter(), { businessId: BUSINESS })).charterVersion;
+  charterVersion = (await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 5)
 });
 afterAll(async () => {
   await closePool();

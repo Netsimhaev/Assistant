@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -211,11 +211,11 @@ async function approvedReplyCard(): Promise<void> {
   );
   const input = { to: ['dana@example.com'], subject: 'Re: s', body: 'תודה רבה על הפנייה שלך', ref: sequence };
   const facts = factsFor(input);
-  const approvalId = await enqueueApproval(
-    { facts, risk: await assessRisk(facts, bundle), proposedInput: input, summary: 'שליחת מייל', jobId },
-    { businessId: BUSINESS },
-  );
-  await decide(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS });
+  const approvalId = await withBusiness(BUSINESS, async (bdb) => enqueueApproval( // TENANCY-TODO(task 10)
+    bdb,
+    { facts, risk: await assessRisk(facts, bundle), proposedInput: input, summary: 'שליחת מייל', jobId }
+  ));
+  await withBusiness(BUSINESS, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 10)
 }
 
 async function autonomyEvent(direction: 'promote' | 'demote', at: Date): Promise<void> {
@@ -237,7 +237,7 @@ describe('learningSnapshot', () => {
   beforeEach(async () => {
     await resetDatabase();
     sequence = 0;
-    bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
   });
   afterAll(async () => {
     await closePool();
@@ -251,10 +251,10 @@ describe('learningSnapshot', () => {
 
   it('a class promoted in its ramp row but clamped by dial off is not acting alone', async () => {
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    await setAutonomyMode('off', 'owner', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner')); // TENANCY-TODO(task 10)
     expect((await replyCard()).status).toBe('shadow');
 
-    await setAutonomyMode('learn', 'owner', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner')); // TENANCY-TODO(task 10)
     const promotedAt = new Date(Date.now() - 3_600_000);
     await autonomyEvent('promote', promotedAt);
     const acting = await replyCard();
@@ -264,7 +264,7 @@ describe('learningSnapshot', () => {
 
   it('a class learned under ask is ready but waiting for the dial', async () => {
     for (let i = 0; i < 5; i += 1) await approvedReplyCard();
-    await setAutonomyMode('ask', 'owner', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner')); // TENANCY-TODO(task 10)
     const ready = await replyCard();
     expect(ready.agreement).toEqual({ right: 5, counted: 5, topWrongReason: null });
     expect(ready.status).toBe('ready_but_dial_not_learn');
@@ -288,9 +288,7 @@ describe('learningSnapshot', () => {
 
   it('a class the charter holds at approve_required is left out of the overall score', async () => {
     await resetDatabase();
-    bundle = await installCharter(buildCharter({ autonomyBase: { 'email.reply': 'approve_required' } }), {
-      businessId: BUSINESS,
-    });
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ autonomyBase: { 'email.reply': 'approve_required' } }))); // TENANCY-TODO(task 10)
     for (let i = 0; i < 5; i += 1) await approvedReplyCard();
     const s = await learningSnapshot({ businessId: BUSINESS });
     expect(s.cards.find((c) => c.actionClass === 'email.reply')?.status).toBe('charter_requires_approval');

@@ -1,6 +1,5 @@
 import { ulid } from 'ulid';
-import type { Queryable } from '../../db/pool.js';
-import { getPool } from '../../db/pool.js';
+import type { BusinessDb } from '../../db/pool.js';
 import { InterviewAnswers, InterviewAnswersDraft } from './answers.js';
 
 /**
@@ -57,10 +56,10 @@ function only(rows: DraftRow[], what: string): InterviewDraft {
   return toDraft(row);
 }
 
-export async function loadDraft(businessId: string, db: Queryable = getPool()): Promise<InterviewDraft | null> {
+export async function loadDraft(db: BusinessDb): Promise<InterviewDraft | null> {
   const { rows } = await db.query<DraftRow>(
     `SELECT ${COLUMNS} FROM charter_interview_drafts WHERE business_id = $1`,
-    [businessId],
+    [db.businessId],
   );
   const row = rows[0];
   return row === undefined ? null : toDraft(row);
@@ -83,13 +82,13 @@ export async function loadDraft(businessId: string, db: Queryable = getPool()): 
  * from does not move because a later section was saved.
  */
 export async function saveSection(
-  businessId: string,
+  db: BusinessDb,
   section: keyof InterviewAnswers,
   value: unknown,
   options: { baseCharterVersion?: string | null } = {},
 ): Promise<InterviewDraft> {
   const parsed = InterviewAnswers.shape[section].parse(value);
-  const { rows } = await getPool().query<DraftRow>(
+  const { rows } = await db.query<DraftRow>(
     `INSERT INTO charter_interview_drafts (draft_id, business_id, answers, base_charter_version)
      VALUES ($1, $2, jsonb_build_object($3::text, $4::jsonb), $5)
      ON CONFLICT (business_id) DO UPDATE
@@ -97,7 +96,7 @@ export async function saveSection(
            frozen_at = NULL,
            updated_at = now()
      RETURNING ${COLUMNS}`,
-    [ulid(), businessId, section, JSON.stringify(parsed), options.baseCharterVersion ?? null],
+    [ulid(), db.businessId, section, JSON.stringify(parsed), options.baseCharterVersion ?? null],
   );
   return only(rows, 'save');
 }
@@ -108,12 +107,12 @@ export async function saveSection(
  * `baseCharterVersion` on update too: a prefill IS a new starting point.
  */
 export async function replaceDraft(
-  businessId: string,
+  db: BusinessDb,
   answers: InterviewAnswersDraft,
   baseCharterVersion: string | null,
 ): Promise<InterviewDraft> {
   const parsed = InterviewAnswersDraft.parse(answers);
-  const { rows } = await getPool().query<DraftRow>(
+  const { rows } = await db.query<DraftRow>(
     `INSERT INTO charter_interview_drafts (draft_id, business_id, answers, base_charter_version)
      VALUES ($1, $2, $3::jsonb, $4)
      ON CONFLICT (business_id) DO UPDATE
@@ -122,7 +121,7 @@ export async function replaceDraft(
            frozen_at = NULL,
            updated_at = now()
      RETURNING ${COLUMNS}`,
-    [ulid(), businessId, JSON.stringify(parsed), baseCharterVersion],
+    [ulid(), db.businessId, JSON.stringify(parsed), baseCharterVersion],
   );
   return only(rows, 'replace');
 }
@@ -133,8 +132,9 @@ export async function replaceDraft(
  * returns the effective value. Throws when the business has no draft — there
  * is nothing to review.
  */
-export async function freezeDraft(businessId: string, at: Date): Promise<Date> {
-  const { rows } = await getPool().query<{ frozen_at: Date }>(
+export async function freezeDraft(db: BusinessDb, at: Date): Promise<Date> {
+  const businessId = db.businessId;
+  const { rows } = await db.query<{ frozen_at: Date }>(
     `UPDATE charter_interview_drafts
         SET frozen_at = coalesce(frozen_at, $2)
       WHERE business_id = $1
@@ -147,6 +147,6 @@ export async function freezeDraft(businessId: string, at: Date): Promise<Date> {
 }
 
 /** Delete the business's draft, inside the caller's transaction (the sign step). */
-export async function deleteDraft(businessId: string, tx: Queryable): Promise<void> {
-  await tx.query('DELETE FROM charter_interview_drafts WHERE business_id = $1', [businessId]);
+export async function deleteDraft(tx: BusinessDb): Promise<void> {
+  await tx.query('DELETE FROM charter_interview_drafts WHERE business_id = $1', [tx.businessId]);
 }

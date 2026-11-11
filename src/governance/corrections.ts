@@ -22,8 +22,7 @@
  * job's provenance — `boss` — the same way it reads any other job's.
  */
 import { ulid } from 'ulid';
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { messagesAPerson, type ActionClass } from '../domain/action.js';
 import { createJob } from '../orchestrator/jobs.js';
@@ -60,15 +59,14 @@ export interface CorrectionResult {
  * which is worse than not filing it at all.
  */
 async function recipientOfStep(
+  db: BusinessDb,
   jobId: string,
   stepId: string,
   actionClass: ActionClass,
-  businessId: string,
-  db: Queryable,
 ): Promise<string | null> {
   if (!messagesAPerson(actionClass)) return null;
 
-  const stored = await loadPlanBody(jobId, { businessId, db });
+  const stored = await loadPlanBody(jobId, { businessId: db.businessId, db });
   if (stored === null) return null;
   const step = stored.plan.steps.find((candidate) => candidate.id === stepId);
   if (step === undefined) return null;
@@ -100,11 +98,10 @@ async function recipientOfStep(
  * ever made about one person instead of the newest.
  */
 export async function recordCorrection(
+  db: BusinessDb,
   input: CorrectionInput,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<CorrectionResult> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
 
   const markId = `AM-${ulid()}`;
   await db.query(
@@ -114,10 +111,10 @@ export async function recordCorrection(
     [markId, businessId, input.jobId, input.stepId, input.actionClass, input.note, input.by],
   );
 
-  const subjectKey = await recipientOfStep(input.jobId, input.stepId, input.actionClass, businessId, db);
+  const subjectKey = await recipientOfStep(db, input.jobId, input.stepId, input.actionClass);
   if (subjectKey === null) return { markId, remembered: false };
 
-  const active = await loadActiveCharter(businessId, db);
+  const active = await loadActiveCharter(db);
   if (active === null) return { markId, remembered: false };
 
   // A job of the correction's OWN, stamped `boss` as a literal — not a

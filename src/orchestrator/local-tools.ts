@@ -34,7 +34,7 @@
  */
 import { z } from 'zod';
 import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
+import { getPool, withTransaction, withBusiness, type Queryable } from '../db/pool.js';
 import { AgentId } from '../domain/audit.js';
 import { SafeLookupKey } from '../domain/charter.js';
 import { ContextRef, ResultEnvelopePayload } from '../domain/envelope.js';
@@ -67,7 +67,6 @@ import {
 import { requestHelp } from './delegate.js';
 import { loadJob, transition } from './jobs.js';
 import { StepChannelError } from './step-error.js';
-import { getPool } from '../db/pool.js';
 import type { Importance, LedgerStage } from '../domain/ledger.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { attachedDocumentsForJob, loadInstructionForJob } from '../governance/instructions.js';
@@ -106,7 +105,6 @@ import { createProduction, type ProductionDestination } from '../production/stor
 import { PRODUCTION_TOOLS_MISSING_REASON } from '../production/render-error.js';
 import { authorisedRecipients } from '../governance/typed-recipients.js';
 import { toOneLine } from '../util/bidi.js';
-import { withTransaction } from '../db/pool.js';
 import type { Runtime } from './runtime.js';
 import { localParts, localToInstant } from '../util/local-time.js';
 
@@ -456,7 +454,7 @@ interface LedgerEnv {
 async function ledgerEnv(ctx: LocalToolContext): Promise<LedgerEnv> {
   const db = ctx.db ?? getPool();
   await assertLedgerWriter(ctx.jobId, ctx.businessId, db);
-  const active = await loadActiveCharter(ctx.businessId, db);
+  const active = await withBusiness(ctx.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
   if (active === null) throw new Error(`runLocalTool: ledger tools need an active charter (${ctx.businessId})`);
   const settings = await loadLedgerSettings({ businessId: ctx.businessId, db });
   return { db, timeZone: active.charter.identity.timezone, dailyHour: settings.dailyHour, bundle: active.bundle };
@@ -791,7 +789,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     }
     const instruction = await loadInstructionForJob(ctx.jobId, { businessId: ctx.businessId, db });
     if (instruction === null) throw new Error(`runLocalTool: doc.produce found no instruction for ${ctx.jobId}`);
-    const active = await loadActiveCharter(ctx.businessId, db);
+    const active = await withBusiness(ctx.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error(`runLocalTool: doc.produce needs an active charter (${ctx.businessId})`);
 
     const notes: string[] = [];
@@ -979,7 +977,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     }
     const dbOpts = { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) };
 
-    const parentEnvelope = await loadEnvelopeForChildJob(ctx.jobId, dbOpts);
+    const parentEnvelope = await withBusiness(ctx.businessId, (bdb) => loadEnvelopeForChildJob(bdb, ctx.jobId)); // TENANCY-TODO(task 4)
 
     const result = await requestHelp({
       parentJobId: ctx.jobId,
@@ -1036,11 +1034,12 @@ const HANDLERS: Record<string, LocalHandler> = {
       // Scoped by `result.correlationId` (this delegation's own tree), not
       // just the child job id — `loadResultForChildJob`'s own docblock says
       // why that predicate has to be real rather than a comment.
-      const resultEnvelope = await loadResultForChildJob(
-        result.childJobId,
-        result.correlationId,
-        dbOpts,
-      );
+      const { childJobId: resultChildJobId, correlationId: resultCorrelationId } = result;
+      const resultEnvelope = await withBusiness(ctx.businessId, (bdb) => loadResultForChildJob( // TENANCY-TODO(task 4)
+        bdb,
+        resultChildJobId,
+        resultCorrelationId
+      ));
       if (resultEnvelope !== null) {
         // Fix round 3, item 1. `ResultEnvelopePayload` is the ONE schema
         // both `resumeDelegatedJobs` (the writer) and this handler (the
@@ -1181,7 +1180,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     const parsed = parseOrFail(AssertEvaluateInput, input, 'assert.evaluate');
     const dbOpts = { businessId: ctx.businessId, ...(ctx.db !== undefined ? { db: ctx.db } : {}) };
 
-    const delegation = await loadHelpRequestFromParentJob(ctx.jobId, dbOpts);
+    const delegation = await withBusiness(ctx.businessId, (bdb) => loadHelpRequestFromParentJob(bdb, ctx.jobId)); // TENANCY-TODO(task 4)
     if (delegation === null) {
       throw new StepChannelError(
         'verification_answer_missing',
@@ -1197,11 +1196,11 @@ const HANDLERS: Record<string, LocalHandler> = {
         false,
       );
     }
-    const resultEnvelope = await loadResultForChildJob(
+    const resultEnvelope = await withBusiness(ctx.businessId, (bdb) => loadResultForChildJob( // TENANCY-TODO(task 4)
+      bdb,
       childJobId,
-      delegation.envelope.correlationId,
-      dbOpts,
-    );
+      delegation.envelope.correlationId
+    ));
     if (resultEnvelope === null) {
       throw new StepChannelError(
         'verification_answer_missing',
@@ -1227,7 +1226,8 @@ const HANDLERS: Record<string, LocalHandler> = {
     if (payload.data.outcome !== 'succeeded') {
       // `DelegationOutcome` minus `succeeded` is exactly `NotJudgedReason` —
       // narrowed here, never cast.
-      await saveNotJudged(parsed.subjectJobId, payload.data.outcome, dbOpts);
+      const notJudged = payload.data.outcome;
+      await withBusiness(ctx.businessId, (bdb) => saveNotJudged(bdb, parsed.subjectJobId, notJudged)); // TENANCY-TODO(task 4)
       return { performed: true, status: 'not_judged', reason: payload.data.outcome };
     }
 
@@ -1261,7 +1261,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     // exactly this, and it is deliberately not one of the two that come from
     // `DelegationOutcome`: the delegation did not fail.
     if (record === null || record.content === null) {
-      await saveNotJudged(parsed.subjectJobId, 'unreadable', dbOpts);
+      await withBusiness(ctx.businessId, (bdb) => saveNotJudged(bdb, parsed.subjectJobId, 'unreadable')); // TENANCY-TODO(task 4)
       return { performed: true, status: 'not_judged', reason: 'unreadable' };
     }
 
@@ -1282,7 +1282,7 @@ const HANDLERS: Record<string, LocalHandler> = {
       // The envelope that caused THIS job to run, if any — passed straight
       // through, and only ever read by the delegating branch `answer`
       // being non-null means we cannot reach.
-      parentEnvelope: await loadEnvelopeForChildJob(ctx.jobId, dbOpts),
+      parentEnvelope: await withBusiness(ctx.businessId, (bdb) => loadEnvelopeForChildJob(bdb, ctx.jobId)), // TENANCY-TODO(task 4)
       businessId: ctx.businessId,
       // So `verifyDraft`'s own `saveVerdict` and this handler's land on the
       // SAME connection — see `VerifyDraftInput.db`.
@@ -1316,7 +1316,7 @@ const HANDLERS: Record<string, LocalHandler> = {
     // is threaded into `VerifyDraftInput.db` above — and `saveVerdict` is an
     // upsert on `(business_id, job_id)`, so the second write of the same
     // verdict is the same row.
-    await saveVerdict(parsed.subjectJobId, result, dbOpts);
+    await withBusiness(ctx.businessId, (bdb) => saveVerdict(bdb, parsed.subjectJobId, result)); // TENANCY-TODO(task 4)
     return { performed: true, status: 'judged' };
   },
 };

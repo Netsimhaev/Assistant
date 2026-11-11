@@ -1,13 +1,14 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { queryAudit, verifyChain } from '../audit/log.js';
 import { decide, getApproval, pendingApprovals } from '../governance/approvals.js';
 import { agreementFor } from '../governance/agreement.js';
 import { release, trip } from '../governance/killswitch.js';
-import { evaluateToolCall, type GateContext } from './engine.js';
+import { evaluateFor, type TestGateContext } from '../test/gate.js';
+import { evaluateToolCall } from './engine.js';
 import { refineActionClass } from './classify.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { BusinessCharter } from '../domain/charter.js';
@@ -17,6 +18,7 @@ import { createCredentialHandle } from '../orchestrator/adapters/types.js';
 import type { CredentialSource } from '../orchestrator/credentials.js';
 
 const BUSINESS = 'test-business';
+const OTHER = 'other-tenant';
 
 /**
  * A fixed clock, 12:00 in Asia/Jerusalem.
@@ -30,10 +32,10 @@ const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 async function install(overrides = {}): Promise<PolicyBundle> {
   const charter = buildCharter(overrides);
-  return installCharter(charter, { businessId: BUSINESS });
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, charter));
 }
 
-function ctx(bundle: PolicyBundle, over: Partial<GateContext> = {}): GateContext {
+function ctx(bundle: PolicyBundle, over: Partial<TestGateContext> = {}): TestGateContext {
   return {
     agent: 'comms.email',
     bundle,
@@ -50,7 +52,7 @@ function ctx(bundle: PolicyBundle, over: Partial<GateContext> = {}): GateContext
     ...over,
     // The spread of a Partial can reintroduce `undefined` for a required field
     // under exactOptionalPropertyTypes; the cast is confined to this helper.
-  } as GateContext;
+  } as TestGateContext;
 }
 
 beforeEach(async () => {
@@ -68,7 +70,7 @@ describe('exit criterion: policy denial', () => {
   it('denies a hard-forbidden action and leaves a citable audit entry', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'data.export',
       { counterpartyId: 'c_812', dataClasses: ['customer_pii'] },
       ctx(bundle, { agent: 'ops.systems' }),
@@ -80,10 +82,10 @@ describe('exit criterion: policy denial', () => {
     // would still pass if the kind prefix were doubled again.
     expect(decision.code).toBe('forbidden:no_customer_data_export');
 
-    const denials = await queryAudit(
-      { businessId: BUSINESS, kind: 'policy_denial' },
-      getPool(),
-    );
+    const denials = await withBusiness(BUSINESS, (bdb) => queryAudit(
+      bdb,
+      { kind: 'policy_denial' }
+    ));
     expect(denials).toHaveLength(1);
     expect(denials[0]?.reason).toContain('no_customer_data_export');
     expect(denials[0]?.charterVersion).toBe(bundle.charterVersion);
@@ -95,7 +97,7 @@ describe('exit criterion: policy denial', () => {
     // contract.sign is forbidden by the charter *and* owned by nobody. The
     // capability layer wins, which is the correct order: the cheapest and most
     // absolute control runs first.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'contract.sign',
       { counterpartyId: 'c_812' },
       ctx(bundle, { agent: 'ops.systems' }),
@@ -110,7 +112,7 @@ describe('exit criterion: policy denial', () => {
     const bundle = await install();
 
     // ops.web must never be able to send mail, whatever the prompt says.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'x@example.com' },
       ctx(bundle, { agent: 'ops.web' }),
@@ -126,7 +128,7 @@ describe('exit criterion: policy denial', () => {
     // A newer charter is signed and activated underneath the running agent.
     await install({ version: '2026-08-15.2' });
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'a@b.com', inReplyTo: 'm1' },
       ctx(stale),
@@ -140,7 +142,7 @@ describe('exit criterion: policy denial', () => {
   it('denies a money action over the per-class ceiling and names the limit', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'quote.issue',
       { counterpartyId: 'c_812', amountMinor: 936_000 }, // ₪9,360 vs ₪5,000 cap
       ctx(bundle, { agent: 'comms.email' }),
@@ -158,7 +160,7 @@ describe('exit criterion: policy denial', () => {
     // whole chain was dead. This test is what keeps it alive.
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'discount.grant',
       { counterpartyId: 'c_812', amountMinor: 10_000, discountPercent: 25 }, // cap is 10%
       ctx(bundle, { agent: 'comms.email' }),
@@ -175,7 +177,7 @@ describe('exit criterion: policy denial', () => {
     // must not be able to reach it.
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812' },
       ctx(bundle, { provenance: 'unknown_external' }),
@@ -189,7 +191,7 @@ describe('exit criterion: policy denial', () => {
   it('blocks a contact flagged doNotContact', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'x@y.com', inReplyTo: 'm1', counterpartyId: 'c_blocked' },
       ctx(bundle),
@@ -208,7 +210,7 @@ describe('exit criterion: approval', () => {
   it('queues an approval rather than blocking, and records intent before the decision', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       { supplierId: 'supplier_a', amountMinor: 210_000, sku: 'PRD-77', qty: 50 },
       ctx(bundle, { agent: 'ops.web' }),
@@ -218,13 +220,13 @@ describe('exit criterion: approval', () => {
     if (decision.outcome !== 'queue_approval') throw new Error('unreachable');
     expect(decision.code).toContain('queued_for_approval:');
 
-    const queued = await pendingApprovals({ businessId: BUSINESS });
+    const queued = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb));
     expect(queued).toHaveLength(1);
     expect(queued[0]?.actionClass).toBe('purchase.place');
 
     // Intent to act is written BEFORE the decision, so a crash between the two
     // is visible. Audit is newest-first, so the intent is the older entry.
-    const entries = await queryAudit({ businessId: BUSINESS }, getPool());
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb));
     const kinds = entries.map((e) => e.kind);
     expect(kinds).toContain('intent_to_act');
     expect(kinds).toContain('decision');
@@ -234,20 +236,20 @@ describe('exit criterion: approval', () => {
   it('binds the approval to the exact input that was shown (TOCTOU guard)', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       { supplierId: 'supplier_a', amountMinor: 210_000, qty: 50 },
       ctx(bundle, { agent: 'ops.web' }),
     );
     if (decision.outcome !== 'queue_approval') throw new Error('expected a queued approval');
 
-    const before = await getApproval(decision.approvalId, { businessId: BUSINESS });
-    const approved = await decide(
+    const before = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, decision.approvalId));
+    const approved = await withBusiness(BUSINESS, (bdb) => decide(
+      bdb,
       decision.approvalId,
       'approved',
-      { by: 'p_boss', channel: 'dashboard' },
-      { businessId: BUSINESS },
-    );
+      { by: 'p_boss', channel: 'dashboard' }
+    ));
 
     expect(approved.state).toBe('approved');
     // The hash the approval is bound to is the hash of what was proposed.
@@ -257,23 +259,23 @@ describe('exit criterion: approval', () => {
   it('re-binds to the edited input when the boss changes the action', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       { supplierId: 'supplier_a', amountMinor: 210_000, qty: 50 },
       ctx(bundle, { agent: 'ops.web' }),
     );
     if (decision.outcome !== 'queue_approval') throw new Error('expected a queued approval');
 
-    const edited = await decide(
+    const edited = await withBusiness(BUSINESS, (bdb) => decide(
+      bdb,
       decision.approvalId,
       'approved',
       {
         by: 'p_boss',
         channel: 'whatsapp',
         editedInput: { supplierId: 'supplier_a', amountMinor: 168_000, qty: 40 },
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
     expect(edited.state).toBe('approved_with_edit');
     expect(edited.editedInput).toMatchObject({ qty: 40 });
@@ -298,10 +300,11 @@ describe('exit criterion: approval', () => {
   it('does not call an unchanged payload an edit, however its keys are ordered', async () => {
     const bundle = await install();
     const original = { supplierId: 'supplier_a', amountMinor: 210_000, qty: 50 };
-    const decision = await evaluateToolCall('browser.submit_order', original, ctx(bundle, { agent: 'ops.web' }));
+    const decision = await evaluateFor('browser.submit_order', original, ctx(bundle, { agent: 'ops.web' }));
     if (decision.outcome !== 'queue_approval') throw new Error('expected a queued approval');
 
-    const unchanged = await decide(
+    const unchanged = await withBusiness(BUSINESS, (bdb) => decide(
+      bdb,
       decision.approvalId,
       'approved',
       {
@@ -309,9 +312,8 @@ describe('exit criterion: approval', () => {
         channel: 'dashboard',
         // Same facts, different key order — what a textarea round-trip yields.
         editedInput: { qty: 50, amountMinor: 210_000, supplierId: 'supplier_a' },
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
     expect(unchanged.state).toBe('approved');
     // Nothing is stored as an edit either, so `execute.ts`'s substitution
@@ -321,7 +323,7 @@ describe('exit criterion: approval', () => {
     // And the agreement rate this would otherwise have dented keeps counting.
     // `agreementFor` only counts mailbox reply jobs, so the gate's job is
     // linked to a stored mail the way a real reply job is.
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO mail_messages
          (mail_id, business_id, provider_message_id, thread_id, from_address, subject,
           received_at, body_text, state, reply_job_id)
@@ -330,23 +332,23 @@ describe('exit criterion: approval', () => {
       [BUSINESS],
     );
     expect(
-      await agreementFor('purchase.place', { businessId: BUSINESS, since: null }),
+      await withBusiness(BUSINESS, (bdb) => agreementFor(bdb, 'purchase.place', { since: null })),
     ).toEqual({ right: 1, counted: 1, topWrongReason: null });
   });
 
   it('refuses to decide the same approval twice', async () => {
     const bundle = await install();
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       { supplierId: 'supplier_a', amountMinor: 210_000 },
       ctx(bundle, { agent: 'ops.web' }),
     );
     if (decision.outcome !== 'queue_approval') throw new Error('expected a queued approval');
 
-    await decide(decision.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => decide(bdb, decision.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 
     await expect(
-      decide(decision.approvalId, 'denied', { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => decide(bdb, decision.approvalId, 'denied', { by: 'p_boss', channel: 'dashboard' })),
     ).rejects.toThrow(/already approved/);
   });
 
@@ -357,7 +359,7 @@ describe('exit criterion: approval', () => {
       autonomyBase: { 'refund.issue': 'auto' },
     });
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'refund.issue',
       { counterpartyId: 'c_812', amountMinor: 5_000 },
       ctx(bundle, { agent: 'ops.systems' }),
@@ -402,7 +404,7 @@ describe('approval notification', () => {
     const bundle = await install();
     const { notifier, calls } = recordingNotifier();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       SUBMIT_ORDER_INPUT,
       ctx(bundle, {
@@ -426,7 +428,7 @@ describe('approval notification', () => {
     const bundle = await install();
     const notifier = throwingNotifier('smtp connection refused');
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       SUBMIT_ORDER_INPUT,
       ctx(bundle, {
@@ -438,13 +440,13 @@ describe('approval notification', () => {
     expect(decision.outcome).toBe('queue_approval');
     if (decision.outcome !== 'queue_approval') throw new Error('unreachable');
 
-    const stored = await getApproval(decision.approvalId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, decision.approvalId));
     expect(stored).not.toBeNull();
     expect(stored?.state).toBe('pending');
 
     // The failure is not silent either — it lands in the audit log as an
     // incident, distinct from the `decision` entry that queued the approval.
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'incident' }, getPool());
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'incident' }));
     expect(entries).toHaveLength(1);
     expect(entries[0]?.reason).toContain(`approval_notify_failed:${decision.approvalId}`);
     expect(entries[0]?.reason).toContain('smtp connection refused');
@@ -453,11 +455,11 @@ describe('approval notification', () => {
   it('does nothing extra when no notifier is configured — the state the system is in today', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall('browser.submit_order', SUBMIT_ORDER_INPUT, ctx(bundle, { agent: 'ops.web' }));
+    const decision = await evaluateFor('browser.submit_order', SUBMIT_ORDER_INPUT, ctx(bundle, { agent: 'ops.web' }));
 
     expect(decision.outcome).toBe('queue_approval');
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'incident' }, getPool());
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'incident' }));
     expect(entries).toHaveLength(0);
   });
 
@@ -491,7 +493,7 @@ describe('approval notification', () => {
     });
 
     const started = Date.now();
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       SUBMIT_ORDER_INPUT,
       ctx(bundle, {
@@ -507,10 +509,10 @@ describe('approval notification', () => {
     // to prove the gate is bounded, not pin the exact number.
     expect(elapsedMs).toBeLessThan(9_000);
 
-    const stored = await getApproval(decision.approvalId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, decision.approvalId));
     expect(stored?.state).toBe('pending');
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'incident' }, getPool());
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'incident' }));
     expect(entries).toHaveLength(1);
     expect(entries[0]?.reason).toContain(`approval_notify_failed:${decision.approvalId}`);
   }, 15_000);
@@ -528,7 +530,7 @@ describe('approval notification', () => {
       },
     };
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       SUBMIT_ORDER_INPUT,
       ctx(bundle, {
@@ -540,10 +542,10 @@ describe('approval notification', () => {
     expect(decision.outcome).toBe('queue_approval');
     if (decision.outcome !== 'queue_approval') throw new Error('unreachable');
 
-    const stored = await getApproval(decision.approvalId, { businessId: BUSINESS });
+    const stored = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, decision.approvalId));
     expect(stored?.state).toBe('pending');
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'incident' }, getPool());
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'incident' }));
     expect(entries).toHaveLength(1);
     expect(entries[0]?.reason).toContain(`approval_notify_failed:${decision.approvalId}`);
     expect(entries[0]?.reason).toContain('mailbox full');
@@ -556,12 +558,9 @@ describe('approval notification', () => {
 describe('exit criterion: kill switch', () => {
   it('stops everything at scope "all" and records who stopped it and why', async () => {
     const bundle = await install();
-    await trip('all', 'p_boss', 'חשד לפעולה שגויה', {
-      businessId: BUSINESS,
-      charterVersion: bundle.charterVersion,
-    });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', 'p_boss', 'חשד לפעולה שגויה', { charterVersion: bundle.charterVersion }));
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'memory.recall',
       {},
       ctx(bundle, { agent: 'know.reader' }),
@@ -571,10 +570,10 @@ describe('exit criterion: kill switch', () => {
     if (decision.outcome !== 'deny') throw new Error('unreachable');
     expect(decision.code).toBe('kill_switch_active');
 
-    const entries = await queryAudit(
-      { businessId: BUSINESS, kind: 'kill_switch' },
-      getPool(),
-    );
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(
+      bdb,
+      { kind: 'kill_switch' }
+    ));
     expect(entries).toHaveLength(1);
     expect(entries[0]?.reason).toContain('TRIPPED');
     expect(entries[0]?.reason).toContain('p_boss');
@@ -582,12 +581,9 @@ describe('exit criterion: kill switch', () => {
 
   it('scope "outbound" stops sending but lets reading continue', async () => {
     const bundle = await install();
-    await trip('outbound', 'p_boss', 'עצירת יוצא זמנית', {
-      businessId: BUSINESS,
-      charterVersion: bundle.charterVersion,
-    });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'outbound', 'p_boss', 'עצירת יוצא זמנית', { charterVersion: bundle.charterVersion }));
 
-    const send = await evaluateToolCall(
+    const send = await evaluateFor(
       'mail.send',
       { to: 'a@b.com', inReplyTo: 'm1', counterpartyId: 'c_812' },
       ctx(bundle),
@@ -595,38 +591,55 @@ describe('exit criterion: kill switch', () => {
     expect(send.outcome).toBe('deny');
 
     // Analysis is deliberately unaffected — that is the point of this scope.
-    const read = await evaluateToolCall('memory.recall', {}, ctx(bundle, { agent: 'know.reader' }));
+    const read = await evaluateFor('memory.recall', {}, ctx(bundle, { agent: 'know.reader' }));
     expect(read.outcome).toBe('allow');
   });
 
   it('a department stop leaves other departments working', async () => {
     const bundle = await install();
-    await trip('operations', 'p_boss', 'תקלה בדפדפן', {
-      businessId: BUSINESS,
-      charterVersion: bundle.charterVersion,
-    });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'operations', 'p_boss', 'תקלה בדפדפן', { charterVersion: bundle.charterVersion }));
 
-    const web = await evaluateToolCall('browser.navigate', {}, ctx(bundle, { agent: 'ops.web' }));
+    const web = await evaluateFor('browser.navigate', {}, ctx(bundle, { agent: 'ops.web' }));
     expect(web.outcome).toBe('deny');
 
-    const reader = await evaluateToolCall('memory.recall', {}, ctx(bundle, { agent: 'know.reader' }));
+    const reader = await evaluateFor('memory.recall', {}, ctx(bundle, { agent: 'know.reader' }));
     expect(reader.outcome).toBe('allow');
   });
 
   it('survives a release and re-records the reason', async () => {
     const bundle = await install();
-    await trip('all', 'p_boss', 'stop', { businessId: BUSINESS, charterVersion: bundle.charterVersion });
-    await release('all', 'p_boss', 'נבדק ותוקן', {
-      businessId: BUSINESS,
-      charterVersion: bundle.charterVersion,
-    });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', 'p_boss', 'stop', { charterVersion: bundle.charterVersion }));
+    await withBusiness(BUSINESS, (bdb) => release(bdb, 'all', 'p_boss', 'נבדק ותוקן', { charterVersion: bundle.charterVersion }));
 
-    const decision = await evaluateToolCall('memory.recall', {}, ctx(bundle, { agent: 'know.reader' }));
+    const decision = await evaluateFor('memory.recall', {}, ctx(bundle, { agent: 'know.reader' }));
     expect(decision.outcome).toBe('allow');
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' }, getPool());
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'kill_switch' }));
     expect(entries).toHaveLength(2);
     expect(entries[0]?.reason).toContain('RELEASED');
+  });
+});
+
+describe('the gate takes the business from ctx.db', () => {
+  it("one business's stop and audit rows never reach another business's gate", async () => {
+    const bundle = await install();
+    const otherBundle = await withBusiness(OTHER, (db) => installCharter(db, buildCharter({ version: 'other-v1' })));
+    await withBusiness(BUSINESS, (db) => trip(db, 'all', 'p_boss', 'stop one business', { charterVersion: bundle.charterVersion }));
+
+    const { businessId: _ignored, ...base } = ctx(bundle, { agent: 'know.reader' });
+    const stopped = await withBusiness(BUSINESS, (db) => evaluateToolCall('memory.recall', {}, { ...base, db }));
+    const free = await withBusiness(OTHER, (db) =>
+      evaluateToolCall('memory.recall', {}, { ...base, bundle: otherBundle, db }),
+    );
+    expect(stopped.outcome).toBe('deny');
+    expect(free.outcome).toBe('allow');
+
+    // A gated call writes its intent under the business of ctx.db.
+    await withBusiness(OTHER, (db) =>
+      evaluateToolCall('mail.send', { to: 'a@b.com', inReplyTo: 'm1' }, { ...base, bundle: otherBundle, agent: 'comms.email', db }),
+    );
+    expect(await withBusiness(OTHER, (db) => queryAudit(db, { kind: 'intent_to_act' }))).toHaveLength(1);
+    expect(await withBusiness(BUSINESS, (db) => queryAudit(db, { kind: 'intent_to_act' }))).toHaveLength(0);
   });
 });
 
@@ -637,22 +650,19 @@ describe('audit chain integrity', () => {
   it('stays intact across a full denial + approval + kill switch sequence', async () => {
     const bundle = await install();
 
-    await evaluateToolCall(
+    await evaluateFor(
       'data.export',
       { counterpartyId: 'c_812' },
       ctx(bundle, { agent: 'ops.systems' }),
     );
-    await evaluateToolCall(
+    await evaluateFor(
       'browser.submit_order',
       { supplierId: 'supplier_a', amountMinor: 210_000 },
       ctx(bundle, { agent: 'ops.web' }),
     );
-    await trip('all', 'p_boss', 'end of test', {
-      businessId: BUSINESS,
-      charterVersion: bundle.charterVersion,
-    });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', 'p_boss', 'end of test', { charterVersion: bundle.charterVersion }));
 
-    const verification = await verifyChain(BUSINESS, getPool());
+    const verification = await withBusiness(BUSINESS, (bdb) => verifyChain(bdb));
     expect(verification.intact).toBe(true);
     if (verification.intact) {
       expect(verification.entries).toBeGreaterThan(3);
@@ -661,14 +671,14 @@ describe('audit chain integrity', () => {
 
   it('rejects an UPDATE against the append-only trigger', async () => {
     const bundle = await install();
-    await evaluateToolCall(
+    await evaluateFor(
       'data.export',
       { counterpartyId: 'c_812' },
       ctx(bundle, { agent: 'ops.systems' }),
     );
 
     await expect(
-      getPool().query(`UPDATE audit_log SET reason = 'tampered' WHERE business_id = $1`, [
+      testDb().query(`UPDATE audit_log SET reason = 'tampered' WHERE business_id = $1`, [
         BUSINESS,
       ]),
     ).rejects.toThrow(/append-only/);
@@ -688,7 +698,7 @@ describe('regressions found in review', () => {
     // `amountMinor`, so `readAmountMinor` returns 0. The budget gate returned
     // early on exactly that and never reached the discount comparison — a 90%
     // discount passed a signed 10% cap with outcome `allow`.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'discount.grant',
       { counterpartyId: 'c_812', discountPercent: 90 },
       ctx(bundle),
@@ -704,7 +714,7 @@ describe('regressions found in review', () => {
 
     // supplier_a is approved up to ₪2,500 in the fixture. Nothing compared
     // that number to anything before this.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.submit_order',
       { supplierId: 'supplier_a', amountMinor: 260_000 },
       ctx(bundle, { agent: 'ops.web' }),
@@ -736,7 +746,7 @@ describe('regressions found in review', () => {
     // thing standing between this call and `allow` is the action class. Under
     // the old classifier it was `email.reply` (auto_notify) and the message
     // went out; it is `email.initiate` (approve_required) now.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'vip@example.com', counterpartyId: 'c_812', inReplyTo: null, body: 'שלום' },
       ctx(bundle),
@@ -751,7 +761,7 @@ describe('regressions found in review', () => {
     // The compiled entry used to be compared against `counterpartyId` alone,
     // so a domain block was a rule that existed in the signed document and
     // stopped nothing.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'Adv@Rival-Legal.co.il', inReplyTo: 'thread-1', body: 'שלום' },
       ctx(bundle),
@@ -761,10 +771,10 @@ describe('regressions found in review', () => {
     if (decision.outcome !== 'deny') throw new Error('unreachable');
     expect(decision.code).toBe('do_not_contact');
 
-    const denials = await queryAudit(
-      { businessId: BUSINESS, kind: 'policy_denial' },
-      getPool(),
-    );
+    const denials = await withBusiness(BUSINESS, (bdb) => queryAudit(
+      bdb,
+      { kind: 'policy_denial' }
+    ));
     expect(denials.some((e) => e.reason.includes('rival-legal.co.il'))).toBe(true);
   });
 
@@ -778,7 +788,7 @@ describe('regressions found in review', () => {
     // deliverable address. This is the regression test for that gap.
     const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'Dana Cohen <dana@rival-legal.co.il>', inReplyTo: 'thread-1', body: 'שלום' },
       ctx(bundle),
@@ -798,7 +808,7 @@ describe('regressions found in review', () => {
     // reader compares it.
     const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'dana@rival-legal.co.il.', inReplyTo: 'thread-1', body: 'שלום' },
       ctx(bundle),
@@ -815,7 +825,7 @@ describe('regressions found in review', () => {
     // equality) never blocked 'dana@mail.rival-legal.co.il'.
     const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'dana@mail.rival-legal.co.il', inReplyTo: 'thread-1', body: 'שלום' },
       ctx(bundle),
@@ -833,7 +843,7 @@ describe('regressions found in review', () => {
     // unrelated domains.
     const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'dana@evilrival-legal.co.il', inReplyTo: 'thread-1', body: 'שלום' },
       ctx(bundle),
@@ -852,7 +862,7 @@ describe('regressions found in review', () => {
     // sides now go through the same normaliseDomainString.
     const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il.' });
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'dana@rival-legal.co.il.', inReplyTo: 'thread-1', body: 'שלום' },
       ctx(bundle),
@@ -870,7 +880,7 @@ describe('regressions found in review', () => {
     // shape the single-dot fix closed, one character further out.
     const bundle = await install({ doNotContactEmailDomain: 'rival-legal.co.il' });
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'dana@rival-legal.co.il..', inReplyTo: 'thread-1', body: 'שלום' },
       ctx(bundle),
@@ -894,7 +904,7 @@ describe('regressions found in review', () => {
     // it would no longer distinguish resolved from unresolved here. Staff
     // is not on that exempt list, so the escalation this test targets still
     // fires.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'x@example.com', entityId: 'not_in_the_charter', inReplyTo: 't-9' },
       ctx(bundle, { provenance: 'staff' }),
@@ -906,7 +916,7 @@ describe('regressions found in review', () => {
   it('refuses to decide an approval whose fuse already burned out', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { to: 'new@example.com', body: 'פנייה ראשונה' },
       ctx(bundle),
@@ -916,19 +926,17 @@ describe('regressions found in review', () => {
 
     // Push the fuse into the past. `expireOverdue` has no caller yet, so the
     // row stays `pending` — which is exactly the state the bug lived in.
-    await getPool().query(
+    await testDb().query(
       `UPDATE approval_requests SET expires_at = now() - interval '3 days'
         WHERE approval_id = $1`,
       [decision.approvalId],
     );
 
     await expect(
-      decide(decision.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }, {
-        businessId: BUSINESS,
-      }),
+      withBusiness(BUSINESS, (bdb) => decide(bdb, decision.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' })),
     ).rejects.toThrow(/expired/);
 
-    const after = await getApproval(decision.approvalId, { businessId: BUSINESS });
+    const after = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, decision.approvalId));
     expect(after?.state).toBe('pending');
   });
 
@@ -938,13 +946,13 @@ describe('regressions found in review', () => {
     // The UPDATE matched no row and the audit entry was written anyway, so the
     // permanent trail gained a RELEASED event for something that never stopped.
     await expect(
-      release('all', 'p_boss', 'לא היה מה לשחרר', { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => release(bdb, 'all', 'p_boss', 'לא היה מה לשחרר')),
     ).rejects.toThrow(/not tripped/);
 
-    const entries = await queryAudit(
-      { businessId: BUSINESS, kind: 'kill_switch' },
-      getPool(),
-    );
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(
+      bdb,
+      { kind: 'kill_switch' }
+    ));
     expect(entries).toEqual([]);
   });
 
@@ -953,14 +961,12 @@ describe('regressions found in review', () => {
     // Same version string, different business — a global primary key on
     // `charter_version` rejected this outright, and the active-charter join
     // could hand one business the other's rules.
-    await installCharter(buildCharter({ dailyCeilingMinor: 50 }), {
-      businessId: 'other-business',
-    });
+    await withBusiness('other-business', (bdb) => installCharter(bdb, buildCharter({ dailyCeilingMinor: 50 })));
 
-    const mine = await loadActiveCharter(BUSINESS, getPool());
+    const mine = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     expect(mine?.bundle.ceilings.dailyMinor).toBe(bundle.ceilings.dailyMinor);
 
-    const theirs = await loadActiveCharter('other-business', getPool());
+    const theirs = await withBusiness('other-business', (bdb) => loadActiveCharter(bdb));
     expect(theirs?.bundle.ceilings.dailyMinor).toBe(50);
   });
 });
@@ -989,11 +995,11 @@ describe('installCharter validates at write time', () => {
       ],
     };
 
-    await expect(installCharter(broken, { businessId: BUSINESS })).rejects.toThrow();
+    await expect(withBusiness(BUSINESS, (bdb) => installCharter(bdb, broken))).rejects.toThrow();
 
     // Nothing was written: the next read finds no active charter rather than
     // throwing when it tries to parse a row that was never valid.
-    const loaded = await loadActiveCharter(BUSINESS, getPool());
+    const loaded = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb));
     expect(loaded).toBeNull();
   });
 });
@@ -1012,7 +1018,7 @@ describe('loadActiveCharter refuses a stale schema version legibly', () => {
     const charter = buildCharter();
     const stale = { ...charter, schemaVersion: '1.0' };
 
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO charter_versions (
          charter_version, business_id, effective_from, supersedes,
          charter, policy_bundle, content_hash,
@@ -1031,7 +1037,7 @@ describe('loadActiveCharter refuses a stale schema version legibly', () => {
         stale.signature.method,
       ],
     );
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO charter_active (business_id, charter_version, activated_at)
        VALUES ($1, $2, now())
        ON CONFLICT (business_id)
@@ -1043,7 +1049,7 @@ describe('loadActiveCharter refuses a stale schema version legibly', () => {
     // Asserts on the remedy text, not on "schemaVersion" — that word also
     // appears in zod's own serialized issue path, so a bare /schemaVersion/
     // match would pass equally against the raw ZodError this guard replaced.
-    await expect(loadActiveCharter(BUSINESS, getPool())).rejects.toThrow(
+    await expect(withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb))).rejects.toThrow(
       /must be re-signed/,
     );
   });
@@ -1060,7 +1066,7 @@ describe('browser gate', () => {
 
     // The point of classifying these was never to make ordinary browsing
     // painful. A boss-initiated session still clicks freely.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.click',
       { selector: '#next-page' },
       ctx(bundle, { agent: 'ops.web', provenance: 'boss' }),
@@ -1075,7 +1081,7 @@ describe('browser gate', () => {
     // This is the hijack. Once the chain's provenance is open_web, the
     // provenance ceiling caps it at draft_only — a ceiling that existed all
     // along and that click/fill were skipping past.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.click',
       { selector: '#place-order' },
       ctx(bundle, { agent: 'ops.web', provenance: 'open_web' }),
@@ -1093,7 +1099,7 @@ describe('browser gate', () => {
     // the page is written by whoever controls the site, so matching a label
     // would be reading the attacker's own input as policy. supplier_a is
     // approved to ₪2,500 and this is ₪2,600.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.click',
       { selector: '#confirm', supplierId: 'supplier_a', amountMinor: 260_000 },
       ctx(bundle, { agent: 'ops.web' }),
@@ -1107,7 +1113,7 @@ describe('browser gate', () => {
   it('requires approval before an agent is handed a live session', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'credential.request_session',
       { host: 'supplier-a.co.il' },
       ctx(bundle, { agent: 'ops.web' }),
@@ -1118,12 +1124,9 @@ describe('browser gate', () => {
 
   it('an outbound stop reaches clicks, not just sends', async () => {
     const bundle = await install();
-    await trip('outbound', 'p_boss', 'עצירת יוצא', {
-      businessId: BUSINESS,
-      charterVersion: bundle.charterVersion,
-    });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'outbound', 'p_boss', 'עצירת יוצא', { charterVersion: bundle.charterVersion }));
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'browser.click',
       { selector: '#anything' },
       ctx(bundle, { agent: 'ops.web' }),
@@ -1133,10 +1136,7 @@ describe('browser gate', () => {
     if (decision.outcome !== 'deny') throw new Error('unreachable');
     expect(decision.code).toBe('kill_switch_active');
 
-    await release('outbound', 'p_boss', 'סוף מבחן', {
-      businessId: BUSINESS,
-      charterVersion: bundle.charterVersion,
-    });
+    await withBusiness(BUSINESS, (bdb) => release(bdb, 'outbound', 'p_boss', 'סוף מבחן', { charterVersion: bundle.charterVersion }));
   });
 });
 
@@ -1153,7 +1153,7 @@ describe('delegation graph', () => {
     // ever runs — a pass for the wrong reason. `gov.verify` holds the tool and
     // its graph entry is `['know.reader']` only, so `comms.email` is outside
     // it and the refusal must come from the delegation check itself.
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'agent.request_help',
       { to: 'comms.email', intent: 'x', payload: {} },
       ctx(bundle, { agent: 'gov.verify' }),
@@ -1167,7 +1167,7 @@ describe('delegation graph', () => {
   it('allows a delegation the graph permits', async () => {
     const bundle = await install();
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'agent.request_help',
       { to: 'know.reader', intent: 'x', payload: {} },
       ctx(bundle, { agent: 'gov.verify' }),
@@ -1186,7 +1186,7 @@ describe('delegation graph', () => {
     // permitted"; only `reason` differs, so that is what proves this guard
     // (engine.ts's unreadable-`to` check) actually ran rather than the graph
     // check underneath it catching both by coincidence.
-    const missing = await evaluateToolCall(
+    const missing = await evaluateFor(
       'agent.request_help',
       { intent: 'x' },
       ctx(bundle, { agent: 'gov.verify' }),
@@ -1199,7 +1199,7 @@ describe('delegation graph', () => {
     // A value that isn't even a string is not a value we failed to read as a
     // string — it's read fine and it isn't one. Same code either way: a value
     // we cannot read as a permitted recipient is never a permitting value.
-    const wrongType = await evaluateToolCall(
+    const wrongType = await evaluateFor(
       'agent.request_help',
       { to: 123, intent: 'x' },
       ctx(bundle, { agent: 'gov.verify' }),

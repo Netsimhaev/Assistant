@@ -1,7 +1,6 @@
-import { config } from '../config.js';
 import { BusinessCharter, CURRENT_SCHEMA_VERSION } from '../domain/charter.js';
 import { PolicyBundle } from '../domain/policy.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { compileCharter } from './compile.js';
 import { verifyCharterSignature } from './sign.js';
 
@@ -34,18 +33,15 @@ function compareSchemaVersions(a: string, b: string): number | null {
  * leave the gate unable to load policy — and the gate refuses to run without it.
  */
 export async function installCharter(
+  /**
+   * Joins `db`'s transaction when it is in one, instead of opening one. For a
+   * caller that must commit the install together with something else — the
+   * dashboard's mailbox amendment writes its `charter_change` audit row in the
+   * same transaction, so a failed append rolls the install back.
+   */
+  db: BusinessDb,
   charter: BusinessCharter,
-  options: {
-    businessId?: string;
-    activate?: boolean;
-    /**
-     * Join a caller's open transaction instead of opening one. For a caller
-     * that must commit the install together with something else — the
-     * dashboard's mailbox amendment writes its `charter_change` audit row in
-     * the same transaction, so a failed append rolls the install back.
-     */
-    tx?: Queryable;
-  } = {},
+  options: { activate?: boolean } = {},
 ): Promise<PolicyBundle> {
   // The argument is typed as `BusinessCharter`, but a caller can construct one
   // without going through `.parse()` — an object literal, a value round-tripped
@@ -53,7 +49,7 @@ export async function installCharter(
   // installs and activates, and the failure surfaces on the *next read*
   // instead of at install time. Parsing throws before anything is written.
   const parsed = BusinessCharter.parse(charter);
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const activate = options.activate ?? true;
 
   const signature = verifyCharterSignature(parsed);
@@ -63,7 +59,7 @@ export async function installCharter(
 
   const bundle = compileCharter(parsed);
 
-  const write = async (tx: Queryable): Promise<void> => {
+  const write = async (tx: BusinessDb): Promise<void> => {
     await tx.query(
       `INSERT INTO charter_versions (
          charter_version, business_id, effective_from, supersedes,
@@ -96,8 +92,7 @@ export async function installCharter(
     }
   };
 
-  if (options.tx !== undefined) await write(options.tx);
-  else await withTransaction(write);
+  await transaction(db, write);
 
   return bundle;
 }
@@ -113,10 +108,8 @@ export interface ActiveCharter {
  * Returns null when no charter is installed. The gate treats that as fatal
  * rather than permissive: an agent must not run against an absent policy.
  */
-export async function loadActiveCharter(
-  businessId: string = config.businessId,
-  db: Queryable = getPool(),
-): Promise<ActiveCharter | null> {
+export async function loadActiveCharter(db: BusinessDb): Promise<ActiveCharter | null> {
+  const businessId = db.businessId;
   const { rows } = await db.query<CharterRow>(
     // The join carries business_id as well as the version. Without it, two
     // businesses that both call their first charter "v1" resolve to whichever
@@ -204,12 +197,9 @@ export type ActiveCharterProbe =
  * versus "roll the code forward"), and flattening that to an enum would throw
  * away the half that says which way to move.
  */
-export async function probeActiveCharter(
-  businessId: string = config.businessId,
-  db: Queryable = getPool(),
-): Promise<ActiveCharterProbe> {
+export async function probeActiveCharter(db: BusinessDb): Promise<ActiveCharterProbe> {
   try {
-    return { ok: true, active: await loadActiveCharter(businessId, db) };
+    return { ok: true, active: await loadActiveCharter(db) };
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }
@@ -224,10 +214,10 @@ export async function probeActiveCharter(
  * active charter.
  */
 export async function loadCharterVersion(
+  db: BusinessDb,
   charterVersion: string,
-  businessId: string = config.businessId,
-  db: Queryable = getPool(),
 ): Promise<BusinessCharter | null> {
+  const businessId = db.businessId;
   const { rows } = await db.query<{ charter: unknown }>(
     'SELECT charter FROM charter_versions WHERE business_id = $1 AND charter_version = $2',
     [businessId, charterVersion],
@@ -243,10 +233,8 @@ export async function loadCharterVersion(
  * policy change must not retroactively authorise an action, and an agent
  * carrying yesterday's rules must not act on today's business.
  */
-export async function activeCharterVersion(
-  businessId: string = config.businessId,
-  db: Queryable = getPool(),
-): Promise<string | null> {
+export async function activeCharterVersion(db: BusinessDb): Promise<string | null> {
+  const businessId = db.businessId;
   const { rows } = await db.query<{ charter_version: string }>(
     'SELECT charter_version FROM charter_active WHERE business_id = $1',
     [businessId],

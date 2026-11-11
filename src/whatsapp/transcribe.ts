@@ -86,8 +86,7 @@
  * was — before anything downstream (the paid provider call, holding the
  * buffer any longer than necessary) happens.
  */
-import type { Queryable } from '../db/pool.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -390,7 +389,8 @@ async function recordAttempt(
   counts: { succeeded: boolean; seconds: number; textLength: number },
 ): Promise<void> {
   try {
-    await appendAudit(
+    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+      bdb,
       {
         actor: 'orchestrator',
         kind: 'whatsapp_transcription',
@@ -403,9 +403,8 @@ async function recordAttempt(
         reason: counts.succeeded
           ? `תמלול הודעת וואטסאפ · ${SENDER_LABEL[senderKind]} · הצליח · ${counts.seconds} שניות · ${counts.textLength} תווים`
           : `תמלול הודעת וואטסאפ · ${SENDER_LABEL[senderKind]} · נכשל · ${counts.seconds} שניות`,
-      },
-      { businessId },
-    );
+      }
+    ));
   } catch {
     // Swallowed on purpose — see the docblock above.
   }

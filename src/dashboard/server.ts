@@ -17,7 +17,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { ApprovalNotDecidableError, getApproval, pendingApprovals } from '../governance/approvals.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
 import { DocumentAlreadySignedError, loadSignature } from '../governance/signatures.js';
@@ -608,7 +608,7 @@ async function handlePendingList(
   modeFailed = false,
 ): Promise<void> {
   const [approvals, remaining] = await Promise.all([
-    pendingApprovals({ businessId }),
+    withBusiness(businessId, (bdb) => pendingApprovals(bdb)), // TENANCY-TODO(task 10)
     remainingCodes(session.username, { businessId }),
   ]);
   sendHtml(
@@ -707,7 +707,7 @@ async function handleMemory(res: ServerResponse, businessId: string, session: Se
 async function handleConnections(res: ServerResponse, businessId: string, session: Session): Promise<void> {
   let charterStatus: CharterReadStatus;
   let connections: CharterConnection[];
-  const probe = await probeActiveCharter(businessId);
+  const probe = await withBusiness(businessId, (bdb) => probeActiveCharter(bdb)); // TENANCY-TODO(task 10)
   if (!probe.ok) {
     console.error('connections screen: could not read the active charter:', probe.reason);
     charterStatus = 'unreadable';
@@ -828,7 +828,7 @@ async function handleDigestGet(
   let active: ActiveCharter | null;
   let liveUnavailable: string | undefined;
   try {
-    active = await loadActiveCharter(businessId);
+    active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
     if (active === null) liveUnavailable = CHARTER_NONE_TEXT;
   } catch (err) {
     active = null;
@@ -1568,7 +1568,7 @@ async function handleInstructAnswer(
   // unclaimed, and nothing is parsed together with the parked half.
   const calendar = doorOptions.calendar === undefined ? undefined : await doorOptions.calendar();
   if (calendar !== undefined) {
-    const active = await loadActiveCharter(businessId);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
     if (active !== null) {
       const schedule = await answerScheduleQuery({
         text: form.get('answer') ?? '',
@@ -2021,7 +2021,7 @@ async function sendErasureEntry(
       csrf: issueCsrfToken(session.sessionId),
       anchorLabel: '',
       plan: null,
-      kept: await listKept({ businessId }),
+      kept: await withBusiness(businessId, (bdb) => listKept(bdb)), // TENANCY-TODO(task 10)
       ...(overrides.error === undefined ? {} : { error: overrides.error }),
       ...(overrides.prefill === undefined ? {} : { prefill: overrides.prefill }),
     }),
@@ -2064,7 +2064,7 @@ async function sendErasurePreview(
  */
 async function charterTimeZone(businessId: string): Promise<string | null> {
   try {
-    return (await loadActiveCharter(businessId))?.charter.identity.timezone ?? null;
+    return (await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)))?.charter.identity.timezone ?? null; // TENANCY-TODO(task 10)
   } catch {
     return null;
   }
@@ -2268,10 +2268,10 @@ async function handleEraseKeep(
     return sendErasureEntry(res, businessId, session, 400, { error: KEEP_UNREADABLE });
 
   if (form.get('revoke') === '1') {
-    await revokeKeep(kind, itemId, { businessId });
+    await withBusiness(businessId, (bdb) => revokeKeep(bdb, kind, itemId)); // TENANCY-TODO(task 10)
   } else {
     const note = noteFrom(form);
-    await keepItem({ kind, itemId, ...(note === undefined ? {} : { note }) }, { businessId });
+    await withBusiness(businessId, (bdb) => keepItem(bdb, { kind, itemId, ...(note === undefined ? {} : { note }) })); // TENANCY-TODO(task 10)
   }
 
   const anchor = anchorFromJson(form.get('anchor'));
@@ -2284,7 +2284,7 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
   // Scoped by businessId in the same query that loads the row — an approval
   // belonging to another business must not be distinguishable from one that
   // does not exist at all, so both come back 404, never 403.
-  const approval = await getApproval(approvalId, { businessId });
+  const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
   if (!approval) return sendHtml(res, 404, renderNotFound());
   // `null` (no document behind this approval) is the ordinary case — most
   // approvals never had a document. When one does resolve, the card shows it
@@ -2316,7 +2316,8 @@ async function handleCard(res: ServerResponse, businessId: string, session: Sess
   let verdictUnreadable = false;
   if (approval.jobId !== null) {
     try {
-      const outcome = await loadVerificationOutcome(approval.jobId, { businessId });
+      const approvalJobId = approval.jobId;
+      const outcome = await withBusiness(businessId, (bdb) => loadVerificationOutcome(bdb, approvalJobId)); // TENANCY-TODO(task 10)
       if (outcome !== null) {
         if (outcome.status === 'judged') {
           verdict = outcome.verdict;
@@ -2508,7 +2509,7 @@ async function handleDecision(
     // has to be given up here. The card still needs a live CSRF token and
     // a session, exactly as the plain approve/deny path does; nothing about
     // this error path skips either check.
-    const approval = await getApproval(approvalId, { businessId });
+    const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
     if (!approval) return sendHtml(res, 404, renderNotFound());
     return sendHtml(
       res,
@@ -2525,7 +2526,7 @@ async function handleDecision(
     return sendHtml(res, 403, renderForbidden());
   }
 
-  const approval = await getApproval(approvalId, { businessId });
+  const approval = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 10)
   if (!approval) return sendHtml(res, 404, renderNotFound());
 
   const note = noteFrom(form);
@@ -2667,7 +2668,8 @@ async function handleDecision(
     // reason in the repo carries attacker-influenced free text.
     let decided: ApprovalRequest;
     try {
-      decided = await decideAndSign(
+      decided = await withBusiness(businessId, (bdb) => decideAndSign( // TENANCY-TODO(task 10)
+        bdb,
         {
           approvalId,
           decision: {
@@ -2696,12 +2698,11 @@ async function handleDecision(
             }),
             reason: `signature:${document.documentId} by ${session.username} for approval ${approvalId}`,
           },
-        },
-        { businessId },
-      );
+        }
+      ));
     } catch (err) {
       if (err instanceof DocumentAlreadySignedError) {
-        const existing = await loadSignature(document.documentId, { businessId });
+        const existing = await withBusiness(businessId, (bdb) => loadSignature(bdb, document.documentId)); // TENANCY-TODO(task 10)
         return sendHtml(
           res,
           400,
@@ -2851,7 +2852,7 @@ async function renderAutonomyScreen(
   error?: string,
   settings?: ActionUpdateSettings,
 ): Promise<void> {
-  const mode = await loadAutonomyMode({ businessId });
+  const mode = await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb)); // TENANCY-TODO(task 10)
   const shown = settings ?? (await loadActionUpdateSettings({ businessId }));
   sendHtml(
     res,
@@ -2885,7 +2886,7 @@ async function handleAutonomyModePost(
     return renderAutonomyScreen(res, businessId, session, 400, 'יש לבחור אחת משלוש האפשרויות.');
   }
 
-  await setAutonomyMode(parsed.data, session.username, { businessId });
+  await withBusiness(businessId, (bdb) => setAutonomyMode(bdb, parsed.data, session.username)); // TENANCY-TODO(task 10)
   redirect(res, '/autonomy');
 }
 
@@ -2977,10 +2978,10 @@ async function handleAutonomousActionMark(
     return sendHtml(res, 400, renderAutonomousActions(actions, issueCsrfToken(session.sessionId), message));
   }
 
-  await recordCorrection(
-    { jobId, stepId, actionClass: action.actionClass, note, by: session.username },
-    { businessId },
-  );
+  await withBusiness(businessId, (bdb) => recordCorrection( // TENANCY-TODO(task 10)
+    bdb,
+    { jobId, stepId, actionClass: action.actionClass, note, by: session.username }
+  ));
   redirect(res, '/autonomy/actions');
 }
 
@@ -3057,7 +3058,7 @@ async function route(
   // it (spec §6.1). Absence is read from the pointer column, never by parsing
   // — a charter that exists but does not parse is NOT absent, and is reached
   // through the banner that leads to "edit the rules" instead.
-  if (!pathname.startsWith('/setup') && (await activeCharterVersion(businessId)) === null) {
+  if (!pathname.startsWith('/setup') && (await withBusiness(businessId, (bdb) => activeCharterVersion(bdb))) === null) { // TENANCY-TODO(task 10)
     return seeOther(res, '/setup');
   }
 

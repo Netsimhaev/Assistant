@@ -22,7 +22,7 @@ import { HOLD_TITLE_PREFIX } from '../calendar/calendar.js';
 import { resolveCalendarAccess, type CalendarAccess } from '../calendar/client-for.js';
 import { isCalendarFailure, type CalendarClient, type CalendarFailure } from '../calendar/types.js';
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import type { Runtime } from '../orchestrator/runtime.js';
 import { stripBidiControls, toOneLine } from '../util/bidi.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -68,7 +68,8 @@ async function auditHold(o: {
   // Calendar, times and the event kind only: never the client's name. The kind
   // is 'tool_call' because `AuditKind` is a closed enum and a new kind would
   // change the audit schema for one feature; `reason` carries the distinction.
-  await appendAudit(
+  await withBusiness(o.businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+    bdb,
     {
       jobId: o.jobId,
       actor: 'sched.meetings',
@@ -85,9 +86,8 @@ async function auditHold(o: {
       artifacts: [],
       costMinor: null,
       tokens: null,
-    },
-    { businessId: o.businessId },
-  );
+    }
+  ));
 }
 
 export async function createHold(o: {

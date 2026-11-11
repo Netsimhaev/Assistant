@@ -3,7 +3,7 @@
  * assistant about, and the daily count is kept apart from document curation.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { settleMail } from '../mail/inbox-store.js';
 import { createJob } from '../orchestrator/jobs.js';
@@ -53,7 +53,8 @@ async function seedMailJob(): Promise<string> {
 
 async function seedCurationRows(n: number, reason: string): Promise<void> {
   for (let i = 0; i < n; i += 1) {
-    await appendAudit(
+    await withBusiness(BUSINESS, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+      bdb,
       {
         actor: 'orchestrator',
         kind: 'curation',
@@ -64,9 +65,8 @@ async function seedCurationRows(n: number, reason: string): Promise<void> {
         costMinor: null,
         tokens: null,
         reason,
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
   }
 }
 

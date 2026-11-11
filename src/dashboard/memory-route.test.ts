@@ -16,7 +16,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -74,9 +74,7 @@ async function loginWithPassword(baseUrl: string): Promise<string> {
 
 /** A job at a given trust level, so `writeMemory` can stamp its provenance. */
 async function jobWithProvenance(provenance: 'boss' | 'unknown_external'): Promise<{ jobId: string }> {
-  const bundle = await installCharter(buildCharter({ version: `memory-screen-${provenance}` }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `memory-screen-${provenance}` }))); // TENANCY-TODO(task 10)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance,

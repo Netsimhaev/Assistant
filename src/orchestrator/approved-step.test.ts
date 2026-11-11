@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -22,7 +22,7 @@ const BUSINESS = 'test-business';
 const NOON = new Date('2026-08-18T09:00:00.000Z');
 
 async function install(overrides = {}): Promise<PolicyBundle> {
-  return installCharter(buildCharter(overrides), { businessId: BUSINESS });
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter(overrides))); // TENANCY-TODO(task 4)
 }
 
 async function jobInExecute(bundle: PolicyBundle): Promise<Job> {
@@ -220,12 +220,12 @@ describe('a step resumed from an approval', () => {
 
     expect(outcome.status).toBe('awaiting_approval');
     if (outcome.status !== 'awaiting_approval') return;
-    const queued = await getApproval(outcome.approvalId, { businessId: BUSINESS });
+    const queued = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, outcome.approvalId)); // TENANCY-TODO(task 4)
     expect(queued?.jobId).toBe(mine.jobId);
     expect((queued?.proposedInput as { body: string }).body).toBe('נוסח מקורי');
 
     // And the foreign approval is still unspent — this step never touched it.
-    const foreign = await getApproval(foreignApprovalId, { businessId: BUSINESS });
+    const foreign = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, foreignApprovalId)); // TENANCY-TODO(task 4)
     expect(foreign?.state).toBe('approved_with_edit');
   });
 });

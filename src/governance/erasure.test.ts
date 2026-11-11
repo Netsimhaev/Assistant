@@ -3,7 +3,7 @@ import { access, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -21,9 +21,7 @@ const RONIT = 'ronit@beta-log.example';
 const SIGNED_SECRET = 'zz-signed-approval-content';
 
 async function seed(): Promise<{ jobId: string }> {
-  const bundle = await installCharter(buildCharter({ version: 'erase-exec' }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'erase-exec' }))); // TENANCY-TODO(task 6)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -44,9 +42,7 @@ async function seed(): Promise<{ jobId: string }> {
 
 /** A bare job, a fresh charter, nothing else attached. */
 async function bareJob(title: string): Promise<string> {
-  const bundle = await installCharter(buildCharter({ version: `er-x-${ulid()}` }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `er-x-${ulid()}` }))); // TENANCY-TODO(task 6)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -312,16 +308,16 @@ describe('executeErasure', () => {
 
     const documentId = `DOC-${ulid()}`;
     await insertDocument(documentId, `nowhere/${documentId}.txt`);
-    await recordSignature(
+    await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+      bdb,
       {
         signatureId: `SIG-${ulid()}`,
         documentId,
         signedSha256: 'c'.repeat(64),
         approvalId: `AP-${ulid()}`,
         signedBy: 'owner',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
     const plan: ErasurePlan = {
       anchor: { kind: 'document', documentId },
@@ -429,16 +425,16 @@ describe('executeErasure', () => {
     );
     const otherDocument = `DOC-${ulid()}`;
     await insertDocument(otherDocument, `nowhere/${otherDocument}.txt`, 'b'.repeat(64));
-    await recordSignature(
+    await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+      bdb,
       {
         signatureId: `SIG-${ulid()}`,
         documentId: otherDocument,
         signedSha256: 'e'.repeat(64),
         approvalId: signedApproval,
         signedBy: 'owner',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
     await getPool().query(
       `INSERT INTO boss_instructions (instruction_id, business_id, job_id, text, text_origin)
        VALUES ($1, $2, $3, 'x', 'typed')`,
@@ -1101,16 +1097,16 @@ describe('executeErasure', () => {
       // refusal never fires and what is measured here is the approval branch.
       const elsewhere = `DOC-${ulid()}`;
       await insertDocument(elsewhere, `nowhere/${elsewhere}.txt`);
-      await recordSignature(
+      await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+        bdb,
         {
           signatureId: `SIG-${ulid()}`,
           documentId: elsewhere,
           signedSha256: 'd'.repeat(64),
           approvalId: signedApproval,
           signedBy: 'owner',
-        },
-        { businessId: BUSINESS },
-      );
+        }
+      ));
 
       const plan = await buildErasurePlan(
         { kind: 'contact', identifier: RONIT },
@@ -1216,16 +1212,16 @@ describe('executeErasure', () => {
     };
 
     // Between the preview and the confirm.
-    await recordSignature(
+    await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+      bdb,
       {
         signatureId: `SIG-${ulid()}`,
         documentId,
         signedSha256: 'f'.repeat(64),
         approvalId: `AP-${ulid()}`,
         signedBy: 'owner',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
     let caught: unknown;
     try {

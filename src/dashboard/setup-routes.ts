@@ -48,6 +48,7 @@ import {
 } from './setup-forms.js';
 import { RULE_TEXT_MAX, renderStep, type StepView } from './setup-step-views.js';
 import { STEP_COUNT, UNREADABLE_NOTICE, renderSetupRefusal, renderSummary } from './setup-views.js';
+import { withBusiness } from '../db/pool.js';
 
 export interface SetupSession {
   sessionId: string;
@@ -100,7 +101,7 @@ function sectionOf(step: number): SectionName {
 /** The base charter of the draft, for the two steps that depend on it; unreadable or gone → none. */
 async function baseOf(draft: InterviewDraft | null, businessId: string): Promise<BusinessCharter | null> {
   if (draft === null) return null;
-  const base = await previousForDraft(draft, businessId);
+  const base = await withBusiness(businessId, (bdb) => previousForDraft(bdb, draft)); // TENANCY-TODO(task 10)
   return base.ok ? base.previous : null;
 }
 
@@ -132,17 +133,17 @@ async function stepView(
     view.connections = buildConnections(provider === 'none' ? null : provider, previous).connections;
   }
   // Step 9 preselects the dial as it is now: on an edit, the live position.
-  if (step === 9) view.currentMode = await loadAutonomyMode({ businessId });
+  if (step === 9) view.currentMode = await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb)); // TENANCY-TODO(task 10)
   return view;
 }
 
 // --- GET /setup --------------------------------------------------------------
 
 export async function handleSetupIndex(res: ServerResponse, businessId: string): Promise<void> {
-  const draft = await loadDraft(businessId);
+  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
   // A charter is active and no interview is in flight: "edit the rules" is
   // the door that fills the draft from it.
-  if (draft === null && (await activeCharterVersion(businessId)) !== null) return seeOther(res, '/setup/edit');
+  if (draft === null && (await withBusiness(businessId, (bdb) => activeCharterVersion(bdb))) !== null) return seeOther(res, '/setup/edit'); // TENANCY-TODO(task 10)
   const next = firstUnsavedStep(draft?.answers ?? null);
   seeOther(res, next === null ? '/setup/summary' : `/setup/step/${next}`);
 }
@@ -157,7 +158,7 @@ export async function handleSetupIndex(res: ServerResponse, businessId: string):
  * create a draft.
  */
 async function editMustStartFromPrefill(draft: InterviewDraft | null, businessId: string): Promise<boolean> {
-  return draft === null && (await activeCharterVersion(businessId)) !== null;
+  return draft === null && (await withBusiness(businessId, (bdb) => activeCharterVersion(bdb))) !== null; // TENANCY-TODO(task 10)
 }
 
 export async function handleSetupStepGet(
@@ -167,7 +168,7 @@ export async function handleSetupStepGet(
   step: number,
   query: URLSearchParams,
 ): Promise<void> {
-  const draft = await loadDraft(businessId);
+  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
   if (await editMustStartFromPrefill(draft, businessId)) return seeOther(res, '/setup/edit');
   const view = await stepView(businessId, session, step, draft, step === 1 && query.get('more') === '1' ? { followUp: true } : {});
   sendHtml(res, 200, renderStep(view));
@@ -182,7 +183,7 @@ export async function handleSetupStepPost(
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
   const section = sectionOf(step);
-  const draft = await loadDraft(businessId);
+  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
   if (await editMustStartFromPrefill(draft, businessId)) return seeOther(res, '/setup/edit');
   let candidate = candidateFromForm(section, form, draft?.answers ?? {});
 
@@ -201,8 +202,8 @@ export async function handleSetupStepPost(
 
   // The draft's base is the charter active when the interview started; a
   // draft that starts now starts from whatever is active now.
-  const baseCharterVersion = draft === null ? await activeCharterVersion(businessId) : undefined;
-  await saveSection(businessId, section, candidate, baseCharterVersion === undefined ? {} : { baseCharterVersion });
+  const baseCharterVersion = draft === null ? await withBusiness(businessId, (bdb) => activeCharterVersion(bdb)) : undefined; // TENANCY-TODO(task 10)
+  await withBusiness(businessId, (bdb) => saveSection(bdb, section, candidate, baseCharterVersion === undefined ? {} : { baseCharterVersion })); // TENANCY-TODO(task 10)
 
   if (step === 1 && form.get('followed') !== '1' && needsFollowUp(candidate)) {
     return seeOther(res, '/setup/step/1?more=1');
@@ -225,7 +226,7 @@ async function renderStep10(
   session: SetupSession,
   extra: Partial<StepView>,
 ): Promise<void> {
-  const draft = await loadDraft(businessId);
+  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
   sendHtml(res, status, renderStep(await stepView(businessId, session, 10, draft, extra)));
 }
 
@@ -254,14 +255,14 @@ export async function handleRulePost(
       ruleError: `המשפט ארוך מדי — עד ${RULE_TEXT_MAX} תווים. אפשר לפצל אותו לכמה משפטים.`,
     });
   }
-  if (await editMustStartFromPrefill(await loadDraft(businessId), businessId)) return seeOther(res, '/setup/edit');
+  if (await editMustStartFromPrefill(await withBusiness(businessId, (bdb) => loadDraft(bdb)), businessId)) return seeOther(res, '/setup/edit'); // TENANCY-TODO(task 10)
   const proposer = options.ruleProposer ?? proposeRuleWithModel;
   const proposal = await proposer(text);
-  const draft = await loadDraft(businessId);
+  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
   const extra = extraOf(draft);
   extra.pending.push(proposal);
-  const baseCharterVersion = draft === null ? await activeCharterVersion(businessId) : undefined;
-  await saveSection(businessId, 'extra', extra, baseCharterVersion === undefined ? {} : { baseCharterVersion });
+  const baseCharterVersion = draft === null ? await withBusiness(businessId, (bdb) => activeCharterVersion(bdb)) : undefined; // TENANCY-TODO(task 10)
+  await withBusiness(businessId, (bdb) => saveSection(bdb, 'extra', extra, baseCharterVersion === undefined ? {} : { baseCharterVersion })); // TENANCY-TODO(task 10)
   seeOther(res, '/setup/step/10');
 }
 
@@ -288,7 +289,7 @@ export async function handleRuleChoice(
   if (!RULE_CHOICES.has(choice)) {
     return renderStep10(res, 400, businessId, session, { ruleError: 'בחירה לא מוכרת. לא בוצעה כל פעולה.' });
   }
-  const draft = await loadDraft(businessId);
+  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
   const extra = extraOf(draft);
   const list = choice === 'remove' ? extra.accepted : extra.pending;
   const rule = list[index];
@@ -301,7 +302,7 @@ export async function handleRuleChoice(
   list.splice(index, 1);
   if (choice === 'accept') extra.accepted.push(rule);
   if (choice === 'guidance') extra.accepted.push({ kind: 'guidance', text: rule.text });
-  await saveSection(businessId, 'extra', extra);
+  await withBusiness(businessId, (bdb) => saveSection(bdb, 'extra', extra)); // TENANCY-TODO(task 10)
   if (choice === 'fix') return renderStep10(res, 200, businessId, session, { ruleText: rule.text });
   seeOther(res, '/setup/step/10');
 }
@@ -309,11 +310,11 @@ export async function handleRuleChoice(
 // --- summary and sign --------------------------------------------------------
 
 export async function handleSummaryGet(res: ServerResponse, businessId: string, session: SetupSession): Promise<void> {
-  const draft = await loadDraft(businessId);
+  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
   const parsed = InterviewAnswers.safeParse(draft?.answers);
   if (draft === null || !parsed.success) return seeOther(res, '/setup');
   if (parsed.data.extra.pending.length > 0) return seeOther(res, '/setup/step/10');
-  const base = await previousForDraft(draft, businessId);
+  const base = await withBusiness(businessId, (bdb) => previousForDraft(bdb, draft)); // TENANCY-TODO(task 10)
   if (!base.ok) {
     return sendHtml(
       res,
@@ -325,7 +326,7 @@ export async function handleSummaryGet(res: ServerResponse, businessId: string, 
       ),
     );
   }
-  const frozenAt = await freezeDraft(businessId, new Date());
+  const frozenAt = await withBusiness(businessId, (bdb) => freezeDraft(bdb, new Date())); // TENANCY-TODO(task 10)
   const unsigned = buildCharterFromInterview(parsed.data, { businessId, frozenAt, previous: base.previous });
   const summary = summarizeCharter(unsigned, { previous: base.previous, documentsWanted: parsed.data.reading.documents });
   sendHtml(
@@ -374,12 +375,7 @@ export async function handleSignPost(
   options: SetupOptions,
 ): Promise<void> {
   if (!verifyCsrfToken(session.sessionId, form.get('csrf'))) return refuseCsrf(res);
-  const outcome = await signAndInstallInterview({
-    businessId,
-    username: session.username,
-    shownHash: form.get('shownHash') ?? '',
-    mailboxPreflight: (provider) => oauthCeremonyPreflight(businessId, provider, options.credentialKeyPath),
-  });
+  const outcome = await withBusiness(businessId, (bdb) => signAndInstallInterview(bdb, { username: session.username, shownHash: form.get('shownHash') ?? '', mailboxPreflight: (provider) => oauthCeremonyPreflight(businessId, provider, options.credentialKeyPath) })); // TENANCY-TODO(task 10)
   if (outcome.outcome === 'installed') return seeOther(res, outcome.modeApplied ? '/' : '/?mode=failed');
   if (outcome.outcome === 'preflight_failed') {
     return sendHtml(
@@ -405,19 +401,20 @@ export async function handleSignPost(
  *   - none → the first-time interview.
  */
 export async function handleSetupEdit(res: ServerResponse, businessId: string, session: SetupSession): Promise<void> {
-  const probe = await probeActiveCharter(businessId);
-  const draft = await loadDraft(businessId);
+  const probe = await withBusiness(businessId, (bdb) => probeActiveCharter(bdb)); // TENANCY-TODO(task 10)
+  const draft = await withBusiness(businessId, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
   if (probe.ok) {
     if (probe.active === null) return seeOther(res, '/setup');
     const version = probe.active.charter.charterVersion;
     if (draft === null || draft.baseCharterVersion !== version) {
-      await replaceDraft(businessId, prefillFromCharter(probe.active.charter), version);
+      const prefill = prefillFromCharter(probe.active.charter);
+      await withBusiness(businessId, (bdb) => replaceDraft(bdb, prefill, version)); // TENANCY-TODO(task 10)
     }
     return seeOther(res, '/setup/step/1');
   }
   console.error('setup edit: the active charter does not parse:', probe.reason);
-  const version = await activeCharterVersion(businessId);
+  const version = await withBusiness(businessId, (bdb) => activeCharterVersion(bdb)); // TENANCY-TODO(task 10)
   const current =
-    draft !== null && draft.baseCharterVersion === version ? draft : await replaceDraft(businessId, {}, version);
+    draft !== null && draft.baseCharterVersion === version ? draft : await withBusiness(businessId, (bdb) => replaceDraft(bdb, {}, version)); // TENANCY-TODO(task 10)
   sendHtml(res, 200, renderStep(await stepView(businessId, session, 1, current, { notice: UNREADABLE_NOTICE })));
 }

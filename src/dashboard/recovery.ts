@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { getPool, withTransaction, withBusinessTransaction, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import { hashPassword, verifyPassword, revokeAllSessions, DECOY_HASH, DECOY_SALT } from './auth.js';
@@ -280,7 +280,7 @@ export async function redeemRecoveryCode(input: {
 
   const matchedCodeId = matched.codeId;
 
-  return withTransaction(async (tx) => {
+  return withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 10)
     const claim = await tx.query<{ code_id: string }>(
       `UPDATE dashboard_recovery_codes SET used_at = $2
         WHERE code_id = $1 AND used_at IS NULL
@@ -325,6 +325,7 @@ export async function redeemRecoveryCode(input: {
     await revokeAllSessions(input.username, { businessId, tx });
 
     await appendAudit(
+      tx,
       {
         actor: 'human',
         onBehalfOf: input.username,
@@ -336,7 +337,6 @@ export async function redeemRecoveryCode(input: {
           `recovery code redeemed for ${input.username} from ` +
           `${input.sourceAddress ?? 'unknown source'}; all sessions revoked`,
       },
-      { businessId, tx },
     );
 
     return { ok: true };

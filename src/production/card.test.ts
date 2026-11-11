@@ -3,7 +3,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withTransaction, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -61,7 +61,6 @@ import {
   saveVersion,
   type ProductionDestination,
 } from './store.js';
-import { withTransaction } from '../db/pool.js';
 
 const B = 'test-business';
 const NOON = new Date('2026-08-18T09:00:00.000Z');
@@ -94,9 +93,7 @@ const sha = (bytes: Buffer): string => createHash('sha256').update(bytes).digest
 let charterSeq = 0;
 async function charter() {
   charterSeq += 1;
-  return installCharter(buildCharter({ version: `card-${charterSeq}`, connections: [MAIL_CONNECTION] }), {
-    businessId: B,
-  });
+  return withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: `card-${charterSeq}`, connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 5)
 }
 
 /** A job the owner opened at the instruction door, sitting in `execute`. */
@@ -350,7 +347,7 @@ describe('approveDocumentCard', () => {
     expect(after).toMatchObject({ state: 'approved', deliveryJobId: outcome.jobId });
 
     await liveMail();
-    expect(await loadAutonomyMode({ businessId: B })).toBe('off');
+    expect(await withBusiness(B, (bdb) => loadAutonomyMode(bdb))).toBe('off'); // TENANCY-TODO(task 5)
     const sent: MailMessage[] = [];
     const ran = await runDueJobs({ businessId: B, runtime: runtimeWith(sent), now: NOON });
     expect(ran.ran).toEqual([{ jobId: outcome.jobId, status: 'done', detail: null }]);

@@ -1,6 +1,5 @@
-import { config } from '../config.js';
 import type { AgentId } from '../domain/audit.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { transaction, withBusiness, type BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -123,35 +122,40 @@ export class KillSwitchAuditUnrecordedError extends Error {
  * the entry happened to be appended — sort or compare on that stamp, never
  * on `seq` or `at`, to recover true ordering across a race like this.
  *
- * Do not pass a caller-owned transaction into this function (there is
- * currently no such option, and none should be added casually): the audit
- * advisory lock is transaction-scoped, so calling `trip()` from inside a
- * transaction that has already appended an audit entry this business would
- * block on that lock with no deadlock detection across separate connections.
- * No caller does this today.
+ * `db` names the business and nothing more: both the state write and the
+ * audit append run on fresh connections of their own (`withBusiness`), never
+ * on `db` — so a caller already inside a transaction cannot drag the stop
+ * into it. Calling `trip()` with a `db` whose transaction has already
+ * appended an audit entry this business would still block on that
+ * transaction-scoped audit lock, with no deadlock detection across separate
+ * connections. No caller does this today.
  */
 export async function trip(
+  db: BusinessDb,
   scope: KillScope,
   by: string,
   reason: string,
-  options: { businessId?: string; charterVersion?: string } = {},
+  options: { charterVersion?: string } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const movedAt = new Date().toISOString();
 
-  await getPool().query(
-    `INSERT INTO kill_switch (business_id, scope, tripped, tripped_by, tripped_at, reason, updated_at)
-     VALUES ($1, $2, true, $3, now(), $4, now())
-     ON CONFLICT (business_id, scope)
-     DO UPDATE SET tripped = true, tripped_by = EXCLUDED.tripped_by,
-                   tripped_at = now(), reason = EXCLUDED.reason,
-                   released_by = NULL, released_at = NULL, updated_at = now()`,
-    [businessId, scope, by, reason],
+  // Committed on its own connection, before and apart from the audit append.
+  await withBusiness(businessId, (own) =>
+    own.query(
+      `INSERT INTO kill_switch (business_id, scope, tripped, tripped_by, tripped_at, reason, updated_at)
+       VALUES ($1, $2, true, $3, now(), $4, now())
+       ON CONFLICT (business_id, scope)
+       DO UPDATE SET tripped = true, tripped_by = EXCLUDED.tripped_by,
+                     tripped_at = now(), reason = EXCLUDED.reason,
+                     released_by = NULL, released_at = NULL, updated_at = now()`,
+      [businessId, scope, by, reason],
+    ),
   );
 
   try {
-    await appendAudit(
-      {
+    await withBusiness(businessId, (own) =>
+      appendAudit(own, {
         actor: 'human',
         onBehalfOf: by,
         kind: 'kill_switch',
@@ -159,8 +163,7 @@ export async function trip(
         provenance: 'boss',
         inputHash: canonicalHash({ scope, action: 'trip' }),
         reason: `kill switch TRIPPED on scope "${scope}" by ${by}: ${reason} [movedAt=${movedAt}]`,
-      },
-      { businessId },
+      }),
     );
   } catch (error) {
     throw new KillSwitchAuditUnrecordedError(scope, error);
@@ -190,15 +193,16 @@ export async function trip(
  * audit entries were appended out of order.
  */
 export async function release(
+  db: BusinessDb,
   scope: KillScope,
   by: string,
   reason: string,
-  options: { businessId?: string; charterVersion?: string } = {},
+  options: { charterVersion?: string } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const movedAt = new Date().toISOString();
 
-  await withTransaction(async (tx) => {
+  await transaction(db, async (tx) => {
     const { rowCount } = await tx.query(
       `UPDATE kill_switch
           SET tripped = false, released_by = $3, released_at = now(), updated_at = now()
@@ -214,28 +218,22 @@ export async function release(
       throw new Error(`kill switch scope "${scope}" is not tripped; nothing to release`);
     }
 
-    await appendAudit(
-      {
-        actor: 'human',
-        onBehalfOf: by,
-        kind: 'kill_switch',
-        charterVersion: options.charterVersion ?? 'unknown',
-        provenance: 'boss',
-        inputHash: canonicalHash({ scope, action: 'release' }),
-        reason: `kill switch RELEASED on scope "${scope}" by ${by}: ${reason} [movedAt=${movedAt}]`,
-      },
-      { businessId, tx },
-    );
+    await appendAudit(tx, {
+      actor: 'human',
+      onBehalfOf: by,
+      kind: 'kill_switch',
+      charterVersion: options.charterVersion ?? 'unknown',
+      provenance: 'boss',
+      inputHash: canonicalHash({ scope, action: 'release' }),
+      reason: `kill switch RELEASED on scope "${scope}" by ${by}: ${reason} [movedAt=${movedAt}]`,
+    });
   });
 }
 
-export async function activeScopes(
-  businessId: string = config.businessId,
-  db: Queryable = getPool(),
-): Promise<KillSwitchState[]> {
+export async function activeScopes(db: BusinessDb): Promise<KillSwitchState[]> {
   const { rows } = await db.query<KillRow>(
     'SELECT scope, tripped, tripped_by, tripped_at, reason FROM kill_switch WHERE business_id = $1 AND tripped = true',
-    [businessId],
+    [db.businessId],
   );
   return rows.map((row) => ({
     scope: row.scope as KillScope,
@@ -260,12 +258,11 @@ export interface KillCheck {
  * cannot send. Read-only work under an outbound stop is intentional, not a gap.
  */
 export async function checkKillSwitch(
+  db: BusinessDb,
   agent: AgentId,
   isOutbound: boolean,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<KillCheck> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const department = AGENT_DEPARTMENT[agent];
 
   const relevant: KillScope[] = ['all', department];

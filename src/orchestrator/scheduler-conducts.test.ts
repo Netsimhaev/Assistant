@@ -3,7 +3,7 @@ import { mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -139,7 +139,7 @@ async function jobReadyToRun(charterVersion: string): Promise<string> {
   // The owner's dial (Task 2) defaults to `off`, which clamps `loadRampLevel`
   // to `draft_only` regardless of what is stored — open it first so the
   // promotion below is actually honoured.
-  await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
   await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
   return job.jobId;
 }
@@ -147,7 +147,7 @@ async function jobReadyToRun(charterVersion: string): Promise<string> {
 describe('schedulerPass and the conductor', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   });
 
   it('scans the inbox when one is configured, into the given document root', async () => {
@@ -249,7 +249,7 @@ describe('schedulerPass and the conductor', () => {
     // stay 0, `reads`/`proposals` would stay 0, and no approval row would
     // exist.
     const conductBusiness = 'biz-sched-conduct-2';
-    await installCharter(buildCharter(), { businessId: conductBusiness });
+    await withBusiness(conductBusiness, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const dir = await mkdtemp(join(tmpdir(), 'sched-doc-'));
     const path = join(dir, 'doc.txt');
     await writeFile(path, 'חוזה שיווק', 'utf8');
@@ -303,7 +303,7 @@ describe('schedulerPass and the conductor', () => {
   // `runtime.notify` on the way into the conductor.
   it('forwards the runtime notifier all the way to the conductor card', async () => {
     const notifyBusiness = 'biz-sched-conduct-notify';
-    await installCharter(buildCharter(), { businessId: notifyBusiness });
+    await withBusiness(notifyBusiness, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const dir = await mkdtemp(join(tmpdir(), 'sched-notify-doc-'));
     const path = join(dir, 'doc.txt');
     await writeFile(path, 'חוזה שיווק להתראה', 'utf8');
@@ -354,7 +354,7 @@ describe('schedulerPass and the conductor', () => {
   // show is that the conductor made zero model calls because of it.
   it('a hostile file is rejected by the scan and costs nothing', async () => {
     const hostileBusiness = 'biz-sched-conduct-hostile';
-    await installCharter(buildCharter(), { businessId: hostileBusiness });
+    await withBusiness(hostileBusiness, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const inbox = await mkdtemp(join(tmpdir(), 'sched-hostile-inbox-'));
     const documentRoot = await mkdtemp(join(tmpdir(), 'sched-hostile-root-'));
     // A `.xlsx` name over bytes that begin as a ZIP and then are not one:
@@ -404,7 +404,8 @@ describe('schedulerPass and the conductor', () => {
     // A second version: `beforeEach` already installed one for `BUSINESS` at
     // the default `buildCharter()` version, and `charter_versions` refuses a
     // repeat.
-    const bundle = await installCharter(
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         version: '2026-08-15.2',
         connections: [MAIL_CONNECTION],
@@ -415,9 +416,8 @@ describe('schedulerPass and the conductor', () => {
         // nothing to do with the broken inbox this test is about.
         knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'auto' },
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const jobId = await jobReadyToRun(bundle.charterVersion);
 
     // A path with a plain file as one of its components: `mkdir(...,

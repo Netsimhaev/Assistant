@@ -4,7 +4,7 @@
  * and every poll have an index.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from './pool.js';
+import { closePool, getPool, withBusiness } from './pool.js';
 import { resetDatabase } from '../test/db.js';
 import { createState } from '../governance/oauth-state.js';
 
@@ -20,13 +20,14 @@ afterAll(async () => {
 describe('oauth_states.provider is a closed set', () => {
   it('accepts google, microsoft and NULL (a calendar ceremony has no provider choice)', async () => {
     for (const provider of ['google', 'microsoft', undefined]) {
-      await createState({
-        businessId: BUSINESS,
-        system: provider === undefined ? 'office-calendar' : 'mailbox',
-        sessionId: 's1',
-        codeVerifier: 'v1',
-        ...(provider !== undefined ? { provider } : {}),
-      });
+      await withBusiness(BUSINESS, (db) =>
+        createState(db, {
+          system: provider === undefined ? 'office-calendar' : 'mailbox',
+          sessionId: 's1',
+          codeVerifier: 'v1',
+          ...(provider !== undefined ? { provider } : {}),
+        }),
+      );
     }
     const { rows } = await getPool().query<{ n: string }>('SELECT count(*)::text AS n FROM oauth_states');
     expect(rows[0]?.n).toBe('3');
@@ -34,7 +35,7 @@ describe('oauth_states.provider is a closed set', () => {
 
   it('refuses any other provider at the database, whatever the caller', async () => {
     await expect(
-      createState({ businessId: BUSINESS, system: 'mailbox', sessionId: 's1', codeVerifier: 'v1', provider: 'yahoo' }),
+      withBusiness(BUSINESS, (db) => createState(db, { system: 'mailbox', sessionId: 's1', codeVerifier: 'v1', provider: 'yahoo' })),
     ).rejects.toThrow(/oauth_states_provider_known/);
   });
 });

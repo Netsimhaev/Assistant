@@ -10,7 +10,7 @@
  */
 import { readFile, stat } from 'node:fs/promises';
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, type Queryable } from '../db/pool.js'; // TENANCY-TODO(task 12)
 import { decryptSecret, encryptSecret, type Sealed } from './secret-cipher.js';
 
 export const KEY_BYTES = 32;
@@ -108,7 +108,7 @@ export async function loadMasterKey(path: string): Promise<Buffer> {
 
 /**
  * Seal the key-check plaintext with `key` and store it as the installation's
- * one row. `businessId` defaults to `config.businessId` — unlike every read
+ * one row. `businessId` defaults to the configured business — unlike every read
  * path for a real secret, this is bookkeeping rather than an authorisation
  * decision: the key is per-installation, the table holds exactly one row,
  * and there is no customer whose secret a default here could hand to another.
@@ -118,8 +118,8 @@ export async function writeKeyState(
   keyId: string,
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = options.businessId ?? config.businessId; // TENANCY-TODO(task 12)
+  const db = options.db ?? getPool(); // TENANCY-TODO(task 12)
   const sealed = encryptSecret(KEY_CHECK_PLAINTEXT, key, { businessId, ref: KEY_CHECK_REF });
 
   await db.query(
@@ -150,8 +150,8 @@ export async function verifyKeyState(
   key: Buffer,
   options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = options.businessId ?? config.businessId; // TENANCY-TODO(task 12)
+  const db = options.db ?? getPool(); // TENANCY-TODO(task 12)
 
   const { rows } = await db.query<KeyStateRow>(
     'SELECT check_nonce, check_value FROM credential_key_state WHERE business_id = $1',

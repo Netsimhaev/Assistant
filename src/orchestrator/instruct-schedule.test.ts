@@ -14,7 +14,7 @@ import { installCharter } from '../charter/store.js';
 import { createOwner } from '../dashboard/auth.js';
 import { issueCsrfToken } from '../dashboard/csrf.js';
 import { createServer } from '../dashboard/server.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { CALENDAR_NOT_CONNECTED_REPLY } from '../meetings/door.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
@@ -66,7 +66,7 @@ const SCHEDULE_OPTIONS = { businessId: BUSINESS, textOrigin: 'typed', channel: '
 
 beforeEach(async () => {
   await resetDatabase();
-  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 4)
 });
 afterAll(async () => {
   await closePool();

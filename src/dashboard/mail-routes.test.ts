@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { annotateAttachment, insertInvoice, linkAttachmentDocument, markOverCap, noteMailError, setCursor, settleMail } from '../mail/inbox-store.js';
 import { resetDatabase, testDb } from '../test/db.js';
@@ -34,7 +34,7 @@ const PASSWORD = 'correct horse battery staple';
  * own version, so a test that installs `buildCharter()` itself still can.
  */
 async function installGateCharter(businessId: string): Promise<void> {
-  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId });
+  await withBusiness(businessId, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
 }
 
 let server: Server | null = null;
@@ -376,14 +376,14 @@ describe('fix round 1', () => {
   });
 
   async function auditGap(daysAgo: number): Promise<void> {
-    await appendAudit(
+    await withBusiness(BUSINESS, (bdb) => appendAudit( // TENANCY-TODO(task 10)
+      bdb,
       {
         jobId: null, actor: 'orchestrator', kind: 'incident', reason: 'mail_cursor_gap', inputHash: 'a'.repeat(64),
         provenance: 'unknown_external', charterVersion: 'v1', envelopeId: null, onBehalfOf: null, actionClass: null,
         risk: null, outputHash: null, artifacts: [], costMinor: null, tokens: null,
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
     if (daysAgo > 0) {
       const db = getPool();
       await testDb().query('ALTER TABLE audit_log DISABLE TRIGGER audit_log_no_update');

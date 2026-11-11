@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   documentsAwaitingRead,
@@ -138,8 +138,8 @@ describe('the conductor queries', () => {
     const inboxFile = await anExtractedDocument('מסמך מתיקיית הקליטה');
     const foreignNamed = await anExtractedDocument('מסמך שעסק אחר נוקב בו');
     const db = getPool();
-    const own = await installCharter(buildCharter({ version: 'cond-own' }), { businessId: BUSINESS });
-    const foreign = await installCharter(buildCharter({ version: 'cond-foreign' }), { businessId: 'someone-else' });
+    const own = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'cond-own' }))); // TENANCY-TODO(task 5)
+    const foreign = await withBusiness('someone-else', (bdb) => installCharter(bdb, buildCharter({ version: 'cond-foreign' }))); // TENANCY-TODO(task 5)
     const ownJob = await createJob({ businessId: BUSINESS, charterVersion: own.charterVersion, provenance: 'boss' });
     const foreignJob = await createJob({ businessId: 'someone-else', charterVersion: foreign.charterVersion, provenance: 'boss' });
     await db.query(

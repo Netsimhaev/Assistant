@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { AdapterRegistry } from '../orchestrator/adapters/registry.js';
 import { envCredentials } from '../orchestrator/credentials.js';
 import type { Runtime } from '../orchestrator/runtime.js';
@@ -83,7 +83,7 @@ afterAll(async () => {
 
 describe('schedulerPass ledger stages', () => {
   it('one pass closes by evidence before it reminds', async () => {
-    await installCharter(buildCharter({}), { businessId: B });
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
     await setModes('remind');
     const item = await createLedgerItem(base(), { businessId: B, by: 'boss' });
     await backdate(item.itemId);
@@ -117,7 +117,7 @@ describe('schedulerPass ledger stages', () => {
   });
 
   it('one pass with an evidence closure and a due reminder sends ONE WhatsApp batch, the notice first', async () => {
-    await installCharter(buildCharter({}), { businessId: B });
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
     await saveLedgerSettings(
       { ...LEDGER_DEFAULTS, modes: { ...LEDGER_DEFAULTS.modes }, meetingLeadMinutesCritical: [1440, 60], toWhatsApp: true },
       { businessId: B, updatedBy: 'owner' },
@@ -172,7 +172,7 @@ describe('schedulerPass ledger stages', () => {
   });
 
   it('a throwing nudge drafter is contained and does not stop the rest of the pass', async () => {
-    await installCharter(buildCharter({}), { businessId: B });
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
     await setModes('act');
     const item = await createLedgerItem(base(), { businessId: B, by: 'boss' });
     await backdate(item.itemId);
@@ -214,7 +214,7 @@ describe('schedulerPass ledger stages', () => {
   });
 
   it('a real fault in both ledger stages is contained and the later stages still run', async () => {
-    await installCharter(buildCharter({}), { businessId: B });
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
     await setModes('remind');
     await testDb().query('ALTER TABLE ledger_items RENAME TO ledger_items_x');
     try {

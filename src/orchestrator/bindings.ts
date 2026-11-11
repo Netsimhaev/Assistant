@@ -1,7 +1,6 @@
-import type pg from 'pg';
 import { config } from '../config.js';
 import { ConnectionBinding } from '../domain/connection.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { getPool, withBusinessTransaction, transaction, type Queryable, type BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 
@@ -73,15 +72,14 @@ export async function loadBindings(
  * worse than a stop with a late or manually reconstructed record. See the
  * docblock on `trip()` for why that asymmetry is intentional.)
  *
- * `options.db`, when supplied, must be a real `pg.PoolClient` already inside
- * a transaction the caller owns — not just anything with a `.query` method.
- * A bare `pg.Pool` satisfies a looser `Queryable` type structurally, which
- * would silently defeat the atomicity this function exists to provide, so
- * the type itself rules it out.
+ * `options.db`, when supplied, is a `BusinessDb`: `transaction` joins the
+ * caller's transaction when it is in one and opens one on it otherwise — never
+ * a bare `pg.Pool`, which would silently defeat the atomicity this function
+ * exists to provide.
  */
 export async function upsertBinding(
   binding: ConnectionBinding,
-  options: { businessId?: string; db?: pg.PoolClient; charterVersion?: string; by: string },
+  options: { businessId?: string; db?: BusinessDb; charterVersion?: string; by: string },
 ): Promise<void> {
   if (options.by.trim().length === 0) {
     throw new Error('upsertBinding: "by" must not be empty');
@@ -97,7 +95,7 @@ export async function upsertBinding(
   // supplies `options.db`, it is trusted to already be such a handle and the
   // caller owns committing or rolling it back; otherwise a transaction is
   // opened here and used for both statements.
-  const write = async (tx: Queryable): Promise<void> => {
+  const write = async (tx: BusinessDb): Promise<void> => {
     await tx.query(
       `INSERT INTO connection_bindings
          (business_id, system, status, endpoint, credential_ref, provider, last_ok_at, last_error, updated_at)
@@ -123,6 +121,7 @@ export async function upsertBinding(
     );
 
     await appendAudit(
+      tx,
       {
         actor: 'human',
         onBehalfOf: options.by,
@@ -149,14 +148,13 @@ export async function upsertBinding(
           `(credentialRef=${parsed.credentialRef ?? 'null'}, provider=${parsed.provider ?? 'null'}) ` +
           `by ${options.by}`,
       },
-      { businessId, tx },
     );
   };
 
   if (options.db) {
-    await write(options.db);
+    await transaction(options.db, write); // TENANCY-TODO(task 4)
   } else {
-    await withTransaction((client) => write(client));
+    await withBusinessTransaction(businessId, write); // TENANCY-TODO(task 4)
   }
 }
 

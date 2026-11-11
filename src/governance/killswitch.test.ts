@@ -1,8 +1,8 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness, withBusinessTransaction } from '../db/pool.js';
 import { queryAudit } from '../audit/log.js';
 import { resetDatabase, testDb } from '../test/db.js';
-import { activeScopes, KillSwitchAuditUnrecordedError, release, trip } from './killswitch.js';
+import { activeScopes, checkKillSwitch, KillSwitchAuditUnrecordedError, release, trip } from './killswitch.js';
 
 const BUSINESS = 'test-business';
 const BY = 'net.simhaev@gmail.com';
@@ -69,7 +69,7 @@ describe('trip() fails loud but does NOT roll back — the stop must hold', () =
     // failed" without regex-matching a human-readable string.
     let caught: unknown;
     try {
-      await trip('all', BY, FORCE_FAILURE, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', BY, FORCE_FAILURE));
     } catch (error) {
       caught = error;
     }
@@ -85,20 +85,20 @@ describe('trip() fails loud but does NOT roll back — the stop must hold', () =
     // the call threw: rolling back an emergency stop because its audit
     // couldn't also be written would defeat the one control meant to work
     // when everything else already has.
-    const scopes = await activeScopes(BUSINESS);
+    const scopes = await withBusiness(BUSINESS, (bdb) => activeScopes(bdb));
     expect(scopes).toHaveLength(1);
     expect(scopes[0]?.scope).toBe('all');
     expect(scopes[0]?.trippedBy).toBe(BY);
     // No audit row: the append genuinely failed and did not silently retry.
-    expect(await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'kill_switch' }))).toEqual([]);
   });
 
   it('stamps the audit reason with the instant of the state write, not the append', async () => {
     const before = new Date();
-    await trip('all', BY, 'עצירה עם חותמת זמן', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', BY, 'עצירה עם חותמת זמן'));
     const after = new Date();
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' });
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'kill_switch' }));
     expect(entries).toHaveLength(1);
     const match = entries[0]?.reason.match(/\[movedAt=([^\]]+)\]/);
     expect(match).not.toBeNull();
@@ -112,8 +112,8 @@ describe('trip() fails loud but does NOT roll back — the stop must hold', () =
 
   it('holds the new trip when re-tripping an already-tripped scope and the audit append fails', async () => {
     // First trip succeeds normally and is audited.
-    await trip('all', BY, 'עצירה ראשונה', { businessId: BUSINESS });
-    const firstAudit = await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', BY, 'עצירה ראשונה'));
+    const firstAudit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'kill_switch' }));
     expect(firstAudit).toHaveLength(1);
 
     // Re-trip the same scope through the ON CONFLICT DO UPDATE path, with a
@@ -121,7 +121,7 @@ describe('trip() fails loud but does NOT roll back — the stop must hold', () =
     await installAuditFailureTrigger();
     const secondBy = 'other.human@example.com';
 
-    await expect(trip('all', secondBy, FORCE_FAILURE, { businessId: BUSINESS })).rejects.toThrow(
+    await expect(withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', secondBy, FORCE_FAILURE))).rejects.toThrow(
       KillSwitchAuditUnrecordedError,
     );
 
@@ -131,14 +131,14 @@ describe('trip() fails loud but does NOT roll back — the stop must hold', () =
     // reporting (via the throw) that something went wrong, which is exactly
     // the kind of "looks stopped but isn't quite" state trip() must not
     // produce.
-    const scopes = await activeScopes(BUSINESS);
+    const scopes = await withBusiness(BUSINESS, (bdb) => activeScopes(bdb));
     expect(scopes).toHaveLength(1);
     expect(scopes[0]?.trippedBy).toBe(secondBy);
     expect(scopes[0]?.reason).toBe(FORCE_FAILURE);
 
     // Still only the one audit entry from the first, successful trip — the
     // second trip's audit entry never made it in.
-    expect(await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' })).toEqual(firstAudit);
+    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'kill_switch' }))).toEqual(firstAudit);
   });
 });
 
@@ -148,32 +148,32 @@ describe('release() is transactional with its audit entry — refusing to releas
   });
 
   it('rolls back a release if the audit append fails, leaving the scope still tripped', async () => {
-    await trip('all', BY, 'תקלה בבדיקה', { businessId: BUSINESS });
-    const before = await activeScopes(BUSINESS);
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', BY, 'תקלה בבדיקה'));
+    const before = await withBusiness(BUSINESS, (bdb) => activeScopes(bdb));
 
     await installAuditFailureTrigger();
 
     await expect(
-      release('all', BY, FORCE_FAILURE, { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => release(bdb, 'all', BY, FORCE_FAILURE)),
     ).rejects.toThrow();
 
     // Still tripped: the UPDATE inside release() must have rolled back along
     // with the failed audit append, not left the switch released with no
     // record of who released it.
-    expect(await activeScopes(BUSINESS)).toEqual(before);
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' });
+    expect(await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).toEqual(before);
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'kill_switch' }));
     expect(entries).toHaveLength(1);
     expect(entries[0]?.reason).toContain('TRIPPED');
   });
 
   it('stamps the audit reason with the instant of the state write, not the append', async () => {
-    await trip('all', BY, 'עצירה', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'all', BY, 'עצירה'));
 
     const before = new Date();
-    await release('all', BY, 'שחרור עם חותמת זמן', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => release(bdb, 'all', BY, 'שחרור עם חותמת זמן'));
     const after = new Date();
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' });
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'kill_switch' }));
     const released = entries.find((entry) => entry.reason.includes('RELEASED'));
     expect(released).toBeDefined();
     const match = released?.reason.match(/\[movedAt=([^\]]+)\]/);
@@ -185,10 +185,45 @@ describe('release() is transactional with its audit entry — refusing to releas
 
   it('release() on a scope that was never tripped throws and writes no audit row', async () => {
     await expect(
-      release('all', BY, 'לא היה מה לשחרר', { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => release(bdb, 'all', BY, 'לא היה מה לשחרר')),
     ).rejects.toThrow(/not tripped/);
 
-    expect(await activeScopes(BUSINESS)).toEqual([]);
-    expect(await queryAudit({ businessId: BUSINESS, kind: 'kill_switch' })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'kill_switch' }))).toEqual([]);
+  });
+});
+
+describe('the kill switch takes the business from its BusinessDb', () => {
+  it("trip() commits on its own connection even when the caller's transaction rolls back", async () => {
+    await expect(
+      withBusinessTransaction(BUSINESS, async (tx) => {
+        await trip(tx, 'all', BY, 'stop inside a doomed transaction');
+        throw new Error('caller rolls back');
+      }),
+    ).rejects.toThrow('caller rolls back');
+
+    // The stop is in force and recorded — neither was inside the caller's transaction.
+    expect((await withBusiness(BUSINESS, (db) => activeScopes(db))).map((s) => s.scope)).toEqual(['all']);
+    expect(await withBusiness(BUSINESS, (db) => queryAudit(db, { kind: 'kill_switch' }))).toHaveLength(1);
+  });
+
+  it("release() joins the caller's transaction, so a rollback undoes the release and its record", async () => {
+    await withBusiness(BUSINESS, (db) => trip(db, 'all', BY, 'stop'));
+    await expect(
+      withBusinessTransaction(BUSINESS, async (tx) => {
+        await release(tx, 'all', BY, 'resume, then roll back');
+        throw new Error('caller rolls back');
+      }),
+    ).rejects.toThrow('caller rolls back');
+
+    expect((await withBusiness(BUSINESS, (db) => activeScopes(db))).map((s) => s.scope)).toEqual(['all']);
+    const entries = await withBusiness(BUSINESS, (db) => queryAudit(db, { kind: 'kill_switch' }));
+    expect(entries.filter((e) => e.reason.includes('RELEASED'))).toEqual([]);
+  });
+
+  it("a stop for one business does not stop another's checks", async () => {
+    await withBusiness(BUSINESS, (db) => trip(db, 'all', BY, 'stop one business'));
+    expect((await withBusiness(BUSINESS, (db) => checkKillSwitch(db, 'comms.email', true))).blocked).toBe(true);
+    expect((await withBusiness('other-business', (db) => checkKillSwitch(db, 'comms.email', true))).blocked).toBe(false);
   });
 });

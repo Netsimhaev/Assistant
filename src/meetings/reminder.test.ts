@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { createJob, loadJob } from '../orchestrator/jobs.js';
@@ -50,7 +50,7 @@ beforeEach(async () => {
   await resetDatabase();
   charterVersion = (await installMailboxCharter(B)).charterVersion;
   // Under the default `off` no job is ever opened (see the `off` test below).
-  await setAutonomyMode('ask', 'p_boss', { businessId: B });
+  await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
 });
 afterAll(async () => {
   await closePool();
@@ -97,7 +97,7 @@ describe('openClientReminder', () => {
     const plan = (await loadPlanBody(jobId, { businessId: B }))?.plan ?? Plan.parse(null);
     const step = plan.steps[0];
     if (step === undefined) throw new Error('no step');
-    const active = await loadActiveCharter(B);
+    const active = await withBusiness(B, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
     if (active === null) throw new Error('no charter');
     const facts = buildFacts(step.toolName, step.input, {
       provenance: 'boss',
@@ -105,7 +105,7 @@ describe('openClientReminder', () => {
       counterpartyTags: [],
       provenanceChainDerived: false,
     });
-    const covers = await confirmedCommandCovers(facts, {
+    const covers = await withBusiness(B, (db) => confirmedCommandCovers(facts, { // TENANCY-TODO(task 5)
       provenance: 'boss',
       chainDepth: 1,
       counterpartyTags: [],
@@ -114,12 +114,12 @@ describe('openClientReminder', () => {
       bundle: active.bundle,
       jobId,
       stepId: step.id,
-      businessId: B,
-    });
+      db,
+    }));
     expect(covers).toBeNull();
 
     // And the gate, under `ask`, raises the owner's card and sends nothing.
-    await setAutonomyMode('ask', 'p_boss', { businessId: B });
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
     const { client, sent, sentNew } = fakeMailboxClient();
     await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
     expect(sent).toHaveLength(0);
@@ -143,8 +143,8 @@ describe('openClientReminder', () => {
     expect(await openClientReminder({ businessId: B, meetingId: once })).toEqual({ skipped: 'already' });
 
     await resetDatabase();
-    charterVersion = (await installCharter(buildCharter(), { businessId: B })).charterVersion;
-    await setAutonomyMode('ask', 'p_boss', { businessId: B });
+    charterVersion = (await withBusiness(B, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 5)
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
     const noMailbox = await seedMeeting();
     expect(await openClientReminder({ businessId: B, meetingId: noMailbox })).toEqual({ skipped: 'no_mailbox' });
     const { rows } = await getPool().query<{ n: string }>('SELECT count(*) AS n FROM jobs WHERE business_id = $1', [B]);
@@ -152,7 +152,7 @@ describe('openClientReminder', () => {
   });
 
   it('under the default off dial opens no job and hands the owner the reminder text', async () => {
-    await setAutonomyMode('off', 'p_boss', { businessId: B });
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'off', 'p_boss')); // TENANCY-TODO(task 5)
     const meetingId = await seedMeeting();
     const result = await openClientReminder({ businessId: B, meetingId, location: 'המשרד' });
     expect(result).toEqual({

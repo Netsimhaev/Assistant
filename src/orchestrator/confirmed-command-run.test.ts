@@ -18,7 +18,7 @@
  * that baseline with the confirmation left pending.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -82,11 +82,11 @@ function runtimeWith(sent: MailMessage[]): Runtime {
 }
 
 async function seedCommand(options: { confirm: boolean }): Promise<string> {
-  const bundle = await installCharter(
-    buildCharter({ version: '2026-08-15.confirmed-run', connections: [MAIL_CONNECTION] }),
-    { businessId: BUSINESS },
-  );
-  expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    bdb,
+    buildCharter({ version: '2026-08-15.confirmed-run', connections: [MAIL_CONNECTION] })
+  ));
+  expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off'); // TENANCY-TODO(task 4)
   expect(bundle.autonomyBase['email.initiate']).toBe('approve_required');
 
   const job = await createJob({

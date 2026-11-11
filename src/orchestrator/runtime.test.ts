@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import type { CharterConnection } from '../domain/connection.js';
 import type { ApprovalRequest } from '../governance/approvals.js';
 import { putSecret } from '../governance/credential-store.js';
@@ -602,7 +602,7 @@ describe('buildRuntime', () => {
    * `runtime.ts`'s own docblock on `buildRuntime`.
    */
   it('registers the provider adapter for a declared system even with no grant stored', async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 4)
     await upsertBinding(
       {
         system: 'office-calendar',
@@ -645,7 +645,8 @@ describe('buildRuntime', () => {
     // declared for `office-mail`, the registration loop's own
     // `connection === undefined` check already skips it, and this test would
     // pass without ever exercising the bug it is named for.
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [
           {
@@ -657,9 +658,8 @@ describe('buildRuntime', () => {
             subprocessor: null,
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     await upsertBinding(
       {
         system: 'office-mail',
@@ -690,7 +690,8 @@ describe('buildRuntime', () => {
    * must never receive a calendar adapter.
    */
   it('does not register a calendar adapter for a mailbox binding', async () => {
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [
           {
@@ -702,9 +703,8 @@ describe('buildRuntime', () => {
             subprocessor: null,
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     await upsertBinding(
       {
         system: 'mailbox',
@@ -725,7 +725,8 @@ describe('buildRuntime', () => {
   });
 
   it('runtime registers mailbox-send for a microsoft mailbox binding', async () => {
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [
           {
@@ -737,9 +738,8 @@ describe('buildRuntime', () => {
             subprocessor: null,
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     await upsertBinding(
       {
         system: 'mailbox',
@@ -761,7 +761,8 @@ describe('buildRuntime', () => {
   });
 
   it('registers the calendar adapter for the calendar binding only', async () => {
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [
           {
@@ -781,9 +782,8 @@ describe('buildRuntime', () => {
             subprocessor: null,
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     for (const [system, provider] of [
       ['calendar', 'google'],
       ['office-calendar', 'google'],
@@ -814,7 +814,8 @@ describe('buildRuntime', () => {
   });
 
   it('does not register the calendar adapter when the binding provider is not the signed one', async () => {
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [
           {
@@ -826,9 +827,8 @@ describe('buildRuntime', () => {
             subprocessor: 'google-workspace',
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     await upsertBinding(
       {
         system: 'calendar',
@@ -847,7 +847,8 @@ describe('buildRuntime', () => {
   });
 
   it('does not register the calendar adapter for a calendar binding that has no provider', async () => {
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [
           {
@@ -859,9 +860,8 @@ describe('buildRuntime', () => {
             subprocessor: 'google-workspace',
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     await upsertBinding(
       {
         system: 'calendar',
@@ -894,7 +894,8 @@ describe('buildRuntime', () => {
    * booting, for any charter shape.
    */
   it('does not collide with the mail adapter when one charter connection serves both mail and calendar', async () => {
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         connections: [
           {
@@ -906,9 +907,8 @@ describe('buildRuntime', () => {
             subprocessor: null,
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     await upsertBinding(
       {
         system: 'office-mail',

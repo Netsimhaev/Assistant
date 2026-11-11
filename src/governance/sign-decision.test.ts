@@ -18,8 +18,8 @@
 
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { queryAudit } from '../audit/log.js';
 import type { AuditEntryInput } from '../domain/audit.js';
 import type { ActionFacts } from '../domain/policy.js';
@@ -102,7 +102,8 @@ async function aDocument(): Promise<string> {
 
 async function anApproval(ttlMinutes = 60): Promise<string> {
   const proposedInput = { to: 'dana@example.com', body: 'שלום' };
-  return enqueueApproval(
+  return withBusiness(BUSINESS, (bdb) => enqueueApproval(
+    bdb,
     {
       jobId: null,
       facts: facts(proposedInput),
@@ -110,9 +111,8 @@ async function anApproval(ttlMinutes = 60): Promise<string> {
       proposedInput,
       summary: 'בקשה לחתימה',
       ttlMinutes,
-    },
-    { businessId: BUSINESS },
-  );
+    }
+  ));
 }
 
 function signPayload(approvalId: string, documentId: string) {
@@ -144,13 +144,11 @@ describe('decideAndSign', () => {
     const documentId = await aDocument();
     const approvalId = await anApproval();
 
-    const decided = await decideAndSign(signPayload(approvalId, documentId), {
-      businessId: BUSINESS,
-    });
+    const decided = await withBusiness(BUSINESS, (bdb) => decideAndSign(bdb, signPayload(approvalId, documentId)));
 
     expect(decided.state).toBe('approved');
-    expect((await loadSignature(documentId, { businessId: BUSINESS }))?.approvalId).toBe(approvalId);
-    expect((await queryAudit({ businessId: BUSINESS, kind: 'signature' })).length).toBe(1);
+    expect((await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId)))?.approvalId).toBe(approvalId);
+    expect((await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'signature' }))).length).toBe(1);
   });
 
   it('leaves no signature and no audit row when the approval was denied after the guard read it', async () => {
@@ -161,15 +159,15 @@ describe('decideAndSign', () => {
     // `approval.state` and `decide`'s own predicate; here it simply happens
     // before the call, which puts `decideAndSign` in exactly the state that
     // window would leave it in.
-    await decide(approvalId, 'denied', { by: 'owner', channel: 'dashboard' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => decide(bdb, approvalId, 'denied', { by: 'owner', channel: 'dashboard' }));
 
     await expect(
-      decideAndSign(signPayload(approvalId, documentId), { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => decideAndSign(bdb, signPayload(approvalId, documentId))),
     ).rejects.toThrow(/already denied/);
 
-    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
-    expect(await queryAudit({ businessId: BUSINESS, kind: 'signature' })).toEqual([]);
-    expect((await getApproval(approvalId, { businessId: BUSINESS }))?.state).toBe('denied');
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'signature' }))).toEqual([]);
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)))?.state).toBe('denied');
   });
 
   it('leaves no signature and no audit row when the fuse burned out after the guard read it', async () => {
@@ -177,18 +175,17 @@ describe('decideAndSign', () => {
     // A minute of TTL, then pushed into the past — what `expireOverdue` or a
     // slow file read does to a request the guard already waved through.
     const approvalId = await anApproval(1);
-    const { getPool } = await import('../db/pool.js');
-    await getPool().query(
+    await testDb().query(
       `UPDATE approval_requests SET expires_at = now() - interval '1 minute'
         WHERE approval_id = $1 AND business_id = $2`,
       [approvalId, BUSINESS],
     );
 
     await expect(
-      decideAndSign(signPayload(approvalId, documentId), { businessId: BUSINESS }),
+      withBusiness(BUSINESS, (bdb) => decideAndSign(bdb, signPayload(approvalId, documentId))),
     ).rejects.toThrow(/expired/);
 
-    expect(await loadSignature(documentId, { businessId: BUSINESS })).toBeNull();
-    expect(await queryAudit({ businessId: BUSINESS, kind: 'signature' })).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => loadSignature(bdb, documentId))).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'signature' }))).toEqual([]);
   });
 });

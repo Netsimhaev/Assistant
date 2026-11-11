@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -30,9 +30,7 @@ const BUSINESS = 'test-business';
 async function openParentJob(
   options: { provenance?: TrustLevel; version?: string } = {},
 ): Promise<{ job: Job; bundle: PolicyBundle }> {
-  const bundle = await installCharter(buildCharter({ version: options.version ?? `parent-${ulid()}` }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: options.version ?? `parent-${ulid()}` }))); // TENANCY-TODO(task 4)
   const created = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: options.provenance ?? 'boss',
@@ -109,8 +107,8 @@ function anAncestorEnvelope(overrides: Partial<AgentEnvelope> = {}): AgentEnvelo
 
 /** Persist an ancestor envelope and mark it as having opened `childJobId` — what `loadEnvelopeWithChild` checks. */
 async function seedAncestor(envelope: AgentEnvelope, childJobId: string): Promise<void> {
-  await writeEnvelope(envelope, { parentJobId: `JOB-ancestor-of-${childJobId}`, businessId: BUSINESS });
-  await attachChildJob(envelope.id, childJobId, { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: `JOB-ancestor-of-${childJobId}` })); // TENANCY-TODO(task 4)
+  await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, envelope.id, childJobId)); // TENANCY-TODO(task 4)
 }
 
 async function anExtractedDocument(text: string): Promise<string> {
@@ -190,7 +188,7 @@ describe('requestHelp', () => {
     const result = await requestHelp(baseRequest(job, bundle, { now }));
     if (result.status !== 'opened') throw new Error('expected opened');
 
-    const envelope = await loadEnvelope(result.envelopeId, { businessId: BUSINESS });
+    const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, result.envelopeId)); // TENANCY-TODO(task 4)
     expect(envelope).not.toBeNull();
     // The parent job's own provenance ('staff') is stricter than the root
     // ancestor's unrestricted baseline ('boss'), and it is the one that must
@@ -233,7 +231,7 @@ describe('requestHelp', () => {
     const result = await requestHelp(baseRequest(job, bundle, { parentEnvelope: priorEnvelope, now }));
     if (result.status !== 'opened') throw new Error('expected opened');
 
-    const envelope = await loadEnvelope(result.envelopeId, { businessId: BUSINESS });
+    const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, result.envelopeId)); // TENANCY-TODO(task 4)
     expect(envelope?.correlationId).toBe('JOB-root-of-the-tree');
     expect(envelope?.correlationId).not.toBe(job.jobId);
     expect(envelope?.hops).toBe(3);
@@ -358,7 +356,7 @@ describe('requestHelp', () => {
     const result = await requestHelp(baseRequest(job, bundle, { parentEnvelope: lied, now }));
     if (result.status !== 'opened') throw new Error('expected opened');
 
-    const envelope = await loadEnvelope(result.envelopeId, { businessId: BUSINESS });
+    const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, result.envelopeId)); // TENANCY-TODO(task 4)
     // The row's values win, not the lied-about ones.
     expect(envelope?.hops).toBe(4); // real.hops (3) + 1, not the claimed 0 + 1
     expect(envelope?.correlationId).toBe('JOB-real-root');
@@ -445,7 +443,7 @@ describe('requestHelp', () => {
       hops: 0,
       idempotencyKey,
     });
-    await writeEnvelope(fabricated, { parentJobId: 'JOB-unrelated', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, fabricated, { parentJobId: 'JOB-unrelated' })); // TENANCY-TODO(task 4)
 
     const before = await countJobs();
     const result = await requestHelp(request);
@@ -485,9 +483,9 @@ describe('requestHelp', () => {
       hops: 0,
       idempotencyKey,
     });
-    await writeEnvelope(fabricated, { parentJobId: 'JOB-unrelated-3', businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, fabricated, { parentJobId: 'JOB-unrelated-3' })); // TENANCY-TODO(task 4)
     const knownChildJobId = `J-${ulid()}`;
-    await attachChildJob(fabricated.id, knownChildJobId, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, fabricated.id, knownChildJobId)); // TENANCY-TODO(task 4)
 
     const result = await requestHelp(request);
     expect(result.status).toBe('duplicate');
@@ -616,9 +614,7 @@ describe('requestHelp', () => {
     // actually satisfy the foreign key for, and `openParentJob` (which
     // installs a fresh, uniquely-versioned charter per call) would give the
     // two jobs two different ones.
-    const bundle = await installCharter(buildCharter({ version: `siblings-${ulid()}` }), {
-      businessId: BUSINESS,
-    });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `siblings-${ulid()}` }))); // TENANCY-TODO(task 4)
     async function jobUnderSharedCharter(): Promise<Job> {
       const created = await createJob({
         charterVersion: bundle.charterVersion,

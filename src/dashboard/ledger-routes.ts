@@ -12,7 +12,7 @@
  */
 import type { ServerResponse } from 'node:http';
 import { loadActiveCharter } from '../charter/store.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { LedgerFamily, LedgerMode, isLedgerOverdue, type LedgerItem } from '../domain/ledger.js';
 import {
   addCriticalRule,
@@ -66,7 +66,7 @@ const EVENTS_SHOWN = 5;
 /** The charter's own zone and currency; stated stand-ins (`UTC`, `ILS`) only when no readable charter exists. */
 async function charterContext(businessId: string): Promise<{ timeZone: string; currency: string }> {
   try {
-    const active = await loadActiveCharter(businessId);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
     if (active !== null) {
       return { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency };
     }

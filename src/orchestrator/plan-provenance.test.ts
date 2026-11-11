@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -105,7 +105,7 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
    * next test, by the mechanism that can actually express it.
    */
   it('asks even when the boss instructed it and nothing was read', async () => {
-    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
     const job = await jobInExecute(bundle);
     const sent: MailMessage[] = [];
 
@@ -133,12 +133,12 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
    * only difference.
    */
   it('sends when the owner’s own instruction named that recipient', async () => {
-    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
     const job = await jobInExecute(bundle);
-    await grantAuthorization(
-      { jobId: job.jobId, actionClass: 'email.initiate', recipients: ['stranger@example.com'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization( // TENANCY-TODO(task 4)
+      bdb,
+      { jobId: job.jobId, actionClass: 'email.initiate', recipients: ['stranger@example.com'] }
+    ));
     const sent: MailMessage[] = [];
 
     const result = await runPlan({
@@ -152,7 +152,7 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
   });
 
   it('still asks when the job has already ingested content', async () => {
-    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
     const job = await jobInExecute(bundle);
     await markContentIngested(job.jobId, { businessId: BUSINESS });
     const fresh = await loadJob(job.jobId, { businessId: BUSINESS });
@@ -177,7 +177,7 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
   });
 
   it('still asks when the plan itself contains a reader, even after the send step', async () => {
-    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
     const job = await jobInExecute(bundle);
     const sent: MailMessage[] = [];
 
@@ -226,7 +226,7 @@ describe('a boss origin is no longer an exemption, and what replaced it', () => 
    * property most easily lost by a later edit to the fixture's ceilings.
    */
   it('still asks when the job did not come from the boss', async () => {
-    const bundle = await installCharter(permissiveCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, permissiveCharter())); // TENANCY-TODO(task 4)
     const job = await jobInExecute(bundle, 'staff');
     const sent: MailMessage[] = [];
 

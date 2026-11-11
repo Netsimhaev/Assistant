@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -27,7 +27,7 @@ const GOOD_PLAN = {
 };
 
 async function bundle(): Promise<PolicyBundle> {
-  return installCharter(buildCharter(), { businessId: BUSINESS });
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
 }
 
 beforeEach(async () => {

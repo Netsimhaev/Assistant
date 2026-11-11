@@ -32,7 +32,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -117,7 +117,7 @@ async function envelopes(): Promise<Envelope[]> {
 describe('the verification loop, end to end through schedulerPass', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   });
 
   it('cards a document, delegates, parks, wakes, judges, and closes', async () => {
@@ -220,7 +220,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
       // Nothing judged yet, and the absence says "still running" — the one
       // meaning `verification_verdicts` reserves for a missing row.
       expect(judgeCalls).toBe(0);
-      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toBeNull();
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull(); // TENANCY-TODO(task 4)
 
       // ---- Pass 2 -------------------------------------------------------
       // `resumeDelegatedJobs` writes the `result` envelope and wakes the
@@ -236,7 +236,7 @@ describe('the verification loop, end to end through schedulerPass', () => {
       const finished = await loadJob(verifyJobId, { businessId: BUSINESS });
       expect(finished?.phase).toBe('closed');
 
-      const outcome = await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS });
+      const outcome = await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId)); // TENANCY-TODO(task 4)
       expect(outcome?.status).toBe('judged');
       if (outcome === null || outcome.status !== 'judged') throw new Error('expected a verdict');
       expect(outcome.verdict.criteria).toHaveLength(1);

@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
 import { CLOSURE_VERB_WORDS } from '../governance/closure-command.js';
 import { DOCUMENT_SETTINGS_DEFAULTS, saveDocumentSettings } from '../governance/document-settings.js';
@@ -129,7 +129,7 @@ async function card(destination: ProductionDestination, deliveredAgoMs: number |
 describe('the WhatsApp time gate inside approveDocumentCard', () => {
   beforeEach(async () => {
     await resetDatabase();
-    await installCharter(buildCharter({ version: 'v-gate' }), { businessId: B });
+    await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'v-gate' }))); // TENANCY-TODO(task 4)
     // A save option needs somewhere to save to (M4); the gate under test is time.
     await saveDocumentSettings({ ...DOCUMENT_SETTINGS_DEFAULTS, baseFolder: tmpdir() }, { businessId: B });
   });

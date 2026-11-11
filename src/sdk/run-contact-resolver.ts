@@ -44,7 +44,7 @@
  * outbound message nobody asked for.
  */
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { writeMemory, retireMemories } from '../memory/store.js';
@@ -216,7 +216,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const charter = await loadActiveCharter(BUSINESS);
+  const charter = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
   if (charter === null) {
     console.error(`אין תקנון פעיל ל-${BUSINESS}. הרץ scripts/seed-charter.ts תחילה.`);
     process.exitCode = 1;

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, withTransaction } from '../db/pool.js';
+import { closePool, getPool, withTransaction, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -68,10 +68,10 @@ async function install(
   overrides: Parameters<typeof buildCharter>[0] = {},
 ): Promise<PolicyBundle> {
   charterCounter += 1;
-  return installCharter(
-    buildCharter({ ...overrides, version: `wa-report-${charterCounter}` }),
-    { businessId: BUSINESS },
-  );
+  return withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    bdb,
+    buildCharter({ ...overrides, version: `wa-report-${charterCounter}` })
+  ));
 }
 
 async function reload(jobId: string): Promise<Job> {
@@ -586,7 +586,7 @@ describe('reportWhatsAppJobs', () => {
 
     // `decide` alone — the row leaves `pending`, but the job's own phase is
     // untouched (still `await_approval`), the exact race window named above.
-    await decide(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 4)
     expect((await reload(job.jobId)).phase).toBe('await_approval');
 
     const messenger = fakeMessenger();

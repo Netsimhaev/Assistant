@@ -25,7 +25,7 @@
  * describes, and precisely what `sign-decision.test.ts` drives.
  */
 
-import { withTransaction } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import type { AuditEntryInput } from '../domain/audit.js';
 import { decide, type ApprovalRequest, type Decision } from './approvals.js';
@@ -65,15 +65,12 @@ export interface SignAndDecideInput {
  * is the same defect this module was written to remove.
  */
 export async function decideAndSign(
+  db: BusinessDb,
   input: SignAndDecideInput,
-  options: { businessId?: string } = {},
 ): Promise<ApprovalRequest> {
-  const businessId = options.businessId;
-  const scope = businessId !== undefined ? { businessId } : {};
-
-  return withTransaction(async (tx) => {
-    await recordSignature(input.signature, { ...scope, db: tx });
-    await appendAudit(input.audit, { ...scope, tx });
-    return decide(input.approvalId, 'approved', input.decision, { ...scope, db: tx });
+  return transaction(db, async (tx) => {
+    await recordSignature(tx, input.signature);
+    await appendAudit(tx, input.audit);
+    return decide(tx, input.approvalId, 'approved', input.decision);
   });
 }

@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { DocxSpec } from '../domain/document-spec.js';
 import type { Plan } from '../domain/plan.js';
 import { DOCUMENT_SETTINGS_HE, loadDocumentSettings } from '../governance/document-settings.js';
@@ -52,7 +52,7 @@ let uploadRoot = '';
 beforeEach(async () => {
   await resetDatabase();
   await createOwner({ username: USERNAME, password: PASSWORD, businessId: B });
-  await installCharter(buildCharter({ version: 'gate-charter' }), { businessId: B });
+  await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
   uploadRoot = await mkdtemp(join(tmpdir(), 'doc-routes-'));
 });
 afterEach(async () => {
@@ -461,7 +461,7 @@ describe('/documents', () => {
   it('another business cannot see or download the card', async () => {
     const a = await card();
     await createOwner({ username: 'other', password: PASSWORD, businessId: 'other-business' });
-    await installCharter(buildCharter({ version: 'gate-charter' }), { businessId: 'other-business' });
+    await withBusiness('other-business', (bdb) => installCharter(bdb, buildCharter({ version: 'gate-charter' }))); // TENANCY-TODO(task 10)
     server = createServer({ businessId: 'other-business', port: 0 });
     await once(server, 'listening');
     const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;

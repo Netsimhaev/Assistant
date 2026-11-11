@@ -1,3 +1,4 @@
+import { config } from '../config.js';
 import type {
   HookJSONOutput,
   PreToolUseHookInput,
@@ -5,7 +6,7 @@ import type {
 import type { AgentId } from '../domain/audit.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import type { AutonomyLevel, TrustLevel } from '../domain/trust.js';
-import type { Queryable } from '../db/pool.js';
+import { withBusiness, type Queryable } from '../db/pool.js';
 import { evaluateToolCall } from '../policy/engine.js';
 import { ingestsExternalContent } from '../policy/classify.js';
 import { markContentIngested } from '../orchestrator/jobs.js';
@@ -149,7 +150,7 @@ async function decide(
       }
     }
 
-    const decision = await evaluateToolCall(
+    const decision = await withBusiness(binding.businessId ?? config.businessId, (db) => evaluateToolCall( // TENANCY-TODO(task 7)
       translated.internal,
       hook.tool_input,
       {
@@ -160,15 +161,14 @@ async function decide(
         counterpartyTags: binding.counterpartyTags,
         rampLevel: binding.rampLevel,
         ...(binding.now !== undefined ? { now: binding.now } : {}),
-        ...(binding.businessId !== undefined ? { businessId: binding.businessId } : {}),
+        db,
         jobId: binding.jobId,
         ...(binding.envelopeId !== undefined ? { envelopeId: binding.envelopeId } : {}),
         ...(binding.autonomyCeiling !== undefined
           ? { autonomyCeiling: binding.autonomyCeiling }
           : {}),
-        ...(binding.db !== undefined ? { db: binding.db } : {}),
       },
-    );
+    ));
 
     if (decision.outcome === 'allow') {
       binding.onDecision?.({ tool: translated.internal, decision: 'allow', code: 'allow' });

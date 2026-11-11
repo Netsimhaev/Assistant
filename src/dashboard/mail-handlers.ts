@@ -14,7 +14,7 @@ import type { ServerResponse } from 'node:http';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { loadDocument } from '../documents/store.js';
 import { AttachmentDocType } from '../domain/mail-triage.js';
 import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
@@ -52,7 +52,7 @@ export function notFound(res: ServerResponse): void {
 /** The charter's own zone; `UTC` only when no readable charter exists (a stated stand-in, not a silent default). */
 async function charterTimeZone(businessId: string): Promise<string> {
   try {
-    const active = await loadActiveCharter(businessId);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
     return active?.charter.identity.timezone ?? 'UTC';
   } catch {
     return 'UTC';

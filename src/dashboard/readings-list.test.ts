@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -214,7 +214,7 @@ describe('recentReadings', () => {
   // I2: the approval-link path — the reason this screen exists — was never
   // exercised by a real reading -> proposal -> job -> approval chain.
   it('carries the approval id through a full reading -> proposal -> job -> approval chain', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
 
     await seedDocument(BUSINESS, 'DOC-3');
@@ -240,7 +240,7 @@ describe('recentReadings', () => {
   // pick either — `a.approval_id DESC` breaks the tie deterministically, the
   // same way `documentForApproval` already breaks its own proposal tie.
   it('breaks a same-timestamp approval tie deterministically, by approval id', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
 
     await seedDocument(BUSINESS, 'DOC-TIE');
@@ -289,7 +289,7 @@ describe('recentReadings', () => {
 
   // Same concern, for the approval lateral's own `a.business_id = r.business_id`.
   it("is not fooled by a foreign business's later approval on the same job", async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const job = await createJob({ charterVersion: bundle.charterVersion, provenance: 'boss', businessId: BUSINESS });
 
     await seedDocument(BUSINESS, 'DOC-5');

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -47,9 +47,7 @@ function mailPlan(to: string): Plan {
 }
 
 async function withCharter(): Promise<void> {
-  await installCharter(buildCharter({ connections: [MAIL_CONNECTION] }), {
-    businessId: BUSINESS,
-  });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION] }))); // TENANCY-TODO(task 4)
 }
 
 describe('runInstruction', () => {
@@ -86,10 +84,10 @@ describe('runInstruction', () => {
   });
 
   it("shows an amount in the question in the charter's currency, never a hard-coded shekel", async () => {
-    await installCharter(
-      buildCharter({ version: '2026-08-15.usd', currency: 'USD', connections: [MAIL_CONNECTION] }),
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
+      buildCharter({ version: '2026-08-15.usd', currency: 'USD', connections: [MAIL_CONNECTION] })
+    ));
     const base = mailPlan('dana@example.com');
     const step = base.steps[0];
     if (step === undefined) throw new Error('unreachable');
@@ -437,7 +435,7 @@ describe('runInstruction', () => {
    * fail this test rather than leaving the suite green.
    */
   it('passes the planner a memory block for an address the instruction names', async () => {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -480,7 +478,7 @@ describe('runInstruction', () => {
    * (see the boss-command block below); past three, today's question stays.
    */
   it('stops and asks when a name fits more than three contacts, and plans nothing', async () => {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -553,7 +551,7 @@ describe('runInstruction', () => {
    * which both identifies the person and authorises writing to them.
    */
   it('tells the owner to type the address when neither candidate has a distinguishing detail', async () => {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -604,7 +602,7 @@ describe('runInstruction', () => {
    * test rather than leaving the suite green.
    */
   it('resolves a name to memory and hands it to the planner', async () => {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -658,7 +656,7 @@ describe('runInstruction', () => {
    * must not stop the job a second time — it proceeds with no memory instead.
    */
   it('does not ask a second time once an answer has come back', async () => {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -706,7 +704,7 @@ describe('runInstruction', () => {
    * The sentence must also say what actually works: giving the address.
    */
   it('says so when it proceeds without memory after an answer', async () => {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -862,7 +860,7 @@ describe('saying she went ahead without the memory when the planner asks too', (
 
   /** Two people called רונית, so the name cannot be settled from contacts alone. */
   async function seedTwoRonits(): Promise<void> {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -890,7 +888,7 @@ describe('saying she went ahead without the memory when the planner asks too', (
   }
 
   async function seedTwoMoreRonits(): Promise<void> {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const seedJob = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -1059,14 +1057,14 @@ describe('an instruction whose text came from a recording', () => {
     // from today's keystrokes: it survives a recording, and over-tightening
     // here — gating the whole filter on the origin instead of the verbatim
     // arm — fails this test while the first one above stays green.
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         version: '2026-08-15.2',
         connections: [MAIL_CONNECTION],
         knownCounterpartyEmailDomain: 'example.com',
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
 
     const result = await runInstruction(
       // No address in the text at all, so nothing but the charter can
@@ -1128,7 +1126,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
   }
 
   async function seedJob(provenance: 'boss' | 'unknown_external'): Promise<string> {
-    const active = await loadActiveCharter(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
     if (active === null) throw new Error('unreachable');
     const job = await createJob({
       charterVersion: active.charter.charterVersion,
@@ -1595,7 +1593,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     }
 
     it('hands the planner the open ledger items AFTER the memory block, to every planner call', async () => {
-      const active = await loadActiveCharter(BUSINESS);
+      const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
       const job = await createJob({ charterVersion: active!.charter.charterVersion, provenance: 'boss', businessId: BUSINESS, title: 't' });
       const existing = await createLedgerItem(
         {
@@ -1651,7 +1649,7 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     }
 
     async function anItem(description: string): Promise<string> {
-      const active = await loadActiveCharter(BUSINESS);
+      const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
       const job = await createJob({ charterVersion: active!.charter.charterVersion, provenance: 'boss', businessId: BUSINESS, title: 't' });
       const created = await createLedgerItem(
         {
@@ -1729,10 +1727,10 @@ describe('an instruction with a side effect waits for one confirmation', () => {
     });
 
     it('F-I4d: an address the charter knows is not flagged unverified in the echo, as the handler stores it', async () => {
-      await installCharter(
-        buildCharter({ version: 'known-acme', connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'acme.example' }),
-        { businessId: BUSINESS },
-      );
+      await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+        bdb,
+        buildCharter({ version: 'known-acme', connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'acme.example' })
+      ));
       const plan = ledgerStepPlan('ledger.add', { family: 'awaiting_reply', description: 'תשובה', counterpartyEmail: 'dana@acme.example' });
       const result = await runInstruction(
         { text: 'תרשמי שמחכה לתשובה מדנה' }, // the address is NOT typed

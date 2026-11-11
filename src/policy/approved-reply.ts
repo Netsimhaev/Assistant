@@ -1,5 +1,3 @@
-import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
 import type { ActionFacts } from '../domain/policy.js';
 import type { GateContext } from './engine.js';
 
@@ -68,8 +66,8 @@ export async function approvedReplyCovers(
   if (typeof ctx.jobId !== 'string') return false;
   if (facts.actionClass !== 'email.reply') return false;
 
-  const businessId = ctx.businessId ?? config.businessId;
-  const db = ctx.db ?? getPool();
+  const db = ctx.db;
+  const businessId = db.businessId;
   const { rows } = await db.query<{ approval_id: string }>(
     `SELECT approval_id
        FROM approval_requests

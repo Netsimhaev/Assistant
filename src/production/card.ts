@@ -79,7 +79,7 @@ import { ulid } from 'ulid';
 import { z } from 'zod';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { getPool, withTransaction, withBusiness, type Queryable } from '../db/pool.js';
 import { FORMAT_MEDIA_TYPE, formatAttachmentSize, type AttachmentRef } from '../domain/attachment-ref.js';
 import { DocumentCardState } from '../domain/document-spec.js';
 import { documentKindLabel } from '../domain/labels.js';
@@ -499,9 +499,9 @@ async function recordNoticeFailure(
 }
 
 /** The active charter's currency, or `null` when the charter is missing or unreadable. */
-async function charterCurrency(businessId: string, db: Queryable): Promise<string | null> {
+async function charterCurrency(businessId: string, _db: Queryable): Promise<string | null> {
   try {
-    const active = await loadActiveCharter(businessId, db);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
     return active === null ? null : active.bundle.ceilings.currency;
   } catch {
     return null;
@@ -728,7 +728,7 @@ export async function approveDocumentCard(
       if (settings.baseFolder === null) return { status: 'no_base_folder', reason: SAVE_NO_BASE_FOLDER_HE };
     }
 
-    const active = await loadActiveCharter(businessId, tx);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
     if (active === null) throw new Error(`approveDocumentCard: no active charter for ${businessId}`);
 
     const job = await createJob({
@@ -915,7 +915,7 @@ async function resendAfterTypedAddress(
     const db = getPool();
     let active: Awaited<ReturnType<typeof loadActiveCharter>>;
     try {
-      active = await loadActiveCharter(businessId, db);
+      active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
     } catch {
       return 'skipped_charter_unreadable';
     }
@@ -993,7 +993,7 @@ export async function requestFix(
     const origin: InstructionTextOrigin =
       production.textOrigin === 'typed' && textOrigin === 'typed' ? 'typed' : 'transcribed';
 
-    const active = await loadActiveCharter(businessId, tx);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
     if (active === null) throw new Error(`requestFix: no active charter for ${businessId}`);
     const perDay = options.perDay ?? config.documentsPerDay;
     if ((await productionsToday(businessId, active.charter.identity.timezone, tx, options.now)) >= perDay) {

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -151,7 +151,7 @@ function twoStepPlan(body = 'שלום'): Plan {
  * `new@example.com` are the ones whose second step is *supposed* to queue.
  */
 async function install(connections: CharterConnection[]): Promise<PolicyBundle> {
-  return installCharter(buildCharter({ connections, knownCounterpartyEmailDomain: 'b.com' }), { businessId: BUSINESS });
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections, knownCounterpartyEmailDomain: 'b.com' }))); // TENANCY-TODO(task 4)
 }
 
 async function jobInExecute(bundle: PolicyBundle): Promise<Job> {
@@ -331,7 +331,7 @@ describe('a resumed plan does not re-run what already ran', () => {
     expect(second.status).toBe('done');
     expect(second.steps[1]?.outcome.status).toBe('done');
     expect(mailsTo(sent, 'new@example.com')).toBe(1);
-    const queuedTwice = await pendingApprovals({ businessId: BUSINESS });
+    const queuedTwice = await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb)); // TENANCY-TODO(task 4)
     expect(queuedTwice).toHaveLength(0);
   });
 
@@ -496,7 +496,7 @@ describe('the real entry point closes the approval loop, not only runPlan called
     expect(sent).toHaveLength(1);
     expect(mailsTo(sent, 'new@example.com')).toBe(1);
     // And nothing asked the boss again.
-    expect(await pendingApprovals({ businessId: BUSINESS })).toHaveLength(0);
+    expect(await withBusiness(BUSINESS, (bdb) => pendingApprovals(bdb))).toHaveLength(0); // TENANCY-TODO(task 4)
   });
 });
 

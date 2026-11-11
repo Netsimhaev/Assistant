@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -78,7 +78,7 @@ describe('the gate hook marks content-ingestion on its own path', () => {
   });
 
   it('marks the job when an allowed tool ingests external content', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
     const jobId = await newJob(bundle);
 
     const { decision } = await callHook(bundle, 'know.reader', 'Read', {
@@ -90,7 +90,7 @@ describe('the gate hook marks content-ingestion on its own path', () => {
   });
 
   it('leaves the flag false when an allowed tool does not ingest content', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
     const jobId = await newJob(bundle);
 
     // `escalate_to_human` is read-only and carries no external content — it is
@@ -110,7 +110,7 @@ describe('the gate hook marks content-ingestion on its own path', () => {
   });
 
   it('does not mark when the gate denies a reading tool', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
     const jobId = await newJob(bundle);
 
     // Climbs out of the document root — denied at the path-scoping check
@@ -125,7 +125,7 @@ describe('the gate hook marks content-ingestion on its own path', () => {
   });
 
   it('does not error when a reading tool runs with an explicit null jobId', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
 
     const { decision } = await callHook(
       bundle,
@@ -139,7 +139,7 @@ describe('the gate hook marks content-ingestion on its own path', () => {
   });
 
   it('fails closed instead of allowing when the jobId matches no row', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 7)
 
     // Never created via `createJob` — stands in for a stale id, a typo, or a
     // job that belongs to another business. `markContentIngested`'s UPDATE

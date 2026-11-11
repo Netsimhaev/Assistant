@@ -9,8 +9,7 @@
  */
 
 import { DatabaseError } from 'pg';
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 /** Postgres' unique/primary-key-violation error code (see `src/cli/create-owner.ts`). */
 const UNIQUE_VIOLATION = '23505';
@@ -95,11 +94,10 @@ export class DocumentAlreadySignedError extends Error {
 
 /** Store the owner's signature on a document. One per document; a second throws `DocumentAlreadySignedError`. */
 export async function recordSignature(
+  db: BusinessDb,
   input: NewSignature,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<SignatureRecord> {
-  const db = options.db ?? getPool();
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   try {
     const { rows } = await db.query<SignatureRow>(
@@ -135,13 +133,12 @@ export async function recordSignature(
 
 /** The signature on a document, if any. */
 export async function loadSignature(
+  db: BusinessDb,
   documentId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<SignatureRecord | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<SignatureRow>(
     `SELECT ${COLUMNS} FROM signatures WHERE business_id = $1 AND document_id = $2`,
-    [options.businessId ?? config.businessId, documentId],
+    [db.businessId, documentId],
   );
   const row = rows[0];
   return row === undefined ? null : toSignature(row);

@@ -1,5 +1,4 @@
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 /**
  * Why an approval could not be spent. Diagnostic only — every one of these is
@@ -35,8 +34,6 @@ export interface ConsumeInput {
   toolName: string;
   /** Hash of the input that is about to run, not of what was proposed. */
   liveInputHash: string;
-  businessId?: string;
-  db?: Queryable;
 }
 
 /**
@@ -72,9 +69,11 @@ export interface ConsumeInput {
  * code in falling through to the normal path, which queues a FRESH request.
  * The action is still wanted; what ran out was the fuse on the question.
  */
-export async function consumeApproval(input: ConsumeInput): Promise<ConsumeOutcome> {
-  const businessId = input.businessId ?? config.businessId;
-  const db = input.db ?? getPool();
+export async function consumeApproval(
+  db: BusinessDb,
+  input: ConsumeInput,
+): Promise<ConsumeOutcome> {
+  const businessId = db.businessId;
 
   const claimed = await db.query<{ approval_id: string }>(
     `UPDATE approval_requests

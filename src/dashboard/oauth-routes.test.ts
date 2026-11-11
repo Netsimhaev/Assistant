@@ -28,7 +28,7 @@ import {
   GOOGLE_CLIENT_SECRET_REF,
 } from '../orchestrator/adapters/google-token-http.js';
 import { loadBindings, upsertBinding } from '../orchestrator/bindings.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { buildCharter } from '../test/fixtures.js';
 import { resetDatabase } from '../test/db.js';
 import { createOwner } from './auth.js';
@@ -198,7 +198,7 @@ async function beginConsent(baseUrl: string, cookie: string, system = SYSTEM): P
 
 describe('GET /oauth/:system/start', () => {
   beforeEach(async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
   });
 
   it('redirects to Google carrying a fresh state and PKCE challenge, and requires a session', async () => {
@@ -272,13 +272,13 @@ describe('GET /oauth/:system/start', () => {
    * the (a) half of the four-part fix: the ceremony itself refuses.
    */
   it('refuses to start the ceremony on a connection that does not serve a calendar tool (item 1a) — no state, no grant, no binding write', async () => {
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+      bdb,
       buildCharter({
         version: '2026-08-15.2-item1a',
         connections: [CALENDAR_CONNECTION, MAIL_ONLY_CONNECTION],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
 
@@ -305,13 +305,13 @@ describe('GET /oauth/:system/start', () => {
    * be "fixed" by refusing everything.
    */
   it('still starts the ceremony on a connection that does serve a calendar tool, under the same charter that refuses mail', async () => {
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+      bdb,
       buildCharter({
         version: '2026-08-15.2-item1a-positive',
         connections: [CALENDAR_CONNECTION, MAIL_ONLY_CONNECTION],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
 
@@ -336,7 +336,8 @@ describe('GET /oauth/:system/start', () => {
     // `calendar.read` for the same (catch-all) target, so this connection
     // alone both satisfies eligibility (channel `api`, serves
     // `calendar.read`) and isolates the SHAPE refusal this test is about.
-    await installCharter(
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+      bdb,
       buildCharter({
         version: '2026-08-15.2-item1c',
         connections: [
@@ -349,9 +350,8 @@ describe('GET /oauth/:system/start', () => {
             subprocessor: null,
           },
         ],
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const baseUrl = await startServer({ oauthFetch: successfulProviderFetch() });
     const cookie = await loginWithPassword(baseUrl);
 
@@ -370,7 +370,7 @@ describe('GET /oauth/:system/start', () => {
 
 describe('GET /oauth/callback', () => {
   beforeEach(async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
   });
 
   it('writes a grant and the binding provider on a correct state, and shows the restart note', async () => {
@@ -407,7 +407,7 @@ describe('GET /oauth/callback', () => {
     // operator-provisioned secret ref of the same shape.
     expect(binding?.credentialRef).toBe('OAUTH_OFFICE_CALENDAR');
 
-    const audit = await queryAudit({ businessId: BUSINESS, kind: 'credential_change' });
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' })); // TENANCY-TODO(task 10)
     expect(audit.some((row) => row.reason.includes(SYSTEM))).toBe(true);
     // M11: extend the "no secrets" assertion beyond the two tokens above to
     // the app's own client secret — on the page and in the permanent record.
@@ -581,7 +581,7 @@ describe('GET /oauth/callback', () => {
 
 describe('POST /oauth/:system/revoke', () => {
   beforeEach(async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
   });
 
   async function grantedSystem(baseUrl: string, cookie: string): Promise<void> {
@@ -610,7 +610,7 @@ describe('POST /oauth/:system/revoke', () => {
     // no longer readable through the ordinary path, which is the point.
     expect(await readGrantBySystem(SYSTEM, BUSINESS, key)).toBeNull();
 
-    const audit = await queryAudit({ businessId: BUSINESS, kind: 'credential_change' });
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' })); // TENANCY-TODO(task 10)
     expect(audit.some((row) => row.reason.includes('revoked'))).toBe(true);
   });
 
@@ -700,7 +700,7 @@ describe('POST /oauth/:system/revoke', () => {
     );
     expect(rows[0]?.revoked_at).not.toBeNull();
 
-    const audit = await queryAudit({ businessId: BUSINESS, kind: 'credential_change' });
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' })); // TENANCY-TODO(task 10)
     const revokeRow = audit.find((row) => row.reason.includes('revoked locally'));
     expect(revokeRow?.reason).toContain('master key');
     expect(revokeRow?.reason).not.toContain('no live grant was found');
@@ -763,9 +763,7 @@ describe('GET /connections', () => {
   });
 
   it('shows a declared connection that was never authorised under its group heading, and never hides an unrecognised one', async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION, UNKNOWN_CONNECTION] }), {
-      businessId: BUSINESS,
-    });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION, UNKNOWN_CONNECTION] }))); // TENANCY-TODO(task 10)
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
 
@@ -794,10 +792,10 @@ describe('GET /connections', () => {
    * refuses is a worse experience than no link.
    */
   it('hides the connect link for a connection that does not serve a calendar tool, while showing it for one that does', async () => {
-    await installCharter(
-      buildCharter({ connections: [CALENDAR_CONNECTION, MAIL_ONLY_CONNECTION] }),
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+      bdb,
+      buildCharter({ connections: [CALENDAR_CONNECTION, MAIL_ONLY_CONNECTION] })
+    ));
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
     const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
@@ -813,7 +811,7 @@ describe('GET /connections', () => {
   });
 
   it("shows an authorised connection's account and granted scopes, offers a revoke control, and never renders the refresh token itself", async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
     const secretToken = 'super-secret-refresh-token-value-should-never-render';
     await writeGrant(
       {
@@ -853,7 +851,7 @@ describe('GET /connections', () => {
   });
 
   it('reads a grant needing reauth as "דורש אישור מחדש", and a revoked grant as not yet authorised again', async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
     await writeGrant(
       {
         businessId: BUSINESS,
@@ -891,7 +889,7 @@ describe('GET /connections', () => {
   });
 
   it('tells the owner the scheduler only reads connections at process startup', async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
     const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
@@ -914,7 +912,7 @@ describe('GET /connections', () => {
    * say both halves, not the false one.
    */
   it('says authorising needs a restart AND that revoking takes effect immediately, not one sentence covering both', async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
     const baseUrl = await startServer();
     const cookie = await loginWithPassword(baseUrl);
     const res = await fetch(`${baseUrl}/connections`, { headers: { cookie } });
@@ -937,7 +935,7 @@ describe('GET /connections', () => {
    * on `lastError` being non-null.
    */
   it('shows a recorded operational error even though the binding status is still "live", and shows the last successful call', async () => {
-    await installCharter(buildCharter({ connections: [CALENDAR_CONNECTION] }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [CALENDAR_CONNECTION] }))); // TENANCY-TODO(task 10)
     await upsertBinding(
       {
         system: SYSTEM,
@@ -1022,9 +1020,7 @@ describe('mailbox ceremony', () => {
    */
   async function installMailboxCharter(provider: MailProvider): Promise<void> {
     const amendment = buildMailboxAmendment(buildCharter(), new Date(), provider);
-    await installCharter(signCharter(amendment, { signedByPersonId: USERNAME, method: 'dashboard_click' }), {
-      businessId: BUSINESS,
-    });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, signCharter(amendment, { signedByPersonId: USERNAME, method: 'dashboard_click' }))); // TENANCY-TODO(task 10)
   }
 
   /** The callback takes the initial cursor; no real provider in tests. */
@@ -1032,7 +1028,7 @@ describe('mailbox ceremony', () => {
     ({ initialCursor: async () => 'cursor-0' }) as unknown as MailboxClient;
 
   beforeEach(async () => {
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     await installMailboxCharter('microsoft');
     await putSecret(
       { businessId: BUSINESS, ref: 'MICROSOFT_OAUTH_CLIENT_ID', value: 'ms-client-id', updatedBy: 'test' },
@@ -1180,7 +1176,7 @@ describe('mailbox ceremony', () => {
     // The route swallows provider-call errors, so a throwing stub proves
     // nothing: count invocations, and check the audit row names the branch.
     expect(providerCalls).toBe(0);
-    const audit = await queryAudit({ businessId: BUSINESS, kind: 'credential_change' });
+    const audit = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'credential_change' })); // TENANCY-TODO(task 10)
     const latest = audit[audit.length - 1];
     expect(latest?.reason).toContain('no token revocation endpoint');
   });

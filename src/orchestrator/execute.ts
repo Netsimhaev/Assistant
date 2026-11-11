@@ -11,6 +11,7 @@ import { canonicalHash } from '../util/canonical.js';
 import { markContentIngested, transition } from './jobs.js';
 import { StepChannelError } from './step-error.js';
 import type { Job } from './jobs.js';
+import { withBusiness } from '../db/pool.js';
 
 /**
  * How long a step sleeps before a retryable channel failure is tried again.
@@ -243,7 +244,8 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
   // before it is allowed to influence anything at all.
   let effectiveInput = request.toolInput;
   if (request.approvalId !== undefined) {
-    const approval = await getApproval(request.approvalId, { businessId: job.businessId });
+    const approvalId = request.approvalId;
+    const approval = await withBusiness(job.businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
     if (
       approval?.jobId === job.jobId &&
       approval.state === 'approved_with_edit' &&
@@ -253,7 +255,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     }
   }
 
-  const decision = await evaluateToolCall(toolName, effectiveInput, {
+  const decision = await withBusiness(job.businessId, (db) => evaluateToolCall(toolName, effectiveInput, { // TENANCY-TODO(task 4)
     agent: request.agent,
     bundle,
     // The job's stamp, inherited by every step. `provenanceChainDerived` below
@@ -265,7 +267,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     // either, and it is deliberately not used as a discriminator anywhere.
     provenance: job.provenance,
     chainDepth: 0,
-    businessId: job.businessId,
+    db,
     jobId: job.jobId,
     counterpartyTags: request.counterpartyTags,
     rampLevel: request.rampLevel,
@@ -303,7 +305,7 @@ export async function executeStep(request: StepRequest): Promise<StepOutcome> {
     ...(request.autonomyCeiling !== undefined
       ? { autonomyCeiling: request.autonomyCeiling }
       : {}),
-  });
+  }));
 
   if (decision.outcome === 'queue_approval') {
     await transition(job.jobId, {
@@ -497,7 +499,8 @@ async function recordStepSpend(
   // passed the per-action cap while the daily total stayed at zero.
   if (!isMoneyBearing(actionClass, amountMinor)) return false;
 
-  return recordSpend(
+  return withBusiness(request.job.businessId, (bdb) => recordSpend( // TENANCY-TODO(task 4)
+    bdb,
     {
       jobId: request.job.jobId,
       actionClass,
@@ -509,8 +512,7 @@ async function recordStepSpend(
         input: effectiveInput,
       }),
     },
-    { businessId: request.job.businessId },
-  );
+  ));
 }
 
 /**

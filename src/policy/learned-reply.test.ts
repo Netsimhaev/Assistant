@@ -13,8 +13,8 @@
  * boring reason that something later refused instead.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter, type CharterOverrides } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { loadAutonomyMode, setAutonomyMode } from '../governance/autonomy-mode.js';
@@ -22,7 +22,7 @@ import { trip } from '../governance/killswitch.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { loadRampLevel, setRampLevel } from '../orchestrator/ramp.js';
 import { DENY_CODES } from '../domain/policy.js';
-import { evaluateToolCall, type GateContext } from './engine.js';
+import { evaluateFor, type TestGateContext } from '../test/gate.js';
 import { buildFacts } from './facts.js';
 import { LEARNED_REPLY_EXEMPTION_MARKER, learnedReplyCovers } from './learned-reply.js';
 import { linkReplyJob } from '../mail/inbox-store.js';
@@ -48,19 +48,19 @@ afterAll(async () => { await closePool(); });
 
 interface Setup {
   jobId: string;
-  ctx: GateContext;
+  ctx: TestGateContext;
 }
 
 async function setup(
   overrides: CharterOverrides = {},
   options: { link?: 'this' | 'none' | 'other-business'; mode?: 'learn' | 'off' } = {},
 ): Promise<Setup> {
-  const bundle = await installCharter(
-    buildCharter({ knownCounterpartyEmailDomain: 'client.example', ...overrides }),
-    { businessId: BUSINESS },
-  );
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+    bdb,
+    buildCharter({ knownCounterpartyEmailDomain: 'client.example', ...overrides })
+  ));
   await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-  await setAutonomyMode(options.mode ?? 'learn', 'owner', { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, options.mode ?? 'learn', 'owner'));
   const rampLevel = await loadRampLevel('email.reply', { businessId: BUSINESS });
   expect(rampLevel).toBe(options.mode === 'off' ? 'draft_only' : 'auto_notify');
 
@@ -96,7 +96,7 @@ async function setup(
 
 /** `job_step_results.job_id` has a foreign key to `jobs` only, so a row under another business is expressible. */
 async function stepResult(jobId: string, businessId: string, status: 'unknown' | 'completed'): Promise<void> {
-  await getPool().query(
+  await testDb().query(
     `INSERT INTO job_step_results (business_id, job_id, plan_hash, step_id, status)
      VALUES ($1, $2, 'h-earlier', 'reply', $3)`,
     [businessId, jobId, status],
@@ -104,26 +104,26 @@ async function stepResult(jobId: string, businessId: string, status: 'unknown' |
 }
 
 async function intentRows(): Promise<{ reason: string }[]> {
-  const { rows } = await getPool().query<{ reason: string }>(
+  const { rows } = await testDb().query<{ reason: string }>(
     `SELECT reason FROM audit_log WHERE business_id = $1 AND kind = 'intent_to_act' ORDER BY seq`,
     [BUSINESS],
   );
   return rows;
 }
 
-function expectDenied(decision: Awaited<ReturnType<typeof evaluateToolCall>>, code: string): void {
+function expectDenied(decision: Awaited<ReturnType<typeof evaluateFor>>, code: string): void {
   expect(decision.outcome).toBe('deny');
   if (decision.outcome !== 'deny') throw new Error('unreachable');
   expect(decision.code).toBe(code);
 }
 
 /** Denied AT stage 8: `draft_only`, and no `intent_to_act` row (written only at stage 10). */
-async function expectDeniedAtStage8(decision: Awaited<ReturnType<typeof evaluateToolCall>>): Promise<void> {
+async function expectDeniedAtStage8(decision: Awaited<ReturnType<typeof evaluateFor>>): Promise<void> {
   expectDenied(decision, DENY_CODES.draftOnly);
   expect(await intentRows()).toHaveLength(0);
 }
 
-async function expectAllowed(decision: Awaited<ReturnType<typeof evaluateToolCall>>): Promise<void> {
+async function expectAllowed(decision: Awaited<ReturnType<typeof evaluateFor>>): Promise<void> {
   expect(decision.outcome).toBe('allow');
   expect(await intentRows()).toHaveLength(1);
 }
@@ -131,12 +131,12 @@ async function expectAllowed(decision: Awaited<ReturnType<typeof evaluateToolCal
 describe('a learned reply to incoming mail passes the provenance ceiling', () => {
   it('allows the reply with no card, and marks the intent row', async () => {
     const s = await setup();
-    const decision = await evaluateToolCall('mail.send', REPLY, s.ctx);
+    const decision = await evaluateFor('mail.send', REPLY, s.ctx);
 
     await expectAllowed(decision);
     const [row] = await intentRows();
     expect(row?.reason.endsWith(` ${LEARNED_REPLY_EXEMPTION_MARKER}`)).toBe(true);
-    const { rows } = await getPool().query('SELECT 1 FROM approval_requests WHERE business_id = $1', [BUSINESS]);
+    const { rows } = await testDb().query('SELECT 1 FROM approval_requests WHERE business_id = $1', [BUSINESS]);
     expect(rows).toHaveLength(0);
   });
 
@@ -145,7 +145,7 @@ describe('a learned reply to incoming mail passes the provenance ceiling', () =>
     // passes WITHOUT the exemption (the job is not a mailbox reply job), and
     // the row must not claim it.
     const s = await setup({ provenanceCeiling: { unknown_external: 'auto_notify' } }, { link: 'none' });
-    const decision = await evaluateToolCall('mail.send', REPLY, s.ctx);
+    const decision = await evaluateFor('mail.send', REPLY, s.ctx);
 
     await expectAllowed(decision);
     const [row] = await intentRows();
@@ -154,7 +154,7 @@ describe('a learned reply to incoming mail passes the provenance ceiling', () =>
 
   it('the recipient match is case-insensitive', async () => {
     const s = await setup();
-    const decision = await evaluateToolCall('mail.send', { ...REPLY, to: ['Dana@Client.Example'] }, s.ctx);
+    const decision = await evaluateFor('mail.send', { ...REPLY, to: ['Dana@Client.Example'] }, s.ctx);
     await expectAllowed(decision);
   });
 });
@@ -162,7 +162,7 @@ describe('a learned reply to incoming mail passes the provenance ceiling', () =>
 describe('each condition, flipped alone, is refused at stage 8', () => {
   it('an approval on the context (no matching row) turns it off', async () => {
     const s = await setup();
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId: 'no-such-approval', stepId: 'reply' },
     });
     await expectDeniedAtStage8(decision);
@@ -170,23 +170,23 @@ describe('each condition, flipped alone, is refused at stage 8', () => {
 
   it('a job no mail names as its reply job is refused', async () => {
     const s = await setup({}, { link: 'none' });
-    await expectDeniedAtStage8(await evaluateToolCall('mail.send', REPLY, s.ctx));
+    await expectDeniedAtStage8(await evaluateFor('mail.send', REPLY, s.ctx));
   });
 
   it('a mail row of another business naming this job does not count', async () => {
     const s = await setup({}, { link: 'other-business' });
-    await expectDeniedAtStage8(await evaluateToolCall('mail.send', REPLY, s.ctx));
+    await expectDeniedAtStage8(await evaluateFor('mail.send', REPLY, s.ctx));
   });
 
   it('no job id at all is refused', async () => {
     const s = await setup();
-    await expectDeniedAtStage8(await evaluateToolCall('mail.send', REPLY, { ...s.ctx, jobId: null }));
+    await expectDeniedAtStage8(await evaluateFor('mail.send', REPLY, { ...s.ctx, jobId: null }));
   });
 
   it('email.initiate (no inReplyTo) is refused', async () => {
     const s = await setup();
     const { inReplyTo: _thread, ...initiate } = REPLY;
-    await expectDeniedAtStage8(await evaluateToolCall('mail.send', initiate, s.ctx));
+    await expectDeniedAtStage8(await evaluateFor('mail.send', initiate, s.ctx));
   });
 
   it('a ramp below auto_notify is refused', async () => {
@@ -194,59 +194,59 @@ describe('each condition, flipped alone, is refused at stage 8', () => {
     // refuses, or the test would hold with the ramp condition deleted.
     const s = await setup();
     await expectDeniedAtStage8(
-      await evaluateToolCall('mail.send', REPLY, { ...s.ctx, rampLevel: 'approve_required' }),
+      await evaluateFor('mail.send', REPLY, { ...s.ctx, rampLevel: 'approve_required' }),
     );
   });
 
   it('a recipient other than the stored From is refused', async () => {
     const s = await setup();
     await expectDeniedAtStage8(
-      await evaluateToolCall('mail.send', { ...REPLY, to: ['other@client.example'] }, s.ctx),
+      await evaluateFor('mail.send', { ...REPLY, to: ['other@client.example'] }, s.ctx),
     );
   });
 
   it('a second recipient beside the From is refused', async () => {
     const s = await setup();
     await expectDeniedAtStage8(
-      await evaluateToolCall('mail.send', { ...REPLY, to: [SENDER, 'other@client.example'] }, s.ctx),
+      await evaluateFor('mail.send', { ...REPLY, to: [SENDER, 'other@client.example'] }, s.ctx),
     );
   });
 
   it('a declared amount is refused, even zero', async () => {
     const s = await setup();
-    await expectDeniedAtStage8(await evaluateToolCall('mail.send', { ...REPLY, amountMinor: 0 }, s.ctx));
+    await expectDeniedAtStage8(await evaluateFor('mail.send', { ...REPLY, amountMinor: 0 }, s.ctx));
   });
 
   it('an attachments key is refused, even empty', async () => {
     const s = await setup();
-    await expectDeniedAtStage8(await evaluateToolCall('mail.send', { ...REPLY, attachments: [] }, s.ctx));
+    await expectDeniedAtStage8(await evaluateFor('mail.send', { ...REPLY, attachments: [] }, s.ctx));
   });
 
   it('a job with an unknown step result (a send that may have gone) is refused', async () => {
     const s = await setup();
     await stepResult(s.jobId, BUSINESS, 'unknown');
-    await expectDeniedAtStage8(await evaluateToolCall('mail.send', REPLY, s.ctx));
+    await expectDeniedAtStage8(await evaluateFor('mail.send', REPLY, s.ctx));
   });
 
   it('an unknown step result filed under another business does not count', async () => {
     const s = await setup();
     await stepResult(s.jobId, 'other-business', 'unknown');
-    await expectAllowed(await evaluateToolCall('mail.send', REPLY, s.ctx));
+    await expectAllowed(await evaluateFor('mail.send', REPLY, s.ctx));
   });
 
   it('a completed step result does not count as unknown', async () => {
     const s = await setup();
     await stepResult(s.jobId, BUSINESS, 'completed');
-    await expectAllowed(await evaluateToolCall('mail.send', REPLY, s.ctx));
+    await expectAllowed(await evaluateFor('mail.send', REPLY, s.ctx));
   });
 
   it('no learned reply when the dial is off', async () => {
     // The stored ramp row still says `auto_notify`; the dial clamps it.
     const s = await setup({}, { mode: 'off' });
-    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
     const facts = buildFacts('mail.send', REPLY, s.ctx);
-    expect(await learnedReplyCovers(facts, REPLY, s.ctx)).toBe(false);
-    await expectDeniedAtStage8(await evaluateToolCall('mail.send', REPLY, s.ctx));
+    expect(await withBusiness(BUSINESS, (db) => learnedReplyCovers(facts, REPLY, { ...s.ctx, db }))).toBe(false);
+    await expectDeniedAtStage8(await evaluateFor('mail.send', REPLY, s.ctx));
   });
 });
 
@@ -255,7 +255,7 @@ describe('the exemption drops the provenance ceiling and nothing else', () => {
     // Observable only here: when the exemption holds the ramp is `auto_notify`,
     // so dropping it too would show as `auto` — the base the charter signed.
     const s = await setup({ autonomyBase: { 'email.reply': 'auto' } });
-    const decision = await evaluateToolCall('mail.send', REPLY, s.ctx);
+    const decision = await evaluateFor('mail.send', REPLY, s.ctx);
     expect(decision.outcome).toBe('allow');
     if (decision.outcome !== 'allow') throw new Error('unreachable');
     expect(decision.effectiveAutonomy).toBe('auto_notify');
@@ -265,7 +265,7 @@ describe('the exemption drops the provenance ceiling and nothing else', () => {
     // Past stage 8 on the exemption (the intent row is written, marked), and
     // then queued: the risk band is untouched.
     const s = await setup({ knownCounterpartyEmailDomain: 'someone-else.example' });
-    const decision = await evaluateToolCall('mail.send', REPLY, s.ctx);
+    const decision = await evaluateFor('mail.send', REPLY, s.ctx);
     expect(decision.outcome).toBe('queue_approval');
     const rows = await intentRows();
     expect(rows).toHaveLength(1);
@@ -274,29 +274,29 @@ describe('the exemption drops the provenance ceiling and nothing else', () => {
 
   it('the charter base draft_only for email.reply still denies at stage 8', async () => {
     const s = await setup({ autonomyBase: { 'email.reply': 'draft_only' } });
-    await expectDeniedAtStage8(await evaluateToolCall('mail.send', REPLY, s.ctx));
+    await expectDeniedAtStage8(await evaluateFor('mail.send', REPLY, s.ctx));
   });
 
   it('an envelope autonomyCeiling of draft_only still denies at stage 8', async () => {
     const s = await setup();
     await expectDeniedAtStage8(
-      await evaluateToolCall('mail.send', REPLY, { ...s.ctx, autonomyCeiling: 'draft_only' }),
+      await evaluateFor('mail.send', REPLY, { ...s.ctx, autonomyCeiling: 'draft_only' }),
     );
   });
 
   it('the kill switch still denies', async () => {
     const s = await setup();
-    await trip('outbound', 'p_boss', 'בדיקה', { businessId: BUSINESS });
-    expectDenied(await evaluateToolCall('mail.send', REPLY, s.ctx), DENY_CODES.killSwitch);
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'outbound', 'p_boss', 'בדיקה'));
+    expectDenied(await evaluateFor('mail.send', REPLY, s.ctx), DENY_CODES.killSwitch);
   });
 
   it('quiet hours still defer', async () => {
     const s = await setup();
-    expectDenied(await evaluateToolCall('mail.send', REPLY, { ...s.ctx, now: NIGHT }), DENY_CODES.quietHours);
+    expectDenied(await evaluateFor('mail.send', REPLY, { ...s.ctx, now: NIGHT }), DENY_CODES.quietHours);
   });
 
   it('doNotContact still denies', async () => {
     const s = await setup({ doNotContactEmailDomain: 'client.example' });
-    expectDenied(await evaluateToolCall('mail.send', REPLY, s.ctx), DENY_CODES.doNotContact);
+    expectDenied(await evaluateFor('mail.send', REPLY, s.ctx), DENY_CODES.doNotContact);
   });
 });

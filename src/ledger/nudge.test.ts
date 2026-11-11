@@ -13,7 +13,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import { decide } from '../governance/approvals.js';
 import { buildErasurePlan } from '../governance/erasure-plan.js';
@@ -130,7 +130,7 @@ afterAll(async () => {
 describe('act mode: the nudge goes through the gate', () => {
   it('act mode under ask raises an approval card and sends nothing', async () => {
     await actMode();
-    await setAutonomyMode('ask', 'p_boss', { businessId: B });
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
     const item = await createLedgerItem(base(), { businessId: B, by: 'boss' });
     const drafter = stubDrafter();
 
@@ -167,7 +167,7 @@ describe('act mode: the nudge goes through the gate', () => {
 
   it('once approved and sent, the outcome is observed as one nudge', async () => {
     await actMode();
-    await setAutonomyMode('ask', 'p_boss', { businessId: B });
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
     const item = await createLedgerItem(base(), { businessId: B, by: 'boss' });
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
@@ -180,7 +180,7 @@ describe('act mode: the nudge goes through the gate', () => {
     );
     const approvalId = rows[0]?.approval_id;
     if (approvalId === undefined) throw new Error('expected a card');
-    const decided = await decide(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }, { businessId: B });
+    const decided = await withBusiness(B, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 5)
     await resumeAfterDecision(decided, 'p_boss', { businessId: B });
     await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
     expect(sentNew).toEqual([{ to: ['dana@acme.co.il'], subject: 'תזכורת לגבי תשלום — INV-123', body: DRAFT }]);
@@ -268,7 +268,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
 
   it('F-I1: a pending card is withdrawn and its job closed when the item is closed by evidence', async () => {
     await actMode();
-    await setAutonomyMode('ask', 'p_boss', { businessId: B });
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
     const item = await createLedgerItem(base(), { businessId: B, by: 'boss' });
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
@@ -296,7 +296,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
     );
     expect(rows[0]?.state).toBe('cancelled');
     await expect(
-      decide(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }, { businessId: B }),
+      withBusiness(B, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' })), // TENANCY-TODO(task 5)
     ).rejects.toThrow();
     expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('closed');
     expect((await loadLedgerItem(item.itemId, { businessId: B }))?.nudgeCount).toBe(0); // never counted
@@ -316,7 +316,7 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
 
   it('F-I1: an item still open keeps its card (control)', async () => {
     await actMode();
-    await setAutonomyMode('ask', 'p_boss', { businessId: B });
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
     const item = await createLedgerItem(base(), { businessId: B, by: 'boss' });
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
@@ -363,19 +363,19 @@ describe('a nudge whose item moved on, or whose opening crashed', () => {
 
   it('M1: an owner-denied card leaves a ledger event naming its job, so erasure reaches the denied job', async () => {
     await actMode();
-    await setAutonomyMode('ask', 'p_boss', { businessId: B });
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
     // A name that appears in no nudge-job content (draft, subject, address, title).
     const item = await createLedgerItem(base({ counterpartyName: 'רונית לוי' }), { businessId: B, by: 'boss' });
     await runLedgerPass({ businessId: B, now: NOW, drafter: stubDrafter().fn, sendAlert: recordingAlert([]) });
     const jobId = await nudgeJobId(item.itemId);
     const { client } = fakeMailboxClient();
     await runDueJobs({ businessId: B, runtime: mailboxRuntime(client), now: NOW });
-    const decided = await decide(
+    const decided = await withBusiness(B, async (bdb) => decide( // TENANCY-TODO(task 5)
+      bdb,
       await pendingCard(jobId),
       'denied',
-      { by: 'p_boss', channel: 'dashboard' },
-      { businessId: B },
-    );
+      { by: 'p_boss', channel: 'dashboard' }
+    ));
     await resumeAfterDecision(decided, 'p_boss', { businessId: B });
     expect((await loadJob(jobId, { businessId: B }))?.phase).toBe('closed');
 
@@ -449,7 +449,7 @@ describe('when no nudge job is opened', () => {
     const original = config.ledgerNudgesPerDay;
     (config as { ledgerNudgesPerDay: number }).ledgerNudgesPerDay = 1;
     try {
-      const active = await loadActiveCharter(B);
+      const active = await withBusiness(B, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
       if (active === null) throw new Error('no charter');
       const drafter = stubDrafter();
       const outcome = await openNudge(item, NUDGE_SLOT, { businessId: B, active, drafter: drafter.fn, now: NOW });
@@ -484,7 +484,7 @@ describe('the nudge job carries no exemption', () => {
     const plan = stored?.plan ?? Plan.parse(null);
     const step = plan.steps[0];
     if (step === undefined) throw new Error('no step');
-    const active = await loadActiveCharter(B);
+    const active = await withBusiness(B, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
     if (active === null) throw new Error('no charter');
     // Every early-return condition is satisfied (job, step, no approval), so
     // the null comes from the database check — the missing instruction row.
@@ -494,7 +494,7 @@ describe('the nudge job carries no exemption', () => {
       counterpartyTags: [],
       provenanceChainDerived: false,
     });
-    const covers = await confirmedCommandCovers(facts, {
+    const covers = await withBusiness(B, (db) => confirmedCommandCovers(facts, { // TENANCY-TODO(task 5)
       provenance: 'boss',
       chainDepth: 1,
       counterpartyTags: [],
@@ -503,8 +503,8 @@ describe('the nudge job carries no exemption', () => {
       bundle: active.bundle,
       jobId,
       stepId: step.id,
-      businessId: B,
-    });
+      db,
+    }));
     expect(covers).toBeNull();
   });
 
@@ -533,7 +533,7 @@ describe('the nudge job carries no exemption', () => {
 
 describe('runNudgeDrafter', () => {
   it('refuses under test', async () => {
-    const bundle = (await loadActiveCharter(B))?.bundle ?? (buildCharter({}) as never);
+    const bundle = (await withBusiness(B, (bdb) => loadActiveCharter(bdb)))?.bundle ?? (buildCharter({}) as never); // TENANCY-TODO(task 5)
     await expect(
       runNudgeDrafter({
         bundle,

@@ -34,8 +34,7 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { appendAudit } from '../audit/log.js';
 import { config } from '../config.js';
-import { acquireAdvisoryLock, closePool, withTransaction } from '../db/pool.js';
-import type { Queryable } from '../db/pool.js';
+import { acquireAdvisoryLock, closePool, withTransaction, withBusiness, withBusinessTransaction, type Queryable, type BusinessDb } from '../db/pool.js';
 import { ROTATION_LOCK_SCOPE } from '../governance/credential-store.js';
 import {
   KEY_BYTES,
@@ -259,9 +258,10 @@ async function auditKeyAction(params: {
   /** Joins the caller's transaction when given, so "the key exists" and "the
    * key was recorded" commit together. Omitted, the audit row is written on
    * its own connection — see `rotate` for the one place that is deliberate. */
-  tx?: Queryable;
+  tx?: BusinessDb;
 }): Promise<void> {
-  await appendAudit(
+  const write = (bdb: BusinessDb) => appendAudit(
+    bdb,
     {
       actor: 'human',
       onBehalfOf: params.operator,
@@ -277,8 +277,8 @@ async function auditKeyAction(params: {
       }),
       reason: params.reason,
     },
-    { businessId: params.businessId, ...(params.tx !== undefined ? { tx: params.tx } : {}) },
   );
+  await (params.tx !== undefined ? write(params.tx) : withBusiness(params.businessId, write)); // TENANCY-TODO(task 7)
 }
 
 /**
@@ -375,7 +375,7 @@ async function create(deps: SecretKeyCliDeps, operator: string): Promise<void> {
   // naming different keys. One operator runs this tool, which is why this was
   // a low finding and not a high one, but check-then-write under a lock that
   // already exists costs nothing.
-  await withTransaction(async (tx: Queryable) => {
+  await withBusinessTransaction(businessId, async (tx: BusinessDb) => { // TENANCY-TODO(task 7)
     await acquireAdvisoryLock(tx, ROTATION_LOCK_SCOPE);
 
     // Refuse, do not prompt (task requirement). Checked BEFORE any write:

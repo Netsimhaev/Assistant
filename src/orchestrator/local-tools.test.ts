@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { config } from '../config.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -34,9 +34,7 @@ import type { TrustLevel } from '../domain/trust.js';
 const BUSINESS = 'test-business';
 
 async function aJob(provenance: TrustLevel = 'boss', tag = 'lt'): Promise<string> {
-  const bundle = await installCharter(buildCharter({ version: `${tag}-${provenance}` }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `${tag}-${provenance}` }))); // TENANCY-TODO(task 4)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance,
@@ -251,10 +249,10 @@ describe('the local tool executor', () => {
    * "the assistant remembers between steps", stated as behaviour.
    */
   it('is reached by a real plan, and the second step reads what the first wrote', async () => {
-    const bundle = await installCharter(
-      buildCharter({ version: 'local-e2e', autonomyBase: { 'memory.write_longterm': 'auto' } }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
+      buildCharter({ version: 'local-e2e', autonomyBase: { 'memory.write_longterm': 'auto' } })
+    ));
     const job = await createJob({
       charterVersion: bundle.charterVersion,
       provenance: 'boss',
@@ -572,9 +570,7 @@ describe('the local tool executor', () => {
    */
   describe('agent.request_help', () => {
     async function parentJobInExecute(): Promise<{ jobId: string; bundle: ReturnType<typeof compileCharter> }> {
-      const bundle = await installCharter(buildCharter({ version: `req-help-${ulid()}` }), {
-        businessId: BUSINESS,
-      });
+      const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `req-help-${ulid()}` }))); // TENANCY-TODO(task 4)
       const job = await createJob({
         charterVersion: bundle.charterVersion,
         provenance: 'boss',
@@ -701,7 +697,8 @@ describe('the local tool executor', () => {
       // A well-formed result, written directly rather than through
       // `resumeDelegatedJobs` — isolating what THIS handler does with one,
       // not re-testing the writer.
-      await writeEnvelope(
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope( // TENANCY-TODO(task 4)
+        bdb,
         {
           v: 1,
           id: `ENV-${ulid()}`,
@@ -724,8 +721,8 @@ describe('the local tool executor', () => {
           idempotencyKey: `IDEM-${ulid()}`,
           createdAt: new Date().toISOString(),
         },
-        { parentJobId: childJobId, businessId: BUSINESS },
-      );
+        { parentJobId: childJobId }
+      ));
 
       await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
       const second = await runLocalTool('agent.request_help', input, ctx);
@@ -757,7 +754,8 @@ describe('the local tool executor', () => {
       const childJobId = first['childJobId'] as string;
 
       // A malformed result — `outcome` is not one of the closed union.
-      await writeEnvelope(
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope( // TENANCY-TODO(task 4)
+        bdb,
         {
           v: 1,
           id: `ENV-${ulid()}`,
@@ -780,8 +778,8 @@ describe('the local tool executor', () => {
           idempotencyKey: `IDEM-${ulid()}`,
           createdAt: new Date().toISOString(),
         },
-        { parentJobId: childJobId, businessId: BUSINESS },
-      );
+        { parentJobId: childJobId }
+      ));
 
       await transition(jobId, { to: 'execute', actor: 'orchestrator', reason: 'test resume', businessId: BUSINESS });
 
@@ -838,8 +836,8 @@ describe('the local tool executor', () => {
         idempotencyKey: `IDEM-${ulid()}`,
         createdAt: new Date().toISOString(),
       };
-      await writeEnvelope(ancestorEnvelope, { parentJobId: 'JOB-some-grandparent', businessId: BUSINESS });
-      await attachChildJob(ancestorEnvelope.id, middleJobId, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, ancestorEnvelope, { parentJobId: 'JOB-some-grandparent' })); // TENANCY-TODO(task 4)
+      await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, ancestorEnvelope.id, middleJobId)); // TENANCY-TODO(task 4)
 
       const documentId = `DOC-${ulid()}`;
       const out = await runLocalTool(
@@ -854,7 +852,7 @@ describe('the local tool executor', () => {
       );
 
       expect(out['status']).toBe('delegated');
-      const envelope = await loadEnvelope(out['envelopeId'] as string, { businessId: BUSINESS });
+      const envelope = await withBusiness(BUSINESS, (bdb) => loadEnvelope(bdb, out['envelopeId'] as string)); // TENANCY-TODO(task 4)
       expect(envelope?.hops).toBe(4); // ancestor's 3 + 1, never 0 + 1
       expect(envelope?.correlationId).toBe('JOB-root-of-the-tree'); // inherited, not middleJobId
       expect(envelope?.constraints.provenanceCeiling).toBe('unknown_external');
@@ -963,9 +961,7 @@ describe('the local tool executor', () => {
       childJobId: string;
       bundle: ReturnType<typeof compileCharter>;
     }> {
-      const bundle = await installCharter(buildCharter({ version: `verify-${ulid()}` }), {
-        businessId: BUSINESS,
-      });
+      const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `verify-${ulid()}` }))); // TENANCY-TODO(task 4)
 
       // `unknown_external`, the literal `conduct.ts` hard-codes for the
       // delegating job — and therefore the provenance the saved reading must
@@ -1076,14 +1072,15 @@ describe('the local tool executor', () => {
       };
       // `parentJobId` is the DELEGATING job — the column the handler looks the
       // request up by.
-      await writeEnvelope(request, { parentJobId: parent.jobId, businessId: BUSINESS });
-      await attachChildJob(request.id, child.jobId, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, request, { parentJobId: parent.jobId })); // TENANCY-TODO(task 4)
+      await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, request.id, child.jobId)); // TENANCY-TODO(task 4)
 
       if (outcome !== null) {
         // Exactly the shape `resumeDelegatedJobs`'s `writeResultAndWake`
         // writes, including `parentJobId: childJobId` — which is why the
         // handler's `kind = 'help_request'` predicate has work to do.
-        await writeEnvelope(
+        await withBusiness(BUSINESS, (bdb) => writeEnvelope( // TENANCY-TODO(task 4)
+          bdb,
           {
             v: 1,
             id: `ENV-${ulid()}`,
@@ -1100,8 +1097,8 @@ describe('the local tool executor', () => {
             idempotencyKey: `IDEM-${ulid()}`,
             createdAt: new Date().toISOString(),
           },
-          { parentJobId: child.jobId, businessId: BUSINESS },
-        );
+          { parentJobId: child.jobId }
+        ));
       }
 
       return {
@@ -1137,7 +1134,7 @@ describe('the local tool executor', () => {
 
       // Proves the handler RAN, not merely that nothing bad happened.
       expect(outcome).toMatchObject({ performed: true, status: 'judged' });
-      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toMatchObject({
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toMatchObject({ // TENANCY-TODO(task 4)
         status: 'judged',
       });
 
@@ -1171,7 +1168,7 @@ describe('the local tool executor', () => {
       );
       expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'failed' });
       expect(judgeCalls).toBe(0);
-      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({ // TENANCY-TODO(task 4)
         status: 'not_judged',
         reason: 'failed',
       });
@@ -1195,7 +1192,7 @@ describe('the local tool executor', () => {
       );
       expect(judgeCalls).toBe(0);
       expect(outcome).toMatchObject({ status: 'not_judged', reason: 'timeout' });
-      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({ // TENANCY-TODO(task 4)
         status: 'not_judged',
         reason: 'timeout',
       });
@@ -1219,7 +1216,7 @@ describe('the local tool executor', () => {
       expect(typed.retryable).toBe(false);
       // A refusal files nothing — the card must keep reading "still running",
       // not "gave up", while the helper may yet answer.
-      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toBeNull();
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull(); // TENANCY-TODO(task 4)
     });
 
     /**
@@ -1267,7 +1264,7 @@ describe('the local tool executor', () => {
 
       expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'unreadable' });
       expect(judgeCalls).toBe(0);
-      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({ // TENANCY-TODO(task 4)
         status: 'not_judged',
         reason: 'unreadable',
       });
@@ -1304,7 +1301,7 @@ describe('the local tool executor', () => {
 
       expect(outcome).toMatchObject({ performed: true, status: 'not_judged', reason: 'unreadable' });
       expect(judgeCalls).toBe(0);
-      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toEqual({
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toEqual({ // TENANCY-TODO(task 4)
         status: 'not_judged',
         reason: 'unreadable',
       });
@@ -1346,7 +1343,7 @@ describe('the local tool executor', () => {
       expect(caught).toBeInstanceOf(StepChannelError);
       expect((caught as StepChannelError).code).toBe('verification_delegated_again');
       expect((caught as StepChannelError).retryable).toBe(false);
-      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toBeNull();
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull(); // TENANCY-TODO(task 4)
     });
 
     /**
@@ -1357,7 +1354,8 @@ describe('the local tool executor', () => {
     it('refuses a result envelope whose payload cannot be read', async () => {
       const { parentJobId, subjectJobId, documentId, childJobId, bundle } =
         await seedUnansweredDelegation();
-      await writeEnvelope(
+      await withBusiness(BUSINESS, (bdb) => writeEnvelope( // TENANCY-TODO(task 4)
+        bdb,
         {
           v: 1,
           id: `ENV-${ulid()}`,
@@ -1380,8 +1378,8 @@ describe('the local tool executor', () => {
           idempotencyKey: `IDEM-${ulid()}`,
           createdAt: new Date().toISOString(),
         },
-        { parentJobId: childJobId, businessId: BUSINESS },
-      );
+        { parentJobId: childJobId }
+      ));
 
       let caught: unknown;
       try {
@@ -1395,7 +1393,7 @@ describe('the local tool executor', () => {
       }
       expect(caught).toBeInstanceOf(StepChannelError);
       expect((caught as StepChannelError).code).toBe('delegation_result_corrupted');
-      expect(await loadVerificationOutcome(subjectJobId, { businessId: BUSINESS })).toBeNull();
+      expect(await withBusiness(BUSINESS, (bdb) => loadVerificationOutcome(bdb, subjectJobId))).toBeNull(); // TENANCY-TODO(task 4)
     });
 
     it('rejects a payload that names no subject job, without reaching the judge', async () => {

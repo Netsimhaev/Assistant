@@ -1,6 +1,6 @@
 import { ZodError } from 'zod';
 import { appendAudit } from '../../audit/log.js';
-import { getPool, withTransaction, type Queryable } from '../../db/pool.js';
+import { transaction, type BusinessDb } from '../../db/pool.js';
 import type { BusinessCharter } from '../../domain/charter.js';
 import { setAutonomyMode } from '../../governance/autonomy-mode.js';
 import type { MailProvider } from '../../mail/mailbox.js';
@@ -40,9 +40,8 @@ import { mailboxAddedBy } from './summary.js';
  * **The autonomy dial is applied after commit, and its failure is reported,
  * not thrown.** The charter is live either way; a failed apply leaves the
  * dial where it was (`off` on a fresh business), the safe direction, and the
- * screen offers `/autonomy`. `setAutonomyMode` opens its own transaction and
- * audit row, so folding it in would mean threading a connection it does not
- * take.
+ * screen offers `/autonomy`. `setAutonomyMode` runs its own transaction and
+ * audit row on `db` after the install's has committed.
  *
  * **A mailbox the signature adds is preflighted first.** The same check the
  * connections screen's own mailbox sign runs (`oauthCeremonyPreflight`):
@@ -97,14 +96,13 @@ export function shownHashFor(draft: InterviewDraft, businessId: string, previous
  * would drop everything the owner signed that the interview does not ask.
  */
 export async function previousForDraft(
+  db: BusinessDb,
   draft: Pick<InterviewDraft, 'baseCharterVersion'>,
-  businessId: string,
-  db: Queryable = getPool(),
 ): Promise<{ ok: true; previous: BusinessCharter | null } | { ok: false }> {
   if (draft.baseCharterVersion === null) return { ok: true, previous: null };
   let previous: BusinessCharter | null;
   try {
-    previous = await loadCharterVersion(draft.baseCharterVersion, businessId, db);
+    previous = await loadCharterVersion(db, draft.baseCharterVersion);
   } catch (error) {
     if (error instanceof ZodError) return { ok: true, previous: null };
     throw error;
@@ -125,7 +123,8 @@ function isUniqueViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === UNIQUE_VIOLATION;
 }
 
-async function lockedChecks(tx: Queryable, businessId: string, draft: InterviewDraft): Promise<void> {
+async function lockedChecks(tx: BusinessDb, draft: InterviewDraft): Promise<void> {
+  const businessId = tx.businessId;
   await tx.query("SELECT pg_advisory_xact_lock(hashtext('charter-install:' || $1))", [businessId]);
 
   const active = await tx.query<{ charter_version: string }>(
@@ -145,22 +144,25 @@ async function lockedChecks(tx: Queryable, businessId: string, draft: InterviewD
   }
 }
 
-export async function signAndInstallInterview(input: {
-  businessId: string;
-  username: string;
-  shownHash: string;
-  mailboxPreflight: MailboxPreflight;
-}): Promise<InstallOutcome> {
-  const { businessId, username } = input;
+export async function signAndInstallInterview(
+  db: BusinessDb,
+  input: {
+    username: string;
+    shownHash: string;
+    mailboxPreflight: MailboxPreflight;
+  },
+): Promise<InstallOutcome> {
+  const { username } = input;
+  const businessId = db.businessId;
 
-  const draft = await loadDraft(businessId);
+  const draft = await loadDraft(db);
   if (draft === null) return { outcome: 'incomplete' };
   const parsed = InterviewAnswers.safeParse(draft.answers);
   if (!parsed.success) return { outcome: 'incomplete' };
   const answers = parsed.data;
   if (draft.frozenAt === null) return { outcome: 'not_frozen' };
 
-  const base = await previousForDraft(draft, businessId);
+  const base = await previousForDraft(db, draft);
   if (!base.ok) return { outcome: 'stale' };
   const { previous } = base;
 
@@ -179,22 +181,19 @@ export async function signAndInstallInterview(input: {
     (previous !== null ? `, superseding ${previous.charterVersion}` : '');
 
   try {
-    await withTransaction(async (tx) => {
-      await lockedChecks(tx, businessId, draft);
-      await installCharter(signed, { businessId, tx });
-      await appendAudit(
-        {
-          actor: 'human',
-          onBehalfOf: username,
-          kind: 'charter_change',
-          charterVersion: signed.charterVersion,
-          provenance: 'boss',
-          inputHash: canonicalHash({ businessId, contentHash: signed.signature.contentHash }),
-          reason,
-        },
-        { businessId, tx },
-      );
-      await deleteDraft(businessId, tx);
+    await transaction(db, async (tx) => {
+      await lockedChecks(tx, draft);
+      await installCharter(tx, signed);
+      await appendAudit(tx, {
+        actor: 'human',
+        onBehalfOf: username,
+        kind: 'charter_change',
+        charterVersion: signed.charterVersion,
+        provenance: 'boss',
+        inputHash: canonicalHash({ businessId, contentHash: signed.signature.contentHash }),
+        reason,
+      });
+      await deleteDraft(tx);
     });
   } catch (error) {
     if (error instanceof Refused) return { outcome: error.outcome };
@@ -208,7 +207,7 @@ export async function signAndInstallInterview(input: {
 
   let modeApplied = true;
   try {
-    await setAutonomyMode(answers.autonomy.mode, username, { businessId });
+    await setAutonomyMode(db, answers.autonomy.mode, username);
   } catch (error) {
     // The error only, never the answers: the charter is live, and this line
     // is what an operator finds when the owner reports the banner.

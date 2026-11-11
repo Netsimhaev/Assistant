@@ -7,7 +7,7 @@ import type { LedgerPassResult } from '../ledger/pass.js';
 import { runNudgeDrafter } from '../sdk/nudge-drafter.js';
 import type { NudgeDrafter } from '../sdk/nudge-drafter.js';
 import { config } from '../config.js';
-import { getPool, withTransaction } from '../db/pool.js';
+import { getPool, withTransaction, withBusiness } from '../db/pool.js';
 import { expireOverdue } from '../governance/approvals.js';
 import { expireConfirmations } from '../governance/instruction-confirmations.js';
 import { settleDecidedConfirmations } from './command-confirm.js';
@@ -118,7 +118,7 @@ async function expireApprovals(businessId: string, limit: number): Promise<strin
   // is a single atomic UPDATE ... RETURNING, and joining it to the tick's
   // transaction would hold the scheduler lock across every job transition
   // below, each of which opens a transaction of its own.
-  const expired = await expireOverdue({ businessId });
+  const expired = await withBusiness(businessId, (bdb) => expireOverdue(bdb)); // TENANCY-TODO(task 9)
 
   const ids: string[] = [];
   for (const approval of expired.slice(0, limit)) {
@@ -309,7 +309,8 @@ async function recordWhatsAppHealthNotifyFailure(
   reason: string,
 ): Promise<void> {
   try {
-    await appendAudit(
+    await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 9)
+      bdb,
       {
         actor: 'system',
         kind: 'incident',
@@ -317,9 +318,8 @@ async function recordWhatsAppHealthNotifyFailure(
         provenance: 'boss',
         inputHash: canonicalHash({ kind: 'whatsapp_health_notify_failed', businessId, reason }),
         reason: `whatsapp_health_notify_failed: ${reason}`,
-      },
-      { businessId },
-    );
+      }
+    ));
   } catch {
     // Best-effort — see this function's own docblock.
   }
@@ -981,7 +981,7 @@ export async function schedulerPass(
   let whatsappMessenger: BossMessenger | null = null;
   if (runtime.whatsapp !== undefined) {
     try {
-      const active = await loadActiveCharter(businessId);
+      const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 9)
       if (active === null) {
         throw new Error(
           `schedulerPass: no active charter for business ${businessId} — refusing to run the WhatsApp loops`,
@@ -1074,7 +1074,7 @@ export async function schedulerPass(
   let ledgerEvidenceError: string | null = null;
   let ledgerError: string | null = null;
   try {
-    ledgerHasCharter = (await activeCharterVersion(businessId)) !== null;
+    ledgerHasCharter = (await withBusiness(businessId, (bdb) => activeCharterVersion(bdb))) !== null; // TENANCY-TODO(task 9)
   } catch (err) {
     // Could not even tell whether a charter is active: neither ledger stage
     // runs, and both say why. The rest of the pass is unaffected.

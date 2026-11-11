@@ -11,7 +11,7 @@
  * just as well for a job nothing ever ran.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   DRAFT_BODY as BODY,
@@ -91,16 +91,16 @@ async function approvalCount(): Promise<number> {
 }
 
 async function approve(approvalId: string, editedInput?: unknown): Promise<void> {
-  const decided = await decide(
+  const decided = await withBusiness(BUSINESS, (bdb) => decide( // TENANCY-TODO(task 4)
+    bdb,
     approvalId,
     'approved',
     {
       by: 'p_boss',
       channel: 'dashboard',
       ...(editedInput !== undefined ? { editedInput } : {}),
-    },
-    { businessId: BUSINESS },
-  );
+    }
+  ));
   await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
 }
 
@@ -119,7 +119,7 @@ describe('replySubject folds control characters (a subject must never break a he
       { businessId: BUSINESS },
     );
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
     const subject = (approval?.proposedInput as Record<string, unknown>)['subject'];
     expect(subject).toBe('Re: Invoice Bcc: v@y.com');
   });
@@ -143,7 +143,7 @@ describe('raiseMailReply', () => {
       { businessId: BUSINESS },
     );
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
     expect((approval?.proposedInput as { body: string }).body).toBe('שלום דנה, 500 ש"ח');
     const stored = await loadPlanBody(raised.replyJobId, { businessId: BUSINESS });
     expect((stored?.plan.steps[0]?.input as { body: string }).body).toBe('שלום דנה, 500 ש"ח');
@@ -184,7 +184,7 @@ describe('raiseMailReply', () => {
     };
     expect(step?.input).toEqual(payload);
 
-    const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
     expect(approval?.jobId).toBe(raised.replyJobId);
     expect(approval?.proposedTool).toBe('mail.send');
     expect(approval?.actionClass).toBe('email.reply');
@@ -204,7 +204,7 @@ describe('raiseMailReply', () => {
       { businessId: BUSINESS },
     );
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
     expect(approval?.summary).toBe('תשובה ל-dana@client.example: מתי תגיע ההצעה?');
     expect(approval?.detail).toContain('dana@client.example');
     expect(approval?.detail).toContain(BODY);
@@ -223,7 +223,7 @@ describe('raiseMailReply', () => {
       { businessId: BUSINESS },
     );
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
     expect(approval?.detail).not.toContain('שים לב');
   });
 
@@ -373,7 +373,7 @@ describe('approve sends, under mode off', () => {
       { businessId: BUSINESS },
     );
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
     const edited = { ...(approval?.proposedInput as Record<string, unknown>), body: 'גוף ערוך על ידי הבעלים' };
     await approve(raised.approvalId, edited);
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
@@ -435,7 +435,7 @@ describe('the stage-8 exemption is a mailbox-reply-job exemption (R20)', () => {
       { businessId: BUSINESS },
     );
     if (approvalId === null) throw new Error('expected a conductor card');
-    const card = await getApproval(approvalId, { businessId: BUSINESS });
+    const card = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
     expect(card?.detail).toContain(RAMP_HONESTY);
     await transition(job.jobId, {
       to: 'await_approval', actor: 'orchestrator', reason: 'test', businessId: BUSINESS,
@@ -514,7 +514,7 @@ describe('a new message goes out through the mailbox too, under the gate (R21)',
 
   it('asks first, and once approved sends a new message (not a reply) from the mailbox', async () => {
     const jobId = await newMailJob();
-    await setAutonomyMode('ask', 'p_boss', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 4)
     const { client, sent, sentNew } = fakeClient();
 
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
@@ -597,7 +597,7 @@ describe('an instruction-door reply goes out threaded through the mailbox', () =
   it('asks first, and once approved sends a reply on the stored thread', async () => {
     await storedMail();
     const jobId = await instructedReplyJob('<q-1@client.example>');
-    await setAutonomyMode('ask', 'p_boss', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 4)
     const { client, sent, sentNew } = fakeClient();
 
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
@@ -626,7 +626,7 @@ describe('an instruction-door reply goes out threaded through the mailbox', () =
   it('an approved reply to a mail the business never received fails reply_target_unknown, sending nothing', async () => {
     await storedMail();
     const jobId = await instructedReplyJob('<never-received@client.example>');
-    await setAutonomyMode('ask', 'p_boss', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 4)
     const { client, sent, sentNew } = fakeClient();
 
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
@@ -697,8 +697,8 @@ describe('reraiseAfterFailedSend', () => {
     expect(card.detail.startsWith(RETRY_PREFIX)).toBe(true);
     expect(card.detail).not.toContain(MAY_HAVE_SENT_WARNING);
 
-    const fresh = await getApproval(card.approval_id, { businessId: BUSINESS });
-    const old = await getApproval(raised.approvalId, { businessId: BUSINESS });
+    const fresh = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, card.approval_id)); // TENANCY-TODO(task 4)
+    const old = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId)); // TENANCY-TODO(task 4)
     expect(fresh?.proposedInput).toEqual(old?.proposedInput);
     const newJob = await loadJob(card.job_id, { businessId: BUSINESS });
     expect(newJob?.provenance).toBe('unknown_external');
@@ -762,8 +762,7 @@ describe('reraiseAfterFailedSend', () => {
       { businessId: BUSINESS },
     );
     if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-    const decided = await decide(raised.approvalId, 'denied', { by: 'p_boss', channel: 'dashboard' },
-      { businessId: BUSINESS });
+    const decided = await withBusiness(BUSINESS, (bdb) => decide(bdb, raised.approvalId as string, 'denied', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 4)
     await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
     expect((await loadJob(raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('closed');
     expect((await reraise()).reraised).toBe(0);
@@ -820,8 +819,8 @@ describe('reraiseAfterFailedSend', () => {
       expect(card.detail).not.toContain(RETRY_PREFIX);
       expect(card.detail).not.toContain(MAY_HAVE_SENT_WARNING);
       expect((await mailRow(mail.mailId)).reply_job_id).toBe(card.job_id);
-      const fresh = await getApproval(card.approval_id, { businessId: BUSINESS });
-      const old = await getApproval(raised.approvalId, { businessId: BUSINESS });
+      const fresh = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, card.approval_id)); // TENANCY-TODO(task 4)
+      const old = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId)); // TENANCY-TODO(task 4)
       expect(fresh?.proposedInput).toEqual(old?.proposedInput);
 
       expect((await reraise()).reraised).toBe(0);
@@ -841,7 +840,7 @@ describe('reraiseAfterFailedSend', () => {
         { businessId: BUSINESS },
       );
       if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-      const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+      const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 4)
       const edited = { ...(approval?.proposedInput as Record<string, unknown>), body: 'גוף ערוך' };
       await approve(raised.approvalId, edited);
       await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NIGHT });
@@ -851,7 +850,7 @@ describe('reraiseAfterFailedSend', () => {
       expect((await reraise()).reraised).toBe(1);
       const card = (await pendingCards())[0];
       if (card === undefined) throw new Error('no card');
-      const fresh = await getApproval(card.approval_id, { businessId: BUSINESS });
+      const fresh = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, card.approval_id)); // TENANCY-TODO(task 4)
       expect((fresh?.proposedInput as Record<string, unknown>)['body']).toBe('גוף ערוך');
     });
 
@@ -881,8 +880,7 @@ describe('reraiseAfterFailedSend', () => {
         { businessId: BUSINESS },
       );
       if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-      const decided = await decide(raised.approvalId, 'denied', { by: 'p_boss', channel: 'dashboard' },
-        { businessId: BUSINESS });
+      const decided = await withBusiness(BUSINESS, (bdb) => decide(bdb, raised.approvalId as string, 'denied', { by: 'p_boss', channel: 'dashboard' })); // TENANCY-TODO(task 4)
       await resumeAfterDecision(decided, 'p_boss', { businessId: BUSINESS });
       await expire(raised.approvalId);
       // Even forced onto the failed path, a denial is not an approval to re-ask.
@@ -944,7 +942,7 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
       options.knownDomain !== undefined ? { knownCounterpartyEmailDomain: options.knownDomain } : {},
     );
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    await setAutonomyMode('learn', 'owner', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner')); // TENANCY-TODO(task 4)
     return activeBundle;
   }
 
@@ -1000,7 +998,7 @@ describe('a reply the assistant has LEARNED goes without a card (owner ruling H1
 
   it('a known sender under learn, but a class NOT yet promoted, still gets a card', async () => {
     activeBundle = await installFor(BUSINESS, 'google', { knownCounterpartyEmailDomain: 'client.example' });
-    await setAutonomyMode('learn', 'owner', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner')); // TENANCY-TODO(task 4)
     const mail = await storedMail();
 
     const raised = await raiseMailReply(
@@ -1118,7 +1116,7 @@ ${MAY_HAVE_SENT_WARNING}`);
 
   it('the dial flipped to off between the fork and the run: no send, then one card', async () => {
     const { replyJobId } = await raiseLearned();
-    await setAutonomyMode('off', 'owner', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner')); // TENANCY-TODO(task 4)
     const { client, sent } = fakeClient();
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(client), now: NOON });
     expect(sent).toHaveLength(0);
@@ -1152,7 +1150,7 @@ ${MAY_HAVE_SENT_WARNING}`);
     // The learned job, its marker row rewritten: only the marker separates
     // it from a reply job that failed some other way.
     const { replyJobId } = await raiseLearned();
-    await setAutonomyMode('off', 'owner', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner')); // TENANCY-TODO(task 4)
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(fakeClient().client), now: NOON });
     expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
     await getPool().query(
@@ -1164,7 +1162,7 @@ ${MAY_HAVE_SENT_WARNING}`);
 
   it('two re-raisers racing on one failed learned job raise exactly one card', async () => {
     const { replyJobId } = await raiseLearned();
-    await setAutonomyMode('off', 'owner', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner')); // TENANCY-TODO(task 4)
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(fakeClient().client), now: NOON });
     expect((await loadJob(replyJobId, { businessId: BUSINESS }))?.phase).toBe('failed');
 
@@ -1194,7 +1192,7 @@ ${MAY_HAVE_SENT_WARNING}`);
     // Now the class is learned, and the sender is known — every other
     // condition for a card-less send holds.
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    await setAutonomyMode('learn', 'owner', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner')); // TENANCY-TODO(task 4)
 
     const result = await reraise();
     expect(result.reraised).toBe(1);

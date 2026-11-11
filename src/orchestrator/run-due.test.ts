@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -109,7 +109,8 @@ async function seedExecutableJob(businessId: string = BUSINESS): Promise<string>
   // between draft_only and a real send" actually true in the "honours the
   // ramp" test below: with this override in place, `setRampLevel(..., 'auto')`
   // is the ONLY thing that changes between that test and this one.
-  const bundle = await installCharter(
+  const bundle = await withBusiness(businessId, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    bdb,
     buildCharter({
       // `charter_versions` keys on `charter_version` alone, globally, not
       // per business — the version must be unique across every call this
@@ -118,9 +119,8 @@ async function seedExecutableJob(businessId: string = BUSINESS): Promise<string>
       connections: [MAIL_CONNECTION],
       knownCounterpartyEmailDomain: 'example.com',
       autonomyBase: { 'email.initiate': 'auto' },
-    }),
-    { businessId },
-  );
+    })
+  ));
   const jobId = await jobInExecute(bundle.charterVersion, 'run-due', businessId);
   await upsertBinding(
     {
@@ -157,7 +157,7 @@ describe('runDueJobs', () => {
     // The owner's dial (Task 2) defaults to `off`, which clamps
     // `loadRampLevel` to `draft_only` regardless of what is stored — open it
     // first so the promotion below is actually honoured.
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     const sent: MailMessage[] = [];
@@ -181,15 +181,15 @@ describe('runDueJobs', () => {
     // `runtimeWith` above never sets `notify` either — deleting the
     // forwarding line in `run-due.ts` leaves every other test in this file
     // green.
-    const bundle = await installCharter(
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         version: `2026-08-15.notify-forward`,
         connections: [MAIL_CONNECTION],
         knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'approve_required' },
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const jobId = await jobInExecute(bundle.charterVersion, 'notify-forward');
     await upsertBinding(
       {
@@ -204,7 +204,7 @@ describe('runDueJobs', () => {
       { businessId: BUSINESS, by: 'test' },
     );
     await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
 
     const notified: string[] = [];
@@ -227,9 +227,7 @@ describe('runDueJobs', () => {
   });
 
   it('reports a job in execute that is bound to no plan, and does not run it', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' }), {
-      businessId: BUSINESS,
-    });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' }))); // TENANCY-TODO(task 4)
     const jobId = await jobInExecute(bundle.charterVersion, 'unbound');
 
     const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
@@ -246,9 +244,7 @@ describe('runDueJobs', () => {
   // conductor card lands here — so this went from a documented hypothetical
   // to a certainty.
   it('moves an unbound job out of execute so it cannot hold the window forever', async () => {
-    const bundle = await installCharter(buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' }), {
-      businessId: BUSINESS,
-    });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [MAIL_CONNECTION], knownCounterpartyEmailDomain: 'example.com' }))); // TENANCY-TODO(task 4)
     const jobId = await jobInExecute(bundle.charterVersion, 'unbound-twice');
 
     await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith([]), now: NOON });
@@ -291,10 +287,10 @@ describe('runDueJobs', () => {
     // A charter with no connection serving `mail.send` at all — so
     // `resolveChannel` has nothing to match and `runPlan` rejects with
     // `no_channel_for_tool`, the rejection `instruct.ts` cannot pre-check.
-    const bundle = await installCharter(
-      buildCharter({ version: '2026-08-15.no-channel', connections: [], autonomyBase: { 'email.initiate': 'auto' } }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
+      buildCharter({ version: '2026-08-15.no-channel', connections: [], autonomyBase: { 'email.initiate': 'auto' } })
+    ));
     const jobId = await jobInExecute(bundle.charterVersion, 'no-channel');
     await bindPlanToJob(jobId, PLAN, { businessId: BUSINESS });
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
@@ -357,10 +353,10 @@ describe('runDueJobs', () => {
     // section for the exact failure this produced when verified.
     const OTHER_BUSINESS = 'other-business';
     const jobIdHome = await seedExecutableJob(BUSINESS);
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
     const jobIdOther = await seedExecutableJob(OTHER_BUSINESS);
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: OTHER_BUSINESS });
+    await withBusiness(OTHER_BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: OTHER_BUSINESS });
 
     const sent: MailMessage[] = [];
@@ -385,15 +381,15 @@ describe('runDueJobs', () => {
     // `charter_versions` keys on `charter_version` alone, and `seedExecutableJob`
     // below installs a charter of its own — both must carry distinct
     // versions or the second `installCharter` collides on the primary key.
-    const bundle = await installCharter(
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+      bdb,
       buildCharter({
         version: '2026-08-15.poison',
         connections: [MAIL_CONNECTION],
         knownCounterpartyEmailDomain: 'example.com',
         autonomyBase: { 'email.initiate': 'auto' },
-      }),
-      { businessId: BUSINESS },
-    );
+      })
+    ));
     const poisonJobId = await jobInExecute(bundle.charterVersion, 'poison');
     await bindPlanToJob(poisonJobId, PLAN, { businessId: BUSINESS });
     // Corrupt the stored plan directly in the database. `loadPlanBody`
@@ -408,7 +404,7 @@ describe('runDueJobs', () => {
     ]);
 
     const healthyJobId = await seedExecutableJob();
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     const sent: MailMessage[] = [];
@@ -434,7 +430,7 @@ describe('runDueJobs', () => {
    */
   it("holds a job at the ceiling carried by the envelope that opened it as a delegation's child", async () => {
     const jobId = await seedExecutableJob();
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
 
     const envelope: AgentEnvelope = {
@@ -462,8 +458,8 @@ describe('runDueJobs', () => {
       idempotencyKey: `IDEM-${ulid()}`,
       createdAt: '2026-09-24T00:00:00.000Z',
     };
-    await writeEnvelope(envelope, { parentJobId: 'JOB-some-other-job', businessId: BUSINESS });
-    await attachChildJob(envelope.id, jobId, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => writeEnvelope(bdb, envelope, { parentJobId: 'JOB-some-other-job' })); // TENANCY-TODO(task 4)
+    await withBusiness(BUSINESS, (bdb) => attachChildJob(bdb, envelope.id, jobId)); // TENANCY-TODO(task 4)
 
     const sent: MailMessage[] = [];
     const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });

@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { activeScopes, checkKillSwitch } from '../governance/killswitch.js';
 import { runKillCli } from './kill.js';
@@ -37,8 +37,8 @@ describe('runKillCli', () => {
     const { log, lines } = collector();
     await runKillCli(['stop', 'outbound', 'operator', 'drill'], { log, businessId: BUSINESS });
 
-    expect((await activeScopes(BUSINESS)).map((s) => s.scope)).toEqual(['outbound']);
-    const check = await checkKillSwitch('comms.email', true, { businessId: BUSINESS });
+    expect((await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).map((s) => s.scope)).toEqual(['outbound']); // TENANCY-TODO(task 7)
+    const check = await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'comms.email', true)); // TENANCY-TODO(task 7)
     expect(check.blocked).toBe(true);
     expect(check.scope).toBe('outbound');
 
@@ -61,11 +61,11 @@ describe('runKillCli', () => {
     const { log } = collector();
 
     await runKillCli(['stop', 'outbound', 'operator', 'drill'], { log, businessId: BUSINESS });
-    expect((await checkKillSwitch('know.reader', false, { businessId: BUSINESS })).blocked).toBe(false);
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'know.reader', false))).blocked).toBe(false); // TENANCY-TODO(task 7)
     await runKillCli(['resume', 'outbound', 'operator', 'done'], { log, businessId: BUSINESS });
 
     await runKillCli(['stop', 'all', 'operator', 'drill'], { log, businessId: BUSINESS });
-    expect((await checkKillSwitch('know.reader', false, { businessId: BUSINESS })).blocked).toBe(true);
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'know.reader', false))).blocked).toBe(true); // TENANCY-TODO(task 7)
   });
 
   /**
@@ -77,8 +77,8 @@ describe('runKillCli', () => {
     const { log, lines } = collector();
     await runKillCli(['stop', 'governance', 'operator', 'drill'], { log, businessId: BUSINESS });
 
-    expect((await checkKillSwitch('gov.verify', false, { businessId: BUSINESS })).blocked).toBe(true);
-    expect((await checkKillSwitch('comms.email', true, { businessId: BUSINESS })).blocked).toBe(false);
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'gov.verify', false))).blocked).toBe(true); // TENANCY-TODO(task 7)
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'comms.email', true))).blocked).toBe(false); // TENANCY-TODO(task 7)
 
     const text = lines.join('\n');
     expect(text).toContain('gov.verify');
@@ -95,7 +95,7 @@ describe('runKillCli', () => {
     lines.length = 0;
     await runKillCli(['resume', 'outbound', 'operator', 'done'], { log, businessId: BUSINESS });
 
-    expect((await activeScopes(BUSINESS)).map((s) => s.scope)).toEqual(['knowledge']);
+    expect((await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).map((s) => s.scope)).toEqual(['knowledge']); // TENANCY-TODO(task 7)
     // The one thing an operator must not conclude from "released": that
     // everything is open again.
     expect(lines.join('\n')).toContain('knowledge');
@@ -137,7 +137,7 @@ describe('runKillCli', () => {
     await expect(runKillCli(['status', 'all'], deps)).rejects.toThrow('status');
     await expect(runKillCli([], deps)).rejects.toThrow('שימוש');
 
-    expect(await activeScopes(BUSINESS)).toEqual([]);
+    expect(await withBusiness(BUSINESS, (bdb) => activeScopes(bdb))).toEqual([]); // TENANCY-TODO(task 7)
     expect(await auditReasons()).toEqual([]);
   });
 
@@ -163,8 +163,8 @@ describe('runKillCli', () => {
     const { log } = collector();
     await runKillCli(['stop', 'all', 'operator', 'drill'], { log, businessId: BUSINESS });
 
-    expect((await checkKillSwitch('comms.email', true, { businessId: BUSINESS })).blocked).toBe(true);
-    expect((await checkKillSwitch('comms.email', true, { businessId: 'other-business' })).blocked).toBe(false);
-    expect(await activeScopes('other-business')).toEqual([]);
+    expect((await withBusiness(BUSINESS, (bdb) => checkKillSwitch(bdb, 'comms.email', true))).blocked).toBe(true); // TENANCY-TODO(task 7)
+    expect((await withBusiness('other-business', (bdb) => checkKillSwitch(bdb, 'comms.email', true))).blocked).toBe(false); // TENANCY-TODO(task 7)
+    expect(await withBusiness('other-business', (bdb) => activeScopes(bdb))).toEqual([]); // TENANCY-TODO(task 7)
   });
 });

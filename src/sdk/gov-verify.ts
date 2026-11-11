@@ -136,7 +136,7 @@ import { query, type Options } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
+import { withBusiness, type Queryable } from '../db/pool.js';
 import type { AgentEnvelope } from '../domain/envelope.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { READ_FOR_QUESTION_MAX_CHARS } from '../governance/intent-registry.js';
@@ -661,7 +661,7 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
   // permissive, the same posture `run-due.ts` takes at its own
   // `loadActiveCharter` call: no job of this business can be verified, or
   // can delegate, while its charter is missing.
-  const active = await loadActiveCharter(businessId);
+  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
   if (active === null) {
     throw new Error(`verifyDraft: no active charter for business ${businessId}`);
   }
@@ -743,9 +743,6 @@ export async function verifyDraft(input: VerifyDraftInput): Promise<VerifyDraftR
   };
   // `subjectJobId`, never `parentJobId` — see `VerifyDraftInput.subjectJobId`'s
   // own docblock for why the two must never be the same field.
-  await saveVerdict(input.subjectJobId, verdict, {
-    businessId,
-    ...(input.db !== undefined ? { db: input.db } : {}),
-  });
+  await withBusiness(businessId, (bdb) => saveVerdict(bdb, input.subjectJobId, verdict)); // TENANCY-TODO(task 7)
   return verdict;
 }

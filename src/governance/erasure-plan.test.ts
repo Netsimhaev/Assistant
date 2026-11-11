@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -22,9 +22,7 @@ const RONIT = 'ronit@beta-log.example';
 
 /** A job with a fresh charter, nothing else attached. */
 async function bareJob(title: string): Promise<string> {
-  const bundle = await installCharter(buildCharter({ version: `er-${title}` }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: `er-${title}` }))); // TENANCY-TODO(task 6)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance: 'boss',
@@ -310,7 +308,7 @@ describe('buildErasurePlan', () => {
    * to anything else that would have carried it in by accident.
    */
   it('finds a digest whose body mentions the contact, and counts it for deletion', async () => {
-    await installCharter(buildCharter({ version: 'digest-found' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-found' }))); // TENANCY-TODO(task 6)
     const digestId = `DG-${ulid()}`;
     await getPool().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
@@ -346,7 +344,7 @@ describe('buildErasurePlan', () => {
    * authorization — nothing but the digest's own `body` names the contact.
    */
   it('discovers a digest by its body alone, with no job or document linking to it', async () => {
-    await installCharter(buildCharter({ version: 'digest-discovery' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-discovery' }))); // TENANCY-TODO(task 6)
     const digestId = `DG-${ulid()}`;
     await getPool().query(
       `INSERT INTO digests (digest_id, business_id, kind, window_start, window_end, body, had_content)
@@ -385,7 +383,7 @@ describe('buildErasurePlan', () => {
    * second before `fromIso` — the edge a `>` vs `>=` mistake would flip.
    */
   it('discovers a digest by a window anchor on its created_at, with a decoy just outside the range', async () => {
-    await installCharter(buildCharter({ version: 'digest-window' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'digest-window' }))); // TENANCY-TODO(task 6)
     const insideId = `DG-${ulid()}`;
     const outsideId = `DG-${ulid()}`;
     await getPool().query(
@@ -673,7 +671,7 @@ describe('buildErasurePlan', () => {
         { jobId, kind: 'entity', subjectKey: RONIT, body: {} },
         { businessId: BUSINESS },
       );
-      await keepItem({ kind: 'memory', itemId: memory.memoryId, note: 'חשוב' }, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'memory', itemId: memory.memoryId, note: 'חשוב' })); // TENANCY-TODO(task 6)
 
       const plan = await buildErasurePlan(
         { kind: 'contact', identifier: RONIT },
@@ -690,7 +688,7 @@ describe('buildErasurePlan', () => {
 
     it('excludes a kept document and says why', async () => {
       const documentId = await aDocument();
-      await keepItem({ kind: 'document', itemId: documentId, note: 'לשימור' }, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'document', itemId: documentId, note: 'לשימור' })); // TENANCY-TODO(task 6)
 
       const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
 
@@ -704,7 +702,7 @@ describe('buildErasurePlan', () => {
 
     it('excludes a kept job and says why', async () => {
       const jobId = await jobAbout(RONIT, 'kept-job');
-      await keepItem({ kind: 'job', itemId: jobId, note: 'לשימור' }, { businessId: BUSINESS });
+      await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: jobId, note: 'לשימור' })); // TENANCY-TODO(task 6)
 
       const plan = await buildErasurePlan(
         { kind: 'contact', identifier: RONIT },
@@ -738,16 +736,16 @@ describe('buildErasurePlan', () => {
 
   it('refuses to erase a document that carries a signature', async () => {
     const documentId = await aDocument();
-    await recordSignature(
+    await withBusiness(BUSINESS, (bdb) => recordSignature( // TENANCY-TODO(task 6)
+      bdb,
       {
         signatureId: `SIG-${ulid()}`,
         documentId,
         signedSha256: 'c'.repeat(64),
         approvalId: `AP-${ulid()}`,
         signedBy: 'owner',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
     const plan = await buildErasurePlan({ kind: 'document', documentId }, { businessId: BUSINESS });
 
@@ -1550,7 +1548,7 @@ describe('calendar scheduling', () => {
     const meetingJob = await bareJob('kept-meeting-job');
     const reminder = await bareJob(`תזכורת ל-${RONIT}`);
     await aMeeting('MT-kept', meetingJob, { eventId: 'ev-kept', reminderJobId: reminder });
-    await keepItem({ kind: 'job', itemId: meetingJob, note: 'לשמור' }, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => keepItem(bdb, { kind: 'job', itemId: meetingJob, note: 'לשמור' })); // TENANCY-TODO(task 6)
 
     const plan = await buildErasurePlan({ kind: 'contact', identifier: RONIT }, { businessId: BUSINESS });
 

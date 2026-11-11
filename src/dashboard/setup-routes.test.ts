@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { activeCharterVersion, installCharter } from '../charter/store.js';
@@ -132,7 +132,7 @@ describe('the no-charter gate', () => {
   });
 
   it('does not redirect once a charter is active', async () => {
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const res = await get(baseUrl, cookie, '/');
@@ -144,9 +144,9 @@ describe('the no-charter gate', () => {
 describe('the interview steps', () => {
   it('resumes at the first unanswered step', async () => {
     const answers = completeAnswers();
-    await saveSection(BUSINESS, 'business', answers.business);
-    await saveSection(BUSINESS, 'principal', answers.principal);
-    await saveSection(BUSINESS, 'voice', answers.voice);
+    await withBusiness(BUSINESS, (bdb) => saveSection(bdb, 'business', answers.business)); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => saveSection(bdb, 'principal', answers.principal)); // TENANCY-TODO(task 10)
+    await withBusiness(BUSINESS, (bdb) => saveSection(bdb, 'voice', answers.voice)); // TENANCY-TODO(task 10)
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const res = await get(baseUrl, cookie, '/setup');
@@ -178,7 +178,7 @@ describe('the interview steps', () => {
     expect(body).toContain('כתבו &quot;rival.co.il&quot; במקום');
     // What was typed is shown back.
     expect(body).toContain('value="*.rival.co.il"');
-    expect((await loadDraft(BUSINESS))?.answers.counterparties).toBeUndefined();
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.counterparties).toBeUndefined(); // TENANCY-TODO(task 10)
   });
 
   it('shows the "domain or phone" issue next to the entry', async () => {
@@ -200,7 +200,7 @@ describe('the interview steps', () => {
     const csrf = await csrfFor(baseUrl, cookie, '/setup/step/6');
     const res = await post(baseUrl, cookie, '/setup/step/6', { csrf, 'row:quote.issue': 'alone' });
     expect(res.status).toBe(400);
-    expect((await loadDraft(BUSINESS))?.answers.actions).toBeUndefined();
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.actions).toBeUndefined(); // TENANCY-TODO(task 10)
   });
 
   it('a time zone it does not know is refused in Hebrew', async () => {
@@ -219,7 +219,7 @@ describe('the interview steps', () => {
     expect(page).toContain('בחרת שאני לא נוגעת בכסף');
     const res = await post(baseUrl, cookie, '/setup/step/7', { csrf: csrfOf(page), single: '999' });
     expect(res.status).toBe(303);
-    expect((await loadDraft(BUSINESS))?.answers.money).toEqual({
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.money).toEqual({ // TENANCY-TODO(task 10)
       singleMinor: 0,
       dailyMinor: 0,
       monthlyMinor: 0,
@@ -250,7 +250,7 @@ describe('the interview steps', () => {
     const cookie = await login(baseUrl);
     const res = await post(baseUrl, cookie, '/setup/step/2', stepForms()[2] ?? {});
     expect(res.status).toBe(403);
-    expect(await loadDraft(BUSINESS)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadDraft(bdb))).toBeNull(); // TENANCY-TODO(task 10)
   });
 });
 
@@ -268,7 +268,7 @@ describe('stage 10', () => {
     const proposed = await post(baseUrl, cookie, '/setup/rule', { csrf, text: 'לעולם לא לפרסם מחירים' });
     expect(proposed.status).toBe(303);
     expect(calls).toEqual(['לעולם לא לפרסם מחירים']);
-    expect((await loadDraft(BUSINESS))?.answers.extra?.pending).toHaveLength(1);
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra?.pending).toHaveLength(1); // TENANCY-TODO(task 10)
 
     const page = await (await get(baseUrl, cookie, '/setup/step/10')).text();
     expect(page).toContain('נכון?');
@@ -281,7 +281,7 @@ describe('stage 10', () => {
       actionClasses: 'purchase.place',
     });
     expect(chosen.status).toBe(303);
-    const extra = (await loadDraft(BUSINESS))?.answers.extra;
+    const extra = (await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra; // TENANCY-TODO(task 10)
     expect(extra?.pending).toEqual([]);
     expect(extra?.accepted).toEqual([{ kind: 'forbid', text: 'לעולם לא לפרסם מחירים', actionClasses: ['media.publish'] }]);
   });
@@ -301,7 +301,7 @@ describe('stage 10', () => {
     expect(second.status).toBe(409);
     expect(await second.text()).toContain('לא בוצעה כל פעולה');
 
-    expect((await loadDraft(BUSINESS))?.answers.extra).toEqual({
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra).toEqual({ // TENANCY-TODO(task 10)
       accepted: [],
       pending: [{ kind: 'guidance', text: 'שני' }],
     });
@@ -314,7 +314,7 @@ describe('stage 10', () => {
     await post(baseUrl, cookie, '/setup/rule', { csrf, text: 'ראשון' });
     const res = await post(baseUrl, cookie, '/setup/rule/0', { csrf, choice: 'accept' });
     expect(res.status).toBe(409);
-    expect((await loadDraft(BUSINESS))?.answers.extra?.pending).toHaveLength(1);
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra?.pending).toHaveLength(1); // TENANCY-TODO(task 10)
   });
 
   it('refuses a sentence over 500 characters before calling the proposer', async () => {
@@ -338,7 +338,7 @@ describe('stage 10', () => {
     await post(baseUrl, cookie, '/setup/rule', { csrf, text: 'לא להגיד שאנחנו זולים' });
     const page = await (await get(baseUrl, cookie, '/setup/step/10')).text();
     await post(baseUrl, cookie, '/setup/rule/0', { csrf, ruleHash: ruleHashOf(page, 0), choice: 'guidance' });
-    expect((await loadDraft(BUSINESS))?.answers.extra?.accepted).toEqual([
+    expect((await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)))?.answers.extra?.accepted).toEqual([ // TENANCY-TODO(task 10)
       { kind: 'guidance', text: 'לא להגיד שאנחנו זולים' },
     ]);
   });
@@ -388,8 +388,8 @@ describe('summary and sign', () => {
     const res = await post(baseUrl, cookie, '/setup/sign', { csrf: csrfOf(html), shownHash: shownHash ?? '' });
     expect(res.status).toBe(303);
     expect(res.headers.get('location')).toBe('/');
-    expect(await activeCharterVersion(BUSINESS)).not.toBeNull();
-    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('ask');
+    expect(await withBusiness(BUSINESS, (bdb) => activeCharterVersion(bdb))).not.toBeNull(); // TENANCY-TODO(task 10)
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('ask'); // TENANCY-TODO(task 10)
     expect((await get(baseUrl, cookie, '/')).status).toBe(200);
   });
 
@@ -401,7 +401,7 @@ describe('summary and sign', () => {
     const res = await post(baseUrl, cookie, '/setup/sign', { csrf: csrfOf(html), shownHash: 'f'.repeat(64) });
     expect(res.status).toBe(409);
     expect(await res.text()).toContain('href="/setup/summary"');
-    expect(await activeCharterVersion(BUSINESS)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => activeCharterVersion(bdb))).toBeNull(); // TENANCY-TODO(task 10)
   });
 
   it('sends an incomplete draft from the summary back to /setup', async () => {
@@ -413,7 +413,7 @@ describe('summary and sign', () => {
   });
 
   it('shows the banner on / when the dial could not be applied', async () => {
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const body = await (await get(baseUrl, cookie, '/?mode=failed')).text();
@@ -429,12 +429,12 @@ describe('edit the rules', () => {
     const html = await (await get(baseUrl, cookie, '/setup/summary')).text();
     const shownHash = /name="shownHash" value="([0-9a-f]+)"/.exec(html)?.[1] ?? '';
     await post(baseUrl, cookie, '/setup/sign', { csrf: csrfOf(html), shownHash });
-    const active = await activeCharterVersion(BUSINESS);
+    const active = await withBusiness(BUSINESS, (bdb) => activeCharterVersion(bdb)); // TENANCY-TODO(task 10)
 
     const res = await get(baseUrl, cookie, '/setup/edit');
     expect(res.status).toBe(303);
     expect(res.headers.get('location')).toBe('/setup/step/1');
-    const draft = await loadDraft(BUSINESS);
+    const draft = await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
     expect(draft?.baseCharterVersion).toBe(active);
     expect(draft?.answers.business?.tradeName).toBe('דוגמה תספורות');
     // `autonomy` is not in the charter: /setup resumes there.
@@ -443,7 +443,7 @@ describe('edit the rules', () => {
   });
 
   it('opens an empty interview with a notice over an unreadable charter', async () => {
-    await installCharter(buildCharter({ version: 'broken-1' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'broken-1' }))); // TENANCY-TODO(task 10)
     await getPool().query(
       `UPDATE charter_versions
           SET charter = jsonb_set(charter::jsonb, '{schemaVersion}', to_jsonb('0'::text))
@@ -461,7 +461,7 @@ describe('edit the rules', () => {
     const res = await get(baseUrl, cookie, '/setup/edit');
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('התקנון הקיים אינו קריא');
-    const draft = await loadDraft(BUSINESS);
+    const draft = await withBusiness(BUSINESS, (bdb) => loadDraft(bdb)); // TENANCY-TODO(task 10)
     expect(draft?.answers).toEqual({});
     expect(draft?.baseCharterVersion).toBe('broken-1');
 
@@ -470,7 +470,7 @@ describe('edit the rules', () => {
     const shownHash = /name="shownHash" value="([0-9a-f]+)"/.exec(html)?.[1] ?? '';
     const sign = await post(baseUrl, cookie, '/setup/sign', { csrf: csrfOf(html), shownHash });
     expect(sign.status).toBe(303);
-    expect(await activeCharterVersion(BUSINESS)).not.toBe('broken-1');
+    expect(await withBusiness(BUSINESS, (bdb) => activeCharterVersion(bdb))).not.toBe('broken-1'); // TENANCY-TODO(task 10)
   });
 
   it('without an active charter, /setup/edit is the first-time interview', async () => {
@@ -540,12 +540,12 @@ describe('final review fixes', () => {
     const body = await res.text();
     expect(body).toContain(escapeHtml(PREFLIGHT_REFUSAL_TITLE));
     expect(body).toContain('לא בוצעה כל פעולה');
-    expect(await activeCharterVersion(BUSINESS)).toBeNull();
-    expect(await loadDraft(BUSINESS)).not.toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => activeCharterVersion(bdb))).toBeNull(); // TENANCY-TODO(task 10)
+    expect(await withBusiness(BUSINESS, (bdb) => loadDraft(bdb))).not.toBeNull(); // TENANCY-TODO(task 10)
   });
 
   it('a step with an active charter and no draft goes to /setup/edit first', async () => {
-    await installCharter(buildCharter(), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 10)
     const baseUrl = await startServer();
     const cookie = await login(baseUrl);
     const getRes = await get(baseUrl, cookie, '/setup/step/3');
@@ -557,7 +557,7 @@ describe('final review fixes', () => {
     const postRes = await post(baseUrl, cookie, '/setup/step/3', { ...stepForms()[3], csrf });
     expect(postRes.status).toBe(303);
     expect(postRes.headers.get('location')).toBe('/setup/edit');
-    expect(await loadDraft(BUSINESS)).toBeNull();
+    expect(await withBusiness(BUSINESS, (bdb) => loadDraft(bdb))).toBeNull(); // TENANCY-TODO(task 10)
   });
 
   it('an edit: step 9 preselects the live dial, and an unchanged edit says nothing changed', async () => {
@@ -565,7 +565,7 @@ describe('final review fixes', () => {
     const cookie = await login(baseUrl);
     await completeViaPosts(baseUrl, cookie);
     expect((await signViaSummary(baseUrl, cookie)).status).toBe(303);
-    await setAutonomyMode('learn', USERNAME, { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', USERNAME)); // TENANCY-TODO(task 10)
 
     await get(baseUrl, cookie, '/setup/edit');
     const step9 = await (await get(baseUrl, cookie, '/setup/step/9')).text();

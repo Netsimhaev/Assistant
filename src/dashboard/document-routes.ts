@@ -30,7 +30,7 @@ import { isAbsolute, relative, resolve } from 'node:path';
 import { z } from 'zod';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { FORMAT_MEDIA_TYPE, formatAttachmentSize } from '../domain/attachment-ref.js';
 import { DocumentKind } from '../domain/document-spec.js';
 import {
@@ -115,7 +115,7 @@ export const CHARTER_UNREADABLE_HE =
  */
 async function charterContext(businessId: string): Promise<{ timeZone: string; currency: string } | null> {
   try {
-    const active = await loadActiveCharter(businessId);
+    const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 10)
     return active === null
       ? null
       : { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency };

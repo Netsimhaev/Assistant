@@ -8,9 +8,7 @@
  * the two functions that write and read it.
  */
 import { z } from 'zod';
-import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
-import type { Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 
 export const Verdict = z.object({
   criteria: z
@@ -99,12 +97,11 @@ function toVerdict(row: VerdictRow): Verdict {
  * reader could confuse for the current one.
  */
 export async function saveVerdict(
+  db: BusinessDb,
   jobId: string,
   verdict: Verdict,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   await db.query(
     `INSERT INTO verification_verdicts (business_id, job_id, verdict)
      VALUES ($1, $2, $3)
@@ -131,11 +128,10 @@ export async function saveVerdict(
  * does not exist is this branch's own target defect class.
  */
 export async function loadVerdict(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<Verdict | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<VerdictRow>(
     `SELECT verdict FROM verification_verdicts
       WHERE business_id = $1 AND job_id = $2 AND verdict IS NOT NULL`,
@@ -184,12 +180,11 @@ export type VerificationOutcome =
  * rejects a row that claims both at once.
  */
 export async function saveNotJudged(
+  db: BusinessDb,
   jobId: string,
   reason: NotJudgedReason,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   await db.query(
     `INSERT INTO verification_verdicts (business_id, job_id, verdict, not_judged_reason)
      VALUES ($1, $2, NULL, $3)
@@ -206,11 +201,10 @@ interface OutcomeRow {
 
 /** The full three-state outcome for a job, or `null` if verification has not written anything yet. */
 export async function loadVerificationOutcome(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<VerificationOutcome | null> {
-  const businessId = options.businessId ?? config.businessId;
-  const db = options.db ?? getPool();
+  const businessId = db.businessId;
   const { rows } = await db.query<OutcomeRow>(
     `SELECT verdict, not_judged_reason FROM verification_verdicts
       WHERE business_id = $1 AND job_id = $2`,

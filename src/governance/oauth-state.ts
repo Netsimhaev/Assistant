@@ -28,8 +28,7 @@
  * third round-trip through an untrusted client.
  */
 import { randomBytes } from 'node:crypto';
-import { getPool } from '../db/pool.js';
-import type { Queryable } from '../db/pool.js';
+import type { BusinessDb, Queryable } from '../db/pool.js';
 
 /**
  * How long an unconsumed state stays valid. Long enough to actually complete
@@ -40,7 +39,6 @@ import type { Queryable } from '../db/pool.js';
 const STATE_TTL_MS = 10 * 60 * 1000;
 
 export interface CreateStateInput {
-  businessId: string;
   system: string;
   sessionId: string;
   codeVerifier: string;
@@ -56,10 +54,9 @@ export interface CreateStateInput {
  * (`system`, `sessionId`, `codeVerifier`) from THIS ROW, via `consumeState`.
  */
 export async function createState(
+  db: BusinessDb,
   input: CreateStateInput,
-  options: { db?: Queryable } = {},
 ): Promise<string> {
-  const db = options.db ?? getPool();
   // Opportunistic, on every ceremony start (final fix wave, item 8): this
   // table had no pruning anywhere, so every started ceremony left a
   // PERMANENT row holding a `code_verifier` in plaintext, consumed or not.
@@ -71,7 +68,7 @@ export async function createState(
   await db.query(
     `INSERT INTO oauth_states (state, business_id, system, session_id, code_verifier, expires_at, provider)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [state, input.businessId, input.system, input.sessionId, input.codeVerifier, expiresAt, input.provider ?? null],
+    [state, db.businessId, input.system, input.sessionId, input.codeVerifier, expiresAt, input.provider ?? null],
   );
   return state;
 }
@@ -138,11 +135,9 @@ export interface ConsumedState {
  * revealing which of the three actually happened.
  */
 export async function consumeState(
+  db: BusinessDb,
   state: string,
-  businessId: string,
-  options: { db?: Queryable } = {},
 ): Promise<ConsumedState | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<{ system: string; session_id: string; code_verifier: string; provider: string | null }>(
     `UPDATE oauth_states
         SET consumed_at = now()
@@ -151,7 +146,7 @@ export async function consumeState(
         AND consumed_at IS NULL
         AND expires_at > now()
       RETURNING system, session_id, code_verifier, provider`,
-    [state, businessId],
+    [state, db.businessId],
   );
   const row = rows[0];
   if (row === undefined) return null;

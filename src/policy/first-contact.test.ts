@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -49,7 +49,7 @@ afterAll(async () => {
 
 describe('first contact escalates, and no origin is exempt from that', () => {
   async function bundle(): Promise<PolicyBundle> {
-    return installCharter(buildCharter(), { businessId: BUSINESS });
+    return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   }
 
   /**
@@ -123,10 +123,10 @@ describe('first contact escalates, and no origin is exempt from that', () => {
   // The recipient is therefore one the charter resolves, so the first-contact
   // rule stays silent and the amount is the only thing that can escalate.
   it('escalates on the amount alone, for a recipient the charter does resolve', async () => {
-    const BUNDLE = await installCharter(
-      buildCharter({ version: '2026-08-15.money-only', knownCounterpartyEmailDomain: 'example.com' }),
-      { businessId: BUSINESS },
-    );
+    const BUNDLE = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ version: '2026-08-15.money-only', knownCounterpartyEmailDomain: 'example.com' })
+    ));
     const known = { ...firstContact('boss', true), counterpartyEmails: ['dana@example.com'] };
 
     // The control, and the half that makes the next assertion mean something:
@@ -150,10 +150,10 @@ describe('first contact escalates, and no origin is exempt from that', () => {
  */
 describe('the risk explanation the owner reads', () => {
   it('names the action class in Hebrew on the routine band', async () => {
-    const BUNDLE = await installCharter(
-      buildCharter({ version: '2026-08-15.money-only', knownCounterpartyEmailDomain: 'example.com' }),
-      { businessId: BUSINESS },
-    );
+    const BUNDLE = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ version: '2026-08-15.money-only', knownCounterpartyEmailDomain: 'example.com' })
+    ));
     const known = { ...firstContact('boss', true), counterpartyEmails: ['dana@example.com'] };
     const risk = await assessRisk(known, BUNDLE);
     // Proves the routine sentence is the one under test, not another branch.
@@ -163,7 +163,7 @@ describe('the risk explanation the owner reads', () => {
   });
 
   it('names an untrusted origin in Hebrew', async () => {
-    const BUNDLE = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const BUNDLE = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
     const risk = await assessRisk(firstContact('unknown_external', true), BUNDLE);
     expect(risk.band).not.toBe('routine');
     expect(risk.explanation).toContain('גורם חיצוני לא מוכר');

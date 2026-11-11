@@ -1,10 +1,10 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { decide } from '../governance/approvals.js';
-import { evaluateToolCall } from './engine.js';
+import { evaluateFor } from '../test/gate.js';
 
 const BUSINESS = 'test-business';
 
@@ -54,47 +54,44 @@ const CALL = {
 
 describe('an approval already granted is honoured, not recomputed', () => {
   it('runs the step instead of queueing a second request', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
 
-    const first = await evaluateToolCall(CALL.toolName, CALL.input, { ...CALL.ctx, bundle });
+    const first = await evaluateFor(CALL.toolName, CALL.input, { ...CALL.ctx, bundle });
     expect(first.outcome).toBe('queue_approval');
     if (first.outcome !== 'queue_approval') throw new Error('unreachable');
 
-    await decide(first.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' },
-      { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => decide(bdb, first.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 
-    const second = await evaluateToolCall(CALL.toolName, CALL.input, {
+    const second = await evaluateFor(CALL.toolName, CALL.input, {
       ...CALL.ctx, bundle, approval: { approvalId: first.approvalId, stepId: STEP_ID },
     });
     expect(second.outcome).toBe('allow');
   });
 
   it('queues a fresh request when the same approval is offered twice', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
-    const first = await evaluateToolCall(CALL.toolName, CALL.input, { ...CALL.ctx, bundle });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const first = await evaluateFor(CALL.toolName, CALL.input, { ...CALL.ctx, bundle });
     if (first.outcome !== 'queue_approval') throw new Error('unreachable');
-    await decide(first.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' },
-      { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => decide(bdb, first.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 
     const ctx = {
       ...CALL.ctx, bundle, approval: { approvalId: first.approvalId, stepId: STEP_ID },
     };
-    expect((await evaluateToolCall(CALL.toolName, CALL.input, ctx)).outcome).toBe('allow');
+    expect((await evaluateFor(CALL.toolName, CALL.input, ctx)).outcome).toBe('allow');
 
-    const third = await evaluateToolCall(CALL.toolName, CALL.input, ctx);
+    const third = await evaluateFor(CALL.toolName, CALL.input, ctx);
     expect(third.outcome).toBe('queue_approval');
     if (third.outcome !== 'queue_approval') throw new Error('unreachable');
     expect(third.approvalId).not.toBe(first.approvalId);
   });
 
   it('queues a fresh request when the input changed after the approval', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
-    const first = await evaluateToolCall(CALL.toolName, CALL.input, { ...CALL.ctx, bundle });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
+    const first = await evaluateFor(CALL.toolName, CALL.input, { ...CALL.ctx, bundle });
     if (first.outcome !== 'queue_approval') throw new Error('unreachable');
-    await decide(first.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' },
-      { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => decide(bdb, first.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 
-    const changed = await evaluateToolCall(
+    const changed = await evaluateFor(
       CALL.toolName,
       { ...CALL.input, body: 'נוסח אחר לגמרי' },
       { ...CALL.ctx, bundle, approval: { approvalId: first.approvalId, stepId: STEP_ID } },
@@ -109,11 +106,11 @@ describe('an approval already granted is honoured, not recomputed', () => {
     // an `approval` is present here and it must still deny. This reuses
     // CALL.ctx, so `known_counterparty` (non-boss, see the CALL docblock)
     // still applies; the forbidden override dominates it regardless.
-    const bundle = await installCharter(
-      buildCharter({ autonomyBase: { 'email.initiate': 'forbidden' } }),
-      { businessId: BUSINESS },
-    );
-    const denied = await evaluateToolCall(CALL.toolName, CALL.input, {
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ autonomyBase: { 'email.initiate': 'forbidden' } })
+    ));
+    const denied = await evaluateFor(CALL.toolName, CALL.input, {
       ...CALL.ctx, bundle, approval: { approvalId: 'A-anything', stepId: STEP_ID },
     });
     expect(denied.outcome).toBe('deny');
@@ -130,10 +127,10 @@ describe('the payload a spent approval executes matches the payload a normal all
   // override below makes it `approve_required` for this test only, without
   // touching outbound-ness.
   it('does not redact a non-outbound payload it consumes', async () => {
-    const bundle = await installCharter(
-      buildCharter({ autonomyBase: { 'artifact.write': 'approve_required' } }),
-      { businessId: BUSINESS },
-    );
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(
+      bdb,
+      buildCharter({ autonomyBase: { 'artifact.write': 'approve_required' } })
+    ));
     const toolName = 'file.write';
     // A 9-digit run matches the fixture's redaction pattern (`\b\d{9}\b`,
     // src/test/fixtures.ts). If the consumption branch redacted unconditionally
@@ -151,14 +148,13 @@ describe('the payload a spent approval executes matches the payload a normal all
       bundle,
     };
 
-    const first = await evaluateToolCall(toolName, input, ctx);
+    const first = await evaluateFor(toolName, input, ctx);
     expect(first.outcome).toBe('queue_approval');
     if (first.outcome !== 'queue_approval') throw new Error('unreachable');
 
-    await decide(first.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' },
-      { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => decide(bdb, first.approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 
-    const second = await evaluateToolCall(toolName, input, {
+    const second = await evaluateFor(toolName, input, {
       ...ctx,
       approval: { approvalId: first.approvalId, stepId: STEP_ID },
     });

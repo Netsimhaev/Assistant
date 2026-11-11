@@ -39,7 +39,7 @@
  */
 import { appendAudit } from '../audit/log.js';
 import { config } from '../config.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import {
   listSecretRefs,
   putSecret,
@@ -102,7 +102,8 @@ async function auditAction(params: {
   action: Command;
   reason: string;
 }): Promise<void> {
-  await appendAudit(
+  await withBusiness(params.businessId, (bdb) => appendAudit( // TENANCY-TODO(task 7)
+    bdb,
     {
       actor: 'human',
       onBehalfOf: params.operator,
@@ -120,9 +121,8 @@ async function auditAction(params: {
         operator: params.operator,
       }),
       reason: params.reason,
-    },
-    { businessId: params.businessId },
-  );
+    }
+  ));
 }
 
 export async function runSecretCli(argv: string[], deps: SecretCliDeps): Promise<void> {

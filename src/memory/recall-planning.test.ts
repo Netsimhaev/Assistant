@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -14,9 +14,7 @@ let jobCounter = 0;
 async function jobWith(provenance: 'boss' | 'unknown_external'): Promise<string> {
   // One argument, `charterVersion` required, no `counterpartyTags`.
   const version = `recall-job-${jobCounter++}`;
-  const bundle = await installCharter(buildCharter({ version }), {
-    businessId: BUSINESS,
-  });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version }))); // TENANCY-TODO(task 5)
   const job = await createJob({
     charterVersion: bundle.charterVersion,
     provenance,
@@ -30,7 +28,7 @@ describe('the memory block handed to the planner', () => {
   beforeEach(async () => {
     await resetDatabase();
     jobCounter = 0;
-    await installCharter(buildCharter({ version: 'recall-setup' }), { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ version: 'recall-setup' }))); // TENANCY-TODO(task 5)
   });
 
   afterAll(async () => {

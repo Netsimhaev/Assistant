@@ -13,8 +13,7 @@
  * to be able to reconstruct later.
  */
 import { z } from 'zod';
-import { config } from '../config.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { transaction, type BusinessDb } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { AutonomyLevel } from '../domain/trust.js';
@@ -50,12 +49,11 @@ export function rampBoundsForMode(
 }
 
 export async function loadAutonomyMode(
-  options: { businessId?: string; db?: Queryable } = {},
+  db: BusinessDb,
 ): Promise<AutonomyMode> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<{ mode: string }>(
     'SELECT mode FROM autonomy_mode WHERE business_id = $1',
-    [options.businessId ?? config.businessId],
+    [db.businessId],
   );
 
   const stored = rows[0]?.mode;
@@ -77,21 +75,19 @@ export async function loadAutonomyMode(
  * audit row describing who moved it and from where simply never lands. A
  * failed audit here must roll the mode back, not leave it changed and mute.
  *
- * The transaction is opened here, on the pool, exactly as `move()` in
- * `orchestrator/promote.ts` opens its own rather than threading
- * `options.db`: that parameter points the read in `loadAutonomyMode` at a
- * connection, and the one production caller (`dashboard/server.ts`) never
- * sets it.
+ * The transaction is opened here, on `db` (`transaction` joins one the
+ * caller already holds), so the read of the previous mode, the write and the
+ * audit row share one connection.
  */
 export async function setAutonomyMode(
+  db: BusinessDb,
   mode: AutonomyMode,
   by: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
-  await withTransaction(async (tx) => {
-    const previous = await loadAutonomyMode({ businessId, db: tx });
+  await transaction(db, async (tx) => {
+    const previous = await loadAutonomyMode(tx);
 
     await tx.query(
       `INSERT INTO autonomy_mode (business_id, mode, updated_at, updated_by)
@@ -101,17 +97,14 @@ export async function setAutonomyMode(
       [businessId, mode, by],
     );
 
-    await appendAudit(
-      {
-        actor: 'human',
-        onBehalfOf: by,
-        kind: 'autonomy_change',
-        charterVersion: 'unknown',
-        provenance: 'boss',
-        inputHash: canonicalHash({ from: previous, to: mode }),
-        reason: `רמת החופש שונתה מ-${previous} ל-${mode} על ידי ${by}`,
-      },
-      { businessId, tx },
-    );
+    await appendAudit(tx, {
+      actor: 'human',
+      onBehalfOf: by,
+      kind: 'autonomy_change',
+      charterVersion: 'unknown',
+      provenance: 'boss',
+      inputHash: canonicalHash({ from: previous, to: mode }),
+      reason: `רמת החופש שונתה מ-${previous} ל-${mode} על ידי ${by}`,
+    });
   });
 }

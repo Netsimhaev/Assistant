@@ -12,8 +12,8 @@
  * condition it claims to test.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool, type Queryable } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness, type BusinessDb } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter, type CharterOverrides } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { decide, enqueueApproval } from '../governance/approvals.js';
@@ -22,7 +22,7 @@ import { trip } from '../governance/killswitch.js';
 import { createJob } from '../orchestrator/jobs.js';
 import { loadRampLevel } from '../orchestrator/ramp.js';
 import { DENY_CODES, type PolicyBundle } from '../domain/policy.js';
-import { evaluateToolCall, type GateContext } from './engine.js';
+import { evaluateFor, type TestGateContext } from '../test/gate.js';
 import { buildFacts } from './facts.js';
 import { assessRisk } from './risk.js';
 import { APPROVED_REPLY_EXEMPTION_MARKER } from './approved-reply.js';
@@ -50,7 +50,7 @@ afterAll(async () => { await closePool(); });
 interface Setup {
   bundle: PolicyBundle;
   jobId: string;
-  ctx: GateContext;
+  ctx: TestGateContext;
 }
 
 async function setup(
@@ -58,10 +58,10 @@ async function setup(
   options: { mailboxReplyJob?: boolean } = {},
 ): Promise<Setup> {
   const charter = buildCharter(overrides);
-  const bundle = await installCharter(charter, { businessId: BUSINESS });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, charter));
   // The dial is not written: a fresh install reads `off`. Asserted, because
   // the whole file is about what happens under it.
-  expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+  expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off');
   const rampLevel = await loadRampLevel('email.reply', { businessId: BUSINESS });
   expect(rampLevel).toBe('draft_only');
 
@@ -109,23 +109,22 @@ async function approvedCard(
     counterpartyTags: [],
   });
   const risk = await assessRisk(facts, s.bundle);
-  const approvalId = await enqueueApproval(
+  const approvalId = await withBusiness(BUSINESS, (bdb) => enqueueApproval(
+    bdb,
     {
       jobId: options.jobId ?? s.jobId,
       facts,
       risk,
       proposedInput: input,
       summary: 'מענה לשולח',
-    },
-    { businessId: BUSINESS },
-  );
-  await decide(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' },
-    { businessId: BUSINESS });
+    }
+  ));
+  await withBusiness(BUSINESS, (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
   return approvalId;
 }
 
 async function consumedAt(approvalId: string): Promise<Date | null> {
-  const { rows } = await getPool().query<{ consumed_at: Date | null }>(
+  const { rows } = await testDb().query<{ consumed_at: Date | null }>(
     'SELECT consumed_at FROM approval_requests WHERE approval_id = $1',
     [approvalId],
   );
@@ -134,14 +133,14 @@ async function consumedAt(approvalId: string): Promise<Date | null> {
   return row.consumed_at;
 }
 
-function expectDenied(decision: Awaited<ReturnType<typeof evaluateToolCall>>, code: string): void {
+function expectDenied(decision: Awaited<ReturnType<typeof evaluateFor>>, code: string): void {
   expect(decision.outcome).toBe('deny');
   if (decision.outcome !== 'deny') throw new Error('unreachable');
   expect(decision.code).toBe(code);
 }
 
 async function intentRows(jobId: string): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(
+  const { rows } = await testDb().query<{ n: string }>(
     `SELECT count(*)::text AS n FROM audit_log WHERE job_id = $1 AND kind = 'intent_to_act'`,
     [jobId],
   );
@@ -157,7 +156,7 @@ async function intentRows(jobId: string): Promise<number> {
  * every negative test below would stay green with its condition removed.
  */
 async function expectDeniedAtStage8(
-  decision: Awaited<ReturnType<typeof evaluateToolCall>>,
+  decision: Awaited<ReturnType<typeof evaluateFor>>,
   jobId: string,
 ): Promise<void> {
   expectDenied(decision, DENY_CODES.draftOnly);
@@ -169,7 +168,7 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     const s = await setup();
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -181,12 +180,12 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     const s = await setup();
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
     expect(decision.outcome).toBe('allow');
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'approval'`,
       [s.jobId],
     );
@@ -205,12 +204,12 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     );
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, rampLevel: 'approve_required', approval: { approvalId, stepId: STEP_ID },
     });
 
     expect(decision.outcome).toBe('allow');
-    const { rows } = await getPool().query<{ reason: string }>(
+    const { rows } = await testDb().query<{ reason: string }>(
       `SELECT reason FROM audit_log WHERE job_id = $1 AND kind = 'approval'`,
       [s.jobId],
     );
@@ -225,7 +224,7 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     const s = await setup({}, { mailboxReplyJob: false });
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -239,7 +238,7 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     await linkReplyJob(mail.mailId, s.jobId, { businessId: 'other-business' });
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -251,7 +250,7 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     const s = await setup();
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, s.ctx);
+    const decision = await evaluateFor('mail.send', REPLY, s.ctx);
 
     await expectDeniedAtStage8(decision, s.jobId);
     expect(await consumedAt(approvalId)).toBeNull();
@@ -261,7 +260,7 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     const s = await setup();
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall(
+    const decision = await evaluateFor(
       'mail.send',
       { ...REPLY, body: 'נוסח אחר שהבעלים מעולם לא ראה' },
       { ...s.ctx, approval: { approvalId, stepId: STEP_ID } },
@@ -279,7 +278,7 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     // only thing that can refuse this, which is exactly the binding under test.
     const approvalId = await approvedCard(s, { toolName: 'wa.send_message' });
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -296,7 +295,7 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     });
     const approvalId = await approvedCard(s, { jobId: other.jobId });
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -312,15 +311,14 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     const facts = buildFacts('mail.send', REPLY, {
       provenance: 'unknown_external', chainDepth: 0, counterpartyTags: [],
     });
-    const approvalId = await enqueueApproval(
+    const approvalId = await withBusiness('other-business', async (bdb) => enqueueApproval(
+      bdb,
       { jobId: s.jobId, facts, risk: await assessRisk(facts, s.bundle),
-        proposedInput: REPLY, summary: 'מענה לשולח' },
-      { businessId: 'other-business' },
-    );
-    await decide(approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' },
-      { businessId: 'other-business' });
+        proposedInput: REPLY, summary: 'מענה לשולח' }
+    ));
+    await withBusiness('other-business', (bdb) => decide(bdb, approvalId, 'approved', { by: 'p_boss', channel: 'dashboard' }));
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -333,13 +331,13 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     const approvalId = await approvedCard(s);
     // `expireOverdue` never touches a decided row, so an approved card past
     // its fuse keeps `state = approved` — the shape that must not be spendable.
-    await getPool().query(
+    await testDb().query(
       `UPDATE approval_requests SET expires_at = now() - interval '1 minute'
         WHERE approval_id = $1`,
       [approvalId],
     );
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -352,19 +350,19 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     const facts = buildFacts('mail.send', REPLY, {
       provenance: 'unknown_external', chainDepth: 0, counterpartyTags: [],
     });
-    const approvalId = await enqueueApproval(
+    const approvalId = await withBusiness(BUSINESS, async (bdb) => enqueueApproval(
+      bdb,
       { jobId: s.jobId, facts, risk: await assessRisk(facts, s.bundle),
-        proposedInput: REPLY, summary: 'מענה לשולח' },
-      { businessId: BUSINESS },
-    );
+        proposedInput: REPLY, summary: 'מענה לשולח' }
+    ));
     // `input_hash_at_decision` is written by `decide`; set it here so the
     // ONLY thing this card lacks is the decision itself.
-    await getPool().query(
+    await testDb().query(
       'UPDATE approval_requests SET input_hash_at_decision = input_hash WHERE approval_id = $1',
       [approvalId],
     );
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -375,13 +373,13 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
   it('an approval already spent is denied draft_only', async () => {
     const s = await setup();
     const approvalId = await approvedCard(s);
-    await getPool().query(
+    await testDb().query(
       `UPDATE approval_requests SET consumed_at = now(), consumed_by_step = 'earlier'
         WHERE approval_id = $1`,
       [approvalId],
     );
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -393,7 +391,7 @@ describe('an owner-approved reply passes the ramp and provenance ceilings', () =
     const { inReplyTo: _thread, ...initiate } = REPLY;
     const approvalId = await approvedCard(s, { input: initiate });
 
-    const decision = await evaluateToolCall('mail.send', initiate, {
+    const decision = await evaluateFor('mail.send', initiate, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -406,9 +404,9 @@ describe('the exemption skips nothing but the two ceilings it names', () => {
   it('kill switch still denies an approved reply', async () => {
     const s = await setup();
     const approvalId = await approvedCard(s);
-    await trip('outbound', 'p_boss', 'בדיקה', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => trip(bdb, 'outbound', 'p_boss', 'בדיקה'));
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -420,7 +418,7 @@ describe('the exemption skips nothing but the two ceilings it names', () => {
     const s = await setup();
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, now: NIGHT, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -432,7 +430,7 @@ describe('the exemption skips nothing but the two ceilings it names', () => {
     const s = await setup({ doNotContactEmailDomain: 'outside.example' });
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -444,7 +442,7 @@ describe('the exemption skips nothing but the two ceilings it names', () => {
     const s = await setup({ autonomyBase: { 'email.reply': 'forbidden' } });
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -458,7 +456,7 @@ describe('the exemption skips nothing but the two ceilings it names', () => {
     const s = await setup({ autonomyBase: { 'email.reply': 'draft_only' } });
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -470,7 +468,7 @@ describe('the exemption skips nothing but the two ceilings it names', () => {
     const s = await setup();
     const approvalId = await approvedCard(s);
 
-    const decision = await evaluateToolCall('mail.send', REPLY, {
+    const decision = await evaluateFor('mail.send', REPLY, {
       ...s.ctx, autonomyCeiling: 'draft_only', approval: { approvalId, stepId: STEP_ID },
     });
 
@@ -489,22 +487,25 @@ describe('the exemption skips nothing but the two ceilings it names', () => {
 
     // Simulate the competing runner: the moment the gate tries to claim, the
     // row is already spent. Every other statement passes through untouched.
-    const pool = getPool();
-    const racing: Queryable = {
-      query: (async (text: string, params?: unknown[]) => {
-        if (/^\s*UPDATE approval_requests\s+SET consumed_at/.test(text)) {
-          await pool.query(
-            `UPDATE approval_requests SET consumed_at = now(), consumed_by_step = 'other'
-              WHERE approval_id = $1`,
-            [approvalId],
-          );
-        }
-        return pool.query(text, params);
-      }) as Queryable['query'],
-    };
-
-    const decision = await evaluateToolCall('mail.send', REPLY, {
-      ...s.ctx, db: racing, approval: { approvalId, stepId: STEP_ID },
+    const pool = testDb();
+    const decision = await withBusiness(BUSINESS, (real) => {
+      const racing: BusinessDb = {
+        businessId: real.businessId,
+        inTransaction: real.inTransaction,
+        query: (async (text: string, params?: unknown[]) => {
+          if (/^\s*UPDATE approval_requests\s+SET consumed_at/.test(text)) {
+            await pool.query(
+              `UPDATE approval_requests SET consumed_at = now(), consumed_by_step = 'other'
+                WHERE approval_id = $1`,
+              [approvalId],
+            );
+          }
+          return real.query(text, params);
+        }) as BusinessDb['query'],
+      };
+      return evaluateFor('mail.send', REPLY, {
+        ...s.ctx, db: racing, approval: { approvalId, stepId: STEP_ID },
+      });
     });
 
     // Denied by the fallback in stage 10, not by stage 8: the one

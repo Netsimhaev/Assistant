@@ -20,7 +20,7 @@
  * carries the weight in the two dial tests.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness, type Queryable } from '../db/pool.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -40,7 +40,6 @@ import { AdapterRegistry } from './adapters/registry.js';
 import { envCredentials } from './credentials.js';
 import type { Runtime } from './runtime.js';
 
-import type { Queryable } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
 import type { PolicyBundle, ActionFacts } from '../domain/policy.js';
 
@@ -115,16 +114,16 @@ async function card(
   const input = { to: 'dana@example.com', body: `card-${sequence}` };
   const facts = factsFor(actionClass, input);
   const risk = await assessRisk(facts, bundle);
-  const approvalId = await enqueueApproval(
-    { facts, risk, proposedInput: input, summary: 'שליחת מייל', jobId },
-    { businessId: BUSINESS },
-  );
-  await decide(
+  const approvalId = await withBusiness(BUSINESS, (bdb) => enqueueApproval( // TENANCY-TODO(task 4)
+    bdb,
+    { facts, risk, proposedInput: input, summary: 'שליחת מייל', jobId }
+  ));
+  await withBusiness(BUSINESS, (bdb) => decide( // TENANCY-TODO(task 4)
+    bdb,
     approvalId,
     outcome,
-    { by: 'p_boss', channel: 'dashboard' },
-    { businessId: BUSINESS },
-  );
+    { by: 'p_boss', channel: 'dashboard' }
+  ));
 
   // `decide` stamps `decided_at` with SQL now(); overwriting with a value that
   // strictly increases with `sequence` keeps the order unambiguous, and choosing
@@ -228,7 +227,7 @@ describe('the evaluation pass', () => {
   beforeEach(async () => {
     await resetDatabase();
     sequence = 0;
-    bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   });
   afterAll(async () => {
     await closePool();
@@ -240,7 +239,7 @@ describe('the evaluation pass', () => {
    * so the first evaluation demonstrably ran and the dial is what held it.
    */
   it('does not move anything while the dial is off, however clean the record', async () => {
-    await setAutonomyMode('off', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'off', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES + 5);
 
@@ -254,13 +253,13 @@ describe('the evaluation pass', () => {
     expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('draft_only');
 
     // Positive control: only the dial changes.
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
   });
 
   /** Spec §3: `ask` measures, it does not climb. Same positive control. */
   it('does not promote on the dial at ask — measuring is not climbing', async () => {
-    await setAutonomyMode('ask', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'ask', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
 
@@ -269,14 +268,14 @@ describe('the evaluation pass', () => {
     expect(await events('email.reply')).toEqual([]);
     expect(await loadRampLevel('email.reply', { businessId: BUSINESS })).toBe('approve_required');
 
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
     expect(await storedLevel('email.reply')).toBe('auto_notify');
   });
 
   /** Spec §5.1. The one earned rung in the system. */
   it('promotes one step at learn once the owner agreed enough', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
 
@@ -294,7 +293,7 @@ describe('the evaluation pass', () => {
    * control per case, not a return-value-only assertion).
    */
   it('does not promote on four verdicts, however clean — and does on the fifth', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES - 1);
 
@@ -307,7 +306,7 @@ describe('the evaluation pass', () => {
   });
 
   it('does not promote on 4 of 5 (80%)', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await verdicts('email.reply', 4, 1);
 
@@ -321,7 +320,7 @@ describe('the evaluation pass', () => {
   });
 
   it('exactly 80% does not promote (8 of 10) — the threshold is strict', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await verdicts('email.reply', 8, 2);
 
@@ -334,7 +333,7 @@ describe('the evaluation pass', () => {
   });
 
   it('promotes on 5 of 6, and the event row says how many and what percent', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await verdicts('email.reply', 5, 1);
 
@@ -349,7 +348,7 @@ describe('the evaluation pass', () => {
    * pass, which would make "has this fallen twice" count promotions too.
    */
   it('writes one event row per move, which is what the demotion count reads', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
 
@@ -372,7 +371,7 @@ describe('the evaluation pass', () => {
    * because that is the level the class was actually stored at.
    */
   it('logs the row it actually held as from_level, not the level the dial clamped to', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'auto', { businessId: BUSINESS });
     // The clamp is doing real work here: the gate never sees 'auto' under
     // `learn`, only the ceiling.
@@ -400,7 +399,7 @@ describe('the evaluation pass', () => {
    * biting and not the machinery being dead.
    */
   it('demotes on an owner mark, and the window starts again', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
@@ -437,7 +436,7 @@ describe('the evaluation pass', () => {
    * declares the class.
    */
   it('demotes on a failed job with no human involved at all', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
@@ -462,7 +461,7 @@ describe('the evaluation pass', () => {
    * row, and only the one without demotes.
    */
   it('a failed boss command does not demote; the same failure without an instruction does', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
@@ -481,7 +480,7 @@ describe('the evaluation pass', () => {
   });
 
   it('a mark on a boss-command step does not demote; the same mark on another job does', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
     expect((await evaluateAutonomy({ businessId: BUSINESS })).promoted).toContain('email.reply');
@@ -515,7 +514,7 @@ describe('the evaluation pass', () => {
    * re-evaluating the same evidence is the positive control.
    */
   it('stops climbing after two demotions, even on a perfect record', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     const before = new Date(PAST - 60_000).toISOString();
     for (const id of ['AE-1', 'AE-2']) {
@@ -545,7 +544,7 @@ describe('the evaluation pass', () => {
    * positive control.
    */
   it('never promotes above auto_notify', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
 
@@ -572,7 +571,7 @@ describe('the evaluation pass', () => {
    * half — that it runs LAST — with evidence that pass itself produces.
    */
   it('is wired into schedulerPass, not merely exported', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
 
@@ -601,7 +600,7 @@ describe('the evaluation pass', () => {
    * job") answers neither half of "why was this class demoted on Tuesday".
    */
   it('records which signal demoted the class, not a disjunction of both', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
     await failedJobDeclaring('email.reply');
 
@@ -622,7 +621,7 @@ describe('the evaluation pass', () => {
    * demote, so the window is what moved and not the signal.
    */
   it('ignores a failure that predates a hand-raised level, and heeds one after it', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await failedJobDeclaring('email.reply');
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
 
@@ -652,7 +651,7 @@ describe('the evaluation pass', () => {
    * for: a cleanup that can fail is not a cleanup.
    */
   it('rolls the level back when the audit entry cannot be written', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'approve_required', { businessId: BUSINESS });
     await cleanRun('email.reply', MIN_SAMPLES);
 
@@ -697,7 +696,7 @@ describe('the evaluation pass', () => {
    * like nothing being due either.
    */
   it('isolates a class whose evaluation throws, and names it in errored', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await cleanRun('email.reply', MIN_SAMPLES);
     await cleanRun('email.initiate', MIN_SAMPLES);
 

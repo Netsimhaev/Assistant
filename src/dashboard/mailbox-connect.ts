@@ -43,7 +43,7 @@ import {
 } from '../charter/amend-mailbox.js';
 import { signCharter } from '../charter/sign.js';
 import { installCharter, loadCharterVersion, probeActiveCharter } from '../charter/store.js';
-import { withTransaction, type Queryable } from '../db/pool.js';
+import { withBusiness, withBusinessTransaction, type Queryable } from '../db/pool.js';
 import type { UnsignedCharter } from '../domain/charter.js';
 import { loadBindings } from '../orchestrator/bindings.js';
 import { oauthCeremonyPreflight } from './oauth-routes.js';
@@ -138,7 +138,7 @@ const CHARTER_MISSING = 'לא הותקן עדיין תקנון פעיל לעסק
 type CharterRead = { ok: true; charter: BusinessCharter } | { ok: false; message: string };
 
 async function readCharter(businessId: string): Promise<CharterRead> {
-  const probe = await probeActiveCharter(businessId);
+  const probe = await withBusiness(businessId, (bdb) => probeActiveCharter(bdb)); // TENANCY-TODO(task 10)
   if (!probe.ok) {
     console.error('mailbox connect: could not read the active charter:', probe.reason);
     return { ok: false, message: CHARTER_UNREADABLE };
@@ -360,10 +360,11 @@ export async function installSigned(
 ): Promise<'installed' | 'stale'> {
   const signed = signCharter(unsigned, { signedByPersonId: username, method: 'dashboard_click' });
   try {
-    await withTransaction(async (tx) => {
+    await withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 10)
       await lockActiveVersion(tx, businessId, base);
-      await installCharter(signed, { businessId, tx });
+      await installCharter(tx, signed);
       await appendAudit(
+        tx,
         {
           actor: 'human',
           onBehalfOf: username,
@@ -373,7 +374,6 @@ export async function installSigned(
           inputHash: canonicalHash({ businessId, contentHash: signed.signature.contentHash }),
           reason,
         },
-        { businessId, tx },
       );
     });
   } catch (error) {
@@ -466,7 +466,8 @@ async function versionBeforeMailbox(businessId: string, active: BusinessCharter)
     if (current.supersedes === undefined) return null;
     let previous: BusinessCharter | null;
     try {
-      previous = await loadCharterVersion(current.supersedes, businessId);
+      const supersedes = current.supersedes;
+      previous = await withBusiness(businessId, (bdb) => loadCharterVersion(bdb, supersedes)); // TENANCY-TODO(task 10)
     } catch (error) {
       console.error('mailbox revert: could not read a superseded charter:', error instanceof Error ? error.message : error);
       return null;

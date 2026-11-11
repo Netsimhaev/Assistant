@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../../db/pool.js';
-import { resetDatabase } from '../../test/db.js';
+import { closePool, withBusiness } from '../../db/pool.js';
+import { resetDatabase, testDb } from '../../test/db.js';
 import type { InterviewAnswers } from './answers.js';
 import { deleteDraft, freezeDraft, loadDraft, replaceDraft, saveSection } from './draft-store.js';
 
@@ -27,7 +27,7 @@ const HOURS: InterviewAnswers['hours'] = {
 };
 
 async function rowCount(businessId: string): Promise<number> {
-  const { rows } = await getPool().query<{ n: string }>(
+  const { rows } = await testDb().query<{ n: string }>(
     'SELECT count(*)::text AS n FROM charter_interview_drafts WHERE business_id = $1',
     [businessId],
   );
@@ -44,10 +44,10 @@ describe('interview draft store', () => {
   });
 
   it('saveSection creates one draft per business and merges sections', async () => {
-    const first = await saveSection(A, 'business', BUSINESS);
-    await saveSection(A, 'hours', HOURS);
+    const first = await withBusiness(A, (bdb) => saveSection(bdb, 'business', BUSINESS));
+    await withBusiness(A, (bdb) => saveSection(bdb, 'hours', HOURS));
 
-    const draft = await loadDraft(A);
+    const draft = await withBusiness(A, (bdb) => loadDraft(bdb));
     expect(draft?.draftId).toBe(first.draftId);
     expect(draft?.answers.business).toEqual(BUSINESS);
     expect(draft?.answers.hours).toEqual(HOURS);
@@ -55,45 +55,45 @@ describe('interview draft store', () => {
   });
 
   it('saveSection clears frozen_at', async () => {
-    await saveSection(A, 'business', BUSINESS);
-    await freezeDraft(A, new Date('2026-10-31T10:00:00Z'));
-    expect((await loadDraft(A))?.frozenAt).not.toBeNull();
+    await withBusiness(A, (bdb) => saveSection(bdb, 'business', BUSINESS));
+    await withBusiness(A, (bdb) => freezeDraft(bdb, new Date('2026-10-31T10:00:00Z')));
+    expect((await withBusiness(A, (bdb) => loadDraft(bdb)))?.frozenAt).not.toBeNull();
 
-    await saveSection(A, 'hours', HOURS);
-    expect((await loadDraft(A))?.frozenAt).toBeNull();
+    await withBusiness(A, (bdb) => saveSection(bdb, 'hours', HOURS));
+    expect((await withBusiness(A, (bdb) => loadDraft(bdb)))?.frozenAt).toBeNull();
   });
 
   it('freezeDraft keeps the first freeze', async () => {
-    await saveSection(A, 'business', BUSINESS);
+    await withBusiness(A, (bdb) => saveSection(bdb, 'business', BUSINESS));
     const t1 = new Date('2026-10-31T10:00:00Z');
     const t2 = new Date('2026-10-31T11:00:00Z');
 
-    expect((await freezeDraft(A, t1)).getTime()).toBe(t1.getTime());
-    expect((await freezeDraft(A, t2)).getTime()).toBe(t1.getTime());
-    expect((await loadDraft(A))?.frozenAt?.getTime()).toBe(t1.getTime());
+    expect((await withBusiness(A, (bdb) => freezeDraft(bdb, t1))).getTime()).toBe(t1.getTime());
+    expect((await withBusiness(A, (bdb) => freezeDraft(bdb, t2))).getTime()).toBe(t1.getTime());
+    expect((await withBusiness(A, (bdb) => loadDraft(bdb)))?.frozenAt?.getTime()).toBe(t1.getTime());
   });
 
   it('drafts are business-scoped', async () => {
-    await saveSection(A, 'business', BUSINESS);
-    expect(await loadDraft(B)).toBeNull();
+    await withBusiness(A, (bdb) => saveSection(bdb, 'business', BUSINESS));
+    expect(await withBusiness(B, (bdb) => loadDraft(bdb))).toBeNull();
   });
 
   it('saveSection refuses a value its section schema rejects, and writes nothing', async () => {
-    await expect(saveSection(A, 'hours', { ...HOURS, timezone: 'Mars/Olympus' })).rejects.toThrow();
+    await expect(withBusiness(A, (bdb) => saveSection(bdb, 'hours', { ...HOURS, timezone: 'Mars/Olympus' }))).rejects.toThrow();
     expect(await rowCount(A)).toBe(0);
   });
 
   it('baseCharterVersion is written on insert only', async () => {
-    await saveSection(A, 'business', BUSINESS, { baseCharterVersion: 'v1' });
-    const second = await saveSection(A, 'hours', HOURS, { baseCharterVersion: 'v2' });
+    await withBusiness(A, (bdb) => saveSection(bdb, 'business', BUSINESS, { baseCharterVersion: 'v1' }));
+    const second = await withBusiness(A, (bdb) => saveSection(bdb, 'hours', HOURS, { baseCharterVersion: 'v2' }));
     expect(second.baseCharterVersion).toBe('v1');
   });
 
   it('replaceDraft overwrites the answers and clears frozen_at', async () => {
-    await saveSection(A, 'business', BUSINESS);
-    await freezeDraft(A, new Date('2026-10-31T10:00:00Z'));
+    await withBusiness(A, (bdb) => saveSection(bdb, 'business', BUSINESS));
+    await withBusiness(A, (bdb) => freezeDraft(bdb, new Date('2026-10-31T10:00:00Z')));
 
-    const replaced = await replaceDraft(A, { hours: HOURS }, 'v7');
+    const replaced = await withBusiness(A, (bdb) => replaceDraft(bdb, { hours: HOURS }, 'v7'));
     expect(replaced.answers).toEqual({ hours: HOURS });
     expect(replaced.frozenAt).toBeNull();
     expect(replaced.baseCharterVersion).toBe('v7');
@@ -101,19 +101,19 @@ describe('interview draft store', () => {
   });
 
   it('loadDraft throws on a stored draft that does not parse, rather than reading it as no draft', async () => {
-    await getPool().query(
+    await testDb().query(
       `INSERT INTO charter_interview_drafts (draft_id, business_id, answers)
        VALUES ('D-corrupt', $1, $2::jsonb)`,
       [A, JSON.stringify({ hours: { timezone: 'nowhere' } })],
     );
-    await expect(loadDraft(A)).rejects.toThrow(/business-a/);
+    await expect(withBusiness(A, (bdb) => loadDraft(bdb))).rejects.toThrow(/business-a/);
   });
 
   it('deleteDraft removes only that business', async () => {
-    await saveSection(A, 'business', BUSINESS);
-    await saveSection(B, 'business', BUSINESS);
-    await deleteDraft(A, getPool());
-    expect(await loadDraft(A)).toBeNull();
-    expect(await loadDraft(B)).not.toBeNull();
+    await withBusiness(A, (bdb) => saveSection(bdb, 'business', BUSINESS));
+    await withBusiness(B, (bdb) => saveSection(bdb, 'business', BUSINESS));
+    await withBusiness(A, (bdb) => deleteDraft(bdb));
+    expect(await withBusiness(A, (bdb) => loadDraft(bdb))).toBeNull();
+    expect(await withBusiness(B, (bdb) => loadDraft(bdb))).not.toBeNull();
   });
 });

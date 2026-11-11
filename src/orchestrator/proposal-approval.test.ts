@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { installCharter } from '../charter/store.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -35,7 +35,7 @@ describe('raiseProposalApproval', () => {
   });
 
   it('raises a pending approval carrying the action headline', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const approvalId = await raiseProposalApproval(
       { jobId: null, proposal: aProposal(), bundle },
       { businessId: BUSINESS },
@@ -51,7 +51,7 @@ describe('raiseProposalApproval', () => {
   });
 
   it('says plainly that approving will not make it happen', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const approvalId = await raiseProposalApproval(
       { jobId: null, proposal: aProposal(), bundle },
       { businessId: BUSINESS },
@@ -64,7 +64,7 @@ describe('raiseProposalApproval', () => {
   });
 
   it('returns null and writes nothing when the proposal carries no action', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const approvalId = await raiseProposalApproval(
       {
         jobId: null,
@@ -80,7 +80,7 @@ describe('raiseProposalApproval', () => {
   });
 
   it('returns null for a read-only action rather than throwing', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const proposal = aProposal();
     const readOnly = {
       ...proposal,
@@ -98,7 +98,7 @@ describe('raiseProposalApproval', () => {
   });
 
   it('stamps the approval\'s risk with external provenance', async () => {
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     const approvalId = await raiseProposalApproval(
       { jobId: null, proposal: aProposal(), bundle },
       { businessId: BUSINESS },

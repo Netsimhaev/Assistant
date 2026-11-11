@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { loadEnvelopeForChildJob } from '../governance/envelope-store.js';
 import { loadJob, transition } from './jobs.js';
@@ -235,7 +235,7 @@ export async function runDueJobs(
           continue;
         }
 
-        const active = await loadActiveCharter(businessId);
+        const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
         if (active === null) {
           // Fatal, never permissive: a job cannot run without the policy
           // that governs it.
@@ -260,7 +260,7 @@ export async function runDueJobs(
         // true of what gets ENFORCED, not merely of what gets stored: without
         // this lookup the ceiling `requestHelp` wrote onto the envelope has no
         // reader in production at all.
-        const governingEnvelope = await loadEnvelopeForChildJob(job.jobId, { businessId });
+        const governingEnvelope = await withBusiness(businessId, (bdb) => loadEnvelopeForChildJob(bdb, job.jobId)); // TENANCY-TODO(task 4)
 
         const outcome = await runPlanForJob({
           job,

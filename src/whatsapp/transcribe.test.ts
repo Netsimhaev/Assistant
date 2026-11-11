@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { appendAudit, queryAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
@@ -35,7 +35,8 @@ function audioMsg(overrides: { seconds?: number } = {}): NormalizedInboundMessag
  * might keep.
  */
 async function seedWhatsappAuditRow(businessId: string, senderKind: SenderKind): Promise<void> {
-  await appendAudit(
+  await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+    bdb,
     {
       actor: 'orchestrator',
       kind: 'whatsapp_transcription',
@@ -46,9 +47,8 @@ async function seedWhatsappAuditRow(businessId: string, senderKind: SenderKind):
       costMinor: null,
       tokens: null,
       reason: 'seed row for test',
-    },
-    { businessId },
-  );
+    }
+  ));
 }
 
 describe('transcribeInbound', () => {
@@ -109,7 +109,8 @@ describe('transcribeInbound', () => {
    * will be named.
    */
   it('does not count an audit row of a different kind toward the transcription budget', async () => {
-    await appendAudit(
+    await withBusiness(BUSINESS, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+      bdb,
       {
         actor: 'orchestrator',
         kind: 'tool_call',
@@ -120,9 +121,8 @@ describe('transcribeInbound', () => {
         costMinor: null,
         tokens: null,
         reason: 'some other boss-provenance event, not a transcription',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
     expect(await whatsappTranscriptionsToday('principal', { businessId: BUSINESS })).toBe(0);
   });
 
@@ -275,7 +275,7 @@ describe('transcribeInbound', () => {
     expect(outcome.status).toBe('transcribed');
     if (outcome.status !== 'transcribed') throw new Error('unreachable');
 
-    const entries = await queryAudit({ businessId: BUSINESS, kind: 'whatsapp_transcription' });
+    const entries = await withBusiness(BUSINESS, (bdb) => queryAudit(bdb, { kind: 'whatsapp_transcription' })); // TENANCY-TODO(task 5)
     expect(entries).toHaveLength(1);
     const entry = entries[0];
     expect(entry?.provenance).toBe('boss');

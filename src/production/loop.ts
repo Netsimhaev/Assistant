@@ -95,7 +95,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { loadActiveCharter, type ActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { renderArtifactFull } from '../documents/brief.js';
 import { loadArtifacts } from '../documents/store.js';
@@ -804,7 +804,8 @@ async function finish(ctx: Ctx, p: Production): Promise<void> {
     }
   }
 
-  await appendAudit(
+  await withBusiness(p.businessId, (bdb) => appendAudit( // TENANCY-TODO(task 5)
+    bdb,
     {
       actor: 'orchestrator',
       kind: 'document_production',
@@ -817,9 +818,8 @@ async function finish(ctx: Ctx, p: Production): Promise<void> {
       costMinor: null,
       tokens: null,
       reason: `הפקת מסמך · ${productionStageLabel[stage]}`,
-    },
-    { businessId: p.businessId },
-  );
+    }
+  ));
 
   await ctx.onFinished({ productionId: p.productionId, versionId, stage, reason });
   // Merge, never overwrite, what the callback recorded on the row: the card
@@ -906,7 +906,7 @@ export async function runDocumentProductions(options: RunProductionsOptions = {}
   }
   const unavailable = printer === null || renderer === null;
 
-  const active = await loadActiveCharter(businessId, db);
+  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
   if (active === null) {
     if (unavailable) return null;
     throw new Error(`runDocumentProductions: no active charter for ${businessId}`);

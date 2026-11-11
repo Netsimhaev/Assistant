@@ -18,7 +18,7 @@
  */
 import { config } from '../config.js';
 import { loadActiveCharter } from '../charter/store.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { getMail } from '../mail/inbox-store.js';
 import { isAutomatedSender } from '../mail/automated.js';
 import { finalCategories, keepValidAttachments } from '../domain/mail-triage.js';
@@ -57,7 +57,7 @@ async function main(): Promise<void> {
 
   // No fixture fallback: installing a charter would be a write, and this
   // script promises to write nothing.
-  const active = await loadActiveCharter(config.businessId);
+  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
   if (active === null) {
     console.error(`אין תקנון פעיל לעסק ${config.businessId}. יש לחתום על תקנון לפני ההרצה; הסקריפט אינו כותב דבר.`);
     process.exitCode = 1;

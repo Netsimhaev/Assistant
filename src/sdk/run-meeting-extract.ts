@@ -9,7 +9,7 @@
  */
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { isMeetingInstruction, verifyTypedEmails } from '../meetings/request.js';
 import { localParts } from '../util/local-time.js';
 import { runMeetingExtractor } from './meeting-extractor.js';
@@ -26,7 +26,7 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const active = await loadActiveCharter(config.businessId);
+  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
   const timeZone = active?.charter.identity.timezone ?? 'Asia/Jerusalem';
   const today = localParts(new Date(), timeZone).date;
   console.log(`isMeetingInstruction: ${isMeetingInstruction(text)}  today: ${today}  tz: ${timeZone}`);

@@ -35,8 +35,7 @@
  */
 
 import { DatabaseError } from 'pg';
-import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import type { BusinessDb } from '../db/pool.js';
 import type { ActionClass } from '../domain/action.js';
 import { readEmails, readPhones } from '../policy/facts.js';
 
@@ -105,11 +104,10 @@ function toAuthorization(row: AuthorizationRow): StandingAuthorization {
  * job that belongs to a different business than the one it claims to act for.
  */
 export async function grantAuthorization(
+  db: BusinessDb,
   input: { jobId: string; actionClass: ActionClass; recipients: string[] },
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<void> {
-  const db = options.db ?? getPool();
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
   const { rows } = await db.query<{ provenance: string }>(
     'SELECT provenance FROM jobs WHERE job_id = $1 AND business_id = $2',
@@ -140,14 +138,13 @@ export async function grantAuthorization(
 }
 
 export async function loadAuthorization(
+  db: BusinessDb,
   jobId: string,
-  options: { businessId?: string; db?: Queryable } = {},
 ): Promise<StandingAuthorization | null> {
-  const db = options.db ?? getPool();
   const { rows } = await db.query<AuthorizationRow>(
     `SELECT business_id, job_id, action_class, recipients FROM job_authorizations
       WHERE business_id = $1 AND job_id = $2`,
-    [options.businessId ?? config.businessId, jobId],
+    [db.businessId, jobId],
   );
   const row = rows[0];
   return row === undefined ? null : toAuthorization(row);

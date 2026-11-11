@@ -15,7 +15,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import {
   NOON,
@@ -88,7 +88,7 @@ async function setup(provider: 'google' | 'microsoft' = 'google') {
     { businessId: BUSINESS },
   );
   if (raised === null || raised.approvalId === null) throw new Error('expected a card');
-  const approval = await getApproval(raised.approvalId, { businessId: BUSINESS });
+  const approval = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, raised.approvalId as string)); // TENANCY-TODO(task 10)
   const proposed = approval?.proposedInput as Record<string, unknown>;
   const baseUrl = await startServer();
   const cookie = await login(baseUrl);
@@ -123,7 +123,7 @@ describe('editing a mailbox-reply card', () => {
     const res = await submit(s, { ...s.proposed, to: ['someone-else@other.example'] });
     expect(res.status).toBe(400);
     expect(await res.text()).toContain(REFUSAL);
-    expect((await getApproval(s.raised.approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, s.raised.approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 10)
     expect((await loadJob(s.raised.replyJobId, { businessId: BUSINESS }))?.phase).toBe('await_approval');
     expect(await runAndCollect()).toHaveLength(0);
   });
@@ -134,14 +134,14 @@ describe('editing a mailbox-reply card', () => {
     const res = await submit(s, rest);
     expect(res.status).toBe(400);
     expect(await res.text()).toContain(REFUSAL);
-    expect((await getApproval(s.raised.approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, s.raised.approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 10)
   });
 
   it('an added field is refused', async () => {
     const s = await setup();
     const res = await submit(s, { ...s.proposed, cc: ['boss@business.example'] });
     expect(res.status).toBe(400);
-    expect((await getApproval(s.raised.approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, s.raised.approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 10)
   });
 
   it('on Gmail the card says nothing about the subject being set by the provider', async () => {
@@ -153,7 +153,7 @@ describe('editing a mailbox-reply card', () => {
     const s = await setup();
     const res = await submit(s, { ...s.proposed, subject: 'Re: נושא ערוך', body: 'גוף ערוך' });
     expect(res.status).toBe(302);
-    expect((await getApproval(s.raised.approvalId, { businessId: BUSINESS }))?.state).toBe('approved_with_edit');
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, s.raised.approvalId)))?.state).toBe('approved_with_edit'); // TENANCY-TODO(task 10)
     const sent = await runAndCollect();
     expect(sent).toHaveLength(1);
     expect(sent[0]?.body).toBe('גוף ערוך');
@@ -177,7 +177,7 @@ describe('a Microsoft 365 mailbox sets the reply subject itself (R22)', () => {
     const res = await submit(s, { ...s.proposed, subject: 'Re: נושא ערוך', body: 'גוף ערוך' });
     expect(res.status).toBe(400);
     expect(await res.text()).toContain(OUTLOOK_REFUSAL);
-    expect((await getApproval(s.raised.approvalId, { businessId: BUSINESS }))?.state).toBe('pending');
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, s.raised.approvalId)))?.state).toBe('pending'); // TENANCY-TODO(task 10)
     expect(await runAndCollect()).toHaveLength(0);
   });
 
@@ -185,7 +185,7 @@ describe('a Microsoft 365 mailbox sets the reply subject itself (R22)', () => {
     const s = await setup('microsoft');
     const res = await submit(s, { ...s.proposed, body: 'גוף ערוך' });
     expect(res.status).toBe(302);
-    expect((await getApproval(s.raised.approvalId, { businessId: BUSINESS }))?.state).toBe('approved_with_edit');
+    expect((await withBusiness(BUSINESS, (bdb) => getApproval(bdb, s.raised.approvalId)))?.state).toBe('approved_with_edit'); // TENANCY-TODO(task 10)
     const sent = await runAndCollect();
     expect(sent).toHaveLength(1);
     expect(sent[0]?.body).toBe('גוף ערוך');

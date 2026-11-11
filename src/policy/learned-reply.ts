@@ -1,5 +1,3 @@
-import { config } from '../config.js';
-import { getPool } from '../db/pool.js';
 import type { ActionFacts } from '../domain/policy.js';
 import type { GateContext } from './engine.js';
 import { readEmails } from './facts.js';
@@ -83,8 +81,8 @@ export async function learnedReplyCovers(
   const recipient = recipients[0];
   if (recipient === undefined) return false;
 
-  const businessId = ctx.businessId ?? config.businessId;
-  const db = ctx.db ?? getPool();
+  const db = ctx.db;
+  const businessId = db.businessId;
   const { rows } = await db.query<{ mail_id: string }>(
     `SELECT mail_id
        FROM mail_messages

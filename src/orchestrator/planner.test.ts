@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter, type CharterOverrides } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -66,9 +66,7 @@ function stubRegistry(): { calls: string[]; registry: AdapterRegistry } {
 }
 
 async function install(overrides: CharterOverrides = {}): Promise<PolicyBundle> {
-  return installCharter(buildCharter({ connections: [OFFICE], ...overrides }), {
-    businessId: BUSINESS,
-  });
+  return withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter({ connections: [OFFICE], ...overrides }))); // TENANCY-TODO(task 4)
 }
 
 async function jobInExecute(bundle: PolicyBundle) {

@@ -30,7 +30,7 @@ import { monotonicFactory } from 'ulid';
 import type { ActiveCharter } from '../charter/store.js';
 import { loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import type { LedgerFamily, LedgerItem } from '../domain/ledger.js';
 import { Plan } from '../domain/plan.js';
 import { canTransition, JobPhase } from '../domain/job.js';
@@ -420,7 +420,7 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
   );
   if (rows.length === 0) return out;
 
-  const active = await loadActiveCharter(businessId, db);
+  const active = await withBusiness(businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 5)
   const r: RenderCtx | null =
     active === null ? null : { timeZone: active.charter.identity.timezone, currency: active.bundle.ceilings.currency, now };
 
@@ -440,7 +440,7 @@ export async function observeNudges(o: { businessId: string; db?: Queryable; now
           WHERE business_id = $1 AND job_id = $2 AND state = 'pending'`,
         [businessId, row.job_id],
       );
-      for (const card of cards) await cancelPendingApproval(card.approval_id, { businessId, db });
+      for (const card of cards) await withBusiness(businessId, (bdb) => cancelPendingApproval(bdb, card.approval_id)); // TENANCY-TODO(task 5)
       try {
         await transition(row.job_id, {
           to: canTransition(phase, 'closed') ? 'closed' : 'failed',

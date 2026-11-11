@@ -37,6 +37,7 @@ import { runLocalTool, type LocalToolContext } from './local-tools.js';
 import { ATTACHMENT_TOOL, ATTACHMENTS_KEY, AttachmentRefs } from '../domain/attachment-ref.js';
 import { deliveryVersionOf, resolveAttachments, type ResolvedAttachment } from '../production/attachments.js';
 import type { Job } from './jobs.js';
+import { withBusiness } from '../db/pool.js';
 
 /**
  * How long one external call may take before it is abandoned.
@@ -406,11 +407,7 @@ export async function runPlan(request: RunPlanRequest): Promise<RunPlanResult> {
     // `unspentApprovalFor` for why a step id cannot be the join key, and why
     // this deliberately does not look at any edit — that substitution is
     // `executeStep`'s job, after the approval has been found.
-    const approvalId = await unspentApprovalFor({
-      jobId: current.jobId,
-      inputHash: canonicalHash(step.input),
-      businessId: current.businessId,
-    });
+    const approvalId = await withBusiness(current.businessId, (bdb) => unspentApprovalFor(bdb, { jobId: current.jobId, inputHash: canonicalHash(step.input) })); // TENANCY-TODO(task 4)
 
     const outcome = await executeStep({
       job: current,

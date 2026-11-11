@@ -148,6 +148,7 @@ import { canonicalHash } from '../util/canonical.js';
 import { createCredentialHandle } from './adapters/types.js';
 import type { CredentialHandle } from './adapters/types.js';
 import type { CredentialSource } from './credentials.js';
+import { withBusiness } from '../db/pool.js';
 
 /**
  * The one network call this module makes. Injectable for the same reason
@@ -313,7 +314,8 @@ async function auditRefreshRejection(params: {
   provider: string;
   message: string;
 }): Promise<void> {
-  await appendAudit(
+  await withBusiness(params.businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
+    bdb,
     {
       actor: 'orchestrator',
       provenance: 'boss',
@@ -327,9 +329,8 @@ async function auditRefreshRejection(params: {
       reason:
         `ריענון ההרשאה למערכת "${params.system}" (ספק: ${params.provider}) נדחה ` +
         `על ידי הספק — נדרשת הרשאה מחדש (${params.message})`,
-    },
-    { businessId: params.businessId },
-  );
+    }
+  ));
 }
 
 /**

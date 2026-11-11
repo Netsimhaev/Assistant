@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { Plan } from '../domain/plan.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
@@ -38,7 +38,7 @@ describe('autonomy ramp', () => {
     // `learn` opens the widest window (`approve_required`..`auto_notify`), so
     // this proves the raw round-trip rather than the dial's clamp — that
     // clamp is `ramp-floor.test.ts`'s job.
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
     expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('approve_required');
   });
@@ -63,14 +63,14 @@ describe('autonomy ramp', () => {
     // Same reason as the round-trip test above: without `learn` the dial
     // clamps both writes down to `draft_only` and the overwrite would be
     // invisible to this assertion.
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
     await setRampLevel('email.initiate', 'approve_required', { businessId: BUSINESS });
     expect(await loadRampLevel('email.initiate', { businessId: BUSINESS })).toBe('approve_required');
   });
 
   it('takes the most restrictive level across every class a plan declares', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.initiate', 'auto', { businessId: BUSINESS });
     await setRampLevel('crm.write', 'approve_required', { businessId: BUSINESS });
     const plan = planWith(['email.initiate', 'crm.write']);
@@ -108,7 +108,7 @@ describe('autonomy ramp', () => {
    * would be a lie". This makes the ramp agree with it.
    */
   it('lets a read-only step contribute no ceiling, so it cannot floor the plan', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
     const plan = Plan.parse({
       goal: 'recall, draft, send',
@@ -169,7 +169,7 @@ describe('autonomy ramp', () => {
    * contributes, exactly as `CEILING_EXEMPT_TOOLS`'s docblock promises.
    */
   it('lets a delegation step contribute no ceiling, so it cannot floor a plan that also acts', async () => {
-    await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+    await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
     const plan = Plan.parse({
       goal: 'ask for help, then send',

@@ -46,6 +46,7 @@ import {
 } from './mailbox-connect.js';
 import { oauthCeremonyPreflight } from './oauth-routes.js';
 import { escLabel, escapeHtml as esc } from './views.js';
+import { withBusiness } from '../db/pool.js';
 
 export type CalendarSession = MailboxSession;
 
@@ -90,7 +91,7 @@ export function parseCalendarProvider(raw: string | null | undefined): CalendarP
 type CharterRead = { ok: true; charter: BusinessCharter } | { ok: false; message: string };
 
 async function readCharter(businessId: string): Promise<CharterRead> {
-  const probe = await probeActiveCharter(businessId);
+  const probe = await withBusiness(businessId, (bdb) => probeActiveCharter(bdb)); // TENANCY-TODO(task 10)
   if (!probe.ok) {
     console.error('calendar connect: could not read the active charter:', probe.reason);
     return { ok: false, message: CHARTER_UNREADABLE };
@@ -329,7 +330,8 @@ async function versionBeforeCalendar(businessId: string, active: BusinessCharter
     if (current.supersedes === undefined) return null;
     let previous: BusinessCharter | null;
     try {
-      previous = await loadCharterVersion(current.supersedes, businessId);
+      const supersedes = current.supersedes;
+      previous = await withBusiness(businessId, (bdb) => loadCharterVersion(bdb, supersedes)); // TENANCY-TODO(task 10)
     } catch (error) {
       console.error('calendar revert: could not read a superseded charter:', error instanceof Error ? error.message : error);
       return null;

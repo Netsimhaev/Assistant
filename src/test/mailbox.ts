@@ -21,6 +21,7 @@ import { envCredentials } from '../orchestrator/credentials.js';
 import type { Runtime } from '../orchestrator/runtime.js';
 import type { Drafter } from '../sdk/mail-drafter.js';
 import { buildCharter, type CharterOverrides } from './fixtures.js';
+import { withBusiness } from '../db/pool.js';
 
 const PREFIX = 'TEST_CRED_';
 // 09:00 UTC is noon in Asia/Jerusalem — outside the fixture's quiet hours.
@@ -43,7 +44,7 @@ export async function installMailboxCharter(
 ): Promise<PolicyBundle> {
   const base = buildCharter({ version: `2026-08-15.${businessId}`, ...overrides });
   // The amendment supersedes the base version, which must exist first.
-  await installCharter(base, { businessId });
+  await withBusiness(businessId, (db) => installCharter(db, base));
   const signed = BusinessCharter.parse(
     signCharter(buildMailboxAmendment(base, NOON, provider), {
       signedByPersonId: 'owner',
@@ -51,7 +52,7 @@ export async function installMailboxCharter(
       signedAt: NOON,
     }),
   );
-  const bundle = await installCharter(signed, { businessId });
+  const bundle = await withBusiness(businessId, (db) => installCharter(db, signed));
   await upsertBinding(
     {
       system: 'mailbox',
@@ -64,7 +65,7 @@ export async function installMailboxCharter(
     },
     { businessId, by: 'test' },
   );
-  expect(await loadAutonomyMode({ businessId })).toBe('off');
+  expect(await withBusiness(businessId, (db) => loadAutonomyMode(db))).toBe('off');
   return bundle;
 }
 

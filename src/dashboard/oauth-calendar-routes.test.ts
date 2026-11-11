@@ -15,7 +15,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildCalendarAmendment } from '../charter/amend-calendar.js';
 import { signCharter } from '../charter/sign.js';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { CalendarProvider } from '../calendar/calendar.js';
 import type { CharterConnection } from '../domain/connection.js';
 import { putSecret } from '../governance/credential-store.js';
@@ -103,14 +103,14 @@ async function login(baseUrl: string): Promise<string> {
 /** Installs a base charter, then the calendar amendment signed for `provider`. */
 async function installSignedCalendar(provider: CalendarProvider, version: string): Promise<void> {
   const base = buildCharter({ version, connections: [OFFICE_CALENDAR] });
-  await installCharter(base, { businessId: BUSINESS });
-  await installCharter(
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, base)); // TENANCY-TODO(task 10)
+  await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 10)
+    bdb,
     signCharter(buildCalendarAmendment(base, new Date(), provider), {
       signedByPersonId: USERNAME,
       method: 'dashboard_click',
-    }),
-    { businessId: BUSINESS },
-  );
+    })
+  ));
 }
 
 describe('calendar OAuth ceremony and the signed provider', () => {

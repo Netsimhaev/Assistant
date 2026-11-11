@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { getPool } from '../db/pool.js';
+import { getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -19,7 +19,7 @@ describe('runDigests', () => {
     // `jobs.charter_version` also carries a composite FK to
     // `charter_versions (business_id, charter_version)` since migration 002,
     // which the "seed a closed job" helper below relies on.
-    const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+    const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
     charterVersion = bundle.charterVersion;
   });
 

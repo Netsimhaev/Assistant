@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool, withBusiness } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
 import { Plan } from '../domain/plan.js';
@@ -66,7 +66,7 @@ const PLAN_WITH_NO_RECIPIENT: Plan = Plan.parse({
 
 /** Installs the charter once per test; `resetDatabase` clears it between tests. */
 async function ensureCharter(): Promise<string> {
-  const bundle = await installCharter(buildCharter(), { businessId: BUSINESS });
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter()));
   return bundle.charterVersion;
 }
 
@@ -109,16 +109,16 @@ describe('recordCorrection', () => {
     const charterVersion = await ensureCharter();
     const strangerJob = await seedJob(charterVersion, 'unknown_external', planTo('dana@example.com'));
 
-    await recordCorrection(
+    await withBusiness(BUSINESS, (bdb) => recordCorrection(
+      bdb,
       {
         jobId: strangerJob,
         stepId: 's1',
         actionClass: 'email.reply',
         note: 'הנוסח היה רשמי מדי',
         by: 'owner@example.com',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
     const rows = await recallMemories({ subjectKey: 'dana@example.com' }, { businessId: BUSINESS });
     expect(rows).toHaveLength(1);
@@ -129,18 +129,18 @@ describe('recordCorrection', () => {
     const charterVersion = await ensureCharter();
     const jobId = await seedJob(charterVersion, 'boss', planTo('dana@example.com'));
 
-    const result = await recordCorrection(
+    const result = await withBusiness(BUSINESS, (bdb) => recordCorrection(
+      bdb,
       {
         jobId,
         stepId: 's1',
         actionClass: 'email.reply',
         note: 'הנוסח היה רשמי מדי',
         by: 'owner@example.com',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
-    const { rows } = await getPool().query<{
+    const { rows } = await testDb().query<{
       job_id: string;
       step_id: string;
       action_class: string;
@@ -173,16 +173,16 @@ describe('recordCorrection', () => {
   it('supersedes an earlier correction on the same person and action class', async () => {
     const charterVersion = await ensureCharter();
     const firstJob = await seedJob(charterVersion, 'boss', planTo('dana@example.com'));
-    await recordCorrection(
-      { jobId: firstJob, stepId: 's1', actionClass: 'email.reply', note: 'הראשון', by: 'owner@example.com' },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => recordCorrection(
+      bdb,
+      { jobId: firstJob, stepId: 's1', actionClass: 'email.reply', note: 'הראשון', by: 'owner@example.com' }
+    ));
 
     const secondJob = await seedJob(charterVersion, 'boss', planTo('dana@example.com'));
-    await recordCorrection(
-      { jobId: secondJob, stepId: 's1', actionClass: 'email.reply', note: 'השני', by: 'owner@example.com' },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => recordCorrection(
+      bdb,
+      { jobId: secondJob, stepId: 's1', actionClass: 'email.reply', note: 'השני', by: 'owner@example.com' }
+    ));
 
     const live = await recallMemories({ subjectKey: 'dana@example.com' }, { businessId: BUSINESS });
     expect(live).toHaveLength(1);
@@ -202,28 +202,28 @@ describe('recordCorrection', () => {
     const charterVersion = await ensureCharter();
 
     const replyJob = await seedJob(charterVersion, 'boss', planTo('dana@example.com'));
-    await recordCorrection(
+    await withBusiness(BUSINESS, (bdb) => recordCorrection(
+      bdb,
       {
         jobId: replyJob,
         stepId: 's1',
         actionClass: 'email.reply',
         note: 'הנוסח היה רשמי מדי',
         by: 'owner@example.com',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
     const calendarJob = await seedJob(charterVersion, 'boss', calendarPlanTo('dana@example.com'));
-    await recordCorrection(
+    await withBusiness(BUSINESS, (bdb) => recordCorrection(
+      bdb,
       {
         jobId: calendarJob,
         stepId: 's1',
         actionClass: 'calendar.create',
         note: 'השעה הייתה שגויה',
         by: 'owner@example.com',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
     const live = await recallMemories({ subjectKey: 'dana@example.com' }, { businessId: BUSINESS });
     expect(live).toHaveLength(2);
@@ -241,20 +241,20 @@ describe('recordCorrection', () => {
     const charterVersion = await ensureCharter();
     const jobId = await seedJob(charterVersion, 'boss', PLAN_WITH_NO_RECIPIENT);
 
-    const result = await recordCorrection(
+    const result = await withBusiness(BUSINESS, (bdb) => recordCorrection(
+      bdb,
       {
         jobId,
         stepId: 's1',
         actionClass: 'calendar.create',
         note: 'התאריך היה שגוי',
         by: 'owner@example.com',
-      },
-      { businessId: BUSINESS },
-    );
+      }
+    ));
 
     expect(result.remembered).toBe(false);
 
-    const { rows } = await getPool().query(
+    const { rows } = await testDb().query(
       'SELECT 1 FROM autonomy_marks WHERE business_id = $1 AND mark_id = $2',
       [BUSINESS, result.markId],
     );

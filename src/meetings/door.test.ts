@@ -10,7 +10,7 @@ import { CALENDAR_SYSTEM, HOLD_TITLE_PREFIX } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent, EventWrite } from '../calendar/types.js';
 import { calendarConnection } from '../charter/amend-calendar.js';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { loadAutonomyMode } from '../governance/autonomy-mode.js';
 import { confirmChoice, loadConfirmation } from '../governance/instruction-confirmations.js';
 import { createCalendarAdapter } from '../orchestrator/adapters/calendar.js';
@@ -197,10 +197,10 @@ const NO_PLANNER = async (): Promise<PlanOutcome> => {
 };
 
 async function setup(): Promise<void> {
-  await installCharter(
-    buildCharter({ version: 'meeting-door', connections: [calendarConnection('google')] }),
-    { businessId: BUSINESS },
-  );
+  await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 5)
+    bdb,
+    buildCharter({ version: 'meeting-door', connections: [calendarConnection('google')] })
+  ));
   await upsertBinding(
     {
       system: CALENDAR_SYSTEM,
@@ -582,7 +582,7 @@ describe('runMeetingOperation through runInstruction', () => {
   });
 
   it('a confirmed meeting runs under confirmedCommandCovers with the dial off', async () => {
-    expect(await loadAutonomyMode({ businessId: BUSINESS })).toBe('off');
+    expect(await withBusiness(BUSINESS, (bdb) => loadAutonomyMode(bdb))).toBe('off'); // TENANCY-TODO(task 5)
     const day = workDay();
     const cal = fakeCalendar();
     const { extractor } = extractorOf({ status: 'extracted', request: createRequest(day, { email: 'dani@example.com' }) });

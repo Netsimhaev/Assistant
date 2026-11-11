@@ -12,7 +12,7 @@
  */
 import { ulid } from 'ulid';
 import { config } from '../config.js';
-import { getPool, withTransaction, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, withBusinessTransaction, type Queryable } from '../db/pool.js';
 import { appendAudit } from '../audit/log.js';
 import { canonicalHash } from '../util/canonical.js';
 import { ActionClass } from '../domain/action.js';
@@ -258,7 +258,7 @@ async function move(
   reason: string,
   businessId: string,
 ): Promise<void> {
-  await withTransaction(async (tx) => {
+  await withBusinessTransaction(businessId, async (tx) => { // TENANCY-TODO(task 4)
     await setRampLevel(actionClass, to, { businessId, db: tx });
     await tx.query(
       `INSERT INTO autonomy_events
@@ -272,18 +272,15 @@ async function move(
         WHERE business_id = $1 AND action_class = $2`,
       [businessId, actionClass],
     );
-    await appendAudit(
-      {
-        actor: 'orchestrator',
-        kind: 'autonomy_change',
-        actionClass,
-        charterVersion: 'unknown',
-        provenance: 'boss',
-        inputHash: canonicalHash({ actionClass, direction, from, to }),
-        reason: `${actionClass}: ${from} → ${to} (${reason})`,
-      },
-      { businessId, tx },
-    );
+    await appendAudit(tx, {
+      actor: 'orchestrator',
+      kind: 'autonomy_change',
+      actionClass,
+      charterVersion: 'unknown',
+      provenance: 'boss',
+      inputHash: canonicalHash({ actionClass, direction, from, to }),
+      reason: `${actionClass}: ${from} → ${to} (${reason})`,
+    });
   });
 }
 
@@ -298,7 +295,7 @@ export async function evaluateAutonomy(
 ): Promise<AutonomyPassResult> {
   const businessId = options.businessId ?? config.businessId;
   const db = options.db ?? getPool();
-  const mode = await loadAutonomyMode({ businessId, db });
+  const mode = await withBusiness(businessId, (bdb) => loadAutonomyMode(bdb)); // TENANCY-TODO(task 4)
 
   const promoted: ActionClass[] = [];
   const demoted: ActionClass[] = [];
@@ -360,7 +357,7 @@ export async function evaluateAutonomy(
       // The owner agreed more than 80% of the time over at least five verdicts.
       // The "starts again after a move" rule (spec §6.3) is carried by `since`:
       // `agreementFor` only counts cards decided after the last ramp move.
-      const agreement = await agreementFor(actionClass, { businessId, since, db });
+      const agreement = await withBusiness(businessId, (bdb) => agreementFor(bdb, actionClass, { since })); // TENANCY-TODO(task 4)
       if (!isLearned(agreement)) continue;
 
       // Spec §5.1.4 — promotion on the windowed agreement rate (>80% of at

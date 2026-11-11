@@ -31,7 +31,7 @@
  */
 import { appendAudit } from '../audit/log.js';
 import { config } from '../config.js';
-import type { Queryable } from '../db/pool.js';
+import { withBusiness, type Queryable } from '../db/pool.js';
 import type { ActionFacts, PolicyBundle } from '../domain/policy.js';
 import type { Proposal } from '../domain/proposal.js';
 import { enqueueApproval, getApproval } from '../governance/approvals.js';
@@ -70,7 +70,7 @@ export async function notifyOwner(
 ): Promise<void> {
   const { businessId, jobId, facts, charterVersion } = context;
   try {
-    const request = await getApproval(approvalId, { businessId });
+    const request = await withBusiness(businessId, (bdb) => getApproval(bdb, approvalId)); // TENANCY-TODO(task 4)
     if (request === null) {
       throw new Error('approval vanished immediately after being queued');
     }
@@ -81,7 +81,8 @@ export async function notifyOwner(
     if (!delivered.ok) throw new Error(delivered.error ?? 'notify returned not-ok');
   } catch (error) {
     try {
-      await appendAudit(
+      await withBusiness(businessId, (bdb) => appendAudit( // TENANCY-TODO(task 4)
+        bdb,
         {
           actor: 'system',
           kind: 'incident',
@@ -93,9 +94,8 @@ export async function notifyOwner(
           reason:
             `approval_notify_failed:${approvalId} via ${target.notifier.channel} — ` +
             `${error instanceof Error ? error.message : String(error)}`,
-        },
-        { businessId },
-      );
+        }
+      ));
     } catch {
       // The audit write itself failed — the same bad moment that most likely
       // broke the send. Swallowed for the reason in this function's docblock:
@@ -164,17 +164,15 @@ export async function raiseProposalApproval(
 
   const risk = await assessRisk(facts, input.bundle);
 
-  const approvalId = await enqueueApproval(
-    {
-      jobId: input.jobId,
-      facts,
-      risk,
-      proposedInput: proposal.action.input,
-      summary: text.headline,
-      detail: `${text.detail}\n\n${RAMP_HONESTY}`,
-    },
-    options,
-  );
+  const proposedInput = proposal.action.input;
+  const approvalId = await withBusiness(options.businessId ?? config.businessId, (bdb) => enqueueApproval(bdb, { // TENANCY-TODO(task 4)
+    jobId: input.jobId,
+    facts,
+    risk,
+    proposedInput,
+    summary: text.headline,
+    detail: `${text.detail}\n\n${RAMP_HONESTY}`,
+  }));
 
   // After the row exists, never before: the notification's whole subject is a
   // card the owner can already open.

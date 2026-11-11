@@ -12,8 +12,8 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { join, sep } from 'node:path';
-import { closePool, getPool } from '../db/pool.js';
-import { resetDatabase } from '../test/db.js';
+import { closePool } from '../db/pool.js';
+import { resetDatabase, testDb } from '../test/db.js';
 import { writeKeyState } from '../governance/master-key.js';
 import { writeGrant } from '../governance/oauth-grants.js';
 import { oauthCredentials } from '../orchestrator/oauth-token.js';
@@ -283,7 +283,7 @@ describe('an OAuth refresh token leaves no trace outside its own ciphertext', ()
     const handle = await source.resolve('OFFICE_CALENDAR', BUSINESS);
     expect(handle?.value).toBe('issued-access-token-value');
 
-    const { rows: columns } = await getPool().query<{ table_name: string; column_name: string }>(
+    const { rows: columns } = await testDb().query<{ table_name: string; column_name: string }>(
       `SELECT c.table_name, c.column_name
          FROM information_schema.columns c
          JOIN information_schema.tables t USING (table_schema, table_name)
@@ -303,7 +303,7 @@ describe('an OAuth refresh token leaves no trace outside its own ciphertext', ()
       // `oauth_grants.ciphertext`/`.nonce` are `bytea`, not in this type
       // list at all, so the sealed value itself is never a candidate here —
       // this loop can only catch the token appearing in PLAINTEXT.
-      const { rows } = await getPool().query<{ n: string }>(
+      const { rows } = await testDb().query<{ n: string }>(
         `SELECT count(*)::text AS n FROM "${column.table_name}"
           WHERE "${column.column_name}"::text LIKE $1`,
         [`%${SENTINEL}%`],

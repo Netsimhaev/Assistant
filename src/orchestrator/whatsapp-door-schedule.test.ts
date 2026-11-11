@@ -9,7 +9,7 @@ import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { CalendarClient, CalendarEvent } from '../calendar/types.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
 import { config } from '../config.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { Plan } from '../domain/plan.js';
 import { answerScheduleQuery } from '../meetings/door.js';
 import { createFakeGateway } from '../whatsapp/fake-gateway.js';
@@ -83,7 +83,7 @@ function recordingMessenger(): { messenger: BossMessenger; jobIds: (string | nul
 }
 
 async function expectedSchedule(text: string): Promise<string> {
-  const active = await loadActiveCharter(BUSINESS);
+  const active = await withBusiness(BUSINESS, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 4)
   if (active === null) throw new Error('no charter');
   const r = await answerScheduleQuery({
     text, businessId: BUSINESS, timeZone: active.charter.identity.timezone, operations: active.charter.operations,
@@ -108,7 +108,7 @@ const clarifyingPlan: Plan = {
 
 beforeEach(async () => {
   await resetDatabase();
-  await installCharter(buildCharter(), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 4)
   await upsertBinding(
     { system: CALENDAR_SYSTEM, status: 'live', endpoint: null, credentialRef: 'OAUTH_CALENDAR', provider: 'google', lastOkAt: null, lastError: null },
     { businessId: BUSINESS, by: 'test' },
@@ -144,13 +144,13 @@ describe('WhatsApp door: schedule question', () => {
 
   it('is neither counted against nor refused by the daily instruction cap', async () => {
     for (let i = 0; i < config.whatsappInstructionsPerDay; i += 1) {
-      await appendAudit(
+      await withBusiness(BUSINESS, (bdb) => appendAudit( // TENANCY-TODO(task 4)
+        bdb,
         {
           actor: 'orchestrator', kind: 'whatsapp_instruction', charterVersion: 'n/a', provenance: 'boss',
           inputHash: canonicalHash({ seeded: i }), artifacts: [], costMinor: null, tokens: null, reason: 'seed',
-        },
-        { businessId: BUSINESS },
-      );
+        }
+      ));
     }
     const before = await count("SELECT count(*)::text AS n FROM audit_log WHERE kind = 'whatsapp_instruction'");
     const gateway = createFakeGateway();

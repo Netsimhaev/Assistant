@@ -276,7 +276,7 @@
  */
 import { isAbsolute, join, normalize, sep } from 'node:path';
 import { config } from '../config.js';
-import { getPool, type Queryable } from '../db/pool.js';
+import { getPool, withBusiness, type Queryable } from '../db/pool.js';
 import { keptIds, type KeptItemKind } from './kept-items.js';
 import { LIKE_ESCAPE, likeLiteral } from '../util/like.js';
 import { TERMINAL_STAGES } from '../production/store.js';
@@ -1747,9 +1747,9 @@ export async function buildErasurePlan(
         );
 
   // Kept items drop out of the plan and into the exclusions, never silently.
-  const keptDocuments = await keptIds('document', { businessId, db });
-  const keptMemories = await keptIds('memory', { businessId, db });
-  const keptJobs = await keptIds('job', { businessId, db });
+  const keptDocuments = await withBusiness(businessId, (bdb) => keptIds(bdb, 'document')); // TENANCY-TODO(task 6)
+  const keptMemories = await withBusiness(businessId, (bdb) => keptIds(bdb, 'memory')); // TENANCY-TODO(task 6)
+  const keptJobs = await withBusiness(businessId, (bdb) => keptIds(bdb, 'job')); // TENANCY-TODO(task 6)
 
   const excluded: KeptExclusion[] = [];
   const { rows: keptRows } = await db.query<{

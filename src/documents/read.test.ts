@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { ulid } from 'ulid';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { compileCharter } from '../charter/compile.js';
 import { installCharter } from '../charter/store.js';
@@ -65,7 +65,7 @@ beforeEach(async () => {
   // one. Install the same charter under the same business so the two tests
   // below that create real jobs against `bundle.charterVersion` satisfy the
   // constraint.
-  await installCharter(buildCharter(), { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => installCharter(bdb, buildCharter())); // TENANCY-TODO(task 5)
 });
 afterAll(async () => { await closePool(); });
 

@@ -9,7 +9,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { CALENDAR_SYSTEM } from '../calendar/calendar.js';
 import type { AttendeeResponse, CalendarClient, CalendarEvent } from '../calendar/types.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import { saveActionUpdateSettings } from '../governance/action-update-settings.js';
 import { setAutonomyMode } from '../governance/autonomy-mode.js';
 import { upsertBinding } from '../orchestrator/bindings.js';
@@ -157,7 +157,7 @@ beforeEach(async () => {
   await connectCalendar();
   // Reminders open a job only when the dial lets email.initiate reach a card;
   // the default `off` hands the owner the text instead (its own test below).
-  await setAutonomyMode('ask', 'p_boss', { businessId: B });
+  await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
 });
 afterAll(async () => {
   await closePool();
@@ -403,9 +403,9 @@ describe('unanswered meetings', () => {
     await resetDatabase();
     const { installCharter } = await import('../charter/store.js');
     const { buildCharter } = await import('../test/fixtures.js');
-    charterVersion = (await installCharter(buildCharter(), { businessId: B })).charterVersion;
+    charterVersion = (await withBusiness(B, (bdb) => installCharter(bdb, buildCharter()))).charterVersion; // TENANCY-TODO(task 5)
     await connectCalendar();
-    await setAutonomyMode('ask', 'p_boss', { businessId: B });
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'ask', 'p_boss')); // TENANCY-TODO(task 5)
     const { meetingId } = await seed({ state: 'active', eventId: 'ev-1', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
     const { client } = fakeCalendar(new Map([['ev-1', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
     const sent: { subject: string; body: string }[] = [];
@@ -417,7 +417,7 @@ describe('unanswered meetings', () => {
   });
 
   it('under the default off dial opens no job and hands the owner the reminder text, once', async () => {
-    await setAutonomyMode('off', 'p_boss', { businessId: B });
+    await withBusiness(B, (bdb) => setAutonomyMode(bdb, 'off', 'p_boss')); // TENANCY-TODO(task 5)
     const { meetingId } = await seed({ state: 'active', eventId: 'ev-1', updatedAt: new Date(NOW.getTime() - 25 * HOUR) });
     const { client } = fakeCalendar(new Map([['ev-1', [{ email: 'dani@acme.co.il', response: 'needs_action' }]]]));
     const sent: { subject: string; body: string }[] = [];

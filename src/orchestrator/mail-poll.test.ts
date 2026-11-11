@@ -14,7 +14,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { ingestDocument } from '../documents/ingest.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { MailTriage } from '../domain/mail-triage.js';
 import type { PolicyBundle } from '../domain/policy.js';
 import { writeKeyState } from '../governance/master-key.js';
@@ -496,7 +496,7 @@ describe('pollMailbox', () => {
       'SELECT approval_id FROM approval_requests WHERE business_id = $1 AND job_id = $2',
       [BUSINESS, replyJobId],
     );
-    const decided = await decide(rows[0]?.approval_id ?? '', 'approved', { by: 'p', channel: 'dashboard' }, { businessId: BUSINESS });
+    const decided = await withBusiness(BUSINESS, (bdb) => decide(bdb, rows[0]?.approval_id ?? '', 'approved', { by: 'p', channel: 'dashboard' })); // TENANCY-TODO(task 4)
     await resumeAfterDecision(decided, 'p', { businessId: BUSINESS });
     const failing = fakeMailboxClient([{ failure: 'rejected', status: 400, message: 'bad request' }]);
     await runDueJobs({ businessId: BUSINESS, runtime: mailboxRuntime(failing.client), now: NOON });

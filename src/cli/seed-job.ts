@@ -19,7 +19,7 @@
  */
 import { config } from '../config.js';
 import { activeCharterVersion } from '../charter/store.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { Plan } from '../domain/plan.js';
 import { createJob, transition } from '../orchestrator/jobs.js';
 import { bindPlanToJob, planHashOf } from '../orchestrator/plan-store.js';
@@ -39,7 +39,7 @@ export async function seedMailJob(
 
   // `activeCharterVersion` is positional, not an options object, and returns
   // `string | null` rather than throwing — see src/charter/store.ts.
-  const charterVersion = await activeCharterVersion(businessId);
+  const charterVersion = await withBusiness(businessId, (bdb) => activeCharterVersion(bdb)); // TENANCY-TODO(task 7)
   if (charterVersion === null) {
     throw new Error(
       `seedMailJob: no active charter for business ${businessId} — install one first`,

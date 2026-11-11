@@ -35,7 +35,7 @@
  * The two runs below differ in one row of `autonomy_ramp` and nothing else.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -167,7 +167,8 @@ async function seedReplyJob(plan: Plan = REPLY_PLAN): Promise<{
   jobId: string;
   bundle: Awaited<ReturnType<typeof installCharter>>;
 }> {
-  const bundle = await installCharter(
+  const bundle = await withBusiness(BUSINESS, (bdb) => installCharter( // TENANCY-TODO(task 4)
+    bdb,
     // No `autonomyBase` override. That absence is the entire point of this
     // file — see the module docblock.
     //
@@ -184,9 +185,8 @@ async function seedReplyJob(plan: Plan = REPLY_PLAN): Promise<{
       version: '2026-08-15.ramp-raise',
       connections: [MAIL_CONNECTION],
       knownCounterpartyEmailDomain: 'example.com',
-    }),
-    { businessId: BUSINESS },
-  );
+    })
+  ));
 
   // The owner's dial (Task 2) clamps `loadRampLevel` around a window that
   // defaults to `off` — everything pinned at `draft_only` — for a business
@@ -194,7 +194,7 @@ async function seedReplyJob(plan: Plan = REPLY_PLAN): Promise<{
   // raised ramp row change anything", so it needs the dial open to its widest
   // setting first; the clamp itself is `ramp-floor.test.ts`'s job, not this
   // file's.
-  await setAutonomyMode('learn', 'owner@example.com', { businessId: BUSINESS });
+  await withBusiness(BUSINESS, (bdb) => setAutonomyMode(bdb, 'learn', 'owner@example.com')); // TENANCY-TODO(task 4)
 
   const job = await createJob({
     charterVersion: bundle.charterVersion,
@@ -340,10 +340,10 @@ describe('raising one action class off approve_required, under the charter a rea
   it('sends to that same address when the owner’s instruction named it', async () => {
     const { jobId } = await seedReplyJob(STRANGER_PLAN);
     await setRampLevel('email.reply', 'auto_notify', { businessId: BUSINESS });
-    await grantAuthorization(
-      { jobId, actionClass: 'email.reply', recipients: ['stranger@nowhere.example'] },
-      { businessId: BUSINESS },
-    );
+    await withBusiness(BUSINESS, (bdb) => grantAuthorization( // TENANCY-TODO(task 4)
+      bdb,
+      { jobId, actionClass: 'email.reply', recipients: ['stranger@nowhere.example'] }
+    ));
 
     const sent: MailMessage[] = [];
     const result = await runDueJobs({ businessId: BUSINESS, runtime: runtimeWith(sent), now: NOON });

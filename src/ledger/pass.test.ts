@@ -8,7 +8,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { installCharter } from '../charter/store.js';
-import { closePool, getPool } from '../db/pool.js';
+import { closePool, getPool, withBusiness } from '../db/pool.js';
 import type { LedgerItem } from '../domain/ledger.js';
 import { resetDatabase, testDb } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
@@ -102,7 +102,7 @@ async function batches(): Promise<{ batch_id: string; items: string[]; sent_at: 
 
 beforeEach(async () => {
   await resetDatabase();
-  await installCharter(buildCharter({}), { businessId: B });
+  await withBusiness(B, (bdb) => installCharter(bdb, buildCharter({}))); // TENANCY-TODO(task 5)
 });
 afterAll(async () => {
   await closePool();

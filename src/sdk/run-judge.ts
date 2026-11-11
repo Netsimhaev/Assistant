@@ -33,7 +33,7 @@
 import { config } from '../config.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter, loadActiveCharter } from '../charter/store.js';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { judgeWithModel, type JudgeOutcome, type JudgeRequest } from './gov-verify.js';
 import type { PolicyBundle } from '../domain/policy.js';
 
@@ -151,8 +151,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const active = await loadActiveCharter(config.businessId);
-  const bundle: PolicyBundle = active?.bundle ?? (await installCharter(buildCharter()));
+  const active = await withBusiness(config.businessId, (bdb) => loadActiveCharter(bdb)); // TENANCY-TODO(task 7)
+  const bundle: PolicyBundle = active?.bundle ?? (await withBusiness(config.businessId, (bdb) => installCharter(bdb, buildCharter()))); // TENANCY-TODO(task 7)
   console.log(`charter: ${bundle.charterVersion}`);
   console.log(`cases: ${CASES.length} — each one live model call\n`);
 

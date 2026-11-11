@@ -1,12 +1,6 @@
-import { config } from '../config.js';
 import type { AuditEntry, AuditEntryInput } from '../domain/audit.js';
 import { GENESIS_HASH } from '../domain/audit.js';
-import {
-  acquireAdvisoryLock,
-  getPool,
-  withTransaction,
-  type Queryable,
-} from '../db/pool.js';
+import { acquireAdvisoryLock, transaction, type BusinessDb } from '../db/pool.js';
 import { chainHash } from '../util/canonical.js';
 
 /**
@@ -46,15 +40,18 @@ export interface AppendedEntry {
  * Serialised per business with an advisory lock: two concurrent appends that
  * both read the same tail would produce two entries claiming the same
  * predecessor, which silently forks the chain. The lock is held for the
- * transaction, so it releases on commit or rollback either way.
+ * transaction, so it releases on commit or rollback either way — and it is
+ * taken on the same connection that inserts the row: `transaction(db, …)`
+ * joins the caller's transaction when `db` is in one, and opens one on `db`
+ * otherwise.
  */
 export async function appendAudit(
+  db: BusinessDb,
   input: AuditEntryInput,
-  options: { businessId?: string; tx?: Queryable } = {},
 ): Promise<AppendedEntry> {
-  const businessId = options.businessId ?? config.businessId;
+  const businessId = db.businessId;
 
-  const run = async (tx: Queryable): Promise<AppendedEntry> => {
+  const run = async (tx: BusinessDb): Promise<AppendedEntry> => {
     await acquireAdvisoryLock(tx, `audit:${businessId}`);
 
     const { rows } = await tx.query<{ hash: string }>(
@@ -122,7 +119,7 @@ export async function appendAudit(
     return { seq, at, hash, prevHash };
   };
 
-  return options.tx ? run(options.tx) : withTransaction(run);
+  return transaction(db, run);
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +171,6 @@ function toEntry(row: AuditRow): AuditEntry {
 }
 
 export interface AuditQuery {
-  businessId?: string;
   jobId?: string;
   kind?: string;
   actionClass?: string;
@@ -183,10 +179,10 @@ export interface AuditQuery {
 
 /** Newest first. This is what the dashboard's plain-language view reads. */
 export async function queryAudit(
+  db: BusinessDb,
   query: AuditQuery = {},
-  db: Queryable = getPool(),
 ): Promise<AuditEntry[]> {
-  const businessId = query.businessId ?? config.businessId;
+  const businessId = db.businessId;
   const conditions = ['business_id = $1'];
   const params: unknown[] = [businessId];
 
@@ -226,10 +222,8 @@ export type ChainVerification =
  * next entry's prevHash no longer matches its predecessor's hash). The
  * append-only trigger makes both hard; this makes both *provable*.
  */
-export async function verifyChain(
-  businessId: string = config.businessId,
-  db: Queryable = getPool(),
-): Promise<ChainVerification> {
+export async function verifyChain(db: BusinessDb): Promise<ChainVerification> {
+  const businessId = db.businessId;
   const { rows } = await db.query<AuditRow>(
     'SELECT * FROM audit_log WHERE business_id = $1 ORDER BY seq ASC',
     [businessId],

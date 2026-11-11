@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool } from '../db/pool.js';
+import { closePool, withBusiness } from '../db/pool.js';
 import { resetDatabase } from '../test/db.js';
 import { canonicalHash } from '../util/canonical.js';
 import type { ActionFacts } from '../domain/policy.js';
@@ -84,16 +84,16 @@ async function makeApproval(options: {
     amountMinor: 210_000,
     note: secret,
   };
-  const approvalId = await enqueueApproval(
+  const approvalId = await withBusiness(BUSINESS, (bdb) => enqueueApproval(
+    bdb,
     {
       facts: factsFixture(proposedInput),
       risk: riskFixture(options.riskOverrides),
       proposedInput,
       summary: options.summary ?? 'הזמנה מספק א׳ טעונה אישור',
-    },
-    { businessId: BUSINESS },
-  );
-  const request = await getApproval(approvalId, { businessId: BUSINESS });
+    }
+  ));
+  const request = await withBusiness(BUSINESS, (bdb) => getApproval(bdb, approvalId));
   if (request === null) throw new Error('approval was not written');
   return request;
 }
