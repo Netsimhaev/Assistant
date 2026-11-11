@@ -587,8 +587,8 @@ describe('what an erasure leaves behind', () => {
       ],
     );
     await db.query(
-      `INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes, check1, check2)
-       VALUES ('VER-probe', 'PR-probe', 1, $1::jsonb, $2, repeat('a', 64), 10, $3::jsonb, $4::jsonb)`,
+      `INSERT INTO document_versions (version_id, production_id, business_id, version_no, spec, stored_path, sha256, size_bytes, check1, check2)
+       VALUES ('VER-probe', 'PR-probe', (SELECT business_id FROM document_productions WHERE production_id = 'PR-probe'), 1, $1::jsonb, $2, repeat('a', 64), 10, $3::jsonb, $4::jsonb)`,
       [
         JSON.stringify({ title: `הצעה "מסגרת" ל-${PROBE}` }),
         `produced/${BUSINESS}/PR-probe/VER-probe.docx`,

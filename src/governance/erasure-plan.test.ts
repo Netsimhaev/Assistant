@@ -1120,8 +1120,8 @@ describe('document production', () => {
     if (opts.storedPath === undefined) await writeFile(join(root, storedPath), 'docx-bytes');
     await writeFile(join(root, previewPath), 'png-bytes');
     await getPool().query(
-      `INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes, check1, check2)
-       VALUES ($1, $2, 1, $3::jsonb, $4, repeat('a', 64), 10, $5::jsonb, $6::jsonb)`,
+      `INSERT INTO document_versions (version_id, production_id, business_id, version_no, spec, stored_path, sha256, size_bytes, check1, check2)
+       VALUES ($1, $2, (SELECT business_id FROM document_productions WHERE production_id = $2), 1, $3::jsonb, $4, repeat('a', 64), 10, $5::jsonb, $6::jsonb)`,
       [
         versionId,
         productionId,
@@ -1382,8 +1382,8 @@ describe('document production', () => {
     await aVersion('PR-esc', 'VER-esc1', { storedPath: outside });
     const badPreview = join('produced', BUSINESS, 'PR-esc', '..', '..', 'p.png');
     await getPool().query(
-      `INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes, check2)
-       VALUES ('VER-esc2', 'PR-esc', 2, '{}'::jsonb, $1, repeat('a', 64), 10, $2::jsonb)`,
+      `INSERT INTO document_versions (version_id, production_id, business_id, version_no, spec, stored_path, sha256, size_bytes, check2)
+       VALUES ('VER-esc2', 'PR-esc', (SELECT business_id FROM document_productions WHERE production_id = 'PR-esc'), 2, '{}'::jsonb, $1, repeat('a', 64), 10, $2::jsonb)`,
       [other, JSON.stringify({ previewPath: badPreview })],
     );
 

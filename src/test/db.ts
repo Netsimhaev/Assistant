@@ -6,6 +6,8 @@ import { config } from '../config.js';
 
 let migrated = false;
 
+export const TEST_BUSINESS = 'test-business';
+
 /**
  * Create the test logins and apply migrations, once per test process — both
  * on the MIGRATOR pool (the superuser in `TEST_DATABASE_URL`). The app code
@@ -46,6 +48,7 @@ export async function resetDatabase(): Promise<void> {
   await testDb().query(`
     TRUNCATE TABLE
       audit_log,
+      businesses,
       meeting_holds,
       meetings,
       meeting_settings,
@@ -109,4 +112,19 @@ export async function resetDatabase(): Promise<void> {
       dashboard_users
     RESTART IDENTITY CASCADE
   `);
+}
+
+/**
+ * Insert a registry row (as the migrator) for tests that need one — the
+ * scheduler's business list, login. Idempotent; resets the status.
+ */
+export async function registerBusiness(id = TEST_BUSINESS, status: 'active' | 'suspended' = 'active'): Promise<void> {
+  await ensureSchema();
+  await testDb().query(
+    `INSERT INTO businesses (business_id, display_name, status, suspended_at)
+     VALUES ($1, $1, $2::text, CASE WHEN $2::text = 'suspended' THEN now() ELSE NULL END)
+     ON CONFLICT (business_id) DO UPDATE
+       SET status = EXCLUDED.status, suspended_at = EXCLUDED.suspended_at`,
+    [id, status],
+  );
 }

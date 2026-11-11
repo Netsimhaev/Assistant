@@ -171,8 +171,8 @@ describe('migration 053', () => {
     );
     const ins = (sha: string, no: number) =>
       getPool().query(
-        `INSERT INTO document_versions (version_id,production_id,version_no,spec,stored_path,sha256,size_bytes)
-         VALUES (gen_random_uuid()::text,'P1',$2,'{}','p',$1,1)`,
+        `INSERT INTO document_versions (version_id,production_id,business_id,version_no,spec,stored_path,sha256,size_bytes)
+         VALUES (gen_random_uuid()::text,'P1',(SELECT business_id FROM document_productions WHERE production_id='P1'),$2,'{}','p',$1,1)`,
         [sha, no],
       );
     await expect(ins('ZZ', 1)).rejects.toThrow(/document_versions_sha256_hex/);

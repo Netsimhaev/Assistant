@@ -229,8 +229,8 @@ export async function transition(
     );
 
     await tx.query(
-      `INSERT INTO job_steps (job_id, from_phase, to_phase, actor, envelope_id, cost_minor, reason)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      `INSERT INTO job_steps (job_id, business_id, from_phase, to_phase, actor, envelope_id, cost_minor, reason)
+       VALUES ($1, $8, $2, $3, $4, $5, $6, $7)`,
       [
         jobId,
         from,
@@ -239,6 +239,7 @@ export async function transition(
         input.envelopeId ?? null,
         input.costMinor ?? null,
         input.reason,
+        businessId,
       ],
     );
 

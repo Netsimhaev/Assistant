@@ -890,8 +890,8 @@ describe('reraiseAfterFailedSend', () => {
       // the expired branch holds, so only the approval's state refuses it.
       await getPool().query(`UPDATE jobs SET phase = 'failed' WHERE job_id = $1`, [raised.replyJobId]);
       await getPool().query(
-        `INSERT INTO job_steps (job_id, from_phase, to_phase, actor, reason)
-         VALUES ($1, 'closed', 'failed', 'test', 'test: forced')`,
+        `INSERT INTO job_steps (job_id, business_id, from_phase, to_phase, actor, reason)
+         VALUES ($1, (SELECT business_id FROM jobs WHERE job_id = $1), 'closed', 'failed', 'test', 'test: forced')`,
         [raised.replyJobId],
       );
 

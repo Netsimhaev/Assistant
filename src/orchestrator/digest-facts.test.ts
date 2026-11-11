@@ -52,8 +52,8 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), charterVersion],
     );
     await db.query(
-      `INSERT INTO job_steps (job_id, from_phase, to_phase, actor, reason)
-       VALUES ('J-bad', 'execute', 'failed', 'orchestrator', 'adapter_timeout')`,
+      `INSERT INTO job_steps (job_id, business_id, from_phase, to_phase, actor, reason)
+       VALUES ('J-bad', (SELECT business_id FROM jobs WHERE job_id = 'J-bad'), 'execute', 'failed', 'orchestrator', 'adapter_timeout')`,
     );
 
     const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
@@ -87,8 +87,8 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), charterVersion],
     );
     await db.query(
-      `INSERT INTO job_steps (job_id, from_phase, to_phase, actor, reason)
-       VALUES ('J-denied-close', 'await_approval', 'closed', 'human', 'denied:AP-1 by owner')`,
+      `INSERT INTO job_steps (job_id, business_id, from_phase, to_phase, actor, reason)
+       VALUES ('J-denied-close', (SELECT business_id FROM jobs WHERE job_id = 'J-denied-close'), 'await_approval', 'closed', 'human', 'denied:AP-1 by owner')`,
     );
 
     const facts = await collectDigestFacts(WINDOW, CEILINGS, { businessId: BUSINESS });
@@ -306,8 +306,8 @@ describe('collectDigestFacts', () => {
       [BUSINESS, new Date('2026-10-07T07:00:00+03:00'), charterVersion],
     );
     await db.query(
-      `INSERT INTO job_steps (job_id, from_phase, to_phase, actor, reason)
-       VALUES ('J-denied', 'execute', 'failed', 'orchestrator',
+      `INSERT INTO job_steps (job_id, business_id, from_phase, to_phase, actor, reason)
+       VALUES ('J-denied', (SELECT business_id FROM jobs WHERE job_id = 'J-denied'), 'execute', 'failed', 'orchestrator',
                'draft_only:persist_as_draft — המחלקה עדיין בטיוטה בלבד')`,
     );
 
@@ -610,8 +610,8 @@ describe('collectDigestFacts', () => {
     ];
     for (const [id, no, superseded] of versions) {
       await db.query(
-        `INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes, superseded_at)
-         VALUES ($1, 'DP-1', $2, '{}', 'p', $3, 1, $4)`,
+        `INSERT INTO document_versions (version_id, production_id, business_id, version_no, spec, stored_path, sha256, size_bytes, superseded_at)
+         VALUES ($1, 'DP-1', (SELECT business_id FROM document_productions WHERE production_id = 'DP-1'), $2, '{}', 'p', $3, 1, $4)`,
         [id, no, sha, superseded],
       );
     }

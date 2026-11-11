@@ -453,8 +453,9 @@ export async function saveVersion(input: SaveVersionInput, db: Queryable = getPo
   const versionId = versionIdFor(input.productionId, input.versionNo);
   await db.query(
     `WITH ins AS (
-       INSERT INTO document_versions (version_id, production_id, version_no, spec, stored_path, sha256, size_bytes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       INSERT INTO document_versions (version_id, production_id, business_id, version_no, spec, stored_path, sha256, size_bytes)
+       SELECT $1, $2, p.business_id, $3, $4, $5, $6, $7
+         FROM document_productions p WHERE p.production_id = $2
        ON CONFLICT (production_id, version_no) DO NOTHING
        RETURNING version_id)
      UPDATE document_versions SET superseded_at = now()

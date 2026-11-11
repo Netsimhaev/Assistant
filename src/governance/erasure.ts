@@ -576,10 +576,10 @@ export async function executeErasure(
     for (const { jobId, envelopeId, phase } of stranded) {
       if (!actuallyFailed.has(jobId)) continue;
       await client.query(
-        `INSERT INTO job_steps (job_id, from_phase, to_phase, actor, envelope_id, reason)
-         VALUES ($1, $2, 'failed', 'human', $3,
+        `INSERT INTO job_steps (job_id, business_id, from_phase, to_phase, actor, envelope_id, reason)
+         VALUES ($1, $4, $2, 'failed', 'human', $3,
                  'מחיקה בהוראת הבעלים מחקה את הפנייה שהמשימה המתינה למענה עליה, והמשימה לא תוכל להמשיך')`,
-        [jobId, phase, envelopeId],
+        [jobId, phase, envelopeId, businessId],
       );
     }
 
