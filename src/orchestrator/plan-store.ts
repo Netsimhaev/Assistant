@@ -229,12 +229,19 @@ export async function completedSteps(
  * the job has advanced and the step it advanced past is unrecorded, and a
  * resume would then run that step a second time.
  *
- * A `BusinessDb` that is not in a transaction is refused at run time: such a
- * write is exactly the separate write this docblock forbids, and exactly the
- * defect `upsertBinding` hit earlier on this branch. (Before the business was
- * threaded through, the narrower `pg.PoolClient` type did this job.) The read
- * functions above take any `BusinessDb`: they hold no lock and have no
- * atomicity to lose.
+ * **A `BusinessDb` that is not in a transaction is refused at run time, and
+ * that check replaces a type barrier.** Before the business was threaded
+ * through, the parameter was `pg.PoolClient` and not `Queryable`, deliberately:
+ * a `Pool` satisfies `Queryable` structurally, so the narrower type was the
+ * only thing that stopped `recordStepCompletion(getPool(), …)` from compiling.
+ * Every `BusinessDb` has the same type whether or not it is in a transaction,
+ * so the barrier now lives in `tx.inTransaction`. What it forbids is unchanged:
+ * a write on a separate connection, outside the transaction that moves the
+ * job, is exactly the two-separate-writes window described above — the job
+ * advances, the completion is unrecorded, and a resume runs the step a second
+ * time — and exactly the defect `upsertBinding` hit earlier on this branch.
+ * The read functions above take any `BusinessDb`: they hold no lock and have
+ * no atomicity to lose.
  *
  * **Resumption is at-least-once, not exactly-once, and no transaction can make
  * it otherwise.** The external call happens before this row can possibly be
@@ -271,6 +278,7 @@ export async function recordStepCompletion(
   tx: BusinessDb,
   input: StepCompletion & { jobId: string },
 ): Promise<void> {
+  // The type barrier's replacement — see the docblock above.
   if (!tx.inTransaction) {
     throw new Error('recordStepCompletion must run inside the transaction that moves the job');
   }

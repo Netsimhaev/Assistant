@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { closePool, withBusiness } from '../db/pool.js';
+import { __setAppPoolMaxForTest, closePool, withBusiness, type BusinessDb } from '../db/pool.js';
 import { resetDatabase, testDb, TEST_BUSINESS } from '../test/db.js';
 import { buildCharter } from '../test/fixtures.js';
 import { installCharter } from '../charter/store.js';
@@ -10,7 +10,7 @@ import { upsertBinding } from './bindings.js';
 import { runPlan } from './run-plan.js';
 import { executeStep } from './execute.js';
 import { AdapterRegistry } from './adapters/registry.js';
-import { withSessionLock } from './session-lock.js';
+import { withSessionLock, withSessionLockOn } from './session-lock.js';
 
 /**
  * The orchestrator takes its business from the `BusinessDb` it is handed —
@@ -169,5 +169,59 @@ describe('withSessionLock', () => {
     // Released after the first run: a second one gets it again.
     const second = await withSessionLock(TEST_BUSINESS, scope, async () => 'again');
     expect(second).toEqual({ locked: true, value: 'again' });
+  });
+
+  it('refuses a connection that is already in a transaction', async () => {
+    await expect(
+      withBusiness(TEST_BUSINESS, async (db) => {
+        await db.query('BEGIN');
+        try {
+          return await withSessionLockOn({ ...db, inTransaction: true }, 'tenancy-test:tx', async () => 1);
+        } finally {
+          await db.query('ROLLBACK');
+        }
+      }),
+    ).rejects.toThrow(/already in a transaction/);
+  });
+
+  it('destroys the connection when the unlock fails, so the lock does not outlive it', async () => {
+    const scope = `tenancy-test:unlock-fails:${TEST_BUSINESS}`;
+    // One pooled connection: the next checkout is either that very session
+    // (pooled — the bug) or a brand-new one (destroyed — the rule).
+    await __setAppPoolMaxForTest(1);
+    try {
+      const firstPid = await withBusiness(TEST_BUSINESS, async (db) => {
+        const { rows } = await db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        const failingUnlock: BusinessDb = {
+          ...db,
+          query: ((text: string, params?: unknown[]) =>
+            text.includes('pg_advisory_unlock')
+              ? Promise.reject(new Error('injected unlock failure'))
+              : db.query(text, params)) as BusinessDb['query'],
+        };
+        const out = await withSessionLockOn(failingUnlock, scope, async () => 'ran');
+        expect(out).toEqual({ locked: true, value: 'ran' });
+        return rows[0]!.pid;
+      });
+      const secondPid = await withBusiness(TEST_BUSINESS, async (db) => {
+        const { rows } = await db.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+        return rows[0]!.pid;
+      });
+      expect(secondPid).not.toBe(firstPid);
+      // And the lock died with the session it was held on.
+      const other = await testDb().connect();
+      try {
+        const { rows } = await other.query<{ locked: boolean }>(
+          'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
+          [scope],
+        );
+        expect(rows[0]?.locked).toBe(true);
+        await other.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [scope]);
+      } finally {
+        other.release();
+      }
+    } finally {
+      await __setAppPoolMaxForTest(10);
+    }
   });
 });

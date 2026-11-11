@@ -24,6 +24,12 @@ export type SessionLocked<T> = { locked: true; value: T } | { locked: false };
  * broken and the RESET `withBusiness` runs next fails too, which destroys it
  * as well.
  *
+ * **A `db` already in a transaction is refused.** The poisoning above works by
+ * leaving the session in a `BEGIN`, which inside a caller's transaction would
+ * be a no-op warning and would not stop the connection being pooled; and a
+ * session lock held across a caller's transaction is not what the callers of
+ * this function — long passes that make external calls — must ever do.
+ *
  * An error from `fn` propagates after the unlock attempt; callers isolate
  * their own per-item failures.
  */
@@ -32,6 +38,9 @@ export async function withSessionLockOn<T>(
   scope: string,
   fn: () => Promise<T>,
 ): Promise<SessionLocked<T>> {
+  if (db.inTransaction) {
+    throw new Error('withSessionLockOn: refusing a connection that is already in a transaction');
+  }
   const lock = await db.query<{ locked: boolean }>(
     'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
     [scope],

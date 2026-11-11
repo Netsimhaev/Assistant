@@ -191,6 +191,9 @@ async function beginVerification(
   try {
     const delegatingJob = await createJob(ctx.db, {
       charterVersion: ctx.charterVersion,
+      // Not a parameter, and not derived from anything the document or the
+      // proposal says — see `the verification job carries unknown_external as
+      // a literal` in conduct.test.ts.
       provenance: 'unknown_external',
       title: `אימות: ${action.headline}`,
     });
@@ -446,6 +449,7 @@ export async function conductPendingDocuments(
       try {
         job = await createJob(db, {
           charterVersion: active.charter.charterVersion,
+          // Not a parameter, and not derived from anything a document says.
           provenance: 'unknown_external',
           title: `מסמך: ${document.originalName}`,
         });
